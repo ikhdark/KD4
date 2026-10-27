@@ -145,32 +145,24 @@ impl ApplyPatchRuntime {
         }
 
         if req.turn_environment.environment.is_remote() {
-            if binding.is_some() {
-                return Err(ToolError::Rejected(
-                    "apply_patch: typed patch tracking requires a local execution environment"
-                        .to_string(),
-                ));
-            }
             self.workspace_tracking_started = true;
             return Ok(());
         }
         let cwd = match req.turn_environment.cwd().to_abs_path() {
             Ok(cwd) => cwd.to_path_buf(),
-            Err(error) => {
-                if binding.is_some() {
-                    return Err(ToolError::Rejected(format!(
-                        "apply_patch: typed patch tracking requires a host-native workspace: {error}"
-                    )));
-                }
+            Err(_) => {
                 self.workspace_tracking_started = true;
                 return Ok(());
             }
         };
         let repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
+        // Task bindings track lifecycle, not filesystem authority. Like root,
+        // subagents may patch outside this repository when the existing
+        // filesystem/approval policy and their assigned task permit it.
         let mutation_paths = native_mutation_repo_paths(
             &repo_root,
             &req.file_paths,
-            /*require_complete*/ binding.is_some(),
+            /*require_complete*/ false,
         )?;
         let repo_paths = mutation_paths.paths;
 

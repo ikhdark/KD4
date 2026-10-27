@@ -2760,7 +2760,12 @@ impl AuthManager {
             };
             let previous_scope = previous.map(policy_scope);
             let next_scope = new_auth.as_ref().map(policy_scope);
-            let policy_changed = previous_scope != next_scope;
+            // Headers expose no verified account/lifecycle identity. Any changed
+            // header projection is a new authority, not a proven token rotation.
+            let headers_changed = auth_changed_for_refresh
+                && (matches!(previous, Some(CodexAuth::Headers(_)))
+                    || matches!(new_auth.as_ref(), Some(CodexAuth::Headers(_))));
+            let policy_changed = previous_scope != next_scope || headers_changed;
             // A missing account id that becomes known within the same stored login lifecycle
             // completes the current identity. Any other scope change starts a new identity.
             let completes_identity = match (previous_scope, next_scope) {

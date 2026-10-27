@@ -126,6 +126,7 @@ struct InitializedClientMetadata {
     client_version: Option<String>,
     supports_openai_form_elicitation: bool,
     rpc_gate: Arc<ConnectionRpcGate>,
+    turn_start_cancellation: Option<CancellationToken>,
 }
 
 fn deserialize_client_request(request: JSONRPCRequest) -> Result<ClientRequest, JSONRPCErrorError> {
@@ -949,11 +950,20 @@ impl MessageProcessor {
                 | codex_app_server_protocol::ClientRequestSerializationScope::ThreadPath { .. }));
         let preparation_gate = Arc::clone(&session.rpc_gate);
         let error_id = connection_request_id.request_id.clone();
+        // Capture the generation before the request can wait in preparation.
+        // A control-lane startup interrupt revokes every earlier queued start.
+        let turn_start_cancellation = match &codex_request {
+            ClientRequest::TurnStart { params, .. } => {
+                Some(self.turn_processor.turn_start_cancellation(&params.thread_id).await?)
+            }
+            _ => None,
+        };
         let client_metadata = InitializedClientMetadata {
             app_server_client_name: session.app_server_client_name().map(str::to_string),
             client_version: session.client_version().map(str::to_string),
             supports_openai_form_elicitation: session.supports_openai_form_elicitation(),
             rpc_gate: Arc::clone(&session.rpc_gate),
+            turn_start_cancellation,
         };
         let admission_error_request_id = connection_request_id.request_id.clone();
         let error_request_id = connection_request_id.clone();
@@ -1139,6 +1149,7 @@ impl MessageProcessor {
                 client_version,
                 supports_openai_form_elicitation,
                 rpc_gate,
+                turn_start_cancellation,
             } = client_metadata;
             let connection_id = connection_request_id.connection_id;
             let request_id = ConnectionRequestId {
@@ -1599,6 +1610,7 @@ impl MessageProcessor {
                                 client_version.clone(),
                                 /*supports_openai_form_elicitation*/
                                 supports_openai_form_elicitation,
+                                turn_start_cancellation,
                             )
                             .await
                     }

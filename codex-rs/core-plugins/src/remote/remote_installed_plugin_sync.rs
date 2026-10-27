@@ -19,19 +19,16 @@ use codex_plugin::PluginId;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::MutexGuard;
 use std::sync::OnceLock;
 use tracing::info;
 use tracing::warn;
 
-static REMOTE_INSTALLED_PLUGIN_BUNDLE_SYNC_IN_FLIGHT: OnceLock<
-    Mutex<HashSet<RemoteInstalledPluginBundleSyncKey>>,
-> = OnceLock::new();
 static REMOTE_PLUGIN_CACHE_MUTATIONS_IN_FLIGHT: OnceLock<Mutex<RemotePluginCacheMutations>> =
     OnceLock::new();
 
@@ -39,13 +36,74 @@ static REMOTE_PLUGIN_CACHE_MUTATIONS_IN_FLIGHT: OnceLock<Mutex<RemotePluginCache
 struct RemotePluginCacheMutations {
     in_flight: HashMap<RemotePluginCacheMutationKey, usize>,
     generations: HashMap<PathBuf, u64>,
+    independent_in_flight: HashMap<PathBuf, usize>,
+    syncs: HashMap<RemoteInstalledPluginBundleSyncKey, RemoteInstalledPluginBundleSyncState>,
 }
+
+#[derive(Default)]
+struct RemoteInstalledPluginBundleSyncState {
+    authority: Option<RemoteInstalledPluginBundleSyncAuthority>,
+    epoch: u64,
+    in_flight: bool,
+    requested: Option<RemoteInstalledPluginBundleSyncRequest>,
+}
+
+#[derive(PartialEq, Eq)]
+struct RemoteInstalledPluginBundleSyncAuthority {
+    chatgpt_base_url: String,
+    account_id: Option<String>,
+    chatgpt_user_id: Option<String>,
+    is_workspace_account: bool,
+}
+
+struct RemoteInstalledPluginBundleSyncRequest {
+    codex_home: PathBuf,
+    config: RemotePluginServiceConfig,
+    auth: CodexAuth,
+    epoch: u64,
+    on_local_cache_changed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+    completion: Option<tokio::sync::oneshot::Sender<RemoteInstalledPluginBundleSyncResult>>,
+    runtime: tokio::runtime::Handle,
+}
+
+type RemoteInstalledPluginBundleSyncResult =
+    Result<RemoteInstalledPluginBundleSyncOutcome, RemoteInstalledPluginBundleSyncError>;
 
 struct RemoteInstalledPluginBundleSyncGuard(RemoteInstalledPluginBundleSyncKey);
 
 impl Drop for RemoteInstalledPluginBundleSyncGuard {
     fn drop(&mut self) {
-        clear_remote_installed_plugin_bundle_sync_in_flight(&self.0);
+        let mutations = REMOTE_PLUGIN_CACHE_MUTATIONS_IN_FLIGHT.get_or_init(Default::default);
+        let key = self.0.clone();
+        let release = move || {
+            let requested = {
+                let mut mutations = lock_cache_mutations();
+                let Some(state) = mutations.syncs.get_mut(&key) else {
+                    return;
+                };
+                state.in_flight = false;
+                take_ready_sync_request(&mut mutations, &key)
+            };
+            if let Some(requested) = requested {
+                spawn_remote_installed_plugin_bundle_sync(requested, key);
+            }
+        };
+        // A last registration may be released by async cancellation while an
+        // unrelated publication owns the mutex. Do not wait for disk I/O there.
+        if let Ok(mut mutations) = mutations.try_lock() {
+            if let Some(state) = mutations.syncs.get_mut(&self.0) {
+                state.in_flight = false;
+            }
+            let requested = take_ready_sync_request(&mut mutations, &self.0);
+            drop(mutations);
+            if let Some(requested) = requested {
+                spawn_remote_installed_plugin_bundle_sync(requested, self.0.clone());
+            }
+        } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn_blocking(release);
+        } else {
+            release();
+        }
     }
 }
 
@@ -99,6 +157,7 @@ pub struct RemotePluginCacheMutationGuard {
     key: RemotePluginCacheMutationKey,
     sync_registration: Option<Arc<RemoteInstalledPluginBundleSyncGuard>>,
     invalidates_snapshot: bool,
+    snapshot_generation: Option<u64>,
 }
 
 pub(crate) fn maybe_start_remote_installed_plugin_bundle_sync(
@@ -108,25 +167,125 @@ pub(crate) fn maybe_start_remote_installed_plugin_bundle_sync(
     on_local_cache_changed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
 ) {
     let Some(auth) = auth else {
+        invalidate_remote_installed_plugin_bundle_sync(&codex_home);
         return;
     };
-    let key = RemoteInstalledPluginBundleSyncKey {
-        plugin_cache_root: remote_plugin_cache_root(&codex_home),
-    };
-    if !mark_remote_installed_plugin_bundle_sync_in_flight(key.clone()) {
-        return;
-    }
+    enqueue_remote_installed_plugin_bundle_sync(RemoteInstalledPluginBundleSyncRequest {
+        codex_home,
+        config,
+        auth,
+        epoch: 0,
+        on_local_cache_changed,
+        completion: None,
+        runtime: tokio::runtime::Handle::current(),
+    });
+}
 
+fn enqueue_remote_installed_plugin_bundle_sync(mut request: RemoteInstalledPluginBundleSyncRequest) {
+    let key = RemoteInstalledPluginBundleSyncKey {
+        plugin_cache_root: remote_plugin_cache_root(&request.codex_home),
+    };
+    let authority = RemoteInstalledPluginBundleSyncAuthority {
+        chatgpt_base_url: request.config.chatgpt_base_url.clone(),
+        account_id: request.auth.get_account_id(),
+        chatgpt_user_id: request.auth.get_chatgpt_user_id(),
+        is_workspace_account: request.auth.is_workspace_account(),
+    };
+    {
+        let mut mutations = lock_cache_mutations();
+        let state = mutations.syncs.entry(key.clone()).or_default();
+        if state.authority.as_ref() != Some(&authority) {
+            state.authority = Some(authority);
+            state.epoch = state.epoch.wrapping_add(1);
+            let generation = mutations
+                .generations
+                .entry(key.plugin_cache_root.clone())
+                .or_default();
+            *generation = generation.wrapping_add(1);
+        }
+        let state = mutations.syncs.get_mut(&key).expect("sync state was inserted");
+        request.epoch = state.epoch;
+        if request.on_local_cache_changed.is_none()
+            && let Some(previous) = state.requested.as_ref()
+            && previous.epoch == request.epoch
+        {
+            request.on_local_cache_changed = previous.on_local_cache_changed.clone();
+        }
+        // One physical owner per home; a changed account/config supersedes
+        // its publication authority immediately, not just its callback.
+        state.requested = Some(request);
+        let Some(ready) = take_ready_sync_request(&mut mutations, &key) else {
+            return;
+        };
+        request = ready;
+    }
+    spawn_remote_installed_plugin_bundle_sync(request, key);
+}
+
+fn take_ready_sync_request(
+    mutations: &mut RemotePluginCacheMutations,
+    key: &RemoteInstalledPluginBundleSyncKey,
+) -> Option<RemoteInstalledPluginBundleSyncRequest> {
+    if mutations.independent_in_flight.contains_key(&key.plugin_cache_root) {
+        return None;
+    }
+    let state = mutations.syncs.get_mut(key)?;
+    if state.in_flight {
+        return None;
+    }
+    let request = state.requested.take()?;
+    state.in_flight = true;
+    Some(request)
+}
+
+fn spawn_remote_installed_plugin_bundle_sync(
+    mut request: RemoteInstalledPluginBundleSyncRequest,
+    key: RemoteInstalledPluginBundleSyncKey,
+) {
     let guard = Arc::new(RemoteInstalledPluginBundleSyncGuard(key));
-    tokio::spawn(async move {
+    let runtime = request.runtime.clone();
+    runtime.spawn(async move {
         let _guard = guard;
-        let result = sync_remote_installed_plugin_bundles_with_registration(
-            codex_home,
-            &config,
-            Some(&auth),
-            Some(Arc::clone(&_guard)),
-        )
-        .await;
+        let snapshot = {
+            let mutations = lock_cache_mutations();
+            mutations
+                .syncs
+                .get(&_guard.0)
+                .filter(|state| state.epoch == request.epoch)
+                .map(|_| {
+                    mutations
+                        .generations
+                        .get(&_guard.0.plugin_cache_root)
+                        .copied()
+                        .unwrap_or_default()
+                })
+        };
+        let sync = async {
+            match snapshot {
+                Some(generation) => {
+                    sync_remote_installed_plugin_bundles_with_registration(
+                        request.codex_home,
+                        &request.config,
+                        Some(&request.auth),
+                        generation,
+                        Arc::clone(&_guard),
+                    )
+                    .await
+                }
+                None => Ok(RemoteInstalledPluginBundleSyncOutcome::default()),
+            }
+        };
+        let result = if let Some(completion) = request.completion.as_mut() {
+            // A cancelled one-shot still cancels its reversible async work.
+            // Already-admitted blocking workers retain the registration until
+            // their publication/rollback or cleanup has actually finished.
+            tokio::select! {
+                result = sync => result,
+                _ = completion.closed() => return,
+            }
+        } else {
+            sync.await
+        };
         let outcome = match &result {
             Ok(outcome) | Err(RemoteInstalledPluginBundleSyncError::Partial { outcome, .. }) => {
                 Some(outcome)
@@ -134,11 +293,11 @@ pub(crate) fn maybe_start_remote_installed_plugin_bundle_sync(
             Err(_) => None,
         };
         if outcome.is_some_and(RemoteInstalledPluginBundleSyncOutcome::changed_local_cache)
-            && let Some(on_local_cache_changed) = on_local_cache_changed
+            && let Some(on_local_cache_changed) = request.on_local_cache_changed
         {
             on_local_cache_changed();
         }
-        match result {
+        match &result {
             Ok(outcome) => {
                 info!(
                     installed_plugin_ids = ?outcome.installed_plugin_ids,
@@ -154,6 +313,9 @@ pub(crate) fn maybe_start_remote_installed_plugin_bundle_sync(
                 );
             }
         }
+        if let Some(completion) = request.completion {
+            let _ = completion.send(result);
+        }
     });
 }
 
@@ -162,14 +324,30 @@ pub async fn sync_remote_installed_plugin_bundles_once(
     config: &RemotePluginServiceConfig,
     auth: Option<&CodexAuth>,
 ) -> Result<RemoteInstalledPluginBundleSyncOutcome, RemoteInstalledPluginBundleSyncError> {
-    sync_remote_installed_plugin_bundles_with_registration(codex_home, config, auth, None).await
+    let auth = ensure_chatgpt_auth(auth)?.clone();
+    let (completion, result) = tokio::sync::oneshot::channel();
+    enqueue_remote_installed_plugin_bundle_sync(RemoteInstalledPluginBundleSyncRequest {
+        codex_home,
+        config: config.clone(),
+        auth,
+        epoch: 0,
+        on_local_cache_changed: None,
+        completion: Some(completion),
+        runtime: tokio::runtime::Handle::current(),
+    });
+    result.await.map_err(|_| {
+        PluginStoreError::Invalid(
+            "remote plugin bundle sync was superseded before execution".to_string(),
+        )
+    })?
 }
 
 async fn sync_remote_installed_plugin_bundles_with_registration(
     codex_home: PathBuf,
     config: &RemotePluginServiceConfig,
     auth: Option<&CodexAuth>,
-    sync_registration: Option<Arc<RemoteInstalledPluginBundleSyncGuard>>,
+    generation: u64,
+    sync_registration: Arc<RemoteInstalledPluginBundleSyncGuard>,
 ) -> Result<RemoteInstalledPluginBundleSyncOutcome, RemoteInstalledPluginBundleSyncError> {
     let mut outcome = RemoteInstalledPluginBundleSyncOutcome::default();
     let result = sync_remote_installed_plugin_bundles_inner(
@@ -177,6 +355,7 @@ async fn sync_remote_installed_plugin_bundles_with_registration(
         config,
         auth,
         &mut outcome,
+        generation,
         sync_registration,
     )
     .await;
@@ -200,12 +379,9 @@ async fn sync_remote_installed_plugin_bundles_inner(
     config: &RemotePluginServiceConfig,
     auth: Option<&CodexAuth>,
     outcome: &mut RemoteInstalledPluginBundleSyncOutcome,
-    sync_registration: Option<Arc<RemoteInstalledPluginBundleSyncGuard>>,
+    generation: u64,
+    sync_registration: Arc<RemoteInstalledPluginBundleSyncGuard>,
 ) -> Result<(), RemoteInstalledPluginBundleSyncError> {
-    // A completed mutation also invalidates deletion based on this snapshot.
-    let snapshot_home = codex_home.clone();
-    let generation =
-        tokio::task::spawn_blocking(move || cache_mutation_generation(&snapshot_home)).await?;
     let auth = ensure_chatgpt_auth(auth)?;
     let global = async {
         let scope = RemotePluginScope::Global;
@@ -296,6 +472,19 @@ async fn sync_remote_installed_plugin_bundles_inner(
                 let registration = sync_registration.clone();
                 tokio::task::spawn_blocking(move || {
                     let _registration = registration;
+                    let _entry_lock = match crate::store::try_lock_plugin_cache_entry(
+                        store.plugin_base_root(&plugin_id).as_path(),
+                    ) {
+                        Ok(lock) => lock,
+                        Err(_) => return None,
+                    };
+                    let _publication = match lock_snapshot_publication(
+                        store.codex_home().as_path(),
+                        generation,
+                    ) {
+                        Ok(publication) => publication,
+                        Err(_) => return Some(Ok(())),
+                    };
                     if !release_version.as_deref().is_some_and(|expected| {
                         store.active_plugin_version(&plugin_id).as_deref() == Some(expected)
                     }) {
@@ -355,7 +544,8 @@ async fn sync_remote_installed_plugin_bundles_inner(
                 /*invalidates_snapshot*/ false,
             )
             .await?;
-            mutation.sync_registration = sync_registration.clone();
+            mutation.sync_registration = Some(sync_registration.clone());
+            mutation.snapshot_generation = Some(generation);
             match crate::remote_bundle::download_and_install_remote_plugin_bundle_with_guard(
                 codex_home.clone(),
                 bundle,
@@ -457,12 +647,39 @@ fn mark_remote_plugin_cache_mutation_in_flight_inner(
             .entry(key.plugin_cache_root.clone())
             .or_default();
         *generation = generation.wrapping_add(1);
+        *mutations
+            .independent_in_flight
+            .entry(key.plugin_cache_root.clone())
+            .or_default() += 1;
     }
     *mutations.in_flight.entry(key.clone()).or_default() += 1;
     RemotePluginCacheMutationGuard {
         key,
         sync_registration: None,
         invalidates_snapshot,
+        snapshot_generation: None,
+    }
+}
+
+pub(crate) struct RemotePluginCachePublicationGuard {
+    _mutations: MutexGuard<'static, RemotePluginCacheMutations>,
+}
+
+impl RemotePluginCacheMutationGuard {
+    pub(crate) fn lock_for_publication(
+        &self,
+    ) -> Result<RemotePluginCachePublicationGuard, PluginStoreError> {
+        let mutations = lock_cache_mutations();
+        if let Some(generation) = self.snapshot_generation
+            && !snapshot_is_current(&mutations, &self.key.plugin_cache_root, generation)
+        {
+            return Err(PluginStoreError::Invalid(
+                "remote plugin bundle snapshot was superseded before publication".to_string(),
+            ));
+        }
+        Ok(RemotePluginCachePublicationGuard {
+            _mutations: mutations,
+        })
     }
 }
 
@@ -472,15 +689,24 @@ impl Drop for RemotePluginCacheMutationGuard {
             return;
         };
         if let Ok(mut mutations) = mutations.try_lock() {
-            release_remote_plugin_cache_mutation(
+            let requested = release_remote_plugin_cache_mutation(
                 &mut mutations,
                 &self.key,
                 self.invalidates_snapshot,
             );
+            drop(mutations);
+            if let Some(requested) = requested {
+                spawn_remote_installed_plugin_bundle_sync(
+                    requested,
+                    RemoteInstalledPluginBundleSyncKey {
+                        plugin_cache_root: self.key.plugin_cache_root.clone(),
+                    },
+                );
+            }
             return;
         }
-        // Cleanup holds this lock across filesystem deletion. A cancelled
-        // download must not wait for that I/O on an async executor thread.
+        // Publication/cleanup may briefly hold this lock across a rename. A
+        // cancelled download must not wait for filesystem I/O on an async thread.
         let key = self.key.clone();
         let invalidates_snapshot = self.invalidates_snapshot;
         let registration = self.sync_registration.take();
@@ -489,7 +715,17 @@ impl Drop for RemotePluginCacheMutationGuard {
             let mut mutations = mutations
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            release_remote_plugin_cache_mutation(&mut mutations, &key, invalidates_snapshot);
+            let requested =
+                release_remote_plugin_cache_mutation(&mut mutations, &key, invalidates_snapshot);
+            drop(mutations);
+            if let Some(requested) = requested {
+                spawn_remote_installed_plugin_bundle_sync(
+                    requested,
+                    RemoteInstalledPluginBundleSyncKey {
+                        plugin_cache_root: key.plugin_cache_root,
+                    },
+                );
+            }
         };
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn_blocking(release);
@@ -503,13 +739,19 @@ fn release_remote_plugin_cache_mutation(
     mutations: &mut RemotePluginCacheMutations,
     key: &RemotePluginCacheMutationKey,
     invalidates_snapshot: bool,
-) {
+) -> Option<RemoteInstalledPluginBundleSyncRequest> {
     if invalidates_snapshot {
         let generation = mutations
             .generations
             .entry(key.plugin_cache_root.clone())
             .or_default();
         *generation = generation.wrapping_add(1);
+        if let Some(count) = mutations.independent_in_flight.get_mut(&key.plugin_cache_root) {
+            *count -= 1;
+            if *count == 0 {
+                mutations.independent_in_flight.remove(&key.plugin_cache_root);
+            }
+        }
     }
     if let Some(count) = mutations.in_flight.get_mut(key) {
         *count -= 1;
@@ -517,17 +759,39 @@ fn release_remote_plugin_cache_mutation(
             mutations.in_flight.remove(key);
         }
     }
+    take_ready_sync_request(
+        mutations,
+        &RemoteInstalledPluginBundleSyncKey {
+            plugin_cache_root: key.plugin_cache_root.clone(),
+        },
+    )
 }
 
-fn cache_mutation_generation(codex_home: &Path) -> u64 {
+fn lock_cache_mutations() -> MutexGuard<'static, RemotePluginCacheMutations> {
     REMOTE_PLUGIN_CACHE_MUTATIONS_IN_FLIGHT
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .generations
-        .get(&remote_plugin_cache_root(codex_home))
-        .copied()
-        .unwrap_or_default()
+}
+
+fn snapshot_is_current(mutations: &RemotePluginCacheMutations, root: &Path, generation: u64) -> bool {
+    mutations.generations.get(root).copied().unwrap_or_default() == generation
+        && !mutations.independent_in_flight.contains_key(root)
+}
+
+fn lock_snapshot_publication(
+    codex_home: &Path,
+    generation: u64,
+) -> Result<RemotePluginCachePublicationGuard, PluginStoreError> {
+    let mutations = lock_cache_mutations();
+    if !snapshot_is_current(&mutations, &remote_plugin_cache_root(codex_home), generation) {
+        return Err(PluginStoreError::Invalid(
+            "remote plugin bundle snapshot was superseded before publication".to_string(),
+        ));
+    }
+    Ok(RemotePluginCachePublicationGuard {
+        _mutations: mutations,
+    })
 }
 
 fn remove_stale_remote_plugin_caches_since(
@@ -536,18 +800,8 @@ fn remove_stale_remote_plugin_caches_since(
     generation: u64,
     removed_cache_plugin_ids: &mut Vec<String>,
 ) -> Result<(), String> {
-    // Hold the same lock used to register mutations through deletion.
-    let mutations = REMOTE_PLUGIN_CACHE_MUTATIONS_IN_FLIGHT
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if mutations
-        .generations
-        .get(&remote_plugin_cache_root(codex_home))
-        .copied()
-        .unwrap_or_default()
-        != generation
-    {
+    let root = remote_plugin_cache_root(codex_home);
+    if !snapshot_is_current(&lock_cache_mutations(), &root, generation) {
         return Ok(());
     }
     for marketplace_name in [
@@ -592,10 +846,23 @@ fn remove_stale_remote_plugin_caches_since(
             {
                 continue;
             }
+            // Retire a cache entry under the same authority as publication, then
+            // recursively delete outside it. Account changes never wait for a
+            // whole cache tree removal, and stale epochs cannot move newer roots.
+            let retired = tempfile::Builder::new()
+                .prefix(".plugin-stale-")
+                .tempdir_in(&marketplace_root)
+                .map_err(|err| {
+                    format!("failed to stage stale remote plugin cache removal: {err}")
+                })?;
+            let mutations = lock_cache_mutations();
+            if !snapshot_is_current(&mutations, &root, generation) {
+                return Ok(());
+            }
             if mutations
                 .in_flight
                 .contains_key(&RemotePluginCacheMutationKey {
-                    plugin_cache_root: remote_plugin_cache_root(codex_home),
+                    plugin_cache_root: root.clone(),
                     marketplace_name: marketplace_name.to_string(),
                     plugin_name: plugin_name.clone(),
                 })
@@ -614,25 +881,24 @@ fn remove_stale_remote_plugin_caches_since(
                     ));
                 }
             };
-            if cache_path.is_dir() {
-                fs::remove_dir_all(&cache_path).map_err(|err| {
-                    format!(
-                        "failed to remove stale remote plugin cache entry {}: {err}",
-                        cache_path.display()
-                    )
-                })?;
-            } else {
-                fs::remove_file(&cache_path).map_err(|err| {
-                    format!(
-                        "failed to remove stale remote plugin cache entry {}: {err}",
-                        cache_path.display()
-                    )
-                })?;
-            }
+            fs::rename(&cache_path, retired.path().join("stale-plugin-root")).map_err(|err| {
+                format!(
+                    "failed to retire stale remote plugin cache entry {}: {err}",
+                    cache_path.display()
+                )
+            })?;
+            drop(mutations);
             let plugin_key = PluginId::new(plugin_name.clone(), marketplace_name.to_string())
                 .map(|plugin_id| plugin_id.as_key())
                 .unwrap_or_else(|_| format!("{plugin_name}@{marketplace_name}"));
             removed_cache_plugin_ids.push(plugin_key);
+            let retired_path = retired.path().to_path_buf();
+            retired.close().map_err(|err| {
+                format!(
+                    "failed to remove retired remote plugin cache entry at {}: {err}",
+                    retired_path.display()
+                )
+            })?;
         }
     }
 
@@ -644,25 +910,16 @@ fn remote_plugin_cache_root(codex_home: &Path) -> PathBuf {
     codex_home.join(PLUGINS_CACHE_DIR)
 }
 
-fn mark_remote_installed_plugin_bundle_sync_in_flight(
-    key: RemoteInstalledPluginBundleSyncKey,
-) -> bool {
-    let syncs =
-        REMOTE_INSTALLED_PLUGIN_BUNDLE_SYNC_IN_FLIGHT.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut syncs = match syncs.lock() {
-        Ok(syncs) => syncs,
-        Err(err) => err.into_inner(),
-    };
-    syncs.insert(key)
-}
-
-fn clear_remote_installed_plugin_bundle_sync_in_flight(key: &RemoteInstalledPluginBundleSyncKey) {
-    let Some(syncs) = REMOTE_INSTALLED_PLUGIN_BUNDLE_SYNC_IN_FLIGHT.get() else {
-        return;
-    };
-    let mut syncs = match syncs.lock() {
-        Ok(syncs) => syncs,
-        Err(err) => err.into_inner(),
-    };
-    syncs.remove(key);
+pub(crate) fn invalidate_remote_installed_plugin_bundle_sync(codex_home: &Path) {
+    let root = remote_plugin_cache_root(codex_home);
+    let mut mutations = lock_cache_mutations();
+    let generation = mutations.generations.entry(root.clone()).or_default();
+    *generation = generation.wrapping_add(1);
+    if let Some(state) = mutations.syncs.get_mut(&RemoteInstalledPluginBundleSyncKey {
+        plugin_cache_root: root,
+    }) {
+        state.epoch = state.epoch.wrapping_add(1);
+        state.authority = None;
+        state.requested = None;
+    }
 }

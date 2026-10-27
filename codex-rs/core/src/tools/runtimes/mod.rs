@@ -12,12 +12,15 @@ use crate::shell::ShellType;
 use crate::shell_snapshot::POWERSHELL_SNAPSHOT_FORMAT_HEADER;
 use crate::shell_snapshot::ShellSnapshotFile;
 use crate::shell_snapshot::parse_cmd_snapshot_environment;
+use crate::tools::sandboxing::ExecApprovalRequirement;
+use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 
 
 use codex_otel::MetricsClient;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::protocol::AskForApproval;
 use codex_sandboxing::SandboxCommand;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::windows_sandbox_uses_elevated_backend;
@@ -84,6 +87,97 @@ const SHELL_TRANSPORT_ENV_KEYS: &[&str] = &[
 pub(crate) mod apply_patch;
 pub(crate) mod shell;
 pub(crate) mod unified_exec;
+
+/// Readonly admission is not a reusable executable-resolution receipt. Re-prove
+/// after snapshot environment projection for every sandbox attempt, and pin a
+/// direct utility's path without changing its policy/approval identity.
+pub(crate) async fn recheck_readonly_command_before_launch(
+    command: &[String],
+    shell_wrapper_is_owned: bool,
+    cwd: Option<&Path>,
+    env: &HashMap<String, String>,
+    sandbox_permissions: SandboxPermissions,
+    requirement: &ExecApprovalRequirement,
+    ctx: &ToolCtx,
+) -> Result<Option<Vec<String>>, ToolError> {
+    let profile = ctx.turn.permission_profile();
+    let managed_without_backend = ctx.turn.windows_sandbox_level == WindowsSandboxLevel::Disabled
+        && crate::exec_policy::profile_has_managed_filesystem_restrictions(&profile);
+    let heuristic_readonly = matches!(
+        requirement,
+        ExecApprovalRequirement::Skip { bypass_sandbox: false, .. }
+    ) && (ctx.turn.approval_policy.value() == AskForApproval::UnlessTrusted
+        || managed_without_backend);
+    let independent_reviewer = crate::agent::task_capabilities::is_independent_review_source(
+        &ctx.turn.session_source,
+    );
+    if !independent_reviewer && !heuristic_readonly {
+        return Ok(None);
+    }
+    let cwd = cwd.ok_or_else(|| {
+        ToolError::Rejected(
+            "Readonly executable provenance is unavailable for this execution environment.".into(),
+        )
+    })?.to_path_buf();
+    if !independent_reviewer {
+        // Reuse the policy owner so explicitly allowed segments remain allowed;
+        // only unmatched readonly segments need provenance. Never replace an
+        // explicit authorization with a blanket whole-script safelist check.
+        let request = crate::exec_policy::ExecApprovalRequest {
+            command,
+            command_for_safety: None,
+            execution_context: Some((&cwd, env)),
+            approval_policy: ctx.turn.approval_policy.value(),
+            permission_profile: profile,
+            windows_sandbox_level: ctx.turn.windows_sandbox_level,
+            sandbox_permissions,
+            prefix_rule: None,
+        };
+        let policy = &ctx.session.services.exec_policy;
+        let refreshed = if shell_wrapper_is_owned {
+            policy.create_exec_approval_requirement_for_command(request).await
+        } else {
+            policy.create_exec_approval_requirement_for_direct_argv(request).await
+        };
+        match refreshed {
+            ExecApprovalRequirement::Skip { bypass_sandbox, .. } => {
+                if shell_wrapper_is_owned || bypass_sandbox {
+                    return Ok(None);
+                }
+            }
+            _ => return Err(ToolError::Rejected(
+                "Readonly executable provenance changed before launch; the requested command was not started.".into(),
+            )),
+        }
+    }
+    let command = command.to_vec();
+    let env = env.clone();
+    let (safe, pinned) = crate::tools::run_blocking_command_analysis(move || {
+        if shell_wrapper_is_owned {
+            (
+                codex_shell_command::is_safe_command::is_known_safe_command_in_state(
+                    &command, &cwd, &env,
+                ),
+                None,
+            )
+        } else {
+            let pinned = codex_shell_command::is_safe_command::proven_safe_direct_argv_in_state(
+                &command, &cwd, &env,
+            );
+            (pinned.is_some(), pinned)
+        }
+    })
+    .await
+    .map_err(|error| {
+        ToolError::Rejected(format!("Readonly executable provenance recheck failed: {error}"))
+    })?;
+    if !safe {
+        return Err(ToolError::Rejected(
+            "Readonly executable provenance changed or could not be proven before launch; the requested command was not started.".into(),
+        ));
+    }
+    Ok(pinned)
+}
 
 pub(crate) async fn prove_noprofile_powershell_direct_argv_async(
     command: &[String],

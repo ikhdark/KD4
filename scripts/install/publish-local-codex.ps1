@@ -2198,11 +2198,15 @@ function Test-DesktopRuntimeProof {
         [string]$TargetPath,
         [string]$LocalCodexHome,
         [int]$TimeoutMilliseconds = 15000,
-        [ref]$FailureReason
+        [ref]$FailureReason,
+        [ref]$ProofUnavailable
     )
 
     if ($null -ne $FailureReason) {
         $FailureReason.Value = $null
+    }
+    if ($null -ne $ProofUnavailable) {
+        $ProofUnavailable.Value = $false
     }
 
     $process = [System.Diagnostics.Process]::new()
@@ -2258,6 +2262,13 @@ function Test-DesktopRuntimeProof {
             }
             $statusProperty = $checkProperty.Value.PSObject.Properties["status"]
             if ($null -eq $statusProperty -or [string]$statusProperty.Value -ne "ok") {
+                $summaryProperty = $checkProperty.Value.PSObject.Properties["summary"]
+                if ($checkId -eq "desktop.runtime_chain" -and
+                    $null -ne $summaryProperty -and
+                    [string]$summaryProperty.Value -eq "Desktop GUI connection is unverified" -and
+                    $null -ne $ProofUnavailable) {
+                    $ProofUnavailable.Value = $true
+                }
                 $check = $checkProperty.Value | ConvertTo-Json -Compress -Depth 10
                 throw "Desktop runtime probe rejected ${checkId}: $check"
             }
@@ -2265,7 +2276,14 @@ function Test-DesktopRuntimeProof {
         if ($process.ExitCode -ne 0) {
             throw "Desktop runtime probe exited with $($process.ExitCode): $($stderr.Trim())"
         }
-        return $true
+        # Older doctor binaries can report ok from a backend-only receipt. This
+        # script must not promote that to proof of the checked GUI's connection.
+        # No GUI PID/creation identity and authenticated transport peer binding
+        # are currently available here, so positive activation remains unknown.
+        if ($null -ne $ProofUnavailable) {
+            $ProofUnavailable.Value = $true
+        }
+        throw "Desktop activation is unverified: the runtime probe supplies no checked GUI/backend creation identities or verified connection peer. A matching client name or independent app-server is insufficient."
     }
     catch {
         if ($null -ne $FailureReason) {
@@ -2427,6 +2445,7 @@ function Restart-CodexDesktop {
     }
 
     $runtimeProofMatched = $false
+    $runtimeProofUnavailable = $false
     $runtimeProofFailure = "Desktop runtime proof did not complete."
     do {
         $remainingMilliseconds = [Math]::Max(
@@ -2438,10 +2457,15 @@ function Restart-CodexDesktop {
                 -TargetPath $LocalCliPath `
                 -LocalCodexHome $LocalCodexHome `
                 -TimeoutMilliseconds $remainingMilliseconds `
-                -FailureReason ([ref]$runtimeProofFailure)) -and
+                -FailureReason ([ref]$runtimeProofFailure) `
+                -ProofUnavailable ([ref]$runtimeProofUnavailable)) -and
             @(Get-CodexDesktopProcessesForPath -DesktopPath $desktopPath).Count -gt 0
         ) {
             $runtimeProofMatched = $true
+            break
+        }
+        if ($runtimeProofUnavailable) {
+            # Repeating a probe cannot create the missing GUI/transport binding.
             break
         }
         Start-Sleep -Milliseconds 100
@@ -4314,13 +4338,30 @@ if ($ConfigureDesktopLocalCli) {
     }
 }
 
+$desktopRuntimeProofUnavailable = $false
 if ($RestartDesktopIfNeeded -and -not $RestartDesktop) {
     $RestartDesktop = $binaryChanged -or $desktopRoutingResult.RestartRequired
     if (-not $RestartDesktop -and -not $DryRun) {
-        $RestartDesktop = -not (Test-DesktopRuntimeProof -TargetPath $targetPath -LocalCodexHome $LocalCodexHome)
+        $desktopRuntimeProofFailure = $null
+        $runtimeMatches = Test-DesktopRuntimeProof `
+            -TargetPath $targetPath `
+            -LocalCodexHome $LocalCodexHome `
+            -FailureReason ([ref]$desktopRuntimeProofFailure) `
+            -ProofUnavailable ([ref]$desktopRuntimeProofUnavailable)
+        # Unknown GUI ownership is not evidence that a restart is needed. Do not
+        # interrupt an otherwise unchanged Desktop merely to repeat that unknown.
+        $RestartDesktop = -not $runtimeMatches -and -not $desktopRuntimeProofUnavailable
+        if ($desktopRuntimeProofUnavailable) {
+            Write-ProofLine "desktopRuntimeProof" "unverified: $desktopRuntimeProofFailure"
+        }
     }
     if (-not $RestartDesktop) {
-        Write-ProofLine "desktopRestart" "skipped: current runtime or dry-run no-op"
+        if ($desktopRuntimeProofUnavailable) {
+            Write-ProofLine "desktopRestart" "not requested: GUI activation is unverified"
+        }
+        else {
+            Write-ProofLine "desktopRestart" "skipped: current runtime or dry-run no-op"
+        }
     }
 }
 if ($RestartDesktop) {

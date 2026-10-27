@@ -96,6 +96,9 @@ impl UserMessageItem {
 
 impl AgentMessageItem {
     pub fn as_legacy_events(&self) -> Vec<EventMsg> {
+        if self.interruption.is_some() {
+            return Vec::new();
+        }
         self.content
             .iter()
             .map(|c| match c {

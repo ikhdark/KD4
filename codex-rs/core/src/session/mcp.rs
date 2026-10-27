@@ -138,6 +138,7 @@ impl Session {
         let current = self.services.latest_mcp_runtime();
         if current.available_environment_ids() == available
             && current.runtime_context().selected_scope_matches(&context)
+            && current.manager().managed_auth_scope_is_current()
         {
             return Ok(current);
         }
@@ -222,6 +223,7 @@ impl Session {
                     })
             };
             if expected_runtime.available_environment_ids() == available_environment_ids
+                && expected_runtime.manager().managed_auth_scope_is_current()
                 && expected_runtime
                     .runtime_context()
                     .selected_scope_matches(&selected_context)
@@ -246,6 +248,7 @@ impl Session {
                 };
                 let current = self.services.latest_mcp_runtime();
                 if current.available_environment_ids() == available_environment_ids
+                    && current.manager().managed_auth_scope_is_current()
                     && current
                         .runtime_context()
                         .selected_scope_matches(&selected_context)
@@ -269,6 +272,7 @@ impl Session {
                         server.enabled && was_available != is_available
                     });
                 if !changed_environment_is_used_by_mcp
+                    && current.manager().managed_auth_scope_is_current()
                     && scope_matches(&current)
                     && current
                         .config()
@@ -302,6 +306,7 @@ impl Session {
             {
                 return Err(codex_protocol::error::CodexErr::TurnAborted);
             }
+            self.services.auth_manager.check_auth_load()?;
             let runtime = self
                 .refresh_mcp_servers_inner(
                     binding,
@@ -313,6 +318,7 @@ impl Session {
                 )
                 .await;
             if runtime.available_environment_ids() == available_environment_ids
+                && runtime.manager().managed_auth_scope_is_current()
                 && runtime
                     .runtime_context()
                     .selected_scope_matches(&selected_context)
@@ -322,6 +328,8 @@ impl Session {
             // A concurrent refresh published a projection for a different environment while this
             // candidate was starting. Rebuild from that publication instead of returning an MCP
             // runtime that does not match the step's resolved capability roots.
+            // Auth may have moved again while the candidate was starting.
+            tokio::task::yield_now().await;
         }
     }
 
@@ -512,6 +520,12 @@ impl Session {
         bound_context: Option<McpRuntimeContext>,
     ) -> Arc<McpRuntimeSnapshot> {
         let auth = self.services.auth_manager.auth().await;
+        // auth() deliberately returns None for the observation that crosses an
+        // identity transition. Do not turn that fence into anonymous startup;
+        // the bound-step loop will rebuild from the next stable snapshot.
+        if auth.is_none() && self.services.auth_manager.auth_cached().is_some() {
+            return expected_runtime;
+        }
         let McpRuntimeProjection {
             config: mcp_config,
             plugins_available,
@@ -531,7 +545,7 @@ impl Session {
             McpRuntimeContext::new(environment_manager, cwd)
                 .with_selected_environments(environments.captured_environments())
         });
-        let auth_statuses = compute_auth_statuses(
+        let auth_statuses = codex_mcp::compute_cached_auth_statuses(
             mcp_servers.iter(),
             &mcp_config.codex_home,
             mcp_config.mcp_oauth_credentials_store_mode,
@@ -540,7 +554,7 @@ impl Session {
             &mcp_runtime_context,
         )
         .await;
-        // Authentication discovery may have yielded to another publication.
+        // Local credential loading may have yielded to another publication.
         // Do not start clients for a candidate already known to have lost.
         // The final compare-and-publish below still covers later races.
         let current_runtime = self.services.latest_mcp_runtime();
@@ -568,9 +582,7 @@ impl Session {
                 }
             }
         });
-        let codex_apps_auth_manager =
-            codex_mcp::host_owned_codex_apps_enabled(&mcp_config, auth.as_ref())
-                .then(|| Arc::clone(&self.services.auth_manager));
+        let codex_apps_auth_manager = Some(Arc::clone(&self.services.auth_manager));
         let refreshed_manager = McpConnectionManager::new(
             &mcp_servers,
             mcp_config.mcp_oauth_credentials_store_mode,

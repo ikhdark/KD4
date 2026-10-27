@@ -727,7 +727,7 @@ fn dependency_fingerprint(path: PathBuf, hash_contents: bool) -> Option<Dependen
             },
         }),
         Ok(metadata) if metadata.is_file() => {
-            let state = file_dependency_state(File::open(&path).ok()?, hash_contents)?;
+            let state = file_dependency_state(File::open(&path).ok()?, hash_contents, None, None)?;
             Some(DependencyFingerprint { path, state })
         }
         Ok(_) => None,
@@ -739,19 +739,37 @@ fn dependency_fingerprint(path: PathBuf, hash_contents: bool) -> Option<Dependen
     }
 }
 
-fn file_dependency_state(mut file: File, hash_contents: bool) -> Option<DependencyState> {
+fn file_dependency_state(
+    mut file: File, hash_contents: bool, max_bytes: Option<u64>, mut read_budget: Option<&mut u64>,
+) -> Option<DependencyState> {
     let metadata = file.metadata().ok()?;
+    if max_bytes.is_some_and(|limit| metadata.len() > limit) { return None; }
     let stable_id = stable_file_identity(&file);
     let digest = if hash_contents {
         let mut hasher = Sha256::new();
         let mut buffer = [0u8; 8192];
+        let mut read_bytes = 0u64;
         loop {
-            match file.read(&mut buffer) {
+            let capacity = max_bytes.map_or(buffer.len(), |limit|
+                limit.saturating_sub(read_bytes).saturating_add(1).min(buffer.len() as u64) as usize);
+            match file.read(&mut buffer[..capacity]) {
                 Ok(0) => break,
-                Ok(count) => hasher.update(&buffer[..count]),
+                Ok(count) => {
+                    if let Some(remaining) = read_budget.as_deref_mut() {
+                        *remaining = remaining.saturating_sub(count as u64);
+                    }
+                    read_bytes = read_bytes.saturating_add(count as u64);
+                    if max_bytes.is_some_and(|limit| read_bytes > limit) { return None; }
+                    hasher.update(&buffer[..count]);
+                }
                 Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                 Err(_) => return None,
             }
+        }
+        if max_bytes.is_some() {
+            let after = file.metadata().ok()?;
+            if after.len() != metadata.len() || after.modified().ok() != metadata.modified().ok()
+                || stable_file_identity(&file) != stable_id { return None; }
         }
         Some(hasher.finalize().into())
     } else {
@@ -764,6 +782,72 @@ fn file_dependency_state(mut file: File, hash_contents: bool) -> Option<Dependen
         stable_id,
         digest,
     })
+}
+
+/// Reobserve only named compilation inputs; never enumerate the repository.
+/// Unavailable/oversized/concurrently changed files provide no change proof.
+pub(crate) fn compilation_input_fingerprints(paths: Vec<PathBuf>) -> BTreeMap<PathBuf, String> {
+    let mut result = BTreeMap::new();
+    let mut remaining = 16 * 1024 * 1024u64;
+    for path in paths.into_iter().take(256) {
+        let limit = remaining.min(8 * 1024 * 1024);
+        let state = match File::open(&path) {
+            Ok(file) => file_dependency_state(file, true, Some(limit), Some(&mut remaining)),
+            Err(error) if error.kind() == ErrorKind::NotFound => Some(DependencyState::Missing),
+            Err(_) => None,
+        };
+        let fingerprint = match state {
+            Some(DependencyState::Missing) => "missing".to_owned(),
+            Some(DependencyState::File { digest: Some(digest), .. }) => hex::encode(digest),
+            _ => continue,
+        };
+        result.insert(path, fingerprint);
+    }
+    result
+}
+
+/// Follow only selected Cargo manifests and declared Rust module links. This
+/// names inputs before the first compilation, including missing generated
+/// modules, so external repairs need neither an apply_patch receipt nor a
+/// repository-wide traversal. The existing source parser owns module syntax.
+pub(crate) fn compilation_rust_inputs(
+    manifests: Vec<PathBuf>, roots: Vec<PathBuf>,
+) -> (Vec<PathBuf>, BTreeMap<PathBuf, String>) {
+    let mut pending = roots.into_iter().map(|path| (path, true)).collect::<std::collections::VecDeque<_>>();
+    pending.extend(manifests.into_iter().map(|path| (path, false)));
+    let mut named = BTreeSet::new();
+    let mut expanded = BTreeSet::new();
+    let mut fingerprints = BTreeMap::new();
+    while let Some((path, crate_root)) = pending.pop_front() {
+        let Ok(path) = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path_checked(path) else { continue; };
+        let path = path.to_path_buf();
+        if !named.insert(path.clone()) { continue; }
+        let bytes = match File::open(&path) {
+            Ok(mut file) => {
+                let before = file.metadata().ok();
+                let mut bytes = Vec::new();
+                if (&mut file).take(8 * 1024 * 1024 + 1).read_to_end(&mut bytes).is_err()
+                    || bytes.len() > 8 * 1024 * 1024 { continue; }
+                let after = file.metadata().ok();
+                if before.as_ref().map(|value| (value.len(), value.modified().ok()))
+                    != after.as_ref().map(|value| (value.len(), value.modified().ok())) { continue; }
+                bytes
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                fingerprints.insert(path, "missing".into());
+                continue;
+            }
+            Err(_) => continue,
+        };
+        fingerprints.insert(path.clone(), hex::encode(Sha256::digest(&bytes)));
+        if path.extension().is_some_and(|extension| extension == "rs")
+            && expanded.insert(dunce::canonicalize(&path).unwrap_or_else(|_| path.clone()))
+            && let Ok(source) = std::str::from_utf8(&bytes) {
+            pending.extend(crate::tools::handlers::compilation_module_paths(&path, source, crate_root)
+                .into_iter().map(|path| (path, false)));
+        }
+    }
+    (named.into_iter().collect(), fingerprints)
 }
 
 fn stable_file_identity(file: &File) -> Option<StableFileIdentity> {

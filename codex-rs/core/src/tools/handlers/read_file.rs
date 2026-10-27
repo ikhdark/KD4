@@ -42,6 +42,7 @@ const DEFAULT_FILE_READ_TOKEN_CEILING: usize = 2_000;
 #[path = "code_sections.rs"]
 pub(super) mod code_sections;
 pub(crate) use code_sections::existing_tests_changed;
+pub(crate) use code_sections::compilation_module_paths;
 
 #[path = "read_file_structure.rs"]
 mod structure;

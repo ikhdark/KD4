@@ -148,7 +148,7 @@ impl ProcessExecRequestProcessor {
         let mut env = std::env::vars().collect::<HashMap<_, _>>();
         if let Some(env_overrides) = env_overrides {
             #[cfg(windows)]
-            validate_environment_override_keys(&env_overrides)?;
+            validate_environment_override_keys(&env_overrides, method_name)?;
             for (key, value) in env_overrides {
                 // Windows treats environment names as case-insensitive. Remove
                 // the inherited spelling before applying either an unset or a
@@ -917,14 +917,17 @@ fn handle_process_resize(
 }
 
 #[cfg(windows)]
-fn validate_environment_override_keys(
+pub(super) fn validate_environment_override_keys(
     overrides: &HashMap<String, Option<String>>,
+    method_name: &str,
 ) -> Result<(), JSONRPCErrorError> {
+    let mut keys = overrides.keys().collect::<Vec<_>>();
+    keys.sort_unstable();
     let mut names = std::collections::HashSet::new();
-    for key in overrides.keys() {
+    for key in keys {
         if !names.insert(key.to_ascii_lowercase()) {
             return Err(invalid_params(format!(
-                "process/spawn env contains conflicting case-insensitive key {key:?}"
+                "{method_name} env contains conflicting case-insensitive key {key:?}"
             )));
         }
     }

@@ -32,7 +32,6 @@ use crate::rmcp_client::CODEX_APPS_REFRESH_DURATION_METRIC;
 use crate::rmcp_client::MCP_TOOLS_LIST_DURATION_METRIC;
 use crate::rmcp_client::ManagedClient;
 use crate::rmcp_client::StartupOutcomeError;
-use crate::rmcp_client::commit_tool_catalog_refresh;
 use crate::rmcp_client::list_tools_for_client_uncached;
 use crate::runtime::McpRuntimeContext;
 use crate::runtime::emit_duration;
@@ -234,6 +233,7 @@ pub struct McpConnectionManager {
     tool_catalog_revision: Arc<AtomicU64>,
     tool_catalog_cache: StdMutex<Option<CachedToolCatalog>>,
     resource_cache_generation: Arc<AtomicU64>,
+    managed_auth_scope: Option<SharedAuthProvider>,
     prefix_mcp_tool_names: bool,
     elicitation_requests: ElicitationRequestManager,
     client_reuse_context: ClientReuseContext,
@@ -364,8 +364,11 @@ impl McpConnectionManager {
         if previous_server != server
             || uses_chatgpt_auth
             || !client.startup_complete.load(Ordering::Acquire)
-            || client.client().await.is_err()
         {
+            return None;
+        }
+        let ready = client.client().await.ok()?;
+        if !ready.client.is_healthy().await || !ready.client.has_current_auth_authority().await {
             return None;
         }
         Some(client)
@@ -379,8 +382,21 @@ impl McpConnectionManager {
         for (name, client) in &self.clients {
             if !client.startup_complete.load(Ordering::Acquire) {
                 pending.push(name.clone());
-            } else if client.client().await.is_err() {
-                failed.push(name.clone());
+            } else if client
+                .startup_reconnect
+                .as_ref()
+                .is_some_and(|reconnect| reconnect.pending_client().is_some())
+            {
+                pending.push(name.clone());
+            } else {
+                match client.client().await {
+                    Ok(managed) if managed.client.is_healthy().await => {
+                        if managed.current_catalog().is_none() {
+                            pending.push(name.clone());
+                        }
+                    }
+                    _ => failed.push(name.clone()),
+                }
             }
         }
         pending.sort();
@@ -395,7 +411,10 @@ impl McpConnectionManager {
                 continue;
             }
             if let Ok(managed_client) = client.client().await
-                && managed_client.server_supports_resources_capability
+                && managed_client.client.is_healthy().await
+                && managed_client
+                    .current_catalog()
+                    .is_some_and(|catalog| catalog.server_supports_resources_capability)
             {
                 return true;
             }
@@ -535,11 +554,12 @@ impl McpConnectionManager {
         let static_chatgpt_auth_provider = auth
             .filter(|auth| auth.uses_codex_backend())
             .map(codex_model_provider::auth_provider_from_auth);
-        let codex_apps_auth_provider = codex_apps_auth_manager.and_then(|auth_manager| {
-            auth.filter(|auth| auth.uses_codex_backend()).map(|auth| {
-                codex_model_provider::auth_provider_from_auth_manager(auth_manager, auth)
-            })
+        let managed_auth_scope = codex_apps_auth_manager.map(|auth_manager| {
+            codex_model_provider::auth_scope_from_auth_manager(auth_manager, auth)
         });
+        let codex_apps_auth_provider = auth
+            .filter(|auth| auth.uses_codex_backend())
+            .and_then(|_| managed_auth_scope.clone());
         let mcp_servers = mcp_servers.clone();
         let server_definitions = mcp_servers
             .iter()
@@ -556,6 +576,7 @@ impl McpConnectionManager {
             tool_plugin_provenance: Arc::clone(&tool_plugin_provenance),
             tool_catalog_revision: Arc::clone(&tool_catalog_revision),
             tool_catalog_cache: StdMutex::new(None),
+            managed_auth_scope,
             resource_cache_generation: previous_manager.map_or_else(
                 || Arc::new(AtomicU64::new(0)),
                 |previous| Arc::clone(&previous.resource_cache_generation),
@@ -637,17 +658,11 @@ impl McpConnectionManager {
             } else {
                 None
             };
-            // The reserved Codex Apps registration follows the shared
-            // AuthManager across refreshes. In the hosted-plugin path, this
-            // is the ChatGPT /ps/mcp connection. User-configured MCP
-            // registrations keep their existing configured auth path.
-            let chatgpt_auth_provider = if server_name == CODEX_APPS_MCP_SERVER_NAME {
-                codex_apps_auth_provider
-                    .clone()
-                    .or_else(|| static_chatgpt_auth_provider.clone())
-            } else {
-                static_chatgpt_auth_provider.clone()
-            };
+            // Every explicitly opted-in ChatGPT server follows refreshes while
+            // remaining bound to its startup account and policy epoch.
+            let chatgpt_auth_provider = codex_apps_auth_provider
+                .clone()
+                .or_else(|| static_chatgpt_auth_provider.clone());
             // If Codex Apps has an env bearer token, that is its auth path. Do
             // not also attach the ambient CodexAuth provider.
             let runtime_auth_provider =
@@ -871,6 +886,7 @@ impl McpConnectionManager {
             tool_catalog_revision: Arc::new(AtomicU64::new(0)),
             tool_catalog_cache: StdMutex::new(None),
             resource_cache_generation: Arc::new(AtomicU64::new(0)),
+            managed_auth_scope: None,
             prefix_mcp_tool_names,
             elicitation_requests: ElicitationRequestManager::new(
                 approval_policy.value(),
@@ -887,6 +903,7 @@ impl McpConnectionManager {
                 ),
                 codex_home: PathBuf::new(),
                 codex_apps_tools_cache_key: CodexAppsToolsCacheKey {
+                    cacheable: false,
                     account_id: None,
                     chatgpt_user_id: None,
                     is_workspace_account: false,
@@ -907,6 +924,12 @@ impl McpConnectionManager {
         !self.clients.is_empty()
     }
 
+    /// The same bound account/lifecycle owner used by managed MCP requests.
+    pub fn managed_auth_scope_is_current(&self) -> bool {
+        self.managed_auth_scope.as_ref().is_none_or(|scope| scope.validate_auth_scope().is_ok())
+            && self.clients.values().all(AsyncManagedClient::managed_auth_scope_is_current)
+    }
+
     /// Invalidates resource contents even when a runtime update reuses live connections.
     pub fn invalidate_resource_caches(&self) {
         self.resource_cache_generation
@@ -917,11 +940,17 @@ impl McpConnectionManager {
         &self,
         server: &str,
     ) -> Option<crate::resource_client::McpResourceServerCacheKey> {
+        if !self.managed_auth_scope_is_current()
+            || !self.clients.get(server)?.managed_auth_scope_is_current()
+        {
+            return None;
+        }
         self.clients.get(server).map(|client| {
             crate::resource_client::McpResourceServerCacheKey {
                 // This shared ownership token identifies the connection across manager reuse.
                 connection: Arc::downgrade(&client.manager_owners),
                 generation: self.resource_cache_generation.load(Ordering::Acquire),
+                session_generation: client.connection_generation.load(Ordering::Acquire),
             }
         })
     }
@@ -1105,8 +1134,8 @@ impl McpConnectionManager {
             return false;
         };
 
-        match tokio::time::timeout(timeout, async_managed_client.client()).await {
-            Ok(Ok(_)) => true,
+        match tokio::time::timeout(timeout, async_managed_client.client_for_operation()).await {
+            Ok(Ok(client)) => client.client.is_healthy().await && client.current_catalog().is_some(),
             Ok(Err(_)) | Err(_) => false,
         }
     }
@@ -1120,11 +1149,22 @@ impl McpConnectionManager {
 
         loop {
             let revision = self.tool_catalog_revision();
-            if let Some(tools) = self.cached_tool_catalog(revision) {
+            if self.managed_auth_scope_is_current()
+                && let Some(tools) = self.cached_tool_catalog(revision)
+            {
                 return tools;
             }
 
-            let tools = self.build_tool_catalog().await;
+            let mut tools = self.build_tool_catalog().await;
+            let invalid = self.clients.iter()
+                .filter(|(_, client)| !client.managed_auth_scope_is_current())
+                .map(|(name, _)| name.as_str())
+                .collect::<HashSet<_>>();
+            if !invalid.is_empty() || !self.managed_auth_scope_is_current() {
+                tools.retain(|tool| !invalid.contains(tool.server_name.as_str()));
+                // Never replace a valid aggregate cache with an auth outage.
+                return Arc::new(tools);
+            }
             if revision != self.tool_catalog_revision() {
                 // A hot catalog must still allow caller deadlines/cancellation
                 // to be polled even when every listing completes immediately.
@@ -1249,11 +1289,14 @@ impl McpConnectionManager {
             .clients
             .get(CODEX_APPS_MCP_SERVER_NAME)
             .ok_or_else(|| anyhow!("unknown MCP server '{CODEX_APPS_MCP_SERVER_NAME}'"))?
-            .client()
+            .client_for_operation()
             .await
             .context("failed to get client")?;
 
         let list_start = Instant::now();
+        let catalog = managed_client
+            .current_catalog()
+            .ok_or_else(|| anyhow!("MCP catalog is refreshing after session reinitialization"))?;
         let fetch_ticket = managed_client
             .codex_apps_tools_cache_context
             .as_ref()
@@ -1264,12 +1307,18 @@ impl McpConnectionManager {
             /*codex_apps_refresh_trigger*/ "explicit",
             &managed_client.client,
             managed_client.tool_timeout,
-            managed_client.server_instructions.as_deref(),
+            catalog.server_instructions.as_deref(),
         )
         .await
         .with_context(|| {
             format!("failed to refresh tools for MCP server '{CODEX_APPS_MCP_SERVER_NAME}'")
         })?;
+
+        if managed_client.client.session_generation() != catalog.generation
+            || !managed_client.client.managed_auth_scope_is_current()
+        {
+            return Err(anyhow!("MCP session changed during tool discovery"));
+        }
 
         let tools = match (
             managed_client.codex_apps_tools_cache_context.as_ref(),
@@ -1277,7 +1326,7 @@ impl McpConnectionManager {
         ) {
             (Some(cache_context), Some(fetch_ticket)) => {
                 cache_context
-                    .publish_if_newest_accepted(fetch_ticket, &managed_client.server_info, tools)
+                    .publish_if_newest_accepted(fetch_ticket, &catalog.server_info, tools)
                     .await
             }
             (None, None) => tools,
@@ -1290,11 +1339,7 @@ impl McpConnectionManager {
         );
         let tools = filter_tools(tools, &managed_client.tool_filter);
         if managed_client.codex_apps_tools_cache_context.is_none() {
-            commit_tool_catalog_refresh(
-                &managed_client.tools,
-                &self.tool_catalog_revision,
-                Ok(tools),
-            )?;
+            managed_client.commit_tools(catalog.generation, tools, &self.tool_catalog_revision)?;
         }
         let tools = self
             .list_all_tools_snapshot()
@@ -1332,7 +1377,7 @@ impl McpConnectionManager {
             let task_server = server_name.clone();
             let abort_handle = join_set.spawn(async move {
                 async_managed_client.reconnect_failed_startup().await;
-                let managed_client = match async_managed_client.client().await {
+                let managed_client = match async_managed_client.client_for_operation().await {
                     Ok(client) => client,
                     Err(err) => {
                         let message = if err.is_authentication_required() {
@@ -1343,7 +1388,10 @@ impl McpConnectionManager {
                         return (server_name, Err(anyhow!(message)));
                     }
                 };
-                if !managed_client.server_supports_resources_capability {
+                let Some(catalog) = managed_client.current_catalog() else {
+                    return (server_name, Err(anyhow!("MCP negotiated catalog is refreshing")));
+                };
+                if !catalog.server_supports_resources_capability {
                     return (server_name, Ok(None));
                 }
                 let client = &managed_client.client;
@@ -1437,7 +1485,7 @@ impl McpConnectionManager {
             let task_server = server_name.clone();
             let abort_handle = join_set.spawn(async move {
                 async_managed_client.reconnect_failed_startup().await;
-                let managed_client = match async_managed_client.client().await {
+                let managed_client = match async_managed_client.client_for_operation().await {
                     Ok(client) => client,
                     Err(err) => {
                         let message = if err.is_authentication_required() {
@@ -1448,7 +1496,10 @@ impl McpConnectionManager {
                         return (server_name, Err(anyhow!(message)));
                     }
                 };
-                if !managed_client.server_supports_resources_capability {
+                let Some(catalog) = managed_client.current_catalog() else {
+                    return (server_name, Err(anyhow!("MCP negotiated catalog is refreshing")));
+                };
+                if !catalog.server_supports_resources_capability {
                     return (server_name, Ok(None));
                 }
                 let timeout = Some(managed_client.tool_timeout);
@@ -1518,7 +1569,7 @@ impl McpConnectionManager {
             let task_server = server_name.clone();
             let abort_handle = join_set.spawn(async move {
                 async_managed_client.reconnect_failed_startup().await;
-                let managed_client = match async_managed_client.client().await {
+                let managed_client = match async_managed_client.client_for_operation().await {
                     Ok(client) => client,
                     Err(err) => {
                         let message = if err.is_authentication_required() {
@@ -1529,7 +1580,10 @@ impl McpConnectionManager {
                         return (server_name, Err(anyhow!(message)));
                     }
                 };
-                if !managed_client.server_supports_resources_capability {
+                let Some(catalog) = managed_client.current_catalog() else {
+                    return (server_name, Err(anyhow!("MCP negotiated catalog is refreshing")));
+                };
+                if !catalog.server_supports_resources_capability {
                     return (server_name, Ok(None));
                 }
                 let client = &managed_client.client;
@@ -1627,7 +1681,7 @@ impl McpConnectionManager {
             let task_server = server_name.clone();
             let abort_handle = join_set.spawn(async move {
                 async_managed_client.reconnect_failed_startup().await;
-                let managed_client = match async_managed_client.client().await {
+                let managed_client = match async_managed_client.client_for_operation().await {
                     Ok(client) => client,
                     Err(err) => {
                         let message = if err.is_authentication_required() {
@@ -1638,7 +1692,10 @@ impl McpConnectionManager {
                         return (server_name, Err(anyhow!(message)));
                     }
                 };
-                if !managed_client.server_supports_resources_capability {
+                let Some(catalog) = managed_client.current_catalog() else {
+                    return (server_name, Err(anyhow!("MCP negotiated catalog is refreshing")));
+                };
+                if !catalog.server_supports_resources_capability {
                     return (server_name, Ok(None));
                 }
                 let timeout = Some(managed_client.tool_timeout);
@@ -1734,6 +1791,8 @@ impl McpConnectionManager {
         Ok(self
             .client_by_name(server)
             .await?
+            .current_catalog()
+            .ok_or_else(|| anyhow!("MCP negotiated catalog is refreshing"))?
             .server_supports_sandbox_state_meta_capability)
     }
 
@@ -1791,6 +1850,9 @@ impl McpConnectionManager {
     pub(crate) async fn list_available_server_infos(&self) -> HashMap<String, McpServerInfo> {
         let mut server_infos = HashMap::new();
         for (server_name, client) in &self.clients {
+            if !client.managed_auth_scope_is_current() {
+                continue;
+            }
             if !client.startup_complete.load(Ordering::Acquire) {
                 if let Some(server_info) = client.cached_server_info.clone() {
                     server_infos.insert(server_name.clone(), server_info);
@@ -1799,7 +1861,9 @@ impl McpConnectionManager {
             }
             match client.client().await {
                 Ok(managed_client) => {
-                    server_infos.insert(server_name.clone(), managed_client.server_info);
+                    if let Some(catalog) = managed_client.current_catalog() {
+                        server_infos.insert(server_name.clone(), catalog.server_info.clone());
+                    }
                 }
                 Err(_) => {
                     if let Some(server_info) = client.cached_server_info.clone() {

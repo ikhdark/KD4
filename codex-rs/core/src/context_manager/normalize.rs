@@ -1,16 +1,11 @@
 use codex_protocol::ResponseItemId;
-use codex_protocol::models::ContentItem;
-use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::openai_models::InputModality;
 use uuid::Uuid;
 
 use crate::invariants::error_or_panic;
 use tracing::info;
 
-const IMAGE_CONTENT_OMITTED_PLACEHOLDER: &str =
-    "image content omitted because you do not support image input";
 pub(super) const MISSING_TOOL_RESULT: &str = "Result unavailable. Execution outcome and side effects are unknown. Do not repeat a state-changing operation solely because its result is missing.";
 // Changing this value would change model-visible IDs and invalidate prompt caches.
 const SYNTHETIC_OUTPUT_ID_NAMESPACE: Uuid = Uuid::from_u128(0x90d38d3e_6a5b_4d52_bfe2_2f1e634bfac4);
@@ -218,65 +213,3 @@ pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItem>) {
     });
 }
 
-/// Strip image content from messages and tool outputs when the model does not support images.
-/// When `input_modalities` contains `InputModality::Image`, no stripping is performed.
-pub(crate) fn strip_images_when_unsupported(
-    input_modalities: &[InputModality],
-    items: &mut Vec<ResponseItem>,
-) {
-    let supports_images = input_modalities.contains(&InputModality::Image);
-    if supports_images {
-        return;
-    }
-
-    let mut image_omissions = Vec::new();
-    for (index, item) in items.iter_mut().enumerate() {
-        match item {
-            ResponseItem::Message { content, .. } => {
-                for content_item in content.iter_mut() {
-                    if matches!(content_item, ContentItem::InputImage { .. }) {
-                        *content_item = ContentItem::InputText {
-                            text: IMAGE_CONTENT_OMITTED_PLACEHOLDER.to_string(),
-                        };
-                    }
-                }
-            }
-            ResponseItem::FunctionCallOutput { output, .. }
-            | ResponseItem::CustomToolCallOutput { output, .. } => {
-                if let Some(content_items) = output.content_items_mut() {
-                    for content_item in content_items.iter_mut() {
-                        if matches!(
-                            content_item,
-                            FunctionCallOutputContentItem::InputImage { .. }
-                        ) {
-                            *content_item = FunctionCallOutputContentItem::InputText {
-                                text: IMAGE_CONTENT_OMITTED_PLACEHOLDER.to_string(),
-                            };
-                        }
-                    }
-                }
-            }
-            ResponseItem::ImageGenerationCall { result, .. } => {
-                if result.as_ref().is_some_and(|result| !result.is_empty()) {
-                    image_omissions.push((
-                        index,
-                        ResponseItem::Message {
-                            id: None,
-                            role: "developer".to_string(),
-                            content: vec![ContentItem::InputText {
-                                text: format!("Generated {IMAGE_CONTENT_OMITTED_PLACEHOLDER}"),
-                            }],
-                            phase: None,
-                            internal_chat_message_metadata_passthrough: None,
-                        },
-                    ));
-                }
-                *result = None;
-            }
-            _ => {}
-        }
-    }
-    // `result` is base64 image data on the wire. Keep the receipt in a text
-    // message beside the call instead of putting prose in that field.
-    insert_items_after(items, image_omissions);
-}

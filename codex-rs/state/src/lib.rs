@@ -29,6 +29,7 @@ pub use model::ProjectSortKey;
 pub use model::ProjectsPage;
 /// Preferred entrypoint: owns configuration and metrics.
 pub use runtime::StateRuntime;
+pub use runtime::InputReceipt;
 pub use runtime::{ExternalAgentConfigImportFailureRecord, ExternalAgentConfigImportHistoryRecord, ExternalAgentConfigImportSuccessRecord};
 pub use runtime::connect_sqlite_pool_with_retry;
 

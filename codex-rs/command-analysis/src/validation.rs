@@ -69,7 +69,12 @@ struct RepositoryRunners {
 }
 
 type Runners = Vec<codex_shell_command::validation::RepositoryRunner>;
-type RunnerCacheSlot = std::sync::Arc<std::sync::OnceLock<Option<Runners>>>;
+#[derive(Clone, Default)]
+struct CachedRepositoryRunners {
+    runners: Runners,
+    justfile: Option<std::sync::Arc<str>>,
+}
+type RunnerCacheSlot = std::sync::Arc<std::sync::OnceLock<Option<CachedRepositoryRunners>>>;
 
 #[derive(Default)]
 struct RepositoryRunnerCache {
@@ -82,8 +87,8 @@ impl RepositoryRunnerCache {
         &self,
         root: &std::path::Path,
         oid: &str,
-        load: impl FnOnce() -> Option<Runners>,
-    ) -> Runners {
+        load: impl FnOnce() -> Option<CachedRepositoryRunners>,
+    ) -> CachedRepositoryRunners {
         let key = (root.to_path_buf(), oid.to_string());
         let slot = {
             let mut entries = self
@@ -94,7 +99,7 @@ impl RepositoryRunnerCache {
                 // Never evict an in-flight key: its waiters must coalesce.
                 entries.retain(|_, slot| std::sync::Arc::strong_count(slot) > 1);
                 if entries.len() >= 64 {
-                    return Vec::new();
+                    return CachedRepositoryRunners::default();
                 }
             }
             std::sync::Arc::clone(entries.entry(key.clone()).or_default())
@@ -128,16 +133,65 @@ pub fn repository_runners(cwd: &std::path::Path) -> Runners {
     let Some(oid) = repository_head_oid(&root) else {
         return Vec::new();
     };
-    let mut runners = CACHE
+    let cached = CACHE
         .get_or_init(Default::default)
         .get_or_load(&root, &oid, || load_repository_runners(&root, &oid));
+    let mut runners = cached.runners;
+    // The declarations own the root justfile, not a nearer foreign producer.
+    // Explicit owner-changing Just options are separately rejected by matches.
+    let root_justfile_selected = cwd.ancestors().find_map(|directory| {
+        let candidates = [directory.join("justfile"), directory.join(".justfile")];
+        let mut existing = candidates.iter().filter(|path| path.is_file());
+        let selected = existing.next()?;
+        Some(existing.next().is_none() && selected == &root.join("justfile")
+            && std::fs::symlink_metadata(selected).is_ok_and(|metadata| !metadata.file_type().is_symlink())
+            && cached.justfile.as_ref().is_some_and(|committed|
+                read_current_justfile(selected).is_some_and(|current|
+                    current.replace("\r\n", "\n") == committed.replace("\r\n", "\n"))))
+    }).unwrap_or(false);
+    runners.retain(|runner| root_justfile_selected
+        || !runner.programs.iter().any(|program| program == "just"));
     for runner in &mut runners {
         runner.path_context = Some((root.clone(), cwd.to_path_buf()));
+    }
+    if root_justfile_selected && cached.justfile.as_ref().is_some_and(|source| {
+        // The declaration owns clippy-lane; only this exact committed body
+        // proves that the undeclared clippy alias has the same script owner.
+        const SHELL: &str = "set working-directory := \"codex-rs\"\nset positional-arguments\nexport JUST_SHELL := justfile_directory() / \"scripts/build/just-shell.py\"\nset shell := [\"python\", \"-c\", 'import os, runpy; runpy.run_path(os.environ[\"JUST_SHELL\"], run_name=\"__main__\")']\nset windows-shell := [\"python\", \"-c\", 'import os, runpy; runpy.run_path(os.environ[\"JUST_SHELL\"], run_name=\"__main__\")']\n";
+        const BODY: &str = r#"    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo clippy --keep-going @forwarded_args; exit $LASTEXITCODE"#;
+        let lines = source.lines().collect::<Vec<_>>();
+        source.replace("\r\n", "\n").starts_with(SHELL)
+            && lines.iter().any(|line| *line == "rust_validation_wait_seconds := \"0\"")
+            && lines.windows(5).any(|lines| !lines[0].starts_with('[')
+                && lines[1] == "[windows]" && lines[2] == "clippy *args:" && lines[3] == BODY
+                && !lines[4].starts_with(char::is_whitespace))
+    }) {
+        let script = root.join("scripts/build/rust_build_status.py").to_string_lossy().into_owned();
+        let invocation = [script, "run-lane".into(), "--".into(), "cargo".into(), "clippy".into()];
+        if runners.iter().any(|runner| runner.admission_runner.as_deref() == Some("rust_build_status")
+            && runner.passthrough_after.as_deref() == Some("--") && runner.matches("python", &invocation))
+            && let Some(mut alias) = runners.iter().find(|runner|
+                runner.admission_runner.as_deref() == Some("rust_build_status")
+                    && runner.operations.contains(&ValidationOperation::Lint)
+                    && runner.matches("just", &["clippy-lane".into()])).cloned()
+        {
+            alias.prefixes = vec![vec!["clippy".into()]];
+            runners.push(alias);
+        }
     }
     runners
 }
 
 const MAX_RUNNER_DECLARATION_BYTES: usize = 64 * 1024;
+
+fn read_current_justfile(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).ok()?.take((MAX_RUNNER_DECLARATION_BYTES * 2 + 1) as u64)
+        .read_to_end(&mut bytes).ok()?;
+    if bytes.len() > MAX_RUNNER_DECLARATION_BYTES * 2 { return None; }
+    String::from_utf8(bytes).ok()
+}
 
 fn parse_repository_runners(bytes: &[u8]) -> Runners {
     let Ok(config) = serde_json::from_slice::<RepositoryRunners>(bytes) else {
@@ -165,10 +219,11 @@ fn parse_repository_runners(bytes: &[u8]) -> Runners {
     config.runners
 }
 
-fn load_repository_runners(root: &std::path::Path, oid: &str) -> Option<Runners> {
+fn load_repository_runners(root: &std::path::Path, oid: &str) -> Option<CachedRepositoryRunners> {
     // Batch mode distinguishes immutable absence (a successful "missing"
     // response) from execution failures, without a second Git invocation.
     let object = format!("{oid}:.codex/test-runners.json");
+    let justfile_object = format!("{oid}:justfile");
     let mut command = std::process::Command::new(codex_git_utils::git_executable());
     command
         .arg("--no-replace-objects")
@@ -179,7 +234,7 @@ fn load_repository_runners(root: &std::path::Path, oid: &str) -> Option<Runners>
         .env("GIT_TERMINAL_PROMPT", "0");
     let (success, bytes) = bounded_runner_lookup(
         command,
-        format!("info {oid}\ncontents {object}\n").as_bytes(),
+        format!("info {oid}\ncontents {object}\ncontents {justfile_object}\n").as_bytes(),
         std::time::Duration::from_secs(5),
     )?;
     // First prove the commit exists. A missing/corrupt commit object is a
@@ -197,7 +252,7 @@ fn load_repository_runners(root: &std::path::Path, oid: &str) -> Option<Runners>
     let newline = bytes.iter().position(|byte| *byte == b'\n')?;
     let header = std::str::from_utf8(&bytes[..newline]).ok()?;
     if header == format!("{object} missing") {
-        return success.then(Vec::new);
+        return success.then(CachedRepositoryRunners::default);
     }
     let fields = header.split_whitespace().collect::<Vec<_>>();
     if fields.len() != 3 || !fields[0].bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -207,19 +262,34 @@ fn load_repository_runners(root: &std::path::Path, oid: &str) -> Option<Runners>
     // A valid object header proves an immutable invalid declaration even when
     // the bounded reader intentionally kills Git before the body completes.
     if size > MAX_RUNNER_DECLARATION_BYTES {
-        return Some(Vec::new());
+        return Some(CachedRepositoryRunners::default());
     }
     if !success {
         return None;
     }
     if fields[1] != "blob" {
-        return Some(Vec::new());
+        return Some(CachedRepositoryRunners::default());
     }
     let body = bytes.get(newline + 1..)?;
-    if body.len() != size + 1 || body.last() != Some(&b'\n') {
+    if body.get(size) != Some(&b'\n') {
         return None;
     }
-    Some(parse_repository_runners(&body[..size]))
+    let runners = parse_repository_runners(&body[..size]);
+    let bytes = body.get(size + 1..)?;
+    let newline = bytes.iter().position(|byte| *byte == b'\n')?;
+    let header = std::str::from_utf8(&bytes[..newline]).ok()?;
+    let justfile = if header == format!("{justfile_object} missing") {
+        None
+    } else {
+        let fields = header.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != 3 || fields[1] != "blob" { return None; }
+        let size = fields[2].parse::<usize>().ok()?;
+        if size > MAX_RUNNER_DECLARATION_BYTES { return Some(CachedRepositoryRunners { runners, justfile: None }); }
+        let body = bytes.get(newline + 1..)?;
+        if body.len() != size + 1 || body.last() != Some(&b'\n') { return None; }
+        std::str::from_utf8(&body[..size]).ok().map(std::sync::Arc::from)
+    };
+    Some(CachedRepositoryRunners { runners, justfile })
 }
 
 /// Runs only Git plumbing (no hooks, filters or shell). The owning blocking
@@ -252,8 +322,8 @@ fn bounded_runner_lookup(
         child.0.stdin.take()?.write_all(input).ok()?;
         let stdout = child.0.stdout.take()?;
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        // Commit metadata is one header; only the declaration has a body.
-        let limit = MAX_RUNNER_DECLARATION_BYTES + 1024;
+        // Commit metadata is one header; declaration and producer are bounded.
+        let limit = MAX_RUNNER_DECLARATION_BYTES * 2 + 1024;
         scope.spawn(move || {
             let mut bytes = Vec::new();
             let result = stdout
@@ -530,6 +600,141 @@ pub fn classify_validation_invocations(
 ) -> ValidationClassification {
     combine_validation_classifications(invocations.iter().map(classify_validation))
 }
+
+/// Literal launch lowering for named compiler operands. This is not a claim
+/// that arbitrary project or transitive compiler inputs have been discovered.
+fn literal_compilation_launch(command: &[String], depth: usize) -> Option<Vec<String>> {
+        if depth > 8 { return None; }
+        let (program, args) = command.split_first()?;
+        let binary = program.rsplit(['/', '\\']).next()?.trim_end_matches(".exe").to_ascii_lowercase();
+        let child = match binary.as_str() {
+            "pwsh" | "powershell" => codex_shell_command::powershell::extract_powershell_command(command)
+                .and_then(|(_, script)| codex_shell_command::validation::standalone_powershell_argv(script))?,
+            "sh" | "bash" => codex_shell_command::bash::extract_bash_command(command)
+                .and_then(|(_, script)| codex_shell_command::validation::standalone_argv(script))?,
+            "env" | "command" | "time" | "exec" | "rustup" => {
+                let codex_shell_command::validation::ExecutionWrapper::Child(index) =
+                    codex_shell_command::validation::decode_execution_wrapper(&binary, args) else { return None; };
+                args[index..].to_vec()
+            }
+            _ => return Some(command.to_vec()),
+        };
+        literal_compilation_launch(&child, depth + 1)
+}
+
+pub fn explicit_compilation_inputs(selection: &str, launch_command: &[String]) -> Option<Vec<std::path::PathBuf>> {
+    let commands = serde_json::from_str::<Vec<Vec<String>>>(selection).ok()?;
+    let [command] = commands.as_slice() else { return None; };
+    let (program, args) = command.split_first()?;
+    let binary = program.rsplit(['/', '\\']).next()?.trim_end_matches(".exe");
+    let actual = literal_compilation_launch(launch_command, 0)?;
+    let (actual_program, actual_args) = actual.split_first()?;
+    if !actual_program.rsplit(['/', '\\']).next()?.trim_end_matches(".exe").eq_ignore_ascii_case(binary)
+        || actual_args != args { return None; }
+    let paths = if binary == "node" {
+        match args {
+            [flag, path] if matches!(flag.as_str(), "--check" | "-c") => std::slice::from_ref(path),
+            _ => return None,
+        }
+    } else if matches!(binary, "python" | "python3" | "py") {
+        let start = args.iter().position(|arg| !matches!(arg.as_str(), "-I" | "-B" | "-u"))?;
+        if args.get(start).is_none_or(|arg| arg != "-m")
+            || args.get(start + 1).is_none_or(|arg| arg != "py_compile") { return None; }
+        &args[start + 2..]
+    } else if matches!(binary, "tsc" | "vue-tsc" | "javac" | "deno") {
+        let args = if binary == "deno" {
+            if args.first().is_none_or(|arg| arg != "check") { return None; }
+            &args[1..]
+        } else { args };
+        let mut files = Vec::new();
+        let mut index = 0;
+        while let Some(arg) = args.get(index) {
+            if binary == "javac" && matches!(arg.as_str(), "-d" | "-encoding" | "--release" | "-source" | "-target") {
+                index += 1; args.get(index)?;
+            } else if matches!(arg.as_str(), "--noEmit" | "--strict" | "--skipLibCheck" | "--allowJs" | "-Werror" | "-nowarn" | "-parameters" | "-g") {
+            } else if !arg.starts_with('-') && !arg.contains("://")
+                && (if binary == "javac" { arg.ends_with(".java") } else {
+                    [".ts", ".tsx", ".js", ".jsx", ".vue"].iter().any(|extension| arg.ends_with(extension))
+                }) {
+                files.push(std::path::PathBuf::from(arg));
+            } else { return None; }
+            index += 1;
+        }
+        return (!files.is_empty() && files.iter().all(|path|
+            !path.to_string_lossy().contains(['*', '?', '[', ']', '$', '`']))).then_some(files);
+    } else { return None; };
+    if paths.is_empty() || paths.len() > 256 || paths.iter().any(|path|
+        path.is_empty() || path.starts_with('-') || path.contains(['*', '?', '[', ']', '$', '`'])) {
+        return None;
+    }
+    Some(paths.iter().map(std::path::PathBuf::from).collect())
+}
+
+pub fn compilation_cargo_cwd(command: &[String], cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+    let command = literal_compilation_launch(command, 0)?;
+    let (program, args) = command.split_first()?;
+    let binary = program.rsplit(['/', '\\']).next()?.trim_end_matches(".exe").to_ascii_lowercase();
+    if binary == "cargo" { return Some(cwd.to_path_buf()); }
+    let runners = repository_runners(cwd);
+    let owner = runners.iter().find(|runner| runner.admission_runner.as_deref() == Some("rust_build_status")
+        && runner.matches(program, args))?;
+    let root = &owner.path_context.as_ref()?.0;
+    if binary == "just" {
+        let source = read_current_justfile(&root.join("justfile"))?;
+        let setting = source.lines().find_map(|line| line.strip_prefix("set working-directory := "))?;
+        let directory = serde_json::from_str::<String>(setting).ok()?;
+        Some(root.join(directory))
+    } else if matches!(binary.as_str(), "python" | "python3" | "py") {
+        // The authenticated run-lane owner guards Cargo children to this
+        // checkout's Cargo workspace before starting the compiler.
+        Some(root.join("codex-rs"))
+    } else { None }
+}
+
+/// Distinct target/options inputs get their own first admission. Canonical
+/// option groups prevent Cargo flag-order/short-option aliases bypassing an
+/// unchanged repeat; unknown option spellings remain literal.
+pub fn compilation_source_selection(selection: &str) -> String {
+    let Ok(mut commands) = serde_json::from_str::<Vec<Vec<String>>>(selection) else { return selection.to_owned(); };
+    for command in &mut commands {
+        if command.first().is_none_or(|program| program != "cargo") { continue; }
+        let mut groups = Vec::new();
+        let mut index = 1;
+        while let Some(arg) = command.get(index) {
+            let (mut flag, inline) = arg.split_once('=').map_or((arg.as_str(), None), |(flag, value)| (flag, Some(value)));
+            flag = match flag { "-p" => "--package", "-F" => "--features", "-j" => "--jobs", other => other };
+            if matches!(flag, "--color" | "--message-format" | "--jobs" | "--target-dir")
+                || arg.starts_with("-j") && arg.len() > 2 {
+                if inline.is_none() && !(arg.starts_with("-j") && arg.len() > 2) { index += 1; }
+                index += 1;
+                continue;
+            }
+            if matches!(flag, "--quiet" | "-q" | "--verbose" | "--keep-going" | "--timings"
+                | "--future-incompat-report" | "--locked" | "--offline" | "--frozen")
+                || arg.strip_prefix('-').is_some_and(|flags| !flags.is_empty() && flags.bytes().all(|flag| flag == b'v')) {
+                index += 1;
+                continue;
+            }
+            let takes_value = matches!(flag, "--package" | "--features" | "--jobs" | "--manifest-path" | "--target" | "--target-dir" | "--profile" | "--config" | "--bin" | "--example" | "--test" | "--bench" | "--message-format" | "--color");
+            let group = if takes_value {
+                let mut value = inline.map(str::to_owned).or_else(|| { index += 1; command.get(index).cloned() }).unwrap_or_default();
+                if flag == "--features" {
+                    let mut features = value.split([',', ' ']).filter(|value| !value.is_empty()).collect::<Vec<_>>();
+                    features.sort_unstable(); features.dedup(); value = features.join(",");
+                }
+                vec![flag.to_owned(), value]
+            } else if let Some(value) = arg.strip_prefix("-p").filter(|value| !value.is_empty()) {
+                vec!["--package".into(), value.to_owned()]
+            } else { vec![arg.clone()] };
+            groups.push(group);
+            index += 1;
+        }
+        groups.sort();
+        *command = std::iter::once("cargo".to_owned()).chain(groups.into_iter().flatten()).collect();
+    }
+    serde_json::to_string(&commands).unwrap_or_else(|_| selection.to_owned())
+}
+
 
 
 

@@ -41,6 +41,32 @@ pub trait AgentGraphStore: Send + Sync {
         status: ThreadSpawnEdgeStatus,
     ) -> AgentGraphStoreFuture<'_, ()>;
 
+    /// Record immutable creation-turn ownership for the current parent.
+    fn set_thread_spawn_turn_owner<'a>(
+        &'a self,
+        parent: ThreadId,
+        child: ThreadId,
+        turn_id: &'a str,
+    ) -> AgentGraphStoreFuture<'a, bool>;
+
+    /// List the identified turn's admitted child subtrees, traversing only open edges.
+    fn list_turn_owned_thread_spawn_descendants<'a>(
+        &'a self,
+        parent: ThreadId,
+        turn_id: &'a str,
+    ) -> AgentGraphStoreFuture<'a, Vec<ThreadId>>;
+
+    /// Retain a versioned instruction snapshot before admitting the child's first work.
+    fn retain_thread_spawn_instruction_snapshot<'a>(
+        &'a self,
+        parent: ThreadId,
+        child: ThreadId,
+        snapshot: &'a str,
+    ) -> AgentGraphStoreFuture<'a, bool>;
+
+    fn thread_spawn_instruction_snapshot(&self, child: ThreadId)
+        -> AgentGraphStoreFuture<'_, Option<String>>;
+
     /// Update the persisted lifecycle status of a spawned thread's incoming edge.
     ///
     /// Implementations should treat missing children as a successful no-op.

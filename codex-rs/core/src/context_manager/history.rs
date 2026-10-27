@@ -1461,7 +1461,8 @@ impl ContextManager {
             || self
                 .token_info
                 .as_ref()
-                .is_none_or(|info| info.estimated_context_tokens.is_some())
+                .is_none_or(|info| info.estimated_context_tokens.is_some()
+                    || info.last_token_usage.known_total().is_none())
     }
 
     /// Share sampling preparation/projection while retaining the distinct
@@ -1498,8 +1499,8 @@ impl ContextManager {
     /// This function enforces a couple of invariants on the in-memory history:
     /// 1. every call (function/custom) has a corresponding output entry
     /// 2. every output has a corresponding call entry
-    /// 3. when images are unsupported, image content is stripped from messages and tool outputs
-    fn normalize_history(&mut self, input_modalities: &[InputModality]) {
+    /// Image evidence is preserved; model compatibility is a request-admission decision.
+    fn normalize_history(&mut self, _input_modalities: &[InputModality]) {
         let items = Arc::make_mut(&mut self.items);
 
         // all function/tool calls must have a corresponding output
@@ -1508,8 +1509,6 @@ impl ContextManager {
         // all outputs must have a corresponding function/tool call
         normalize::remove_orphan_outputs(items);
 
-        // strip images when model does not support them
-        normalize::strip_images_when_unsupported(input_modalities, items);
     }
 
     pub(crate) fn process_item(

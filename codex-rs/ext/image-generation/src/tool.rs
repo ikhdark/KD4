@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::io;
+use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -59,6 +60,7 @@ const IMAGE_MODEL: &str = "gpt-image-2";
 const MAX_EDIT_IMAGES: usize = 5;
 const IMAGEGEN_DESCRIPTION: &str = include_str!("../imagegen_description.md");
 const IMAGE_GENERATION_CANCELLED_MESSAGE: &str = "image generation cancelled";
+const IMAGE_OPERATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone)]
 pub(crate) struct ImageGenerationTool {
@@ -181,7 +183,19 @@ impl ImageGenerationTool {
             .map_err(|err| format!("image generation failed: {err}"))?;
             Ok::<_, String>(result)
         };
-        let operation_result = call.cancellation_token.run_until_cancelled(operation).await;
+        // Bound provider setup, headers and complete body collection together.
+        // Dropping a dispatched request cannot establish that generation stopped;
+        // never automatically submit a replacement on deadline expiration.
+        let operation_result = call
+            .cancellation_token
+            .run_until_cancelled(async {
+                tokio::time::timeout(IMAGE_OPERATION_TIMEOUT, operation)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err("image generation timed out after 15 minutes; provider completion is unknown if the request was dispatched. No replacement request was submitted automatically.".to_string())
+                    })
+            })
+            .await;
         let response = match operation_result {
             None => {
                 emit_failed_item(&call, &args.prompt).await;

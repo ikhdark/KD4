@@ -1106,6 +1106,12 @@
             "id": {
               "type": "string"
             },
+            "interruption": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "phase": {
               "anyOf": [
                 {

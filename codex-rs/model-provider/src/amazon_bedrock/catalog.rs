@@ -11,7 +11,9 @@ use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
 
-const GPT_5_BEDROCK_CONTEXT_WINDOW: i64 = 272_000;
+// AWS model cards verified 2026-10-26 for GPT-5.5 and GPT-6 Astra, both endpoints.
+// The backend ceiling is distinct from config's operating window and input reserve.
+const BEDROCK_DOCUMENTED_CONTEXT_WINDOW: i64 = 1_050_000;
 const GPT_5_5_OPENAI_MODEL_ID: &str = "gpt-5.5";
 
 #[expect(
@@ -58,7 +60,7 @@ pub(crate) fn static_model_catalog() -> ModelsResponse {
                 "GPT-5.6 Luna",
                 /*priority*/ 5,
             ),
-            gpt_5_bedrock_model(
+            bedrock_model(
                 bundled_openai_model(&bundled, GPT_5_5_OPENAI_MODEL_ID),
                 AMAZON_BEDROCK_GPT_5_5_MODEL_ID,
                 "GPT-5.5",
@@ -101,10 +103,19 @@ fn bedrock_model(
     model.priority = priority;
     model.visibility = ModelVisibility::List;
     normalize_bedrock_model(&mut model);
+    if let Some(ceiling) = documented_context_ceiling(&model.slug) {
+        // The bundled OpenAI operating window is not Bedrock's default.
+        model.context_window = Some(ceiling);
+    }
     model
 }
 
 fn normalize_bedrock_model(model: &mut ModelInfo) {
+    if let Some(ceiling) = documented_context_ceiling(&model.slug) {
+        model.max_context_window = Some(ceiling);
+        // Preserve an explicit catalog's smaller operating window.
+        model.context_window = model.context_window.map(|window| window.min(ceiling));
+    }
     // Bedrock uses Responses and direct tools, without Codex-only Ultra effort.
     model.use_responses_lite = false;
     model.tool_mode = None;
@@ -127,16 +138,16 @@ fn normalize_bedrock_model(model: &mut ModelInfo) {
     }
 }
 
-fn gpt_5_bedrock_model(
-    model: ModelInfo,
-    bedrock_slug: &str,
-    display_name: &str,
-    priority: i32,
-) -> ModelInfo {
-    let mut model = bedrock_model(model, bedrock_slug, display_name, priority);
-    model.context_window = Some(GPT_5_BEDROCK_CONTEXT_WINDOW);
-    model.max_context_window = Some(GPT_5_BEDROCK_CONTEXT_WINDOW);
-    model
+fn documented_context_ceiling(slug: &str) -> Option<i64> {
+    let slug = slug
+        .strip_prefix("global.")
+        .or_else(|| slug.strip_prefix("us."))
+        .unwrap_or(slug);
+    matches!(
+        slug,
+        AMAZON_BEDROCK_GPT_5_5_MODEL_ID | AMAZON_BEDROCK_GPT_6_ASTRA_MODEL_ID
+    )
+    .then_some(BEDROCK_DOCUMENTED_CONTEXT_WINDOW)
 }
 
 fn bundled_openai_model(catalog: &ModelsResponse, slug: &str) -> ModelInfo {

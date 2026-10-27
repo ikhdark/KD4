@@ -6,6 +6,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use super::RequestOrigin;
+use super::OutboundProxyRoute;
 use super::RouteFailureClass;
 use super::SystemProxyDecision;
 use system_configuration::core_foundation::array::CFArray;
@@ -141,14 +142,12 @@ fn proxy_entries_decision(
 ) -> SystemProxyDecision {
     let mut saw_unsupported = false;
     let mut failure = None;
-
-    // CFNetwork returns candidates in failover order, but the shared resolver currently carries
-    // only one route. This matches the Windows limitation; cross-platform retry requires request
-    // replay semantics and is intentionally deferred.
+    let mut routes = Vec::new();
     for entry in entries {
         match entry {
-            ProxyEntryDecision::Direct => return SystemProxyDecision::Direct,
-            ProxyEntryDecision::Proxy { url } => return SystemProxyDecision::Proxy { url },
+            ProxyEntryDecision::Direct => routes.push(OutboundProxyRoute::Direct),
+            ProxyEntryDecision::Proxy { url } => routes.push(OutboundProxyRoute::Proxy { url, no_proxy: None }),
+            ProxyEntryDecision::Fallback(candidates) => routes.extend(candidates),
             ProxyEntryDecision::UnsupportedScheme => saw_unsupported = true,
             ProxyEntryDecision::Unavailable(reason) => {
                 if failure.is_none()
@@ -160,6 +159,13 @@ fn proxy_entries_decision(
         }
     }
 
+    if !routes.is_empty() {
+        return match routes.as_slice() {
+            [OutboundProxyRoute::Direct] => SystemProxyDecision::Direct,
+            [OutboundProxyRoute::Proxy { url, .. }] => SystemProxyDecision::Proxy { url: url.clone() },
+            _ => SystemProxyDecision::Fallback { routes },
+        };
+    }
     if saw_unsupported {
         SystemProxyDecision::Unavailable {
             failure: RouteFailureClass::UnsupportedProxyScheme,
@@ -246,6 +252,7 @@ fn pac_decision(
     match proxy_array_decision(&proxies, target_url, origin) {
         SystemProxyDecision::Direct => ProxyEntryDecision::Direct,
         SystemProxyDecision::Proxy { url } => ProxyEntryDecision::Proxy { url },
+        SystemProxyDecision::Fallback { routes } => ProxyEntryDecision::Fallback(routes),
         SystemProxyDecision::Unavailable {
             failure: RouteFailureClass::UnsupportedProxyScheme,
         } => ProxyEntryDecision::UnsupportedScheme,
@@ -393,6 +400,7 @@ fn cf_url(value: &str) -> Option<CFURL> {
 enum ProxyEntryDecision {
     Direct,
     Proxy { url: String },
+    Fallback(Vec<OutboundProxyRoute>),
     UnsupportedScheme,
     Unavailable(RouteFailureClass),
 }

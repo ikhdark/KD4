@@ -840,7 +840,7 @@ def _preserve_open_error_enum(out_path: Path, schema_dir: Path) -> None:
 
 
 def _preserve_retained_wire_contracts(out_path: Path) -> None:
-    """Keep runtime nullability and historical input aliases across regeneration."""
+    """Keep runtime nullability and historical wire compatibility across regeneration."""
     content = out_path.read_text()
     content = re.sub(
         r"(class ImageGenerationThreadItem\(BaseModel\):[\s\S]*?\n    result:) str(?=\n)",
@@ -854,6 +854,49 @@ def _preserve_retained_wire_contracts(out_path: Path) -> None:
         content = content.replace(canonical, compatible, 1)
     if "AliasChoices(" in content and "from pydantic import AliasChoices," not in content:
         content = content.replace("from pydantic import ", "from pydantic import AliasChoices, ", 1)
+    # Rust's canonical schema is now a string. Preserve the previous Python
+    # helper classes and their branch order without publishing the old wire
+    # shape as the current app-server JSON Schema.
+    match = re.search(
+        r"^class ThreadSource\(RootModel\[[^\n]+\]\):\n.*?(?=\n\nclass |\Z)",
+        content,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    if match is None or match.group().splitlines()[0] not in {
+        "class ThreadSource(RootModel[str]):",
+        "class ThreadSource(RootModel[ThreadSourceValue | FeatureThreadSource]):",
+        "class ThreadSource(RootModel[ThreadSourceValue | FeatureThreadSource | str]):",
+    }:
+        raise RuntimeError("Unsupported generated ThreadSource wire model")
+    helpers = ""
+    if "class ThreadSourceValue(Enum):" not in content:
+        helpers += '''class ThreadSourceValue(Enum):
+    user = "User"
+    subagent = "Subagent"
+    memory_consolidation = "MemoryConsolidation"
+
+
+'''
+    if "class FeatureThreadSource(BaseModel):" not in content:
+        helpers += '''class FeatureThreadSource(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+    )
+    feature: Annotated[str, Field(alias="Feature")]
+
+
+'''
+    compatible_source = '''class ThreadSource(RootModel[ThreadSourceValue | FeatureThreadSource | str]):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    # Current protocol uses a string; retain the legacy enum/object wire forms.
+    root: Annotated[
+        ThreadSourceValue | FeatureThreadSource | str, Field(union_mode="left_to_right")
+    ]
+'''
+    content = content[: match.start()] + helpers + compatible_source + content[match.end() :]
     out_path.write_text(content)
 
 
@@ -1270,7 +1313,12 @@ def _render_codex_block(
         *_approval_mode_model_arg_lines(),
         *_model_arg_lines(resume_fields),
         "        )",
-        "        resumed = self._client.thread_resume(thread_id, params)",
+        "        # This facade returns a handle, not history. Keep the low-level API's",
+        "        # full response and the nonexperimental wire contract unchanged.",
+        "        resume_params: ThreadResumeParams | JsonObject = params",
+        "        if self._client.config.experimental_api:",
+        '            resume_params = {**_params_dict(params), "excludeTurns": True}',
+        "        resumed = self._client.thread_resume(thread_id, resume_params)",
         "        return Thread(self._client, resumed.thread.id)",
         "",
         "    def thread_fork(",
@@ -1352,7 +1400,11 @@ def _render_async_codex_block(
         *_approval_mode_model_arg_lines(),
         *_model_arg_lines(resume_fields),
         "        )",
-        "        resumed = await self._client.thread_resume(thread_id, params)",
+        "        # Match the sync facade without changing the low-level response API.",
+        "        resume_params: ThreadResumeParams | JsonObject = params",
+        "        if self._client._sync.config.experimental_api:",
+        '            resume_params = {**_params_dict(params), "excludeTurns": True}',
+        "        resumed = await self._client.thread_resume(thread_id, resume_params)",
         "        return AsyncThread(self, resumed.thread.id)",
         "",
         "    async def thread_fork(",

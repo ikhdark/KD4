@@ -450,7 +450,7 @@ impl ModelProviderInfo {
             requires_openai_auth: false,
             supports_websockets: false,
             supports_standalone_web_search: false,
-            supports_hosted_web_search: false,
+            supports_hosted_web_search: true,
         }
     }
 
@@ -461,6 +461,7 @@ impl ModelProviderInfo {
         provider.kind = ProviderKind::AmazonBedrockRuntime;
         provider.name = AMAZON_BEDROCK_RUNTIME_PROVIDER_NAME.into();
         provider.http_headers = None;
+        provider.supports_hosted_web_search = false;
         provider
     }
 

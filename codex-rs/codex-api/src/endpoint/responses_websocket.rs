@@ -40,7 +40,6 @@ use tokio_tungstenite::tungstenite::Utf8Bytes;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
-use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tracing::Instrument;
 use tracing::Span;
 use tracing::debug;
@@ -53,6 +52,8 @@ use tungstenite::protocol::WebSocketConfig;
 use url::Url;
 
 struct WsStream {
+    retired: Arc<AtomicBool>,
+    handshake_metadata_emitted: bool,
     tx_command: mpsc::Sender<WsCommand>,
     rx_message: WsIngressReceiver,
     rx_failure: Option<oneshot::Receiver<WsIngressFailure>>,
@@ -181,18 +182,53 @@ enum WsCommand {
     Send {
         message: Message,
         dispatch_guard: Option<Arc<dyn codex_http_client::RequestDispatchGuard>>,
-        tx_result: oneshot::Sender<Result<(), WsSendError>>,
+        receipt: WsSendReceipt,
     },
+}
+
+/// Dropping a queued command proves it was never handed to the socket. Dropping
+/// an active write does not. Resolve that distinction even when the pump exits.
+struct WsSendReceipt {
+    tx_result: Option<oneshot::Sender<Result<(), WsSendError>>>,
+    dispatch_started: bool,
+}
+
+impl WsSendReceipt {
+    fn is_closed(&self) -> bool {
+        self.tx_result.as_ref().is_none_or(oneshot::Sender::is_closed)
+    }
+
+    fn finish(mut self, result: Result<(), WsSendError>) {
+        if let Some(tx_result) = self.tx_result.take() {
+            let _ = tx_result.send(result);
+        }
+    }
+}
+
+impl Drop for WsSendReceipt {
+    fn drop(&mut self) {
+        if let Some(tx_result) = self.tx_result.take() {
+            let _ = tx_result.send(Err(if self.dispatch_started {
+                WsSendError::OutcomeUnknown
+            } else {
+                WsSendError::NotSent
+            }));
+        }
+    }
 }
 
 #[derive(Debug)]
 enum WsSendError {
     Admission(String),
+    NotSent,
+    OutcomeUnknown,
     Socket(WsError),
 }
 
 impl WsStream {
     fn new(inner: WebSocketConnection) -> Self {
+        let retired = Arc::new(AtomicBool::new(false));
+        let pump_retired = Arc::clone(&retired);
         let (tx_command, mut rx_command) = mpsc::channel::<WsCommand>(32);
         let (tx_message, rx_message) = ws_ingress_channel(
             WEBSOCKET_INGRESS_CAPACITY,
@@ -211,17 +247,22 @@ impl WsStream {
                             break;
                         };
                         match command {
-                            WsCommand::Send { message, dispatch_guard, tx_result } => {
+                            WsCommand::Send { message, dispatch_guard, mut receipt } => {
                                 // A cancelled queued request must never be sent later.
-                                if tx_result.is_closed() {
+                                if receipt.is_closed() {
                                     continue;
                                 }
+                                if pump_retired.load(Ordering::Acquire) {
+                                    receipt.finish(Err(WsSendError::NotSent));
+                                    continue;
+                                }
+                                receipt.dispatch_started = true;
                                 let result = codex_http_client::with_dispatch_guard(dispatch_guard,
                                     codex_http_client::admit_dispatch(inner.send(message))).await
                                     .map_err(WsSendError::Admission)
                                     .and_then(|result| result.map_err(WsSendError::Socket));
                                 let should_break = matches!(&result, Err(WsSendError::Socket(_)));
-                                let _ = tx_result.send(result);
+                                receipt.finish(result);
                                 if should_break {
                                     break;
                                 }
@@ -257,6 +298,7 @@ impl WsStream {
                     }
                     message = inner.next(), if pending_message.is_none() => {
                         let Some(message) = message else {
+                            pump_retired.store(true, Ordering::Release);
                             break;
                         };
                         match message {
@@ -273,6 +315,11 @@ impl WsStream {
                             | Message::Binary(_)
                             | Message::Close(_)
                             | Message::Frame(_))) => {
+                                // Publish Close before staging it: ingress backpressure
+                                // must not leave a closed socket eligible for dispatch.
+                                if matches!(&message, Message::Close(_)) {
+                                    pump_retired.store(true, Ordering::Release);
+                                }
                                 pending_message = Some(message);
                             }
                             Err(err) => {
@@ -285,9 +332,12 @@ impl WsStream {
                     }
                 }
             }
+            pump_retired.store(true, Ordering::Release);
         });
 
         Self {
+            retired,
+            handshake_metadata_emitted: false,
             tx_command,
             rx_message,
             rx_failure: Some(rx_failure),
@@ -308,16 +358,21 @@ impl WsStream {
                 message: "timeout waiting for websocket send queue before dispatch".into(),
                 delay: None,
             })?
-            .map_err(|_| ApiError::Retryable {
-                message: "websocket send queue closed before dispatch".into(),
-                delay: None,
-            })?;
+            .map_err(|_| websocket_closed_before_dispatch())?;
         let (tx_result, rx_result) = oneshot::channel();
-        permit.send(WsCommand::Send { message, dispatch_guard, tx_result });
+        permit.send(WsCommand::Send {
+            message,
+            dispatch_guard,
+            receipt: WsSendReceipt { tx_result: Some(tx_result), dispatch_started: false },
+        });
         let reason = match tokio::time::timeout_at(deadline, rx_result).await {
             Ok(Ok(Ok(()))) => return Ok(()),
+            Ok(Ok(Err(WsSendError::NotSent | WsSendError::Socket(WsError::Protocol(ProtocolError::SendAfterClosing))))) => {
+                return Err(websocket_closed_before_dispatch());
+            }
             Ok(Ok(Err(WsSendError::Admission(error)))) => return Err(ApiError::Transport(TransportError::Build(error))),
             Ok(Ok(Err(WsSendError::Socket(error)))) => format!("failed to send websocket request: {error}"),
+            Ok(Ok(Err(WsSendError::OutcomeUnknown))) => "websocket write was interrupted".into(),
             Ok(Err(_)) => "websocket send acknowledgement was lost".into(),
             Err(_) => format!(
                 "idle timeout sending websocket request after {}ms",
@@ -364,7 +419,8 @@ impl WsStream {
     }
 
     fn is_closed(&self) -> bool {
-        self.pending_failure.is_some()
+        self.retired.load(Ordering::Acquire)
+            || self.pending_failure.is_some()
             || self.pump_task.is_finished()
             || self.response_history.must_retire()
     }
@@ -414,7 +470,7 @@ impl ResponsesWebsocketConnection {
         Self {
             pump_handle: stream.pump_task.abort_handle(),
             dispatch_auth: None,
-            retired: Arc::new(AtomicBool::new(false)),
+            retired: Arc::clone(&stream.retired),
             stream: Arc::new(Mutex::new(Some(stream))),
             idle_timeout,
             metadata,
@@ -647,7 +703,13 @@ impl ResponsesWebsocketConnection {
                     if let Err(err) = send_result {
                         Err(err)
                     } else {
-                        for event in metadata.initial_events() {
+                        let initial_events = if ws_stream.handshake_metadata_emitted {
+                            metadata.initial_events_without_rate_limits()
+                        } else {
+                            ws_stream.handshake_metadata_emitted = true;
+                            metadata.initial_events()
+                        };
+                        for event in initial_events {
                             if tx_event.send(Ok(event)).await.is_err() {
                                 break 'response Err(ApiError::Stream(
                                     "response event consumer dropped".to_string(),
@@ -1183,6 +1245,9 @@ async fn run_websocket_response_stream(
                     }
                     completed |= is_completed;
                 }
+                if interpreter.take_compaction_progress() {
+                    progress_deadline = tokio::time::Instant::now() + idle_timeout;
+                }
                 if completed {
                     ws_stream.response_history = interpreter.into_connection_history();
                     return Ok(());
@@ -1196,20 +1261,15 @@ async fn run_websocket_response_stream(
             Message::Close(frame) => {
                 let mut message =
                     "websocket closed by server before response.completed".to_string();
-                let mut reconnectable = false;
+                let code = frame.as_ref().map(|frame| u16::from(frame.code));
                 if let Some(frame) = frame {
                     message.push_str(&format!(
                         " (code {}, reason: {:?})",
                         frame.code,
                         frame.reason.as_str()
                     ));
-                    reconnectable = close_code_invites_reconnect(frame.code);
                 }
-                return Err(if reconnectable {
-                    ApiError::reconnectable_close(message)
-                } else {
-                    ApiError::Stream(message)
-                });
+                return Err(ApiError::WebsocketClosed { code, message });
             }
             Message::Frame(_) => {}
             Message::Ping(_) | Message::Pong(_) => {}
@@ -1217,18 +1277,13 @@ async fn run_websocket_response_stream(
     }
 }
 
-/// Whether a mid-response close code means "connect again", not "do not".
-///
-/// The server closes with these codes when it sheds load or restarts a node,
-/// which is unrelated to this request: the same request on a new socket
-/// normally completes. Every other code — a policy rejection, a protocol or
-/// payload error, an authentication failure — describes the request or the
-/// client, so reconnecting would only repeat the rejection.
-fn close_code_invites_reconnect(code: CloseCode) -> bool {
-    matches!(
-        code,
-        CloseCode::Normal | CloseCode::Away | CloseCode::Restart | CloseCode::Again
-    )
+/// The pump or tungstenite proved rejection before writing this request.
+fn websocket_closed_before_dispatch() -> ApiError {
+    ApiError::WebsocketRejected {
+        reason: codex_protocol::error::WebsocketRecoveryReason::ConnectionClosedBeforeDispatch,
+        message: "websocket closed before the request could be written".into(),
+        delay: None,
+    }
 }
 
 fn websocket_read_error(err: WsError) -> ApiError {

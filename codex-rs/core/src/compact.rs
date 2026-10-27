@@ -3240,6 +3240,13 @@ async fn drain_to_completed(
         } => result,
     };
     drop(model_request_timing_guard);
+    sess.bind_rate_limit_account(client_session.dispatched_account().cloned())
+        .await;
+    if let Err(CodexErr::UsageLimitReached(error)) = &stream_result
+        && let Some(snapshot) = error.rate_limits.as_deref()
+    {
+        sess.update_rate_limits(turn_context, snapshot.clone()).await;
+    }
     let mut stream = stream_result?;
     let mut accumulator = LocalCompactionAccumulator::default();
     let mut model_stream_processing_handoff: Option<crate::turn_timing::TurnTimingGuard> = None;
@@ -3272,7 +3279,13 @@ async fn drain_to_completed(
                             .await?;
                     }
                 }
-                return Err(error.into_response_error());
+                let error = error.into_response_error();
+                if let CodexErr::UsageLimitReached(limit) = &error
+                    && let Some(snapshot) = limit.rate_limits.as_deref()
+                {
+                    sess.update_rate_limits(turn_context, snapshot.clone()).await;
+                }
+                return Err(error);
             }
         };
         model_stream_processing_handoff = turn_context

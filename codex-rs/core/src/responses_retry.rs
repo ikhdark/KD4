@@ -55,9 +55,8 @@ pub(crate) struct ResponsesStreamRetryState {
     wait_deadline: Option<tokio::time::Instant>,
     account_wait_started: bool,
     /// Whether this request already spent its one WebSocket reconnect on a
-    /// close that invited another connection. Separate from `retries` so the
-    /// reconnect does not shrink the provider budget, and per-request so a
-    /// server restarting repeatedly cannot reconnect without bound.
+    /// close that invited another connection. It also consumes `retries`:
+    /// reconnect and HTTPS fallback share the post-dispatch replay budget.
     reconnected_after_close: bool,
     repaired_explicit_rejection: bool,
 }
@@ -146,7 +145,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
             return Err(err);
         }
         retry_state.repaired_explicit_rejection = true;
-        // Both typed rejections prove no sampling was accepted. Retire the
+        // Each typed refusal proves no sampling was accepted. Retire the
         // chain/socket so the next request carries full authoritative input.
         client_session.replace_websocket_for_recovery();
         if let Some(advice) = retry_after {
@@ -167,21 +166,36 @@ pub(crate) async fn handle_retryable_response_stream_error(
     // abandon WebSockets for the session: rebuild the stream once first. Placed
     // ahead of the fallback branch because that branch switches transport on the
     // first stream-read failure, which would otherwise consume this case.
-    if should_reconnect_after_close(&err, retry_state) {
+    if retry_state.retries < max_retries && should_reconnect_after_close(&err, retry_state) {
+        retry_state.retries += 1;
         retry_state.reconnected_after_close = true;
+        let delay = response_stream_retry_delay(&err, retry_state.retries);
+        let retry_at = retry_after
+            .map(RetryAfter::deadline)
+            .unwrap_or_else(|| tokio::time::Instant::now() + delay);
         warn!(
             turn_id = %turn_context.sub_id,
             ?request,
+            ?delay,
             error = %err,
             "provider closed the stream and invited a reconnect; rebuilding the websocket"
         );
         client_session.replace_websocket_for_recovery();
         sess.notify_stream_error(
             turn_context,
-            "Reconnecting... the server closed the stream".to_string(),
+            format!("Reconnecting... the server closed the stream (next retry in {delay:.1?})"),
             err,
         )
         .await;
+        wait_for_response_retry_deadline(
+            retry_at,
+            wait_deadline,
+            retry_after.is_some(),
+            sess,
+            turn_context,
+            cancellation_token,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -211,6 +225,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
         err,
         CodexErr::ConnectionFailed(_) | CodexErr::ResponseStreamFailed(_)
     ) || retry_budget_exhausted)
+        && (matches!(err, CodexErr::ConnectionFailed(_)) || !retry_budget_exhausted)
         && should_switch_fallback_transport(&err)
         && client_session
             .try_switch_fallback_transport_after_error(&turn_context.session_telemetry, &err)
@@ -223,10 +238,10 @@ pub(crate) async fn handle_retryable_response_stream_error(
             }),
         )
         .await;
-        // The loop supplies one immediate HTTPS attempt. Early fallback keeps the remaining
-        // budget; exhausted recovery must not start a second full retry window.
-        if retry_budget_exhausted {
-            exhaust_retry_budget_for_http_fallback(&mut retry_state.retries, max_retries);
+        // A post-dispatch HTTPS replay spends the same budget as a reconnect.
+        // Proven pre-dispatch connection recovery does not spend that budget.
+        if !matches!(err, CodexErr::ConnectionFailed(_)) {
+            retry_state.retries += 1;
         }
         if let Some(advice) = retry_after {
             wait_for_response_retry_deadline(
@@ -317,19 +332,15 @@ pub(crate) async fn handle_retryable_response_stream_error(
     Err(err)
 }
 
-fn exhaust_retry_budget_for_http_fallback(retries: &mut u64, max_retries: u64) {
-    *retries = max_retries;
-}
-
 /// Decides whether a mid-response close should rebuild the WebSocket instead of
 /// abandoning the transport for the rest of the session.
 ///
 /// Applies once per request, and only to a close whose code invites another
-/// connection. The reconnect is immediate and unbacked-off: the server has
-/// already answered, so there is nothing to wait for, and a second close of the
-/// same request falls through to the ordinary fallback path. A close code that
-/// rejects the request (policy, protocol, payload) is never reconnected, since
-/// a new socket would only repeat the rejection.
+/// connection. Recovery backs off so a restarting or overloaded backend has
+/// time to recover; a second close of the same request falls through to the
+/// ordinary fallback path. A close code that rejects the request (policy,
+/// protocol, payload) is never reconnected, since a new socket would only repeat
+/// the rejection.
 fn should_reconnect_after_close(err: &CodexErr, state: &ResponsesStreamRetryState) -> bool {
     !state.reconnected_after_close
         && matches!(err, CodexErr::ResponseStreamFailed(failed) if failed.reconnectable_close)
@@ -721,9 +732,13 @@ fn response_stream_retry_delay(err: &CodexErr, retry_count: u64) -> Duration {
     if let Some(advice) = err.retry_after() {
         return advice.remaining_delay();
     }
-    if is_server_busy(err) {
+    if is_server_busy(err)
+        || matches!(err, CodexErr::ResponseStreamFailed(failed) if failed.reconnectable_close)
+    {
         // Reuse the shared jitter implementation so simultaneous agents do not
-        // retry in lockstep. No new retry loop or independent budget is added.
+        // retry in lockstep after capacity rejection or a server restart. A
+        // close is not proof that a replacement backend is ready to accept work.
+        // No new retry loop or independent budget is added.
         return codex_client::capped_backoff(
             INITIAL_CAPACITY_RETRY_DELAY,
             retry_count,

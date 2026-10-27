@@ -176,6 +176,23 @@ impl Session {
                         }
                     }
                     for section in sections {
+                        if section.is_unavailable() {
+                            if let Some(snapshot) = previous_world_state
+                                .as_ref()
+                                .and_then(|previous| previous.section(section.id()))
+                            {
+                                let rendering = previous_world_state
+                                    .as_ref()
+                                    .and_then(|previous| previous.rendered_extension(section.id()))
+                                    .cloned();
+                                world_state.add_preserved_extension_section(
+                                    section.id(),
+                                    snapshot.clone(),
+                                    rendering,
+                                );
+                            }
+                            continue;
+                        }
                         let previous_rendering = previous_world_state
                             .as_ref()
                             .and_then(|previous| previous.rendered_extension(section.id()));

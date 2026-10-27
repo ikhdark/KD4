@@ -169,7 +169,9 @@ struct CompactionReceipt {
 pub(crate) struct SessionState {
     pub(crate) session_configuration: SessionConfiguration,
     pub(crate) history: ContextManager,
-    pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
+    rate_limits: HashMap<String, RateLimitSnapshot>,
+    active_rate_limit_id: Option<String>,
+    rate_limit_account: Option<crate::responses_retry::AccountChangeIdentity>,
     /// Latest compaction request usage; see `published_token_info`.
     latest_compaction_receipt: Option<CompactionReceipt>,
     /// Usage and rate limits carried by the last published `TokenCount`.
@@ -208,7 +210,9 @@ impl SessionState {
         Self {
             session_configuration,
             history,
-            latest_rate_limits: None,
+            rate_limits: HashMap::new(),
+            active_rate_limit_id: None,
+            rate_limit_account: None,
             latest_compaction_receipt: None,
             last_published_token_count: None,
             prompt_token_calibration: PromptTokenCalibration::default(),
@@ -423,18 +427,39 @@ impl SessionState {
         Some(info)
     }
 
-    pub(crate) fn set_rate_limits(&mut self, snapshot: RateLimitSnapshot) {
-        self.latest_rate_limits = Some(merge_rate_limit_fields(
-            self.latest_rate_limits.as_ref(),
-            snapshot,
-        ));
+    pub(crate) fn bind_rate_limit_account(
+        &mut self,
+        account: Option<crate::responses_retry::AccountChangeIdentity>,
+    ) {
+        if self.rate_limit_account != account {
+            self.rate_limits.clear();
+            self.active_rate_limit_id = None;
+            self.rate_limit_account = account;
+        }
+    }
+
+    pub(crate) fn set_rate_limits(&mut self, mut snapshot: RateLimitSnapshot) {
+        let limit_id = snapshot.limit_id.as_deref().map(str::trim)
+            .filter(|id| !id.is_empty()).unwrap_or("codex").to_ascii_lowercase().replace('-', "_");
+        snapshot.limit_id = Some(limit_id.clone());
+        // Credits are account-wide; bucket windows and policy fields are not.
+        let credits = snapshot.credits.clone().or_else(|| self.active_rate_limit_id
+            .as_ref().and_then(|id| self.rate_limits.get(id)).and_then(|prior| prior.credits.clone()));
+        let mut snapshot = merge_rate_limit_fields(self.rate_limits.get(&limit_id), snapshot);
+        snapshot.credits = credits.clone();
+        for prior in self.rate_limits.values_mut() {
+            prior.credits = credits.clone();
+        }
+        self.rate_limits.insert(limit_id.clone(), snapshot);
+        self.active_rate_limit_id = Some(limit_id);
     }
 
     /// The snapshot a `TokenCount` publishes; see `published_token_info`.
     pub(crate) fn token_info_and_rate_limits(
         &self,
     ) -> (Option<TokenUsageInfo>, Option<RateLimitSnapshot>) {
-        (self.published_token_info(), self.latest_rate_limits.clone())
+        (self.published_token_info(), self.active_rate_limit_id.as_ref()
+            .and_then(|id| self.rate_limits.get(id)).cloned())
     }
 
     /// Whether `event` exactly repeats the last published `TokenCount`.
@@ -557,16 +582,14 @@ fn merge_rate_limit_fields(
     if snapshot.limit_id.is_none() {
         snapshot.limit_id = Some("codex".to_string());
     }
-    // Responses without rate-limit headers still yield an empty default bucket,
-    // and event updates can carry only credits or plan. Neither reports that the
-    // bucket's windows ended. A window-bearing update stays authoritative for
-    // both windows, and another bucket's windows never carry over.
-    if snapshot.primary.is_none()
-        && snapshot.secondary.is_none()
-        && let Some(prior) = previous.filter(|prior| prior.limit_id == snapshot.limit_id)
-    {
-        snapshot.primary = prior.primary.clone();
-        snapshot.secondary = prior.secondary.clone();
+    // Missing optional windows do not revoke an independently reported window.
+    if let Some(prior) = previous.filter(|prior| prior.limit_id == snapshot.limit_id) {
+        if snapshot.primary.is_none() {
+            snapshot.primary = prior.primary.clone();
+        }
+        if snapshot.secondary.is_none() {
+            snapshot.secondary = prior.secondary.clone();
+        }
     }
     if snapshot.credits.is_none() {
         snapshot.credits = previous.and_then(|prior| prior.credits.clone());

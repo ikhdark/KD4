@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use codex_core::config::Config;
 use codex_extension_api::ConfigContributor;
@@ -52,7 +53,11 @@ impl ImageGenerationExtensionConfig {
 }
 
 fn image_generation_http_clients(http_client_factory: HttpClientFactory) -> RouteAwareClientPool {
-    RouteAwareClientPool::new(http_client_factory, ClientRouteClass::Api)
+    RouteAwareClientPool::with_connect_timeout(
+        http_client_factory,
+        ClientRouteClass::Api,
+        Duration::from_secs(30),
+    )
 }
 
 impl ThreadLifecycleContributor<Config> for ImageGenerationExtension {

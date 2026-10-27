@@ -54,6 +54,8 @@ use crate::transport::validate_websocket_listener;
 use codex_analytics::AppServerRpcTransport;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::JSONRPCMessage;
+use codex_app_server_protocol::JSONRPCRequest;
+use codex_app_server_protocol::RemoteControlStatusChangedNotification;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::TextPosition as AppTextPosition;
 use codex_app_server_protocol::TextRange as AppTextRange;
@@ -225,12 +227,13 @@ fn prepare_connection(
     disconnect_sender: Option<CancellationToken>,
     transport_shutdown: CancellationToken,
 ) -> (ConnectionState, OutboundControlEvent) {
-    let connection = ConnectionState::new(
+    let mut connection = ConnectionState::new(
         origin,
         Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
         Arc::new(transport::OutboundNotificationOptOuts::new(HashSet::new())),
     );
+    connection.disconnect = disconnect_sender.clone().unwrap_or_else(|| transport_shutdown.clone());
     let state = OutboundConnectionState::new(
         writer,
         Arc::clone(&connection.outbound_initialized),
@@ -239,6 +242,11 @@ fn prepare_connection(
         disconnect_sender,
         transport_shutdown,
     );
+    let state = if matches!(origin, ConnectionOrigin::Stdio) {
+        state.with_stdio_delivery()
+    } else {
+        state
+    };
     (
         connection,
         OutboundControlEvent::Opened {
@@ -246,6 +254,44 @@ fn prepare_connection(
             state,
         },
     )
+}
+
+async fn process_connection_request(
+    processor: &Arc<MessageProcessor>,
+    outgoing: &Arc<OutgoingMessageSender>,
+    connection_id: ConnectionId,
+    request: JSONRPCRequest,
+    transport: &AppServerTransport,
+    connection: &ConnectionState,
+    remote_status: RemoteControlStatusChangedNotification,
+) {
+    let was_initialized = connection.session.initialized();
+    processor
+        .process_request(connection_id, request, transport, Arc::clone(&connection.session))
+        .await;
+    if !was_initialized && connection.session.initialized() {
+        let experimental_api_enabled = connection.session.experimental_api_enabled();
+        if !connection.outbound_opted_out_notification_methods.replace(
+            connection.session.opted_out_notification_methods(),
+        ) {
+            warn!("failed to update outbound opted-out notifications");
+        }
+        connection.outbound_experimental_api_enabled
+            .store(experimental_api_enabled, std::sync::atomic::Ordering::Release);
+        processor.initialize_processor
+            .send_initialize_notifications_to_connection(connection_id).await;
+        outgoing.send_server_notification_to_connections(
+            &[connection_id], ServerNotification::RemoteControlStatusChanged(remote_status),
+        ).await;
+        processor.thread_processor.thread_state_manager.connection_initialized(
+            connection_id,
+            ConnectionCapabilities {
+                request_attestation: connection.session.request_attestation(),
+                experimental_api: experimental_api_enabled,
+            },
+        ).await;
+        connection.outbound_initialized.store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 #[derive(Default)]
@@ -935,6 +981,7 @@ pub async fn run_main(
     let outbound_handle = tokio::spawn(async move {
         let mut outbound_connections = HashMap::<ConnectionId, OutboundConnectionState>::new();
         loop {
+            outbound_connections.retain(|_, state| !state.is_disconnected());
             tokio::select! {
                     biased;
                     event = outbound_control_rx.recv() => {
@@ -1007,13 +1054,32 @@ pub async fn run_main(
             .thread_processor
             .thread_watch_manager
             .subscribe_running_turn_count();
-        let mut connections = HashMap::<ConnectionId, ConnectionState>::new();
+        let mut connections = HashMap::<ConnectionId, Arc<ConnectionState>>::new();
         let mut connection_cleanup_tasks = ConnectionCleanupTasks::new();
         // Initialization watchdogs share `connection_cleanup_tasks`; release them
         // when the loop exits so shutdown cleanup does not wait out their timer.
         let init_watchdog_shutdown = CancellationToken::new();
-        let mut remote_control_status_rx = remote_control_handle.status_receiver();
-        let mut remote_control_status = remote_control_status_rx.borrow().clone();
+        let remote_control_status_rx = remote_control_handle.status_receiver();
+        {
+            // Watch coalesces status changes while the bounded output owner is
+            // congested. No status send can hold the shared ingress dispatcher.
+            let mut status_rx = remote_control_status_rx.clone();
+            let outgoing = Arc::clone(&initialize_notification_sender);
+            let stop = init_watchdog_shutdown.clone();
+            connection_cleanup_tasks.spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = stop.cancelled() => break,
+                        changed = status_rx.changed() => if changed.is_err() { break; },
+                    }
+                    let status = status_rx.borrow().clone();
+                    tokio::select! {
+                        _ = stop.cancelled() => break,
+                        _ = outgoing.send_server_notification(ServerNotification::RemoteControlStatusChanged(status)) => {},
+                    }
+                }
+            });
+        }
         let transport_shutdown_token = transport_shutdown_token.clone();
         let force_shutdown_token = force_shutdown_token.clone();
         async move {
@@ -1071,7 +1137,7 @@ pub async fn run_main(
                                 writer,
                                 disconnect_sender,
                             } => {
-                                let (connection, outbound_opened) = prepare_connection(
+                                let (mut connection, outbound_opened) = prepare_connection(
                                     connection_id,
                                     origin,
                                     writer,
@@ -1094,20 +1160,54 @@ pub async fn run_main(
                                         }
                                     });
                                 }
-                                initialize_notification_sender
-                                    .connection_opened_with_runtime(
-                                        connection_id,
-                                        Arc::clone(&connection.outbound_initialized),
-                                        disconnect_sender.unwrap_or_else(|| transport_shutdown_token.clone()),
-                                    )
-                                    .await;
-                                if outbound_control_tx
-                                    .send(outbound_opened)
-                                    .await
-                                    .is_err()
-                                {
-                                    break "outbound_router_closed";
+                                match outbound_control_tx.try_send(outbound_opened) {
+                                    Ok(()) => {},
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        // Dropping the unopened outbound state retires only
+                                        // this connection; never await a congested router.
+                                        connection.disconnect.cancel();
+                                        continue;
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => break "outbound_router_closed",
                                 }
+                                let (ingress, mut requests) = transport::ConnectionRequestIngress::channel();
+                                connection.request_ingress = Some(ingress);
+                                let connection = Arc::new(connection);
+                                let worker_connection = Arc::clone(&connection);
+                                let worker_processor = Arc::clone(&processor);
+                                let outgoing = Arc::clone(&initialize_notification_sender);
+                                let worker_transport = transport.clone();
+                                let status_rx = remote_control_status_rx.clone();
+                                connection_cleanup_tasks.spawn(async move {
+                                    let cancelled = worker_connection.session.rpc_gate.cancellation_token();
+                                    tokio::select! {
+                                        biased;
+                                        _ = cancelled.cancelled() => return,
+                                        _ = outgoing.connection_opened_with_runtime(
+                                            connection_id,
+                                            Arc::clone(&worker_connection.outbound_initialized),
+                                            worker_connection.disconnect.clone(),
+                                        ) => {},
+                                    }
+                                    loop {
+                                        let next = tokio::select! {
+                                            biased;
+                                            _ = cancelled.cancelled() => break,
+                                            next = requests.recv() => next,
+                                        };
+                                        let Some(queued) = next else { break; };
+                                        let status = status_rx.borrow().clone();
+                                        tokio::select! {
+                                            biased;
+                                            _ = cancelled.cancelled() => break,
+                                            _ = process_connection_request(
+                                                &worker_processor, &outgoing, connection_id,
+                                                queued.request, &worker_transport, &worker_connection, status,
+                                            ) => {},
+                                        }
+                                        drop(queued._credit);
+                                    }
+                                });
                                 connections.insert(connection_id, connection);
                             }
                             TransportEvent::ConnectionClosed { connection_id } => {
@@ -1115,10 +1215,10 @@ pub async fn run_main(
                                     continue;
                                 };
                                 connection_state.session.rpc_gate.close().await;
-                                let outbound_closed = outbound_control_tx
-                                    .send(OutboundControlEvent::Closed { connection_id })
-                                    .await
-                                    .is_ok();
+                                connection_state.disconnect.cancel();
+                                let outbound_closed = !matches!(outbound_control_tx.try_send(
+                                    OutboundControlEvent::Closed { connection_id },
+                                ), Err(mpsc::error::TrySendError::Closed(_)));
                                 let processor = Arc::clone(&processor);
                                 connection_cleanup_tasks.spawn(async move {
                                     processor
@@ -1135,73 +1235,13 @@ pub async fn run_main(
                             TransportEvent::IncomingMessage { connection_id, message } => {
                                 match message {
                                     JSONRPCMessage::Request(request) => {
-                                        let Some(connection_state) = connections.get_mut(&connection_id) else {
+                                        let Some(connection) = connections.get(&connection_id) else {
                                             warn!("dropping request from unknown connection: {connection_id:?}");
                                             continue;
                                         };
-                                        let was_initialized =
-                                            connection_state.session.initialized();
-                                        processor
-                                            .process_request(
-                                                connection_id,
-                                                request,
-                                                &transport,
-                                                Arc::clone(&connection_state.session),
-                                            )
-                                            .await;
-                                        let is_initialized = connection_state.session.initialized();
-                                        if !was_initialized && is_initialized {
-                                            let opted_out_notification_methods_snapshot = connection_state
-                                                .session
-                                                .opted_out_notification_methods();
-                                            let experimental_api_enabled =
-                                                connection_state.session.experimental_api_enabled();
-
-                                            if !connection_state
-                                                .outbound_opted_out_notification_methods
-                                                .replace(opted_out_notification_methods_snapshot)
-                                            {
-                                                warn!(
-                                                    "failed to update outbound opted-out notifications"
-                                                );
-                                            }
-                                            connection_state
-                                                .outbound_experimental_api_enabled
-                                                .store(
-                                                    experimental_api_enabled,
-                                                    std::sync::atomic::Ordering::Release,
-                                                );
-
-                                            processor
-                                                .initialize_processor
-                                                .send_initialize_notifications_to_connection(
-                                                    connection_id,
-                                                )
-                                                .await;
-                                            initialize_notification_sender
-                                                .send_server_notification_to_connections(
-                                                    &[connection_id],
-                                                    ServerNotification::RemoteControlStatusChanged(
-                                                        remote_control_status.clone(),
-                                                    ),
-                                                )
-                                                .await;
-                                            processor
-                                                .thread_processor
-                                                .thread_state_manager
-                                                .connection_initialized(
-                                                    connection_id,
-                                                    ConnectionCapabilities {
-                                                        request_attestation: connection_state
-                                                            .session
-                                                            .request_attestation(),
-                                                        experimental_api: experimental_api_enabled,
-                                                    },
-                                                )
-                                                .await;
-                                            connection_state
-                                                .outbound_initialized
-                                                .store(true, std::sync::atomic::Ordering::Release);
+                                        if !connection.request_ingress.as_ref().is_some_and(|ingress| ingress.try_send(request)) {
+                                            warn!(?connection_id, "retiring overloaded connection request ingress");
+                                            connection.disconnect.cancel();
                                         }
                                     }
                                     JSONRPCMessage::Response(response) => {
@@ -1232,20 +1272,6 @@ pub async fn run_main(
                         }
                     }
                     _ = connection_cleanup_tasks.reap_next() => {}
-                    changed = remote_control_status_rx.changed() => {
-                        if changed.is_err() {
-                            continue;
-                        }
-                        let status = remote_control_status_rx.borrow().clone();
-                        if remote_control_status == status {
-                            continue;
-                        }
-                        remote_control_status = status.clone();
-                        let notification = ServerNotification::RemoteControlStatusChanged(status);
-                        initialize_notification_sender
-                            .send_server_notification(notification)
-                            .await;
-                    }
                     result = thread_attachment_tasks.join_next(), if !thread_attachment_tasks.is_empty() => {
                         match result {
                             Some(Ok(keep_listening)) => listen_for_threads = keep_listening,

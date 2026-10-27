@@ -95,6 +95,64 @@ use tracing::warn;
 
 const THREAD_CREATED_CHANNEL_CAPACITY: usize = 1024;
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct InheritedInstructionSnapshot {
+    version: u8,
+    source_parent_thread_id: ThreadId,
+    instructions: Option<InheritedInstructionBody>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct InheritedInstructionBody {
+    source: AbsolutePathBuf,
+    text: String,
+    sha256: String,
+}
+
+pub(crate) fn capture_inherited_user_instructions(
+    parent: ThreadId,
+    instructions: Option<codex_extension_api::UserInstructions>,
+) -> CodexResult<String> {
+    let snapshot = InheritedInstructionSnapshot {
+        version: 1,
+        source_parent_thread_id: parent,
+        instructions: instructions.map(|instructions| {
+            let digest = <sha2::Sha256 as sha2::Digest>::digest(instructions.text.as_bytes());
+            InheritedInstructionBody {
+                source: instructions.source,
+                text: instructions.text,
+                sha256: hex::encode(digest),
+            }
+        }),
+    };
+    serde_json::to_string(&snapshot).map_err(|error| CodexErr::Fatal(format!(
+        "failed to retain inherited instruction snapshot: {error}"
+    )))
+}
+
+fn restore_inherited_user_instructions(
+    snapshot: &str,
+) -> CodexResult<Option<codex_extension_api::UserInstructions>> {
+    let snapshot: InheritedInstructionSnapshot = serde_json::from_str(snapshot)
+        .map_err(|error| CodexErr::InvalidRequest(format!(
+            "child instruction recovery is blocked: invalid inherited snapshot ({error})"
+        )))?;
+    if snapshot.version != 1 {
+        return Err(CodexErr::InvalidRequest(
+            "child instruction recovery is blocked: unsupported inherited snapshot version".to_string(),
+        ));
+    }
+    snapshot.instructions.map(|body| {
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(body.text.as_bytes());
+        if body.sha256 != hex::encode(digest) {
+            return Err(CodexErr::InvalidRequest(
+                "child instruction recovery is blocked: inherited snapshot digest mismatch".to_string(),
+            ));
+        }
+        Ok(codex_extension_api::UserInstructions { text: body.text, source: body.source })
+    }).transpose()
+}
+
 /// Represents a newly created Codex thread (formerly called a conversation), including the first event
 /// (which is [`EventMsg::SessionConfigured`]).
 pub struct NewThread {
@@ -1129,6 +1187,25 @@ impl ThreadManager {
             .await
     }
 
+    /// Retire ID-keyed consumers under the existing replacement-publication
+    /// lease, without holding the global map lock across asynchronous cleanup.
+    /// The callback receives (removed_expected, replacement_present). A replaced
+    /// instance must not be cleaned up; after its old unload marker is released,
+    /// its creation notification is retried so attachment cannot be stranded.
+    #[doc(hidden)]
+    pub async fn retire_thread_with_cleanup<F, Fut>(
+        &self,
+        thread_id: ThreadId,
+        expected_thread: &Arc<CodexThread>,
+        cleanup: F,
+    ) -> bool
+    where
+        F: FnOnce(bool, bool) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        self.state.retire_thread_with_cleanup(thread_id, expected_thread, cleanup).await
+    }
+
     /// Roll back a newly spawned thread that failed before its creator could
     /// publish a successful response.
     /// Returns true only after shutdown and persistence cleanup both succeed.
@@ -1733,6 +1810,39 @@ impl ThreadManagerState {
         true
     }
 
+    async fn retire_thread_with_cleanup<F, Fut>(
+        &self,
+        thread_id: ThreadId,
+        expected_thread: &Arc<CodexThread>,
+        cleanup: F,
+    ) -> bool
+    where
+        F: FnOnce(bool, bool) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let lease = self.acquire_thread_registry_lease(thread_id).await;
+        let (removed_expected, replacement) = {
+            let mut threads = self.threads.write().await;
+            match threads.get(&thread_id) {
+                Some(current) if Arc::ptr_eq(current, expected_thread) => {
+                    threads.remove(&thread_id);
+                    self.forget_thread_created_instance_if_same(&thread_id, expected_thread);
+                    (true, None)
+                }
+                Some(current) => (false, Some(Arc::clone(current))),
+                None => (false, None),
+            }
+        };
+        cleanup(removed_expected, replacement.is_some()).await;
+        drop(lease);
+        if let Some(replacement) = replacement {
+            self.notify_thread_created(thread_id, &replacement).await;
+            false
+        } else {
+            true
+        }
+    }
+
     async fn list_thread_created_ids(&self) -> Vec<ThreadId> {
         let threads = self.threads.read().await;
         let mut created_instances = self
@@ -1870,21 +1980,34 @@ impl ThreadManagerState {
     ///   provider;
     /// - running resumes and compaction paths, which retain the live session.
     ///
-    /// Provider warnings only apply to fresh loads. If a parent runtime is no
-    /// longer available, its child starts without provider instructions rather
-    /// than loading independently.
+    /// Provider warnings only apply to fresh loads. A child cannot silently
+    /// replace an unavailable inherited snapshot with an empty instruction set.
     async fn user_instructions_for_spawn(
         &self,
+        initial_history: &InitialHistory,
         session_source: &SessionSource,
         parent_thread_id: Option<ThreadId>,
         forked_from_thread_id: Option<ThreadId>,
-    ) -> LoadedUserInstructions {
+    ) -> CodexResult<LoadedUserInstructions> {
         let is_root_agent = !session_source.is_non_root_agent();
         if is_root_agent {
-            return self
+            return Ok(self
                 .user_instructions_provider
                 .load_user_instructions()
-                .await;
+                .await);
+        }
+
+        if let InitialHistory::Resumed(resumed) = initial_history
+            && let Some(graph) = self.agent_graph_store()
+            && let Some(snapshot) = graph.thread_spawn_instruction_snapshot(resumed.conversation_id)
+                .await.map_err(|error| CodexErr::InvalidRequest(format!(
+                    "child instruction recovery is blocked: failed to read inherited snapshot ({error})"
+                )))?
+        {
+            return Ok(LoadedUserInstructions {
+                instructions: restore_inherited_user_instructions(&snapshot)?,
+                warnings: Vec::new(),
+            });
         }
 
         let inherited_thread_id = match session_source {
@@ -1896,16 +2019,19 @@ impl ThreadManagerState {
         let instructions = match inherited_thread_id {
             // The spawn path retains only thread IDs, so look up the live
             // runtime again here to inherit its user instructions.
-            Some(thread_id) => match self.get_thread(thread_id).await {
-                Ok(thread) => thread.codex.session.user_instructions().await,
-                Err(_) => None,
-            },
-            None => None,
+            Some(thread_id) => self.get_thread(thread_id).await.map_err(|error| {
+                CodexErr::InvalidRequest(format!(
+                    "child instruction recovery is blocked: parent {thread_id} must be loaded before resuming its child ({error})"
+                ))
+            })?.codex.session.user_instructions().await,
+            None => return Err(CodexErr::InvalidRequest(
+                "child instruction recovery is blocked: inherited instruction owner is unknown".to_string(),
+            )),
         };
-        LoadedUserInstructions {
+        Ok(LoadedUserInstructions {
             instructions,
             warnings: Vec::new(),
-        }
+        })
     }
 
     async fn inherited_originator_for_parent_thread(
@@ -2278,7 +2404,7 @@ impl ThreadManagerState {
             let _thread_registry_lease = self
                 .acquire_thread_registry_lease(resumed.conversation_id)
                 .await;
-            let mut threads = self.threads.write().await;
+            let threads = self.threads.write().await;
             if let Some(thread) = threads.get(&resumed.conversation_id).cloned() {
                 if thread.is_running() {
                     if let Some(requested_rollout_path) = resumed.rollout_path.as_deref()
@@ -2296,7 +2422,17 @@ impl ThreadManagerState {
                         was_already_running: true,
                     });
                 }
-                threads.remove(&resumed.conversation_id);
+                // A closed event stream is not proof that accepted effects or
+                // durable writers have stopped. Retain registration while the
+                // exact instance drains; never wait with the global map locked.
+                drop(threads);
+                thread.request_shutdown().await?;
+                thread.wait_until_drained().await?;
+                let mut threads = self.threads.write().await;
+                if threads.get(&resumed.conversation_id).is_some_and(|current| Arc::ptr_eq(current, &thread)) {
+                    threads.remove(&resumed.conversation_id);
+                    self.forget_thread_created_instance_if_same(&resumed.conversation_id, &thread);
+                }
             }
         }
         if parent_thread_id.is_none()
@@ -2319,8 +2455,8 @@ impl ThreadManagerState {
             }
         }
         let user_instructions = self
-            .user_instructions_for_spawn(&session_source, parent_thread_id, forked_from_thread_id)
-            .await;
+            .user_instructions_for_spawn(&initial_history, &session_source, parent_thread_id, forked_from_thread_id)
+            .await?;
         let tracked_session_source = session_source.clone();
         let multi_agent_version = self
             .initial_multi_agent_version_for_spawn(

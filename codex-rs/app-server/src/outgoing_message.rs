@@ -191,7 +191,7 @@ pub(crate) struct ThreadScopedOutgoingMessageSender {
 #[derive(Default)]
 struct ComponentNotificationCache {
     token_usage: HashMap<(ConnectionId, String), ThreadTokenUsageUpdatedNotification>,
-    rate_limits: HashMap<ConnectionId, RateLimitSnapshot>,
+    rate_limits: HashMap<(ConnectionId, String), RateLimitSnapshot>,
     publications: HashMap<ComponentNotificationKey, ComponentNotificationPublication>,
 }
 
@@ -214,7 +214,7 @@ impl ComponentNotificationPublication {
 #[derive(Clone, Eq, Hash, PartialEq)]
 enum ComponentNotificationKey {
     TokenUsage(ConnectionId, String),
-    RateLimits(ConnectionId),
+    RateLimits(ConnectionId, String),
 }
 
 impl ComponentNotificationKey {
@@ -223,15 +223,23 @@ impl ComponentNotificationKey {
             ServerNotification::ThreadTokenUsageUpdated(notification) => {
                 Some(Self::TokenUsage(connection_id, notification.thread_id.clone()))
             }
-            ServerNotification::AccountRateLimitsUpdated(_) => Some(Self::RateLimits(connection_id)),
+            ServerNotification::AccountRateLimitsUpdated(notification) => {
+                Some(Self::RateLimits(connection_id, Self::rate_limit_family(&notification.rate_limits)))
+            }
             _ => None,
         }
     }
 
     fn connection_id(&self) -> ConnectionId {
         match self {
-            Self::TokenUsage(connection_id, _) | Self::RateLimits(connection_id) => *connection_id,
+            Self::TokenUsage(connection_id, _) | Self::RateLimits(connection_id, _) => *connection_id,
         }
+    }
+
+    fn rate_limit_family(snapshot: &RateLimitSnapshot) -> String {
+        snapshot.limit_id.as_deref().map(str::trim)
+            .filter(|id| !id.is_empty()).unwrap_or("codex")
+            .to_ascii_lowercase().replace('-', "_")
     }
 }
 
@@ -287,7 +295,8 @@ impl ComponentNotificationCache {
                 self.token_usage.get(&(connection_id, notification.thread_id.clone())) != Some(notification)
             }
             ServerNotification::AccountRateLimitsUpdated(notification) => {
-                self.rate_limits.get(&connection_id) != Some(&notification.rate_limits)
+                self.rate_limits.get(&(connection_id, ComponentNotificationKey::rate_limit_family(&notification.rate_limits)))
+                    != Some(&notification.rate_limits)
             }
             _ => true,
         }
@@ -299,7 +308,10 @@ impl ComponentNotificationCache {
                 self.token_usage.insert((connection_id, notification.thread_id.clone()), notification.clone());
             }
             ServerNotification::AccountRateLimitsUpdated(notification) => {
-                self.rate_limits.insert(connection_id, notification.rate_limits.clone());
+                self.rate_limits.insert(
+                    (connection_id, ComponentNotificationKey::rate_limit_family(&notification.rate_limits)),
+                    notification.rate_limits.clone(),
+                );
             }
             _ => {}
         }
@@ -311,7 +323,7 @@ impl ComponentNotificationCache {
     fn remove_connection(&mut self, connection_id: ConnectionId) {
         self.token_usage
             .retain(|(cached_connection_id, _), _| *cached_connection_id != connection_id);
-        self.rate_limits.remove(&connection_id);
+        self.rate_limits.retain(|(cached_connection_id, _), _| *cached_connection_id != connection_id);
         self.publications.retain(|key, _| key.connection_id() != connection_id);
     }
 

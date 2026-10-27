@@ -99,6 +99,12 @@ pub(crate) struct NonCuratedCacheRefreshError {
 pub(crate) fn plugin_load_warnings(plugins: &[LoadedPlugin<McpServerConfig>]) -> Vec<String> {
     let mut warnings = Vec::new();
     for plugin in plugins.iter().filter(|plugin| plugin.enabled) {
+        warnings.extend(plugin.load_warnings.iter().map(|warning| {
+            format!(
+                "Plugin `{}`: {warning}. Other plugin capabilities were not disabled by this failure.",
+                plugin.config_name
+            )
+        }));
         if let Some(error) = plugin.error.as_deref() {
             warn!(
                 plugin = plugin.config_name,
@@ -806,6 +812,7 @@ async fn load_plugin(
         apps: Vec::new(),
         hook_sources: Vec::new(),
         hook_load_warnings: Vec::new(),
+        load_warnings: Vec::new(),
         error: None,
     };
 
@@ -879,18 +886,20 @@ async fn load_plugin(
                     *restriction_product,
                     *plugin_skill_snapshots,
                 ),
-                load_plugin_mcp_servers_from_manifest(
+                discover_plugin_mcp_servers_from_manifest(
                     plugin_root.as_path(),
                     manifest_paths,
                     Some(&plugin.mcp_servers),
                 ),
-                load_plugin_apps_from_manifest(plugin_root.as_path(), manifest_paths),
+                discover_plugin_apps_from_manifest(plugin_root.as_path(), manifest_paths),
             );
             let resolved_skills = inventory.resolve(skill_config_rules);
             loaded_plugin.has_enabled_skills = resolved_skills.has_enabled_skills();
             loaded_plugin.disabled_skill_paths = resolved_skills.disabled_skill_paths;
-            loaded_plugin.mcp_servers = mcp_servers;
-            loaded_plugin.apps = apps;
+            loaded_plugin.mcp_servers = mcp_servers.mcp_servers;
+            loaded_plugin.apps = apps.apps;
+            loaded_plugin.load_warnings.extend(mcp_servers.warnings);
+            loaded_plugin.load_warnings.extend(apps.warnings);
             loaded_plugin.tool_exposure = manifest.tool_exposure.clone();
         }
         PluginLoadScope::HooksOnly => {}
@@ -1122,22 +1131,38 @@ pub async fn load_plugin_apps(plugin_root: &Path) -> Vec<AppDeclaration> {
         warn!(error = %err, "failed to inspect plugin app manifest");
         Vec::new()
     });
-    load_apps_from_paths(plugin_root, paths).await
+    load_apps_from_paths(plugin_root, paths).await.apps
 }
 
 pub(crate) async fn load_plugin_apps_from_manifest(
     plugin_root: &Path,
     manifest_paths: &PluginManifestPaths,
 ) -> Vec<AppDeclaration> {
+    discover_plugin_apps_from_manifest(plugin_root, manifest_paths)
+        .await
+        .apps
+}
+
+async fn discover_plugin_apps_from_manifest(
+    plugin_root: &Path,
+    manifest_paths: &PluginManifestPaths,
+) -> PluginAppDiscovery {
     let root = plugin_root.to_path_buf();
     let manifest_paths = manifest_paths.clone();
-    let paths =
-        tokio::task::spawn_blocking(move || plugin_app_config_paths(&root, &manifest_paths))
-            .await
-            .unwrap_or_else(|err| {
-                warn!(error = %err, "failed to inspect plugin app paths");
-                Vec::new()
-            });
+    let paths = match tokio::task::spawn_blocking(move || {
+        plugin_app_config_paths(&root, &manifest_paths)
+    })
+    .await
+    {
+        Ok(paths) => paths,
+        Err(err) => {
+            warn!(error = %err, "failed to inspect plugin app paths");
+            return PluginAppDiscovery {
+                warnings: vec!["failed to inspect plugin app config paths".to_string()],
+                ..Default::default()
+            };
+        }
+    };
     load_apps_from_paths(plugin_root, paths).await
 }
 
@@ -1287,11 +1312,19 @@ fn append_plugin_hook_file(
 async fn load_apps_from_paths(
     plugin_root: &Path,
     app_config_paths: Vec<AbsolutePathBuf>,
-) -> Vec<AppDeclaration> {
-    let mut app_declarations = Vec::new();
+) -> PluginAppDiscovery {
+    let mut discovery = PluginAppDiscovery::default();
     for app_config_path in app_config_paths {
-        let Ok(contents) = tokio::fs::read_to_string(app_config_path.as_path()).await else {
-            continue;
+        let contents = match tokio::fs::read_to_string(app_config_path.as_path()).await {
+            Ok(contents) => contents,
+            Err(err) => {
+                discovery.warnings.push(format!(
+                    "failed to read plugin app config {} ({})",
+                    app_config_path.display(),
+                    err.kind()
+                ));
+                continue;
+            }
         };
         let declarations = match parse_plugin_app_config(&contents) {
             Ok(declarations) => declarations,
@@ -1300,23 +1333,39 @@ async fn load_apps_from_paths(
                     path = %app_config_path.display(),
                     "failed to parse plugin app config: {err}"
                 );
+                discovery.warnings.push(format!(
+                    "failed to parse plugin app config {} at line {}, column {}",
+                    app_config_path.display(),
+                    err.line(),
+                    err.column()
+                ));
                 continue;
             }
         };
 
-        app_declarations.extend(declarations.into_iter().filter(|app| {
+        discovery.apps.extend(declarations.into_iter().filter(|app| {
             if app.connector_id.0.trim().is_empty() {
                 warn!(
                     plugin = %plugin_root.display(),
                     "plugin app config is missing an app id"
                 );
+                discovery.warnings.push(format!(
+                    "plugin app config {} is missing an app id",
+                    app_config_path.display()
+                ));
                 false
             } else {
                 true
             }
         }));
     }
-    app_declarations
+    discovery
+}
+
+#[derive(Debug, Default)]
+struct PluginAppDiscovery {
+    apps: Vec<AppDeclaration>,
+    warnings: Vec<String>,
 }
 
 pub async fn plugin_capability_summary_from_root(
@@ -1348,7 +1397,7 @@ pub async fn plugin_capability_summary_from_root(
     mcp_server_names.sort_unstable();
     mcp_server_names.dedup();
 
-    let app_declarations = load_apps_from_paths(plugin_root.as_path(), app_paths).await;
+    let app_declarations = load_apps_from_paths(plugin_root.as_path(), app_paths).await.apps;
     let app_connector_ids = app_connector_ids_from_declarations(&app_declarations);
 
     Some(PluginCapabilitySummary {
@@ -1401,10 +1450,22 @@ pub(crate) async fn load_plugin_mcp_servers_from_manifest(
     manifest_paths: &PluginManifestPaths,
     plugin_policy: Option<&HashMap<String, PluginMcpServerConfig>>,
 ) -> HashMap<String, McpServerConfig> {
-    let mut mcp_servers = HashMap::new();
+    discover_plugin_mcp_servers_from_manifest(plugin_root, manifest_paths, plugin_policy)
+        .await
+        .mcp_servers
+}
+
+async fn discover_plugin_mcp_servers_from_manifest(
+    plugin_root: &Path,
+    manifest_paths: &PluginManifestPaths,
+    plugin_policy: Option<&HashMap<String, PluginMcpServerConfig>>,
+) -> PluginMcpDiscovery {
+    let mut discovery = PluginMcpDiscovery::default();
+    let mcp_servers = &mut discovery.mcp_servers;
     match &manifest_paths.mcp_servers {
         Some(PluginManifestMcpServers::Object(object_servers)) => {
             let plugin_mcp = load_mcp_servers_from_manifest_object(plugin_root, object_servers);
+            discovery.warnings.extend(plugin_mcp.warnings);
             for (name, mut config) in plugin_mcp.mcp_servers {
                 if let Some(policy) = plugin_policy.and_then(|policy| policy.get(&name)) {
                     apply_plugin_mcp_server_policy(&mut config, policy);
@@ -1427,10 +1488,14 @@ pub(crate) async fn load_plugin_mcp_servers_from_manifest(
             .await
             .unwrap_or_else(|err| {
                 warn!(error = %err, "failed to inspect plugin MCP paths");
+                discovery
+                    .warnings
+                    .push("failed to inspect plugin MCP config paths".to_string());
                 Vec::new()
             });
             for mcp_config_path in paths {
                 let plugin_mcp = load_mcp_servers_from_file(plugin_root, &mcp_config_path).await;
+                discovery.warnings.extend(plugin_mcp.warnings);
                 for (name, mut config) in plugin_mcp.mcp_servers {
                     if let Some(policy) = plugin_policy.and_then(|policy| policy.get(&name)) {
                         apply_plugin_mcp_server_policy(&mut config, policy);
@@ -1448,15 +1513,25 @@ pub(crate) async fn load_plugin_mcp_servers_from_manifest(
         }
     }
 
-    mcp_servers
+    discovery
 }
 
 async fn load_mcp_servers_from_file(
     plugin_root: &Path,
     mcp_config_path: &AbsolutePathBuf,
 ) -> PluginMcpDiscovery {
-    let Ok(contents) = tokio::fs::read_to_string(mcp_config_path.as_path()).await else {
-        return PluginMcpDiscovery::default();
+    let contents = match tokio::fs::read_to_string(mcp_config_path.as_path()).await {
+        Ok(contents) => contents,
+        Err(err) => {
+            return PluginMcpDiscovery {
+                warnings: vec![format!(
+                    "failed to read plugin MCP config {} ({})",
+                    mcp_config_path.display(),
+                    err.kind()
+                )],
+                ..Default::default()
+            };
+        }
     };
     let parsed = match parse_plugin_mcp_config(plugin_root, &contents) {
         Ok(parsed) => parsed,
@@ -1465,10 +1540,24 @@ async fn load_mcp_servers_from_file(
                 path = %mcp_config_path.display(),
                 "failed to parse plugin MCP config: {err}"
             );
-            return PluginMcpDiscovery::default();
+            return PluginMcpDiscovery {
+                warnings: vec![format!(
+                    "failed to parse plugin MCP config {} at line {}, column {}",
+                    mcp_config_path.display(),
+                    err.line(),
+                    err.column()
+                )],
+                ..Default::default()
+            };
         }
     };
+    let mut warnings = Vec::new();
     for error in parsed.errors {
+        warnings.push(format!(
+            "invalid plugin MCP server {:?} in {}",
+            error.name,
+            mcp_config_path.display()
+        ));
         warn!(
             plugin = %plugin_root.display(),
             server = error.name,
@@ -1479,6 +1568,7 @@ async fn load_mcp_servers_from_file(
     }
     PluginMcpDiscovery {
         mcp_servers: parsed.servers.into_iter().collect(),
+        warnings,
     }
 }
 
@@ -1493,10 +1583,18 @@ fn load_mcp_servers_from_manifest_object(
                 plugin = %plugin_root.display(),
                 "failed to parse plugin manifest MCP object: {err}"
             );
-            return PluginMcpDiscovery::default();
+            return PluginMcpDiscovery {
+                warnings: vec!["failed to parse plugin manifest MCP object".to_string()],
+                ..Default::default()
+            };
         }
     };
+    let mut warnings = Vec::new();
     for error in parsed.errors {
+        warnings.push(format!(
+            "invalid plugin manifest MCP server {:?}",
+            error.name
+        ));
         warn!(
             plugin = %plugin_root.display(),
             server = error.name,
@@ -1506,12 +1604,14 @@ fn load_mcp_servers_from_manifest_object(
     }
     PluginMcpDiscovery {
         mcp_servers: parsed.servers.into_iter().collect(),
+        warnings,
     }
 }
 
 #[derive(Debug, Default)]
 struct PluginMcpDiscovery {
     mcp_servers: HashMap<String, McpServerConfig>,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug)]

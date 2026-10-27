@@ -82,6 +82,7 @@ type LegacyFragmentMatcher = dyn Fn(&str, &str) -> bool + Send + Sync;
 #[derive(Clone)]
 pub struct WorldStateSectionContribution {
     id: &'static str,
+    unavailable: bool,
     snapshot: Value,
     render_diff: Arc<RenderDiff>,
     matches_legacy_fragment: Arc<LegacyFragmentMatcher>,
@@ -107,12 +108,27 @@ impl WorldStateSectionContribution {
     ) -> Self {
         Self {
             id,
+            unavailable: false,
             snapshot,
             render_diff: Arc::new(render_diff),
             matches_legacy_fragment: Arc::new(|_, _| false),
             matches_retained_fragment: None,
             budget_fallback: None,
         }
+    }
+
+    /// Discovery did not establish a replacement for this section. The host preserves its
+    /// last accepted snapshot and delivery, just as on contributor timeout. This is not
+    /// successful omission or an empty catalog. Contribute a separate status section when
+    /// the model needs an explanation of the unavailable observation.
+    pub fn unavailable(id: &'static str) -> Self {
+        let mut contribution = Self::new(id, Value::Null, |_| None);
+        contribution.unavailable = true;
+        contribution
+    }
+
+    pub fn is_unavailable(&self) -> bool {
+        self.unavailable
     }
 
     pub fn with_legacy_matcher(

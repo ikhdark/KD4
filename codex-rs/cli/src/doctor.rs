@@ -2659,6 +2659,7 @@ fn websocket_error_detail(err: &ApiError) -> String {
         | ApiError::UsageNotIncluded
         | ApiError::Retryable { .. }
         | ApiError::WebsocketRejected { .. }
+        | ApiError::WebsocketClosed { .. }
         | ApiError::RateLimit(_)
         | ApiError::InvalidRequest { .. }
         | ApiError::CyberPolicy { .. }

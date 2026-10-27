@@ -65,6 +65,7 @@ impl Handler {
                     turn.config.sqlite_home.clone(),
                     turn.config.model_provider_id.clone(),
                     session.services.agent_control.session_id().to_string(),
+                    turn.config.ephemeral,
                 )
                 .await
                 .map_err(|error| {

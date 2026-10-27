@@ -155,6 +155,8 @@ export type AgentMessageItem = {
   text: string;
   /** Absent on legacy producers. Commentary and partial answers are not terminal. */
   phase?: "commentary" | "partial_answer" | "final_answer";
+  /** Present when the provider never finalized this streamed prefix; not a completed answer. */
+  interruption?: string;
 };
 
 /** Canonical planning content; not a claim that the plan was implemented. */

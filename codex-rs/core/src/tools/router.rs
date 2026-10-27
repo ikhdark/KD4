@@ -1,7 +1,6 @@
 use crate::FunctionCallError;
 use crate::agent::task_capabilities::ExternalMutationIntent;
 use crate::agent::task_capabilities::TypedToolClass;
-use crate::agent::task_capabilities::authorize_typed_tool;
 use crate::agent::task_capabilities::is_independent_review_source;
 use crate::client_common::ToolSchemaArtifact;
 use crate::session::session::Session;
@@ -19,7 +18,6 @@ use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::spec_plan::build_tool_router;
 use crate::tools::tool_dispatch_trace::record_authorization_state_coordination;
-use codex_agent_task_store::AssignmentAdmissionOrigin;
 use codex_agent_task_store::AttemptState;
 use codex_config::schema::canonicalize as canonicalize_json;
 use codex_mcp::ToolInfo;
@@ -89,6 +87,8 @@ struct ResolvedToolPlanningIdentity {
     available_models: Arc<Vec<codex_protocol::openai_models::ModelPreset>>,
     code_mode_available: bool,
     multi_agent_version: codex_protocol::protocol::MultiAgentVersion,
+    hosted_web_search_available: bool,
+    hosted_web_search_requires_cached_access: bool,
 }
 
 #[derive(Default)]
@@ -170,6 +170,12 @@ impl ToolRouter {
             available_models: Arc::clone(&turn.available_models),
             code_mode_available: turn.code_mode_available,
             multi_agent_version: turn.multi_agent_version,
+            hosted_web_search_available: turn
+                .provider
+                .supports_hosted_web_search(&turn.model_info.slug),
+            hosted_web_search_requires_cached_access: turn
+                .provider
+                .hosted_web_search_requires_cached_access(),
         });
         self
     }
@@ -185,6 +191,12 @@ impl ToolRouter {
                         || identity.available_models.as_ref() == turn.available_models.as_ref())
                     && identity.code_mode_available == turn.code_mode_available
                     && identity.multi_agent_version == turn.multi_agent_version
+                    && identity.hosted_web_search_available
+                        == turn
+                            .provider
+                            .supports_hosted_web_search(&turn.model_info.slug)
+                    && identity.hosted_web_search_requires_cached_access
+                        == turn.provider.hosted_web_search_requires_cached_access()
             })
     }
 
@@ -595,6 +607,10 @@ impl ToolRouter {
             .prepares_during_workspace_baseline(&call.tool_name)
     }
 
+    pub(crate) fn is_workspace_independent(&self, call: &ToolCall) -> bool {
+        self.registry.is_workspace_independent(&call.tool_name)
+    }
+
     pub(crate) fn delegates_workspace_admission(&self, call: &ToolCall) -> bool {
         self.registry
             .delegates_workspace_admission(&call.tool_name, &call.payload)
@@ -736,9 +752,7 @@ impl ToolRouter {
         let authorization_result = authorize_bound_typed_tool_call(
             session.as_ref(),
             step_context.as_ref(),
-            tool_class,
             &call,
-            external_mutation_intent,
         )
         .await;
         record_authorization_state_coordination(authorization_state_started.elapsed());
@@ -877,9 +891,7 @@ fn authorize_independent_review_tool_call(
 async fn authorize_bound_typed_tool_call(
     session: &Session,
     step_context: &StepContext,
-    class: TypedToolClass,
     call: &ToolCall,
-    _external_mutation_intent: ExternalMutationIntent,
 ) -> Result<(), FunctionCallError> {
     let coordinator = session.services.agent_control.task_coordinator();
     let Some(binding) = coordinator.binding_for_turn(&step_context.turn) else {
@@ -914,20 +926,9 @@ async fn authorize_bound_typed_tool_call(
         )));
     }
 
-    let is_legacy_nested_spawn = class == TypedToolClass::RootTaskControl
-        && call.tool_name.name == "spawn_agent"
-        && matches!(
-            authorization.admission_origin,
-            AssignmentAdmissionOrigin::LegacyMessage { .. }
-        );
-    if !is_legacy_nested_spawn {
-        authorize_typed_tool(class).map_err(|error| {
-            FunctionCallError::DeniedToModel(format!(
-                "{}: typed assignment capability denied: {error}",
-                call.tool_name.name
-            ))
-        })?;
-    }
+    // A task binding governs lifecycle, not tool authority. Active subagents
+    // use the same tool permissions as root; task-specific restrictions are
+    // enforced separately (including independent-review read-only policy).
     // An authorized tool call is meaningful progress, not just liveness.
     let heartbeated = coordinator
         .heartbeat_typed_actor_binding(&binding, /*progress*/ true)

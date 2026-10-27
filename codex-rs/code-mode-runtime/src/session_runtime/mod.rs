@@ -358,17 +358,18 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         })
     }
 
-    pub(crate) async fn begin_observe(
+    pub(crate) async fn begin_observe_releasable(
         &self,
         cell_id: &CellId,
         mode: ObserveMode,
+        release: Option<CancellationToken>,
     ) -> Result<PendingEvent, Error> {
         let handle = self.inner.cells.lock().await.get(cell_id).cloned();
         let Some(handle) = handle else {
             return self.cached_terminal_observation(cell_id).await;
         };
         Ok(PendingEvent {
-            event: map_actor_event(cell_id.clone(), handle.observe(mode)),
+            event: map_actor_event(cell_id.clone(), handle.observe(mode, release)),
         })
     }
 
@@ -1217,6 +1218,7 @@ fn actor_error(cell_id: &CellId, error: CellError) -> Error {
         CellError::Busy => Error::BusyObserver(cell_id.clone()),
         CellError::AlreadyTerminating => Error::AlreadyTerminating(cell_id.clone()),
         CellError::Closed => Error::ClosedCell(cell_id.clone()),
+        CellError::ObservationReleased => Error::Runtime("code-mode request cancelled".to_string()),
         CellError::CleanupFailed => Error::Runtime(format!(
             "code-mode cell {cell_id} cleanup failed; external effects must not be replayed"
         )),

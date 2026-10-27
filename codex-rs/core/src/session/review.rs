@@ -192,6 +192,7 @@ pub(super) async fn spawn_review_thread(
             text_elements: Vec::new(),
         }],
         client_id: None,
+        start_fence: None,
     }];
     let tc = Arc::new(review_turn_context);
     tc.turn_timing_state

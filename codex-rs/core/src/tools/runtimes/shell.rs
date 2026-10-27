@@ -47,6 +47,7 @@ pub struct ShellRequest {
     /// Semantically equivalent, inspectable command used for approvals and
     /// approval caching when `command` contains an encoded runtime payload.
     pub command_for_approval: Vec<String>,
+    pub shell_wrapper_is_owned: bool,
 
     pub approved_powershell_direct_argv: Option<Vec<String>>,
     pub turn_environment: TurnEnvironment,
@@ -310,6 +311,16 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             proof_cwd: Some(req.cwd.as_path()),
         })
         .await;
+
+        let command = super::recheck_readonly_command_before_launch(
+            &req.command_for_approval,
+            req.shell_wrapper_is_owned,
+            (!req.turn_environment.environment.is_remote()).then_some(req.cwd.as_path()),
+            &env,
+            req.sandbox_permissions,
+            &req.exec_approval_requirement,
+            ctx,
+        ).await?.unwrap_or(command);
 
         if ctx
             .turn

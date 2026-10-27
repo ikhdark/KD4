@@ -98,12 +98,12 @@ pub(crate) fn raw_assistant_output_text_from_item(item: &ResponseItem) -> Option
 }
 
 pub(crate) async fn record_completed_response_item_with_finalized_facts(
-    sess: &Session,
-    turn_context: &TurnContext,
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
     item: &ResponseItem,
     finalized_facts: Option<&FinalizedTurnItemFacts>,
 ) -> std::io::Result<()> {
-    sess.record_conversation_items(turn_context, std::slice::from_ref(item))
+    sess.record_conversation_items_ordered(turn_context, std::slice::from_ref(item))
         .await?;
     let defers_mailbox_delivery = finalized_facts.map_or_else(
         || {
@@ -177,6 +177,7 @@ pub(crate) struct HandleOutputCtx {
     pub turn_store: Arc<ExtensionData>,
     pub tool_runtime: ToolCallRuntime,
     pub cancellation_token: CancellationToken,
+    pub waiting_tool_cancellation_token: CancellationToken,
     pub response_item_recorder: OrderedResponseItemRecorder,
 }
 
@@ -517,7 +518,7 @@ pub(crate) async fn handle_output_item_done(
                 "ToolCall"
             );
 
-            let _persistence_barrier = ctx
+            let persistence_barrier = ctx
                 .response_item_recorder
                 .enqueue(
                     Arc::clone(&ctx.sess),
@@ -528,7 +529,11 @@ pub(crate) async fn handle_output_item_done(
                 )
                 .await;
 
-            let cancellation_token = ctx.cancellation_token.child_token();
+            let cancellation_token = if call.tool_name == codex_tools::ToolName::plain("request_user_input") {
+                ctx.waiting_tool_cancellation_token.child_token()
+            } else {
+                ctx.cancellation_token.child_token()
+            };
             let tool_runtime = ctx.tool_runtime.clone();
             let accepted_call = call.clone();
             let future_timing = Arc::clone(&timing);
@@ -538,9 +543,10 @@ pub(crate) async fn handle_output_item_done(
             // Other direct tools must enter their supervised cancellation path
             // rather than holding the model behind a long-running operation.
             let yields_on_steering = tool_runtime.tool_yields_on_steering(&call.tool_name);
-            // Recording runs in provider order on the recorder's owned task.
-            // Join it before relaying outputs, without delaying tool execution.
+            // Call history is the admission boundary, including hooks and tools
+            // whose apparent read-only payload can still invoke effectful work.
             let completion = async move {
+                persistence_barrier.await.map_err(CodexErr::Fatal)?;
                 let execution = tool_runtime.handle_model_tool_call_with_admission(
                     call,
                     cancellation_token.clone(),

@@ -112,7 +112,7 @@ impl SessionTask for ReviewTask {
                 match item {
                     TurnInput::UserInput { mut content, .. } => user_input.append(&mut content),
                     TurnInput::ResponseItem(_)
-                    | TurnInput::AdditionalContext(_)
+                    | TurnInput::AdditionalContext { .. }
                     | TurnInput::InternalResponseItem(_)
                     | TurnInput::InterAgentCommunication(_) => {}
                 }
@@ -277,6 +277,7 @@ async fn process_review_events(
                             text: message.message,
                         }],
                         phase: message.phase,
+                        interruption: None,
                     });
                     session.emit_turn_item_started(&ctx, &item).await;
                     session.emit_turn_item_completed(&ctx, item).await;

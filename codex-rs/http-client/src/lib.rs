@@ -41,6 +41,8 @@ pub use crate::outbound_proxy::HttpClientFactory;
 pub use crate::outbound_proxy::OutboundProxyPolicy;
 pub use crate::outbound_proxy::OutboundProxyRoute;
 pub use crate::outbound_proxy::RouteFailureClass;
+pub use crate::outbound_proxy::proxy_bypasses_url;
+pub use crate::outbound_proxy::websocket_environment_proxy_route;
 pub use crate::request::EncodedJsonBody;
 pub use crate::request::PreparedRequestBody;
 pub use crate::request::Request;

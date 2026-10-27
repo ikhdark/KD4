@@ -60,6 +60,49 @@ impl AgentGraphStore for LocalAgentGraphStore {
         })
     }
 
+    fn set_thread_spawn_turn_owner<'a>(
+        &'a self,
+        parent: ThreadId,
+        child: ThreadId,
+        turn_id: &'a str,
+    ) -> AgentGraphStoreFuture<'a, bool> {
+        Box::pin(async move {
+            self.state_db.set_thread_spawn_turn_owner(parent, child, turn_id).await
+                .map_err(|err| internal_error("record thread-spawn turn owner", err))
+        })
+    }
+
+    fn list_turn_owned_thread_spawn_descendants<'a>(
+        &'a self,
+        parent: ThreadId,
+        turn_id: &'a str,
+    ) -> AgentGraphStoreFuture<'a, Vec<ThreadId>> {
+        Box::pin(async move {
+            self.state_db.list_turn_owned_thread_spawn_descendants(parent, turn_id).await
+                .map_err(|err| internal_error("list turn-owned thread-spawn children", err))
+        })
+    }
+
+    fn retain_thread_spawn_instruction_snapshot<'a>(
+        &'a self,
+        parent: ThreadId,
+        child: ThreadId,
+        snapshot: &'a str,
+    ) -> AgentGraphStoreFuture<'a, bool> {
+        Box::pin(async move {
+            self.state_db.retain_thread_spawn_instruction_snapshot(parent, child, snapshot).await
+                .map_err(|err| internal_error("retain inherited instruction snapshot", err))
+        })
+    }
+
+    fn thread_spawn_instruction_snapshot(&self, child: ThreadId)
+        -> AgentGraphStoreFuture<'_, Option<String>> {
+        Box::pin(async move {
+            self.state_db.thread_spawn_instruction_snapshot(child).await
+                .map_err(|err| internal_error("read inherited instruction snapshot", err))
+        })
+    }
+
     fn set_thread_spawn_edge_status(
         &self,
         child_thread_id: ThreadId,

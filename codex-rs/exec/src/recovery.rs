@@ -65,6 +65,7 @@ impl ExecRecoveryState {
                     &event.item,
                     ThreadItem::AgentMessage {
                         phase: Some(MessagePhase::FinalAnswer),
+                        interruption: None,
                         ..
                     } | ThreadItem::Plan { .. }
                 ) {

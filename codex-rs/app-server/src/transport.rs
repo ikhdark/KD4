@@ -3,10 +3,13 @@ use crate::outgoing_message::OutgoingEnvelope;
 use crate::outgoing_message::OutgoingWriteReceipt;
 use codex_app_server_protocol::ExperimentalApi;
 use codex_app_server_protocol::ServerRequest;
+use codex_app_server_protocol::JSONRPCRequest;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::RwLock;
+use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
@@ -43,6 +46,37 @@ pub(crate) struct ConnectionState {
     pub(crate) outbound_experimental_api_enabled: Arc<AtomicBool>,
     pub(crate) outbound_opted_out_notification_methods: Arc<OutboundNotificationOptOuts>,
     pub(crate) session: Arc<ConnectionSessionState>,
+    pub(crate) request_ingress: Option<ConnectionRequestIngress>,
+    pub(crate) disconnect: CancellationToken,
+}
+
+pub(crate) struct QueuedConnectionRequest {
+    pub(crate) request: JSONRPCRequest,
+    pub(crate) _credit: tokio::sync::OwnedSemaphorePermit,
+}
+
+pub(crate) struct ConnectionRequestIngress {
+    sender: mpsc::Sender<QueuedConnectionRequest>,
+    bytes: Arc<tokio::sync::Semaphore>,
+}
+
+impl ConnectionRequestIngress {
+    pub(crate) fn channel() -> (Self, mpsc::Receiver<QueuedConnectionRequest>) {
+        let (sender, receiver) = mpsc::channel(64);
+        (Self { sender, bytes: Arc::new(tokio::sync::Semaphore::new(16 * 1024 * 1024)) }, receiver)
+    }
+
+    pub(crate) fn try_send(&self, request: JSONRPCRequest) -> bool {
+        const LIMIT: usize = 16 * 1024 * 1024;
+        let bytes = codex_app_server_transport::serialized_request_bytes_up_to(&request, LIMIT);
+        if bytes > LIMIT {
+            return false;
+        }
+        let Ok(credit) = Arc::clone(&self.bytes).try_acquire_many_owned(bytes.max(1) as u32) else {
+            return false;
+        };
+        self.sender.try_send(QueuedConnectionRequest { request, _credit: credit }).is_ok()
+    }
 }
 
 impl ConnectionState {
@@ -57,6 +91,8 @@ impl ConnectionState {
             outbound_experimental_api_enabled,
             outbound_opted_out_notification_methods,
             session: Arc::new(ConnectionSessionState::new()),
+            request_ingress: None,
+            disconnect: CancellationToken::new(),
         }
     }
 }
@@ -104,15 +140,74 @@ pub(crate) struct OutboundConnectionState {
     pub(crate) writer: mpsc::Sender<QueuedOutgoingMessage>,
     disconnect_sender: Option<CancellationToken>,
     transport_shutdown: CancellationToken,
+    is_stdio: bool,
     stdio_delivery: Option<StdioDelivery>,
 }
 
 struct StdioDelivery {
-    sender: mpsc::Sender<QueuedOutgoingMessage>,
-    bytes: Arc<tokio::sync::Semaphore>,
+    sender: mpsc::Sender<Arc<Mutex<Option<QueuedOutgoingMessage>>>>,
+    tail: Weak<Mutex<Option<QueuedOutgoingMessage>>>,
 }
 
 const STDIO_DELIVERY_BYTES: usize = 16 * 1024 * 1024;
+const STDIO_COALESCED_TEXT_BYTES: usize = 64 * 1024;
+
+impl StdioDelivery {
+    fn try_send(&mut self, message: QueuedOutgoingMessage) -> bool {
+        // mpsc does not expose a mutable queued tail. The handoff node permits
+        // adjacent text to append only until the existing consumer takes it.
+        // No lock survives encoding, a capacity wait or a physical write.
+        if let Some(tail) = self.tail.upgrade() {
+            let Ok(mut queued) = tail.lock() else { return false; };
+            if let Some(queued) = queued.as_mut()
+                && coalesce_stdio_text(queued, &message)
+            {
+                return true;
+            }
+        }
+        let queued = Arc::new(Mutex::new(Some(message)));
+        if self.sender.try_send(Arc::clone(&queued)).is_err() {
+            return false;
+        }
+        self.tail = Arc::downgrade(&queued);
+        true
+    }
+}
+
+fn coalesce_stdio_text(left: &mut QueuedOutgoingMessage, right: &QueuedOutgoingMessage) -> bool {
+    // Receipts and all non-text/lifecycle messages remain exact wire boundaries.
+    // Core publication, persistence and replay have already observed every delta.
+    if left.write_complete_tx.is_some() || right.write_complete_tx.is_some()
+        || left.encoded_json.is_some() || right.encoded_json.is_some()
+    {
+        return false;
+    }
+    let (
+        OutgoingMessage::AppServerNotification(left),
+        OutgoingMessage::AppServerNotification(right),
+    ) = (&mut left.message, &right.message) else { return false; };
+    macro_rules! append {
+        ($a:ident, $b:ident $(, $part:ident)?) => {{
+            if $a.thread_id != $b.thread_id || $a.turn_id != $b.turn_id
+                || $a.item_id != $b.item_id $(|| $a.$part != $b.$part)?
+                || $b.delta.len() > STDIO_COALESCED_TEXT_BYTES.saturating_sub($a.delta.len())
+            {
+                false
+            } else {
+                $a.delta.push_str(&$b.delta);
+                true
+            }
+        }};
+    }
+    use codex_app_server_protocol::ServerNotification;
+    match (left, right) {
+        (ServerNotification::AgentMessageDelta(a), ServerNotification::AgentMessageDelta(b)) => append!(a, b),
+        (ServerNotification::PlanDelta(a), ServerNotification::PlanDelta(b)) => append!(a, b),
+        (ServerNotification::ReasoningSummaryTextDelta(a), ServerNotification::ReasoningSummaryTextDelta(b)) => append!(a, b, summary_index),
+        (ServerNotification::ReasoningTextDelta(a), ServerNotification::ReasoningTextDelta(b)) => append!(a, b, content_index),
+        _ => false,
+    }
+}
 
 impl OutboundConnectionState {
     pub(crate) fn new(
@@ -123,6 +218,7 @@ impl OutboundConnectionState {
         disconnect_sender: Option<CancellationToken>,
         transport_shutdown: CancellationToken,
     ) -> Self {
+        let is_stdio = disconnect_sender.is_none();
         Self {
             initialized,
             experimental_api_enabled,
@@ -130,12 +226,19 @@ impl OutboundConnectionState {
             writer,
             disconnect_sender,
             transport_shutdown,
+            is_stdio,
             stdio_delivery: None,
         }
     }
 
-    fn can_disconnect(&self) -> bool {
-        self.disconnect_sender.is_some()
+    pub(crate) fn with_stdio_delivery(mut self) -> Self {
+        self.is_stdio = true;
+        self
+    }
+
+    pub(crate) fn is_disconnected(&self) -> bool {
+        self.disconnect_sender.as_ref().is_some_and(CancellationToken::is_cancelled)
+            || self.transport_shutdown.is_cancelled()
     }
 
     pub(crate) fn request_disconnect(&self) {
@@ -219,12 +322,12 @@ async fn send_message_to_connection(
     }
 
     let writer = connection_state.writer.clone();
-    let mut queued_message = QueuedOutgoingMessage {
+    let queued_message = QueuedOutgoingMessage {
         message,
         encoded_json: None,
         write_complete_tx: write_complete_tx.map(|receipt| receipt.writer),
     };
-    if connection_state.can_disconnect() {
+    if !connection_state.is_stdio {
         match writer.try_send(queued_message) {
             Ok(()) => false,
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -238,27 +341,78 @@ async fn send_message_to_connection(
             }
         }
     } else {
-        // The per-stdio owner absorbs bursts without waiting on the physical
-        // writer. When its bounded staging budget fills, backpressure must reach
-        // producers instead of cancelling the shared server shutdown token.
-        let shutdown = connection_state.transport_shutdown.clone();
+        // Stdio has an independent bounded delivery owner. Queue admission is
+        // nonblocking here; encoding and byte-credit waits belong to that owner.
+        let shutdown = connection_state.disconnect_sender.clone()
+            .unwrap_or_else(|| connection_state.transport_shutdown.clone());
         if shutdown.is_cancelled() {
             return disconnect_connection(connections, connection_id);
         }
         let delivery = connection_state.stdio_delivery.get_or_insert_with(|| {
+            // Preserve the existing 128-node limit. Coalesced text is at most
+            // 64 KiB/node (8 MiB total), below the 16-MiB delivery-byte budget.
+            // Individually larger legal frames still use the streaming owner.
             let (sender, mut receiver) =
-                mpsc::channel::<QueuedOutgoingMessage>(128);
+                mpsc::channel::<Arc<Mutex<Option<QueuedOutgoingMessage>>>>(128);
             let shutdown = shutdown.clone();
             tokio::spawn(async move {
+                let bytes = Arc::new(tokio::sync::Semaphore::new(STDIO_DELIVERY_BYTES));
                 loop {
                     let next = tokio::select! {
                         biased;
                         _ = shutdown.cancelled() => break,
                         next = receiver.recv() => next,
                     };
-                    let Some(message) = next else {
+                    let Some(queued) = next else {
                         break;
                     };
+                    let message = match queued.lock() {
+                        Ok(mut queued) => queued.take(),
+                        Err(_) => { shutdown.cancel(); break; }
+                    };
+                    let Some(mut message) = message else {
+                        shutdown.cancel();
+                        break;
+                    };
+                    let encoded_bytes = match message.prepare_stdio_json(STDIO_DELIVERY_BYTES) {
+                        Ok(encoded_bytes) => encoded_bytes,
+                        Err(error) => {
+                            warn!(?connection_id, %error, "failed to encode bounded stdio output");
+                            shutdown.cancel();
+                            break;
+                        }
+                    };
+                    if encoded_bytes > STDIO_DELIVERY_BYTES {
+                        let (message_kind, request_id) = match &message.message {
+                            OutgoingMessage::Response(response) => ("response", Some(&response.id)),
+                            OutgoingMessage::Error(error) => ("error", Some(&error.id)),
+                            OutgoingMessage::Request(_) => ("request", None),
+                            OutgoingMessage::AppServerNotification(_) => ("notification", None),
+                        };
+                        warn!(
+                            ?connection_id,
+                            message_kind,
+                            ?request_id,
+                            encoded_bytes,
+                            "streaming stdio output larger than the staging budget"
+                        );
+                    }
+                    // The writer holds credit through physical write/flush. Wait
+                    // here, not in the shared router, so a legal large frame can
+                    // follow earlier frames and later frames remain ordered.
+                    let credit = tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => break,
+                        credit = Arc::clone(&bytes).acquire_many_owned(
+                            encoded_bytes.clamp(1, STDIO_DELIVERY_BYTES) as u32,
+                        ) => match credit {
+                            Ok(credit) => credit,
+                            Err(_) => { shutdown.cancel(); break; }
+                        },
+                    };
+                    if let Some(encoded) = &mut message.encoded_json {
+                        encoded.delivery_credit = Some(credit);
+                    }
                     tokio::select! {
                         biased;
                         _ = shutdown.cancelled() => break,
@@ -268,60 +422,14 @@ async fn send_message_to_connection(
                     }
                 }
             });
-            StdioDelivery {
-                sender,
-                bytes: Arc::new(tokio::sync::Semaphore::new(STDIO_DELIVERY_BYTES)),
-            }
+            StdioDelivery { sender, tail: Weak::new() }
         });
-        let bytes = match queued_message.prepare_stdio_json(STDIO_DELIVERY_BYTES) {
-            Ok(bytes) => {
-                if bytes > STDIO_DELIVERY_BYTES {
-                    let (message_kind, request_id) = match &queued_message.message {
-                        OutgoingMessage::Response(response) => ("response", Some(&response.id)),
-                        OutgoingMessage::Error(error) => ("error", Some(&error.id)),
-                        OutgoingMessage::Request(_) => ("request", None),
-                        OutgoingMessage::AppServerNotification(_) => ("notification", None),
-                    };
-                    warn!(
-                        ?connection_id,
-                        message_kind,
-                        ?request_id,
-                        encoded_bytes = bytes,
-                        "streaming stdio output larger than the staging budget"
-                    );
-                }
-                bytes.clamp(1, STDIO_DELIVERY_BYTES) as u32
-            }
-            Err(error) => {
-                warn!(?connection_id, %error, "failed to encode bounded stdio output");
-                return disconnect_connection(connections, connection_id);
-            }
-        };
-        // Both admission waits remain interruptible. Credits stay attached to
-        // the frame until its physical write completes, preserving the byte cap.
-        // A streamed frame reserves the entire budget so large frames cannot
-        // accumulate behind a slow writer or wait for impossible permit counts.
-        let credit = tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => None,
-            result = delivery.bytes.clone().acquire_many_owned(bytes) => result.ok(),
-        };
-        let Some(credit) = credit else {
-            return disconnect_connection(connections, connection_id);
-        };
-        if let Some(encoded) = &mut queued_message.encoded_json {
-            encoded.delivery_credit = Some(credit);
-        }
-        let sent = tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => false,
-            result = delivery.sender.send(queued_message) => result.is_ok(),
-        };
+        let sent = delivery.try_send(queued_message);
         if sent {
             return false;
         }
-        // A closed writer or explicit shutdown still retires the connection;
-        // temporary count/byte saturation does not.
+        // Queue saturation is a local, explicit delivery failure. Durable
+        // thread state remains available to surviving/reconnecting clients.
         disconnect_connection(connections, connection_id)
     }
 }

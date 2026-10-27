@@ -585,9 +585,9 @@ pub(super) async fn initialize_from_store(
     thread_id: ThreadId,
     include_archived: bool,
     rollout_path: Option<PathBuf>,
-) -> ThreadStoreResult<SharedLocalThreadProjection> {
+) -> ThreadStoreResult<(SharedLocalThreadProjection, OwnedSemaphorePermit)> {
     let projection = projection_entry(store, thread_id).await;
-    let _operation = projection.acquire_operation().await?;
+    let operation = projection.acquire_operation().await?;
     if !store.live_recorders.lock().await.contains_key(&thread_id) {
         // Unloaded rollouts may be appended, rolled back, or compressed by another process.
         // Compare the durable source (the physical plain or compressed file) before reusing its
@@ -670,7 +670,7 @@ pub(super) async fn initialize_from_store(
         evict_least_recent_unloaded_projections(store).await;
     }
     initialize_entry_from_store(store, thread_id, include_archived, &projection).await?;
-    Ok(projection)
+    Ok((projection, operation))
 }
 
 async fn evict_least_recent_unloaded_projections(store: &LocalThreadStore) {
@@ -772,7 +772,7 @@ pub(super) async fn list_turns(
     require_positive_page_size(params.page_size)?;
     let rollout_path =
         validate_thread_visibility(store, params.thread_id, params.include_archived).await?;
-    let projection = initialize_from_store(
+    let (projection, _operation) = initialize_from_store(
         store,
         params.thread_id,
         params.include_archived,
@@ -789,7 +789,7 @@ pub(super) async fn list_items(
     require_positive_page_size(params.page_size)?;
     let rollout_path =
         validate_thread_visibility(store, params.thread_id, params.include_archived).await?;
-    let projection = initialize_from_store(
+    let (projection, _operation) = initialize_from_store(
         store,
         params.thread_id,
         params.include_archived,
@@ -873,7 +873,7 @@ fn summary_items(items: &[ProjectedItem]) -> Vec<ThreadItem> {
         .iter()
         .rev()
         .map(|item| &item.item)
-        .find(|item| matches!(item, ThreadItem::AgentMessage { .. }))
+        .find(|item| matches!(item, ThreadItem::AgentMessage { interruption: None, .. }))
         .cloned();
     match (first_user_message, final_agent_message) {
         (Some(user_message), Some(agent_message)) if user_message.id() != agent_message.id() => {

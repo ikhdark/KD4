@@ -31,6 +31,37 @@ impl ReviewSourceScope {
         self.comparison.last().map(String::as_str)
     }
 
+    /// Safelisted immutable comparison without `show`'s configurable helpers.
+    pub fn commit_diff_command(&self) -> Result<String, String> {
+        if self.comparison.first().map(String::as_str) != Some("show") {
+            return Err("review scope is not an immutable commit".into());
+        }
+        let revision = self.comparison.last().ok_or("missing review commit")?;
+        let parents = run_git_for_stdout(
+            &self.root,
+            ["rev-list", "--parents", "--max-count=1", revision],
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+        let mut commits = parents.split_whitespace();
+        if commits.next() != Some(revision.as_str()) {
+            return Err("review commit parents could not be resolved".into());
+        }
+        let base = if let Some(parent) = commits.next() {
+            parent.to_string()
+        } else {
+            // With no -w, this computes the repository-format empty tree ID
+            // without writing an object. Command::output supplies empty stdin.
+            run_git_for_stdout(&self.root, ["hash-object", "-t", "tree", "--stdin"], None)
+                .map_err(|error| error.to_string())?
+                .trim()
+                .to_string()
+        };
+        Ok(format!(
+            "git -c core.fsmonitor=false diff --no-ext-diff --no-textconv --no-color --no-renames {base} {revision} --"
+        ))
+    }
+
     pub fn capture(cwd: &Path, target: &ReviewTarget) -> Result<Self, String> {
         let custom = matches!(target, ReviewTarget::Custom { .. });
         // A custom prompt can contain all its source and need not name a Git repository.

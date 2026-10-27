@@ -372,25 +372,27 @@ impl codex_http_client::RequestDispatchGuard for ManagedDispatchGuard {
 }
 
 impl AuthManagerAuthProvider {
+    fn current_scope_auth(&self) -> Result<(u64, Option<CodexAuth>), AuthError> {
+        self.auth_manager.check_auth_load()
+            .map_err(|err| AuthError::Build(err.to_string()))?;
+        let (epoch, auth) = self.auth_manager.policy_auth_snapshot()
+            .map_err(|err| AuthError::Build(err.to_string()))?;
+        if epoch != self.expected_epoch
+            || ProviderAccountScope::from_auth(auth.as_ref()) != self.expected_scope
+        {
+            return Err(AuthError::Build("authentication account scope changed or lifecycle invalidated; rebuild request state".into()));
+        }
+        Ok((epoch, auth))
+    }
+
     fn with_projection<T>(
         &self,
         apply: impl FnOnce(&dyn AuthProvider, u64) -> Result<T, AuthError>,
     ) -> Result<T, AuthError> {
-        self.auth_manager
-            .check_auth_load()
-            .map_err(|err| AuthError::Build(err.to_string()))?;
-        let (epoch, auth) = self
-            .auth_manager
-            .policy_auth_snapshot()
-            .map_err(|err| AuthError::Build(err.to_string()))?;
+        let (epoch, auth) = self.current_scope_auth()?;
         let auth = auth.ok_or_else(|| {
             AuthError::Build("managed authentication is no longer available".into())
         })?;
-        if epoch != self.expected_epoch
-            || ProviderAccountScope::from_auth(Some(&auth)) != self.expected_scope
-        {
-            return Err(AuthError::Build("authentication account scope changed or lifecycle invalidated; rebuild request state".into()));
-        }
         let projection = self
             .projection
             .clone()
@@ -403,6 +405,10 @@ impl AuthManagerAuthProvider {
 }
 
 impl AuthProvider for AuthManagerAuthProvider {
+    fn validate_auth_scope(&self) -> Result<(), AuthError> {
+        self.current_scope_auth().map(drop)
+    }
+
     fn auth_recovery_revision(&self) -> Option<u64> {
         Some(self.last_request_auth_revision.load(Ordering::Acquire))
     }
@@ -655,13 +661,22 @@ pub fn auth_provider_from_auth_manager(
     auth_manager: Arc<AuthManager>,
     expected_auth: &CodexAuth,
 ) -> SharedAuthProvider {
+    auth_scope_from_auth_manager(auth_manager, Some(expected_auth))
+}
+
+/// Bind retained metadata to an auth snapshot, including logged-out absence.
+/// This shares the request provider's account/epoch owner but mints no headers.
+pub fn auth_scope_from_auth_manager(
+    auth_manager: Arc<AuthManager>,
+    expected_auth: Option<&CodexAuth>,
+) -> SharedAuthProvider {
     let expected_epoch = auth_manager
         .policy_auth_snapshot()
         .map(|(epoch, _)| epoch)
         .unwrap_or(u64::MAX);
     Arc::new(AuthManagerAuthProvider {
         auth_manager,
-        expected_scope: ProviderAccountScope::from_auth(Some(expected_auth)),
+        expected_scope: ProviderAccountScope::from_auth(expected_auth),
         expected_epoch,
         projection: None,
         last_request_auth_revision: AtomicU64::new(u64::MAX),

@@ -25,6 +25,16 @@ pub(crate) struct McpToolSnapshot {
 
 const MCP_SNAPSHOT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
+static STALE_AUTH_MCP_SNAPSHOT: std::sync::LazyLock<McpToolSnapshot> =
+    std::sync::LazyLock::new(|| McpToolSnapshot {
+        temporarily_unavailable: true,
+        revision: u64::MAX,
+        tools: Arc::new(Vec::new()),
+        resources_available: false,
+        pending_servers: Vec::new(),
+        failed_servers: Vec::new(),
+    });
+
 async fn bounded_mcp_snapshot(
     capture: impl std::future::Future<Output = McpToolSnapshot>,
 ) -> McpToolSnapshot {
@@ -112,7 +122,10 @@ impl StepContext {
     }
 
     pub(crate) async fn mcp_tool_snapshot(&self) -> &McpToolSnapshot {
-        self.mcp_tool_snapshot
+        if !self.mcp.manager().managed_auth_scope_is_current() {
+            return &STALE_AUTH_MCP_SNAPSHOT;
+        }
+        let snapshot = self.mcp_tool_snapshot
             .get_or_init(|| async {
                 bounded_mcp_snapshot(async {
                     // Required startup is validated by construction. Optional
@@ -139,7 +152,11 @@ impl StepContext {
                 })
                 .await
             })
-            .await
+            .await;
+        if !self.mcp.manager().managed_auth_scope_is_current() {
+            return &STALE_AUTH_MCP_SNAPSHOT;
+        }
+        snapshot
     }
 
     pub(crate) async fn mcp_tools(&self) -> &[ToolInfo] {

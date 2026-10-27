@@ -39,6 +39,25 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
             token_usage,
         },
         ApiError::ProviderFailure { code, message } => CodexErr::ProviderFailure { code, message },
+        ApiError::WebsocketClosed { code, message } => {
+            // RFC policy/protocol/payload rejection cannot be repaired by
+            // replaying the same inference over another transport. Other codes
+            // (notably 1011, an unexpected server condition) retain recovery.
+            if matches!(code, Some(1002 | 1003 | 1007 | 1008 | 1009 | 1010)) {
+                CodexErr::ProviderFailure {
+                    code: code.map(|code| format!("websocket_close_{code}")),
+                    message,
+                }
+            } else {
+                CodexErr::ResponseStreamFailed(ResponseStreamFailed {
+                    message,
+                    status: None,
+                    request_id: None,
+                    idle_timeout: false,
+                    reconnectable_close: matches!(code, Some(1000 | 1001 | 1012 | 1013)),
+                })
+            }
+        }
         ApiError::Stream(message) => {
             // A close that invites a reconnect is recoverable by rebuilding the
             // transport. Provider silence is only classified: post-dispatch
@@ -80,7 +99,7 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                 url,
                 headers,
                 body,
-                retry_after,
+                mut retry_after,
             } => {
                 let body_text = body.unwrap_or_default();
 
@@ -89,7 +108,19 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                     && let Some(classified) =
                         crate::responses_stream::classify_provider_error(error)
                 {
-                    return map_api_error(classified).with_retry_after(retry_after);
+                    // HTTP capacity identity and diagnostics belong to the
+                    // status envelope. Do not refine a 429/503 into a generic
+                    // stream error or discard its request id and body.
+                    if !matches!(status, http::StatusCode::TOO_MANY_REQUESTS | http::StatusCode::SERVICE_UNAVAILABLE)
+                        || !matches!(&classified, ApiError::ServerOverloaded { .. } | ApiError::Retryable { .. })
+                    {
+                        return map_api_error(classified).with_retry_after(retry_after);
+                    }
+                    retry_after = retry_after.or(match classified {
+                        ApiError::ServerOverloaded { retry_after } => retry_after,
+                        ApiError::Retryable { delay, .. } => delay,
+                        _ => None,
+                    });
                 }
 
                 if status == http::StatusCode::BAD_REQUEST {

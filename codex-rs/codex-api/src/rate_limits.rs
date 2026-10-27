@@ -29,7 +29,9 @@ pub fn parse_default_rate_limit(headers: &HeaderMap) -> Option<RateLimitSnapshot
 /// Parses all known rate-limit header families into update records keyed by limit id.
 pub fn parse_all_rate_limits(headers: &HeaderMap) -> Vec<RateLimitSnapshot> {
     let mut snapshots = Vec::new();
-    if let Some(snapshot) = parse_default_rate_limit(headers) {
+    if let Some(snapshot) = parse_default_rate_limit(headers)
+        && has_rate_limit_data(&snapshot)
+    {
         snapshots.push(snapshot);
     }
 

@@ -307,6 +307,7 @@ fn build_tool_specs_and_registry(
 
     quarantine_conflicting_namespaces(&mut planned_tools);
     apply_namespace_description_budget(&mut planned_tools);
+    reserve_generated_control_names(turn_context, &mut planned_tools);
     let tool_search = append_tool_search_executor(&context, &mut planned_tools);
     // Generated native controls take precedence before code mode captures its
     // catalog; final registry deduplication cannot repair an earlier snapshot.
@@ -318,8 +319,8 @@ fn build_tool_specs_and_registry(
     );
     let search_sources = tool_search.map(|(handler, indexes)| {
         // Reuse the handler's immutable inventory, including on a warm cache
-        // hit. Final registration still decides membership and lexical order:
-        // generated controls may have displaced a conflicting deferred name.
+        // hit. Generated-control collisions were removed before this inventory
+        // was captured; final registration decides membership and lexical order.
         let entries = registry.manifest_entries();
         let infos = entries
             .into_iter()
@@ -476,6 +477,33 @@ fn retain_unique_planned_tool_names(planned_tools: &mut PlannedTools) {
     });
 }
 
+fn reserve_generated_control_names(turn_context: &TurnContext, planned_tools: &mut PlannedTools) {
+    let mut reserved = HashSet::new();
+    if matches!(
+        effective_tool_mode(turn_context),
+        ToolMode::CodeMode | ToolMode::CodeModeOnly
+    ) {
+        reserved.insert(ToolName::plain(codex_code_mode::PUBLIC_TOOL_NAME));
+        reserved.insert(CodeModeWaitHandler.tool_name());
+    }
+    // Resolve code-mode collisions first: a displaced deferred tool must not
+    // cause tool search to capture a contract absent from the final registry.
+    let has_searchable_tools = planned_tools.runtimes.iter().any(|tool| {
+        !reserved.contains(tool.tool_name())
+            && tool.exposure() == ToolExposure::Deferred
+            && tool.search_info_ref().is_some()
+    });
+    if search_tool_enabled(turn_context) && has_searchable_tools {
+        reserved.insert(ToolName::plain(codex_tools::TOOL_SEARCH_TOOL_NAME));
+    }
+    let PlannedTools {
+        runtimes, warnings, ..
+    } = planned_tools;
+    runtimes.retain(|tool| {
+        retain_unique_tool_name(&mut reserved, tool.tool_name().clone(), warnings)
+    });
+}
+
 fn apply_namespace_description_budget(planned_tools: &mut PlannedTools) {
     let mut namespace_order = Vec::new();
     let mut descriptions = BTreeMap::<String, String>::new();
@@ -575,7 +603,9 @@ fn hosted_model_tool_specs(
     // `Some(Cached/Live/Disabled)` are the options for mode when standalone search is unavailable
     // and the provider supports hosted search. `None` prevents emitting a hosted search tool.
     let web_search_mode = (!standalone_web_search_available
-        && turn_context.provider.capabilities().web_search)
+        && turn_context
+            .provider
+            .supports_hosted_web_search(&turn_context.model_info.slug))
         .then_some(turn_context.config.web_search_mode.value());
     let web_search_config = web_search_mode
         .as_ref()
@@ -584,6 +614,9 @@ fn hosted_model_tool_specs(
         web_search_mode,
         web_search_config,
         web_search_tool_type: turn_context.model_info.web_search_tool_type,
+        force_cached_access: turn_context
+            .provider
+            .hosted_web_search_requires_cached_access(),
     }) {
         specs.push(hosted_web_search_tool);
     }
@@ -607,6 +640,11 @@ fn namespace_tools_enabled(turn_context: &TurnContext) -> bool {
 
 
 fn collab_tools_enabled(turn_context: &TurnContext) -> bool {
+    // Generic delegation requires durable task coordination, including history
+    // forks. Do not advertise it for a session that forbids persistence.
+    if turn_context.config.ephemeral {
+        return false;
+    }
     // Bulk workers carry a report tag rather than structured ThreadSpawn
     // ancestry. Do not let them reset nesting depth or the child namespace.
     if matches!(&turn_context.session_source, SessionSource::SubAgent(SubAgentSource::Other(label)) if label.starts_with("agent_job:")) {
@@ -897,6 +935,7 @@ fn build_code_mode_executors(
     let mut result: Vec<Arc<dyn CoreToolRuntime>> = vec![Arc::new(CodeModeExecuteHandler::new_with_input_schemas(
         create_code_mode_tool(
             tool_mode == ToolMode::CodeModeOnly,
+            turn_context.config.features.enabled(Feature::Kd4Runtime),
             has_deferred_tools,
             &direct_only_tool_names,
             &eager_nested_tool_descriptions,
@@ -1464,23 +1503,22 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
                 exposure,
                 TypedToolClass::OwnTask,
             );
-        } else {
-            planned_tools.add_arc_with_exposure_and_authorization_class(
-                multi_agent_v2_handler(AmendAgentTaskHandler, tool_namespace),
-                exposure,
-                TypedToolClass::RootTaskControl,
-            );
-            planned_tools.add_arc_with_exposure_and_authorization_class(
-                multi_agent_v2_handler(WaiveAgentGateHandler, tool_namespace),
-                exposure,
-                TypedToolClass::RootTaskControl,
-            );
-            planned_tools.add_arc_with_exposure_and_authorization_class(
-                multi_agent_v2_handler(AbandonAgentTaskHandler, tool_namespace),
-                exposure,
-                TypedToolClass::RootTaskControl,
-            );
         }
+        planned_tools.add_arc_with_exposure_and_authorization_class(
+            multi_agent_v2_handler(AmendAgentTaskHandler, tool_namespace),
+            exposure,
+            TypedToolClass::RootTaskControl,
+        );
+        planned_tools.add_arc_with_exposure_and_authorization_class(
+            multi_agent_v2_handler(WaiveAgentGateHandler, tool_namespace),
+            exposure,
+            TypedToolClass::RootTaskControl,
+        );
+        planned_tools.add_arc_with_exposure_and_authorization_class(
+            multi_agent_v2_handler(AbandonAgentTaskHandler, tool_namespace),
+            exposure,
+            TypedToolClass::RootTaskControl,
+        );
     }
 }
 

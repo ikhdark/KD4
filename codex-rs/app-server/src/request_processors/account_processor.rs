@@ -694,7 +694,12 @@ impl AccountRequestProcessor {
         chatgpt_plan_type: Option<String>,
     ) {
         let result = self
-            .login_chatgpt_auth_tokens_response(access_token, chatgpt_account_id, chatgpt_plan_type)
+            .login_chatgpt_auth_tokens_response(
+                request_id.connection_id,
+                access_token,
+                chatgpt_account_id,
+                chatgpt_plan_type,
+            )
             .await;
         let logged_in = result.is_ok();
         self.outgoing.send_result(request_id, result).await;
@@ -707,6 +712,7 @@ impl AccountRequestProcessor {
 
     async fn login_chatgpt_auth_tokens_response(
         &self,
+        owner: crate::transport::ConnectionId,
         access_token: String,
         chatgpt_account_id: String,
         chatgpt_plan_type: Option<String>,
@@ -739,6 +745,7 @@ impl AccountRequestProcessor {
         self.auth_manager
             .set_external_auth(Arc::new(ExternalAuthBridge::new(
                 Arc::clone(&self.outgoing),
+                owner,
                 auth,
             )))
             .await

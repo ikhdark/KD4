@@ -56,13 +56,68 @@ const KEYRING_SERVICE: &str = "Codex MCP Credentials";
 const MCP_OAUTH_SECRET_PREFIX: &str = "MCP_OAUTH";
 const REFRESH_SKEW_MILLIS: u64 = 30_000;
 
+/// Credential durability is separate from whether the server operation ran.
+#[derive(Debug, thiserror::Error)]
+pub enum OAuthPersistenceError {
+    #[error("MCP OAuth credential persistence failed; durable authentication was not confirmed")]
+    Failed(#[source] anyhow::Error),
+    #[error("MCP OAuth credential durability is unconfirmed; an admitted write may still complete")]
+    Pending,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 enum CredentialBackend { File, Direct, Secrets }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct CredentialAuthority {
     backend: Option<CredentialBackend>,
     fingerprint: Option<String>,
+    #[serde(default)]
+    revision: u64,
+}
+
+/// A loaded client's claim on committed authority. Clones share successful
+/// rotations, but an explicit login/logout never updates an older claim.
+#[derive(Clone)]
+pub(crate) struct OAuthRequestAuthority {
+    codex_home: PathBuf,
+    server_name: String,
+    url: String,
+    expected: Arc<std::sync::Mutex<Option<CredentialAuthority>>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("MCP OAuth authority changed; reconnect after login or logout")]
+struct OAuthAuthorityChanged;
+
+impl OAuthRequestAuthority {
+    fn check_with_lock_held(&self, state: &CredentialAuthorities, key: &str) -> Result<()> {
+        let expected = self.expected.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.entries.get(key) != expected.as_ref() {
+            return Err(OAuthAuthorityChanged.into());
+        }
+        Ok(())
+    }
+
+    fn accept_with_lock_held(&self, authority: CredentialAuthority) {
+        *self.expected.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(authority);
+    }
+
+    pub(crate) async fn check(&self) -> Result<()> {
+        let authority = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _transaction = OAuthStoreLock::acquire_in(
+                &authority.codex_home, OAuthStore::Authority, OAUTH_PERSISTENCE_TIMEOUT,
+            )?;
+            let state = read_credential_authorities(&authority.codex_home)?;
+            authority.check_with_lock_held(
+                &state,
+                &compute_store_key(&authority.server_name, &authority.url)?,
+            )
+        })
+        .await
+        .context("MCP OAuth authority admission task failed")?
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -144,6 +199,17 @@ pub(crate) fn load_oauth_tokens(
     store_mode: OAuthCredentialsStoreMode,
     keyring_backend_kind: AuthKeyringBackendKind,
 ) -> Result<Option<StoredOAuthTokens>> {
+    load_oauth_tokens_with_authority(codex_home, server_name, url, store_mode, keyring_backend_kind)
+        .map(|(tokens, _)| tokens)
+}
+
+pub(crate) fn load_oauth_tokens_with_authority(
+    codex_home: &Path,
+    server_name: &str,
+    url: &str,
+    store_mode: OAuthCredentialsStoreMode,
+    keyring_backend_kind: AuthKeyringBackendKind,
+) -> Result<(Option<StoredOAuthTokens>, OAuthRequestAuthority)> {
     let keyring_store = DefaultKeyringStore;
     load_oauth_tokens_coordinated(&keyring_store, codex_home, server_name, url, store_mode, keyring_backend_kind)
 }
@@ -151,15 +217,23 @@ pub(crate) fn load_oauth_tokens(
 fn load_oauth_tokens_coordinated<K: KeyringStore + Clone + 'static>(
     keyring_store: &K, codex_home: &Path, server_name: &str, url: &str,
     store_mode: OAuthCredentialsStoreMode, keyring_backend_kind: AuthKeyringBackendKind,
-) -> Result<Option<StoredOAuthTokens>> {
+) -> Result<(Option<StoredOAuthTokens>, OAuthRequestAuthority)> {
     // Global lock order: authority -> one aggregate store -> Secrets internal lock.
     let _transaction = OAuthStoreLock::acquire(codex_home, OAuthStore::Authority)?;
     let authority = read_credential_authorities(codex_home)?;
+    let request_authority = OAuthRequestAuthority {
+        codex_home: codex_home.to_path_buf(),
+        server_name: server_name.to_string(),
+        url: url.to_string(),
+        expected: Arc::new(std::sync::Mutex::new(
+            authority.entries.get(&compute_store_key(server_name, url)?).cloned(),
+        )),
+    };
     if let Some(committed) = authority.entries.get(&compute_store_key(server_name, url)?) {
-        let Some(backend) = committed.backend else { return Ok(None); };
+        let Some(backend) = committed.backend else { return Ok((None, request_authority)); };
         if matches!(store_mode, OAuthCredentialsStoreMode::File) && backend != CredentialBackend::File
             || matches!(store_mode, OAuthCredentialsStoreMode::Keyring) && backend == CredentialBackend::File {
-            return Ok(None);
+            return Ok((None, request_authority));
         }
         let tokens = match backend {
             CredentialBackend::File => load_oauth_tokens_from_file(codex_home, server_name, url)?,
@@ -173,9 +247,9 @@ fn load_oauth_tokens_coordinated<K: KeyringStore + Clone + 'static>(
             }
         }.context("committed OAuth credentials are unavailable")?;
         anyhow::ensure!(committed.fingerprint.as_deref() == Some(credential_fingerprint(&tokens)?.as_str()), "OAuth credentials do not match their committed authority");
-        return Ok(Some(tokens));
+        return Ok((Some(tokens), request_authority));
     }
-    match store_mode {
+    let tokens = match store_mode {
         OAuthCredentialsStoreMode::Auto => load_legacy_oauth_tokens_with_fallback(
             keyring_store,
             codex_home,
@@ -194,7 +268,8 @@ fn load_oauth_tokens_coordinated<K: KeyringStore + Clone + 'static>(
             url,
         )
         .with_context(|| "failed to read OAuth tokens from keyring".to_string()),
-    }
+    }?;
+    Ok((tokens, request_authority))
 }
 
 pub(crate) fn oauth_token_status(
@@ -354,7 +429,7 @@ pub fn save_oauth_tokens(
     keyring_backend_kind: AuthKeyringBackendKind,
 ) -> Result<()> {
     let keyring_store = DefaultKeyringStore;
-    save_oauth_tokens_coordinated(&keyring_store, codex_home, keyring_backend_kind, server_name, tokens, store_mode)
+    save_oauth_tokens_coordinated(&keyring_store, codex_home, keyring_backend_kind, server_name, tokens, store_mode, None)
 }
 
 fn save_oauth_tokens_with_keyring<K: KeyringStore + Clone + 'static>(
@@ -454,10 +529,17 @@ fn save_oauth_tokens_to_secrets_keyring_with_lock_held<K: KeyringStore + Clone +
 fn save_oauth_tokens_coordinated<K: KeyringStore + Clone + 'static>(
     keyring_store: &K, codex_home: &Path, keyring_backend_kind: AuthKeyringBackendKind,
     server_name: &str, tokens: &StoredOAuthTokens, mode: OAuthCredentialsStoreMode,
+    expected: Option<&OAuthRequestAuthority>,
 ) -> Result<()> {
     anyhow::ensure!(server_name == tokens.server_name, "OAuth credential server identity does not match the save target");
     let _transaction = OAuthStoreLock::acquire(codex_home, OAuthStore::Authority)?;
     let mut state = read_credential_authorities(codex_home)?;
+    let key = compute_store_key(server_name, &tokens.url)?;
+    if let Some(expected) = expected {
+        expected.check_with_lock_held(&state, &key)?;
+    }
+    let revision = state.entries.get(&key).map_or(0, |authority| authority.revision)
+        .checked_add(1).context("MCP OAuth authority revision exhausted")?;
     let mut tokens = tokens.clone();
     tokens.expires_at = tokens.expires_at.or_else(|| compute_expires_at_millis(&tokens.token_response.0));
     let tokens = &tokens;
@@ -492,10 +574,15 @@ fn save_oauth_tokens_coordinated<K: KeyringStore + Clone + 'static>(
             CredentialBackend::File
         }
     }};
-    state.entries.insert(compute_store_key(server_name, &tokens.url)?, CredentialAuthority { backend: Some(backend), fingerprint: Some(credential_fingerprint(tokens)?) });
+    let authority = CredentialAuthority { backend: Some(backend), fingerprint: Some(credential_fingerprint(tokens)?), revision };
+    state.entries.insert(key, authority.clone());
     // Publication failures are not secure-store failures and must never trigger
     // a retry to plaintext. Cleanup above is serialized with every logical save.
-    commit_credential_authority(codex_home, &state)
+    commit_credential_authority(codex_home, &state)?;
+    if let Some(expected) = expected {
+        expected.accept_with_lock_held(authority);
+    }
+    Ok(())
 }
 
 pub fn delete_oauth_tokens(
@@ -513,6 +600,7 @@ pub fn delete_oauth_tokens(
         keyring_backend_kind,
         server_name,
         url,
+        None,
     )
 }
 
@@ -523,10 +611,16 @@ fn delete_oauth_tokens_from_keyring_and_file<K: KeyringStore + Clone + 'static>(
     keyring_backend_kind: AuthKeyringBackendKind,
     server_name: &str,
     url: &str,
+    expected: Option<&OAuthRequestAuthority>,
 ) -> Result<bool> {
     let _transaction = OAuthStoreLock::acquire(codex_home, OAuthStore::Authority)?;
     let mut authorities = read_credential_authorities(codex_home)?;
     let key = compute_store_key(server_name, url)?;
+    if let Some(expected) = expected {
+        expected.check_with_lock_held(&authorities, &key)?;
+    }
+    let revision = authorities.entries.get(&key).map_or(0, |authority| authority.revision)
+        .checked_add(1).context("MCP OAuth authority revision exhausted")?;
     let keyring_result = delete_oauth_tokens_from_keyring(
         keyring_store,
         codex_home,
@@ -549,8 +643,12 @@ fn delete_oauth_tokens_from_keyring_and_file<K: KeyringStore + Clone + 'static>(
     };
 
     let file_removed = delete_oauth_tokens_from_file(codex_home, &key)?;
-    authorities.entries.insert(key, CredentialAuthority { backend: None, fingerprint: None });
+    let authority = CredentialAuthority { backend: None, fingerprint: None, revision };
+    authorities.entries.insert(key, authority.clone());
     commit_credential_authority(codex_home, &authorities)?;
+    if let Some(expected) = expected {
+        expected.accept_with_lock_held(authority);
+    }
     Ok(keyring_removed || file_removed)
 }
 
@@ -617,6 +715,9 @@ pub(crate) struct OAuthPersistor {
 struct OAuthPersistorInner {
     credential_store: InMemoryCredentialStore,
     persistence: OAuthPersistenceState,
+    authority: OAuthRequestAuthority,
+    retrying: std::sync::atomic::AtomicBool,
+    retry_generation: std::sync::atomic::AtomicU64,
 }
 
 enum OAuthPersistenceOperation {
@@ -635,31 +736,25 @@ enum OAuthPersistenceOperation {
 }
 
 impl OAuthPersistenceOperation {
-    fn execute(self, codex_home: &Path) -> Result<()> {
+    fn execute(self, codex_home: &Path, authority: &OAuthRequestAuthority) -> Result<()> {
         match self {
             Self::Save {
                 server_name,
                 tokens,
                 store_mode,
                 keyring_backend_kind,
-            } => save_oauth_tokens(
-                codex_home,
-                &server_name,
-                &tokens,
-                store_mode,
-                keyring_backend_kind,
+            } => save_oauth_tokens_coordinated(
+                &DefaultKeyringStore, codex_home, keyring_backend_kind,
+                &server_name, &tokens, store_mode, Some(authority),
             ),
             Self::Delete {
                 server_name,
                 url,
                 store_mode,
                 keyring_backend_kind,
-            } => delete_oauth_tokens(
-                codex_home,
-                &server_name,
-                &url,
-                store_mode,
-                keyring_backend_kind,
+            } => delete_oauth_tokens_from_keyring_and_file(
+                &DefaultKeyringStore, codex_home, store_mode, keyring_backend_kind,
+                &server_name, &url, Some(authority),
             )
             .map(drop),
         }
@@ -733,6 +828,7 @@ impl OAuthPersistenceState {
         client_id: String,
         maybe_credentials: Option<OAuthTokenResponse>,
         operation_guard: tokio::sync::OwnedMutexGuard<()>,
+        custody: OAuthPersistor,
     ) -> Result<()> {
         match maybe_credentials {
             Some(credentials) => {
@@ -770,6 +866,7 @@ impl OAuthPersistenceState {
                             keyring_backend_kind: self.keyring_backend_kind,
                         },
                         operation_guard,
+                        custody,
                     )
                     .await?;
                 }
@@ -785,6 +882,7 @@ impl OAuthPersistenceState {
                                 keyring_backend_kind: self.keyring_backend_kind,
                             },
                             operation_guard,
+                            custody,
                         )
                         .await?;
                 }
@@ -798,6 +896,7 @@ impl OAuthPersistenceState {
         &self,
         operation: OAuthPersistenceOperation,
         operation_guard: tokio::sync::OwnedMutexGuard<()>,
+        custody: OAuthPersistor,
     ) -> Result<()> {
         let executor = Arc::clone(&self.executor);
         let last_credentials = Arc::clone(&self.last_credentials);
@@ -826,6 +925,7 @@ impl OAuthPersistenceState {
                 // The original observer may have timed out or coalesced. The
                 // admitted owner must still surface a late durability failure.
                 warn!(%error, "OAuth credential persistence failed");
+                custody.retain_for_retry();
             })?;
             // The durable write and bookkeeping share ownership even if the waiter is dropped.
             *last_credentials.blocking_lock() = next_credentials;
@@ -846,12 +946,17 @@ impl OAuthPersistor {
         store_mode: OAuthCredentialsStoreMode,
         keyring_backend_kind: AuthKeyringBackendKind,
         initial_credentials: Option<StoredOAuthTokens>,
+        authority: OAuthRequestAuthority,
     ) -> Self {
+        let write_authority = authority.clone();
         let executor: OAuthPersistenceExecutor =
-            Arc::new(move |operation| operation.execute(&codex_home));
+            Arc::new(move |operation| operation.execute(&codex_home, &write_authority));
         Self {
             inner: Arc::new(OAuthPersistorInner {
                 credential_store,
+                authority,
+                retrying: std::sync::atomic::AtomicBool::new(false),
+                retry_generation: std::sync::atomic::AtomicU64::new(0),
                 persistence: OAuthPersistenceState::new(
                     server_name,
                     url,
@@ -869,16 +974,20 @@ impl OAuthPersistor {
     /// later attempt. After admission, execute() owns the write lock and its
     /// bookkeeping in spawn_blocking even if this observer times out.
     pub(crate) async fn persist_if_needed(&self) -> Result<()> {
-        tokio::time::timeout(OAUTH_PERSISTENCE_TIMEOUT, self.persist_latest())
-            .await
-            .context("timed out persisting OAuth credentials; durability remains pending")?
+        match tokio::time::timeout(OAUTH_PERSISTENCE_TIMEOUT, self.persist_latest()).await {
+            Ok(result) => result.map_err(|error| {
+                self.retain_for_retry();
+                OAuthPersistenceError::Failed(error).into()
+            }),
+            Err(_) => Err(OAuthPersistenceError::Pending.into()),
+        }
     }
 
     /// Post-result observation may join an already admitted generation without
     /// awaiting the same slow write again. This is not a durability receipt:
     /// initialize/recovery keep persist_if_needed's completion boundary.
     pub(crate) async fn observe_after_operation(&self) -> Result<()> {
-        tokio::time::timeout(OAUTH_PERSISTENCE_TIMEOUT, async {
+        let result = tokio::time::timeout(OAUTH_PERSISTENCE_TIMEOUT, async {
             let stored = self.inner.credential_store.load().await?;
             let already_admitted = {
                 let pending = self
@@ -903,14 +1012,59 @@ impl OAuthPersistor {
                     })
             };
             if already_admitted {
-                return Ok(());
+                return Err(OAuthPersistenceError::Pending.into());
             }
             // Sample again after acquiring write order. A differing old save or
             // delete must finish before we decide that the latest state is saved.
             self.persist_latest().await
         })
-        .await
-        .context("timed out persisting OAuth credentials; durability remains pending")?
+        .await;
+        match result {
+            Ok(Err(error)) if error.downcast_ref::<OAuthPersistenceError>().is_some() => Err(error),
+            Ok(result) => result.map_err(|error| {
+                self.retain_for_retry();
+                OAuthPersistenceError::Failed(error).into()
+            }),
+            Err(_) => Err(OAuthPersistenceError::Pending.into()),
+        }
+    }
+
+    /// A failed startup may drop its client. Keep one persistence-only owner of
+    /// replacement credentials until storage recovers or a newer login/logout
+    /// fences it. Retries use the existing write admission and never replay MCP
+    /// or OAuth network operations.
+    fn retain_for_retry(&self) {
+        use std::sync::atomic::Ordering;
+        self.inner.retry_generation.fetch_add(1, Ordering::AcqRel);
+        if self.inner.retrying.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let mut delay = Duration::from_secs(1);
+            loop {
+                tokio::time::sleep(delay).await;
+                if let Err(error) = runtime.inner.authority.check().await {
+                    if error.downcast_ref::<OAuthAuthorityChanged>().is_some() {
+                        runtime.inner.retrying.store(false, Ordering::Release);
+                        return;
+                    }
+                    delay = (delay * 2).min(Duration::from_secs(30));
+                    continue;
+                }
+                let generation = runtime.inner.retry_generation.load(Ordering::Acquire);
+                if runtime.persist_latest().await.is_ok() {
+                    runtime.inner.retrying.store(false, Ordering::Release);
+                    // A concurrent failed generation must not lose its retry
+                    // while the successful owner was releasing write order.
+                    if runtime.inner.retry_generation.load(Ordering::Acquire) != generation {
+                        runtime.retain_for_retry();
+                    }
+                    return;
+                }
+                delay = (delay * 2).min(Duration::from_secs(30));
+            }
+        });
     }
 
     /// Persists the latest stored credentials if they have changed.
@@ -931,7 +1085,7 @@ impl OAuthPersistor {
 
         self.inner
             .persistence
-            .persist_with_guard(client_id, maybe_credentials, operation_guard)
+            .persist_with_guard(client_id, maybe_credentials, operation_guard, self.clone())
             .await
     }
 }

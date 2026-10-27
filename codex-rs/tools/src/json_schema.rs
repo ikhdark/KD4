@@ -403,6 +403,7 @@ pub fn parse_tool_input_schema_without_compaction(
 }
 
 fn prepare_tool_input_schema(mut input_schema: JsonValue) -> Result<JsonValue, serde_json::Error> {
+    validate_schema_type_names(&input_schema, "#")?;
     // Compatibility is limited to the callable argument envelope. Nested
     // applicators constrain their own instance types, not all JSON values.
     if let Some(map) = input_schema.as_object_mut()
@@ -542,6 +543,48 @@ fn project_mcp_schema(value: &mut JsonValue, definitions: Option<&BTreeSet<Defin
             }
         }
     }
+}
+
+fn validate_schema_type_names(value: &JsonValue, path: &str) -> Result<(), serde_json::Error> {
+    if let JsonValue::Array(values) = value {
+        for (index, value) in values.iter().enumerate() {
+            validate_schema_type_names(value, &format!("{path}/{index}"))?;
+        }
+    } else if let JsonValue::Object(map) = value {
+        if let Some(value) = map.get("type") {
+            let valid = match value {
+                JsonValue::String(name) => schema_type_from_str(name).is_some(),
+                JsonValue::Array(names) => {
+                    let mut seen = BTreeSet::new();
+                    !names.is_empty() && names.iter().all(|name| {
+                        name.as_str().is_some_and(|name| {
+                            schema_type_from_str(name).is_some() && seen.insert(name)
+                        })
+                    })
+                }
+                _ => false,
+            };
+            if !valid {
+                return Err(<serde_json::Error as serde::de::Error>::custom(format!(
+                    "invalid JSON Schema type at {path}/type: {value}"
+                )));
+            }
+        }
+        for key in ["properties", "$defs", "definitions"] {
+            if let Some(entries) = map.get(key).and_then(JsonValue::as_object) {
+                for (name, child) in entries {
+                    let name = name.replace('~', "~0").replace('/', "~1");
+                    validate_schema_type_names(child, &format!("{path}/{key}/{name}"))?;
+                }
+            }
+        }
+        for key in ["items", "additionalProperties", "anyOf", "oneOf", "allOf"] {
+            if let Some(child) = map.get(key) {
+                validate_schema_type_names(child, &format!("{path}/{key}"))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn reject_unsupported_assertions(value: &JsonValue) -> Result<(), serde_json::Error> {

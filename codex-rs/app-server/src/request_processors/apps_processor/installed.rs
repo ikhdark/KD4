@@ -122,15 +122,25 @@ impl AppsRequestProcessor {
                         .wait_for_server_ready(CODEX_APPS_MCP_SERVER_NAME, startup_timeout)
                         .await
                     {
-                        mcp_manager
-                            .codex_apps_tools_cache()
-                            .current_tools(config.codex_home.to_path_buf(), cache_key.clone())
-                            .await
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "hosted connector refresh completed without publishing tools"
-                                )
-                            })
+                        if matches!(auth.as_ref(), Some(CodexAuth::Headers(_))) {
+                            // Header credentials have no verified shared-cache
+                            // identity. Use this connection's live catalog only.
+                            Ok(connection_manager
+                                .list_all_tools_snapshot()
+                                .await
+                                .as_ref()
+                                .clone())
+                        } else {
+                            mcp_manager
+                                .codex_apps_tools_cache()
+                                .current_tools(config.codex_home.to_path_buf(), cache_key.clone())
+                                .await
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "hosted connector refresh completed without publishing tools"
+                                    )
+                                })
+                        }
                     } else {
                         Err(anyhow::anyhow!(
                             "failed to refresh tools for MCP server '{CODEX_APPS_MCP_SERVER_NAME}'"

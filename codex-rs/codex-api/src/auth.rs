@@ -28,6 +28,12 @@ impl From<AuthError> for TransportError {
 /// Header-only providers can implement `add_auth_headers`; providers that sign
 /// complete requests can override `apply_auth`.
 pub trait AuthProvider: Send + Sync {
+    /// Validate retained account-scoped metadata without minting request headers.
+    /// Immutable providers have no mutable scope to invalidate.
+    fn validate_auth_scope(&self) -> Result<(), AuthError> {
+        Ok(())
+    }
+
     /// Opaque managed-auth revision used by this request's last header projection.
     /// Recovery callers must use a request-local provider, never a shared recorder.
     fn auth_recovery_revision(&self) -> Option<u64> {

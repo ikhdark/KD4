@@ -724,6 +724,125 @@ fn workspace_root(
     Ok(directory.to_path_buf())
 }
 
+/// Targeted source ownership, using the same manifest/path resolver as Cargo
+/// admission. Follow declared local dependencies, not every workspace file.
+pub fn compilation_sources(selection: &str, cwd: &Path) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
+    use std::collections::{BTreeSet, VecDeque};
+    let commands = serde_json::from_str::<Vec<Vec<String>>>(selection).ok()?;
+    let [command] = commands.as_slice() else { return None; };
+    let (program, args) = command.split_first()?;
+    if !program_name(program).eq_ignore_ascii_case("cargo") { return None; }
+    let mut cwd = cwd.to_path_buf();
+    let mut manifest = None;
+    let mut packages = Vec::new();
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        let (key, inline) = arg.split_once('=').map_or((arg.as_str(), None), |(key, value)| (key, Some(value)));
+        if matches!(key, "--manifest-path" | "-p" | "--package" | "-C") {
+            let value = inline.or_else(|| { index += 1; args.get(index).map(String::as_str) })?;
+            match key {
+                "--manifest-path" => manifest = Some(value.to_owned()),
+                "-C" => cwd = cwd.join(value),
+                _ => packages.push(value.to_owned()),
+            }
+        } else if let Some(value) = arg.strip_prefix("-p").filter(|value| !value.is_empty()) {
+            packages.push(value.to_owned());
+        } else if let Some(value) = arg.strip_prefix("-C").filter(|value| !value.is_empty()) {
+            cwd = cwd.join(value);
+        }
+        index += 1;
+    }
+    let workspace = workspace_root(&cwd, manifest.as_deref(), &mut ConfigReadBudget::default()).ok()?;
+    let workspace_manifest = workspace.join("Cargo.toml");
+    let workspace_doc = read_toml(&workspace_manifest, &mut ConfigReadBudget::default()).ok()?;
+    let workspace_dependencies = workspace_doc.get("workspace").and_then(|value| value.get("dependencies"));
+    let mut pending = VecDeque::new();
+    let direct_manifest = manifest.as_ref().map(|path| cwd.join(path)).unwrap_or_else(|| cwd.join("Cargo.toml"));
+    let direct = read_toml(&direct_manifest, &mut ConfigReadBudget::default()).ok();
+    for package in &packages {
+        let name = package.split('@').next()?;
+        if direct.as_ref().and_then(|doc| doc.get("package")?.get("name")?.as_str()) == Some(name) {
+            pending.push_back((direct_manifest.clone(), true));
+        } else if let Some(path) = workspace_dependencies.and_then(|deps| deps.get(name))
+            .and_then(|dependency| dependency.get("path")).and_then(toml::Value::as_str) {
+            pending.push_back((workspace.join(path).join("Cargo.toml"), true));
+        } else {
+            let members = workspace_doc.get("workspace")?.get("members")?.as_array()?;
+            let found = members.iter().filter_map(toml::Value::as_str).find_map(|member| {
+                if member.contains(['*', '?', '[']) { return None; }
+                let manifest = workspace.join(member).join("Cargo.toml");
+                let doc = read_toml(&manifest, &mut ConfigReadBudget::default()).ok()?;
+                (doc.get("package")?.get("name")?.as_str()? == name).then_some(manifest)
+            })?;
+            pending.push_back((found, true));
+        }
+    }
+    if packages.is_empty() { pending.push_back((direct_manifest, true)); }
+    let mut manifests = BTreeSet::from([workspace_manifest, workspace.join("Cargo.lock")]);
+    let mut roots = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    while let Some((manifest, selected)) = pending.pop_front() {
+        let manifest = resolved(&manifest).ok()?;
+        if !seen.insert(manifest.clone()) { continue; }
+        let doc = read_toml(&manifest, &mut ConfigReadBudget::default()).ok()?;
+        let directory = manifest.parent()?;
+        manifests.insert(manifest.clone());
+        let library = doc.get("lib").and_then(|value| value.get("path")).and_then(toml::Value::as_str)
+            .map(|path| directory.join(path)).unwrap_or_else(|| directory.join("src/lib.rs"));
+        if doc.get("lib").is_some() || doc.get("package").and_then(|value| value.get("autolib")).and_then(toml::Value::as_bool) != Some(false) {
+            roots.insert(library);
+        }
+        if doc.get("package").and_then(|value| value.get("build")).and_then(toml::Value::as_bool) != Some(false) {
+            let build = doc.get("package").and_then(|value| value.get("build")).and_then(toml::Value::as_str)
+                .map(|path| directory.join(path)).unwrap_or_else(|| directory.join("build.rs"));
+            roots.insert(build);
+        }
+        if selected && !args.iter().any(|arg| arg == "--lib") {
+            let main = directory.join("src/main.rs");
+            if main.is_file() || doc.get("package").and_then(|value| value.get("autobins")).and_then(toml::Value::as_bool) != Some(false) { roots.insert(main); }
+            for kind in ["bin", "example", "test", "bench"] {
+                if kind != "bin" && !args.iter().any(|arg| arg == &format!("--{kind}") || arg == &format!("--{kind}s") || arg == "--all-targets") { continue; }
+                if let Some(targets) = doc.get(kind).and_then(toml::Value::as_array) {
+                    for target in targets {
+                        if let Some(path) = target.get("path").and_then(toml::Value::as_str) { roots.insert(directory.join(path)); }
+                    }
+                }
+                let folder = directory.join(if kind == "bin" { "src/bin" } else { match kind { "example" => "examples", "test" => "tests", _ => "benches" } });
+                if let Ok(entries) = std::fs::read_dir(folder) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().is_some_and(|extension| extension == "rs") { roots.insert(path); }
+                        else if path.is_dir() && path.join("main.rs").is_file() { roots.insert(path.join("main.rs")); }
+                    }
+                }
+            }
+        }
+        let mut tables = vec![&doc];
+        if let Some(targets) = doc.get("target").and_then(toml::Value::as_table) { tables.extend(targets.values()); }
+        for table in tables {
+            for kind in ["dependencies", "build-dependencies", "dev-dependencies"] {
+                if kind == "dev-dependencies" && (!selected || !args.iter().any(|arg|
+                    matches!(arg.as_str(), "--test" | "--tests" | "--example" | "--examples" | "--bench" | "--benches" | "--all-targets"))) { continue; }
+                let Some(dependencies) = table.get(kind).and_then(toml::Value::as_table) else { continue; };
+                for (name, dependency) in dependencies {
+                    let inherited = dependency.get("workspace").and_then(toml::Value::as_bool) == Some(true);
+                    let value = if inherited { workspace_dependencies.and_then(|deps| deps.get(name))? } else { dependency };
+                    if let Some(path) = value.get("path").and_then(toml::Value::as_str) {
+                        pending.push_back(((if inherited { &workspace } else { directory }).join(path).join("Cargo.toml"), false));
+                    }
+                }
+            }
+        }
+    }
+    for directory in cwd.ancestors() {
+        for name in ["config", "config.toml"] {
+            let config = directory.join(".cargo").join(name);
+            if config.is_file() { manifests.insert(config); }
+        }
+    }
+    Some((manifests.into_iter().collect(), roots.into_iter().collect()))
+}
+
 fn resolved(path: &Path) -> Result<PathBuf, String> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()

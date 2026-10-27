@@ -168,5 +168,9 @@ impl ToolExecutor<ToolInvocation> for SleepHandler {
     }
 }
 
-impl CoreToolRuntime for SleepHandler {}
+impl CoreToolRuntime for SleepHandler {
+    fn is_workspace_independent(&self) -> bool {
+        true
+    }
+}
 

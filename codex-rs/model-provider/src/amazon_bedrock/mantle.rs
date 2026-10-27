@@ -4,10 +4,15 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
 
 const BEDROCK_MANTLE_SERVICE_NAME: &str = "bedrock-mantle";
-const BEDROCK_MANTLE_SUPPORTED_REGIONS: [&str; 12] = [
+// AWS endpoint registry verified 2026-10-26. Endpoint support is not model availability.
+// https://docs.aws.amazon.com/bedrock/latest/userguide/endpoints-region-availability.html
+const BEDROCK_MANTLE_SUPPORTED_REGIONS: [&str; 15] = [
     "us-east-2",
     "us-east-1",
     "us-west-2",
+    "us-gov-east-1",
+    "us-gov-west-1",
+    "ap-southeast-2",
     "ap-southeast-3",
     "ap-south-1",
     "ap-northeast-1",

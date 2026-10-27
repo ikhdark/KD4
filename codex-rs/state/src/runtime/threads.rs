@@ -222,6 +222,8 @@ INSERT INTO thread_spawn_edges (
     status
 ) VALUES (?, ?, ?)
 ON CONFLICT(child_thread_id) DO UPDATE SET
+    parent_turn_id = CASE WHEN thread_spawn_edges.parent_thread_id = excluded.parent_thread_id
+        THEN thread_spawn_edges.parent_turn_id ELSE NULL END,
     parent_thread_id = excluded.parent_thread_id,
     status = excluded.status
             "#,
@@ -242,6 +244,67 @@ ON CONFLICT(child_thread_id) DO UPDATE SET
                 source,
             })?;
         Ok(())
+    }
+
+    /// Attach creation-turn ownership only while the same parent still owns the edge.
+    pub async fn set_thread_spawn_turn_owner(
+        &self,
+        parent: ThreadId,
+        child: ThreadId,
+        turn_id: &str,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE thread_spawn_edges SET parent_turn_id = ? WHERE parent_thread_id = ? AND child_thread_id = ? AND (parent_turn_id IS NULL OR parent_turn_id = ?)",
+        )
+        .bind(turn_id)
+        .bind(parent.to_string())
+        .bind(child.to_string())
+        .bind(turn_id)
+        .execute(self.pool.as_ref())
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn list_turn_owned_thread_spawn_descendants(
+        &self,
+        parent: ThreadId,
+        turn_id: &str,
+    ) -> anyhow::Result<Vec<ThreadId>> {
+        let rows = sqlx::query(
+            "WITH RECURSIVE owned(child_thread_id) AS (SELECT child_thread_id FROM thread_spawn_edges WHERE parent_thread_id = ? AND parent_turn_id = ? AND status = 'open' UNION SELECT edge.child_thread_id FROM thread_spawn_edges AS edge JOIN owned ON edge.parent_thread_id = owned.child_thread_id WHERE edge.status = 'open' AND edge.child_thread_id != ?) SELECT child_thread_id FROM owned WHERE child_thread_id != ? ORDER BY child_thread_id",
+        )
+        .bind(parent.to_string())
+        .bind(turn_id)
+        .bind(parent.to_string())
+        .bind(parent.to_string())
+        .fetch_all(self.pool.as_ref())
+        .await?;
+        rows.into_iter().map(|row| {
+            ThreadId::try_from(row.try_get::<String, _>("child_thread_id")?).map_err(Into::into)
+        }).collect()
+    }
+
+    pub async fn retain_thread_spawn_instruction_snapshot(
+        &self,
+        parent: ThreadId,
+        child: ThreadId,
+        snapshot: &str,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE thread_spawn_edges SET inherited_user_instructions = ? WHERE parent_thread_id = ? AND child_thread_id = ? AND inherited_user_instructions IS NULL",
+        )
+        .bind(snapshot)
+        .bind(parent.to_string())
+        .bind(child.to_string())
+        .execute(self.pool.as_ref())
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn thread_spawn_instruction_snapshot(&self, child: ThreadId) -> anyhow::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT inherited_user_instructions FROM thread_spawn_edges WHERE child_thread_id = ?",
+        ).bind(child.to_string()).fetch_optional(self.pool.as_ref()).await?.flatten())
     }
 
     /// Update the persisted lifecycle status of a spawned thread's incoming edge.

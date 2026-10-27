@@ -478,17 +478,11 @@ impl HostState {
             } => {
                 let result = match self.session(&session_id) {
                     Ok(session) => {
-                        tokio::select! {
-                            biased;
-                            _ = cancellation.cancelled() => {
-                                Err("code-mode request cancelled".to_string())
+                        session.wait_releasable(request.into(), cancellation).await.map(|outcome| {
+                            HostResponse::WaitCompleted {
+                                outcome: outcome.into(),
                             }
-                            result = session.wait(request.into()) => result.map(|outcome| {
-                                HostResponse::WaitCompleted {
-                                    outcome: outcome.into(),
-                                }
-                            }),
-                        }
+                        })
                     }
                     Err(err) => Err(err),
                 };

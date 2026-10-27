@@ -5,6 +5,8 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -72,9 +74,10 @@ use tracing::warn;
 use crate::elicitation_client_service::ElicitationClientService;
 use crate::http_client_adapter::StreamableHttpClientAdapter;
 use crate::http_client_adapter::StreamableHttpClientAdapterError;
-use crate::load_oauth_tokens;
 use crate::oauth::OAuthPersistor;
+use crate::oauth::OAuthRequestAuthority;
 use crate::oauth::StoredOAuthTokens;
+use crate::oauth::load_oauth_tokens_with_authority;
 use crate::oauth_http_client::OAuthHttpClientAdapter;
 use crate::stdio_server_launcher::StdioServerCommand;
 use crate::stdio_server_launcher::StdioServerLauncher;
@@ -136,7 +139,9 @@ enum TransportRecipe {
         keyring_backend_kind: AuthKeyringBackendKind,
         http_client: Arc<dyn HttpClient>,
         auth_provider: Option<SharedAuthProvider>,
+        active_auth_provider: Arc<StdMutex<Option<SharedAuthProvider>>>,
         oauth_runtime: SharedOAuthRuntime,
+        oauth_authority: Arc<StdMutex<Option<OAuthRequestAuthority>>>,
     },
 }
 
@@ -150,6 +155,10 @@ struct InitializeContext {
 pub(crate) struct ElicitationPauseState {
     timing: watch::Sender<ElicitationTiming>,
 }
+
+// Without a parent request identity, human wait is excluded from the budgets
+// of the outstanding cohort, but cannot keep unrelated work alive indefinitely.
+const MAX_UNCORRELATED_ELICITATION_PAUSE: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Default)]
 pub(crate) struct ElicitationPauseRegistry {
@@ -168,7 +177,7 @@ impl ElicitationPauseRegistry {
         }
     }
 
-    pub(crate) fn enter(&self) -> Option<ElicitationPauseGuard> {
+    pub(crate) fn enter(&self) -> Vec<ElicitationPauseGuard> {
         let operations = self
             .operations
             .lock()
@@ -176,12 +185,17 @@ impl ElicitationPauseRegistry {
         // RMCP supplies no parent-operation identity for elicitation. Its
         // progressToken identifies the incoming request, not our tools/call;
         // comparing the two directions' counters can pause the wrong call.
-        // Preserve the unambiguous single-operation pause, never a client-wide
-        // pause when concurrent operations make attribution unavailable.
-        let [state] = operations.as_slice() else {
-            return None;
-        };
-        Some(state.enter())
+        // With no parent identity, pause only the operations already outstanding
+        // when the dialog arrives. Each receives at most five minutes of this
+        // ambiguous pause over its entire lifetime; later work is never paused.
+        let bounded = operations.len() > 1;
+        if bounded {
+            warn!(
+                max_pause_sec = MAX_UNCORRELATED_ELICITATION_PAUSE.as_secs(),
+                "concurrent MCP elicitation has no parent identity; applying a bounded pause to outstanding request budgets"
+            );
+        }
+        operations.iter().map(|state| state.enter(bounded)).collect()
     }
 }
 
@@ -204,6 +218,9 @@ impl Drop for ElicitationOperationRegistration {
 #[derive(Clone, Copy)]
 struct ElicitationTiming {
     active_count: usize,
+    bounded_count: usize,
+    bounded_remaining: Duration,
+    ambiguous_pause: bool,
     active_elapsed: Duration,
     active_since: Instant,
 }
@@ -212,10 +229,25 @@ impl ElicitationTiming {
     fn active_time(&self) -> Duration {
         self.active_elapsed
             + if self.active_count == 0 {
-                self.active_since.elapsed()
+                if self.bounded_count == 0 {
+                    self.active_since.elapsed()
+                } else {
+                    self.active_since
+                        .elapsed()
+                        .saturating_sub(self.bounded_remaining)
+                }
             } else {
                 Duration::ZERO
             }
+    }
+
+    fn settle(&mut self) {
+        let elapsed = self.active_since.elapsed();
+        self.active_elapsed = self.active_time();
+        if self.active_count == 0 && self.bounded_count > 0 {
+            self.bounded_remaining = self.bounded_remaining.saturating_sub(elapsed);
+        }
+        self.active_since = Instant::now();
     }
 }
 
@@ -223,21 +255,30 @@ impl ElicitationPauseState {
     fn new() -> Self {
         let (timing, _rx) = watch::channel(ElicitationTiming {
             active_count: 0,
+            bounded_count: 0,
+            bounded_remaining: MAX_UNCORRELATED_ELICITATION_PAUSE,
+            ambiguous_pause: false,
             active_elapsed: Duration::ZERO,
             active_since: Instant::now(),
         });
         Self { timing }
     }
 
-    pub(crate) fn enter(&self) -> ElicitationPauseGuard {
+    pub(crate) fn enter(&self, bounded: bool) -> ElicitationPauseGuard {
+        let mut bounded = bounded;
         self.timing.send_modify(|timing| {
-            if timing.active_count == 0 {
-                timing.active_elapsed = timing.active_time();
+            timing.settle();
+            timing.ambiguous_pause |= bounded;
+            bounded = timing.ambiguous_pause;
+            if bounded {
+                timing.bounded_count += 1;
+            } else {
+                timing.active_count += 1;
             }
-            timing.active_count += 1;
         });
         ElicitationPauseGuard {
             pause_state: self.clone(),
+            bounded,
         }
     }
 
@@ -248,14 +289,17 @@ impl ElicitationPauseState {
 
 pub(crate) struct ElicitationPauseGuard {
     pause_state: ElicitationPauseState,
+    bounded: bool,
 }
 
 impl Drop for ElicitationPauseGuard {
     fn drop(&mut self) {
         self.pause_state.timing.send_modify(|timing| {
-            timing.active_count -= 1;
-            if timing.active_count == 0 {
-                timing.active_since = Instant::now();
+            timing.settle();
+            if self.bounded {
+                timing.bounded_count -= 1;
+            } else {
+                timing.active_count -= 1;
             }
         });
     }
@@ -272,9 +316,14 @@ where
     let started = pause_state.borrow_and_update().active_time();
     tokio::pin!(operation);
     loop {
-        let (active_count, active_time) = {
+        let (active_count, active_time, bounded_remaining) = {
             let timing = pause_state.borrow_and_update();
-            (timing.active_count, timing.active_time())
+            let bounded_remaining = if timing.bounded_count > 0 {
+                timing.bounded_remaining.saturating_sub(timing.active_since.elapsed())
+            } else {
+                Duration::ZERO
+            };
+            (timing.active_count, timing.active_time(), bounded_remaining)
         };
         let remaining = duration.saturating_sub(active_time.saturating_sub(started));
         if remaining.is_zero() {
@@ -282,7 +331,7 @@ where
         }
         tokio::select! {
             result = &mut operation => return Ok(result),
-            _ = time::sleep(remaining), if active_count == 0 => {},
+            _ = time::sleep(remaining.saturating_add(bounded_remaining)), if active_count == 0 => {},
             changed = pause_state.changed() => {
                 if changed.is_err() {
                     let remaining = duration.saturating_sub(
@@ -578,6 +627,7 @@ pub struct RmcpClient {
     transport_recipe: TransportRecipe,
     initialize_context: Mutex<Option<InitializeContext>>,
     session_recovery: StdMutex<Option<RecoveryObservation>>,
+    session_generation: AtomicU64,
     elicitation_pause_state: ElicitationPauseRegistry,
 }
 
@@ -611,6 +661,7 @@ impl RmcpClient {
             transport_recipe,
             initialize_context: Mutex::new(None),
             session_recovery: StdMutex::new(None),
+            session_generation: AtomicU64::new(0),
             elicitation_pause_state: ElicitationPauseRegistry::default(),
         })
     }
@@ -639,7 +690,9 @@ impl RmcpClient {
             keyring_backend_kind,
             http_client,
             auth_provider,
+            active_auth_provider: Arc::default(),
             oauth_runtime: Arc::default(),
+            oauth_authority: Arc::default(),
         };
         let transport = Self::create_pending_transport(&transport_recipe).await?;
         Ok(Self {
@@ -650,6 +703,7 @@ impl RmcpClient {
             transport_recipe,
             initialize_context: Mutex::new(None),
             session_recovery: StdMutex::new(None),
+            session_generation: AtomicU64::new(0),
             elicitation_pause_state: ElicitationPauseRegistry::default(),
         })
     }
@@ -743,12 +797,12 @@ impl RmcpClient {
                 service,
                 oauth: oauth_persistor.clone(),
             };
+            self.session_generation.fetch_add(1, Ordering::AcqRel);
         }
 
         if let Some(runtime) = oauth_persistor
-            && let Err(error) = runtime.persist_if_needed().await
         {
-            warn!("failed to persist OAuth tokens after initialize: {error}");
+            runtime.persist_if_needed().await?;
         }
 
         Ok(initialize_result)
@@ -800,7 +854,7 @@ impl RmcpClient {
             })
             .await;
         let persist_start = Instant::now();
-        self.persist_oauth_tokens().await;
+        let result = self.finish_oauth_operation(result).await;
         result.map(|(result, active_time)| (result, active_time + persist_start.elapsed()))
     }
 
@@ -887,8 +941,7 @@ impl RmcpClient {
                 .boxed()
             })
             .await;
-        self.persist_oauth_tokens().await;
-        result
+        self.finish_oauth_operation(result).await
     }
 
     pub async fn list_resource_templates(
@@ -922,8 +975,7 @@ impl RmcpClient {
                 },
             )
             .await;
-        self.persist_oauth_tokens().await;
-        result
+        self.finish_oauth_operation(result).await
     }
 
     pub async fn read_resource(
@@ -950,8 +1002,7 @@ impl RmcpClient {
                 .boxed()
             })
             .await;
-        self.persist_oauth_tokens().await;
-        result
+        self.finish_oauth_operation(result).await
     }
 
     pub async fn call_tool(
@@ -1011,7 +1062,7 @@ impl RmcpClient {
                 .boxed()
             })
             .await;
-        self.persist_oauth_tokens().await;
+        let result = self.finish_oauth_operation(result).await;
         result.map_err(|source| {
             if attempted.load(std::sync::atomic::Ordering::Acquire) && !is_timeout_error(&source) {
                 ClientOperationError::CompletionUnknown { source }.into()
@@ -1047,8 +1098,7 @@ impl RmcpClient {
                 },
             )
             .await;
-        self.persist_oauth_tokens().await;
-        result
+        self.finish_oauth_operation(result).await
     }
 
     pub async fn send_custom_request(
@@ -1075,8 +1125,7 @@ impl RmcpClient {
                 },
             )
             .await;
-        self.persist_oauth_tokens().await;
-        response
+        self.finish_oauth_operation(response).await
     }
 
     async fn service(&self) -> Result<Arc<RunningService<RoleClient, ElicitationClientService>>> {
@@ -1085,6 +1134,79 @@ impl RmcpClient {
             ClientState::Ready { service, .. } => Ok(Arc::clone(service)),
             ClientState::Connecting { .. } => Err(anyhow!("MCP client not initialized")),
             ClientState::Closed => Err(anyhow!("MCP client is shut down")),
+        }
+    }
+
+    /// Live service health is independent of the original initialization result.
+    pub async fn is_healthy(&self) -> bool {
+        self.service()
+            .await
+            .is_ok_and(|service| !service.is_closed() && !service.is_transport_closed())
+    }
+
+    pub fn session_generation(&self) -> u64 {
+        self.session_generation.load(Ordering::Acquire)
+    }
+
+    pub fn session_recovery_in_progress(&self) -> bool {
+        self.session_recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Read peer metadata and its generation under the same replacement lock.
+    pub async fn negotiated_session(&self) -> Result<(u64, InitializeResult)> {
+        let guard = self.state.lock().await;
+        let ClientState::Ready { service, .. } = &*guard else {
+            return Err(anyhow!("MCP client is not ready"));
+        };
+        let peer = service
+            .peer()
+            .peer_info()
+            .ok_or_else(|| anyhow!("MCP peer info is missing"))?;
+        let mut result = InitializeResult::new(peer.capabilities.clone())
+            .with_protocol_version(peer.protocol_version.clone())
+            .with_server_info(
+                peer.server_info
+                    .clone()
+                    .ok_or_else(|| anyhow!("MCP server info is missing"))?,
+            );
+        result.instructions = peer.instructions.clone();
+        result.meta = peer.meta.clone();
+        Ok((self.session_generation(), result))
+    }
+
+    /// A healthy session may only be adopted while its loaded OAuth authority
+    /// still matches the credential store's committed login/logout revision.
+    pub async fn has_current_auth_authority(&self) -> bool {
+        if !self.managed_auth_scope_is_current() {
+            return false;
+        }
+        let authority = match &self.transport_recipe {
+            TransportRecipe::StreamableHttp { oauth_authority, .. } => oauth_authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            TransportRecipe::Stdio { .. } => None,
+        };
+        match authority {
+            Some(authority) => authority.check().await.is_ok(),
+            None => true,
+        }
+    }
+
+    /// Match transport auth precedence without reading/minting any credentials.
+    pub fn managed_auth_scope_is_current(&self) -> bool {
+        match &self.transport_recipe {
+            TransportRecipe::StreamableHttp {
+                active_auth_provider, ..
+            } => {
+                let auth = active_auth_provider.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                auth.as_ref().is_none_or(|auth| auth.validate_auth_scope().is_ok())
+            }
+            _ => true,
         }
     }
 
@@ -1105,6 +1227,9 @@ impl RmcpClient {
             let mut guard = self.state.lock().await;
             std::mem::replace(&mut *guard, ClientState::Closed)
         };
+        // Release notification senders owned by the initialize recipe too, so
+        // retired clients do not leave catalog workers waiting indefinitely.
+        self.initialize_context.lock().await.take();
 
         if let ClientState::Ready { service, .. } = previous_state {
             match Arc::try_unwrap(service) {
@@ -1139,12 +1264,21 @@ impl RmcpClient {
     /// Refresh itself belongs to `AuthClient`: every request re-checks expiry
     /// under the shared authorization-manager lock, so concurrent operations
     /// near expiry share one token-endpoint call inside their timeouts.
-    async fn persist_oauth_tokens(&self) {
-        if let Some(runtime) = self.oauth_persistor().await
-            && let Err(error) = runtime.observe_after_operation().await
-        {
-            warn!("failed to persist OAuth tokens: {error}");
+    async fn finish_oauth_operation<T>(&self, result: Result<T>) -> Result<T> {
+        if let Some(runtime) = self.oauth_persistor().await {
+            let durability = runtime.observe_after_operation().await;
+            if let Err(error) = durability {
+                return match result {
+                    Ok(_) => Err(error.context(
+                        "MCP operation completed, but credential durability is unconfirmed; do not replay the operation",
+                    )),
+                    Err(operation_error) => Err(error.context(format!(
+                        "MCP operation also failed: {operation_error:#}"
+                    ))),
+                };
+            }
         }
+        result
     }
 
     async fn create_pending_transport(
@@ -1166,7 +1300,9 @@ impl RmcpClient {
                 keyring_backend_kind,
                 http_client,
                 auth_provider,
+                active_auth_provider,
                 oauth_runtime,
+                oauth_authority,
             } => {
                 // Each transport/worker keeps its own deadline, even when a
                 // cancelled handshake outlives its caller or a retry starts.
@@ -1182,6 +1318,8 @@ impl RmcpClient {
 
                 // Reinitialization must reuse the live credential store and
                 // refresh lock; disk can lag a one-use refresh-token rotation.
+                *active_auth_provider.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = auth_provider.clone();
                 let mut cached_oauth = oauth_runtime.lock().await;
                 if bearer_token.is_none()
                     && auth_provider.is_none()
@@ -1210,8 +1348,8 @@ impl RmcpClient {
                     let url = url.clone();
                     let store_mode = *store_mode;
                     let keyring_backend_kind = *keyring_backend_kind;
-                    match tokio::task::spawn_blocking(move || {
-                        load_oauth_tokens(
+                    let (tokens, authority) = tokio::task::spawn_blocking(move || {
+                        load_oauth_tokens_with_authority(
                             &codex_home,
                             &name,
                             &url,
@@ -1219,17 +1357,16 @@ impl RmcpClient {
                             keyring_backend_kind,
                         )
                     })
-                    .await?
-                    {
-                        Ok(tokens) => tokens,
-                        Err(err) => {
-                            warn!("failed to read tokens for server `{server_name}`: {err}");
-                            None
-                        }
-                    }
+                    .await??;
+                    *oauth_authority.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(authority);
+                    tokens
                 } else {
                     None
                 };
+                let request_authority = oauth_authority
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
 
                 if let Some(initial_tokens) = initial_oauth_tokens.clone() {
                     match create_oauth_transport_and_runtime(OAuthTransportRuntimeParams {
@@ -1237,6 +1374,7 @@ impl RmcpClient {
                         url,
                         codex_home: codex_home.clone(),
                         initial_tokens: initial_tokens.clone(),
+                        authority: request_authority.clone().ok_or_else(|| anyhow!("MCP OAuth authority was not loaded"))?,
                         credentials_store: *store_mode,
                         keyring_backend_kind: *keyring_backend_kind,
                         default_headers: default_headers.clone(),
@@ -1276,7 +1414,7 @@ impl RmcpClient {
                                     default_headers,
                                     /*auth_provider*/ None,
                                     Arc::clone(&initialize_deadline),
-                                ),
+                                ).with_oauth_authority(request_authority),
                                 http_config,
                             );
                             Ok(PendingTransport::StreamableHttp {
@@ -1299,7 +1437,7 @@ impl RmcpClient {
                             default_headers,
                             auth_provider,
                             Arc::clone(&initialize_deadline),
-                        ),
+                        ).with_oauth_authority(request_authority),
                         http_config,
                     );
                     Ok(PendingTransport::StreamableHttp {
@@ -1660,6 +1798,7 @@ impl RmcpClient {
             .clone()
             .ok_or_else(|| anyhow!("MCP client cannot recover before initialize succeeds"))?;
         let pending_transport = Self::create_pending_transport(&self.transport_recipe).await?;
+        let client_service = initialize_context.client_service.clone();
         let (service, oauth_persistor) = self
             .connect_pending_transport_with_initialize_retries(
                 pending_transport,
@@ -1677,12 +1816,16 @@ impl RmcpClient {
                 service,
                 oauth: oauth_persistor.clone(),
             };
+            self.session_generation.fetch_add(1, Ordering::AcqRel);
         }
 
+        // Reinitialization is a new negotiated catalog, even without a server
+        // tools/list_changed notification. The existing coalescing owner fills it.
+        client_service.notify_session_changed().await;
+
         if let Some(runtime) = oauth_persistor
-            && let Err(error) = runtime.persist_if_needed().await
         {
-            warn!("failed to persist OAuth tokens after session recovery: {error}");
+            runtime.persist_if_needed().await?;
         }
 
         Ok(())
@@ -1706,6 +1849,7 @@ struct OAuthTransportRuntimeParams<'a> {
     url: &'a str,
     codex_home: PathBuf,
     initial_tokens: StoredOAuthTokens,
+    authority: OAuthRequestAuthority,
     credentials_store: OAuthCredentialsStoreMode,
     keyring_backend_kind: AuthKeyringBackendKind,
     default_headers: HeaderMap,
@@ -1725,6 +1869,7 @@ async fn create_oauth_transport_and_runtime(
         url,
         codex_home,
         initial_tokens,
+        authority,
         credentials_store,
         keyring_backend_kind,
         default_headers,
@@ -1733,7 +1878,8 @@ async fn create_oauth_transport_and_runtime(
     } = params;
     let oauth_http_client = Arc::new(
         OAuthHttpClientAdapter::new(http_client.clone(), url, default_headers.clone())
-            .map_err(anyhow::Error::from_boxed)?,
+            .map_err(anyhow::Error::from_boxed)?
+            .with_authority(authority.clone()),
     );
     let mut oauth_state =
         OAuthState::new_with_oauth_http_client(url.to_string(), oauth_http_client).await?;
@@ -1767,7 +1913,7 @@ async fn create_oauth_transport_and_runtime(
             default_headers,
             /*auth_provider*/ None,
             initialize_deadline,
-        ),
+        ).with_oauth_authority(Some(authority.clone())),
         manager,
     );
 
@@ -1784,6 +1930,7 @@ async fn create_oauth_transport_and_runtime(
         credentials_store,
         keyring_backend_kind,
         Some(initial_tokens),
+        authority,
     );
 
     Ok((transport, runtime, auth_client))

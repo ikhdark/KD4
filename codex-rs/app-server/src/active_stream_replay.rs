@@ -118,7 +118,10 @@ impl ActiveStreamReplay {
         self.bytes += bytes;
     }
 
-    pub(super) fn snapshot(&self) -> Vec<ServerNotification> {
+    pub(super) fn snapshot(&self, active_turn_id: Option<&str>) -> Vec<ServerNotification> {
+        if active_turn_id.is_none() || self.turn_id.as_deref() != active_turn_id {
+            return Vec::new();
+        }
         let mut notifications = self
             .entries
             .iter()

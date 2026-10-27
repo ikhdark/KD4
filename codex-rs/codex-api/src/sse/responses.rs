@@ -432,5 +432,8 @@ async fn process_sse_with_metadata(
                 return;
             }
         }
+        if interpreter.take_compaction_progress() {
+            progress_deadline = Instant::now() + idle_timeout;
+        }
     }
 }

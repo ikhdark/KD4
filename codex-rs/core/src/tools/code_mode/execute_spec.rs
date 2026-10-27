@@ -4,6 +4,7 @@ use codex_tools::ToolSpec;
 
 pub(crate) fn create_code_mode_tool(
     code_mode_only: bool,
+    direct_delivery_enabled: bool,
     has_deferred_tools: bool,
     direct_only_tool_names: &[String],
     eager_nested_tool_descriptions: &[String],
@@ -20,6 +21,7 @@ SOURCE: /[\s\S]+/
 
     let mut description = codex_code_mode::build_exec_tool_description(
         code_mode_only,
+        direct_delivery_enabled,
         has_deferred_tools,
         direct_only_tool_names,
     );

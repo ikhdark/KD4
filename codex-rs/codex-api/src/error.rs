@@ -12,6 +12,8 @@ pub enum ApiError {
     Api { status: StatusCode, message: String },
     #[error("stream error: {0}")]
     Stream(String),
+    #[error("{message}")]
+    WebsocketClosed { code: Option<u16>, message: String },
     #[error("{0}")]
     IncompleteResponse(Box<codex_protocol::error::IncompleteResponse>),
     #[error("{source}")]

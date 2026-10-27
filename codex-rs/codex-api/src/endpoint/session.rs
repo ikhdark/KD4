@@ -255,12 +255,9 @@ impl<T: HttpTransport> EndpointSession<T> {
                     }
                     // Authentication and safe pre-dispatch retry backoff are
                     // not response silence. Give each dispatch its own budget.
-                    tokio::time::timeout(
-                        header_timeout,
-                        codex_client::with_dispatch_guard(
-                            auth.dispatch_guard(),
-                            transport.stream(req),
-                        ),
+                    codex_client::with_dispatch_guard(
+                        auth.dispatch_guard(),
+                        transport.stream_with_header_timeout(req, header_timeout),
                     )
                     .await
                     .unwrap_or_else(|_| {

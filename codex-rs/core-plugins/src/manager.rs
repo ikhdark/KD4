@@ -1343,6 +1343,7 @@ impl PluginsManager {
     }
 
     pub fn clear_remote_installed_plugins_cache(&self) -> bool {
+        crate::remote::invalidate_remote_installed_plugin_bundle_sync(&self.codex_home);
         let generation = self
             .remote_installed_plugins_cache_generation
             .fetch_add(1, Ordering::AcqRel)
@@ -1464,6 +1465,7 @@ impl PluginsManager {
         on_effective_plugins_changed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     ) {
         if !config.plugins_enabled {
+            crate::remote::invalidate_remote_installed_plugin_bundle_sync(&self.codex_home);
             return;
         }
 

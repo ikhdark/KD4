@@ -258,6 +258,11 @@ impl CommandExecRequestProcessor {
             /*thread_id*/ None,
         );
         if let Some(env_overrides) = env_overrides {
+            #[cfg(windows)]
+            super::process_exec_processor::validate_environment_override_keys(
+                &env_overrides,
+                "command/exec",
+            )?;
             for (key, value) in env_overrides {
                 #[cfg(windows)]
                 env.retain(|inherited_key, _| !inherited_key.eq_ignore_ascii_case(&key));

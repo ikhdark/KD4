@@ -24,10 +24,13 @@ pub fn is_dangerous_command_windows(command: &[String]) -> bool {
     is_direct_gui_launch(command)
 }
 
-/// Checks only hazards intrinsic to the exact executable argv. Structured
-/// direct argv must not be reinterpreted as an owned PowerShell or CMD wrapper.
+/// A structured shell launch is opaque, not an owned wrapper. Require normal
+/// hazardous-command approval without lowering its body or granting it authority.
 pub(super) fn is_dangerous_direct_argv_windows(command: &[String]) -> bool {
-    is_direct_gui_launch(command)
+    command.first().is_some_and(|exe| {
+        is_powershell_executable(exe)
+            || matches!(executable_basename(exe).as_deref(), Some("cmd" | "cmd.exe"))
+    }) || is_direct_gui_launch(command)
 }
 
 fn is_dangerous_powershell(command: &[String]) -> bool {

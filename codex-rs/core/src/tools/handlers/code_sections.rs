@@ -27,6 +27,8 @@ pub(crate) struct CodeItem {
     /// Possible locations when file context is unknown; existence is not checked.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub linked_path_candidates: Vec<String>,
+    #[serde(skip)]
+    module_candidate_group_size: usize,
     /// The item or a Rust owner header used for its qualified identity has errors.
     pub syntax_error: bool,
     /// Diagnostic-only spelling for trait methods; never an executable alias.
@@ -278,6 +280,7 @@ pub(super) fn parse_with_completeness(
             }
             // Bound outline metadata; the complete signature remains in the exact section.
             let mut linked_path_candidates = Vec::new();
+            let module_candidate_group_size = if module_path.is_some() { 1 } else { 2 };
             if rust && kind == "mod" && body.is_none() && !conditional_path {
                 let bases = module_directories(path, node, source, module_path.is_none())
                     .unwrap_or_default();
@@ -329,6 +332,7 @@ pub(super) fn parse_with_completeness(
                 in_test_context,
                 linked_path,
                 linked_path_candidates,
+                module_candidate_group_size,
                 syntax_error,
                 trait_method_alias,
                 start,
@@ -348,6 +352,22 @@ pub(super) fn parse_with_completeness(
             }
         }
     }
+}
+
+/// Resolve the parser's context-dependent module candidates when a compilation
+/// owner supplies crate-root context. No directory enumeration or macro
+/// evaluation is performed; missing declared modules remain named inputs.
+pub(crate) fn compilation_module_paths(path: &Path, source: &str, crate_root: bool) -> Vec<std::path::PathBuf> {
+    let Some(items) = parse(&path.to_string_lossy(), source, "compilation-input",
+        Instant::now() + std::time::Duration::from_secs(2)) else { return Vec::new(); };
+    let use_first = crate_root || path.file_stem().is_some_and(|stem| stem == "mod");
+    items.into_iter().filter(|item| item.kind == "mod" && !item.in_test_context).flat_map(|item| {
+        if let Some(path) = item.linked_path { return vec![std::path::PathBuf::from(path)]; }
+        let count = item.module_candidate_group_size.min(item.linked_path_candidates.len());
+        let start = if use_first { 0 } else { item.linked_path_candidates.len() - count };
+        item.linked_path_candidates.into_iter().skip(start).take(count)
+            .map(std::path::PathBuf::from).collect::<Vec<_>>()
+    }).collect()
 }
 
 /// Whether `after` removes or rewrites a test item of `before`: an item under

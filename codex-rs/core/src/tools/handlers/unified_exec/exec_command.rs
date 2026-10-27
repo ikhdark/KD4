@@ -50,8 +50,8 @@ use codex_otel::TOOL_CALL_UNIFIED_EXEC_METRIC;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
 use codex_sandboxing::select_initial;
-use codex_shell_command::is_safe_command::is_known_safe_command;
-use codex_shell_command::is_safe_command::is_known_safe_direct_argv;
+use codex_shell_command::is_safe_command::is_known_safe_command_in_state;
+use codex_shell_command::is_safe_command::is_known_safe_direct_argv_in_state;
 use codex_shell_command::shell_detect::detect_shell_type;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
@@ -582,11 +582,23 @@ impl ExecCommandHandler {
         };
         let safety_command = resolved_command.safety_command.clone();
         let direct_argv = command_invocation.is_argv();
+        let inspection_state = native_cwd
+            .as_ref()
+            .filter(|_| {
+                !environment_is_remote
+                    && crate::agent::task_capabilities::is_independent_review_source(
+                        &turn.session_source,
+                    )
+            })
+            .map(|cwd| (cwd.clone(), manager.effective_environment(&context)));
         let safety_analysis = crate::tools::run_blocking_command_analysis(move || {
+            let Some((cwd, inspection_env)) = inspection_state else {
+                return false;
+            };
             if direct_argv {
-                is_known_safe_direct_argv(&safety_command)
+                is_known_safe_direct_argv_in_state(&safety_command, cwd.as_path(), &inspection_env)
             } else {
-                is_known_safe_command(&safety_command)
+                is_known_safe_command_in_state(&safety_command, cwd.as_path(), &inspection_env)
             }
         });
         // Pure launch analyses share inputs but not results. Join them before
@@ -826,6 +838,9 @@ impl ExecCommandHandler {
             policy_selection,
             &format!("{validation_cwd}:{environment_hash}"),
             workspace_identity.as_deref(),
+            &turn_environment.environment_id,
+            &cwd,
+            &command,
         ).await {
             Ok(permit) => permit,
             Err(refusal) => return Ok(boxed_tool_output(refusal)),

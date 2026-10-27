@@ -4346,6 +4346,20 @@ impl TurnTimingState {
             .saturating_sub(state.accounted_model_responses)
     }
 
+    /// Last physical entry reported by the transport dispatch owner, not stream creation.
+    pub(crate) fn latest_model_dispatch_identity(
+        &self,
+    ) -> Option<crate::client_common::ResponseAttemptIdentity> {
+        let state = self.state();
+        let request = state.model_requests.last()?;
+        let physical_attempt_id = request.physical_attempt_ids.iter().rev()
+            .find(|id| request.dispatched_attempt_ids.contains(*id))?;
+        Some(crate::client_common::ResponseAttemptIdentity {
+            sampling_request_id: request.sampling_request_id.clone()?,
+            physical_attempt_id: physical_attempt_id.clone(),
+        })
+    }
+
     /// Called at transport entry, after preparation/authentication, not at readiness.
     /// Registered identities fence stale callbacks and deduplicate notifications.
     pub(crate) fn mark_model_attempt_dispatched(

@@ -256,8 +256,8 @@ pub(super) async fn local_publish_check(
     .details(details)
 }
 
-/// Verifies that Codex Desktop has a non-current app-server process running
-/// from the selected local target, without starting or stopping Desktop.
+/// Checks backend provenance without starting or stopping Desktop. A matching
+/// backend receipt alone cannot verify the GUI's actual connection.
 pub(super) async fn desktop_runtime_chain_check(
     target_path: PathBuf,
     target_sha256: Result<String, String>,
@@ -302,7 +302,7 @@ pub(super) async fn desktop_runtime_chain_check(
             "desktop.runtime_chain",
             "desktop",
             CheckStatus::Warning,
-            "Desktop is not using the selected local app-server binary",
+            "No matching local app-server process was observed",
         )
         .details(details)
         .remediation("Restart Codex Desktop after publishing the local Codex binary.");
@@ -363,15 +363,19 @@ pub(super) async fn desktop_runtime_chain_check(
         .details(details)
         .remediation("Restart Codex Desktop with the selected local binary and CODEX_HOME.");
     }
-    details.push("desktop runtime receipt status: matched".to_string());
+    details.push(
+        "app-server runtime receipt status: binary, build and CODEX_HOME matched".to_string(),
+    );
+    details.push("Desktop GUI binding: unavailable; no checked GUI/backend process creation identities or verified connection peer are supplied by this receipt".to_string());
 
     DoctorCheck::new(
         "desktop.runtime_chain",
         "desktop",
-        CheckStatus::Ok,
-        "Desktop app-server matches the selected local binary, build, and CODEX_HOME",
+        CheckStatus::Warning,
+        "Desktop GUI connection is unverified",
     )
     .details(details)
+    .remediation("Obtain a GUI-bound transport/peer receipt before claiming Desktop activation; a client name or another matching app-server is insufficient.")
 }
 
 /// Verifies that the search command selected by the install context is usable.
@@ -587,7 +591,7 @@ fn validate_desktop_runtime_receipt(
     current_pid: u32,
     expected_codex_home: &Path,
 ) -> Result<(), String> {
-    if receipt.schema_version != 1 {
+    if receipt.schema_version != 2 {
         return Err(format!(
             "unsupported schema version {}",
             receipt.schema_version
@@ -643,6 +647,15 @@ fn push_desktop_runtime_receipt_details(
         receipt.codex_home.display()
     ));
     details.push(format!("receipt client: {}", receipt.client_name));
+    details.push(format!(
+        "receipt process RPC transport (not connection peer proof): {}",
+        receipt.process_rpc_transport.as_deref().unwrap_or("<unavailable>")
+    ));
+    details.push(format!("receipt connection ID: {:?}", receipt.connection_id));
+    details.push(format!(
+        "receipt enabled features: {}",
+        receipt.enabled_features.join(", ")
+    ));
     details.push(format!("receipt build commit: {}", receipt.build_commit));
     details.push(format!("receipt build built: {}", receipt.build_built));
 }

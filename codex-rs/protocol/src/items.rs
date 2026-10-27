@@ -155,6 +155,10 @@ pub struct AgentMessageItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub phase: Option<MessagePhase>,
+    /// Provider never finalized this streamed prefix. It is not a completed answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub interruption: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
@@ -749,6 +753,7 @@ impl AgentMessageItem {
             id: new_item_id(),
             content: content.to_vec(),
             phase: None,
+            interruption: None,
         }
     }
 }

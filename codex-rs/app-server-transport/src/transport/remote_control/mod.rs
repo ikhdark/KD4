@@ -469,68 +469,79 @@ impl RemoteControlHandle {
     ) -> Result<RemoteControlStatusChangedNotification, RemoteControlEnableError> {
         self.auth_manager
             .with_policy_identity(|identity| {
-                // Holding the decision orders a concurrent denial before or after this enable.
-                let decision = self.policy.borrow();
-                if !policy_admits(*decision, identity) {
-                    return Err(RemoteControlEnableError::DisabledByRequirements(
-                        RemoteControlDisabledByRequirements,
-                    ));
-                }
-
-                if self.state_db.is_none() {
-                    warn!(
-                        "remote control cannot be enabled because sqlite state db is unavailable"
-                    );
-                    return Err(RemoteControlEnableError::Unavailable(
-                        RemoteControlUnavailable,
-                    ));
-                }
-
-                let mut effective_persistence_preference = persistence_preference;
-                let desired_state_changed = self.desired_state_tx.send_if_modified(|state| {
-                    if effective_persistence_preference.is_none()
-                        && matches!(
-                            *state,
-                            RemoteControlDesiredState::Enabled {
-                                persistence_preference: Some(true)
-                            }
-                        )
-                    {
-                        effective_persistence_preference = Some(true);
-                    }
-                    let next_state = RemoteControlDesiredState::Enabled {
-                        persistence_preference: effective_persistence_preference,
-                    };
-                    let changed = *state != next_state;
-                    *state = next_state;
-                    changed
-                });
-
-                let status = self.status();
-                info!(
-                    desired_state_changed,
-                    ?effective_persistence_preference,
-                    current_status = ?status.status,
-                    environment_id = ?status.environment_id,
-                    installation_id = %status.installation_id,
-                    server_name = %status.server_name,
-                    "remote control enable requested"
-                );
-                if matches!(
-                    status.status,
-                    RemoteControlConnectionStatus::Connected
-                        | RemoteControlConnectionStatus::Connecting
-                ) {
-                    return Ok(status);
-                }
-
-                Ok(self.publish_status(RemoteControlConnectionStatus::Connecting))
+                self.enable_with_preference_at_identity(identity, persistence_preference)
             })
             .map_err(|_| {
                 RemoteControlEnableError::DisabledByRequirements(
                     RemoteControlDisabledByRequirements,
                 )
             })?
+    }
+
+    // The caller must retain with_policy_identity's auth guard through this commit.
+    // Durable enable acquires auth before lifecycle, matching policy denial, and
+    // must not re-enter AuthManager while holding the lifecycle commit guard.
+    fn enable_with_preference_at_identity(
+        &self,
+        identity: PolicyIdentity,
+        persistence_preference: Option<bool>,
+    ) -> Result<RemoteControlStatusChangedNotification, RemoteControlEnableError> {
+        // Holding the decision orders a concurrent denial before or after this enable.
+        let decision = self.policy.borrow();
+        if !policy_admits(*decision, identity) {
+            return Err(RemoteControlEnableError::DisabledByRequirements(
+                RemoteControlDisabledByRequirements,
+            ));
+        }
+
+        if self.state_db.is_none() {
+            warn!(
+                "remote control cannot be enabled because sqlite state db is unavailable"
+            );
+            return Err(RemoteControlEnableError::Unavailable(
+                RemoteControlUnavailable,
+            ));
+        }
+
+        let mut effective_persistence_preference = persistence_preference;
+        let desired_state_changed = self.desired_state_tx.send_if_modified(|state| {
+            if effective_persistence_preference.is_none()
+                && matches!(
+                    *state,
+                    RemoteControlDesiredState::Enabled {
+                        persistence_preference: Some(true)
+                    }
+                )
+            {
+                effective_persistence_preference = Some(true);
+            }
+            let next_state = RemoteControlDesiredState::Enabled {
+                persistence_preference: effective_persistence_preference,
+            };
+            let changed = *state != next_state;
+            *state = next_state;
+            changed
+        });
+
+        let status = self.status();
+        info!(
+            desired_state_changed,
+            ?effective_persistence_preference,
+            current_status = ?status.status,
+            environment_id = ?status.environment_id,
+            installation_id = %status.installation_id,
+            server_name = %status.server_name,
+            "remote control enable requested"
+        );
+        if matches!(
+            status.status,
+            RemoteControlConnectionStatus::Connected
+                | RemoteControlConnectionStatus::Connecting
+        ) {
+            return Ok(status);
+        }
+
+        Ok(self.publish_status(RemoteControlConnectionStatus::Connecting))
     }
 
     pub async fn disable(

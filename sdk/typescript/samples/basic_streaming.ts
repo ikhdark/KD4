@@ -14,7 +14,8 @@ const rl = createInterface({ input, output });
 const handleItemCompleted = (item: ThreadItem): void => {
   switch (item.type) {
     case "agent_message":
-      console.log(`Assistant: ${item.text}`);
+      console.log(`Assistant${item.interruption ? " (interrupted prefix)" : ""}: ${item.text}`);
+      if (item.interruption) console.error(item.interruption);
       break;
     case "reasoning":
       console.log(`Reasoning: ${item.text}`);

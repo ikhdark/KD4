@@ -222,6 +222,10 @@ impl OpenAiModelsEndpoint {
 }
 
 impl ModelsEndpointClient for OpenAiModelsEndpoint {
+    fn has_authoritative_catalog(&self) -> bool {
+        self.provider_info.kind == codex_model_provider_info::ProviderKind::Custom
+    }
+
     fn has_command_auth(&self) -> bool {
         self.provider_info.has_command_auth()
     }

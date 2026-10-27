@@ -95,12 +95,23 @@ impl InProcessCodeModeSession {
     }
 
     pub async fn wait(&self, request: WaitRequest) -> Result<WaitOutcome, String> {
-        self.begin_wait(request).await.await
+        self.begin_wait(request, None).await.await
+    }
+
+    /// Releasing an observer must drain an already-enqueued packet or leave it
+    /// with the actor; dropping a cancellation-selected wait cannot do that.
+    pub async fn wait_releasable(
+        &self,
+        request: WaitRequest,
+        release: CancellationToken,
+    ) -> Result<WaitOutcome, String> {
+        self.begin_wait(request, Some(release)).await.await
     }
 
     async fn begin_wait(
         &self,
         request: WaitRequest,
+        release: Option<CancellationToken>,
     ) -> CodeModeSessionResultFuture<'static, WaitOutcome> {
         let WaitRequest {
             cell_id,
@@ -125,7 +136,7 @@ impl InProcessCodeModeSession {
             Err(runtime::Error::MissingCell(runtime_cell_id.clone()))
         } else {
             self.runtime
-                .begin_observe(&runtime_cell_id, observe_mode_for_yield_time(yield_time_ms))
+                .begin_observe_releasable(&runtime_cell_id, observe_mode_for_yield_time(yield_time_ms), release.clone())
                 .await
         };
         if matches!(
@@ -146,7 +157,7 @@ impl InProcessCodeModeSession {
                     .await
             } else {
                 self.runtime
-                    .begin_observe(&runtime_cell_id, observe_mode_for_yield_time(yield_time_ms))
+                    .begin_observe_releasable(&runtime_cell_id, observe_mode_for_yield_time(yield_time_ms), release.clone())
                     .await
             };
         }

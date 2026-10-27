@@ -5,6 +5,7 @@ use std::collections::hash_map::Entry;
 
 use codex_config::ConfigEditsBuilder;
 use codex_config::McpServerConfig;
+use codex_config::McpServerDisabledReason;
 use codex_config::McpServerTransportConfig;
 use codex_config::load_global_mcp_servers;
 use codex_login::default_client::is_first_party_originator;
@@ -44,6 +45,8 @@ pub(crate) struct PlannedMcpDependencyEffect {
 pub(crate) struct PlannedMcpDependencies {
     pub(crate) effect: Option<PlannedMcpDependencyEffect>,
     pub(crate) warnings: Vec<String>,
+    /// Safe dependency-availability explanations, deliberately distinct from raw setup warnings.
+    pub(crate) model_notices: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,25 +63,39 @@ pub(crate) async fn plan_mcp_dependencies(
     sess: &Session,
     turn_context: &TurnContext,
     mentioned_skills: &[SkillMetadata],
+    installed_catalog: &codex_mcp::ResolvedMcpCatalog,
 ) -> PlannedMcpDependencies {
-    let originator_value = originator().value;
-    if !is_first_party_originator(originator_value.as_str())
-        || mentioned_skills.is_empty()
-        || !turn_context
-            .config
-            .features
-            .enabled(codex_features::Feature::SkillMcpDependencyInstall)
-    {
+    if mentioned_skills.is_empty() {
         return PlannedMcpDependencies::default();
     }
+    let originator_value = originator().value;
+    let install_allowed = is_first_party_originator(originator_value.as_str())
+        && turn_context
+            .config
+            .features
+            .enabled(codex_features::Feature::SkillMcpDependencyInstall);
 
-    let installed = sess.runtime_mcp_servers(turn_context.config.as_ref()).await;
-    let (missing, warnings) = collect_missing_mcp_dependencies(mentioned_skills, &installed);
+    // The frozen planning step already resolved config, requirements, and extension overlays.
+    // Inspect that registration catalog without rediscovering or contacting disabled servers.
+    let installed = installed_catalog.configured_servers();
+    let (missing, mut warnings, model_notices) =
+        collect_missing_mcp_dependencies(mentioned_skills, &installed);
+    // Availability diagnostics do not depend on permission to offer installation. Only the
+    // pre-existing setup warnings/effect remain gated by the installation feature/originator.
+    if !install_allowed {
+        return PlannedMcpDependencies {
+            effect: None,
+            warnings: model_notices.clone(),
+            model_notices,
+        };
+    }
+    warnings.extend(model_notices.iter().cloned());
     let unprompted_missing = filter_prompted_mcp_dependencies(sess, &missing).await;
     if unprompted_missing.is_empty() {
         return PlannedMcpDependencies {
             effect: None,
             warnings,
+            model_notices,
         };
     }
 
@@ -94,6 +111,7 @@ pub(crate) async fn plan_mcp_dependencies(
             expected_inventory_keys,
         }),
         warnings,
+        model_notices,
     }
 }
 
@@ -602,11 +620,16 @@ fn conflicting_mcp_dependency_warning(
 fn collect_missing_mcp_dependencies(
     mentioned_skills: &[SkillMetadata],
     installed: &HashMap<String, McpServerConfig>,
-) -> (HashMap<String, McpServerConfig>, Vec<String>) {
-    let installed_keys: HashSet<String> = installed
-        .iter()
-        .map(|(name, config)| canonical_mcp_server_key(name, config))
-        .collect();
+) -> (HashMap<String, McpServerConfig>, Vec<String>, Vec<String>) {
+    let mut installed_by_key: HashMap<String, Vec<(&String, &McpServerConfig)>> = HashMap::new();
+    for (name, config) in installed {
+        installed_by_key
+            .entry(canonical_mcp_server_key(name, config))
+            .or_default()
+            .push((name, config));
+    }
+    let mut disabled_dependencies: BTreeMap<&String, (&McpServerConfig, HashSet<String>)> =
+        BTreeMap::new();
     let mut declared_by_name: HashMap<String, HashMap<String, DeclaredMcpDependency>> =
         HashMap::new();
     let mut warnings = Vec::new();
@@ -631,7 +654,18 @@ fn collect_missing_mcp_dependencies(
                     continue;
                 }
             };
-            if installed_keys.contains(&dependency_key) {
+            if let Some(matching_servers) = installed_by_key.get(&dependency_key) {
+                // Canonical aliases already count as installed. An enabled matching alias
+                // still satisfies the dependency; otherwise explain the intentional disablement.
+                if !matching_servers.iter().any(|(_, config)| config.enabled) {
+                    for &(name, config) in matching_servers {
+                        disabled_dependencies
+                            .entry(name)
+                            .or_insert_with(|| (config, HashSet::new()))
+                            .1
+                            .insert(skill.name.clone());
+                    }
+                }
                 continue;
             }
 
@@ -708,5 +742,22 @@ fn collect_missing_mcp_dependencies(
 
     warnings.sort();
 
-    (missing, warnings)
+    let model_notices = disabled_dependencies
+        .into_iter()
+        .map(|(name, (config, skill_names))| {
+            let reason = match &config.disabled_reason {
+                Some(McpServerDisabledReason::Requirements { .. }) =>
+                    "disabled by configuration requirements",
+                Some(McpServerDisabledReason::Unknown) | None => "disabled in configuration",
+            };
+            // Never copy transport URLs/commands, credentials, headers, or requirement sources
+            // into model input. The configured name, selected skills, and typed reason suffice.
+            format!(
+                "MCP dependency for {} is unavailable: matching server {name:?} is {reason}. Its tools are unavailable while disabled. No automatic setup was attempted; do not enable, install, or probe it automatically. Use an available alternative or report this limitation.",
+                format_mcp_dependency_skills(&skill_names),
+            )
+        })
+        .collect();
+
+    (missing, warnings, model_notices)
 }

@@ -52,7 +52,7 @@ def _final_assistant_response_from_items(items: list[ThreadItem]) -> str | None:
 
     for item in reversed(items):
         agent_message = _agent_message_item_from_thread_item(item)
-        if agent_message is None:
+        if agent_message is None or agent_message.interruption is not None:
             continue
         if agent_message.phase == MessagePhase.final_answer:
             return agent_message.text
@@ -147,6 +147,15 @@ def _turn_result(
 ) -> TurnResult:
     turn = completed.turn
     surfaced_result = completed.surfaced_result or turn.surfaced_result
+    timing = completed.timing if completed.timing is not None else turn.timing
+    if surfaced_result is not None:
+        final_response = surfaced_result.canonical_message
+    elif timing is not None and timing.final_answer is not None:
+        # A present receipt with no message explicitly rejects visible item fallback.
+        message = timing.final_answer.message
+        final_response = message.text if message is not None else None
+    else:
+        final_response = _final_assistant_response_from_items(items)
     return TurnResult(
         id=turn.id,
         status=turn.status,
@@ -154,15 +163,11 @@ def _turn_result(
         started_at=turn.started_at,
         completed_at=turn.completed_at,
         duration_ms=turn.duration_ms,
-        final_response=(
-            surfaced_result.canonical_message
-            if surfaced_result is not None
-            else _final_assistant_response_from_items(items)
-        ),
+        final_response=final_response,
         items=items,
         usage=usage,
         surfaced_result=surfaced_result,
-        timing=completed.timing if completed.timing is not None else turn.timing,
+        timing=timing,
     )
 
 

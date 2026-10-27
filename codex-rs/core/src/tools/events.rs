@@ -1010,11 +1010,22 @@ async fn emit_patch_end(
                 .await;
         }
     }
+    let effects = patch_effects(&tracker_update);
+    if effects.exact {
+        let changed_paths = effects.changes.iter().filter(|change| change.before != change.after)
+            .map(|change| change.path.to_path_buf()).collect::<Vec<_>>();
+        let environment = match &tracker_update {
+            TurnDiffTrackerUpdate::Track { environment_id, .. } => environment_id.as_deref(),
+            _ => None,
+        }.or_else(|| ctx.patch_environment.map(|environment| environment.environment_id.as_str()))
+            .unwrap_or(codex_exec_server::LOCAL_ENVIRONMENT_ID);
+        ctx.turn.full_suite_budget.record_compilation_input_changes(environment, &changed_paths);
+    }
     ctx.session
         .emit_turn_item_completed(
             ctx.turn,
             TurnItem::FileChange(FileChangeItem {
-                effects: Some(patch_effects(&tracker_update)),
+                effects: Some(effects),
                 environment: ctx
                     .patch_environment
                     .map(super::super::session::turn_context::TurnEnvironment::provenance),

@@ -357,7 +357,7 @@ async fn observe_parent_job_cancellation(
 
 async fn run_agent_job_loop(
     session: Arc<Session>,
-    _turn: Arc<TurnContext>,
+    turn: Arc<TurnContext>,
     db: Arc<codex_state::StateRuntime>,
     job_id: String,
     options: JobRunnerOptions,
@@ -423,26 +423,18 @@ async fn run_agent_job_loop(
         }
 
         if active_items.len() < options.max_concurrency {
-            // Reserve distinct pending rows for this batch before any spawn is
-            // polled. Initializers count against the same worker capacity.
-            let slots = (options.max_concurrency - active_items.len()).min(8);
-            let pending_items = db
-                .list_agent_job_items(
-                    &job_id,
-                    Some(codex_state::AgentJobItemStatus::Pending),
-                    Some(slots),
-                )
-                .await?;
-            let mut spawns = FuturesUnordered::new();
-            for item in pending_items {
-                let prompt = build_worker_prompt(&job, &item)?;
+            // A rolling initializer set shares the configured total worker limit.
+            // Reserving row identities before polling prevents duplicate admission.
+            let make_spawn = |item: codex_state::AgentJobItem, prompt: String|
+                -> futures::future::BoxFuture<'static, (String, Result<crate::agent::control::LiveAgent, CodexErr>)> {
                 let session = session.clone();
                 let db = db.clone();
                 let job_id = job_id.clone();
                 let spawn_config = options.spawn_config.clone();
                 let environments = options.environments.clone();
                 let cancellation = cancellation_token.clone();
-                spawns.push(async move {
+                let parent_turn_id = turn.sub_id.clone();
+                Box::pin(async move {
                     if cancellation.is_cancelled() {
                         return (item.item_id, Err(CodexErr::TurnAborted));
                     }
@@ -475,6 +467,7 @@ async fn run_agent_job_loop(
                             )))),
                             SpawnAgentOptions {
                                 parent_thread_id: Some(session.thread_id),
+                                parent_turn_id: Some(parent_turn_id),
                                 environments: Some(environments.to_selections()),
                                 captured_environments: Some(environments),
                                 agent_job_binding: Some(AgentJobBinding {
@@ -488,12 +481,127 @@ async fn run_agent_job_loop(
                         )
                         .await;
                     (item.item_id, result)
-                });
-            }
-            let mut failed_spawns = std::collections::VecDeque::new();
-            while !spawns.is_empty() || !failed_spawns.is_empty() {
+                })
+            };
+            let mut spawns: FuturesUnordered<
+                futures::future::BoxFuture<
+                    'static,
+                    (String, Result<crate::agent::control::LiveAgent, CodexErr>),
+                >,
+            > = FuturesUnordered::new();
+            let mut reserved_rows = HashSet::new();
+            let mut failed_spawns = std::collections::VecDeque::<(String, CodexErr)>::new();
+            let mut capacity_limited = false;
+            loop {
+                if let Some((item_id, error)) = failed_spawns.pop_front() {
+                    if matches!(error, CodexErr::AgentLimitReached { .. }) {
+                        capacity_limited = true;
+                        reserved_rows.remove(&item_id);
+                        continue;
+                    }
+                    let settle = async {
+                        if observe_parent_job_cancellation(&cancellation_token, db.as_ref(), &job_id).await?
+                            || !db.agent_job_is_owned_running(&job_id).await? {
+                            return anyhow::Ok(false);
+                        }
+                        let message = format!("failed to spawn worker: {error}");
+                        if !db.mark_agent_job_item_spawn_failed(&job_id, &item_id, &message).await? {
+                            if !db.agent_job_is_owned_running(&job_id).await? {
+                                return Ok(false);
+                            }
+                            anyhow::bail!("{message}; item was no longer pending or bound to the worker");
+                        }
+                        Ok(true)
+                    };
+                    tokio::pin!(settle);
+                    let mut completed = Vec::new();
+                    let runnable = loop {
+                        // Failure settlement must not suspend sibling DB owners.
+                        tokio::select! {
+                            Some(result) = spawns.next(), if !spawns.is_empty() => completed.push(result),
+                            result = &mut settle => break result,
+                        }
+                    };
+                    let mut subscribe = Vec::new();
+                    for (completed_id, result) in completed {
+                        match result {
+                            Ok(agent) => {
+                                reserved_rows.remove(&completed_id);
+                                active_items.insert(agent.thread_id, ActiveJobItem {
+                                    item_id: completed_id, started_at: agent.execution_started_at, status_rx: None,
+                                });
+                                subscribe.push(agent.thread_id);
+                            }
+                            Err(error) => failed_spawns.push_back((completed_id, error)),
+                        }
+                    }
+                    reserved_rows.remove(&item_id);
+                    if !runnable? {
+                        cancel_requested = true;
+                        break;
+                    }
+                    for thread_id in subscribe {
+                        if let Some(item) = active_items.get_mut(&thread_id) {
+                            item.status_rx = session.services.agent_control.subscribe_status(thread_id).await.ok();
+                        }
+                    }
+                    progressed = true;
+                    continue;
+                }
+                let slots = options.max_concurrency.saturating_sub(active_items.len() + spawns.len())
+                    .min(8usize.saturating_sub(spawns.len()));
+                if slots > 0 && failed_spawns.is_empty() && !capacity_limited {
+                    let pending = db.list_agent_job_items(
+                        &job_id, Some(codex_state::AgentJobItemStatus::Pending),
+                        Some(slots + reserved_rows.len()),
+                    );
+                    tokio::pin!(pending);
+                    let mut completed = Vec::new();
+                    let pending_items = loop {
+                        // Admission can need a transaction held by an initializer.
+                        // Keep polling all existing owners until the read settles.
+                        tokio::select! {
+                            Some(result) = spawns.next(), if !spawns.is_empty() => completed.push(result),
+                            result = &mut pending => break result,
+                        }
+                    };
+                    let mut subscribe = Vec::new();
+                    for (item_id, result) in completed {
+                        match result {
+                            Ok(agent) => {
+                                reserved_rows.remove(&item_id);
+                                active_items.insert(agent.thread_id, ActiveJobItem {
+                                    item_id, started_at: agent.execution_started_at, status_rx: None,
+                                });
+                                subscribe.push(agent.thread_id);
+                                progressed = true;
+                            }
+                            Err(error) => failed_spawns.push_back((item_id, error)),
+                        }
+                    }
+                    // Register every successful handoff even if admission failed.
+                    let pending_items = pending_items?;
+                    for thread_id in subscribe {
+                        if let Some(item) = active_items.get_mut(&thread_id) {
+                            item.status_rx = session.services.agent_control.subscribe_status(thread_id).await.ok();
+                        }
+                    }
+                    let slots = options.max_concurrency.saturating_sub(active_items.len() + spawns.len())
+                        .min(8usize.saturating_sub(spawns.len()));
+                    if failed_spawns.is_empty() {
+                        for item in pending_items.into_iter().filter(|item| !reserved_rows.contains(&item.item_id))
+                            .take(slots).collect::<Vec<_>>() {
+                            let prompt = build_worker_prompt(&job, &item)?;
+                            reserved_rows.insert(item.item_id.clone());
+                            spawns.push(make_spawn(item, prompt));
+                        }
+                    }
+                }
+                if !failed_spawns.is_empty() {
+                    continue;
+                }
                 let completion = if spawns.is_empty() {
-                    failed_spawns.pop_front()
+                    None
                 } else {
                     tokio::select! {
                         completion = spawns.next() => completion,
@@ -524,13 +632,14 @@ async fn run_agent_job_loop(
                             for (item_id, result) in completed {
                                 match result {
                                     Ok(agent) => {
+                                        reserved_rows.remove(&item_id);
                                         active_items.insert(agent.thread_id, ActiveJobItem {
                                             item_id, started_at: agent.execution_started_at, status_rx: None,
                                         });
                                         subscribe.push(agent.thread_id);
                                         progressed = true;
                                     }
-                                    Err(error) => failed_spawns.push_back((item_id, Err(error))),
+                                    Err(error) => failed_spawns.push_back((item_id, error)),
                                 }
                             }
                             // Register successes before either the error or stop path.
@@ -546,6 +655,7 @@ async fn run_agent_job_loop(
                                         .subscribe_status(thread_id).await.ok();
                                 }
                             }
+                            capacity_limited = false;
                             continue;
                         }
                     }
@@ -553,73 +663,28 @@ async fn run_agent_job_loop(
                 let Some((item_id, spawn_result)) = completion else {
                     break;
                 };
-                // A sibling initializer may own a database transaction until
-                // its future is polled again. Do not suspend that owner while
-                // settling a failed row; drain the bounded batch first. The
-                // service branch above continues checking cancellation and
-                // worker deadlines while polling every remaining initializer.
-                if spawn_result.is_err() && !spawns.is_empty() {
-                    failed_spawns.push_back((item_id, spawn_result));
-                    continue;
-                }
                 match spawn_result {
+                    Err(error) => {
+                        failed_spawns.push_back((item_id, error));
+                        continue;
+                    }
                     Ok(agent) => {
+                        reserved_rows.remove(&item_id);
                         let thread_id = agent.thread_id;
                         // No await between spawn completion and cleanup ownership.
-                        active_items.insert(
-                            thread_id,
-                            ActiveJobItem {
-                                item_id,
-                                started_at: agent.execution_started_at,
-                                status_rx: None,
-                            },
-                        );
+                        active_items.insert(thread_id, ActiveJobItem {
+                            item_id, started_at: agent.execution_started_at, status_rx: None,
+                        });
                         progressed = true;
-                        let status_rx = session
-                            .services
-                            .agent_control
-                            .subscribe_status(thread_id)
-                            .await
-                            .ok();
+                        let status_rx = session.services.agent_control.subscribe_status(thread_id).await.ok();
                         if let Some(item) = active_items.get_mut(&thread_id) {
                             item.status_rx = status_rx;
                         }
                     }
-                    Err(CodexErr::AgentLimitReached { .. }) => {
-                        // Other admitted initializers still need to be consumed.
-                        // Leave this row pending until the capacity notification.
-                    }
-                    Err(error) => {
-                        if observe_parent_job_cancellation(
-                            &cancellation_token,
-                            db.as_ref(),
-                            &job_id,
-                        )
-                        .await?
-                            || !db.agent_job_is_owned_running(&job_id).await?
-                        {
-                            cancel_requested = true;
-                            break;
-                        }
-                        let message = format!("failed to spawn worker: {error}");
-                        if !db
-                            .mark_agent_job_item_spawn_failed(&job_id, &item_id, &message)
-                            .await?
-                        {
-                            if !db.agent_job_is_owned_running(&job_id).await? {
-                                cancel_requested = true;
-                                break;
-                            }
-                            anyhow::bail!(
-                                "{message}; item was no longer pending or bound to the worker"
-                            );
-                        }
-                        progressed = true;
-                    }
                 }
-                // While initializers remain, only the concurrent service
-                // branch may await database work. A completed sibling must
-                // not stop polling an initializer that holds its write lock.
+                // Admission, failure settlement and service poll every
+                // initializer alongside their database work. Do not wait for
+                // a database operation alone while an initializer can own it.
                 if !spawns.is_empty() {
                     continue;
                 }
@@ -635,6 +700,7 @@ async fn run_agent_job_loop(
 
         if cancel_requested {
             break;
+
         }
 
         if reap_stale_active_items(

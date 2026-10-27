@@ -40,6 +40,9 @@ pub(crate) const DEFAULT_CODEX_APPS_MCP_PRODUCT_SKU: &str = "codex";
 /// need the CodexAuth-backed identity plus the effective endpoint and product.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CodexAppsToolsCacheKey {
+    /// External header credentials do not establish an authenticated account.
+    #[serde(skip)]
+    pub(crate) cacheable: bool,
     pub(crate) account_id: Option<String>,
     pub(crate) chatgpt_user_id: Option<String>,
     pub(crate) is_workspace_account: bool,
@@ -55,6 +58,7 @@ pub fn codex_apps_tools_cache_key(
     apps_mcp_product_sku: Option<&str>,
 ) -> CodexAppsToolsCacheKey {
     CodexAppsToolsCacheKey {
+        cacheable: auth.is_some_and(|auth| !matches!(auth, CodexAuth::Headers(_))),
         account_id: auth.and_then(CodexAuth::get_account_id),
         chatgpt_user_id: auth.and_then(CodexAuth::get_chatgpt_user_id),
         is_workspace_account: auth.is_some_and(CodexAuth::is_workspace_account),
@@ -310,6 +314,9 @@ impl CodexAppsToolsCache {
         codex_home: PathBuf,
         auth_key: CodexAppsToolsCacheKey,
     ) -> Option<Vec<ToolInfo>> {
+        if !auth_key.cacheable {
+            return None;
+        }
         self.context(codex_home, auth_key).await.current_tools()
     }
 
@@ -320,6 +327,9 @@ impl CodexAppsToolsCache {
         codex_home: PathBuf,
         auth_key: CodexAppsToolsCacheKey,
     ) -> Option<Arc<CodexAppsToolsSnapshot>> {
+        if !auth_key.cacheable {
+            return None;
+        }
         self.context(codex_home, auth_key)
             .await
             .entry
@@ -366,6 +376,13 @@ impl CodexAppsToolsCache {
             codex_home,
             auth_key,
         };
+        if !identity.auth_key.cacheable {
+            // Keep a connection's live discovery, but never share or seed an
+            // ambiguous identity across clients or processes.
+            return CodexAppsToolsCacheContext {
+                entry: Arc::new(CodexAppsToolsCacheEntry::new(identity)),
+            };
+        }
         let entry = lock_unpoisoned(&self.entries).context_entry(identity);
         entry.seed_with(|| load(&entry.identity));
         CodexAppsToolsCacheContext { entry }
@@ -512,6 +529,9 @@ fn write_cached_codex_apps_tools(
 fn load_cached_codex_apps_server_info(
     cache_context: &CodexAppsToolsCacheContext,
 ) -> Option<McpServerInfo> {
+    if !cache_context.entry.identity.auth_key.cacheable {
+        return None;
+    }
     let bytes = std::fs::read(cache_context.server_info_cache_path()).ok()?;
     let cache: CodexAppsServerInfoDiskCache = serde_json::from_slice(&bytes).ok()?;
     (cache.schema_version == CODEX_APPS_SERVER_INFO_CACHE_SCHEMA_VERSION)
@@ -561,6 +581,9 @@ fn persist_codex_apps_cache(
     server_info: &McpServerInfo,
     tools: &[ToolInfo],
 ) {
+    if !cache_context.entry.identity.auth_key.cacheable {
+        return;
+    }
     let cache_write_start = Instant::now();
     let mut persisted = lock_unpoisoned(&cache_context.entry.persisted);
     let revision = cache_context.content_revision();

@@ -231,6 +231,8 @@ const DEFAULT_MULTI_AGENT_V2_TOOL_NAMESPACE: &str = "agents";
 const LEGACY_MULTI_AGENT_V2_TOOL_NAMESPACE: &str = "collaboration";
 const DEFAULT_MULTI_AGENT_V2_SHARED_USAGE_HINT_TEXT: &str = r#"Use advertised agent-tool entrypoints. For deferred tools in `functions.exec`, `resolve_tool('<namespace>.<name>')` (namespace `agents` by default) returns the callable and its contract; resolve and call in the same cell.
 
+Subagents inherit the parent's active filesystem, network, shell, approval and tool permissions rather than a reduced worker profile. An active task binding does not limit native patches to its repository or reserve team task-control tools to root. Authorized benchmark execution and external harness preparation can stay with the assigned worker. This does not widen the task, bypass validation or resource limits, or lift independent-review read-only restrictions.
+
 Shared is the default workspace strategy (`auto` selects shared): shared agents see edits immediately in one working directory. Explicitly isolated assignments use separate Git worktrees/directories; edits reach shared checkout only through configured integration. Path/contract claims are advisory, not write reservations. Before parallel/overlapping edits, communicate surfaces and review latest shared state; separate files can share contracts. Follow only demonstrably affected dependencies; necessary edits beyond advisory scope require reporting broader impact. Independent reviewers stay read-only. Agent agreement alone is not proof.
 
 Before filesystem-dependent fan-out, reuse or perform one successful bounded repository read through the workers' intended backend, sandbox, and effective permissions. A different root access path proves nothing; if needed, await one authorized canary worker's read before expanding. This is inspection, not validation authorization. Parents at every depth coordinate shared startup recovery, not duplicate attempts.
@@ -834,7 +836,8 @@ pub struct Config {
     /// Settings that govern if and what will be written to `~/.codex/history.jsonl`.
     pub history: History,
 
-    /// When true, session is not persisted on disk. Default to `false`
+    /// When true, session is not persisted on disk. Default to `false`.
+    /// Durable multi-agent task coordination is unavailable in ephemeral sessions.
     pub ephemeral: bool,
 
     /// Optional extra configuration fields for the thread.

@@ -37,7 +37,7 @@ where
     }
 }
 
-fn thread_page_size(limit: Option<u32>) -> usize {
+pub(super) fn thread_page_size(limit: Option<u32>) -> usize {
     limit
         .map(|value| value as usize)
         .unwrap_or(THREAD_PAGE_DEFAULT_LIMIT)
@@ -660,6 +660,9 @@ impl ThreadRequestProcessor {
     }
 
     async fn finalize_thread_teardown(&self, thread_id: ThreadId) {
+        if let Some(queue) = &self.thread_queue_processor {
+            queue.retire_thread(thread_id).await;
+        }
         self.pending_thread_unloads.finish(&thread_id).await;
         self.outgoing
             .cancel_requests_for_thread(thread_id, /*error*/ None)
@@ -720,6 +723,10 @@ impl ThreadRequestProcessor {
             .unsubscribe_connection_from_thread(thread_id, connection_id)
             .await;
 
+        if was_subscribed && let Some(queue) = &self.thread_queue_processor {
+            queue.retire_thread_connection(thread_id, connection_id).await;
+        }
+
         let status = if was_subscribed {
             ThreadUnsubscribeStatus::Unsubscribed
         } else {
@@ -747,22 +754,20 @@ impl ThreadRequestProcessor {
         Ok(())
     }
 
-    pub(super) async fn prepare_thread_for_removal(&self, thread_id: ThreadId, operation: &str) {
-        let removed_conversation = self.thread_manager.remove_thread(&thread_id).await;
-        if let Some(conversation) = removed_conversation {
-            info!("thread {thread_id} was active; shutting down");
-            match wait_for_thread_shutdown(&conversation).await {
-                ThreadShutdownResult::Complete => {}
-                ThreadShutdownResult::SubmitFailed => {
-                    error!(
-                        "failed to submit Shutdown to thread {thread_id}; proceeding with {operation}"
-                    );
-                }
-                ThreadShutdownResult::TimedOut => {
-                    warn!("thread {thread_id} shutdown timed out; proceeding with {operation}");
-                }
+    pub(super) async fn quiesce_thread_for_removal(&self, thread_id: ThreadId) -> Result<(), JSONRPCErrorError> {
+        if let Ok(conversation) = self.thread_manager.get_thread(thread_id).await {
+            if wait_for_thread_shutdown(&conversation).await != ThreadShutdownResult::Complete {
+                return Err(internal_error(format!(
+                    "thread {thread_id} shutdown or persistence retirement is unconfirmed; deletion was not performed"
+                )));
             }
         }
+        Ok(())
+    }
+
+    pub(super) async fn prepare_thread_for_removal(&self, thread_id: ThreadId) {
+        // Every loaded member was quiesced before the irreversible store commit.
+        self.thread_manager.remove_thread(&thread_id).await;
         self.finalize_thread_teardown(thread_id).await;
     }
 
@@ -2983,6 +2988,10 @@ impl ThreadRequestProcessor {
             .remove_connection(connection_id)
             .await;
 
+        if let Some(queue) = &self.thread_queue_processor {
+            queue.retire_connection(connection_id).await;
+        }
+
         for thread_id in thread_ids {
             if self.thread_manager.get_thread(thread_id).await.is_err() {
                 // Reconcile stale app-server bookkeeping when the thread has already been
@@ -3601,6 +3610,16 @@ impl ThreadRequestProcessor {
         };
 
         if let Some((existing_thread_id, existing_thread, source_thread)) = running_thread {
+            if !existing_thread.is_running() {
+                // A stream may have failed while no listener was attached.
+                // Reuse the listener's exact-instance retirement owner rather
+                // than leaving an unhealthy loaded runtime permanently parked.
+                let state = self.thread_state_manager.thread_state(existing_thread_id).await;
+                self.ensure_listener_task_running(existing_thread_id, existing_thread.clone(), state).await?;
+                return Err(invalid_request(format!(
+                    "thread {existing_thread_id} is retiring; retry after shutdown completes"
+                )));
+            }
             let existing_thread_rollout_path = existing_thread.rollout_path();
             let active_path = existing_thread_rollout_path
                 .as_ref()
@@ -3652,6 +3671,7 @@ impl ThreadRequestProcessor {
                         &self.pending_thread_unloads,
                         &self.thread_state_manager,
                         &self.thread_watch_manager,
+                        self.thread_queue_processor.as_ref(),
                         existing_thread_id,
                         Arc::clone(&existing_thread),
                     )
@@ -3667,7 +3687,6 @@ impl ThreadRequestProcessor {
                                 "thread {existing_thread_id} is closing; retry after the thread is closed"
                             )));
                         }
-                        IdleThreadShutdownResult::RejoinLoaded => {}
                     }
                 }
 
@@ -3714,12 +3733,13 @@ impl ThreadRequestProcessor {
             thread_summary.session_id = existing_thread.session_configured().session_id.to_string();
             let instruction_sources = existing_thread.legacy_instruction_sources().await;
 
-            let (listener_command_tx, listener_generation, resume_history_is_seeded) = {
+            let (listener_command_tx, listener_generation, resume_history_is_seeded, history_generation) = {
                 let thread_state = thread_state.lock().await;
                 (
                     thread_state.listener_command_tx(),
                     thread_state.listener_generation,
                     thread_state.resume_history_is_seeded_for_current_listener(),
+                    thread_state.turn_index_history_generation(),
                 )
             };
             let Some(listener_command_tx) = listener_command_tx else {
@@ -3728,17 +3748,6 @@ impl ThreadRequestProcessor {
                 )));
             };
             let include_turns = !params.exclude_turns;
-            let prepared_initial_turns_page = if !include_turns {
-                match params.initial_turns_page.as_ref() {
-                    Some(initial_page_params) => Some(
-                        self.initial_turns_page_for_thread(existing_thread_id, initial_page_params)
-                            .await?,
-                    ),
-                    None => None,
-                }
-            } else {
-                None
-            };
             let history_items = if include_turns || !resume_history_is_seeded {
                 let history_source = self
                     .read_stored_thread_for_resume(
@@ -3769,13 +3778,13 @@ impl ThreadRequestProcessor {
                 Box::new(crate::thread_state::PendingThreadResumeRequest {
                     request_id: request_id.clone(),
                     history_items,
+                    history_generation,
                     listener_generation,
                     config_snapshot,
                     instruction_sources,
                     thread_summary,
                     include_turns,
                     initial_turns_page: params.initial_turns_page.clone(),
-                    prepared_initial_turns_page,
                     redact_resume_payloads,
                 }),
             );
@@ -4717,7 +4726,7 @@ fn paginate_thread_turns(
     })
 }
 
-fn serialize_thread_turns_cursor(
+pub(super) fn serialize_thread_turns_cursor(
     turn_id: &str,
     include_anchor: bool,
 ) -> Result<String, JSONRPCErrorError> {
@@ -4858,7 +4867,7 @@ fn apply_thread_turns_items_view(turns: &mut [Turn], items_view: TurnItemsView) 
 }
 
 
-fn normalize_thread_turns_status(
+pub(super) fn normalize_thread_turns_status(
     turns: &mut [Turn],
     loaded_status: ThreadStatus,
     has_live_in_progress_turn: bool,

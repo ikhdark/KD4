@@ -20,6 +20,7 @@ use std::collections::hash_map::Entry;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
@@ -28,11 +29,13 @@ use tracing::warn;
 
 const FS_CHANGED_NOTIFICATION_DEBOUNCE: Duration = Duration::from_millis(200);
 const FS_WATCH_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+const FS_WATCH_INITIALIZATION_COOLDOWN: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub(crate) struct FsWatchManager {
     outgoing: Arc<OutgoingMessageSender>,
-    file_watcher: Arc<std::sync::OnceLock<Option<Arc<FileWatcher>>>>,
+    file_watcher: Arc<std::sync::OnceLock<Arc<FileWatcher>>>,
+    initialization_failure: Arc<std::sync::Mutex<Option<Instant>>>,
     state: Arc<AsyncMutex<FsWatchState>>,
     setup_slots: Arc<tokio::sync::Semaphore>,
 }
@@ -126,6 +129,7 @@ impl FsWatchManager {
         Self {
             outgoing,
             file_watcher: Arc::new(std::sync::OnceLock::new()),
+            initialization_failure: Arc::new(std::sync::Mutex::new(None)),
             state: Arc::new(AsyncMutex::new(FsWatchState::default())),
             setup_slots: Arc::new(tokio::sync::Semaphore::new(4)),
         }
@@ -190,17 +194,7 @@ impl FsWatchManager {
             if cancellation.is_cancelled() {
                 return Err(invalid_request("watch registration was canceled"));
             }
-            let file_watcher = setup_manager
-                .file_watcher
-                .get_or_init(|| match FileWatcher::new() {
-                    Ok(watcher) => Some(Arc::new(watcher)),
-                    Err(err) => {
-                        warn!("filesystem watch manager unavailable: {err}");
-                        None
-                    }
-                })
-                .as_ref()
-                .ok_or_else(|| internal_error("filesystem watching is unavailable"))?;
+            let file_watcher = setup_manager.file_watcher()?;
             if cancellation.is_cancelled() {
                 return Err(invalid_request("watch registration was canceled"));
             }
@@ -340,6 +334,39 @@ impl FsWatchManager {
         commit_result.ok_or_else(|| invalid_request("connection is closed"))??;
 
         Ok(FsWatchResponse { path: params.path })
+    }
+
+    fn file_watcher(&self) -> Result<&Arc<FileWatcher>, JSONRPCErrorError> {
+        if let Some(watcher) = self.file_watcher.get() {
+            return Ok(watcher);
+        }
+        // Construction runs only in blocking setup workers. Publish success once,
+        // but allow an explicit later request to retry a transient native failure.
+        let mut failure = self
+            .initialization_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.file_watcher.get().is_none() {
+            if failure.is_some_and(|when| when.elapsed() < FS_WATCH_INITIALIZATION_COOLDOWN) {
+                return Err(internal_error("filesystem watching is unavailable"));
+            }
+            match FileWatcher::new() {
+                Ok(watcher) => {
+                    let _ = self.file_watcher.set(Arc::new(watcher));
+                    *failure = None;
+                }
+                Err(err) => {
+                    *failure = Some(Instant::now());
+                    warn!("filesystem watch manager unavailable: {err}");
+                    return Err(internal_error("filesystem watching is unavailable"));
+                }
+            }
+        }
+        self.file_watcher
+            .get()
+            .ok_or_else(|| {
+                internal_error("filesystem watch initialization did not publish a watcher")
+            })
     }
 
     async fn remove_pending_reservation(&self, watch_key: &WatchKey, reservation_id: u64) {

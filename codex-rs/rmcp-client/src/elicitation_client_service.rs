@@ -44,6 +44,7 @@ pub(crate) struct ElicitationClientService {
     handler: LoggingClientHandler,
     supports_openai_form: bool,
     send_elicitation: Arc<SendElicitation>,
+    send_tool_list_changed: Arc<SendToolListChanged>,
     pause_state: ElicitationPauseRegistry,
 }
 
@@ -61,17 +62,24 @@ impl ElicitationClientService {
             .as_ref()
             .is_some_and(|extensions| extensions.contains_key(OPENAI_FORM_METHOD));
         let send_elicitation = Arc::new(send_elicitation);
+        let send_tool_list_changed = Arc::new(send_tool_list_changed);
+        let changed = Arc::clone(&send_tool_list_changed);
         Self {
             handler: LoggingClientHandler::new(
                 client_info,
                 clone_send_elicitation(Arc::clone(&send_elicitation)),
                 send_progress,
-                send_tool_list_changed,
+                Box::new(move || changed()),
             ),
             supports_openai_form,
             send_elicitation,
+            send_tool_list_changed,
             pause_state,
         }
+    }
+
+    pub(crate) async fn notify_session_changed(&self) {
+        (self.send_tool_list_changed)().await;
     }
 
     async fn create_elicitation(
@@ -81,7 +89,8 @@ impl ElicitationClientService {
     ) -> Result<ElicitationResponse, rmcp::ErrorData> {
         let RequestContext { id, meta, .. } = context;
         // Operation timing is distinct from the global UI pause owned by the
-        // caller. An uncorrelated dialog cannot pause concurrent requests.
+        // caller. Concurrent uncorrelated dialogs use the registry's bounded
+        // policy rather than silently spending the eliciting operation's budget.
         let _pause = self.pause_state.enter();
         let request = restore_context_meta(request, meta);
         (self.send_elicitation)(id, request)

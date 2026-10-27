@@ -18121,6 +18121,12 @@
               "id": {
                 "type": "string"
               },
+              "interruption": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "phase": {
                 "anyOf": [
                   {
@@ -19989,29 +19995,7 @@
         "type": "string"
       },
       "ThreadSource": {
-        "oneOf": [
-          {
-            "enum": [
-              "User",
-              "Subagent",
-              "MemoryConsolidation"
-            ],
-            "type": "string"
-          },
-          {
-            "additionalProperties": false,
-            "properties": {
-              "Feature": {
-                "type": "string"
-              }
-            },
-            "required": [
-              "Feature"
-            ],
-            "title": "FeatureThreadSource",
-            "type": "object"
-          }
-        ]
+        "type": "string"
       },
       "ThreadSourceKind": {
         "enum": [

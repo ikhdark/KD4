@@ -22,6 +22,9 @@ const ACTION_RESTART_CODEX_DESKTOP: &str = "restartCodexDesktop";
 pub(crate) fn write_desktop_runtime_receipt(
     codex_home: &Path,
     client_name: &str,
+    process_rpc_transport: &str,
+    connection_id: u64,
+    enabled_features: Vec<String>,
 ) -> io::Result<Option<PathBuf>> {
     if !matches!(client_name, DESKTOP_CLIENT_NAME | "Codex Desktop") {
         return Ok(None);
@@ -37,12 +40,18 @@ pub(crate) fn write_desktop_runtime_receipt(
     let (published_executable_sha256, published_build_match, expected_codex_home, codex_home_match) =
         published_identity(published.as_ref(), &executable_sha256, codex_home);
     let receipt = DesktopRuntimeReceipt {
-        schema_version: 1,
+        schema_version: 2,
         pid: std::process::id(),
         executable_path,
         executable_sha256,
         codex_home: codex_home.to_path_buf(),
         client_name: DESKTOP_CLIENT_NAME.to_string(),
+        // A client-supplied name does not attest the GUI process, its creation
+        // identity, or ownership of this connection. Consumers must not treat
+        // this backend-only receipt as successful Desktop activation proof.
+        process_rpc_transport: Some(process_rpc_transport.to_string()),
+        connection_id: Some(connection_id),
+        enabled_features,
         build_version: build_info.version.to_string(),
         build_commit: build_info.commit.to_string(),
         build_dirty: build_info.dirty.to_string(),

@@ -464,6 +464,13 @@ async fn run_remote_compaction_request_v2(
             ) => result,
         };
         drop(model_request_timing_guard);
+        sess.bind_rate_limit_account(client_session.dispatched_account().cloned())
+            .await;
+        if let Err(CodexErr::UsageLimitReached(error)) = &stream_result
+            && let Some(snapshot) = error.rate_limits.as_deref()
+        {
+            sess.update_rate_limits(turn_context, snapshot.clone()).await;
+        }
         let result = match stream_result {
             Ok(stream) => {
                 collect_compaction_output(
@@ -544,7 +551,14 @@ async fn collect_compaction_output(
                             .await?;
                     }
                 }
-                return Err(error.into_response_error());
+                let error = error.into_response_error();
+                if let (Some((sess, turn)), CodexErr::UsageLimitReached(limit)) =
+                    (accounting_context, &error)
+                    && let Some(snapshot) = limit.rate_limits.as_deref()
+                {
+                    sess.update_rate_limits(turn, snapshot.clone()).await;
+                }
+                return Err(error);
             }
         };
         let _model_stream_processing_timing_guard =

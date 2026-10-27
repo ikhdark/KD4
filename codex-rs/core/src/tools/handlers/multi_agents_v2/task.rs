@@ -32,7 +32,6 @@ use codex_agent_task_store::TaskActor;
 use codex_agent_task_store::ValidationCall;
 use codex_git_utils::get_git_repo_root;
 use codex_protocol::ThreadId;
-use codex_protocol::protocol::SessionSource;
 use codex_protocol::validation::ValidationResult;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
@@ -147,21 +146,21 @@ async fn handle_get_agent_task(
         .min(MAX_OBSERVATION_LIMIT);
 
     let coordinator = session.services.agent_control.task_coordinator();
-    let caller_binding = if turn.session_source.is_non_root_agent() {
-        let binding = coordinator.binding_for_turn(&turn).ok_or_else(|| {
-            FunctionCallError::RespondToModel(format!(
-                "{GET_AGENT_TASK_TOOL}: non-root callers may only read their own current bound task"
-            ))
-        })?;
-        Some(binding)
-    } else {
-        None
-    };
+    let caller_binding = coordinator.binding_for_turn(&turn);
+    if crate::agent::task_capabilities::is_independent_review_source(&turn.session_source)
+        && caller_binding.is_none()
+    {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "{GET_AGENT_TASK_TOOL}: independent reviewers require their current bound task"
+        )));
+    }
     let task = coordinator
         .get_agent_task(assignment_id, Some(observation_limit))
         .await
         .map_err(|error| task_store_error(GET_AGENT_TASK_TOOL, error))?;
-    if let Some(binding) = &caller_binding {
+    if crate::agent::task_capabilities::is_independent_review_source(&turn.session_source)
+        && let Some(binding) = &caller_binding
+    {
         let caller = if binding.assignment_id == assignment_id {
             task.clone()
         } else {
@@ -179,7 +178,7 @@ async fn handle_get_agent_task(
             && caller.assignment.repository_id == task.assignment.repository_id;
         if !current || (binding.assignment_id != assignment_id && !immediate_child) {
             return Err(FunctionCallError::RespondToModel(format!(
-                "{GET_AGENT_TASK_TOOL}: non-root callers may read only their current bound task or its immediate children"
+                "{GET_AGENT_TASK_TOOL}: independent reviewers may read only their current bound task or its immediate children"
             )));
         }
     }
@@ -585,7 +584,9 @@ async fn handle_set_agent_gate(
         .parse::<AttemptId>()
         .map_err(|error| task_store_error(SET_AGENT_GATE_TOOL, error))?;
     let coordinator = session.services.agent_control.task_coordinator();
-    let actor = if turn.session_source.is_non_root_agent() {
+    let actor = if crate::agent::task_capabilities::is_independent_review_source(
+        &turn.session_source,
+    ) {
         let binding = coordinator.binding_for_turn(&turn).ok_or_else(|| {
             FunctionCallError::RespondToModel(format!(
                 "{SET_AGENT_GATE_TOOL}: the caller is not a typed agent with a bound task"
@@ -624,14 +625,11 @@ async fn handle_amend_agent_task(
 ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
     let ToolInvocation {
         session,
-        step_context,
         payload,
         ..
     } = invocation;
-    let turn = Arc::clone(&step_context.turn);
     let arguments = function_arguments(payload)?;
     let args: AmendAgentTaskArgs = parse_arguments(&arguments)?;
-    require_root(&turn.session_source, AMEND_AGENT_TASK_TOOL)?;
     let assignment_id = parse_assignment_id(AMEND_AGENT_TASK_TOOL, &args.assignment_id)?;
     let coordinator = session.services.agent_control.task_coordinator();
     let attempt = coordinator
@@ -654,7 +652,6 @@ async fn handle_waive_agent_gate(
     let turn = Arc::clone(&step_context.turn);
     let arguments = function_arguments(payload)?;
     let args: WaiveAgentGateArgs = parse_arguments(&arguments)?;
-    require_root(&turn.session_source, WAIVE_AGENT_GATE_TOOL)?;
     let assignment_id = parse_assignment_id(WAIVE_AGENT_GATE_TOOL, &args.assignment_id)?;
     let coordinator = session.services.agent_control.task_coordinator();
     let store = coordinator.store().ok_or_else(|| {
@@ -691,7 +688,6 @@ async fn handle_abandon_agent_task(
     let turn = Arc::clone(&step_context.turn);
     let arguments = function_arguments(payload)?;
     let args: AbandonAgentTaskArgs = parse_arguments(&arguments)?;
-    require_root(&turn.session_source, ABANDON_AGENT_TASK_TOOL)?;
     let assignment_id = parse_assignment_id(ABANDON_AGENT_TASK_TOOL, &args.assignment_id)?;
     let coordinator = session.services.agent_control.task_coordinator();
     let store = coordinator.store().ok_or_else(|| {
@@ -758,18 +754,6 @@ fn parse_assignment_id(
     value: &str,
 ) -> Result<AssignmentId, FunctionCallError> {
     AssignmentId::parse(value).map_err(|error| task_store_error(tool_name, error))
-}
-
-fn require_root(
-    session_source: &SessionSource,
-    tool_name: &'static str,
-) -> Result<(), FunctionCallError> {
-    if session_source.is_non_root_agent() {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "{tool_name}: this operation is root-only"
-        )));
-    }
-    Ok(())
 }
 
 fn task_store_error(tool_name: &'static str, error: StoreError) -> FunctionCallError {
@@ -1880,8 +1864,8 @@ fn get_agent_task_spec() -> ToolSpec {
          with read_tool_output using canonical_recovery.artifact_id and the supplied JSON pointers. \
          Summaries and worker declarations are not proof or workspace-freshness claims; null \
          receipts mean unavailable. Current attempts are separate from pinned admission provenance. \
-         Handoffs include no transcripts and grant no direct target/dependency/sibling access. \
-         Non-root callers may also read their immediate compatibility children's tasks.",
+         Handoffs include no transcripts. Root and active subagents may read tasks in this team; \
+         independent reviewers remain limited to their bound task and immediate children.",
         object_schema(
             [
                 (
@@ -2121,7 +2105,7 @@ fn submit_agent_receipt_spec() -> ToolSpec {
 fn set_agent_gate_spec() -> ToolSpec {
     function_spec(
         SET_AGENT_GATE_TOOL,
-        "Submit an evidence-backed gate verdict. Reviewers may set only review gates for their declared targets; verifiers may set only verification gates for their declared targets. Root may set any non-waiver gate. Waivers remain root-only through waive_agent_gate.",
+        "Submit an evidence-backed gate verdict using the team's shared authority. Independent reviewers remain limited to review gates for their declared targets. Use waive_agent_gate for permitted soft-gate waivers.",
         object_schema(
             [
                 ("assignment_id", assignment_id_schema()),
@@ -2178,7 +2162,7 @@ fn amend_agent_task_spec() -> ToolSpec {
     );
     function_spec(
         AMEND_AGENT_TASK_TOOL,
-        "Root-only. Create the one allowed correction attempt for a sealed worker assignment \
+        "Create the one allowed correction attempt for a sealed worker assignment \
          after its review gate requests changes. This updates the durable contract and binding, \
          but does not notify or start the worker. Use followup_task to request the correction; \
          the worker must recover its current attempt and effective contract before acting.",
@@ -2220,7 +2204,7 @@ fn amend_agent_task_spec() -> ToolSpec {
 fn waive_agent_gate_spec() -> ToolSpec {
     function_spec(
         WAIVE_AGENT_GATE_TOOL,
-        "Root-only. Waive a pending soft review or verification gate with an explicit reason. \
+        "Waive a pending soft review or verification gate with an explicit reason. \
          Other gate kinds cannot be waived.",
         object_schema(
             [
@@ -2242,7 +2226,7 @@ fn waive_agent_gate_spec() -> ToolSpec {
 fn abandon_agent_task_spec() -> ToolSpec {
     function_spec(
         ABANDON_AGENT_TASK_TOOL,
-        "Root-only. Seal the assignment's current active attempt as abandoned and release its \
+        "Seal the assignment's current active attempt as abandoned and release its \
          task lease.",
         object_schema(
             [

@@ -979,14 +979,19 @@ class CodexClient:
         thread_id: str,
         expected_turn_id: str,
         input_items: list[JsonObject] | JsonObject | str,
+        *,
+        client_user_message_id: str | None = None,
     ) -> TurnSteerResponse:
+        payload: JsonObject = {
+            "threadId": thread_id,
+            "expectedTurnId": expected_turn_id,
+            "input": self._normalize_input_items(input_items),
+        }
+        if client_user_message_id is not None:
+            payload["clientUserMessageId"] = client_user_message_id
         return self.request(
             "turn/steer",
-            {
-                "threadId": thread_id,
-                "expectedTurnId": expected_turn_id,
-                "input": self._normalize_input_items(input_items),
-            },
+            payload,
             response_model=TurnSteerResponse,
         )
 

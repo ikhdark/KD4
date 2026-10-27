@@ -32,6 +32,25 @@ pub(super) enum BedrockAuthMethod {
     AwsSdkAuth { context: AwsAuthContext },
 }
 
+/// Planning can use only region data already resolved by the request auth owner.
+/// Unknown profile-only regions remain ineligible until SDK context initialization.
+pub(super) fn known_region(
+    managed_auth: Option<&BedrockApiKeyAuth>,
+    aws: &ModelProviderAwsAuthInfo,
+    sdk_context: &tokio::sync::OnceCell<AwsAuthContext>,
+) -> Option<String> {
+    if let Some(auth) = managed_auth {
+        return Some(auth.region.clone());
+    }
+    if non_empty_env_var_from(AWS_BEARER_TOKEN_BEDROCK_ENV_VAR, std::env::var).is_some() {
+        return bearer_token_region(aws, std::env::var).ok();
+    }
+    sdk_context
+        .get()
+        .map(|context| context.region().to_string())
+        .or_else(|| bearer_token_region(aws, std::env::var).ok())
+}
+
 pub(super) async fn resolve_auth_method(
     managed_auth: Option<&BedrockApiKeyAuth>,
     aws: &ModelProviderAwsAuthInfo,

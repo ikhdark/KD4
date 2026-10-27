@@ -47,7 +47,8 @@ use crate::state::ExecutorSkillsStepState;
 use crate::state::SkillsThreadState;
 use crate::tools::skill_tools;
 use crate::world_state::SKILLS_WORLD_STATE_ID;
-use crate::world_state::executor_skills_world_state_section;
+use crate::world_state::SKILLS_DISCOVERY_WORLD_STATE_ID;
+use crate::world_state::executor_skills_world_state_sections;
 
 struct SkillsExtension<C> {
     providers: SkillProviders,
@@ -102,7 +103,7 @@ where
     C: Send + Sync + 'static,
 {
     fn world_state_section_ids(&self) -> &'static [&'static str] {
-        &[SKILLS_WORLD_STATE_ID]
+        &[SKILLS_WORLD_STATE_ID, SKILLS_DISCOVERY_WORLD_STATE_ID]
     }
 
     fn estimate_thread_context<'a>(
@@ -192,10 +193,10 @@ where
             };
             let config = thread_state.config();
             if !config.include_instructions {
-                return vec![executor_skills_world_state_section(
+                return executor_skills_world_state_sections(
                     &SkillCatalog::default(),
                     false,
-                )];
+                );
             }
             let catalog = thread_state
                 .estimate_executor_catalog_snapshot(
@@ -213,10 +214,10 @@ where
                     },
                 )
                 .await;
-            vec![executor_skills_world_state_section(
+            executor_skills_world_state_sections(
                 &catalog,
                 config.include_instructions,
-            )]
+            )
         })
     }
 
@@ -249,10 +250,10 @@ where
             input
                 .turn_store
                 .insert(ExecutorSkillsStepState(catalog.clone()));
-            vec![executor_skills_world_state_section(
+            executor_skills_world_state_sections(
                 &catalog,
                 config.include_instructions,
-            )]
+            )
         })
     }
 }
@@ -294,8 +295,15 @@ where
         thread_store: &'a ExtensionData,
         turn_store: &'a ExtensionData,
     ) -> ExtensionFuture<'a, Vec<Box<dyn ContextualUserFragment + Send>>> {
+        let thread_state = thread_store.get::<SkillsThreadState>();
+        if thread_state.is_some() {
+            // Claim ownership synchronously, even if the shared deadline expires before
+            // this future is first polled. Every replan starts without stale bodies/errors.
+            turn_store.insert(InjectedHostSkillPrompts::pending_selection());
+            let _ = turn_store.remove::<codex_core_skills::injection::UnresolvedSkillSelections>();
+        }
         Box::pin(async move {
-            let Some(thread_state) = thread_store.get::<SkillsThreadState>() else {
+            let Some(thread_state) = thread_state else {
                 return Vec::new();
             };
 
@@ -342,7 +350,16 @@ where
                 self.emit_turn_warning(thread_store, turn_store, &input.turn_id, warning.clone());
             }
 
-            let selected_entries = collect_explicit_skill_mentions(&input.user_input, &catalog);
+            let selected_entries = match collect_explicit_skill_mentions(&input.user_input, &catalog) {
+                Ok(selected) => {
+                    let _ = turn_store.remove::<codex_core_skills::injection::UnresolvedSkillSelections>();
+                    selected
+                }
+                Err(unresolved) => {
+                    turn_store.insert(codex_core_skills::injection::UnresolvedSkillSelections(unresolved));
+                    return Vec::new();
+                }
+            };
             let mut fragments: Vec<Box<dyn ContextualUserFragment + Send>> = Vec::new();
             if config.include_instructions {
                 // Selection has already copied its entries, so the catalog can be narrowed in place.

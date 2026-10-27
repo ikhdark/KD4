@@ -1,4 +1,6 @@
 use crate::bash::parse_shell_lc_plain_commands;
+use std::collections::HashMap;
+use std::path::Path;
 use crate::command_safety::is_dangerous_command::executable_name_lookup_key;
 // Find the first matching git subcommand, skipping known global options that
 // may appear before it (e.g., `-C`, `-c`, `--git-dir`).
@@ -44,6 +46,83 @@ pub fn is_known_safe_direct_argv(command: &[String]) -> bool {
     is_safe_to_call_with_exec(command)
 }
 
+/// Readonly admission requires live executable identity, not just a safe basename.
+/// The syntax-only entrypoints remain conservative for explicit paths.
+pub fn is_known_safe_direct_argv_in_state(
+    command: &[String],
+    cwd: &Path,
+    env: &HashMap<String, String>,
+) -> bool {
+    proven_safe_direct_argv_in_state(command, cwd, env).is_some()
+}
+
+/// Re-prove immediately before launch and pin the executable, preserving all
+/// operands. Policy matching must continue to use the original outer argv.
+pub fn proven_safe_direct_argv_in_state(
+    command: &[String],
+    cwd: &Path,
+    env: &HashMap<String, String>,
+) -> Option<Vec<String>> {
+    let resolved = crate::powershell::trusted_native_executable(command.first()?, cwd, env)?;
+    let filename = resolved.file_name()?.to_str()?;
+    let mut classified = command.to_vec();
+    classified[0] = filename.to_owned();
+    if !is_safe_to_call_with_exec(&classified) {
+        return None;
+    }
+    classified[0] = resolved.to_str()?.to_owned();
+    Some(classified)
+}
+
+pub fn is_safe_powershell_words_in_state(
+    command: &[String],
+    cwd: &Path,
+    env: &HashMap<String, String>,
+) -> bool {
+    // Builtins/aliases are established by the restricted, no-profile AST parser.
+    // Native utilities and explicit paths still need executable provenance.
+    let native = command.first().is_some_and(|name| {
+        !is_bare_executable(name)
+            || matches!(executable_name_lookup_key(name).as_deref(), Some("git" | "rg" | "findstr"))
+            || is_exact_version_probe(command)
+    });
+    if native {
+        is_known_safe_direct_argv_in_state(command, cwd, env)
+            || command.first().is_some_and(|name| {
+                executable_name_lookup_key(name).as_deref() == Some("findstr")
+                    && crate::powershell::trusted_native_executable(name, cwd, env).is_some()
+            })
+    } else {
+        is_safe_powershell_words(command)
+    }
+}
+
+pub fn is_known_safe_command_in_state(
+    command: &[String],
+    cwd: &Path,
+    env: &HashMap<String, String>,
+) -> bool {
+    if let Some(commands) =
+        crate::powershell::parse_noprofile_powershell_command_into_plain_commands(command)
+    {
+        return command.first().is_some_and(|shell| {
+            crate::powershell::is_trusted_powershell_executable_in_state(shell, cwd, env)
+        }) && !commands.is_empty()
+            && commands.iter().all(|words| is_safe_powershell_words_in_state(words, cwd, env));
+    }
+    if let Some(commands) = parse_shell_lc_plain_commands(command) {
+        return command.first().is_some_and(|shell| {
+            crate::powershell::trusted_native_executable(shell, cwd, env).is_some()
+        }) && !commands.is_empty()
+            && commands.iter().all(|words| is_known_safe_direct_argv_in_state(words, cwd, env));
+    }
+    is_known_safe_direct_argv_in_state(command, cwd, env)
+}
+
+fn is_bare_executable(executable: &str) -> bool {
+    !executable.is_empty() && !executable.contains(['/', '\\', ':'])
+}
+
 /// Returns whether words from the restricted PowerShell AST parser are read-only
 /// enough to be auto-approved. Raw script tokens do not satisfy this precondition.
 pub fn is_safe_powershell_words(command: &[String]) -> bool {
@@ -54,6 +133,9 @@ fn is_safe_to_call_with_exec(command: &[String]) -> bool {
     let Some(cmd0) = command.first().map(String::as_str) else {
         return false;
     };
+    if !is_bare_executable(cmd0) {
+        return false;
+    }
 
     if is_exact_version_probe(command) {
         return true;
@@ -266,6 +348,9 @@ pub(crate) fn is_exact_version_probe(command: &[String]) -> bool {
     let [executable, flag] = command else {
         return false;
     };
+    if !is_bare_executable(executable) {
+        return false;
+    }
     let Some(executable) = executable_name_lookup_key(executable) else {
         return false;
     };

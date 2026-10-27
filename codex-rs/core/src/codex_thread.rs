@@ -376,10 +376,25 @@ impl CodexThread {
         self.codex.reserve_turn_id()
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "The residency pin must exclude idle eviction until start admission completes"
-    )]
+    pub async fn find_start_input_receipt(&self, client_id: &str, fingerprint: &str) -> CodexResult<Option<String>> {
+        self.codex.session.find_start_receipt(client_id, fingerprint).await
+    }
+
+    pub async fn reserve_start_input_receipt(&self, client_id: &str, fingerprint: &str, turn_id: &str) -> CodexResult<String> {
+        self.codex.session.reserve_start_receipt(client_id, fingerprint, turn_id).await
+    }
+
+    pub async fn turn_terminal_event(&self, turn_id: &str) -> CodexResult<Option<codex_protocol::protocol::EventMsg>> {
+        match self.codex.session.live_thread() {
+            Some(thread) => thread.terminal_event(turn_id, false).await.map_err(|error| CodexErr::Fatal(error.to_string())),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn cancel_start_input_receipts(&self, turn_id: &str) -> CodexResult<()> {
+        self.codex.session.cancel_start_receipts(turn_id).await
+    }
+
     pub async fn submit_user_input_with_reserved_turn_id(
         &self,
         turn_id: String,
@@ -387,6 +402,27 @@ impl CodexThread {
         trace: Option<W3cTraceContext>,
         client_user_message_id: Option<String>,
     ) -> CodexResult<()> {
+        self.submit_user_input_with_reserved_turn_id_and_cancellation(
+            turn_id, op, trace, client_user_message_id,
+            tokio_util::sync::CancellationToken::new(),
+        ).await
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "The residency pin excludes idle eviction until start admission completes"
+    )]
+    pub async fn submit_user_input_with_reserved_turn_id_and_cancellation(
+        &self,
+        turn_id: String,
+        op: Op,
+        trace: Option<W3cTraceContext>,
+        client_user_message_id: Option<String>,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> CodexResult<()> {
+        if cancellation.is_cancelled() {
+            return Err(CodexErr::TurnAborted);
+        }
         debug_assert!(matches!(op, Op::UserInput { .. }));
         let guard = self.reserve_execution_guard(&op).await?;
         let _residency_pin = self.residency_gate.read().await;
@@ -399,8 +435,21 @@ impl CodexThread {
                     client_user_message_id,
                 },
                 guard,
+                cancellation,
             )
             .await
+    }
+
+    /// An acknowledged startup stop must not be overtaken by an older installer.
+    /// A timeout reports pending cancellation rather than claiming completion.
+    pub async fn wait_for_startup_cancellation(&self) -> CodexResult<()> {
+        let _permit = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.codex.session.task_start_gate.acquire(),
+        ).await.map_err(|_| CodexErr::InvalidRequest(
+            "startup cancellation requested; preparation is still pending".to_string(),
+        ))?.map_err(|_| CodexErr::InternalAgentDied)?;
+        Ok(())
     }
 
     pub async fn steer_input(
@@ -555,7 +604,9 @@ impl CodexThread {
     }
 
     /// Interrupt only the identified turn, leaving any newer turn untouched.
-    pub async fn interrupt_turn_if_active(&self, turn_id: &str) -> bool {
+    pub async fn interrupt_turn_if_active(&self, turn_id: &str) -> CodexResult<bool> {
+        // Terminalization is owned by the session tracker, not by this RPC.
+        // Expiring the UI wait must not cancel admitted writes or admit a successor.
         self.codex
             .session
             .abort_turn_if_active(
@@ -742,8 +793,15 @@ impl CodexThread {
         self.session_configured.clone()
     }
 
-    pub(crate) fn is_running(&self) -> bool {
-        !self.codex.tx_sub.is_closed()
+    pub fn is_running(&self) -> bool {
+        !self.codex.tx_sub.is_closed() && !self.codex.rx_event.is_closed()
+    }
+
+    /// Identity of the currently installed worker, not a lagging event projection.
+    pub async fn active_turn_id(&self) -> Option<String> {
+        self.codex.session.active_turn.lock().await.as_ref()
+            .and_then(|turn| turn.task.as_ref())
+            .map(|task| task.turn_context.sub_id.clone())
     }
 
     pub async fn load_history(

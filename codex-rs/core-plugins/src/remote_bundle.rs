@@ -285,7 +285,7 @@ pub(crate) async fn download_and_install_remote_plugin_bundle_with_guard(
     .await?;
     tokio::task::spawn_blocking(move || {
         let _mutation = mutation;
-        install_remote_plugin_bundle(codex_home, bundle, bundle_bytes)
+        install_remote_plugin_bundle(codex_home, bundle, bundle_bytes, &_mutation)
     })
     .await
     .map_err(|err| {
@@ -295,24 +295,31 @@ pub(crate) async fn download_and_install_remote_plugin_bundle_with_guard(
     })?
 }
 
-pub(crate) async fn download_and_extract_remote_plugin_bundle_to_path(
+pub(crate) async fn download_and_extract_remote_plugin_bundle_to_path<T>(
     bundle: ValidatedRemotePluginBundle,
     destination: AbsolutePathBuf,
     http_clients: &RouteAwareClientPool,
-) -> Result<AbsolutePathBuf, RemotePluginBundleInstallError> {
+    finalize: impl FnOnce(AbsolutePathBuf) -> T + Send + 'static,
+) -> Result<T, RemotePluginBundleInstallError>
+where
+    T: Send + 'static,
+{
     let bundle_bytes = download_remote_plugin_bundle_with_limit(
         &bundle.bundle_download_url,
         /*max_bytes*/ REMOTE_PLUGIN_BUNDLE_MAX_DOWNLOAD_BYTES,
         http_clients,
     )
     .await?;
+    // Keep the download cancellable, but once extraction is admitted its owner must also
+    // finish local registration even if the caller stops observing the blocking task.
     tokio::task::spawn_blocking(move || {
-        extract_remote_plugin_bundle_to_path(bundle, bundle_bytes, destination)
+        let destination = extract_remote_plugin_bundle_to_path(bundle, bundle_bytes, destination)?;
+        Ok(finalize(destination))
     })
     .await
     .map_err(|err| {
         RemotePluginBundleInstallError::InvalidBundle(format!(
-            "failed to join remote plugin bundle extraction task: {err}"
+            "failed to join remote plugin bundle extraction and finalization task: {err}"
         ))
     })?
 }
@@ -429,12 +436,14 @@ fn install_remote_plugin_bundle(
     codex_home: PathBuf,
     bundle: ValidatedRemotePluginBundle,
     bundle_bytes: Vec<u8>,
+    mutation: &crate::remote::RemotePluginCacheMutationGuard,
 ) -> Result<PluginInstallResult, RemotePluginBundleInstallError> {
     install_remote_plugin_bundle_with_metadata_writer(
         codex_home,
         bundle,
         bundle_bytes,
         PluginStore::write_remote_plugin_id,
+        mutation,
     )
 }
 
@@ -443,6 +452,7 @@ fn install_remote_plugin_bundle_with_metadata_writer(
     bundle: ValidatedRemotePluginBundle,
     bundle_bytes: Vec<u8>,
     write_metadata: impl FnOnce(&PluginStore, &PluginId, &str) -> Result<(), PluginStoreError>,
+    mutation: &crate::remote::RemotePluginCacheMutationGuard,
 ) -> Result<PluginInstallResult, RemotePluginBundleInstallError> {
     let staging_root = codex_home.join(REMOTE_PLUGIN_INSTALL_STAGING_DIR);
     fs::create_dir_all(&staging_root).map_err(|source| {
@@ -473,7 +483,12 @@ fn install_remote_plugin_bundle_with_metadata_writer(
     let store = PluginStore::try_new(codex_home)?;
     let remote_plugin_id = bundle.remote_plugin_id;
     let pending_install = store
-        .begin_install_with_version(plugin_root, bundle.plugin_id, bundle.plugin_version)
+        .begin_install_with_version_and_publication_guard(
+            plugin_root,
+            bundle.plugin_id,
+            bundle.plugin_version,
+            || mutation.lock_for_publication(),
+        )
         .map_err(RemotePluginBundleInstallError::from)?;
     write_metadata(
         &store,

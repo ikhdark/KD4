@@ -186,6 +186,16 @@ pub trait HttpTransport: Send + Sync {
         &self,
         req: Request,
     ) -> impl std::future::Future<Output = Result<StreamResponse, TransportError>> + Send;
+
+    /// The outer result reports expiry before headers; implementations that
+    /// collect error diagnostics must stop that deadline at header receipt.
+    fn stream_with_header_timeout(
+        &self,
+        req: Request,
+        timeout: std::time::Duration,
+    ) -> impl std::future::Future<Output = Result<Result<StreamResponse, TransportError>, tokio::time::error::Elapsed>> + Send {
+        tokio::time::timeout(timeout, self.stream(req))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -200,6 +210,33 @@ enum TransportClient {
 }
 
 impl ReqwestTransport {
+    async fn finish_stream_response(
+        url: String,
+        resp: crate::HttpResponse,
+    ) -> Result<StreamResponse, TransportError> {
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        if !status.is_success() {
+            let retry_after = RetryAfter::from_headers(&headers);
+            let body = collect_error_body(resp.bytes_stream()).await;
+            return Err(TransportError::Http {
+                status,
+                url: Some(url),
+                headers: Some(headers),
+                body,
+                retry_after,
+            });
+        }
+        let stream = resp
+            .bytes_stream()
+            .map(|result| result.map_err(Self::map_error));
+        Ok(StreamResponse {
+            status,
+            headers,
+            bytes: Box::pin(stream),
+        })
+    }
+
     pub fn new(client: reqwest::Client) -> Self {
         Self {
             client: TransportClient::Fixed(HttpClient::new(client)),
@@ -405,26 +442,22 @@ impl HttpTransport for ReqwestTransport {
 
         let url = req.url.clone();
         let resp = self.send(req).await?;
-        let status = resp.status();
-        let headers = resp.headers().clone();
-        if !status.is_success() {
-            let retry_after = RetryAfter::from_headers(&headers);
-            let body = collect_error_body(resp.bytes_stream()).await;
-            return Err(TransportError::Http {
-                status,
-                url: Some(url),
-                headers: Some(headers),
-                body,
-                retry_after,
-            });
-        }
-        let stream = resp
-            .bytes_stream()
-            .map(|result| result.map_err(Self::map_error));
-        Ok(StreamResponse {
-            status,
-            headers,
-            bytes: Box::pin(stream),
+        Self::finish_stream_response(url, resp).await
+    }
+
+    async fn stream_with_header_timeout(
+        &self,
+        req: Request,
+        timeout: std::time::Duration,
+    ) -> Result<Result<StreamResponse, TransportError>, tokio::time::error::Elapsed> {
+        self.trace_request(&req);
+        let url = req.url.clone();
+        // Route selection, redirects and dispatch are bounded until headers.
+        // Once received, status/advice survive the independent diagnostic wait.
+        let response = tokio::time::timeout(timeout, self.send(req)).await?;
+        Ok(match response {
+            Ok(response) => Self::finish_stream_response(url, response).await,
+            Err(error) => Err(error),
         })
     }
 }

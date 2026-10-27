@@ -251,6 +251,13 @@ pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
         false
     }
 
+    /// Trusted passive runtimes neither read nor mutate the workspace and need
+    /// no repository admission. Hooks retain their separate workspace leases.
+    /// Unknown and external runtimes must not opt in through a public name.
+    fn is_workspace_independent(&self) -> bool {
+        false
+    }
+
     /// Orchestrators acquire workspace leases through each nested dispatch.
     /// Holding an outer lease while waiting on them would deadlock. This is
     /// runtime-owned, never inferred from a tool's public name.
@@ -1557,6 +1564,11 @@ impl ToolRegistry {
     ) -> bool {
         self.tool(name)
             .is_some_and(|tool| tool.permits_shared_workspace_observation(payload))
+    }
+
+    pub(crate) fn is_workspace_independent(&self, name: &ToolName) -> bool {
+        self.tool(name)
+            .is_some_and(|tool| tool.is_workspace_independent())
     }
 
     pub(crate) fn delegates_workspace_admission(
@@ -3026,7 +3038,7 @@ fn canonical_json_argument(value: &str) -> Value {
 }
 
 fn generic_projection_is_exempt(tool_name: &ToolName, force_inline_carrier: bool) -> bool {
-    tool_name.name == "read_tool_output"
+    (tool_name.namespace.is_none() && tool_name.name == "read_tool_output")
         // MCP handlers already own provider-safe truncation and typed content
         // shaping. Re-projecting their results can replace image content with
         // a text artifact and can supersede distinct parallel call/output

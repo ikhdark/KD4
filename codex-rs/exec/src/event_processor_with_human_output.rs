@@ -208,8 +208,12 @@ impl EventProcessorWithHumanOutput {
         let in_progress = crate::event_processor::item_is_in_progress(&item);
         self.streamed_final_message.observe(&item);
         match item {
-            ThreadItem::AgentMessage { id, text, .. } => {
-                self.render_completed_text(&id, &text, "codex");
+            ThreadItem::AgentMessage { id, text, interruption, .. } => {
+                self.render_completed_text(&id, &text,
+                    if interruption.is_some() { "codex (interrupted prefix)" } else { "codex" });
+                if let Some(reason) = interruption {
+                    eprintln!("[partial assistant output was not finalized: {reason}]");
+                }
                 self.final_message = self.streamed_final_message.message();
                 self.final_message_rendered = self.final_message.as_ref() == Some(&text);
             }

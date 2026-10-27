@@ -79,6 +79,7 @@ pub(crate) struct ToolCallCompletion {
     pub(crate) response: ResponseInputItem,
     pub(crate) required_terminal: Option<RequiredToolTerminal>,
     pub(crate) failure_detail: Option<ResponseItem>,
+    pub(crate) pending_continuation_ack: Option<crate::tools::code_mode::PendingContinuationAcknowledgment>,
 }
 
 impl ToolCallCompletion {
@@ -87,6 +88,7 @@ impl ToolCallCompletion {
             response,
             required_terminal: None,
             failure_detail: None,
+            pending_continuation_ack: None,
         }
     }
 }
@@ -1212,6 +1214,10 @@ fn workspace_evidence_source_dependencies(
 }
 
 impl ToolCallRuntime {
+    pub(crate) fn mcp_auth_scope_is_current(&self) -> bool {
+        self.step_context.mcp.manager().managed_auth_scope_is_current()
+    }
+
     pub(crate) fn new(
         session: Arc<Session>,
         step_context: Arc<StepContext>,
@@ -1872,6 +1878,7 @@ impl ToolCallRuntime {
                     }
                     return Ok(ToolCallCompletion {
                         failure_detail: None,
+                        pending_continuation_ack: None,
                         required_terminal: Some(RequiredToolTerminal {
                             call_id: call.call_id.clone(),
                             cause: RequiredToolTerminalCause::Blocked,
@@ -1962,26 +1969,39 @@ impl ToolCallRuntime {
                     let required_terminal =
                         required_tool_terminal(&error_call, outcome_context, signal.as_ref());
                     let owner_key = response.deterministic_continuation_owner_key();
+                    let mut pending_receipts = Vec::new();
+                    let carried_identities = response.deterministic_continuation_receipts()
+                        .iter().filter_map(|receipt| receipt.runtime_identity())
+                        .collect::<std::collections::HashSet<_>>();
                     if let Some(owner_key) = owner_key.as_deref() {
-                        let continuations = self
+                        let mut continuations = self
                             .session
                             .services
                             .code_mode_service
                             .owner_drained_continuation_snapshot(owner_key);
+                        // A clean cell already consumed these pages into its
+                        // computed answer. Retain custody until admission, but
+                        // do not reattach their raw pages to that same carrier.
+                        continuations.retain(|continuation| continuation.receipt.runtime_identity()
+                            .is_none_or(|identity| !carried_identities.contains(&identity)));
                         let accepted = response.merge_owner_drained_continuations(continuations);
-                        self.session
-                            .services
-                            .code_mode_service
-                            .acknowledge_owner_drained_continuations(owner_key, &accepted);
                         if let Some(collector) = &signal_collector {
                             collector
                                 .record_accepted_deterministic_continuation_receipts(&accepted);
                         }
+                        pending_receipts.extend(accepted);
                     }
                     let receipts = response.deterministic_continuation_receipts();
                     if let Some(collector) = &signal_collector {
                         collector.record_accepted_deterministic_continuation_receipts(&receipts);
                     }
+                    pending_receipts.extend(receipts);
+                    let pending_continuation_ack = owner_key.as_ref()
+                        .filter(|_| !pending_receipts.is_empty())
+                        .map(|owner_key| crate::tools::code_mode::PendingContinuationAcknowledgment {
+                            owner_key: owner_key.clone(),
+                            receipts: pending_receipts,
+                        });
                     let canonical_artifact_required = response.requires_canonical_artifact();
                     let executed_workspace_call_classification =
                         executed_workspace_classification(
@@ -2133,6 +2153,7 @@ impl ToolCallRuntime {
                         response,
                         failure_detail,
                         required_terminal,
+                        pending_continuation_ack,
                     })
                 }
                 Err(FunctionCallError::Fatal(message)) => {
@@ -2178,6 +2199,7 @@ impl ToolCallRuntime {
                     Ok(ToolCallCompletion {
                         response,
                         failure_detail,
+                        pending_continuation_ack: None,
                         required_terminal: terminal_cause.map(|cause| RequiredToolTerminal {
                             call_id: error_call.call_id,
                             cause,
@@ -2576,7 +2598,8 @@ impl ToolCallRuntime {
                     None
                 };
                 let mut workspace_admission = workspace_admission_plan(
-                    router.delegates_workspace_admission(&evidence_call),
+                    router.delegates_workspace_admission(&evidence_call)
+                        || router.is_workspace_independent(&evidence_call),
                     router.permits_shared_workspace_observation(&evidence_call)
                         // Reuse the shell-aware proof already needed for eager
                         // dispatch. A public name alone cannot opt a custom

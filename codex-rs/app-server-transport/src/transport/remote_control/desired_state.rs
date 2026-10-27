@@ -178,24 +178,33 @@ impl RemoteControlHandle {
             }
             // Once persistence starts, retain both commit locks until it finishes.
             // A newer disable then writes last, even if its intent arrived mid-write.
-            let _lifecycle_commit = self.current_enrollment.lifecycle.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if lifecycle.is_cancelled() {
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "remote control enable superseded"));
-            }
-            publish_current_enrollment(&mut current_enrollment, &enrollment);
-            self.enable_with_preference(Some(true)).map_err(|err| {
-                let kind = match err {
-                    RemoteControlEnableError::Unavailable(_) => io::ErrorKind::NotFound,
-                    RemoteControlEnableError::DisabledByRequirements(_) => {
-                        io::ErrorKind::PermissionDenied
-                    }
-                };
-                io::Error::new(kind, err)
-            })?;
-            RemoteControlStatusPublisher::new(self.status_tx.as_ref().clone())
-                .publish_environment_id(Some(enrollment.environment_id));
-            Ok(self.status())
+            // Auth must precede lifecycle, as it does in update_policy. A queued
+            // auth writer must never strand a denial reader waiting on our guard.
+            self.auth_manager.with_policy_identity(|identity| {
+                let _lifecycle_commit = self.current_enrollment.lifecycle.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if lifecycle.is_cancelled() {
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "remote control enable superseded"));
+                }
+                publish_current_enrollment(&mut current_enrollment, &enrollment);
+                self.enable_with_preference_at_identity(identity, Some(true)).map_err(|err| {
+                    let kind = match err {
+                        RemoteControlEnableError::Unavailable(_) => io::ErrorKind::NotFound,
+                        RemoteControlEnableError::DisabledByRequirements(_) => {
+                            io::ErrorKind::PermissionDenied
+                        }
+                    };
+                    io::Error::new(kind, err)
+                })?;
+                RemoteControlStatusPublisher::new(self.status_tx.as_ref().clone())
+                    .publish_environment_id(Some(enrollment.environment_id));
+                Ok(self.status())
+            }).map_err(|_| io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                RemoteControlEnableError::DisabledByRequirements(
+                    super::RemoteControlDisabledByRequirements,
+                ),
+            ))?
         })
         .await
     }

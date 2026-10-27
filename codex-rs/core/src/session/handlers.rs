@@ -150,7 +150,10 @@ async fn thread_settings_update(
 
 /// Preparation owns the acknowledgement after it leaves the pending map.
 /// Cancelling that future must reject the start rather than drop its reply.
-struct TurnStartAdmission(Option<tokio::sync::oneshot::Sender<CodexResult<()>>>);
+struct TurnStartAdmission(
+    Option<tokio::sync::oneshot::Sender<CodexResult<()>>>,
+    tokio_util::sync::CancellationToken,
+);
 
 impl TurnStartAdmission {
     fn send(mut self, result: CodexResult<()>) -> Result<(), CodexResult<()>> {
@@ -196,13 +199,23 @@ pub(super) async fn user_input_or_turn_inner(
     let mut start_only_admission = {
         let mut task_start = sess.task_start_state.lock().await;
         match task_start.pending_start_only_admissions.remove(&sub_id) {
-            Some(admission) => Some((task_start_permit, TurnStartAdmission(Some(admission)))),
+            Some((admission, cancellation)) => Some((
+                task_start_permit,
+                TurnStartAdmission(Some(admission), cancellation),
+            )),
             None => {
                 drop(task_start_permit);
                 None
             }
         }
     };
+    if start_only_admission.as_ref().is_some_and(|(_, admission)| admission.1.is_cancelled()) {
+        if let Some((permit, admission)) = start_only_admission.take() {
+            drop(permit);
+            let _ = admission.send(Err(CodexErr::TurnAborted));
+        }
+        return;
+    }
     if start_only_admission.is_some() && sess.active_turn.lock().await.is_some() {
         if let Some((task_start_permit, admission)) = start_only_admission.take() {
             drop(task_start_permit);
@@ -394,14 +407,33 @@ pub(super) async fn user_input_or_turn_inner(
             return;
         }
     };
-    let mut task_input = vec![TurnInput::AdditionalContext(additional_context)];
+    if let Some((_, admission)) = start_only_admission.as_ref()
+        && !admission.1.is_cancelled()
+        && let Err(error) = sess.accept_start_receipt(&sub_id, client_user_message_id.as_deref(), &items, &additional_context).await
+    {
+        if let Some((permit, admission)) = start_only_admission.take() {
+            drop(permit);
+            let _ = admission.send(Err(error));
+        }
+        return;
+    }
+    let start_fence = start_only_admission.as_ref().map(|(_, admission)| super::input_queue::StartInputFence {
+        turn_id: sub_id.clone(), cancellation: admission.1.clone(),
+    });
+    let mut task_input = vec![TurnInput::AdditionalContext { values: additional_context, start_fence: start_fence.clone() }];
     if !items.is_empty() {
         task_input.push(TurnInput::UserInput {
             content: items,
             client_id: client_user_message_id,
+            start_fence,
         });
     }
     if let Some((task_start_permit, admission)) = start_only_admission.take() {
+        if admission.1.is_cancelled() {
+            drop(task_start_permit);
+            let _ = admission.send(Err(CodexErr::TurnAborted));
+            return;
+        }
         let result = sess
             .start_task_with_admission(
                 &task_start_permit,
@@ -804,6 +836,7 @@ struct RuntimeShutdown {
 }
 
 async fn shutdown_session_runtime(sess: &Arc<Session>) -> RuntimeShutdown {
+    sess.services.model_client.retire_transport_cache();
     let terminal_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let admission_incomplete = tokio::time::timeout_at(terminal_deadline, sess.begin_shutdown())
         .await
@@ -1115,6 +1148,12 @@ pub(super) async fn submission_loop(
             }
             continue;
         }
+        // Required publication failure is fatal even without an event consumer.
+        // Reuse this loop's teardown owner rather than executing buffered work
+        // on a permanently closed stream until somebody next resumes the thread.
+        if sess.tx_event.is_closed() {
+            break;
+        }
         if pending.is_none()
             && let Some(queued) = ordered.pop_front()
         {
@@ -1136,6 +1175,7 @@ pub(super) async fn submission_loop(
         let queued = if let Some((_, _, preparation)) = pending.as_mut() {
             tokio::select! {
                 biased;
+                _ = sess.tx_event.closed() => break,
                 should_exit = preparation => {
                     pending = None;
                     if should_exit { shutdown_received = true; break; }
@@ -1144,7 +1184,11 @@ pub(super) async fn submission_loop(
                 received = rx_sub.recv() => received,
             }
         } else {
-            rx_sub.recv().await
+            tokio::select! {
+                biased;
+                _ = sess.tx_event.closed() => break,
+                received = rx_sub.recv() => received,
+            }
         };
         let Ok(queued) = queued else {
             break;
@@ -1253,6 +1297,15 @@ pub(super) async fn submission_loop(
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some(mandatory_error.map_or(Ok(()), Err));
     }
+    // ShutdownComplete can precede accepted late terminal producers. Close only
+    // after those owners finish, so listeners drain their ordered final events
+    // and can release the runtime even while display clients stay subscribed.
+    let event_owner = Arc::clone(&sess);
+    tokio::spawn(async move {
+        event_owner.terminal_tasks.wait().await;
+        event_owner.wait_for_ordered_history_commits().await;
+        event_owner.tx_event.close();
+    });
     debug!("Agent loop exited");
 }
 
@@ -1266,7 +1319,7 @@ async fn cancel_queued_preparation(
         .services
         .agent_control
         .execution_permit_cleanup(sess.thread_id, &id);
-    if let Some(admission) = sess
+    if let Some((admission, _)) = sess
         .task_start_state
         .lock()
         .await

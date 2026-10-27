@@ -226,6 +226,19 @@ fn extraction_cache() -> &'static Mutex<ExtractionCache> {
     CACHE.get_or_init(|| Mutex::new(ExtractionCache::default()))
 }
 
+/// Snapshot only existing summary paths; callers must still perform normal
+/// rollout-key and payload-version validation before reusing a value.
+pub(crate) fn cached_summary_paths(default_provider: &str) -> HashSet<PathBuf> {
+    extraction_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .summaries
+        .keys()
+        .filter(|key| key.default_provider == default_provider)
+        .map(|key| key.path.clone())
+        .collect()
+}
+
 async fn extraction_cache_key(
     rollout_path: &Path,
     default_provider: &str,
@@ -474,6 +487,9 @@ pub(crate) enum PassRemainder {
     ConfirmedPayloadGaps(usize),
     /// Some payload gap was read only once at its current rollout version.
     UnconfirmedPayloadGaps,
+    /// Discovery retained a traversal cursor after a bounded slice. The caller
+    /// may continue with this memo while its overall deadline permits.
+    DiscoveryPending,
     /// The pass stopped early, or a failure a retry may resolve remains.
     Unresolved,
 }
@@ -597,7 +613,7 @@ pub(crate) async fn backfill_sessions_until(
     if !memo.discovery.as_mut().expect("discovery initialized").advance(&mut should_stop).await {
         // A partial tree cannot certify a contiguous durable watermark. Retain
         // the in-memory traversal but release the cross-process claim promptly.
-        memo.last_pass = Some(PassRemainder::Unresolved);
+        memo.last_pass = Some(PassRemainder::DiscoveryPending);
         if let Err(error) = runtime.release_backfill_claim(&claim).await {
             warn!(%error, "failed to release paused rollout discovery claim");
         }

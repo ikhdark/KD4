@@ -48,6 +48,8 @@ pub(crate) struct InFlightTaskReference {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TurnStartClaim {
     Claimed,
+    Replay(String),
+    SubmissionConflict,
     IdenticalTask(InFlightTaskReference),
     ActiveTurn(InFlightTaskReference),
     CapacityExceeded,
@@ -127,6 +129,7 @@ impl Drop for TurnOriginReservation {
 pub(crate) struct PendingThreadResumeRequest {
     pub(crate) request_id: ConnectionRequestId,
     pub(crate) history_items: Option<Vec<RolloutItem>>,
+    pub(crate) history_generation: u64,
     pub(crate) listener_generation: u64,
     pub(crate) config_snapshot: ThreadConfigSnapshot,
     pub(crate) instruction_sources: Vec<LegacyAppPathString>,
@@ -134,7 +137,6 @@ pub(crate) struct PendingThreadResumeRequest {
     pub(crate) include_turns: bool,
     pub(crate) initial_turns_page:
         Option<codex_app_server_protocol::ThreadResumeInitialTurnsPageParams>,
-    pub(crate) prepared_initial_turns_page: Option<codex_app_server_protocol::TurnsPage>,
     pub(crate) redact_resume_payloads: bool,
 }
 
@@ -547,7 +549,7 @@ pub(crate) fn turn_summary_item_indices(items: &[ThreadItem]) -> (Option<usize>,
         .position(|item| matches!(item, ThreadItem::UserMessage { .. }));
     let agent = items
         .iter()
-        .rposition(|item| matches!(item, ThreadItem::AgentMessage { .. }))
+        .rposition(|item| matches!(item, ThreadItem::AgentMessage { interruption: None, .. }))
         .filter(|&index| user.is_none_or(|user| items[user].id() != items[index].id()));
     (user, agent)
 }
@@ -738,6 +740,7 @@ impl ThreadState {
         if let Some(previous) = self.listener_cancellation.replace(cancellation) {
             previous.cancel();
         }
+        self.active_stream_replay = active_stream_replay::ActiveStreamReplay::default();
         self.listener_generation = self.listener_generation.wrapping_add(1);
         self.last_thread_settings = Some(thread_settings_baseline);
         let (listener_command_tx, listener_command_rx) = thread_listener_command_channel();
@@ -752,6 +755,7 @@ impl ThreadState {
             cancellation.cancel();
         }
         self.listener_command_tx = None;
+        self.active_stream_replay = active_stream_replay::ActiveStreamReplay::default();
         self.current_turn_history.reset();
         self.turn_summary = TurnSummary::default();
         self.turn_summary_id = None;
@@ -779,10 +783,14 @@ impl ThreadState {
         self.current_turn_history.active_turn_snapshot()
     }
 
+    pub(crate) fn indexed_turn_snapshot(&self, turn_id: &str) -> Option<Turn> {
+        self.turn_index.turns.get(turn_id).map(|turn| clone_turn_with_items_view(turn, TurnItemsView::NotLoaded))
+    }
+
     pub(crate) fn active_stream_replay(
         &self,
     ) -> Vec<codex_app_server_protocol::ServerNotification> {
-        self.active_stream_replay.snapshot()
+        self.active_stream_replay.snapshot(self.in_progress_turn_id())
     }
 
     pub(crate) fn active_turn_id(&self) -> Option<&str> {
@@ -1121,13 +1129,15 @@ impl ThreadState {
         &mut self,
         items: &[RolloutItem],
         listener_generation: u64,
+        history_generation: u64,
     ) -> bool {
         if self.listener_generation != listener_generation || self.listener_command_tx.is_none() {
             return false;
         }
-        if codex_rollout::ensure_rollout_source_integrity(items).is_err() {
-            self.turn_index_source_partial = true;
-        } else if self.turn_index_source_partial {
+        if !self.turn_index.initialized || self.turn_index_source_partial {
+            if self.turn_index_rollback_generation != history_generation {
+                return false;
+            }
             self.seed_turn_index_from_history(items);
         }
         // Persisted history can lag events already consumed by this listener.
@@ -1147,6 +1157,17 @@ impl ThreadState {
         }
         self.resume_history_seeded_generation = Some(listener_generation);
         true
+    }
+
+    /// The listener's index overlays every completion consumed since the durable
+    /// snapshot. Capture this before admitting the observer, not in the RPC task.
+    pub(crate) fn resume_turns_snapshot(
+        &self,
+        limit: usize,
+        direction: SortDirection,
+        items_view: TurnItemsView,
+    ) -> Option<IndexedTurnPage> {
+        self.turn_index.page(None, limit, direction, items_view).ok().flatten()
     }
 
     pub(crate) fn turn_origin_tracker(&self) -> TurnOriginTracker {
@@ -1264,6 +1285,8 @@ struct ThreadStateManagerInner {
         HashMap<ThreadId, HashMap<OutOfBandElicitationLeaseKey, Weak<CodexThread>>>,
     in_flight_tasks: HashMap<String, InFlightTaskReference>,
     in_flight_turn_starts: HashMap<ThreadId, String>,
+    in_flight_client_submissions: HashMap<ThreadId, (String, String, String)>,
+    turn_start_cancellation: HashMap<ThreadId, tokio_util::sync::CancellationToken>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1359,13 +1382,52 @@ impl ThreadStateManager {
         Self::default()
     }
 
+    pub(crate) async fn turn_start_cancellation(
+        &self,
+        thread_id: ThreadId,
+    ) -> tokio_util::sync::CancellationToken {
+        self.state.lock().await.turn_start_cancellation.entry(thread_id).or_default().clone()
+    }
+
+    pub(crate) async fn cancel_pending_turn_starts(&self, thread_id: ThreadId) -> Option<String> {
+        let mut state = self.state.lock().await;
+        let token = state.turn_start_cancellation.entry(thread_id).or_default();
+        token.cancel();
+        *token = tokio_util::sync::CancellationToken::new();
+        state.in_flight_turn_starts.get(&thread_id).cloned()
+    }
+
+    pub(crate) async fn pending_turn_start_id(&self, thread_id: ThreadId) -> Option<String> {
+        self.state.lock().await.in_flight_turn_starts.get(&thread_id).cloned()
+    }
+
+    pub(crate) async fn pending_client_submission(
+        &self, thread_id: ThreadId, client_id: &str, fingerprint: &str,
+    ) -> Result<Option<String>, ()> {
+        let state = self.state.lock().await;
+        match state.in_flight_client_submissions.get(&thread_id) {
+            Some((id, hash, turn_id)) if id == client_id => {
+                if hash == fingerprint { Ok(Some(turn_id.clone())) } else { Err(()) }
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub(crate) async fn claim_turn_start(
         &self,
         fingerprint: Option<&str>,
         thread_id: ThreadId,
         turn_id: &str,
+        client_submission: Option<(&str, &str)>,
     ) -> TurnStartClaim {
         let mut state = self.state.lock().await;
+        if let Some((client_id, fingerprint)) = client_submission
+            && let Some((id, hash, original)) = state.in_flight_client_submissions.get(&thread_id)
+            && id == client_id
+        {
+            return if hash == fingerprint { TurnStartClaim::Replay(original.clone()) }
+                else { TurnStartClaim::SubmissionConflict };
+        }
         if let Some(existing) = fingerprint.and_then(|key| state.in_flight_tasks.get(key)) {
             return TurnStartClaim::IdenticalTask(existing.clone());
         }
@@ -1385,6 +1447,10 @@ impl ThreadStateManager {
         state
             .in_flight_turn_starts
             .insert(thread_id, turn_id.to_string());
+        if let Some((client_id, fingerprint)) = client_submission {
+            state.in_flight_client_submissions.insert(thread_id,
+                (client_id.to_owned(), fingerprint.to_owned(), turn_id.to_owned()));
+        }
         if let Some(fingerprint) = fingerprint {
             state.in_flight_tasks.insert(
                 fingerprint.to_string(),
@@ -1409,6 +1475,7 @@ impl ThreadStateManager {
             .is_some_and(|active_turn_id| active_turn_id == turn_id)
         {
             state.in_flight_turn_starts.remove(&thread_id);
+            state.in_flight_client_submissions.remove(&thread_id);
         }
     }
 
@@ -1422,6 +1489,17 @@ impl ThreadStateManager {
             .await
             .live_connections
             .insert(connection_id, capabilities);
+    }
+
+    /// Publish synchronous connection-owned bookkeeping under the same admission
+    /// lock that removes a connection. The callback must not perform I/O or await.
+    pub(crate) async fn with_live_connection<T>(
+        &self,
+        connection_id: ConnectionId,
+        publish: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let state = self.state.lock().await;
+        state.live_connections.contains_key(&connection_id).then(publish)
     }
 
     pub(crate) async fn acquire_out_of_band_elicitation_lease(
@@ -1713,6 +1791,10 @@ impl ThreadStateManager {
                 release_out_of_band_elicitation_leases(leases);
             }
             state.in_flight_turn_starts.remove(&thread_id);
+            state.in_flight_client_submissions.remove(&thread_id);
+            if let Some(cancellation) = state.turn_start_cancellation.remove(&thread_id) {
+                cancellation.cancel();
+            }
             state
                 .in_flight_tasks
                 .retain(|_, entry| entry.thread_id != thread_id);

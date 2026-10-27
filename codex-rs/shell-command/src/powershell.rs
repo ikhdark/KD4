@@ -197,6 +197,16 @@ pub fn is_trusted_powershell_executable(executable: &str) -> bool {
     crate::command_safety::is_trusted_powershell_host(executable)
 }
 
+pub fn is_trusted_powershell_executable_in_state(
+    executable: &str,
+    cwd: &Path,
+    env: &HashMap<String, String>,
+) -> bool {
+    crate::command_safety::trusted_powershell_host_path(executable).is_some_and(|trusted| {
+        native_executable_against_trusted(executable, cwd, env, &trusted).is_some()
+    })
+}
+
 fn extract_powershell_command_details(
     command: &[String],
 ) -> Option<ExtractedPowershellCommand<'_>> {
@@ -411,6 +421,93 @@ fn resolve_direct_exe(command_name: &str, path: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Resolve a native utility against this launch's cwd/environment and compare it
+/// with the independently resolved host utility. Never cache this filesystem proof.
+/// Script wrappers and ambiguous search state cannot establish readonly authority.
+pub(crate) fn trusted_native_executable(
+    executable: &str,
+    cwd: &Path,
+    env: &HashMap<String, String>,
+) -> Option<PathBuf> {
+    let requested = Path::new(executable);
+    let filename = requested.file_name()?.to_str()?;
+    let host_path = std::env::var("PATH").ok()?;
+    let trusted = resolve_direct_exe(filename, &host_path)?;
+    native_executable_against_trusted(executable, cwd, env, &trusted)
+}
+
+fn native_executable_against_trusted(
+    executable: &str,
+    cwd: &Path,
+    env: &HashMap<String, String>,
+    trusted: &Path,
+) -> Option<PathBuf> {
+    let requested = Path::new(executable);
+    let filename = requested.file_name()?.to_str()?;
+    let path = if requested.is_absolute() {
+        ""
+    } else {
+        env_value_ignore_ascii_case(env, "PATH")?
+    };
+    let resolved = resolve_direct_exe(executable, path)?;
+    if !same_windows_path(trusted, &resolved) || !cwd.is_absolute() {
+        return None;
+    }
+    if !requested.is_absolute() {
+        // Native pipe and PTY launchers have different search details. Reject
+        // cwd/application-directory and script-extension shadows rather than
+        // assuming that PATH-only .exe resolution proves both launchers agree.
+        let stem = requested.file_stem()?.to_str()?;
+        let mut directories = vec![cwd.to_path_buf()];
+        directories.push(std::env::current_exe().ok()?.parent()?.to_path_buf());
+        for directory in directories {
+            let candidate = directory.join(stem).with_extension("exe");
+            if candidate.is_file()
+                && canonical_exe(&candidate)
+                    .is_none_or(|candidate| !same_windows_path(&candidate, &trusted))
+            {
+                return None;
+            }
+        }
+        let pathext = env_value_ignore_ascii_case(env, "PATHEXT")?;
+        for directory in std::env::split_paths(OsStr::new(path)) {
+            if directory.as_os_str().is_empty() || !directory.is_absolute() {
+                return None;
+            }
+            let candidate = directory.join(filename);
+            if candidate.is_file() {
+                return canonical_exe(&candidate)
+                    .filter(|candidate| same_windows_path(candidate, &trusted));
+            }
+            if requested.extension().is_none() {
+                // Mirror the PTY extension search as well as the pipe launcher's
+                // .exe lookup. A script/custom extension winning either is opaque.
+                for extension in pathext.split(';') {
+                    let extension = extension.strip_prefix('.')?;
+                    if extension.is_empty() || !extension.bytes().all(|ch| ch.is_ascii_alphanumeric()) {
+                        return None;
+                    }
+                    let candidate = candidate.with_extension(extension);
+                    if candidate.is_file() {
+                        return canonical_exe(&candidate)
+                            .filter(|candidate| same_windows_path(candidate, &trusted));
+                    }
+                }
+            }
+        }
+        return None;
+    }
+    Some(resolved)
+}
+
+pub fn is_trusted_native_executable_in_state(
+    executable: &str,
+    cwd: &Path,
+    env: &HashMap<String, String>,
+) -> bool {
+    trusted_native_executable(executable, cwd, env).is_some()
 }
 
 fn canonical_exe(path: &Path) -> Option<PathBuf> {

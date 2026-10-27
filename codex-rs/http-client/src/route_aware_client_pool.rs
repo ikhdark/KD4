@@ -583,6 +583,7 @@ impl RouteAwareClientPool {
             .or(self.client_builder.configured_timeout())
             .map(|timeout| tokio::time::Instant::now() + timeout);
         let mut redirects = 0;
+        let mut refreshed_failed_route = false;
         let mut previous_route = None;
         loop {
             let current_url = request.url().clone();
@@ -605,7 +606,7 @@ impl RouteAwareClientPool {
             {
                 request.headers_mut().remove(PROXY_AUTHORIZATION);
             }
-            previous_route = Some(current_route);
+            previous_route = Some(current_route.clone());
             if let Some(timeout_deadline) = timeout_deadline {
                 let remaining = timeout_deadline
                     .checked_duration_since(tokio::time::Instant::now())
@@ -617,13 +618,11 @@ impl RouteAwareClientPool {
             }
             let redirect_state = follows_redirects_manually
                 .then(|| PreparedRedirect::capture(&request));
-            let execute_request = async {
-                if follows_redirects_manually {
-                    client.execute_without_request_logging(request).await
-                } else {
-                    client.execute(request).await
-                }
-            };
+            let route_replay = (!refreshed_failed_route).then(|| request.try_clone()).flatten();
+            // Defaults were projected once at the pool boundary. Do not apply
+            // them again after a route/redirect removed an origin-bound header.
+            // Logging is owned below, independently of default-header projection.
+            let execute_request = client.execute_without_request_logging(request);
             let execute_request = crate::admit_dispatch(execute_request);
             let response = match match timeout_deadline {
                 Some(timeout_deadline) => {
@@ -637,17 +636,42 @@ impl RouteAwareClientPool {
             {
                 Ok(response) => response,
                 Err(error) => {
+                    // is_connect proves this hop failed before HTTP dispatch.
+                    // Retain permanent TLS/configuration errors for the caller.
+                    // Refresh OS/PAC authority once after a network change, and
+                    // retry only a different route with a replayable body.
+                    if error.is_connect()
+                        && !crate::is_permanent_connection_error(&error)
+                        && !refreshed_failed_route
+                        && !self.force_direct
+                        && self.http_client_factory.outbound_proxy_policy()
+                            == OutboundProxyPolicy::RespectSystemProxy
+                    {
+                        refreshed_failed_route = true;
+                        self.http_client_factory.invalidate_cached_proxy_route(current_url.as_str());
+                        if let Some(replay) = route_replay {
+                            let fresh = match timeout_deadline {
+                                Some(deadline) => tokio::time::timeout_at(deadline, resolve_route(current_url.to_string()))
+                                    .await.map_err(|_| RouteAwareRequestError::Timeout)?,
+                                None => resolve_route(current_url.to_string()).await,
+                            }.map_err(RouteAwareClientPoolError::Resolve)?;
+                            if fresh != current_route {
+                                request = replay;
+                                continue;
+                            }
+                        }
+                    }
                     if follows_redirects_manually {
                         client.log_error_summary(&request_method, &request_url, &error);
+                    } else {
+                        client.log_error(&request_method, &request_url, &error);
                     }
                     return Err(error.into());
                 }
             };
             let status = response.status();
             if !follows_redirects_manually || !is_redirect(status) {
-                if follows_redirects_manually {
-                    client.log_response(&request_method, &request_url, &response);
-                }
+                client.log_response(&request_method, &request_url, &response);
                 return Ok(response);
             }
             let Some(next_url) = redirect_url(&response) else {

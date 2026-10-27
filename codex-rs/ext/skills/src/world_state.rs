@@ -12,10 +12,84 @@ use crate::catalog::SkillCatalog;
 use crate::render::available_skills_fragment;
 
 pub(crate) const SKILLS_WORLD_STATE_ID: &str = "skills";
+pub(crate) const SKILLS_DISCOVERY_WORLD_STATE_ID: &str = "skills_discovery";
+const INCOMPLETE_EXECUTOR_SKILLS_BODY: &str = "\n## Skills discovery update\nSelected-environment skill discovery is incomplete. Earlier accepted catalog entries are historical, not confirmed current; this observation does not establish that skills are absent. Any entries listed below are only the known partial catalog. Discover SKILL.md files under the selected capability roots with that environment's filesystem tools and read_file with environment_id if needed.\n";
 const NO_EXECUTOR_SKILLS_BODY: &str =
     "\n## Skills update\nNo selected-environment skills are currently available.\n";
 const HIDDEN_EXECUTOR_SKILLS_BODY: &str = "\n## Skills update\nSelected-environment skills are not listed automatically. Explicit skill mentions can still be resolved when available.\n";
 const DEFERRED_EXECUTOR_SKILLS_BODY: &str = "\n## Skills update\nThe previous selected-environment skills catalog is no longer current. Its replacement listing was omitted due to context pressure. Discover SKILL.md files under the current selected capability roots with that environment's filesystem tools and read_file with environment_id if needed.\n";
+
+pub(crate) fn executor_skills_world_state_sections(
+    catalog: &SkillCatalog,
+    include_instructions: bool,
+) -> Vec<WorldStateSectionContribution> {
+    // Discovery/read/metadata warnings cannot prove absence. Retain the accepted catalog,
+    // but separately tell the model it is not a confirmed current inventory.
+    let incomplete = include_instructions && !catalog.warnings.is_empty();
+    let mut sections = vec![if incomplete {
+        WorldStateSectionContribution::unavailable(SKILLS_WORLD_STATE_ID)
+    } else {
+        executor_skills_world_state_section(catalog, include_instructions)
+    }];
+    let status = if incomplete {
+        "incomplete"
+    } else if include_instructions {
+        "complete"
+    } else {
+        "hidden"
+    };
+    let short_body = if incomplete {
+        INCOMPLETE_EXECUTOR_SKILLS_BODY
+    } else if include_instructions {
+        "\n## Skills discovery update\nSelected-environment skill discovery completed. The earlier incomplete-discovery notice no longer applies; use the current skills listing.\n"
+    } else {
+        "\n## Skills discovery update\nThe earlier discovery notice no longer applies. Selected-environment skills are not listed automatically; this does not disable them.\n"
+    };
+    let mut body = short_body.to_string();
+    if incomplete && let Some(fragment) = available_skills_fragment(catalog) {
+        body.push_str(fragment.body().as_ref());
+    }
+    let snapshot = json!({"status": status, "body": body});
+    let current_snapshot = snapshot.clone();
+    let retained_body = body.clone();
+    let mut discovery = WorldStateSectionContribution::new(
+        SKILLS_DISCOVERY_WORLD_STATE_ID,
+        snapshot,
+        move |previous| {
+            if matches!(&previous, PreviousWorldStateSection::Known(previous) if *previous == &current_snapshot)
+                || (!incomplete
+                    && match &previous {
+                        PreviousWorldStateSection::Absent => true,
+                        PreviousWorldStateSection::Known(previous) =>
+                            previous.get("status").and_then(serde_json::Value::as_str) != Some("incomplete"),
+                        PreviousWorldStateSection::Unknown => false,
+                    })
+            {
+                return None;
+            }
+            Some(RenderedWorldStateFragment::new(
+                "developer",
+                ("<environment_skills_discovery>", "</environment_skills_discovery>"),
+                body.clone(),
+            ))
+        },
+    )
+    .with_budget_fallback(
+        json!({"status": status, "body": short_body}),
+        RenderedWorldStateFragment::new(
+            "developer",
+            ("<environment_skills_discovery>", "</environment_skills_discovery>"),
+            short_body,
+        ),
+    );
+    if incomplete {
+        discovery = discovery.with_retained_fragment_matcher(move |role, text| {
+            role == "developer" && (text.contains(&retained_body) || text.contains(short_body))
+        });
+    }
+    sections.push(discovery);
+    sections
+}
 
 pub(crate) fn executor_skills_world_state_section(
     catalog: &SkillCatalog,

@@ -487,6 +487,9 @@ impl ShellCommandHandler {
             policy_selection,
             &format!("{validation_cwd}:{environment_hash}"),
             workspace_identity.as_deref(),
+            &turn_environment.environment_id,
+            &PathUri::from_abs_path(&exec_params.cwd),
+            &exec_params.command,
         ).await {
             Ok(permit) => permit,
             Err(refusal) => return Ok(boxed_tool_output(refusal)),

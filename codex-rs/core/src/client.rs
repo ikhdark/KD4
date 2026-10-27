@@ -2776,6 +2776,7 @@ impl PromptContextMeasurementDispatch {
 #[derive(Debug, Default)]
 struct WebsocketTransportCache {
     epoch: u64,
+    retired: bool,
     session: Option<WebsocketSession>,
     fallback: WebsocketFallbackState,
 }
@@ -2828,7 +2829,7 @@ impl WebsocketTransportCache {
         permit: WebsocketCachePublicationPermit,
         websocket_session: WebsocketSession,
     ) -> bool {
-        if self.epoch != permit.epoch || self.session.is_some() {
+        if self.retired || self.epoch != permit.epoch || self.session.is_some() {
             return false;
         }
         self.session = Some(websocket_session);
@@ -3723,6 +3724,18 @@ impl ModelClient {
         }
     }
 
+    /// Shutdown permanently revokes late turn-session cache publication.
+    pub(crate) fn retire_transport_cache(&self) {
+        let retired = {
+            let mut cache = self.state.cached_websocket_transport.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.retired = true;
+            cache.epoch = cache.epoch.wrapping_add(1);
+            cache.session.take()
+        };
+        drop(retired);
+    }
+
     fn take_cached_websocket_transport(
         &self,
     ) -> (WebsocketSession, WebsocketCachePublicationPermit) {
@@ -3998,6 +4011,15 @@ impl ModelClient {
         } else {
             prompt.get_formatted_input_for_request(model_info.use_responses_lite)
         };
+        let image_count = crate::image_preparation::image_input_count(&input);
+        if image_count != 0 && !model_info.input_modalities
+            .contains(&codex_protocol::openai_models::InputModality::Image)
+        {
+            return Err(CodexErr::Fatal(format!(
+                "Model {} cannot receive {image_count} required image attachment(s); select an image-capable model.",
+                model_info.slug,
+            )));
+        }
         input = crate::image_preparation::for_model_image_detail(
             input,
             model_info.supports_image_detail_original,
@@ -6637,6 +6659,9 @@ impl ModelClientSession {
             .client
             .activate_http_fallback(session_telemetry, recoverable);
         self.websocket_session = WebsocketSession::default();
+        // HTTP must route afresh too: the failed socket's sticky token can
+        // otherwise send the fallback straight back to the restarting backend.
+        self.turn_state = Arc::new(OnceLock::new());
         self.last_stream_transport = Some(ModelAttemptTransport::ResponsesHttp);
         self.http_for_turn = true;
         activated || failed_stream_was_websocket

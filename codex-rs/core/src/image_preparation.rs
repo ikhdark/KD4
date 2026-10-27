@@ -204,10 +204,40 @@ pub(crate) fn response_items_need_preparation(items: &[ResponseItem]) -> bool {
     })
 }
 
+pub(crate) fn prepare_required_user_images(item: &mut ResponseItem) -> std::io::Result<()> {
+    if let ResponseItem::Message { content, .. } = item {
+        try_prepare_message_content(content, true, true)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn image_input_count(items: &[ResponseItem]) -> usize {
+    items.iter().map(|item| match item {
+        ResponseItem::Message { content, .. } => content.iter()
+            .filter(|part| matches!(part, ContentItem::InputImage { .. })).count(),
+        ResponseItem::FunctionCallOutput { output, .. }
+        | ResponseItem::CustomToolCallOutput { output, .. } => output.content_items()
+            .map_or(0, |content| content.iter().filter(|part|
+                matches!(part, FunctionCallOutputContentItem::InputImage { .. })).count()),
+        ResponseItem::ImageGenerationCall { result, .. } => usize::from(result.as_ref().is_some_and(|image| !image.is_empty())),
+        _ => 0,
+    }).sum()
+}
+
 fn prepare_message_content(items: &mut Vec<ContentItem>, supports_original: bool) {
+    let _ = try_prepare_message_content(items, supports_original, false);
+}
+
+fn try_prepare_message_content(
+    items: &mut Vec<ContentItem>,
+    supports_original: bool,
+    required: bool,
+) -> std::io::Result<()> {
     let mut index = 0;
+    let mut image_index = 0;
     while index < items.len() {
         if let ContentItem::InputImage { image_url, detail } = &mut items[index] {
+            image_index += 1;
             if !supports_original && *detail != Some(ImageDetail::Original) {
                 index += 1;
                 continue;
@@ -233,6 +263,10 @@ fn prepare_message_content(items: &mut Vec<ContentItem>, supports_original: bool
                 }
                 Ok(None) => {}
                 Err(error) => {
+                    if required {
+                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+                            format!("Required image attachment {image_index} could not be delivered: {error}")));
+                    }
                     warn!(%error, "failed to prepare message image");
                     items[index] = ContentItem::InputText {
                         text: error.placeholder().to_string(),
@@ -242,6 +276,7 @@ fn prepare_message_content(items: &mut Vec<ContentItem>, supports_original: bool
         }
         index += 1;
     }
+    Ok(())
 }
 
 fn prepare_tool_output_content(

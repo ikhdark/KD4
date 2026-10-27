@@ -226,17 +226,22 @@ async fn claim_turn_start_before_connection_updates<F, Fut>(
     task_fingerprint: Option<&str>,
     thread_id: ThreadId,
     turn_id: &str,
+    client_submission: Option<(&str, &str)>,
     apply_connection_updates: F,
-) -> Result<(), JSONRPCErrorError>
+) -> Result<Option<String>, JSONRPCErrorError>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<(), JSONRPCErrorError>>,
 {
     match thread_state_manager
-        .claim_turn_start(task_fingerprint, thread_id, turn_id)
+        .claim_turn_start(task_fingerprint, thread_id, turn_id, client_submission)
         .await
     {
         crate::thread_state::TurnStartClaim::Claimed => {}
+        crate::thread_state::TurnStartClaim::Replay(original) => return Ok(Some(original)),
+        crate::thread_state::TurnStartClaim::SubmissionConflict => {
+            return Err(invalid_request("clientUserMessageId was already used with different turn/start contents"));
+        }
         crate::thread_state::TurnStartClaim::IdenticalTask(existing) => {
             return Err(identical_task_in_flight_error(&existing));
         }
@@ -255,7 +260,7 @@ where
         return Err(error);
     }
 
-    Ok(())
+    Ok(None)
 }
 
 async fn release_turn_start_after_submission_error(
@@ -336,6 +341,10 @@ pub(crate) struct TurnRequestProcessor {
 
 fn steer_input_error(err: SteerInputError) -> (JSONRPCErrorError, Option<AnalyticsJsonRpcError>) {
     let (message, data, error_type) = match err {
+        SteerInputError::ReceiptUnavailable { message } => return (internal_error(message), None),
+        SteerInputError::IdempotencyConflict => return (
+            invalid_request("clientUserMessageId was already used with different steering contents"), None,
+        ),
         SteerInputError::AdditionalContextUnavailable { message } => {
             return (internal_error(message), None);
         }
@@ -537,6 +546,15 @@ struct ThreadSettingsBuildParams {
 }
 
 impl TurnRequestProcessor {
+    pub(crate) async fn turn_start_cancellation(
+        &self,
+        thread_id: &str,
+    ) -> Result<CancellationToken, JSONRPCErrorError> {
+        let thread_id = ThreadId::from_string(thread_id)
+            .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
+        Ok(self.thread_state_manager.turn_start_cancellation(thread_id).await)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         auth_manager: Arc<AuthManager>,
@@ -571,6 +589,7 @@ impl TurnRequestProcessor {
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
         supports_openai_form_elicitation: bool,
+        cancellation: Option<CancellationToken>,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         validate_user_input_image_urls(&params.input)?;
         let additional_context = map_additional_context(params.additional_context.take())?;
@@ -581,6 +600,7 @@ impl TurnRequestProcessor {
             (app_server_client_name, app_server_client_version),
             /*supports_openai_form_elicitation*/ supports_openai_form_elicitation,
             None,
+            cancellation,
         )
         .await
         .map(|response| Some(response.into()))
@@ -611,6 +631,7 @@ impl TurnRequestProcessor {
             (client_name, client_version),
             supports_openai_form_elicitation,
             Some(turn_id),
+            None,
         )
         .await
     }
@@ -861,6 +882,55 @@ impl TurnRequestProcessor {
         normalized_task_fingerprint(params, &workspace_identity, &settings_identity)
     }
 
+    async fn replay_turn_start(
+        &self,
+        request_id: &ConnectionRequestId,
+        thread_id: ThreadId,
+        thread: &CodexThread,
+        turn_id: String,
+    ) -> Result<TurnStartResponse, JSONRPCErrorError> {
+        let terminal = thread.turn_terminal_event(&turn_id).await
+            .map_err(|error| internal_error(format!("failed to reconcile original turn: {error}")))?;
+        let active = {
+            let state = self.thread_state_manager.thread_state(thread_id).await;
+            state.lock().await.indexed_turn_snapshot(&turn_id)
+        };
+        let mut turn = Turn { id: turn_id.clone(), items: vec![], items_view: TurnItemsView::NotLoaded,
+            error: None, status: TurnStatus::InProgress, started_at: None, completed_at: None,
+            duration_ms: None, timing: None, surfaced_result: None };
+        if terminal.is_none() && let Some(snapshot) = active.as_ref()
+            && snapshot.status != TurnStatus::InProgress
+        {
+            self.outgoing.record_request_turn_id(request_id, &turn_id).await;
+            return Ok(TurnStartResponse { turn: snapshot.clone() });
+        }
+        match terminal {
+            Some(codex_protocol::protocol::EventMsg::TurnComplete(event)) => {
+                turn.status = if event.error.is_some() { TurnStatus::Failed } else { TurnStatus::Completed };
+                turn.error = event.error.map(|error| TurnError { message: error.message,
+                    codex_error_info: error.codex_error_info.map(Into::into), additional_details: None });
+                turn.completed_at = event.completed_at;
+                turn.duration_ms = event.duration_ms;
+                turn.timing = event.timing;
+                turn.surfaced_result = event.surfaced_result;
+            }
+            Some(codex_protocol::protocol::EventMsg::TurnAborted(event)) => {
+                turn.status = TurnStatus::Interrupted;
+                turn.completed_at = event.completed_at;
+                turn.duration_ms = event.duration_ms;
+                turn.timing = event.timing;
+            }
+            _ if active.is_some() || self.thread_state_manager.pending_turn_start_id(thread_id).await.as_deref() == Some(&turn_id) => {}
+            _ => {
+                let mut error = invalid_request("the original submission outcome is uncertain; it was not executed again");
+                error.data = Some(serde_json::json!({"reason": "submissionOutcomeUnknown", "turnId": turn_id}));
+                return Err(error);
+            }
+        }
+        self.outgoing.record_request_turn_id(request_id, &turn_id).await;
+        Ok(TurnStartResponse { turn })
+    }
+
     async fn turn_start_inner(
         &self,
         request_id: ConnectionRequestId,
@@ -869,7 +939,15 @@ impl TurnRequestProcessor {
         app_server_client_info: (Option<String>, Option<String>),
         supports_openai_form_elicitation: bool,
         reserved_turn_id: Option<String>,
+        cancellation: Option<CancellationToken>,
     ) -> Result<TurnStartResponse, JSONRPCErrorError> {
+        let cancellation = match cancellation {
+            Some(token) => token,
+            None => self.turn_start_cancellation(&params.thread_id).await?,
+        };
+        if cancellation.is_cancelled() {
+            return Err(invalid_request("turn start was cancelled by startup interrupt"));
+        }
         let (app_server_client_name, app_server_client_version) = app_server_client_info;
         let received_at = std::time::Instant::now();
         let (thread_id, thread) = self.load_thread(&params.thread_id).await.inspect_err(|_| {
@@ -883,6 +961,26 @@ impl TurnRequestProcessor {
                 Some(AnalyticsJsonRpcError::Input(InputError::TooLarge)),
             );
             return Err(error);
+        }
+        let submission_fingerprint = if params.client_user_message_id.is_some() {
+            let mut value = serde_json::to_value((&params, &additional_context))
+                .map_err(|error| internal_error(format!("failed to fingerprint input: {error}")))?;
+            canonicalize_task_fingerprint_json(&mut value);
+            let mut writer = Sha256Writer(Sha256::new());
+            serde_json::to_writer(&mut writer, &value).map_err(|error| internal_error(error.to_string()))?;
+            Some(hex::encode(writer.0.finalize()))
+        } else { None };
+        if let (Some(client_id), Some(fingerprint)) = (&params.client_user_message_id, &submission_fingerprint)
+            && let Some(original) = thread.find_start_input_receipt(client_id, fingerprint).await
+                .map_err(|error| match error { CodexErr::InvalidRequest(message) => invalid_request(message), error => internal_error(error.to_string()) })?
+        {
+            return self.replay_turn_start(&request_id, thread_id, thread.as_ref(), original).await;
+        }
+        if let (Some(client_id), Some(fingerprint)) = (&params.client_user_message_id, &submission_fingerprint)
+            && let Some(original) = self.thread_state_manager.pending_client_submission(thread_id, client_id, fingerprint).await
+                .map_err(|()| invalid_request("clientUserMessageId was already used with different turn/start contents"))?
+        {
+            return self.replay_turn_start(&request_id, thread_id, thread.as_ref(), original).await;
         }
         let is_running = matches!(thread.agent_status().await, AgentStatus::Running);
         let active_turn_id = {
@@ -972,21 +1070,26 @@ impl TurnRequestProcessor {
         let processor = self.clone();
         let submission_thread = Arc::clone(&thread);
         let submission_turn_id = turn_id.clone();
+        let requested_turn_id = turn_id.clone();
         let submission_request_id = request_id.clone();
-        self.background_tasks
+        let turn_id = self.background_tasks
             .spawn(
                 async move {
                     let thread = submission_thread;
                     let turn_id = submission_turn_id;
                     let request_id = submission_request_id;
+                    if cancellation.is_cancelled() {
+                        return Err(invalid_request("turn start was cancelled by startup interrupt"));
+                    }
                     // Admission must precede connection capability mutations. Duplicate or overloaded turns
                     // are rejected without changing shared thread or MCP state, and a failed capability update
                     // releases the claim so the request can be retried.
-                    claim_turn_start_before_connection_updates(
+                    let replay = claim_turn_start_before_connection_updates(
                         &processor.thread_state_manager,
                         task_fingerprint.as_deref(),
                         thread_id,
                         &turn_id,
+                        client_user_message_id.as_deref().zip(submission_fingerprint.as_deref()),
                         || async {
                             Self::set_app_server_client_info(
                                 thread.as_ref(),
@@ -1011,6 +1114,19 @@ impl TurnRequestProcessor {
                     .inspect_err(|_| {
                         processor.track_error_response(&request_id, /*error_type*/ None);
                     })?;
+                    if let Some(original) = replay { return Ok(original); }
+                    if let (Some(client_id), Some(fingerprint)) = (&client_user_message_id, &submission_fingerprint) {
+                        let original = match thread.reserve_start_input_receipt(client_id, fingerprint, &turn_id).await {
+                            Ok(original) => original,
+                            Err(error) => return Err(release_turn_start_after_submission_error(
+                                &processor.thread_state_manager, thread_id, &turn_id, error,
+                            ).await),
+                        };
+                        if original != turn_id {
+                            processor.thread_state_manager.release_turn_start(thread_id, &turn_id).await;
+                            return Ok(original);
+                        }
+                    }
                     let turn_origin_tracker = {
                         let thread_state =
                             processor.thread_state_manager.thread_state(thread_id).await;
@@ -1034,11 +1150,12 @@ impl TurnRequestProcessor {
                     );
                     let request_trace_context = processor.request_trace_context(&request_id).await;
                     if let Err(err) = thread
-                        .submit_user_input_with_reserved_turn_id(
+                        .submit_user_input_with_reserved_turn_id_and_cancellation(
                             turn_id.clone(),
                             turn_op,
                             request_trace_context,
                             client_user_message_id,
+                            cancellation,
                         )
                         .await
                     {
@@ -1067,12 +1184,16 @@ impl TurnRequestProcessor {
                                 .unwrap_or(u64::MAX),
                         ),
                     );
-                    Ok::<(), JSONRPCErrorError>(())
+                    Ok::<String, JSONRPCErrorError>(turn_id)
                 }
                 .instrument(tracing::Span::current()),
             )
             .await
             .map_err(|error| internal_error(format!("turn submission task failed: {error}")))??;
+
+        if turn_id != requested_turn_id {
+            return self.replay_turn_start(&request_id, thread_id, thread.as_ref(), turn_id).await;
+        }
 
         self.outgoing
             .record_request_turn_id(&request_id, &turn_id)
@@ -1333,7 +1454,16 @@ impl TurnRequestProcessor {
     ) -> Result<ThreadInjectItemsResponse, JSONRPCErrorError> {
         let (_, thread) = self.load_thread(&params.thread_id).await?;
 
-        let items = params
+        if !thread
+            .config_snapshot()
+            .await
+            .session_source
+            .accepts_direct_user_input(thread.multi_agent_version())
+        {
+            return Err(invalid_request(DIRECT_INPUT_TO_MULTI_AGENT_V2_SUBAGENT_ERROR));
+        }
+
+        let mut items = params
             .items
             .into_iter()
             .enumerate()
@@ -1344,6 +1474,19 @@ impl TurnRequestProcessor {
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(invalid_request)?;
         validate_response_item_image_urls(&items)?;
+
+        for item in &mut items {
+            if let ResponseItem::Message { role, .. } | ResponseItem::AdditionalTools { role, .. } = item
+                && (role.eq_ignore_ascii_case("system") || role.eq_ignore_ascii_case("developer"))
+            {
+                return Err(invalid_request(
+                    "externally injected items cannot have system or developer authority",
+                ));
+            }
+            // Core allocates ordinary IDs when recording these items. A client
+            // must never mint runtime-owned provenance such as msg_sctx_*.
+            item.set_id(None);
+        }
 
         thread
             .inject_response_items(items)
@@ -1429,6 +1572,33 @@ impl TurnRequestProcessor {
 
         let (thread_uuid, thread) = self.load_thread(&thread_id).await?;
 
+        if is_startup_interrupt {
+            let active_turn = {
+                let state = self.thread_state_manager.thread_state(thread_uuid).await;
+                state.lock().await.in_progress_turn_id().map(str::to_owned)
+            };
+            let pending_turn = self.thread_state_manager.cancel_pending_turn_starts(thread_uuid).await;
+            let target = pending_turn.or(active_turn);
+            if let Some(target) = target.as_deref() {
+                // Co-record revocation before reporting Stop. Recovery must not
+                // resurrect accepted initial input from this cancelled start.
+                thread.cancel_start_input_receipts(target).await.map_err(|error| {
+                    internal_error(format!("failed to persist startup cancellation: {error}"))
+                })?;
+            }
+            // Wait only for the installation fence, not for unbounded cleanup.
+            // Older preparations carry the revoked token even if not yet in core.
+            thread.wait_for_startup_cancellation().await.map_err(|error| {
+                internal_error(format!("failed to fence startup interrupt: {error}"))
+            })?;
+            if let Some(target) = target {
+                thread.interrupt_turn_if_active(&target).await.map_err(|error| {
+                    internal_error(format!("failed to interrupt startup turn: {error}"))
+                })?;
+            }
+            return Ok(Some(TurnInterruptResponse {}));
+        }
+
         // Record turn interrupts so we can reply when TurnAborted arrives. Startup
         // interrupts do not have a turn and are acknowledged after submission.
         let interrupt_reservation = if !is_startup_interrupt {
@@ -1458,7 +1628,20 @@ impl TurnRequestProcessor {
         if !is_startup_interrupt {
             // Core checks identity while claiming terminal ownership. A completed
             // target must never turn this request into an interrupt of its successor.
-            if thread.interrupt_turn_if_active(&turn_id).await {
+            let interrupted = match thread.interrupt_turn_if_active(&turn_id).await {
+                Ok(interrupted) => interrupted,
+                Err(error) => {
+                    let state = self.thread_state_manager.thread_state(thread_uuid).await;
+                    let needs_response = state.lock().await.finish_interrupt(request_id);
+                    drop(interrupt_reservation);
+                    return if needs_response {
+                        Err(internal_error(error.to_string()))
+                    } else {
+                        Ok(None)
+                    };
+                }
+            };
+            if interrupted {
                 // Let the listener acknowledge after terminal side effects (including
                 // pausing queued prompts) have been persisted.
                 if let Some(reservation) = interrupt_reservation {

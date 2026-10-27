@@ -43,8 +43,8 @@ use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::same_exec_authorization_envelope;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::ExecCommandSource;
-use codex_shell_command::is_safe_command::is_known_safe_command;
-use codex_shell_command::is_safe_command::is_known_safe_direct_argv;
+use codex_shell_command::is_safe_command::is_known_safe_command_in_state;
+use codex_shell_command::is_safe_command::is_known_safe_direct_argv_in_state;
 
 use codex_tools::CanonicalToolResult;
 use codex_tools::ToolName;
@@ -454,11 +454,17 @@ pub(super) async fn run_exec_like_with_exit_code(
     let session_source = args.turn.session_source.clone();
     let safety_command = args.safety_command.clone();
     let shell_wrapper_is_owned = args.shell_wrapper_is_owned;
+    let inspection_state = (!args.turn_environment.environment.is_remote()
+        && crate::agent::task_capabilities::is_independent_review_source(&session_source))
+        .then(|| (args.exec_params.cwd.clone(), args.exec_params.env.clone()));
     let inspection_command = crate::tools::run_blocking_command_analysis(move || {
+        let Some((inspection_cwd, inspection_env)) = inspection_state else {
+            return false;
+        };
         if shell_wrapper_is_owned {
-            is_known_safe_command(&safety_command)
+            is_known_safe_command_in_state(&safety_command, inspection_cwd.as_path(), &inspection_env)
         } else {
-            is_known_safe_direct_argv(&safety_command)
+            is_known_safe_direct_argv_in_state(&safety_command, inspection_cwd.as_path(), &inspection_env)
         }
     })
     .await
@@ -729,6 +735,7 @@ async fn run_exec_like_with_exit_code_inner(
                 .create_exec_approval_requirement_for_command(ExecApprovalRequest {
                     command: proof.command_for_policy(),
                     command_for_safety: None,
+                    execution_context: (!turn_environment.environment.is_remote()).then_some((exec_params.cwd.as_path(), &exec_params.env)),
                     approval_policy: turn.approval_policy.value(),
                     permission_profile: turn.permission_profile(),
                     windows_sandbox_level: turn.windows_sandbox_level,
@@ -749,6 +756,7 @@ async fn run_exec_like_with_exit_code_inner(
     let exec_approval_request = ExecApprovalRequest {
         command: &exec_params.command,
         command_for_safety: Some(&safety_command),
+        execution_context: (!turn_environment.environment.is_remote()).then_some((exec_params.cwd.as_path(), &exec_params.env)),
         approval_policy: turn.approval_policy.value(),
         permission_profile: turn.permission_profile(),
         windows_sandbox_level: turn.windows_sandbox_level,
@@ -789,6 +797,7 @@ async fn run_exec_like_with_exit_code_inner(
     let req = ShellRequest {
         command: exec_params.command.clone(),
         command_for_approval: safety_command,
+        shell_wrapper_is_owned,
 
         approved_powershell_direct_argv,
         turn_environment: turn_environment.clone(),

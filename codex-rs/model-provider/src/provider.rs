@@ -112,6 +112,23 @@ pub trait ModelProvider: fmt::Debug + Send + Sync {
         ProviderCapabilities::default()
     }
 
+    /// Intersect provider upper bounds with model- and region-specific eligibility.
+    fn supports_hosted_web_search(&self, _model: &str) -> bool {
+        self.capabilities().web_search
+    }
+
+    /// Resolve provider-owned metadata needed by the synchronous tool planner.
+    fn prepare_hosted_web_search(
+        &self,
+    ) -> ModelProviderFuture<'_, codex_protocol::error::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Whether hosted search must remain inside the provider's index/cache boundary.
+    fn hosted_web_search_requires_cached_access(&self) -> bool {
+        false
+    }
+
     /// Returns whether requests made through this provider should include attestation.
     fn supports_attestation(&self) -> bool {
         false

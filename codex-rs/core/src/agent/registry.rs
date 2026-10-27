@@ -50,6 +50,8 @@ struct ActiveAgents {
     agent_tree: HashMap<String, AgentMetadata>,
     // Residency is not lineage: keep the edge through cold/pathless intermediates.
     parents: HashMap<ThreadId, ThreadId>,
+    // Ephemeral turn ownership retires with its existing lineage edge.
+    turn_spawn_owners: HashMap<ThreadId, (ThreadId, String)>,
     used_agent_nicknames: HashSet<String>,
     nickname_reset_count: usize,
     closing_threads: HashMap<ThreadId, usize>,
@@ -156,6 +158,9 @@ impl AgentRegistry {
                 .find_map(|(key, metadata)| (metadata.agent_id == Some(thread_id)).then_some(key))
                 .cloned();
             active_agents.input_queues.remove(&thread_id);
+            if !active_agents.parents.contains_key(&thread_id) {
+                active_agents.turn_spawn_owners.remove(&thread_id);
+            }
             let removed = removed_key
                 .and_then(|key| active_agents.agent_tree.remove(key.as_str()))
                 .is_some_and(|metadata| {
@@ -176,6 +181,7 @@ impl AgentRegistry {
                 let Some(parent) = active_agents.parents.remove(&retired) else {
                     break;
                 };
+                active_agents.turn_spawn_owners.remove(&retired);
                 retired = parent;
             }
             removed
@@ -427,6 +433,16 @@ impl AgentRegistry {
             .iter()
             .map(|(child, parent)| (*parent, *child))
             .collect()
+    }
+
+    pub(crate) fn record_turn_spawn_owner(&self, child: ThreadId, parent: ThreadId, turn: String) {
+        self.active_agents.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .turn_spawn_owners.insert(child, (parent, turn));
+    }
+
+    pub(crate) fn turn_spawn_owners(&self) -> HashMap<ThreadId, (ThreadId, String)> {
+        self.active_agents.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .turn_spawn_owners.clone()
     }
 
     pub(crate) fn restore_cold_agent(

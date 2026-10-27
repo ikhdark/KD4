@@ -7,7 +7,7 @@ pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript, not JS
 - exec_command waits; one still running after the default wait returns a live `session_id` (see await_command). r.output is display text; r.exit_code is status; the host reports failed commands itself. For exact parsing use `r.stdout`, present when `r.streams_complete` is true. Before parsing, concatenating, or indexing a result, verify success and the advertised representation, and finish its live handle or required continuations. A display string is not exact completed data.
 - Await every call: unawaited work is discarded, and an uncaught rejection ends the cell. Earlier effects survive failure; recover receipts, never replay them. Use `Promise.allSettled` for independent fallible calls. Batch independent reads and searches as one `text(await Promise.allSettled([tools.read_file({path:"a.rs"}), tools.exec_command({cmd:"rg -n x src"})]))`. Run builds and other commands that may write outside such batches; they hold the workspace exclusively.
 - Nested deadlines: { timeout_ms } overrides the host default. Expiry cancels the nested call and may return only an error, without a live handle. After expiry, check the outcome before retrying uncertain effects.
-- First-line // @exec: {"deliver": true} makes printed text the final answer, without a model call, when everything in the cell succeeded. For a settled answer, await closing work (including tools.update_plan), then print only that answer in this cell. Plan completion alone is not task completion. Delivery appears at cell end; use a normal final for long reports.
+- {{delivery_guidance}}
 - Output defaults to 10000 tokens; first-line // @exec: {"max_output_tokens": 40000} raises it (ceiling 40000). A truncated result names the `read_tool_output` call that returns the rest. Oversized: result_retained:true, outcome.recovery (possibly pending). Recover required recovery/canonical_recovery or outcome.recovery ranges with `await tools.read_tool_output(recipe.arguments)` in-cell before returning; consume pages; bound printing; never rerun producers.
 - JS bindings reset per exec; store(key,value)/load(key) retain JSON. Load large JSON once per computation and compare stable keys, not object references across loads. Keep one working body, retiring obsolete copies before storing replacements. Summarize already-consumed machine data without reprinting it. Keep compact state/provenance; deleteStored(key) drops duplicates. Failed quota cells discard staged stores; check listKeys before resuming. listKeys({after?,limit?}): 1-64, default 32; continue next_after. First-line // @exec: {"persist":true} preserves completed values across host restart.
 - Deferred tools: ALL_TOOL_NAMES/ALL_TOOLS or tool_search; resolve_tool(name) retains full contracts. Resolve known followups in-cell; never infer arguments from names. Follow namespace_instructions_ref and operation rules, or resolve the full contract.
@@ -27,10 +27,16 @@ const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- `exec` buffers output while its awa
 
 pub fn build_exec_tool_description(
     code_mode_only: bool,
+    direct_delivery_enabled: bool,
     has_deferred_tools: bool,
     direct_only_tool_names: &[String],
 ) -> String {
-    let mut description = String::from(EXEC_DESCRIPTION_TEMPLATE);
+    let delivery_guidance = if direct_delivery_enabled {
+        "First-line // @exec: {\"deliver\": true} makes printed text the final answer, without a model call, when everything in the cell succeeded. For a settled answer, await closing work (including tools.update_plan), then print only that answer in this cell. Plan completion alone is not task completion. Delivery appears at cell end; use a normal final for long reports."
+    } else {
+        "Final-answer delivery is unavailable in this session. `deliver: true` is rejected before the cell starts; omit it and return the answer in a normal final response after `exec` completes."
+    };
+    let mut description = EXEC_DESCRIPTION_TEMPLATE.replace("{{delivery_guidance}}", delivery_guidance);
     if !code_mode_only {
         description.push_str("\n\nFor a single call, prefer its direct interface when advertised. Use `exec` for orchestration or result processing.");
     }

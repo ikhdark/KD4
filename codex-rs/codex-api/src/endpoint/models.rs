@@ -10,7 +10,20 @@ use http::HeaderMap;
 use http::Method;
 use http::StatusCode;
 use http::header::ETAG;
+use serde::Deserialize;
 use std::sync::Arc;
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ModelsEnvelope {
+    Codex(ModelsResponse),
+    Public { data: Vec<PublicModel> },
+}
+
+#[derive(Deserialize)]
+struct PublicModel {
+    id: String,
+}
 
 #[derive(Debug)]
 pub enum ModelsListResult {
@@ -108,7 +121,7 @@ impl<T: HttpTransport> ModelsClient<T> {
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string);
 
-        let ModelsResponse { models } = serde_json::from_slice::<ModelsResponse>(&resp.body)
+        let envelope = serde_json::from_slice::<ModelsEnvelope>(&resp.body)
             .map_err(|e| {
                 ApiError::Stream(format!(
                     "failed to decode models response: {:?} at line {} column {}; status: {}; body length: {}",
@@ -119,6 +132,19 @@ impl<T: HttpTransport> ModelsClient<T> {
                     resp.body.len()
                 ))
             })?;
+        let models = match envelope {
+            ModelsEnvelope::Codex(ModelsResponse { models }) => models,
+            ModelsEnvelope::Public { data } => {
+                if data.iter().any(|model| model.id.trim().is_empty()) {
+                    return Err(ApiError::Stream(
+                        "models response contains an empty model id".into(),
+                    ));
+                }
+                data.into_iter()
+                    .map(|model| ModelInfo::from_public_model_id(model.id))
+                    .collect()
+            }
+        };
 
         Ok(ModelsListResult::Modified {
             models,

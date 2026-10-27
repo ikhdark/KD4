@@ -326,6 +326,18 @@ impl CodeModeExecuteHandler {
     ) -> Result<FunctionToolOutput, FunctionCallError> {
         let args =
             codex_code_mode::parse_exec_source(&code).map_err(FunctionCallError::RespondToModel)?;
+        if args.deliver
+            && !step_context
+                .turn
+                .config
+                .features
+                .enabled(codex_features::Feature::Kd4Runtime)
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "exec `deliver: true` is unavailable when `kd4_runtime` is disabled; no cell was started. Omit `deliver` and return the answer in a normal final response."
+                    .to_string(),
+            ));
+        }
         // Apply the public ceiling before crossing either session transport.
         // The remote wire uses i32, while the pragma accepts safe integers.
         let max_output_tokens = args

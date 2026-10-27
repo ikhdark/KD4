@@ -9,6 +9,7 @@ pub use full_suite::FullSuitePermit;
 #[path = "managed_cargo_lane.rs"]
 mod managed_cargo_lane;
 pub use managed_cargo_lane::check_managed_cargo_lane;
+pub use managed_cargo_lane::compilation_sources;
 
 use super::command_search::rg_search_path_indices;
 use super::command_search::rg_search_path_operands;
@@ -557,8 +558,8 @@ fn preflight_invocation_with_equivalent_repair_detailed(
                 let repaired_argv_commands =
                     preflight_command_issue(&repaired_command, /*shell_type*/ None)?;
                 return Ok(CommandPreflightOutcome {
-                    // Status is already valid. Disabling optional locks is
-                    // normalization, so it must not bypass retry admission.
+                    // Status is already valid. Disabling optional locks and
+                    // fsmonitor is normalization, not a retry-admission bypass.
                     repair_notice: None,
                     advisory: None,
                     validation_invocations: validation_invocations(
@@ -663,15 +664,25 @@ fn git_status_read_only_equivalent(invocation: &CommandInvocation) -> Option<Com
     let command = invocation.to_direct_argv()?;
     let (subcommand_index, _) =
         codex_shell_command::is_dangerous_command::find_git_subcommand(&command, &["status"])?;
-    if command[1..subcommand_index]
+    let global_args = &command[1..subcommand_index];
+    let locks_disabled = global_args
         .iter()
-        .any(|arg| arg == "--no-optional-locks")
-    {
+        .any(|arg| arg == "--no-optional-locks");
+    let fsmonitor_disabled = global_args.iter().any(|arg| arg == "-ccore.fsmonitor=false")
+        || global_args
+            .windows(2)
+            .any(|args| args[0] == "-c" && args[1] == "core.fsmonitor=false");
+    if locks_disabled && fsmonitor_disabled {
         return None;
     }
 
-    let mut repaired_args = Vec::with_capacity(args.len() + 1);
-    repaired_args.push("--no-optional-locks".to_string());
+    let mut repaired_args = Vec::with_capacity(args.len() + 3);
+    if !locks_disabled {
+        repaired_args.push("--no-optional-locks".to_string());
+    }
+    if !fsmonitor_disabled {
+        repaired_args.extend(["-c".to_string(), "core.fsmonitor=false".to_string()]);
+    }
     repaired_args.extend(args.iter().cloned());
     Some(CommandInvocation::Argv {
         program: program.clone(),

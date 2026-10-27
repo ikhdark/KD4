@@ -69,6 +69,8 @@ mod projects;
 mod recovery;
 mod remote_control;
 mod thread_queues;
+mod input_receipts;
+pub use input_receipts::InputReceipt;
 mod threads;
 
 async fn file_modified_time_utc(path: &Path) -> Option<DateTime<Utc>> {
@@ -140,6 +142,7 @@ pub struct StateRuntime {
     codex_home: PathBuf,
     default_provider: String,
     pool: Arc<sqlx::SqlitePool>,
+    input_receipts_pool: Arc<tokio::sync::OnceCell<sqlx::SqlitePool>>,
     logs_pool: Arc<sqlx::SqlitePool>,
     agent_job_runner_instance_id: String,
     // Capability for owning jobs; the actual lease is enrolled on first use.
@@ -321,6 +324,7 @@ SELECT
             tokio::sync::watch::channel(false);
         let runtime = Arc::new(Self {
             pool,
+            input_receipts_pool: Default::default(),
             logs_pool,
             agent_job_runner_instance_id,
             agent_job_runner_registered: register_job_runner,

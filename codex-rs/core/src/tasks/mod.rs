@@ -931,15 +931,19 @@ impl Session {
         self: &Arc<Self>,
         turn_id: &str,
         reason: TurnAbortReason,
-    ) -> bool {
+    ) -> CodexResult<bool> {
         let schedule = self
             .schedule_turn_terminal(Some(turn_id), TurnTerminalOutcome::Aborted(reason))
             .await;
         let matched = schedule.matched();
         if let Some(coordinator) = schedule.coordinator() {
-            coordinator.wait_completed().await;
+            tokio::time::timeout(Duration::from_secs(5), coordinator.wait_completed())
+                .await
+                .map_err(|_| CodexErr::InvalidRequest(
+                    "cancellation requested; terminal persistence is still pending. The turn remains fenced until its owned writes settle".to_string(),
+                ))?;
         }
-        matched
+        Ok(matched)
     }
 
     fn schedule_turn_terminal<'a>(
@@ -1271,6 +1275,13 @@ impl Session {
                     .set(CancellationCause::TurnAborted { reason });
             }
             finalization.task.cancellation_token.cancel();
+        }
+
+        if finalization.abort_reason == Some(TurnAbortReason::Interrupted) {
+            // Request the owned child subtree's cancellation before any history
+            // checkpoint can stall. Reparented/detached and earlier-turn children
+            // are outside this turn's ownership fence.
+            self.interrupt_turn_owned_agents(&turn_context, false).await;
         }
 
         // Auxiliary work and the sampling worker receive cancellation together
@@ -1650,6 +1661,14 @@ impl Session {
         &self,
         turn_context: &TurnContext,
     ) -> Vec<String> {
+        self.interrupt_turn_owned_agents(turn_context, true).await
+    }
+
+    async fn interrupt_turn_owned_agents(
+        &self,
+        turn_context: &TurnContext,
+        failed: bool,
+    ) -> Vec<String> {
         let control = &self.services.agent_control;
         let label = |thread_id: codex_protocol::ThreadId| {
             control
@@ -1665,7 +1684,7 @@ impl Session {
         let mut unconfirmed = Vec::new();
         match tokio::time::timeout_at(
             deadline,
-            control.list_live_agent_subtree_thread_ids(self.thread_id),
+            control.list_turn_owned_agent_subtree(self.thread_id, &turn_context.sub_id),
         )
         .await
         {
@@ -1712,8 +1731,11 @@ impl Session {
         if interrupted.is_empty() && queued.is_empty() && unconfirmed.is_empty() {
             return interrupted;
         }
-        let mut message =
-            "This turn ended on an error, so it will not read results from agents.".to_string();
+        let mut message = if failed {
+            "This turn ended on an error, so it will not read results from agents."
+        } else {
+            "Cancellation was requested for this turn and its owned agents."
+        }.to_string();
         if !interrupted.is_empty() {
             message.push_str(&format!(
                 " Enqueued interrupt requests for agents it started: {}. This does not confirm they have stopped. They keep their work and can be resumed.",

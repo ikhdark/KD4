@@ -271,6 +271,7 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let connection_id = next_connection_id();
+    let cancellation = CancellationToken::new();
     let (writer_tx, mut writer_rx) = mpsc::channel::<QueuedOutgoingMessage>(CHANNEL_CAPACITY);
     let writer_tx_for_reader = writer_tx.clone();
     transport_event_tx
@@ -278,12 +279,11 @@ where
             connection_id,
             origin: ConnectionOrigin::Stdio,
             writer: writer_tx,
-            disconnect_sender: None,
+            disconnect_sender: Some(cancellation.clone()),
         })
         .await
         .map_err(|_| std::io::Error::new(ErrorKind::BrokenPipe, "processor unavailable"))?;
 
-    let cancellation = CancellationToken::new();
     let connection_closed = Arc::new(AtomicBool::new(false));
     let transport_event_tx_for_reader = transport_event_tx.clone();
     let cancellation_for_reader = cancellation.clone();

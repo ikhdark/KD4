@@ -251,6 +251,14 @@ async fn wait_for_backfill_gate(
             // indexed so far. Coverage stays uncertified and each gap keeps the
             // checkpoint before it, so a later repair is still reconciled.
             match memo.last_pass_remainder() {
+                Some(metadata::PassRemainder::DiscoveryPending)
+                    if tokio::time::Instant::now() < backfill_stop_at =>
+                {
+                    // A fairness slice is not a failed traversal. The pass
+                    // released its lease; yield before resuming the same memo.
+                    tokio::task::yield_now().await;
+                    continue;
+                }
                 Some(metadata::PassRemainder::ConfirmedPayloadGaps(gaps)) => {
                     warn!(
                         "state db at {} serves with {gaps} rollouts whose payload artifacts are missing; backfill coverage remains pending",

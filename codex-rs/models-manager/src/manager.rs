@@ -39,7 +39,7 @@ const MODEL_REFRESH_FAILURE_COOLDOWN: Duration = Duration::from_secs(1);
 /// manager owns refresh policy, cache behavior, and catalog merging; it calls
 /// this endpoint only when it decides a remote refresh should happen.
 pub trait ModelsEndpointClient: fmt::Debug + Send + Sync {
-    /// Local discovery has authoritative membership and does not require Codex auth.
+    /// Provider discovery has authoritative membership and does not require Codex auth.
     fn has_authoritative_catalog(&self) -> bool {
         false
     }
@@ -556,6 +556,7 @@ pub struct StaticModelsManager {
     remote_models: Vec<ModelInfo>,
     rejected_slugs: std::collections::BTreeSet<String>,
     available_models: AvailableModelPresets,
+    explicit_selection_required: bool,
     auth_manager: Option<Arc<AuthManager>>,
     model_catalog_activity: Arc<ModelCatalogActivity>,
 }
@@ -612,12 +613,24 @@ impl StaticModelsManager {
         Self {
             remote_models,
             available_models,
+            explicit_selection_required: false,
             auth_manager,
             rejected_slugs: normalized.rejected_slugs,
             model_catalog_activity: Arc::new(ModelCatalogActivity::new()),
         }
     }
 
+    /// Keep backend metadata without claiming that these models are available in
+    /// the current account/region. An explicit catalog remains the authority for
+    /// callers that can establish eligibility themselves.
+    pub fn requiring_explicit_selection(mut self) -> Self {
+        self.explicit_selection_required = true;
+        for model in &mut self.remote_models {
+            model.visibility = ModelVisibility::None;
+        }
+        self.available_models = AvailableModelPresets::from_normalized(&[]);
+        self
+    }
 }
 
 impl ModelsManager for OpenAiModelsManager {
@@ -722,12 +735,20 @@ impl ModelsManager for OpenAiModelsManager {
                 self.note_catalog_activity(RefreshStrategy::Offline).await;
                 self.ensure_current_cache_identity().await;
                 let state = self.state.read().await;
-                construct_model_info_with_rejections(
+                let mut info = construct_model_info_with_rejections(
                     model,
                     &state.remote_models,
                     &state.rejected_slugs,
                     config,
-                )
+                );
+                if self.endpoint_client.has_authoritative_catalog()
+                    && info.used_fallback_model_metadata
+                {
+                    // Discovery membership does not establish image support for
+                    // an explicitly selected model missing from the snapshot.
+                    info.input_modalities = vec![codex_protocol::openai_models::InputModality::Text];
+                }
+                info
             }
             .instrument(tracing::info_span!("get_model_info", model = model)),
         )
@@ -1516,6 +1537,11 @@ impl ModelsManager for StaticModelsManager {
     ) -> ModelsManagerFuture<'a, CoreResult<String>> {
         Box::pin(
             async move {
+                if self.explicit_selection_required {
+                    return model.clone().ok_or_else(|| CodexErr::Fatal(
+                        "Provider model availability is not established for the current endpoint/region; set an explicit model or model_catalog_json after checking provider availability.".into(),
+                    ));
+                }
                 if !allow_provider_model_fallback && let Some(model) = model.as_ref() {
                     return Ok(model.clone());
                 }

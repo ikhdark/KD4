@@ -4139,6 +4139,7 @@ class AgentMessageThreadItem(BaseModel):
         populate_by_name=True,
     )
     id: str
+    interruption: str | None = None
     phase: MessagePhase | None = None
     text: str
     type: Annotated[Literal["agentMessage"], Field(title="AgentMessageThreadItemType")]
@@ -4668,11 +4669,14 @@ class FeatureThreadSource(BaseModel):
     feature: Annotated[str, Field(alias="Feature")]
 
 
-class ThreadSource(RootModel[ThreadSourceValue | FeatureThreadSource]):
+class ThreadSource(RootModel[ThreadSourceValue | FeatureThreadSource | str]):
     model_config = ConfigDict(
         populate_by_name=True,
     )
-    root: ThreadSourceValue | FeatureThreadSource
+    # Current protocol uses a string; retain the legacy enum/object wire forms.
+    root: Annotated[
+        ThreadSourceValue | FeatureThreadSource | str, Field(union_mode="left_to_right")
+    ]
 
 
 class ThreadSourceKind(Enum):

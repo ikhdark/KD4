@@ -297,7 +297,7 @@ pub(crate) struct ThreadQueueRequestProcessor {
     turn_processor: TurnRequestProcessor,
     background_tasks: TaskTracker,
     // Connection capabilities are never persisted or reused across restarts.
-    origins: Arc<StdMutex<HashMap<(ThreadId, String), QueueOrigin>>>,
+    origins: Arc<StdMutex<HashMap<ThreadId, HashMap<String, QueueOrigin>>>>,
     notification_revisions: Arc<StdMutex<HashMap<ThreadId, std::sync::Weak<Mutex<u64>>>>>,
 }
 
@@ -325,6 +325,64 @@ impl ThreadQueueRequestProcessor {
         self.state_db
             .as_ref()
             .ok_or_else(|| internal_error("thread queue requires the state database"))
+    }
+
+    fn origin(&self, id: ThreadId, submission_id: &str) -> Option<QueueOrigin> {
+        self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&id)?.get(submission_id).cloned()
+    }
+
+    async fn insert_origin(&self, id: ThreadId, submission_id: String, origin: QueueOrigin) -> bool {
+        self.thread_state_manager.with_live_connection(origin.request_id.connection_id, || {
+            self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(id).or_default().insert(submission_id, origin);
+        }).await.is_some()
+    }
+
+    fn remove_origin(&self, id: ThreadId, submission_id: &str) {
+        let mut origins = self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(submissions) = origins.get_mut(&id) {
+            submissions.remove(submission_id);
+            if submissions.is_empty() { origins.remove(&id); }
+        }
+    }
+
+    fn has_origins(&self, id: ThreadId) -> bool {
+        self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&id)
+    }
+
+    /// Called only after the runtime is unregistered. The existing queue lock
+    /// joins any in-flight origin publication before retiring its capabilities;
+    /// durable pending prompts are left intact for explicit recovery.
+    pub(super) async fn retire_thread(&self, id: ThreadId) {
+        if self.state_db.is_none() { return; }
+        let _guard = loop {
+            match self.lock(id).await {
+                Ok(guard) => break guard,
+                Err(error) => {
+                    tracing::warn!(%id, error = %error.message, "queue retirement lock failed; retaining cleanup owner");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        };
+        self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id);
+    }
+
+    pub(super) async fn retire_thread_connection(&self, id: ThreadId, connection_id: ConnectionId) {
+        let _guard = self.lock(id).await.ok();
+        let mut origins = self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(submissions) = origins.get_mut(&id) {
+            submissions.retain(|_, origin| origin.request_id.connection_id != connection_id);
+            if submissions.is_empty() { origins.remove(&id); }
+        }
+    }
+
+    pub(super) async fn retire_connection(&self, connection_id: ConnectionId) {
+        self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|_, submissions| {
+                submissions.retain(|_, origin| origin.request_id.connection_id != connection_id);
+                !submissions.is_empty()
+            });
     }
 
     async fn load(&self, id: ThreadId) -> Result<Queue, JSONRPCErrorError> {
@@ -492,11 +550,7 @@ impl ThreadQueueRequestProcessor {
                 return Ok(());
             }
         }
-        let origin_present = self
-            .origins
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(&(id, pending.submission_id.clone()));
+        let origin_present = self.origin(id, &pending.submission_id).is_some();
         let pending = queue.pending_start.take().ok_or_else(|| {
             internal_error("pending thread queue start disappeared during recovery")
         })?;
@@ -519,10 +573,7 @@ impl ThreadQueueRequestProcessor {
         queue.paused |= !accepted || !origin_present;
         self.save(id, queue).await?;
         if accepted {
-            self.origins
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&(id, pending.submission_id));
+            self.remove_origin(id, &pending.submission_id);
         }
         let processor = self.clone();
         let revision = queue.revision;
@@ -611,15 +662,14 @@ impl ThreadQueueRequestProcessor {
                 None,
             );
         }
+        if added {
+            // Publish under the queue lock: whole-thread retirement joins this
+            // owner before clearing its in-memory connection capabilities.
+            self.insert_origin(id, queued_submission.id.clone(), origin.clone()).await;
+        }
         drop(guard);
         if added {
             self.changed(id, queue.revision, publication).await;
-        }
-        if added {
-            self.origins
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert((id, queued_submission.id.clone()), origin.clone());
         }
         // The client must see acceptance before a fast automatic start removes the entry.
         self.outgoing
@@ -706,10 +756,7 @@ impl ThreadQueueRequestProcessor {
             })
             .await?;
         if deleted {
-            self.origins
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&(id, params.queued_submission_id));
+            self.remove_origin(id, &params.queued_submission_id);
         }
         Ok(ThreadQueueDeleteResponse { deleted })
     }
@@ -771,13 +818,7 @@ impl ThreadQueueRequestProcessor {
         };
         // An explicit starter owns only this submission. Automatic starts use
         // its original connection, never the last client to touch the thread.
-        let mut origin = match origin.or_else(|| {
-            self.origins
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&(id, item.id.clone()))
-                .cloned()
-        }) {
+        let mut origin = match origin.or_else(|| self.origin(id, &item.id)) {
             Some(origin) => origin,
             None => return Ok(None),
         };
@@ -788,10 +829,9 @@ impl ThreadQueueRequestProcessor {
         if selected.is_none() && !connections.contains(&origin.request_id.connection_id) {
             return Ok(None);
         }
-        self.origins
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert((id, item.id.clone()), origin.clone());
+        if !self.insert_origin(id, item.id.clone(), origin.clone()).await {
+            return Err(invalid_request("queue origin connection is closed"));
+        }
         if selected.is_none() {
             origin.request_id.request_id =
                 RequestId::String(format!("thread-queue-{}", uuid::Uuid::new_v4()));
@@ -885,7 +925,7 @@ impl ThreadQueueRequestProcessor {
         self.origins
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|(thread_id, _), _| *thread_id != id);
+            .remove(&id);
         // This runs before the listener forwards every interrupted or failed
         // turn. Without queued prompts there is nothing to protect: skip the
         // lock file, queue write, and change notification.
@@ -914,13 +954,7 @@ impl ThreadQueueRequestProcessor {
     }
 
     pub(super) fn input_recorded(&self, id: ThreadId) {
-        if !self
-            .origins
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .keys()
-            .any(|(thread_id, _)| *thread_id == id)
-        {
+        if !self.has_origins(id) {
             return;
         }
         let processor = self.clone();
@@ -937,13 +971,7 @@ impl ThreadQueueRequestProcessor {
     }
 
     pub(super) fn kick(&self, id: ThreadId) {
-        if !self
-            .origins
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .keys()
-            .any(|(thread_id, _)| *thread_id == id)
-        {
+        if !self.has_origins(id) {
             return;
         }
         let processor = self.clone();

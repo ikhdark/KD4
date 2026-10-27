@@ -15,7 +15,6 @@ use futures::Stream;
 use rustls::ClientConfig;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
-use tokio::net::TcpStream;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream as TungsteniteStream;
 use tokio_tungstenite::tungstenite::Error as WebSocketError;
@@ -70,12 +69,13 @@ impl WebSocketConnector {
         request: Request,
         config: WebSocketConfig,
     ) -> Result<(WebSocketConnection, Response), WebSocketError> {
+        let route_url = request.uri().to_string();
         let proxy_route = self
             .http_client_factory
-            .resolve_proxy_route_async(request.uri().to_string())
+            .resolve_proxy_route_async(route_url.clone())
             .await
             .map_err(WebSocketError::Io)?;
-        let (inner, response) = codex_http_client::admit_dispatch(dialer::connect(
+        let result = codex_http_client::admit_dispatch(dialer::connect(
             request,
             config,
             Arc::clone(&self.tls_config),
@@ -88,7 +88,17 @@ impl WebSocketConnector {
                 std::io::ErrorKind::PermissionDenied,
                 DispatchRejected(error),
             ))
-        })??;
+        })?;
+        let (inner, response) = match result {
+            Ok(connected) => connected,
+            Err(error) => {
+                // Connection/upgrade setup has not sent a model request. Retire
+                // cached OS routing after failure so the owning setup retry can
+                // observe VPN/proxy changes, without replaying anything here.
+                self.http_client_factory.invalidate_cached_proxy_route(&route_url);
+                return Err(error);
+            }
+        };
         Ok((WebSocketConnection { inner }, response))
     }
 }
@@ -120,7 +130,6 @@ impl Stream for WebSocketConnection {
 
     fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match &mut self.get_mut().inner {
-            ConnectionInner::TransportDefault(stream) => Pin::new(stream).poll_next(context),
             ConnectionInner::Routed(stream) => Pin::new(stream).poll_next(context),
         }
     }
@@ -134,14 +143,12 @@ impl Sink<Message> for WebSocketConnection {
         context: &mut Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
         match &mut self.get_mut().inner {
-            ConnectionInner::TransportDefault(stream) => Pin::new(stream).poll_ready(context),
             ConnectionInner::Routed(stream) => Pin::new(stream).poll_ready(context),
         }
     }
 
     fn start_send(self: Pin<&mut Self>, message: Message) -> Result<(), Self::Error> {
         match &mut self.get_mut().inner {
-            ConnectionInner::TransportDefault(stream) => Pin::new(stream).start_send(message),
             ConnectionInner::Routed(stream) => Pin::new(stream).start_send(message),
         }
     }
@@ -151,7 +158,6 @@ impl Sink<Message> for WebSocketConnection {
         context: &mut Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
         match &mut self.get_mut().inner {
-            ConnectionInner::TransportDefault(stream) => Pin::new(stream).poll_flush(context),
             ConnectionInner::Routed(stream) => Pin::new(stream).poll_flush(context),
         }
     }
@@ -161,14 +167,12 @@ impl Sink<Message> for WebSocketConnection {
         context: &mut Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
         match &mut self.get_mut().inner {
-            ConnectionInner::TransportDefault(stream) => Pin::new(stream).poll_close(context),
             ConnectionInner::Routed(stream) => Pin::new(stream).poll_close(context),
         }
     }
 }
 
 pub(crate) enum ConnectionInner {
-    TransportDefault(TungsteniteStream<MaybeTlsStream<TcpStream>>),
     Routed(TungsteniteStream<MaybeTlsStream<Box<dyn AsyncIo>>>),
 }
 

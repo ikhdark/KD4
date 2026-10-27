@@ -69,7 +69,7 @@ pub(crate) fn validate_independent_review_shell(
     }
     if !inspection_command {
         return Err(
-            "independent reviewers may run only shell commands proven read-only; on PowerShell use safelisted read-only commands (Get-Content, Get-ChildItem, Select-String, Test-Path, `rg`, `git diff`/`log`/`show`, `git --no-optional-locks status`), without assignments, script blocks or redirection",
+            "independent reviewers may run only shell commands proven read-only; on PowerShell use safelisted read-only commands (Get-Content, Get-ChildItem, Select-String, Test-Path, `rg`, `git -c core.fsmonitor=false diff --no-ext-diff --no-textconv --`, `git --no-optional-locks -c core.fsmonitor=false status --short`), without assignments, script blocks or redirection; `git log`/`show` are not safelisted, so use the supplied immutable comparison command for commit reviews",
         );
     }
     Ok(())
@@ -88,8 +88,6 @@ pub(crate) fn validate_independent_review_stdin(
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum CapabilityPolicyError {
-    #[error("root task-control tools are not available to typed subagents")]
-    RootTaskControlDenied,
     #[error("assignment repository {expected} does not match active repository {actual}")]
     RepositoryMismatch { expected: String, actual: String },
     #[error("assignment workspace {expected} does not match active workspace {actual}")]
@@ -255,15 +253,6 @@ pub(crate) fn build_cold_review_context(
         relevant_contracts: input.relevant_contracts,
         nearest_tests: input.nearest_tests,
     })
-}
-
-/// Keeps lifecycle task control root-only while giving active non-review typed agents the same
-/// tool authority as their root turn.
-pub(crate) fn authorize_typed_tool(class: TypedToolClass) -> Result<(), CapabilityPolicyError> {
-    match class {
-        TypedToolClass::RootTaskControl => Err(CapabilityPolicyError::RootTaskControlDenied),
-        _ => Ok(()),
-    }
 }
 
 #[derive(Clone, Copy, Debug)]

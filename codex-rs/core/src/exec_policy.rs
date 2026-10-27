@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
@@ -26,8 +27,8 @@ use codex_protocol::permissions::FileSystemSandboxKind;
 use codex_protocol::protocol::AskForApproval;
 use codex_shell_command::is_dangerous_command::command_might_be_dangerous;
 use codex_shell_command::is_dangerous_command::direct_argv_might_be_dangerous;
-use codex_shell_command::is_safe_command::is_known_safe_command;
-use codex_shell_command::is_safe_command::is_known_safe_direct_argv;
+use codex_shell_command::is_safe_command::is_known_safe_command_in_state;
+use codex_shell_command::is_safe_command::is_known_safe_direct_argv_in_state;
 use thiserror::Error;
 use tokio::fs;
 use tokio::sync::Semaphore;
@@ -170,6 +171,7 @@ pub(crate) struct UnmatchedCommandContext<'a> {
     pub(crate) sandbox_permissions: SandboxPermissions,
     pub(crate) used_complex_parsing: bool,
     pub(crate) command_origin: ExecPolicyCommandOrigin,
+    pub(crate) execution_context: Option<(&'a Path, &'a HashMap<String, String>)>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -289,6 +291,7 @@ pub(crate) struct ExecApprovalRequest<'a> {
     /// This keeps encoded shell payloads executable without hiding their plain
     /// command shape from safety and approval rules.
     pub(crate) command_for_safety: Option<&'a [String]>,
+    pub(crate) execution_context: Option<(&'a Path, &'a HashMap<String, String>)>,
     pub(crate) approval_policy: AskForApproval,
     pub(crate) permission_profile: PermissionProfile,
     pub(crate) windows_sandbox_level: WindowsSandboxLevel,
@@ -338,6 +341,7 @@ impl ExecPolicyManager {
         let ExecApprovalRequest {
             command,
             command_for_safety,
+            execution_context,
             approval_policy,
             permission_profile,
             windows_sandbox_level,
@@ -346,6 +350,7 @@ impl ExecPolicyManager {
         } = req;
         let command = command.to_vec();
         let command_for_safety = command_for_safety.map(<[String]>::to_vec);
+        let execution_context = execution_context.map(|(cwd, env)| (cwd.to_path_buf(), env.clone()));
         let exec_policy = self.current();
         // PowerShell parsing can start a host and synchronously wait for its response.
         // Keep fallback safety parsing and executable resolution in the same worker.
@@ -355,6 +360,9 @@ impl ExecPolicyManager {
                 ExecApprovalRequest {
                     command: &command,
                     command_for_safety: command_for_safety.as_deref(),
+                    execution_context: execution_context
+                        .as_ref()
+                        .map(|(cwd, env)| (cwd.as_path(), env)),
                     approval_policy,
                     permission_profile,
                     windows_sandbox_level,
@@ -378,6 +386,7 @@ impl ExecPolicyManager {
         let ExecApprovalRequest {
             command,
             command_for_safety,
+            execution_context,
             approval_policy,
             permission_profile,
             windows_sandbox_level,
@@ -406,6 +415,29 @@ impl ExecPolicyManager {
         // allow/prompt/forbidden rules still apply, but avoid auto-derived
         // amendments when only the heredoc fallback parser matched.
         let auto_amendment_allowed = !used_complex_parsing;
+        let readonly_heuristics_needed = approval_policy == AskForApproval::UnlessTrusted
+            || (windows_sandbox_level == WindowsSandboxLevel::Disabled
+                && profile_has_managed_filesystem_restrictions(&permission_profile));
+        let execution_context = execution_context.filter(|(cwd, env)| {
+            if !readonly_heuristics_needed || used_complex_parsing {
+                return true;
+            }
+            if command_origin == ExecPolicyCommandOrigin::PowerShell {
+                return policy_command.first().is_some_and(|shell| {
+                    codex_shell_command::powershell::is_trusted_powershell_executable_in_state(
+                        shell, cwd, env,
+                    )
+                });
+            }
+            if shell_wrapper_is_owned && parse_shell_lc_plain_commands(policy_command).is_some() {
+                return policy_command.first().is_some_and(|shell| {
+                    codex_shell_command::powershell::is_trusted_native_executable_in_state(
+                        shell, cwd, env,
+                    )
+                });
+            }
+            true
+        });
         let exec_policy_fallback = |cmd: &[String]| {
             render_decision_for_unmatched_command(
                 cmd,
@@ -416,6 +448,7 @@ impl ExecPolicyManager {
                     sandbox_permissions,
                     used_complex_parsing,
                     command_origin,
+                    execution_context,
                 },
             )
         };
@@ -763,18 +796,9 @@ pub(crate) fn render_decision_for_unmatched_command(
         sandbox_permissions,
         used_complex_parsing,
         command_origin,
+        execution_context,
     } = context;
     let file_system_sandbox_policy = permission_profile.file_system_sandbox_policy();
-    let is_known_safe = match command_origin {
-        ExecPolicyCommandOrigin::Generic => is_known_safe_command(command),
-
-        ExecPolicyCommandOrigin::DirectArgv => is_known_safe_direct_argv(command),
-
-        ExecPolicyCommandOrigin::PowerShell => {
-            codex_shell_command::is_safe_command::is_safe_powershell_words(command)
-        }
-    };
-
     // When the Windows sandbox backend is disabled, managed filesystem
     // restrictions are only a policy shape; there is no platform sandbox to
     // enforce the boundary. Keep that legacy case conservative while still
@@ -783,10 +807,16 @@ pub(crate) fn render_decision_for_unmatched_command(
         == WindowsSandboxLevel::Disabled
         && profile_has_managed_filesystem_restrictions(permission_profile);
 
-    if is_known_safe
-        && !used_complex_parsing
+    if !used_complex_parsing
         && (approval_policy == AskForApproval::UnlessTrusted
             || windows_managed_fs_restrictions_without_sandbox_backend)
+        && execution_context.is_some_and(|(cwd, env)| match command_origin {
+            ExecPolicyCommandOrigin::Generic => is_known_safe_command_in_state(command, cwd, env),
+            ExecPolicyCommandOrigin::DirectArgv => is_known_safe_direct_argv_in_state(command, cwd, env),
+            ExecPolicyCommandOrigin::PowerShell => {
+                codex_shell_command::is_safe_command::is_safe_powershell_words_in_state(command, cwd, env)
+            }
+        })
     {
         return Decision::Allow;
     }
@@ -874,7 +904,7 @@ pub(crate) fn render_decision_for_unmatched_command(
     }
 }
 
-fn profile_has_managed_filesystem_restrictions(permission_profile: &PermissionProfile) -> bool {
+pub(crate) fn profile_has_managed_filesystem_restrictions(permission_profile: &PermissionProfile) -> bool {
     let file_system_sandbox_policy = permission_profile.file_system_sandbox_policy();
     matches!(permission_profile, PermissionProfile::Managed { .. })
         && matches!(

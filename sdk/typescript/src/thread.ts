@@ -242,6 +242,7 @@ export class Thread {
         if (event.type === "item.completed") {
           if (
             event.item.type === "agent_message" &&
+            event.item.interruption === undefined &&
             event.item.phase !== "commentary" &&
             event.item.phase !== "partial_answer" &&
             (!explicitFinalSeen || event.item.phase === "final_answer")

@@ -73,16 +73,26 @@ impl ResponsesStreamMetadata {
     }
 
     pub(crate) fn initial_events(&self) -> Vec<ResponseEvent> {
+        self.initial_events_with_rate_limits(true)
+    }
+
+    pub(crate) fn initial_events_without_rate_limits(&self) -> Vec<ResponseEvent> {
+        self.initial_events_with_rate_limits(false)
+    }
+
+    fn initial_events_with_rate_limits(&self, include_rate_limits: bool) -> Vec<ResponseEvent> {
         let mut events = Vec::new();
         if let Some(model) = self.server_model.clone() {
             events.push(ResponseEvent::ServerModel(model));
         }
-        events.extend(
-            self.rate_limit_snapshots
-                .iter()
-                .cloned()
-                .map(ResponseEvent::RateLimits),
-        );
+        if include_rate_limits {
+            events.extend(
+                self.rate_limit_snapshots
+                    .iter()
+                    .cloned()
+                    .map(ResponseEvent::RateLimits),
+            );
+        }
         if let Some(etag) = self.models_etag.clone() {
             events.push(ResponseEvent::ModelsEtag(etag));
         }
@@ -132,6 +142,7 @@ pub(crate) struct ResponsesEventInterpreter {
     turn_state: Option<Arc<OnceLock<String>>>,
     events: Vec<ResponseEvent>,
     lifecycle: response_lifecycle::ResponseLifecycle,
+    compaction_progress: bool,
 }
 
 impl ResponsesEventInterpreter {
@@ -155,7 +166,12 @@ impl ResponsesEventInterpreter {
             turn_state,
             events: Vec::new(),
             lifecycle: response_lifecycle::ResponseLifecycle::default(),
+            compaction_progress: false,
         }
+    }
+
+    pub(crate) fn take_compaction_progress(&mut self) -> bool {
+        std::mem::take(&mut self.compaction_progress)
     }
 
     pub(crate) fn process_payload(
@@ -178,6 +194,7 @@ impl ResponsesEventInterpreter {
         // Retain the allocation across frames, including when a previous frame
         // failed after interpreting metadata. Both transports drain in order.
         self.events.clear();
+        self.compaction_progress = false;
         // Ordinary frames take one JSON pass and never use flattened-field buffering.
         // A rate-limit frame may contain fields incompatible with the ordinary shape,
         // so only failed deserialization needs a discriminator-only fallback.
@@ -204,7 +221,10 @@ impl ResponsesEventInterpreter {
         if kind.as_deref() == Some("error") {
             let value: Value = serde_json::from_str(payload)?;
             let error = value.get("error").unwrap_or(&value);
-            return Err(ResponsesEventError::Api(provider_error(error)));
+            return Err(ResponsesEventError::Api(provider_error(
+                error,
+                retry_after_from_json_headers(value.get("headers")),
+            )));
         }
         // Unknown extensions may reuse field names with new types. Known events
         // remain strict, especially output items containing executable actions.
@@ -302,6 +322,7 @@ impl ResponsesEventInterpreter {
         };
         let provider_observation = event.provider_observation(self.events.iter()
             .any(|event| matches!(event, ResponseEvent::SafetyBuffering(_))));
+        let compaction_progress = self.lifecycle.owns_compaction_progress(&event);
         let interpreted = self
             .lifecycle
             .process(event, payload.len(), completion_usage, &mut ownership_admitted)
@@ -332,6 +353,7 @@ impl ResponsesEventInterpreter {
             }
         }
         let interpreted = interpreted?;
+        self.compaction_progress = compaction_progress;
         if let Some(etag) = models_etag {
             self.events.push(ResponseEvent::ModelsEtag(etag));
         }
@@ -404,6 +426,7 @@ fn is_known_event(kind: &str) -> bool {
             | "codex.response.metadata"
             | "response.created"
             | "response.in_progress"
+            | "response.compaction.compacting"
             | "response.failed"
             | "response.incomplete"
             | "response.completed"
@@ -528,16 +551,25 @@ fn parse_usage(value: Option<Value>) -> Option<TokenUsage> {
 /// Stable error fields are independent of optional provider metadata. HTTP
 /// adapters keep their status-based fallback when both code and type are unknown.
 pub(crate) fn classify_provider_error(value: &Value) -> Option<ApiError> {
+    classify_provider_error_with_retry_after(value, None)
+}
+
+fn retry_after_from_json_headers(value: Option<&Value>) -> Option<codex_http_client::RetryAfter> {
+    value.and_then(Value::as_object).and_then(|headers| {
+        codex_http_client::RetryAfter::from_headers(&json_headers_to_http_headers(headers))
+    })
+}
+
+fn classify_provider_error_with_retry_after(
+    value: &Value,
+    envelope_advice: Option<codex_http_client::RetryAfter>,
+) -> Option<ApiError> {
     let message = value
         .get("message")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let retry_after = value
-        .get("headers")
-        .and_then(Value::as_object)
-        .and_then(|headers| {
-            codex_http_client::RetryAfter::from_headers(&json_headers_to_http_headers(headers))
-        });
+    // Most specific valid headers win: error > response > event > message.
+    let retry_after = retry_after_from_json_headers(value.get("headers")).or(envelope_advice);
     // A provider-specific code can refine a stable type without being known to
     // this client. Prefer recognized codes, but do not let an unknown one hide
     // a recognized type (for example server_error).
@@ -548,14 +580,16 @@ pub(crate) fn classify_provider_error(value: &Value) -> Option<ApiError> {
         .find_map(|code| {
             Some(match code {
                 "context_length_exceeded" => ApiError::ContextWindowExceeded,
-                "insufficient_quota" | "quota_exceeded" | "billing_hard_limit_reached" => {
+                "insufficient_quota" | "quota_exceeded" | "billing_hard_limit_reached"
+                | "credit_balance_exhausted" | "organization_spend_limit_exceeded"
+                | "project_spend_limit_exceeded" | "organization_usage_limit_exceeded" => {
                     ApiError::QuotaExceeded
                 }
                 "usage_not_included" => ApiError::UsageNotIncluded,
                 "cyber_policy" => ApiError::CyberPolicy {
                     message: cyber_policy_message(Some(message.to_owned())),
                 },
-                "server_is_overloaded" | "slow_down" => {
+                "server_is_overloaded" | "slow_down" | "rate_limit_exceeded" => {
                     let delay = try_parse_retry_after(&Error {
                         code: Some(code.to_owned()),
                         message: Some(message.to_owned()),
@@ -566,7 +600,7 @@ pub(crate) fn classify_provider_error(value: &Value) -> Option<ApiError> {
                         }),
                     }
                 }
-                "server_error" | "internal_server_error" | "rate_limit_exceeded" => {
+                "server_error" | "internal_server_error" => {
                     let delay = try_parse_retry_after(&Error {
                         code: Some(code.to_owned()),
                         message: Some(message.to_owned()),
@@ -602,8 +636,8 @@ pub(crate) fn classify_provider_error(value: &Value) -> Option<ApiError> {
         })
 }
 
-fn provider_error(value: &Value) -> ApiError {
-    classify_provider_error(value).unwrap_or_else(|| ApiError::ProviderFailure {
+fn provider_error(value: &Value, envelope_advice: Option<codex_http_client::RetryAfter>) -> ApiError {
+    classify_provider_error_with_retry_after(value, envelope_advice).unwrap_or_else(|| ApiError::ProviderFailure {
         code: value.get("code").and_then(Value::as_str).map(str::to_owned),
         message: value
             .get("message")
@@ -848,6 +882,9 @@ fn process_responses_event(
             }
         }
         "response.failed" => {
+            let envelope_advice = retry_after_from_json_headers(
+                event.response.as_ref().and_then(|response| response.headers.as_ref()),
+            ).or_else(|| retry_after_from_json_headers(event.headers.as_ref()));
             let response = event.response;
             let response_id = response
                 .as_ref()
@@ -859,6 +896,7 @@ fn process_responses_event(
                     .as_ref()
                     .and_then(|response| response.error.as_ref())
                     .unwrap_or(&Value::Null),
+                envelope_advice,
             );
             let token_usage = parse_usage(response.and_then(|response| response.usage));
             return Err(ResponsesEventError::Api(

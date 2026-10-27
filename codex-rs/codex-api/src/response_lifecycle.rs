@@ -6,6 +6,9 @@ use super::ResponsesStreamEvent;
 use super::parse_required_response_item;
 use crate::common::ResponseEvent;
 use crate::error::ApiError;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ReasoningItemContent;
+use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -37,6 +40,8 @@ pub(super) struct ResponseLifecycle {
     response_id: Option<String>,
     active: Option<ItemIdentity>,
     active_wire_bytes: usize,
+    active_fragments: HashMap<(FragmentKind, u64), String>,
+    active_fragment_bytes: usize,
     admitted: Vec<ResponseItem>,
     admitted_output_indices: Vec<Option<u64>>,
     identities: HashMap<String, usize>,
@@ -53,6 +58,41 @@ struct ItemIdentity {
     call_id: Option<String>,
     kind: String,
     output_index: Option<u64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum FragmentKind {
+    OutputText,
+    Refusal,
+    FunctionArguments,
+    CustomInput,
+    ReasoningText,
+    ReasoningSummary,
+}
+
+fn finalized_fragment(item: &ResponseItem, key: (FragmentKind, u64)) -> Option<&str> {
+    let (kind, index) = key;
+    let index = usize::try_from(index).ok()?;
+    match (item, kind) {
+        (ResponseItem::Message { content, .. }, FragmentKind::OutputText) => match content.get(index)? {
+            ContentItem::OutputText { text } => Some(text),
+            _ => None,
+        },
+        (ResponseItem::Message { content, .. }, FragmentKind::Refusal) => match content.get(index)? {
+            ContentItem::Refusal { refusal } => Some(refusal),
+            _ => None,
+        },
+        (ResponseItem::FunctionCall { arguments, .. }, FragmentKind::FunctionArguments) if index == 0 => Some(arguments),
+        (ResponseItem::CustomToolCall { input, .. }, FragmentKind::CustomInput) if index == 0 => Some(input),
+        (ResponseItem::Reasoning { summary, .. }, FragmentKind::ReasoningSummary) => {
+            let ReasoningItemReasoningSummary::SummaryText { text } = summary.get(index)?;
+            Some(text)
+        }
+        (ResponseItem::Reasoning { content: Some(content), .. }, FragmentKind::ReasoningText) => match content.get(index)? {
+            ReasoningItemContent::ReasoningText { text } | ReasoningItemContent::Text { text } => Some(text),
+        },
+        _ => None,
+    }
 }
 
 fn invalid(message: &str) -> ResponsesEventError {
@@ -95,6 +135,64 @@ impl ItemIdentity {
 }
 
 impl ResponseLifecycle {
+    pub(super) fn owns_compaction_progress(&self, event: &ResponsesStreamEvent<'_>) -> bool {
+        if event.kind != "response.compaction.compacting" {
+            return false;
+        }
+        // The documented event carries item_id/output_index, not response_id.
+        // Only an admitted compaction item's exact identity can extend its wait.
+        self.active.as_ref().is_some_and(|active| {
+            matches!(active.kind.as_str(), "compaction" | "context_compaction")
+                && active.id.as_ref().is_some_and(|id| event.item_id.as_ref() == Some(id))
+                && event.output_index.is_some_and(|index| {
+                    active.output_index.is_none_or(|expected| index == expected)
+                })
+        })
+    }
+
+    fn append_fragment(&mut self, key: (FragmentKind, u64), text: &str) -> Result<(), ResponsesEventError> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let retained = self.retained_wire_bytes.saturating_add(self.active_wire_bytes)
+            .saturating_add(self.finalized_summary_bytes).saturating_add(self.active_fragment_bytes);
+        if (self.active_fragments.len() >= MAX_ITEMS && !self.active_fragments.contains_key(&key))
+            || text.len() > MAX_RETAINED_WIRE_BYTES.saturating_sub(retained)
+        {
+            return Err(invalid("streamed output fragment budget exceeded"));
+        }
+        self.active_fragments.entry(key).or_default().push_str(text);
+        self.active_fragment_bytes += text.len();
+        Ok(())
+    }
+
+    fn seed_fragments(&mut self, item: &ResponseItem) -> Result<(), ResponsesEventError> {
+        match item {
+            ResponseItem::Message { content, .. } => {
+                for (index, content) in content.iter().enumerate() {
+                    match content {
+                        ContentItem::OutputText { text } => self.append_fragment((FragmentKind::OutputText, index as u64), text)?,
+                        ContentItem::Refusal { refusal } => self.append_fragment((FragmentKind::Refusal, index as u64), refusal)?,
+                        _ => {}
+                    }
+                }
+            }
+            ResponseItem::FunctionCall { arguments, .. } => self.append_fragment((FragmentKind::FunctionArguments, 0), arguments)?,
+            ResponseItem::CustomToolCall { input, .. } => self.append_fragment((FragmentKind::CustomInput, 0), input)?,
+            ResponseItem::Reasoning { summary, content, .. } => {
+                for (index, ReasoningItemReasoningSummary::SummaryText { text }) in summary.iter().enumerate() {
+                    self.append_fragment((FragmentKind::ReasoningSummary, index as u64), text)?;
+                }
+                for (index, content) in content.iter().flatten().enumerate() {
+                    let (ReasoningItemContent::ReasoningText { text } | ReasoningItemContent::Text { text }) = content;
+                    self.append_fragment((FragmentKind::ReasoningText, index as u64), text)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     pub(super) fn owns_terminal_observation(&self, id: Option<&str>) -> bool {
         id.is_some_and(|id| {
             !self.connection.responses.contains(id)
@@ -292,6 +390,32 @@ impl ResponseLifecycle {
         {
             return Err(invalid("reasoning summary fragment received after finalization"));
         }
+        let fragment_key = match event.kind.as_ref() {
+            "response.output_text.delta" => Some((FragmentKind::OutputText, event.content_index.unwrap_or(0) as u64)),
+            "response.refusal.delta" => Some((FragmentKind::Refusal, event.content_index.unwrap_or(0) as u64)),
+            "response.function_call_arguments.delta" => Some((FragmentKind::FunctionArguments, 0)),
+            "response.custom_tool_call_input.delta" => Some((FragmentKind::CustomInput, 0)),
+            "response.reasoning_text.delta" => event.content_index.map(|index| (FragmentKind::ReasoningText, index as u64)),
+            "response.reasoning_summary_text.delta" => event.summary_index.map(|index| (FragmentKind::ReasoningSummary, index as u64)),
+            _ => None,
+        };
+        if let (Some(key), Some(delta)) = (fragment_key, event.delta.as_deref()) {
+            self.append_fragment(key, delta)?;
+        }
+        let finalized_key = match event.kind.as_ref() {
+            "response.refusal.done" => Some((FragmentKind::Refusal, event.content_index.unwrap_or(0) as u64)),
+            "response.reasoning_summary_text.done" => event.summary_index.map(|index| (FragmentKind::ReasoningSummary, index as u64)),
+            _ => None,
+        };
+        if let (Some(key), Some(text)) = (finalized_key, event.text.as_deref()) {
+            if let Some(streamed) = self.active_fragments.get(&key) {
+                if streamed != text {
+                    return Err(invalid("finalized output text conflicts with streamed fragments"));
+                }
+            } else {
+                self.append_fragment(key, text)?;
+            }
+        }
         if event.kind == "response.reasoning_summary_text.done"
             && let (Some(index), Some(text), Some(_)) =
                 (event.summary_index, event.text.as_ref(), event.item_id.as_ref())
@@ -330,13 +454,33 @@ impl ResponseLifecycle {
         }
         let result = super::process_responses_event(event, completion_usage)?;
         match &result {
-            Some(ResponseEvent::OutputItemAdded(_)) => {
+            Some(ResponseEvent::OutputItemAdded(item)) => {
                 self.finalized_summaries.clear();
                 self.finalized_summary_bytes = 0;
                 self.active = identity;
                 self.active_wire_bytes = wire_bytes;
+                self.active_fragments.clear();
+                self.active_fragment_bytes = 0;
+                self.seed_fragments(item)?;
             }
             Some(ResponseEvent::OutputItemDone(item)) => {
+                // Final executable arguments and persisted text must be exactly
+                // what the admitted seed/delta stream previewed. Final-only
+                // fields remain compatible when no fragment was observed.
+                if self.active.is_some() {
+                    for (key, streamed) in &self.active_fragments {
+                        // Raw reasoning plaintext is optional in the final item;
+                        // absence is not an authoritative replacement snapshot.
+                        if key.0 == FragmentKind::ReasoningText
+                            && matches!(item, ResponseItem::Reasoning { content: None, .. })
+                        {
+                            continue;
+                        }
+                        if finalized_fragment(item, *key) != Some(streamed.as_str()) {
+                            return Err(invalid("finalized output item conflicts with streamed fragments"));
+                        }
+                    }
+                }
                 if let ResponseItem::Reasoning { summary, .. } = item
                     && self.active.is_some()
                 {
@@ -413,6 +557,8 @@ impl ResponseLifecycle {
                 self.admitted.push(item.clone());
                 self.active = None;
                 self.active_wire_bytes = 0;
+                self.active_fragments.clear();
+                self.active_fragment_bytes = 0;
             }
             Some(ResponseEvent::Completed { response_id, .. }) => {
                 self.completed_id = Some(response_id.clone());

@@ -7,17 +7,24 @@ const WEB_SEARCH_TEXT_AND_IMAGE_CONTENT_TYPES: [&str; 2] = ["text", "image"];
 
 pub struct WebSearchToolOptions<'a> {
     pub web_search_mode: Option<WebSearchMode>,
+    pub force_cached_access: bool,
     pub web_search_config: Option<&'a WebSearchConfig>,
     pub web_search_tool_type: WebSearchToolType,
 }
 
 pub fn create_web_search_tool(options: WebSearchToolOptions<'_>) -> Option<ToolSpec> {
-    let (external_web_access, indexed_web_access) = match options.web_search_mode {
+    let (mut external_web_access, mut indexed_web_access) = match options.web_search_mode {
         Some(WebSearchMode::Cached) => (false, None),
         Some(WebSearchMode::Indexed) => (true, Some(true)),
         Some(WebSearchMode::Live) => (true, None),
         Some(WebSearchMode::Disabled) | None => return None,
     };
+    if options.force_cached_access {
+        // Bedrock live fetching requires a separate authorization policy. A
+        // general search mode must not opt into crossing its AWS boundary.
+        external_web_access = false;
+        indexed_web_access = None;
+    }
 
     let search_content_types = match options.web_search_tool_type {
         WebSearchToolType::Text => None,

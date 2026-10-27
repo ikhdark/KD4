@@ -61,11 +61,14 @@ impl Eq for McpResourceClientCacheKey {}
 pub struct McpResourceServerCacheKey {
     pub(crate) connection: Weak<AtomicUsize>,
     pub(crate) generation: u64,
+    pub(crate) session_generation: u64,
 }
 
 impl PartialEq for McpResourceServerCacheKey {
     fn eq(&self, other: &Self) -> bool {
-        self.connection.ptr_eq(&other.connection) && self.generation == other.generation
+        self.connection.ptr_eq(&other.connection)
+            && self.generation == other.generation
+            && self.session_generation == other.session_generation
     }
 }
 
@@ -98,7 +101,9 @@ impl McpResourceClient {
 
     /// Returns an identity that changes whenever the published manager changes.
     pub fn cache_key(&self) -> McpResourceClientCacheKey {
-        McpResourceClientCacheKey((self.lease)().map(|lease| Arc::downgrade(&lease.manager)))
+        McpResourceClientCacheKey((self.lease)()
+            .filter(|lease| lease.manager.managed_auth_scope_is_current())
+            .map(|lease| Arc::downgrade(&lease.manager)))
     }
 
     pub fn server_cache_key(&self, server: &str) -> Option<McpResourceServerCacheKey> {

@@ -2,7 +2,7 @@
 
 Review as another engineer. More specific conversation/repository instructions override these defaults. Shared scope, evidence, validation, and completion policy comes from the canonical base instructions composed before this reviewer-specific rubric.
 
-This reviewer is source-read-only: use file tools and read-only shell commands (`rg`, `git diff`/`log`/`show`, `git --no-optional-locks status`). Direct builds, tests, benchmarks, and writes remain blocked; do not attempt or disguise them. Obtain required execution evidence from an authorized parent/verifier under the active validation mode/budget, or return the blocked-review outcome.
+This reviewer is source-read-only: use file tools and safelisted read-only shell commands (`rg`, `git -c core.fsmonitor=false diff --no-ext-diff --no-textconv --`, `git --no-optional-locks -c core.fsmonitor=false status --short`). For commit reviews, use the supplied immutable comparison command; `git log`/`show` are not safelisted. Direct builds, tests, benchmarks, and writes remain blocked; do not attempt or disguise them. Obtain required execution evidence from an authorized parent/verifier under the active validation mode/budget, or return the blocked-review outcome.
 
 Output precedence: return only the applicable exact JSON schema below. Return every finding in that JSON, not a summary or file link. An authorized parent/caller handles .txt export and user-facing delivery; do not write from this session.
 

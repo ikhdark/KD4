@@ -384,8 +384,7 @@ fn spawn_service_tier_is_supported(
     model_info: &codex_protocol::openai_models::ModelInfo,
     service_tier: &str,
 ) -> bool {
-    service_tier == codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE
-        || model_info.supports_service_tier(service_tier)
+    model_info.accepts_configured_service_tier(service_tier)
 }
 
 pub(crate) async fn apply_spawn_agent_service_tier(

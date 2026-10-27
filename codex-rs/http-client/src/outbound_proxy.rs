@@ -11,6 +11,8 @@ use std::io;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -275,6 +277,22 @@ impl HttpClientFactory {
             .map(|decision| route_from_system_decision(&ProcessEnv, env_proxy_kind, decision))
     }
 
+    /// Discard a failed pre-dispatch route so the next lookup consults the OS.
+    /// This never authorizes replay after a request may have reached its peer.
+    pub fn invalidate_cached_proxy_route(&self, request_url: &str) {
+        if self.outbound_proxy_policy != OutboundProxyPolicy::RespectSystemProxy {
+            return;
+        }
+        if let Some(cache) = SYSTEM_PROXY_CACHE.get() {
+            let key = system_proxy_cache_key(&proxy_resolution_url(request_url));
+            let mut cache = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Fence an older in-flight PAC lookup from republishing its result
+            // after this invalidation. Epoch publication shares the cache lock.
+            SYSTEM_PROXY_CACHE_GENERATION.fetch_add(1, Ordering::AcqRel);
+            cache.remove(&key);
+        }
+    }
+
     /// Builds a reqwest client for a concrete outbound route.
     ///
     /// Ordered PAC plans require [`Self::build_client`] or [`crate::RouteAwareClientPool`].
@@ -341,7 +359,7 @@ fn route_from_system_decision(
             no_proxy: None,
         },
         SystemProxyDecision::Unavailable { .. } => resolve_env_proxy_route(env, env_proxy_kind),
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         SystemProxyDecision::Fallback { routes } => OutboundProxyRoute::Fallback { routes },
     }
 }
@@ -369,6 +387,17 @@ fn resolve_env_proxy_route(
         },
         None => OutboundProxyRoute::Direct,
     }
+}
+
+/// Environment route for WebSockets, shared by default and system-resolver fallback.
+pub fn websocket_environment_proxy_route(request_url: &str) -> OutboundProxyRoute {
+    resolve_env_proxy_route(&ProcessEnv, EnvProxyKind::from_request_url(request_url))
+}
+
+/// Destination bypass policy shared by HTTP system proxies and WebSockets.
+pub fn proxy_bypasses_url(no_proxy: &str, request_url: &str) -> bool {
+    RequestOrigin::parse(request_url)
+        .is_some_and(|origin| no_proxy_matches_origin(no_proxy, &origin))
 }
 
 #[derive(Clone, Copy)]
@@ -523,7 +552,7 @@ impl RequestOrigin {
 enum SystemProxyDecision {
     Direct,
     Proxy { url: String },
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     Fallback { routes: Vec<OutboundProxyRoute> },
     Unavailable { failure: RouteFailureClass },
 }
@@ -574,6 +603,7 @@ fn resolve_system_proxy_with(
     {
         return decision;
     }
+    let generation = SYSTEM_PROXY_CACHE_GENERATION.load(Ordering::Acquire);
     drop(decisions);
 
     // PAC/WPAD can take seconds. Do not hold the cache lock across platform I/O:
@@ -582,7 +612,9 @@ fn resolve_system_proxy_with(
     let mut cache = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    insert_system_proxy_cache_entry(&mut cache, &cache_key, decision.clone(), Instant::now());
+    if generation == SYSTEM_PROXY_CACHE_GENERATION.load(Ordering::Acquire) {
+        insert_system_proxy_cache_entry(&mut cache, &cache_key, decision.clone(), Instant::now());
+    }
     decision
 }
 
@@ -610,11 +642,13 @@ fn resolve_platform_system_proxy(
 struct CachedSystemProxyDecision {
     decision: SystemProxyDecision,
     expires_at: Instant,
+    generation: u64,
 }
 
 static SYSTEM_PROXY_CACHE: OnceLock<Mutex<HashMap<[u8; 32], CachedSystemProxyDecision>>> =
     OnceLock::new();
 static SYSTEM_PROXY_RESOLUTION_LOCK: Mutex<()> = Mutex::new(());
+static SYSTEM_PROXY_CACHE_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn cached_system_proxy_decision(request_url: &str) -> Option<SystemProxyDecision> {
     let cache = SYSTEM_PROXY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -633,7 +667,9 @@ fn cached_system_proxy_decision_from_cache(
     now: Instant,
 ) -> Option<SystemProxyDecision> {
     let cached = cache.get(cache_key)?;
-    if cached.expires_at > now {
+    if cached.expires_at > now
+        && cached.generation == SYSTEM_PROXY_CACHE_GENERATION.load(Ordering::Acquire)
+    {
         return Some(cached.decision.clone());
     }
     cache.remove(cache_key);
@@ -657,7 +693,7 @@ fn insert_system_proxy_cache_entry(
     now: Instant,
 ) {
     let ttl = match &decision {
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         SystemProxyDecision::Fallback { .. } => SYSTEM_PROXY_SUCCESS_CACHE_TTL,
         SystemProxyDecision::Direct | SystemProxyDecision::Proxy { .. } => {
             SYSTEM_PROXY_SUCCESS_CACHE_TTL
@@ -665,7 +701,8 @@ fn insert_system_proxy_cache_entry(
         SystemProxyDecision::Unavailable { .. } => SYSTEM_PROXY_UNAVAILABLE_CACHE_TTL,
     };
 
-    cache.retain(|_, cached| cached.expires_at > now);
+    let generation = SYSTEM_PROXY_CACHE_GENERATION.load(Ordering::Acquire);
+    cache.retain(|_, cached| cached.expires_at > now && cached.generation == generation);
     if cache.len() >= SYSTEM_PROXY_CACHE_MAX_ENTRIES
         && !cache.contains_key(cache_key)
         && let Some(cache_key_to_evict) = cache
@@ -680,6 +717,7 @@ fn insert_system_proxy_cache_entry(
         CachedSystemProxyDecision {
             decision,
             expires_at: now + ttl,
+            generation,
         },
     );
 }
@@ -712,6 +750,22 @@ fn no_proxy_entry_matches_origin(entry: &str, origin: &RequestOrigin) -> bool {
         .or_else(|| entry.strip_prefix("https://"))
         .unwrap_or(entry)
         .to_ascii_lowercase();
+    if let Some((network, prefix)) = entry.rsplit_once('/') {
+        let network = network.trim_matches(['[', ']']).parse::<std::net::IpAddr>();
+        let address = origin.host.parse::<std::net::IpAddr>();
+        let prefix = prefix.parse::<u32>();
+        return match (network, address, prefix) {
+            (Ok(std::net::IpAddr::V4(network)), Ok(std::net::IpAddr::V4(address)), Ok(bits @ 0..=32)) => {
+                let mask = u32::MAX.checked_shl(32 - bits).unwrap_or(0);
+                u32::from(network) & mask == u32::from(address) & mask
+            }
+            (Ok(std::net::IpAddr::V6(network)), Ok(std::net::IpAddr::V6(address)), Ok(bits @ 0..=128)) => {
+                let mask = u128::MAX.checked_shl(128 - bits).unwrap_or(0);
+                u128::from(network) & mask == u128::from(address) & mask
+            }
+            _ => false,
+        };
+    }
     let mut port = None;
     if let Some(bracketed) = entry.strip_prefix('[') {
         let Some((host, suffix)) = bracketed.split_once(']') else {
@@ -753,6 +807,8 @@ fn no_proxy_entry_matches_origin(entry: &str, origin: &RequestOrigin) -> bool {
     }
 
     origin.host == entry
+        || (origin.host.parse::<std::net::IpAddr>().is_err()
+            && origin.host.ends_with(&format!(".{entry}")))
 }
 
 fn wildcard_host_match(pattern: &str, host: &str) -> bool {

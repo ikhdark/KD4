@@ -440,13 +440,14 @@ pub(crate) fn try_parse_powershell_ast_analysis_with_resolution(
 }
 
 pub(crate) fn is_trusted_powershell_host(executable: &str) -> bool {
-    let Some(flavor) = PowershellFlavor::from_requested_executable(executable) else {
-        return false;
-    };
-    let Some(trusted_executable) = trusted_parser_executable(flavor) else {
-        return false;
-    };
+    trusted_powershell_host_path(executable).is_some()
+}
+
+pub(crate) fn trusted_powershell_host_path(executable: &str) -> Option<PathBuf> {
+    let flavor = PowershellFlavor::from_requested_executable(executable)?;
+    let trusted_executable = trusted_parser_executable(flavor)?;
     requested_executable_matches_trusted(executable, &trusted_executable)
+        .then_some(trusted_executable)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

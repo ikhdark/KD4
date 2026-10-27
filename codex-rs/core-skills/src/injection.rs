@@ -148,13 +148,12 @@ pub struct SkillInjectionMetric {
     pub status: &'static str,
 }
 
-/// Host skill prompts that have already been injected by an extension for this
-/// turn.
-///
-/// Core uses this to keep the legacy skill-injection path from sending the same
-/// host `SKILL.md` body again while the skills extension is being wired in.
+/// Extension-owned selection and host instruction delivery for one planning attempt.
+/// Presence suppresses host-only selection even while discovery/reads are incomplete;
+/// completed resolutions also prevent duplicate legacy host `SKILL.md` injection.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct InjectedHostSkillPrompts {
+    selection_incomplete: bool,
     paths: HashSet<String>,
     // Selection precedence, a failed load, or a prompt budget can suppress
     // legacy host injection without implying successful instruction delivery.
@@ -173,6 +172,19 @@ struct HostSkillInstructionFragment {
 }
 
 impl InjectedHostSkillPrompts {
+    /// Claim selection authority before discovery or selected-body reads can be cancelled.
+    /// A pending owner is not a successful empty selection, nor permission for host fallback.
+    pub fn pending_selection() -> Self {
+        Self {
+            selection_incomplete: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn selection_incomplete(&self) -> bool {
+        self.selection_incomplete
+    }
+
     pub fn record_resolution(&mut self, skill: SkillMetadata, result: Result<String, String>) {
         let path = skill.path_to_skills_md.to_string_lossy();
         self.host_fragments.remove(&normalize_host_skill_path(&path));
@@ -460,6 +472,10 @@ fn emit_skill_injected_metric(otel: &SessionTelemetry, skill_name: &str, status:
     );
 }
 
+/// Unavailable structured inputs reported by the final, merged skill owner.
+#[derive(Clone, Default)]
+pub struct UnresolvedSkillSelections(pub Vec<String>);
+
 /// Collect explicitly mentioned skills from structured and text mentions.
 ///
 /// Structured `UserInput::Skill` selections are resolved first by path against
@@ -476,7 +492,7 @@ pub fn collect_explicit_skill_mentions(
     skills: &[SkillMetadata],
     disabled_paths: &HashSet<AbsolutePathBuf>,
     connector_slug_counts: &HashMap<String, usize>,
-) -> Vec<SkillMetadata> {
+) -> Result<Vec<SkillMetadata>, Vec<String>> {
     let skill_name_counts = build_skill_name_counts(skills, disabled_paths).0;
 
     let selection_context = SkillSelectionContext {
@@ -489,15 +505,16 @@ pub fn collect_explicit_skill_mentions(
     let mut seen_names: HashSet<String> = HashSet::new();
     let mut seen_paths: HashSet<AbsolutePathBuf> = HashSet::new();
     let mut blocked_plain_names: HashSet<String> = HashSet::new();
+    let mut unresolved = Vec::new();
 
     for input in inputs {
         if let UserInput::Skill { name, path, .. } = input {
-            blocked_plain_names.insert(name.clone());
             let Ok(path) = AbsolutePathBuf::relative_to_current_dir(path) else {
+                unresolved.push(format!("Selected skill `{name}` has an invalid path: {}", path.display()));
                 continue;
             };
 
-            if selection_context.disabled_paths.contains(&path) || seen_paths.contains(&path) {
+            if seen_paths.contains(&path) {
                 continue;
             }
 
@@ -506,15 +523,19 @@ pub fn collect_explicit_skill_mentions(
                 .iter()
                 .find(|skill| {
                     (skill.path_to_skills_md == path || skill.discovery_paths.contains(&path))
+                        && !selection_context.disabled_paths.contains(&path)
                         && !selection_context
                             .disabled_paths
                             .contains(&skill.path_to_skills_md)
-                        && !seen_paths.contains(&skill.path_to_skills_md)
                 })
             {
-                seen_paths.insert(skill.path_to_skills_md.clone());
-                seen_names.insert(skill.name.clone());
-                selected.push(skill.clone());
+                blocked_plain_names.insert(name.clone());
+                if seen_paths.insert(skill.path_to_skills_md.clone()) {
+                    seen_names.insert(skill.name.clone());
+                    selected.push(skill.clone());
+                }
+            } else {
+                unresolved.push(format!("Selected skill `{name}` at {} is unavailable or disabled", path.display()));
             }
         }
     }
@@ -533,7 +554,7 @@ pub fn collect_explicit_skill_mentions(
         }
     }
 
-    selected
+    if unresolved.is_empty() { Ok(selected) } else { Err(unresolved) }
 }
 
 struct SkillSelectionContext<'a> {

@@ -92,7 +92,7 @@ pub fn build_turns_from_rollout_items_with_items_view<'a>(
             TurnItemsView::NotLoaded => turn.items = Vec::new(),
             TurnItemsView::Summary => {
                 let user = turn.items.iter().position(|item| matches!(item, ThreadItem::UserMessage { .. }));
-                let agent = turn.items.iter().rposition(|item| matches!(item, ThreadItem::AgentMessage { .. }))
+                let agent = turn.items.iter().rposition(|item| matches!(item, ThreadItem::AgentMessage { interruption: None, .. }))
                     .filter(|&index| user.is_none_or(|user| turn.items[user].id() != turn.items[index].id()));
                 let (mut first_user, mut last_agent) = (None, None);
                 for (index, item) in std::mem::take(&mut turn.items).into_iter().enumerate() {
@@ -715,7 +715,7 @@ impl ThreadHistoryBuilder {
         }
 
         let id = self.next_item_id();
-        self.push_item_in_current_turn(ThreadItem::AgentMessage { id, text, phase });
+        self.push_item_in_current_turn(ThreadItem::AgentMessage { id, text, phase, interruption: None });
         if let Some(turn) = self.current_turn.as_mut()
             && !turn.opened_explicitly
             && turn.status == TurnStatus::InProgress
@@ -814,7 +814,8 @@ impl ThreadHistoryBuilder {
             if !matches!(&item, ThreadItem::AgentMessage { text, .. } if text.is_empty()) {
                 self.upsert_item_in_turn_id(&payload.turn_id, item.clone());
                 if self.contains_turn(&payload.turn_id) {
-                    self.pending_legacy_item_mirror = Some(item);
+                    self.pending_legacy_item_mirror = (!matches!(item,
+                        ThreadItem::AgentMessage { interruption: Some(_), .. })).then_some(item);
                 }
             }
         } else {
@@ -1143,6 +1144,15 @@ impl ThreadHistoryBuilder {
             self.upsert_item_in_current_turn(Self::omitted_tool_item(payload.call_id.clone()));
             return;
         }
+        // Legacy ends cannot express usage. Keep the same turn/call's receipt,
+        // without copying or comparing image bytes or suppressing later updates.
+        let provider_usage = self.current_turn.as_ref().and_then(|turn| {
+            let index = *turn.item_indexes.get(&payload.call_id)?;
+            match &turn.items[index] {
+                ThreadItem::ImageGeneration(item) => item.provider_usage.clone(),
+                _ => None,
+            }
+        });
         let item = ThreadItem::ImageGeneration(ImageGenerationItem {
             id: payload.call_id.clone(),
             status: payload.status.clone(),
@@ -1150,7 +1160,7 @@ impl ThreadHistoryBuilder {
             result: payload.result.clone(),
             error: payload.error.clone(),
             saved_path: payload.saved_path.clone(),
-            provider_usage: None,
+            provider_usage,
         });
         self.upsert_item_in_current_turn(item);
     }

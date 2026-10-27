@@ -31,6 +31,7 @@ pub struct LoadedPlugin<M> {
     pub apps: Vec<AppDeclaration>,
     pub hook_sources: Vec<PluginHookSource>,
     pub hook_load_warnings: Vec<String>,
+    pub load_warnings: Vec<String>,
     pub error: Option<String>,
 }
 

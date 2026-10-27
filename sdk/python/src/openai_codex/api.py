@@ -41,7 +41,7 @@ from ._run import (
 )
 from ._sandbox import Sandbox as Sandbox, _sandbox_mode, _sandbox_policy
 from .async_client import AsyncCodexClient
-from .client import CodexClient, CodexConfig
+from .client import CodexClient, CodexConfig, _params_dict
 from .errors import TransportClosedError
 from .generated.v2_all import (
     ApiKeyLoginAccountParams,
@@ -245,7 +245,12 @@ class Codex:
             sandbox=_sandbox_mode(sandbox),
             **({"service_tier": service_tier} if service_tier is not UNSET else {}),
         )
-        resumed = self._client.thread_resume(thread_id, params)
+        # This facade returns a handle, not history. Keep the low-level API's
+        # full response and the nonexperimental wire contract unchanged.
+        resume_params: ThreadResumeParams | JsonObject = params
+        if self._client.config.experimental_api:
+            resume_params = {**_params_dict(params), "excludeTurns": True}
+        resumed = self._client.thread_resume(thread_id, resume_params)
         return Thread(self._client, resumed.thread.id)
 
     def thread_fork(
@@ -498,7 +503,11 @@ class AsyncCodex:
             sandbox=_sandbox_mode(sandbox),
             **({"service_tier": service_tier} if service_tier is not UNSET else {}),
         )
-        resumed = await self._client.thread_resume(thread_id, params)
+        # Match the sync facade without changing the low-level response API.
+        resume_params: ThreadResumeParams | JsonObject = params
+        if self._client._sync.config.experimental_api:
+            resume_params = {**_params_dict(params), "excludeTurns": True}
+        resumed = await self._client.thread_resume(thread_id, resume_params)
         return AsyncThread(self, resumed.thread.id)
 
     async def thread_fork(

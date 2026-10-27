@@ -14,9 +14,8 @@ use tokio::net::TcpStream;
 use tokio::time::Instant;
 use tokio::time::sleep_until;
 use tokio_rustls::TlsConnector;
-use tokio_tungstenite::Connector;
-use tokio_tungstenite::client_async_tls_with_config;
-use tokio_tungstenite::connect_async_tls_with_config;
+use tokio_tungstenite::MaybeTlsStream;
+use tokio_tungstenite::client_async_with_config;
 use tokio_tungstenite::proxy::connect_via_proxy;
 use tokio_tungstenite::tungstenite::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::client::uri_mode;
@@ -54,35 +53,15 @@ async fn connect_route(
     proxy_route: OutboundProxyRoute,
     tcp_nodelay: TcpNodelay,
 ) -> Result<(ConnectionInner, Response), WebSocketError> {
-    let disable_nagle = tcp_nodelay == TcpNodelay::Enabled;
+    // Resolve the default environment path without rediscovering system policy.
+    // Snapshot bypass matching below preserves the WebSocket transport contract.
+    let proxy_route = match proxy_route {
+        OutboundProxyRoute::TransportDefault => codex_http_client::websocket_environment_proxy_route(
+            &request.uri().to_string(),
+        ),
+        route => route,
+    };
     let routes = match proxy_route {
-        OutboundProxyRoute::TransportDefault => {
-            // The workspace enables tokio-tungstenite's `proxy` feature, so its default dialer
-            // resolves HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, and NO_PROXY before opening the socket.
-            match connect_async_tls_with_config(
-                request.clone(),
-                Some(config),
-                disable_nagle,
-                Some(Connector::Rustls(Arc::clone(&tls_config))),
-            )
-            .await
-            {
-                Ok((stream, response)) => {
-                    return Ok((ConnectionInner::TransportDefault(stream), response));
-                }
-                Err(WebSocketError::Url(UrlError::UnsupportedProxyScheme)) => {
-                    // The environment parser has already applied NO_PROXY, but it cannot
-                    // establish TLS to an HTTPS proxy. Reuse our explicit TLS tunnel path.
-                    vec![OutboundProxyRoute::Proxy {
-                        url: https_proxy_from_env(&request).ok_or(WebSocketError::Url(
-                            UrlError::UnsupportedProxyScheme,
-                        ))?,
-                        no_proxy: None,
-                    }]
-                }
-                Err(error) => return Err(error),
-            }
-        }
         OutboundProxyRoute::Fallback { routes } => routes,
         route => vec![route],
     };
@@ -92,18 +71,19 @@ async fn connect_route(
         let route = routes.next().ok_or_else(invalid_proxy_config)?;
         match connect_routed_stream(&request, &tls_config, route, tcp_nodelay).await {
             Ok(stream) => break stream,
-            Err(_) if routes.peek().is_some() => continue,
+            Err(error) if routes.peek().is_some()
+                && !codex_http_client::is_permanent_connection_error(&error) => continue,
             Err(error) => return Err(error),
         }
     };
 
-    // A WebSocket handshake is sent at most once. Only TCP/proxy tunnel setup
-    // above can advance to another explicitly supplied PAC candidate.
-    let (stream, response) = client_async_tls_with_config(
+    // TCP, CONNECT and destination TLS have all succeeded before leaving the
+    // candidate loop. Send the HTTP upgrade exactly once; never fail over on
+    // an authorization/policy rejection or an ambiguous upgrade write.
+    let (stream, response) = client_async_with_config(
         request,
-        stream,
+        MaybeTlsStream::Plain(stream),
         Some(config),
-        Some(Connector::Rustls(tls_config)),
     ).await?;
     Ok((ConnectionInner::Routed(stream), response))
 }
@@ -117,7 +97,9 @@ async fn connect_routed_stream(
     let proxy_url = match route {
         OutboundProxyRoute::Direct => None,
         OutboundProxyRoute::Proxy { url, no_proxy } => {
-            let bypass = no_proxy.as_deref().is_some_and(|no_proxy| no_proxy_matches(no_proxy, request.uri()));
+            let bypass = no_proxy.as_deref().is_some_and(|no_proxy| {
+                no_proxy_matches(no_proxy, request.uri())
+            });
             (!bypass).then_some(url)
         }
         // Resolved PAC plans are flat and never rediscover ambient policy.
@@ -154,29 +136,16 @@ async fn connect_routed_stream(
         }
     };
 
-    Ok(stream)
-}
-
-/// Match Tungstenite's environment precedence only after it rejects a non-bypassed proxy scheme.
-/// Keep all supported routes and NO_PROXY handling in the transport's existing parser.
-fn https_proxy_from_env(request: &Request) -> Option<String> {
-    let env_value = |upper: &str, lower: &str| {
-        std::env::var(upper)
-            .or_else(|_| std::env::var(lower))
-            .ok()
-            .filter(|value| !value.is_empty())
-    };
-    let proxy = match request.uri().scheme_str() {
-        Some("wss") => env_value("HTTPS_PROXY", "https_proxy")
-            .or_else(|| env_value("HTTP_PROXY", "http_proxy")),
-        Some("ws") => env_value("HTTP_PROXY", "http_proxy"),
-        _ => None,
+    if request.uri().scheme_str() == Some("wss") {
+        let server_name = proxy_server_name(websocket_host(request)?)?;
+        let stream = TlsConnector::from(Arc::clone(tls_config))
+            .connect(server_name, stream)
+            .await
+            .map_err(WebSocketError::Io)?;
+        Ok(Box::new(stream))
+    } else {
+        Ok(stream)
     }
-    .or_else(|| env_value("ALL_PROXY", "all_proxy"))?;
-    url::Url::parse(&proxy)
-        .ok()
-        .filter(|url| url.scheme() == "https")
-        .map(|_| proxy)
 }
 
 /// Proxy settings can carry credentials, and Tungstenite's environment parser echoes the value it
@@ -188,8 +157,9 @@ fn redact_proxy_config_error(error: WebSocketError) -> WebSocketError {
     }
 }
 
-// Apply Tungstenite's host/suffix/port bypass semantics to the resolved value,
-// not to a second read of the process environment.
+// Apply the pinned Tungstenite host/suffix/port semantics to the resolved
+// snapshot. Its private matcher cannot be reused without rereading the environment,
+// and the system-proxy matcher intentionally supports broader bypass patterns.
 fn no_proxy_matches(no_proxy: &str, uri: &tokio_tungstenite::tungstenite::http::Uri) -> bool {
     let Some(host) = uri.host() else { return false };
     let host = host

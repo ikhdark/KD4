@@ -51,6 +51,7 @@ pub struct UnifiedExecRequest {
     /// Semantically equivalent, inspectable command used for approvals and
     /// approval caching when `command` contains an encoded runtime payload.
     pub command_for_approval: Vec<String>,
+    pub shell_wrapper_is_owned: bool,
 
     pub normalization_cwd: Option<std::path::PathBuf>,
 
@@ -341,6 +342,16 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
             proof_cwd: req.normalization_cwd.as_deref(),
         })
         .await;
+
+        let command = super::recheck_readonly_command_before_launch(
+            &req.command_for_approval,
+            req.shell_wrapper_is_owned,
+            req.normalization_cwd.as_deref(),
+            &env,
+            req.sandbox_permissions,
+            &req.exec_approval_requirement,
+            ctx,
+        ).await?.unwrap_or(command);
 
         if ctx
             .turn

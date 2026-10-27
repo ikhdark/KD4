@@ -226,9 +226,9 @@ impl EventProcessorWithJsonOutput {
         make_id: impl FnOnce() -> String,
     ) -> Option<ExecThreadItem> {
         match item {
-            ThreadItem::AgentMessage { text, phase, .. } => Some(ExecThreadItem {
+            ThreadItem::AgentMessage { text, phase, interruption, .. } => Some(ExecThreadItem {
                 id: make_id(),
-                details: ThreadItemDetails::AgentMessage(AgentMessageItem { text, phase }),
+                details: ThreadItemDetails::AgentMessage(AgentMessageItem { text, phase, interruption }),
             }),
             ThreadItem::Plan { text, .. } => Some(ExecThreadItem {
                 id: make_id(),

@@ -18,6 +18,13 @@ pub struct DesktopRuntimeReceipt {
     pub executable_sha256: String,
     pub codex_home: PathBuf,
     pub client_name: String,
+    /// Process startup transport class, not this connection's transport or GUI peer.
+    #[serde(default)]
+    pub process_rpc_transport: Option<String>,
+    #[serde(default)]
+    pub connection_id: Option<u64>,
+    #[serde(default)]
+    pub enabled_features: Vec<String>,
     pub build_version: String,
     pub build_commit: String,
     pub build_dirty: String,

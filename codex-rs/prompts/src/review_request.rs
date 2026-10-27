@@ -20,16 +20,16 @@ pub struct ResolvedReviewRequest {
     pub source_scope: codex_git_utils::ReviewSourceScope,
 }
 
-const UNCOMMITTED_PROMPT: &str = "Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings. Run `git --no-optional-locks status --short --untracked-files=all`, `git diff`, and `git diff --cached` to establish the scope. Read relevant untracked files directly; git diff does not include their contents.";
+const UNCOMMITTED_PROMPT: &str = "Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings. Run `git --no-optional-locks -c core.fsmonitor=false status --short --untracked-files=all`, `git -c core.fsmonitor=false diff --no-ext-diff --no-textconv --`, and `git -c core.fsmonitor=false diff --no-ext-diff --no-textconv --cached --` to establish the scope. Read relevant untracked files directly; git diff does not include their contents.";
 
-const BASE_BRANCH_PROMPT: &str = "Review the code changes against the base branch '{{base_branch}}'. The merge base commit for this comparison is {{merge_base_sha}}. Run `git diff {{merge_base_sha}}` to inspect tracked changes relative to {{base_branch}}, including staged and unstaged edits. Provide prioritized, actionable findings.";
+const BASE_BRANCH_PROMPT: &str = "Review the code changes against the base branch '{{base_branch}}'. The merge base commit for this comparison is {{merge_base_sha}}. Run `git -c core.fsmonitor=false diff --no-ext-diff --no-textconv {{merge_base_sha}} --` to inspect tracked changes relative to {{base_branch}}, including staged and unstaged edits. Provide prioritized, actionable findings.";
 static BASE_BRANCH_PROMPT_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
     Template::parse(BASE_BRANCH_PROMPT)
         .unwrap_or_else(|err| panic!("base branch review prompt must parse: {err}"))
 });
 
-const COMMIT_PROMPT_WITH_TITLE: &str = "Review the code changes introduced by commit {{sha}} (\"{{title}}\"). Use `git show --diff-merges=first-parent {{sha}}` so merge commits use the same first-parent comparison as the host scope. Provide prioritized, actionable findings.";
-const COMMIT_PROMPT: &str = "Review the code changes introduced by commit {{sha}}. Use `git show --diff-merges=first-parent {{sha}}` so merge commits use the same first-parent comparison as the host scope. Provide prioritized, actionable findings.";
+const COMMIT_PROMPT_WITH_TITLE: &str = "Review the code changes introduced by commit {{sha}} (\"{{title}}\"). Run `{{diff_command}}` to inspect the host-selected immutable comparison: merge commits compare with their first parent, and root commits compare with the empty tree. Do not substitute current workspace contents for immutable commit source. Provide prioritized, actionable findings.";
+const COMMIT_PROMPT: &str = "Review the code changes introduced by commit {{sha}}. Run `{{diff_command}}` to inspect the host-selected immutable comparison: merge commits compare with their first parent, and root commits compare with the empty tree. Do not substitute current workspace contents for immutable commit source. Provide prioritized, actionable findings.";
 static COMMIT_PROMPT_WITH_TITLE_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
     Template::parse(COMMIT_PROMPT_WITH_TITLE)
         .unwrap_or_else(|err| panic!("commit review prompt with title must parse: {err}"))
@@ -73,6 +73,29 @@ fn review_prompt_for_scope(
         return Ok(render_review_prompt(&BASE_BRANCH_PROMPT_TEMPLATE,
             [("base_branch", branch.as_str()), ("merge_base_sha", revision)]));
     }
+    if let ReviewTarget::Commit { title, .. } = target {
+        let revision = source_scope
+            .comparison_revision()
+            .ok_or_else(|| anyhow::anyhow!("missing captured review commit"))?;
+        let diff_command = source_scope
+            .commit_diff_command()
+            .map_err(anyhow::Error::msg)?;
+        return Ok(if let Some(title) = title {
+            render_review_prompt(
+                &COMMIT_PROMPT_WITH_TITLE_TEMPLATE,
+                [
+                    ("sha", revision),
+                    ("title", title.as_str()),
+                    ("diff_command", diff_command.as_str()),
+                ],
+            )
+        } else {
+            render_review_prompt(
+                &COMMIT_PROMPT_TEMPLATE,
+                [("sha", revision), ("diff_command", diff_command.as_str())],
+            )
+        });
+    }
     review_prompt(target, cwd)
 }
 
@@ -93,18 +116,10 @@ pub fn review_prompt(target: &ReviewTarget, cwd: &AbsolutePathBuf) -> anyhow::Re
                 ],
             ))
         }
-        ReviewTarget::Commit { sha, title } => {
-            if let Some(title) = title {
-                Ok(render_review_prompt(
-                    &COMMIT_PROMPT_WITH_TITLE_TEMPLATE,
-                    [("sha", sha.as_str()), ("title", title.as_str())],
-                ))
-            } else {
-                Ok(render_review_prompt(
-                    &COMMIT_PROMPT_TEMPLATE,
-                    [("sha", sha.as_str())],
-                ))
-            }
+        ReviewTarget::Commit { .. } => {
+            let source_scope = codex_git_utils::ReviewSourceScope::capture(cwd, target)
+                .map_err(anyhow::Error::msg)?;
+            review_prompt_for_scope(target, cwd, &source_scope)
         }
         ReviewTarget::Custom { instructions } => {
             let prompt = instructions.trim();

@@ -228,7 +228,9 @@ impl PendingThreadUnloads {
                     },
                 );
             }
-            if state.eligible.len() <= MAX_INACTIVE_THREADS {
+            // Failed/uncertain retirements still occupy memory and residency;
+            // their surviving owners remain counted until actual cleanup.
+            if state.eligible.len().saturating_add(state.unloading.len()) <= MAX_INACTIVE_THREADS {
                 return;
             }
             let oldest = state
@@ -493,7 +495,6 @@ pub(super) enum ThreadShutdownResult {
 #[derive(Debug, Eq, PartialEq)]
 pub(super) enum IdleThreadShutdownResult {
     ReadyForColdResume,
-    RejoinLoaded,
     Closing,
 }
 
@@ -701,6 +702,7 @@ pub(super) async fn ensure_listener_task_running(
         thread_state_manager,
         pending_thread_unloads,
         thread_watch_manager,
+        thread_queue_processor,
         ..
     } = listener_task_context;
     let outgoing_for_task = Arc::clone(&outgoing);
@@ -708,6 +710,7 @@ pub(super) async fn ensure_listener_task_running(
     // must not leave a registered command sender without its owning listener task.
     tokio::spawn(async move {
         unloading_state.register_listener(listener_generation).await;
+        let mut shutdown_observed = false;
         loop {
             tokio::select! {
                 biased;
@@ -743,16 +746,33 @@ pub(super) async fn ensure_listener_task_running(
                     let event = match event {
                         Ok(event) => event,
                         Err(err) => {
-                            tracing::warn!("thread.next_event() failed with: {err}");
-                            // A failed required event stream must not leave a
-                            // connected client waiting for a terminal receipt
-                            // that this listener can no longer deliver.
-                            for connection_id in thread_state_manager.subscribed_connection_ids(conversation_id).await {
-                                outgoing_for_task.fail_connection_delivery(connection_id).await;
+                            if !shutdown_observed {
+                                tracing::warn!("thread.next_event() failed with: {err}");
+                                for connection_id in thread_state_manager.subscribed_connection_ids(conversation_id).await {
+                                    outgoing_for_task.fail_connection_delivery(connection_id).await;
+                                }
+                            }
+                            // EOF follows actual terminal-producer drain on a
+                            // normal shutdown. On failure, core intake is fenced;
+                            // retain an exact-instance shutdown/reap owner before
+                            // removing anything from the runtime registry.
+                            if pending_thread_unloads.begin(conversation_id).await {
+                                unload_thread_without_subscribers(
+                                    thread_manager.clone(),
+                                    outgoing_for_task.clone(),
+                                    pending_thread_unloads.clone(),
+                                    thread_state_manager.clone(),
+                                    thread_watch_manager.clone(),
+                                    thread_queue_processor.clone(),
+                                    conversation_id,
+                                    conversation.clone(),
+                                    EvictionCompletion(None),
+                                ).await;
                             }
                             break;
                         }
                     };
+                    shutdown_observed |= matches!(&event.msg, EventMsg::ShutdownComplete);
 
                     process_thread_listener_event(
                         &event_context,
@@ -793,6 +813,7 @@ pub(super) async fn ensure_listener_task_running(
                         pending_thread_unloads.clone(),
                         thread_state_manager.clone(),
                         thread_watch_manager.clone(),
+                        thread_queue_processor.clone(),
                         conversation_id,
                         conversation.clone(),
                         eviction_completion,
@@ -931,6 +952,23 @@ async fn wait_for_thread_shutdown_with_timeout(
     }
 }
 
+/// An unload attempt is irreversible once shutdown is admitted. Keep its exact
+/// runtime and closing marker until actual accepted owners and persistence drain.
+async fn wait_for_owned_thread_retirement(thread_id: ThreadId, thread: &Arc<CodexThread>) {
+    let mut retry_delay = Duration::from_secs(1);
+    loop {
+        match async {
+            thread.request_shutdown().await?;
+            thread.wait_until_drained().await
+        }.await {
+            Ok(()) => return,
+            Err(error) => warn!(%thread_id, %error, "thread retirement failed; retaining owner for retry"),
+        }
+        tokio::time::sleep(retry_delay).await;
+        retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn finish_thread_unload(
     thread_manager: &Arc<ThreadManager>,
@@ -938,75 +976,43 @@ pub(super) async fn finish_thread_unload(
     pending_thread_unloads: &Arc<PendingThreadUnloads>,
     thread_state_manager: &ThreadStateManager,
     thread_watch_manager: &ThreadWatchManager,
+    thread_queue_processor: Option<&ThreadQueueRequestProcessor>,
     thread_id: ThreadId,
     expected_thread: &Arc<CodexThread>,
     emit_thread_closed: bool,
 ) -> bool {
-    let removed_expected = thread_manager
-        .remove_thread_if_same(&thread_id, expected_thread)
-        .await;
-    let ready_for_cold_resume = if removed_expected {
-        outgoing.forget_dynamic_tool_owner(thread_id).await;
-        outgoing
-            .cancel_requests_for_thread(thread_id, /*error*/ None)
-            .await;
-        thread_state_manager.remove_thread_state(thread_id).await;
-        // Status removal updates local state before publication can suspend. Keep
-        // healthy status/closed ordering, but transport cannot retain unload authority.
-        let notifications = async {
-            thread_watch_manager
-                .remove_thread(&thread_id.to_string())
-                .await;
-            if emit_thread_closed {
-                let notification = ThreadClosedNotification {
-                    thread_id: thread_id.to_string(),
-                };
-                outgoing
-                    .send_server_notification(ServerNotification::ThreadClosed(notification))
-                    .await;
-            }
-        };
-        if tokio::time::timeout(
-            crate::outgoing_message::RESOURCE_DELIVERY_TIMEOUT,
-            notifications,
-        )
-        .await
-        .is_err()
-        {
-            warn!(
-                "timed out publishing final thread state for {thread_id}; releasing unload authority"
-            );
-        }
-        true
-    } else {
-        match thread_manager.get_thread(thread_id).await {
-            Err(_) => {
-                info!("thread {thread_id} was already removed before teardown finalized");
+    thread_manager
+        .retire_thread_with_cleanup(thread_id, expected_thread, |removed_expected, replacement_present| async move {
+            // The manager retains the existing per-ID publication lease through
+            // every await, including release of the old unload marker. No global
+            // thread-map lock is held while consumers or transports retire.
+            if !replacement_present {
+                if let Some(queue) = thread_queue_processor {
+                    queue.retire_thread(thread_id).await;
+                }
                 outgoing.forget_dynamic_tool_owner(thread_id).await;
+                outgoing.cancel_requests_for_thread(thread_id, /*error*/ None).await;
                 thread_state_manager.remove_thread_state(thread_id).await;
+                let notifications = async {
+                    thread_watch_manager.remove_thread(&thread_id.to_string()).await;
+                    if removed_expected && emit_thread_closed {
+                        outgoing.send_server_notification(ServerNotification::ThreadClosed(
+                            ThreadClosedNotification { thread_id: thread_id.to_string() },
+                        )).await;
+                    }
+                };
                 if tokio::time::timeout(
                     crate::outgoing_message::RESOURCE_DELIVERY_TIMEOUT,
-                    thread_watch_manager.remove_thread(&thread_id.to_string()),
-                )
-                .await
-                .is_err()
-                {
-                    warn!(
-                        "timed out publishing removed thread state for {thread_id}; releasing unload authority"
-                    );
+                    notifications,
+                ).await.is_err() {
+                    warn!("timed out publishing retired thread state for {thread_id}; releasing unload authority");
                 }
-                true
+            } else {
+                warn!("thread {thread_id} was replaced before teardown finalized; preserving and rearming the replacement");
             }
-            Ok(_) => {
-                warn!(
-                    "thread {thread_id} was replaced before teardown finalized; preserving the replacement"
-                );
-                false
-            }
-        }
-    };
-    pending_thread_unloads.finish(&thread_id).await;
-    ready_for_cold_resume
+            pending_thread_unloads.finish(&thread_id).await;
+        })
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1016,6 +1022,7 @@ pub(super) async fn unload_thread_without_subscribers(
     pending_thread_unloads: Arc<PendingThreadUnloads>,
     thread_state_manager: ThreadStateManager,
     thread_watch_manager: ThreadWatchManager,
+    thread_queue_processor: Option<ThreadQueueRequestProcessor>,
     thread_id: ThreadId,
     thread: Arc<CodexThread>,
     eviction_completion: EvictionCompletion,
@@ -1026,6 +1033,7 @@ pub(super) async fn unload_thread_without_subscribers(
         pending_thread_unloads,
         thread_state_manager,
         thread_watch_manager,
+        thread_queue_processor,
         thread_id,
         thread,
         eviction_completion,
@@ -1042,6 +1050,7 @@ async fn unload_thread_without_subscribers_with_timeout(
     pending_thread_unloads: Arc<PendingThreadUnloads>,
     thread_state_manager: ThreadStateManager,
     thread_watch_manager: ThreadWatchManager,
+    thread_queue_processor: Option<ThreadQueueRequestProcessor>,
     thread_id: ThreadId,
     thread: Arc<CodexThread>,
     eviction_completion: EvictionCompletion,
@@ -1061,49 +1070,21 @@ async fn unload_thread_without_subscribers_with_timeout(
         if let Some(shutdown_result_tx) = shutdown_result_tx {
             let _ = shutdown_result_tx.send(shutdown_result);
         }
-        match shutdown_result {
-            ThreadShutdownResult::Complete => {
-                finish_thread_unload(
-                    &thread_manager,
-                    &outgoing,
-                    &pending_thread_unloads,
-                    &thread_state_manager,
-                    &thread_watch_manager,
-                    thread_id,
-                    &thread,
-                    /*emit_thread_closed*/ true,
-                )
-                .await;
-            }
-            ThreadShutdownResult::SubmitFailed => {
-                pending_thread_unloads.finish(&thread_id).await;
-                warn!("failed to submit Shutdown to thread {thread_id}");
-            }
-            ThreadShutdownResult::TimedOut => {
-                warn!("thread {thread_id} shutdown timed out; waiting for late termination");
-                // The timed observer may have cancelled mailbox admission.
-                // This surviving owner must reissue idempotent shutdown first.
-                if let Err(error) = async {
-                    thread.request_shutdown().await?;
-                    thread.wait_until_drained().await
-                }.await {
-                    warn!(%thread_id, %error, "late thread shutdown failed; retaining runtime");
-                    pending_thread_unloads.finish(&thread_id).await;
-                    return;
-                }
-                finish_thread_unload(
-                    &thread_manager,
-                    &outgoing,
-                    &pending_thread_unloads,
-                    &thread_state_manager,
-                    &thread_watch_manager,
-                    thread_id,
-                    &thread,
-                    /*emit_thread_closed*/ true,
-                )
-                .await;
-            }
+        if shutdown_result != ThreadShutdownResult::Complete {
+            warn!(%thread_id, ?shutdown_result, "idle shutdown incomplete; retaining unload authority");
+            wait_for_owned_thread_retirement(thread_id, &thread).await;
         }
+        finish_thread_unload(
+            &thread_manager,
+            &outgoing,
+            &pending_thread_unloads,
+            &thread_state_manager,
+            &thread_watch_manager,
+            thread_queue_processor.as_ref(),
+            thread_id,
+            &thread,
+            /*emit_thread_closed*/ true,
+        ).await;
         drop(eviction_completion);
     });
 }
@@ -1115,6 +1096,7 @@ pub(super) async fn shutdown_idle_thread_for_resume(
     pending_thread_unloads: &Arc<PendingThreadUnloads>,
     thread_state_manager: &ThreadStateManager,
     thread_watch_manager: &ThreadWatchManager,
+    thread_queue_processor: Option<&ThreadQueueRequestProcessor>,
     thread_id: ThreadId,
     thread: Arc<CodexThread>,
 ) -> IdleThreadShutdownResult {
@@ -1124,6 +1106,7 @@ pub(super) async fn shutdown_idle_thread_for_resume(
         pending_thread_unloads,
         thread_state_manager,
         thread_watch_manager,
+        thread_queue_processor,
         thread_id,
         thread,
         THREAD_SHUTDOWN_TIMEOUT,
@@ -1138,6 +1121,7 @@ async fn shutdown_idle_thread_for_resume_with_timeout(
     pending_thread_unloads: &Arc<PendingThreadUnloads>,
     thread_state_manager: &ThreadStateManager,
     thread_watch_manager: &ThreadWatchManager,
+    thread_queue_processor: Option<&ThreadQueueRequestProcessor>,
     thread_id: ThreadId,
     thread: Arc<CodexThread>,
     shutdown_timeout: Duration,
@@ -1150,6 +1134,7 @@ async fn shutdown_idle_thread_for_resume_with_timeout(
     let pending_thread_unloads = Arc::clone(pending_thread_unloads);
     let thread_state_manager = thread_state_manager.clone();
     let thread_watch_manager = thread_watch_manager.clone();
+    let thread_queue_processor = thread_queue_processor.cloned();
     // Once the closing marker is published, shutdown and cleanup must outlive
     // cancellation of the resume request that initiated them.
     tokio::spawn(async move {
@@ -1161,6 +1146,7 @@ async fn shutdown_idle_thread_for_resume_with_timeout(
                     &pending_thread_unloads,
                     &thread_state_manager,
                     &thread_watch_manager,
+                    thread_queue_processor.as_ref(),
                     thread_id,
                     &thread,
                     /*emit_thread_closed*/ false,
@@ -1172,13 +1158,8 @@ async fn shutdown_idle_thread_for_resume_with_timeout(
                     IdleThreadShutdownResult::Closing
                 }
             }
-            ThreadShutdownResult::SubmitFailed => {
-                pending_thread_unloads.finish(&thread_id).await;
-                warn!("failed to submit Shutdown to thread {thread_id}");
-                IdleThreadShutdownResult::RejoinLoaded
-            }
-            ThreadShutdownResult::TimedOut => {
-                warn!("thread {thread_id} shutdown timed out; waiting for late termination");
+            ThreadShutdownResult::SubmitFailed | ThreadShutdownResult::TimedOut => {
+                warn!("thread {thread_id} shutdown incomplete; retaining retirement owner");
                 outgoing
                     .cancel_requests_for_thread(thread_id, /*error*/ None)
                     .await;
@@ -1188,20 +1169,14 @@ async fn shutdown_idle_thread_for_resume_with_timeout(
                 let thread_state_manager = thread_state_manager.clone();
                 let thread_watch_manager = thread_watch_manager.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = async {
-                        thread.request_shutdown().await?;
-                        thread.wait_until_drained().await
-                    }.await {
-                        warn!(%thread_id, %error, "late thread shutdown failed; retaining runtime");
-                        pending_thread_unloads.finish(&thread_id).await;
-                        return;
-                    }
+                    wait_for_owned_thread_retirement(thread_id, &thread).await;
                     finish_thread_unload(
                         &thread_manager,
                         &outgoing,
                         &pending_thread_unloads,
                         &thread_state_manager,
                         &thread_watch_manager,
+                        thread_queue_processor.as_ref(),
                         thread_id,
                         &thread,
                         /*emit_thread_closed*/ true,
@@ -1277,6 +1252,8 @@ pub(super) async fn handle_pending_thread_resume_request(
             .await
             .contains(&pending.request_id.connection_id);
     let mut stream_prefix = Vec::new();
+    let mut resume_turns = None;
+    let mut indexed_initial_page = None;
     let active_turn = {
         let mut state = thread_state.lock().await;
         if state.listener_generation != pending.listener_generation
@@ -1284,11 +1261,18 @@ pub(super) async fn handle_pending_thread_resume_request(
         {
             Err(resume_listener_changed_error(conversation_id))
         } else if let Some(history_items) = pending.history_items.as_deref() {
-            state.seed_resume_history_for_listener(history_items, pending.listener_generation);
-            if needs_stream_prefix {
-                stream_prefix = state.active_stream_replay();
+            if !state.seed_resume_history_for_listener(
+                history_items,
+                pending.listener_generation,
+                pending.history_generation,
+            ) {
+                Err(resume_listener_changed_error(conversation_id))
+            } else {
+                if needs_stream_prefix {
+                    stream_prefix = state.active_stream_replay();
+                }
+                Ok(state.active_turn_snapshot())
             }
-            Ok(state.active_turn_snapshot())
         } else if !state.resume_history_is_seeded_for_current_listener() {
             Err(internal_error(format!(
                 "thread {conversation_id} resume history is not initialized for the active listener"
@@ -1308,6 +1292,21 @@ pub(super) async fn handle_pending_thread_resume_request(
         }
     };
     let history_items = pending.history_items.as_deref().unwrap_or(&[]);
+    {
+        // No listener event can interleave this capture and subscription commit.
+        // The index preserves completed turns/items that active-prefix replay omits.
+        let state = thread_state.lock().await;
+        if pending.include_turns {
+            resume_turns = state.resume_turns_snapshot(usize::MAX, SortDirection::Asc, TurnItemsView::Full)
+                .map(|page| page.turns);
+        } else if let Some(params) = pending.initial_turns_page.as_ref() {
+            indexed_initial_page = state.resume_turns_snapshot(
+                super::thread_processor::thread_page_size(params.limit),
+                params.sort_direction.unwrap_or(SortDirection::Desc),
+                params.items_view.unwrap_or(TurnItemsView::Summary),
+            );
+        }
+    }
     tracing::debug!(
         thread_id = %conversation_id,
         request_id = ?pending.request_id,
@@ -1321,16 +1320,26 @@ pub(super) async fn handle_pending_thread_resume_request(
     // whether that persisted in-progress turn is still running.
     let has_live_in_progress_turn =
         matches!(conversation.agent_status().await, AgentStatus::Running);
+    let live_turn_id = conversation.active_turn_id().await;
+    if !has_live_in_progress_turn
+        || live_turn_id.as_deref() != active_turn.as_ref().map(|turn| turn.id.as_str())
+    {
+        stream_prefix.clear();
+    }
 
     let request_id = pending.request_id;
     let connection_id = request_id.connection_id;
     let mut thread = pending.thread_summary;
     let token_usage_snapshot = if pending.include_turns {
-        populate_thread_turns_from_history_with_token_usage(
+        let usage = populate_thread_turns_from_history_with_token_usage(
             &mut thread,
             history_items,
             active_turn.as_ref(),
-        )
+        );
+        if let Some(turns) = resume_turns {
+            thread.turns = turns;
+        }
+        usage
     } else {
         None
     };
@@ -1344,8 +1353,24 @@ pub(super) async fn handle_pending_thread_resume_request(
         thread_status,
         has_live_in_progress_turn,
     );
-    let mut initial_turns_page = if let Some(page) = pending.prepared_initial_turns_page {
-        Some(page)
+    let mut initial_turns_page = if let Some(mut page) = indexed_initial_page {
+        super::thread_processor::normalize_thread_turns_status(&mut page.turns, thread.status.clone(), has_live_in_progress_turn);
+        let cursors = (|| {
+            let backwards_cursor = page.turns.first()
+                .map(|turn| super::thread_processor::serialize_thread_turns_cursor(&turn.id, true))
+                .transpose()?;
+            let next_cursor = if page.more_turns_available {
+                page.turns.last()
+                    .map(|turn| super::thread_processor::serialize_thread_turns_cursor(&turn.id, false))
+                    .transpose()?
+            } else { None };
+            Ok::<_, JSONRPCErrorError>((next_cursor, backwards_cursor))
+        })();
+        let (next_cursor, backwards_cursor) = match cursors {
+            Ok(cursors) => cursors,
+            Err(error) => { outgoing.send_error(request_id, error).await; return; }
+        };
+        Some(codex_app_server_protocol::TurnsPage { data: page.turns, next_cursor, backwards_cursor })
     } else if let Some(params) = pending.initial_turns_page.as_ref() {
         let page = if pending.include_turns {
             super::thread_processor::build_thread_resume_initial_turns_page(&thread.turns, params)

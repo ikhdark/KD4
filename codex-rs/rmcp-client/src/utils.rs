@@ -13,18 +13,12 @@ pub(crate) fn create_env_for_mcp_server(
     env_vars: &[McpServerEnvVar],
 ) -> Result<HashMap<OsString, OsString>> {
     let additional_env_vars = local_stdio_env_var_names(env_vars)?;
-    let entries = DEFAULT_ENV_VARS
+    let inherited = DEFAULT_ENV_VARS
         .iter()
         .copied()
         .chain(additional_env_vars)
-        .filter_map(|var| env::var_os(var).map(|value| (OsString::from(var), value)))
-        .chain(extra_env.unwrap_or_default());
-    let mut env: HashMap<OsString, OsString> = HashMap::new();
-    for (key, value) in entries {
-        env.retain(|existing, _| !env_keys_equal(existing, &key));
-        env.insert(key, value);
-    }
-    Ok(env)
+        .filter_map(|var| env::var_os(var).map(|value| (OsString::from(var), value)));
+    Ok(merge_env_layers(inherited, extra_env))
 }
 
 pub(crate) fn env_keys_equal(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> bool {
@@ -39,12 +33,31 @@ pub(crate) fn create_env_overlay_for_remote_mcp_server(
     // Remote stdio should inherit PATH/HOME/etc. from the executor side, not
     // from the orchestrator process. Only forward variables explicitly named
     // by the MCP config plus literal env overrides from that config.
-    env_vars
+    let forwarded = env_vars
         .iter()
         .filter(|var| !var.is_remote_source())
-        .filter_map(|var| env::var_os(var.name()).map(|value| (OsString::from(var.name()), value)))
-        .chain(extra_env.unwrap_or_default())
-        .collect()
+        .filter_map(|var| env::var_os(var.name()).map(|value| (OsString::from(var.name()), value)));
+    merge_env_layers(forwarded, extra_env)
+}
+
+fn merge_env_layers(
+    inherited: impl IntoIterator<Item = (OsString, OsString)>,
+    extra_env: Option<HashMap<OsString, OsString>>,
+) -> HashMap<OsString, OsString> {
+    let mut env: HashMap<OsString, OsString> = HashMap::new();
+    // Match shell_environment::apply_env_overlay without converting OsString
+    // data: local stdio accepts it, while the remote launcher validates Unicode.
+    // Resolve aliases within each layer before applying the explicit layer, so
+    // spelling cannot override layer precedence after the maps are flattened.
+    for layer in [inherited.into_iter().collect(), extra_env.unwrap_or_default()] {
+        let mut entries = layer.into_iter().collect::<Vec<_>>();
+        entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        for (key, value) in entries {
+            env.retain(|existing, _| !env_keys_equal(existing, &key));
+            env.insert(key, value);
+        }
+    }
+    env
 }
 
 pub(crate) fn remote_mcp_env_var_names(env_vars: &[McpServerEnvVar]) -> Result<Vec<String>> {
@@ -86,13 +99,14 @@ pub(crate) fn build_default_headers(
                     continue;
                 }
             };
-            let header_value = match HeaderValue::from_str(value.as_str()) {
+            let mut header_value = match HeaderValue::from_str(value.as_str()) {
                 Ok(value) => value,
                 Err(err) => {
                     tracing::warn!("invalid HTTP header value for `{name}`: {err}");
                     continue;
                 }
             };
+            header_value.set_sensitive(true);
             headers.insert(header_name, header_value);
         }
     }
@@ -112,7 +126,7 @@ pub(crate) fn build_default_headers(
                     }
                 };
 
-                let header_value = match HeaderValue::from_str(value.as_str()) {
+                let mut header_value = match HeaderValue::from_str(value.as_str()) {
                     Ok(value) => value,
                     Err(err) => {
                         tracing::warn!(
@@ -121,6 +135,7 @@ pub(crate) fn build_default_headers(
                         continue;
                     }
                 };
+                header_value.set_sensitive(true);
                 headers.insert(header_name, header_value);
             }
         }

@@ -4494,7 +4494,12 @@ async fn validate_dependencies_tx(
     repository_id: Option<&str>,
     dependencies: &[AssignmentId],
 ) -> StoreResult<Vec<crate::DependencyAdmission>> {
-    let admitted = validate_direct_dependencies_tx(transaction, candidate_id, repository_id, dependencies, &[]).await?;
+    // Reuse adjacency for a single-prerequisite closure, never authority.
+    // Multi-prerequisite roots retain the original per-direct-check lifetime.
+    let mut cached_dependencies = (dependencies.len() == 1).then(HashMap::new);
+    let admitted = validate_direct_dependencies_tx(
+        transaction, candidate_id, repository_id, dependencies, &[], cached_dependencies.as_mut(),
+    ).await?;
     // Follow prerequisite provenance iteratively: a sealed intermediate result
     // cannot hide a superseded input. One database snapshot, no recursive tasks
     // or cross-transaction freshness cache; shared DAG nodes are visited once.
@@ -4508,7 +4513,7 @@ async fn validate_dependencies_tx(
         let judged_targets = judged_dependency_targets(&dependency);
         let current = validate_direct_dependencies_tx(
             transaction, dependency_id, Some(&dependency.repository_id), &dependency.dependencies,
-            judged_targets,
+            judged_targets, cached_dependencies.as_mut(),
         ).await?;
         let captured = load_dependency_admissions_tx(transaction, dependency_id).await?;
         let blockers = compare_dependency_admissions(&dependency.dependencies, &captured, &current);
@@ -4612,13 +4617,12 @@ async fn validate_direct_dependencies_tx(
     repository_id: Option<&str>,
     dependencies: &[AssignmentId],
     judged_targets: &[AssignmentId],
+    cached_dependencies: Option<&mut HashMap<AssignmentId, Vec<AssignmentId>>>,
 ) -> StoreResult<Vec<crate::DependencyAdmission>> {
     let mut blockers = Vec::new();
     let mut admitted = Vec::new();
-    // One transaction-local adjacency observation for overlapping DAG roots.
-    // JSON authority is decoded on first visit; no cross-transaction cache can
-    // hide amendments, missing rows or corrupt dependency bodies.
-    let mut cached_dependencies = HashMap::new();
+    let mut local_cached_dependencies = HashMap::new();
+    let cached_dependencies = cached_dependencies.unwrap_or(&mut local_cached_dependencies);
     for dependency in dependencies {
         if *dependency == candidate_id {
             blockers.push(DependencyBlocker {
@@ -4664,7 +4668,7 @@ async fn validate_direct_dependencies_tx(
                 continue;
             }
         }
-        if dependency_reaches_tx(transaction, *dependency, candidate_id, &mut cached_dependencies).await? {
+        if dependency_reaches_tx(transaction, *dependency, candidate_id, cached_dependencies).await? {
             blockers.push(DependencyBlocker {
                 assignment_id: *dependency,
                 state: DependencyState::Cyclic,
@@ -5078,6 +5082,16 @@ async fn require_gate_actor_tx(
         return Err(StoreError::GateAuthorityRequired {
             gate: kind.to_string(),
         });
+    }
+    // A judge's relation identifies the assignment, but its admission pins the
+    // exact attempt and receipt it may judge. Reuse completion's target-aware
+    // check so a negative verdict does not invalidate its own authority.
+    let admissions =
+        load_dependency_admissions_tx(transaction, actor_assignment.assignment_id).await?;
+    let blockers =
+        dependency_authority_blockers_tx(transaction, &actor_assignment, &admissions).await?;
+    if !blockers.is_empty() {
+        return Err(StoreError::DependencyBlocked { blockers });
     }
     Ok(())
 }

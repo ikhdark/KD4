@@ -613,7 +613,7 @@ pub(crate) async fn inspect_pending_input(
             .await
         }
         TurnInput::ResponseItem(_)
-        | TurnInput::AdditionalContext(_)
+        | TurnInput::AdditionalContext { .. }
         | TurnInput::InternalResponseItem(_)
         | TurnInput::InterAgentCommunication(_) => HookRuntimeOutcome::default(),
     }
@@ -626,11 +626,11 @@ pub(crate) async fn record_pending_input(
     additional_contexts: Vec<String>,
 ) -> std::io::Result<()> {
     match pending_input {
-        TurnInput::AdditionalContext(values) => {
+        TurnInput::AdditionalContext { values, .. } => {
             sess.record_additional_context_snapshot(turn_context, values)
                 .await?;
         }
-        TurnInput::UserInput { content, client_id } => {
+        TurnInput::UserInput { content, client_id, .. } => {
             sess.record_user_prompt_and_emit_turn_item(turn_context, content.as_slice(), client_id)
                 .await?;
 

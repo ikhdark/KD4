@@ -16,6 +16,8 @@ use rmcp::transport::auth::OAuthHttpClientFuture;
 use rmcp::transport::auth::OAuthHttpRedirectPolicy;
 use rmcp::transport::auth::OAuthHttpRequest;
 
+use crate::oauth::OAuthRequestAuthority;
+
 pub(crate) const MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 static NEXT_OAUTH_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -26,6 +28,7 @@ pub(crate) struct OAuthHttpClientAdapter {
     resource_origin: url::Origin,
     buffered_responses: bool,
     timeout_cap: Option<Duration>,
+    authority: Option<OAuthRequestAuthority>,
 }
 
 impl OAuthHttpClientAdapter {
@@ -47,7 +50,13 @@ impl OAuthHttpClientAdapter {
             resource_origin: resource.origin(),
             buffered_responses: false,
             timeout_cap: None,
+            authority: None,
         })
+    }
+
+    pub(crate) fn with_authority(mut self, authority: OAuthRequestAuthority) -> Self {
+        self.authority = Some(authority);
+        self
     }
 
     pub(crate) fn with_buffered_responses(mut self) -> Self {
@@ -184,6 +193,11 @@ impl OAuthHttpClientAdapter {
         request: HttpRequest,
         timeout: Option<Duration>,
     ) -> Result<HttpResponse, OAuthHttpClientError> {
+        if let Some(authority) = &self.authority {
+            authority.check().await.map_err(|error| {
+                OAuthHttpClientError::from(error.to_string())
+            })?;
+        }
         let (parts, body) = request.into_parts();
         let target = url::Url::parse(&parts.uri.to_string())
             .map_err(|error| OAuthHttpClientError::from(error.to_string()))?;

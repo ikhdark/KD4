@@ -443,6 +443,55 @@ pub struct ModelInfo {
 }
 
 impl ModelInfo {
+    /// A public `/models` listing establishes membership, not model capabilities.
+    pub fn from_public_model_id(id: String) -> Self {
+        Self {
+            display_name: id.clone(),
+            slug: id,
+            description: Some(
+                "Provider model; capabilities are unknown unless configured in model_catalog_json."
+                    .into(),
+            ),
+            default_reasoning_level: None,
+            supported_reasoning_levels: Vec::new(),
+            shell_type: ConfigShellToolType::Default,
+            visibility: ModelVisibility::List,
+            supported_in_api: true,
+            priority: 99,
+            additional_speed_tiers: Vec::new(),
+            service_tiers: Vec::new(),
+            default_service_tier: None,
+            availability_nux: None,
+            upgrade: None,
+            base_instructions: crate::models::BASE_INSTRUCTIONS_DEFAULT.to_string(),
+            model_messages: None,
+            include_skills_usage_instructions: true,
+            include_apps_usage_instructions: true,
+            include_plugin_usage_instructions: true,
+            supports_reasoning_summaries: false,
+            default_reasoning_summary: ReasoningSummary::Auto,
+            support_verbosity: false,
+            default_verbosity: None,
+            apply_patch_tool_type: None,
+            web_search_tool_type: WebSearchToolType::Text,
+            truncation_policy: TruncationPolicyConfig::bytes(10_000),
+            supports_parallel_tool_calls: false,
+            supports_image_detail_original: false,
+            context_window: None,
+            max_context_window: None,
+            auto_compact_token_limit: None,
+            comp_hash: None,
+            effective_context_window_percent: default_effective_context_window_percent(),
+            experimental_supported_tools: Vec::new(),
+            input_modalities: vec![InputModality::Text],
+            used_fallback_model_metadata: true,
+            supports_search_tool: false,
+            use_responses_lite: false,
+            tool_mode: None,
+            multi_agent_version: None,
+        }
+    }
+
     /// Validate model-owned admission limits before activating a descriptor.
     /// Tool-output truncation has a different, intentionally zero-clamping policy.
     pub fn validate_capabilities(&self) -> Result<(), String> {
@@ -690,6 +739,14 @@ fn supports_service_tier(
 }
 
 impl ModelInfo {
+    /// Configured routing accepts the default sentinel and explicit Flex even
+    /// when the catalog does not advertise them as selectable tiers.
+    pub fn accepts_configured_service_tier(&self, service_tier: &str) -> bool {
+        service_tier == SERVICE_TIER_DEFAULT_REQUEST_VALUE
+            || service_tier == ServiceTier::Flex.request_value()
+            || self.supports_service_tier(service_tier)
+    }
+
     pub fn supports_service_tier(&self, service_tier: &str) -> bool {
         supports_service_tier(
             &self.service_tiers,
@@ -705,9 +762,7 @@ impl ModelInfo {
             if service_tier == SERVICE_TIER_DEFAULT_REQUEST_VALUE {
                 return false;
             }
-            if service_tier == ServiceTier::Flex.request_value()
-                || self.supports_service_tier(service_tier)
-            {
+            if self.accepts_configured_service_tier(service_tier) {
                 return true;
             }
             // Session callers surface a user-facing warning before filtering.

@@ -436,7 +436,10 @@ async fn execute_with_fallbacks(
             (result, FALLBACK_REDIRECT_SEEN.with(Cell::get))
         }).await;
         match result {
-            Err(error) if error.is_connect() && !redirected && next_candidate < fallback.clients.len() => {
+            Err(error) if error.is_connect()
+                && !crate::is_permanent_connection_error(&error)
+                && !redirected
+                && next_candidate < fallback.clients.len() => {
                 let Some(mut replay) = replay else { return Err(error) };
                 let next = &fallback.clients[next_candidate];
                 // Restore from the original binding, not the preceding replay:

@@ -49,6 +49,8 @@ use sse_stream::SseStream;
 use tokio::time::Instant;
 use url::Url;
 
+use crate::oauth::OAuthRequestAuthority;
+
 mod www_authenticate;
 
 use self::www_authenticate::insufficient_scope_challenge;
@@ -66,6 +68,7 @@ pub(crate) struct StreamableHttpClientAdapter {
     http_client: Arc<dyn HttpClient>,
     default_headers: HeaderMap,
     auth_provider: Option<SharedAuthProvider>,
+    oauth_authority: Option<OAuthRequestAuthority>,
     initialize_deadline: Arc<Mutex<Option<Instant>>>,
 }
 
@@ -84,6 +87,10 @@ pub(crate) enum StreamableHttpClientAdapterError {
     },
     #[error("invalid HTTP header: {0}")]
     Header(String),
+    #[error("MCP request authentication rejected: {0}")]
+    Auth(#[from] codex_api::AuthError),
+    #[error("MCP OAuth request authority rejected: {0}")]
+    OAuthAuthority(String),
 }
 
 impl StreamableHttpClientAdapter {
@@ -97,8 +104,14 @@ impl StreamableHttpClientAdapter {
             http_client,
             default_headers,
             auth_provider,
+            oauth_authority: None,
             initialize_deadline,
         }
+    }
+
+    pub(crate) fn with_oauth_authority(mut self, authority: Option<OAuthRequestAuthority>) -> Self {
+        self.oauth_authority = authority;
+        self
     }
 
     pub(crate) fn with_initialize_deadline(
@@ -123,9 +136,13 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
     ) -> std::result::Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
         let (mcp_method, mcp_request_id) = client_jsonrpc_message_fields(&message);
         let has_session_id = session_id.is_some();
+        let redirect_policy = self.redirect_policy(
+            &custom_headers,
+            auth_token.is_some() || has_session_id,
+        );
         let mut headers = self.default_headers.clone();
         headers.extend(custom_headers);
-        self.add_auth_headers(&mut headers);
+        self.add_auth_headers(&mut headers).await?;
         insert_header(
             &mut headers,
             ACCEPT,
@@ -182,7 +199,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
                 headers: protocol_headers(&headers)?,
                 body: Some(body.into()),
                 timeout_ms,
-                redirect_policy: HttpRedirectPolicy::Follow,
+                redirect_policy,
                 request_id: "buffered-request".to_string(),
                 stream_response: true,
             })
@@ -352,9 +369,10 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         auth_token: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> std::result::Result<(), StreamableHttpError<Self::Error>> {
+        let redirect_policy = self.redirect_policy(&custom_headers, true);
         let mut headers = self.default_headers.clone();
         headers.extend(custom_headers);
-        self.add_auth_headers(&mut headers);
+        self.add_auth_headers(&mut headers).await?;
         if let Some(auth_token) = auth_token {
             insert_header(
                 &mut headers,
@@ -378,7 +396,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
                 headers: protocol_headers(&headers)?,
                 body: None,
                 timeout_ms: None,
-                redirect_policy: HttpRedirectPolicy::Follow,
+                redirect_policy,
                 request_id: "buffered-request".to_string(),
                 stream_response: false,
             })
@@ -411,9 +429,13 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
         BoxStream<'static, std::result::Result<Sse, sse_stream::Error>>,
         StreamableHttpError<Self::Error>,
     > {
+        let redirect_policy = self.redirect_policy(
+            &custom_headers,
+            auth_token.is_some() || session_id.is_some(),
+        );
         let mut headers = self.default_headers.clone();
         headers.extend(custom_headers);
-        self.add_auth_headers(&mut headers);
+        self.add_auth_headers(&mut headers).await?;
         insert_header(
             &mut headers,
             ACCEPT,
@@ -453,7 +475,7 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
                 headers: protocol_headers(&headers)?,
                 body: None,
                 timeout_ms: None,
-                redirect_policy: HttpRedirectPolicy::Follow,
+                redirect_policy,
                 request_id: "buffered-request".to_string(),
                 stream_response: true,
             })
@@ -507,10 +529,43 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
 }
 
 impl StreamableHttpClientAdapter {
-    fn add_auth_headers(&self, headers: &mut HeaderMap) {
-        if let Some(auth_provider) = &self.auth_provider {
-            headers.extend(auth_provider.to_auth_headers());
+    // The executor envelope cannot preserve origin-bound credential provenance.
+    // Do not let its ordinary redirect handling forward arbitrary configured
+    // headers, managed credentials, or MCP session authority to another origin.
+    fn redirect_policy(
+        &self,
+        custom_headers: &HashMap<HeaderName, HeaderValue>,
+        has_transport_authority: bool,
+    ) -> HttpRedirectPolicy {
+        if !self.default_headers.is_empty()
+            || !custom_headers.is_empty()
+            || self.auth_provider.is_some()
+            || has_transport_authority
+        {
+            HttpRedirectPolicy::Stop
+        } else {
+            HttpRedirectPolicy::Follow
         }
+    }
+
+    async fn add_auth_headers(
+        &self,
+        headers: &mut HeaderMap,
+    ) -> Result<(), StreamableHttpError<StreamableHttpClientAdapterError>> {
+        if let Some(authority) = &self.oauth_authority {
+            authority.check().await.map_err(|error| {
+                StreamableHttpError::Client(StreamableHttpClientAdapterError::OAuthAuthority(
+                    error.to_string(),
+                ))
+            })?;
+        }
+        if let Some(auth_provider) = &self.auth_provider {
+            auth_provider
+                .try_add_auth_headers(headers)
+                .map_err(StreamableHttpClientAdapterError::Auth)
+                .map_err(StreamableHttpError::Client)?;
+        }
+        Ok(())
     }
 }
 

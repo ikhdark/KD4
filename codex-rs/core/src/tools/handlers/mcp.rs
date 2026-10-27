@@ -230,17 +230,8 @@ impl McpHandler {
     }
 
     pub(crate) fn external_mutation_intent(&self) -> ExternalMutationIntent {
-        let annotations = self.tool_info.tool.annotations.as_ref();
-        if annotations.and_then(|hints| hints.destructive_hint) == Some(true) {
-            return ExternalMutationIntent::MayMutate;
-        }
-        // Neither a provider annotation nor a familiar callable name establishes
-        // host authority. In particular, custom servers can reuse app namespaces.
-        if annotations.and_then(|hints| hints.read_only_hint) == Some(true) {
-            ExternalMutationIntent::ProviderAssertedReadOnly
-        } else {
-            ExternalMutationIntent::MayMutate
-        }
+        // Server annotations are advisory, not host-established read-only authority.
+        ExternalMutationIntent::MayMutate
     }
 }
 fn join_tool_name(tool_name: &ToolName) -> String {
@@ -272,18 +263,8 @@ impl ToolExecutor<ToolInvocation> for McpHandler {
     }
 
     fn supports_parallel_tool_calls(&self) -> bool {
-        // Correctly implemented MCP servers should tolerate parallel calls to
-        // tools that advertise themselves as read-only.
+        // Only explicit host configuration can authorize parallel MCP calls.
         self.tool_info.supports_parallel_tool_calls
-            || self
-                .tool_info
-                .tool
-                .annotations
-                .as_ref()
-                .is_some_and(|annotations| {
-                    annotations.read_only_hint == Some(true)
-                        && annotations.destructive_hint != Some(true)
-                })
     }
 
     fn search_info_for_registered_spec(

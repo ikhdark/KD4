@@ -4004,6 +4004,9 @@ impl TokenUsage {
         self.known(self.reasoning_output_tokens, |c| c.reasoning_output_tokens)
     }
     pub fn known_total(&self) -> Option<i64> {
+        if self.coverage.as_ref()?.invalid_receipts != 0 {
+            return None;
+        }
         self.known(self.total_tokens, |c| c.total_tokens)
     }
     pub fn known_visible_output(&self) -> Option<i64> {
@@ -4686,9 +4689,8 @@ pub enum SessionSource {
     Unknown,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, TS)]
 #[serde(try_from = "String", into = "String")]
-#[schemars(with = "String")]
 #[ts(type = "string")]
 #[ts(export_to = "v2/")]
 pub enum ThreadSource {
@@ -4697,6 +4699,16 @@ pub enum ThreadSource {
     Feature(String),
     // Legacy rollout origin only; no memory worker is registered.
     MemoryConsolidation,
+}
+
+impl JsonSchema for ThreadSource {
+    fn schema_name() -> String {
+        "ThreadSource".to_string()
+    }
+
+    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        <String>::json_schema(generator)
+    }
 }
 
 impl ThreadSource {

@@ -54,6 +54,9 @@ pub(crate) async fn reserve_policy(
     selection: String,
     execution_scope: &str,
     source_revision: Option<&str>,
+    environment_id: &str,
+    cwd: &codex_utils_path_uri::PathUri,
+    command: &[String],
 ) -> Result<Option<codex_command_analysis::command_preflight::FullSuitePermit>, crate::tools::context::FunctionToolOutput> {
     use codex_command_analysis::validation::ValidationPolicyClassification as Class;
     if classification == Class::ReadOnly { return Ok(None); }
@@ -61,14 +64,51 @@ pub(crate) async fn reserve_policy(
     if !declared && !classification.is_validation() {
         return Ok(None);
     }
-    // A workspace identity can describe only the repository root. Always
-    // include tracked mutations so that an unchanged root cannot hide edits.
-    // These tokens invalidate admission; they do not prove source equivalence.
-    // Both command handlers already observed the tracker revision. Observing
-    // zero reads that monotonic epoch without invalidating it.
-    let epoch = session.services.command_execution
-        .observe_repository_revision(&turn.sub_id, 0).await;
-    let revision = serde_json::json!([source_revision, epoch]).to_string();
+    let revision = if classification == Class::TargetedCompilation {
+        // Cache invalidation is not source-change evidence. Keep it for other
+        // command observations, but use exact edits/named inputs for repairs.
+        let source_selection = codex_command_analysis::validation::compilation_source_selection(&selection);
+        let scope = serde_json::json!([environment_id, execution_scope, source_selection]).to_string();
+        let unambiguous = command.split_first().is_some_and(|(program, args)|
+            codex_shell_command::validation::validation_resource_cwd_is_unambiguous(program, args));
+        let native_cwd = (environment_id == codex_exec_server::LOCAL_ENVIRONMENT_ID)
+            .then(|| cwd.to_abs_path().ok()).flatten();
+        let explicit_inputs = if !unambiguous { Some(Vec::new()) } else {
+            codex_command_analysis::validation::explicit_compilation_inputs(&selection, command).map(|paths|
+                paths.into_iter().map(|path| match native_cwd.as_ref() {
+                    Some(base) => codex_utils_absolute_path::AbsolutePathBuf::resolve_literal_path_against_base(path, base)
+                        .to_path_buf(),
+                    None if path.has_root() => path,
+                    None => std::path::PathBuf::from(cwd.inferred_native_path_string()).join(path),
+                }).collect::<Vec<_>>())
+        };
+        let mut paths = explicit_inputs.clone().unwrap_or_default();
+        let mut fingerprints = if native_cwd.is_some() && unambiguous {
+            let paths = paths.clone();
+            tokio::task::spawn_blocking(move || crate::git_workspace::compilation_input_fingerprints(paths))
+                .await.unwrap_or_default()
+        } else { Default::default() };
+        if explicit_inputs.is_none() && unambiguous
+            && let Some(cwd) = native_cwd.as_ref()
+        {
+            let (selection, command, cwd) = (selection.clone(), command.to_vec(), cwd.to_path_buf());
+            if let Ok(Some((named, current))) = tokio::task::spawn_blocking(move || {
+                let cwd = codex_command_analysis::validation::compilation_cargo_cwd(&command, &cwd)?;
+                let (manifests, roots) = codex_command_analysis::command_preflight::compilation_sources(&selection, &cwd)?;
+                Some(crate::git_workspace::compilation_rust_inputs(manifests, roots))
+            }).await {
+                paths = named;
+                fingerprints = current;
+            }
+        }
+        turn.full_suite_budget.compilation_revision(
+            &scope, environment_id, &paths, explicit_inputs.is_some(), fingerprints,
+        )
+    } else {
+        let epoch = session.services.command_execution
+            .observe_repository_revision(&turn.sub_id, 0).await;
+        serde_json::json!([source_revision, epoch]).to_string()
+    };
     turn.full_suite_budget.reserve_policy(
         reservation_owner(session, turn, call_id),
         serde_json::json!([execution_scope, selection]).to_string(), revision,

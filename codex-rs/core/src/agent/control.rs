@@ -86,6 +86,7 @@ pub(crate) struct SpawnAgentOptions {
     pub(crate) fork_parent_spawn_call_id: Option<String>,
     pub(crate) fork_mode: Option<SpawnAgentForkMode>,
     pub(crate) parent_thread_id: Option<ThreadId>,
+    pub(crate) parent_turn_id: Option<String>,
     pub(crate) environments: Option<Vec<TurnEnvironmentSelection>>,
     pub(crate) captured_environments: Option<TurnEnvironmentSnapshot>,
     pub(crate) typed_task_binding: Option<codex_agent_task_store::AgentTaskBindingDraft>,
@@ -708,6 +709,17 @@ impl AgentControl {
     ) -> CodexResult<String> {
         let (expected_thread, result) = request?;
         if matches!(result, Err(CodexErr::InternalAgentDied)) {
+            let drained = tokio::time::timeout(
+                residency::RESIDENCY_ACQUISITION_TIMEOUT,
+                async {
+                    expected_thread.request_shutdown().await?;
+                    expected_thread.wait_until_drained().await
+                },
+            ).await;
+            if !matches!(drained, Ok(Ok(()))) {
+                warn!(%agent_id, "failed agent runtime is still retiring; preserving registration and residency");
+                return result;
+            }
             let retain_cold_identity =
                 expected_thread.multi_agent_version() == Some(MultiAgentVersion::V2);
             state
@@ -859,6 +871,56 @@ impl AgentControl {
         Ok(thread_ids)
     }
 
+    pub(crate) async fn list_turn_owned_agent_subtree(
+        &self,
+        parent: ThreadId,
+        turn_id: &str,
+    ) -> CodexResult<Vec<ThreadId>> {
+        let state = self.upgrade()?;
+        let ephemeral_owners = self.state.turn_spawn_owners();
+        let mut roots = ephemeral_owners.iter().filter_map(|(child, (owner, turn))| {
+                (*owner == parent && turn == turn_id).then_some(*child)
+            }).collect::<HashSet<_>>();
+        let mut parents = self.state.known_spawn_edges().into_iter()
+            .map(|(parent, child)| (child, parent)).collect::<HashMap<_, _>>();
+        parents.extend(state.list_live_thread_spawn_edges().await.into_iter()
+            .map(|(parent, child)| (child, parent)));
+        let mut edges = parents.into_iter().map(|(child, parent)| (parent, child)).collect();
+        let mut durable_allowed = None;
+        if let Some(graph) = state.agent_graph_store() {
+            let allowed = graph.list_turn_owned_thread_spawn_descendants(parent, turn_id).await
+                .map_err(|error| CodexErr::Fatal(format!("failed to read turn-owned children: {error}")))?
+                .into_iter().collect::<HashSet<_>>();
+            roots.extend(allowed.iter().copied());
+            durable_allowed = Some(allowed);
+            edges = graph.list_reconciled_thread_spawn_edges(parent, edges).await
+                .map_err(|error| CodexErr::Fatal(format!("failed to reconcile turn-owned children: {error}")))?;
+        }
+        let mut children = HashMap::<ThreadId, Vec<ThreadId>>::new();
+        for (owner, child) in edges {
+            if durable_allowed.as_ref().is_some_and(|allowed| {
+                !allowed.contains(&child) && !ephemeral_owners.contains_key(&child)
+            }) {
+                continue;
+            }
+            if owner != parent || roots.contains(&child) {
+                children.entry(owner).or_default().push(child);
+            }
+        }
+        let mut seen = HashSet::from([parent]);
+        let mut pending = vec![parent];
+        let mut result = Vec::new();
+        while let Some(owner) = pending.pop() {
+            for child in children.remove(&owner).unwrap_or_default() {
+                if seen.insert(child) {
+                    result.push(child);
+                    pending.push(child);
+                }
+            }
+        }
+        Ok(result)
+    }
+
     /// Sums readable model usage across `agent_id` and its known descendants.
     ///
     /// Per-thread accounting alone makes delegated work look free: a parent that spawns
@@ -927,6 +989,19 @@ impl AgentControl {
             return None;
         };
         Some(thread.config_snapshot().await)
+    }
+
+    /// Runtime grants remain owned by the live root, not copied into child config.
+    pub(crate) async fn root_session_for_permissions(
+        &self,
+        caller_thread_id: ThreadId,
+    ) -> Option<Arc<crate::session::session::Session>> {
+        let root_thread_id = ThreadId::from(self.session_id);
+        if root_thread_id == caller_thread_id {
+            return None;
+        }
+        let root = self.upgrade().ok()?.get_thread(root_thread_id).await.ok()?;
+        Some(Arc::clone(&root.codex.session))
     }
 
     pub(crate) async fn resolve_agent_reference(

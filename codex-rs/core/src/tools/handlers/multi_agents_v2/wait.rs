@@ -172,6 +172,7 @@ impl Handler {
                         turn.config.sqlite_home.clone(),
                         turn.config.model_provider_id.clone(),
                         session.services.agent_control.session_id().to_string(),
+                        turn.config.ephemeral,
                     ), parsed_cursor)
                     .map_err(|error| {
                         task_store_context_error(

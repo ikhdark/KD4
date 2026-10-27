@@ -128,6 +128,10 @@ impl AmazonBedrockModelProvider {
     ) -> Result<auth::BedrockAuthMethod> {
         auth::resolve_auth_method(managed_auth, &self.aws, self.endpoint, &self.sdk_context).await
     }
+
+    fn known_region(&self) -> Option<String> {
+        auth::known_region(self.managed_auth().as_ref(), &self.aws, &self.sdk_context)
+    }
 }
 
 impl ModelProvider for AmazonBedrockModelProvider {
@@ -139,8 +143,48 @@ impl ModelProvider for AmazonBedrockModelProvider {
         ProviderCapabilities {
             namespace_tools: true,
             image_generation: false,
-            web_search: false,
+            web_search: self.endpoint == BedrockEndpoint::Mantle,
         }
+    }
+
+    fn supports_hosted_web_search(&self, model: &str) -> bool {
+        self.endpoint == BedrockEndpoint::Mantle
+            && self.known_region().is_some_and(|region| {
+                // AWS Web Search regional/model support, verified 2026-10-26:
+                // https://docs.aws.amazon.com/bedrock/latest/userguide/web-search.html
+                match region.as_str() {
+                    "us-east-1" | "us-east-2" | "us-west-2" => matches!(model,
+                        codex_model_provider_info::AMAZON_BEDROCK_GPT_6_ASTRA_MODEL_ID
+                        | codex_model_provider_info::AMAZON_BEDROCK_GPT_6_SOL_MODEL_ID
+                        | codex_model_provider_info::AMAZON_BEDROCK_GPT_6_LUNA_MODEL_ID
+                        | codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID
+                        | codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_TERRA_MODEL_ID
+                        | codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_LUNA_MODEL_ID
+                        | codex_model_provider_info::AMAZON_BEDROCK_GPT_5_5_MODEL_ID
+                        | "openai.gpt-5.4"),
+                    "us-gov-west-1" => matches!(model,
+                        codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_TERRA_MODEL_ID
+                        | codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_LUNA_MODEL_ID
+                        | "openai.gpt-5.4"),
+                    _ => false,
+                }
+            })
+    }
+
+    fn hosted_web_search_requires_cached_access(&self) -> bool {
+        true
+    }
+
+    fn prepare_hosted_web_search(&self) -> ModelProviderFuture<'_, Result<()>> {
+        Box::pin(async move {
+            if self.endpoint == BedrockEndpoint::Mantle {
+                let managed_auth = self.managed_auth();
+                // Reuse request auth's cancellation-safe OnceCell; do not build
+                // a second AWS region/profile loader for tool planning.
+                self.resolve_auth_method(managed_auth.as_ref()).await?;
+            }
+            Ok(())
+        })
     }
 
     fn auth_manager(&self) -> Option<Arc<AuthManager>> {
@@ -206,16 +250,18 @@ impl ModelProvider for AmazonBedrockModelProvider {
         _codex_home: PathBuf,
         config_model_catalog: Option<ModelsResponse>,
     ) -> SharedModelsManager {
-        Arc::new(StaticModelsManager::new(
-            /*auth_manager*/ None,
-            config_model_catalog.map_or_else(
-                || match self.endpoint {
+        let manager = match config_model_catalog {
+            Some(catalog) => StaticModelsManager::new(None, with_default_only_service_tier(catalog)),
+            None => StaticModelsManager::new(
+                None,
+                match self.endpoint {
                     BedrockEndpoint::Mantle => static_model_catalog(),
                     BedrockEndpoint::Runtime => static_runtime_model_catalog(),
                 },
-                with_default_only_service_tier,
-            ),
-        ))
+            )
+            .requiring_explicit_selection(),
+        };
+        Arc::new(manager)
     }
 }
 

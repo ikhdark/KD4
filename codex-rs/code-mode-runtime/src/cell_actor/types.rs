@@ -27,6 +27,7 @@ pub(crate) enum CellError {
     AlreadyTerminating,
     Closed,
     CleanupFailed,
+    ObservationReleased,
 }
 
 pub(crate) struct CellToolCall {
@@ -85,14 +86,18 @@ impl CellHandle {
         Self { command_tx, state }
     }
 
-    pub(crate) fn observe(&self, mode: ObserveMode) -> CellEventFuture {
+    pub(crate) fn observe(
+        &self,
+        mode: ObserveMode,
+        release: Option<CancellationToken>,
+    ) -> CellEventFuture {
         if !self.state.accepting_observations() {
             return self
                 .state
                 .terminal_event()
                 .map_or_else(closed_event, ready_event);
         }
-        let (response_tx, response_rx) = oneshot::channel();
+        let (response_tx, mut response_rx) = oneshot::channel();
         if self
             .command_tx
             .send(CellCommand::Observe { mode, response_tx })
@@ -105,7 +110,22 @@ impl CellHandle {
         }
         let state = Arc::clone(&self.state);
         Box::pin(async move {
-            match response_event(response_rx).await {
+            let event = if let Some(release) = release {
+                tokio::select! {
+                    biased;
+                    _ = release.cancelled() => {
+                        // Close and drain atomically against the actor's send:
+                        // an already-enqueued packet belongs to this observer;
+                        // a later send fails and restores it to actor custody.
+                        response_rx.close();
+                        response_rx.try_recv().unwrap_or(Err(CellError::ObservationReleased))
+                    }
+                    event = &mut response_rx => event.unwrap_or(Err(CellError::Closed)),
+                }
+            } else {
+                response_event(response_rx).await
+            };
+            match event {
                 Err(CellError::Closed) => state.terminal_event().ok_or(CellError::Closed),
                 result => result,
             }

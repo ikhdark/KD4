@@ -273,6 +273,7 @@ impl PreparedCodexOneShot {
                     },
                 },
                 None,
+                self.child_cancel.clone(),
             )
             .await;
         if let Err(error) = admitted {

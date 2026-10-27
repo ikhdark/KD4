@@ -77,6 +77,7 @@ use rmcp::model::ClientCapabilities;
 use rmcp::model::ElicitationCapability;
 use rmcp::model::Implementation;
 use rmcp::model::InitializeRequestParams;
+use rmcp::model::InitializeResult;
 use rmcp::model::JsonObject;
 use rmcp::model::NumberOrString;
 use rmcp::model::PaginatedRequestParams;
@@ -154,18 +155,36 @@ fn make_progress_sender(tx_event: Sender<Event>) -> SendProgress {
 #[derive(Clone)]
 pub(crate) struct ManagedClient {
     pub(crate) client: Arc<RmcpClient>,
-    pub(crate) server_info: McpServerInfo,
-    pub(crate) tools: Arc<ArcSwap<Vec<ToolInfo>>>,
+    pub(crate) catalog: Arc<ArcSwap<NegotiatedCatalog>>,
     pub(crate) tool_filter: ToolFilter,
     pub(crate) tool_timeout: Duration,
-    pub(crate) server_instructions: Option<String>,
-    pub(crate) server_supports_sandbox_state_meta_capability: bool,
-    pub(crate) server_supports_resources_capability: bool,
     pub(crate) codex_apps_tools_cache_context: Option<CodexAppsToolsCacheContext>,
 }
 
+#[derive(Clone)]
+pub(crate) struct NegotiatedCatalog {
+    pub(crate) generation: u64,
+    pub(crate) server_info: McpServerInfo,
+    pub(crate) tools: Vec<ToolInfo>,
+    pub(crate) server_instructions: Option<String>,
+    pub(crate) server_supports_sandbox_state_meta_capability: bool,
+    pub(crate) server_supports_resources_capability: bool,
+    pub(crate) server_supports_tools_capability: bool,
+}
+
 impl ManagedClient {
+    pub(crate) fn current_catalog(&self) -> Option<Arc<NegotiatedCatalog>> {
+        if !self.client.managed_auth_scope_is_current() {
+            return None;
+        }
+        let catalog = self.catalog.load_full();
+        (catalog.generation == self.client.session_generation()).then_some(catalog)
+    }
+
     fn listed_tools(&self) -> Vec<ToolInfo> {
+        let Some(catalog) = self.current_catalog() else {
+            return Vec::new();
+        };
         if let Some(tools) = self
             .codex_apps_tools_cache_context
             .as_ref()
@@ -173,7 +192,51 @@ impl ManagedClient {
         {
             return filter_tools(tools, &self.tool_filter);
         }
-        self.tools.load_full().as_ref().clone()
+        catalog.tools.clone()
+    }
+
+    pub(crate) fn commit_tools(
+        &self,
+        generation: u64,
+        tools: Vec<ToolInfo>,
+        revision: &AtomicU64,
+    ) -> Result<()> {
+        if self.client.session_generation() != generation
+            || !self.client.managed_auth_scope_is_current()
+        {
+            return Err(anyhow!("MCP session changed during tool discovery"));
+        }
+        self.catalog.rcu(|current| {
+            if current.generation != generation {
+                return Arc::clone(current);
+            }
+            let mut next = current.as_ref().clone();
+            next.tools = tools.clone();
+            Arc::new(next)
+        });
+        revision.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+}
+
+fn negotiated_catalog(
+    generation: u64,
+    result: InitializeResult,
+    discover_tools: bool,
+    tools: Vec<ToolInfo>,
+) -> NegotiatedCatalog {
+    NegotiatedCatalog {
+        generation,
+        server_supports_sandbox_state_meta_capability: result
+            .capabilities
+            .experimental
+            .as_ref()
+            .is_some_and(|exp| exp.contains_key(MCP_SANDBOX_STATE_META_CAPABILITY)),
+        server_supports_resources_capability: result.capabilities.resources.is_some(),
+        server_supports_tools_capability: discover_tools && result.capabilities.tools.is_some(),
+        server_info: mcp_server_info_from_implementation(result.server_info),
+        server_instructions: result.instructions,
+        tools,
     }
 }
 
@@ -200,6 +263,7 @@ pub(crate) struct CodexAppsStartupReconnect {
     codex_apps_tools_cache_context: Option<CodexAppsToolsCacheContext>,
     tool_filter: ToolFilter,
     tool_catalog_revision: Arc<AtomicU64>,
+    connection_generation: Arc<AtomicU64>,
     state: StdMutex<CodexAppsStartupReconnectState>,
     startup_status_context: Option<CodexAppsStartupStatusContext>,
 }
@@ -210,12 +274,14 @@ impl CodexAppsStartupReconnect {
         codex_apps_tools_cache_context: Option<CodexAppsToolsCacheContext>,
         tool_filter: ToolFilter,
         tool_catalog_revision: Arc<AtomicU64>,
+        connection_generation: Arc<AtomicU64>,
     ) -> Self {
         Self {
             factory,
             codex_apps_tools_cache_context,
             tool_filter,
             tool_catalog_revision,
+            connection_generation,
             state: StdMutex::new(CodexAppsStartupReconnectState::default()),
             startup_status_context: None,
         }
@@ -243,13 +309,22 @@ impl CodexAppsStartupReconnect {
             .clone()
     }
 
-    fn reconnect_in_background(self: &Arc<Self>) {
+    fn reconnect_in_background(self: &Arc<Self>, failed_client: Option<Arc<RmcpClient>>) {
         let pending_client = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.current_client.is_some() || state.pending_client.is_some() {
+            if let Some(current) = state.current_client.as_ref() {
+                if !failed_client
+                    .as_ref()
+                    .is_some_and(|failed| Arc::ptr_eq(failed, &current.client))
+                {
+                    return;
+                }
+                state.current_client = None;
+            }
+            if state.pending_client.is_some() {
                 return;
             }
             if state
@@ -258,8 +333,28 @@ impl CodexAppsStartupReconnect {
             {
                 return;
             }
-            let pending_client = (self.factory)();
+            let startup = (self.factory)();
+            let pending_client = async move {
+                if let Some(failed_client) = failed_client {
+                    // Cleanup belongs to the shared future too: callers joining
+                    // recovery must not start a replacement before it completes.
+                    if !matches!(
+                        tokio::time::timeout(DEFAULT_STARTUP_TIMEOUT, failed_client.shutdown()).await,
+                        Ok(Ok(()))
+                    ) {
+                        let _ = tokio::time::timeout(
+                            DEFAULT_STARTUP_TIMEOUT,
+                            failed_client.force_shutdown(),
+                        )
+                        .await;
+                    }
+                }
+                startup.await
+            }
+            .boxed()
+            .shared();
             state.pending_client = Some(pending_client.clone());
+            self.tool_catalog_revision.fetch_add(1, Ordering::AcqRel);
             pending_client
         };
 
@@ -281,6 +376,8 @@ impl CodexAppsStartupReconnect {
                 match result {
                     Ok(client) => {
                         state.current_client = Some(client.clone());
+                        reconnect.connection_generation.fetch_add(1, Ordering::AcqRel);
+                        reconnect.tool_catalog_revision.fetch_add(1, Ordering::AcqRel);
                         advance_tool_catalog_revision_if_changed(
                             previously_exposed_tools.as_deref(),
                             &client.listed_tools(),
@@ -320,7 +417,7 @@ impl CodexAppsStartupReconnect {
         });
     }
 
-    fn pending_client(&self) -> Option<ManagedClientFuture> {
+    pub(crate) fn pending_client(&self) -> Option<ManagedClientFuture> {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -355,6 +452,7 @@ struct ManagedClientStartup {
     client_elicitation_capability: ElicitationCapability,
     supports_openai_form_elicitation: bool,
     tool_catalog_revision: Arc<AtomicU64>,
+    connection_generation: Arc<AtomicU64>,
     cancel_token: CancellationToken,
     startup_complete: Arc<AtomicBool>,
     discover_tools: bool,
@@ -384,6 +482,7 @@ impl ManagedClientStartup {
             client_elicitation_capability,
             supports_openai_form_elicitation,
             tool_catalog_revision,
+            connection_generation,
             cancel_token,
             startup_complete,
             discover_tools,
@@ -450,6 +549,7 @@ impl ManagedClientStartup {
                         client_elicitation_capability,
                         supports_openai_form_elicitation,
                         tool_catalog_revision: Arc::clone(&tool_catalog_revision),
+                        connection_generation,
                         discover_tools,
                     },
                 )
@@ -498,7 +598,9 @@ pub(crate) struct AsyncManagedClient {
     pub(crate) cached_server_info: Option<McpServerInfo>,
     pub(crate) codex_apps_tools_cache_context: Option<CodexAppsToolsCacheContext>,
     pub(crate) tool_filter: ToolFilter,
+    managed_auth: Option<SharedAuthProvider>,
     pub(crate) startup_complete: Arc<AtomicBool>,
+    pub(crate) connection_generation: Arc<AtomicU64>,
     pub(crate) startup_reconnect: Option<Arc<CodexAppsStartupReconnect>>,
     pub(crate) tool_plugin_provenance: Arc<ToolPluginProvenance>,
     pub(crate) cancel_token: CancellationToken,
@@ -542,6 +644,7 @@ impl AsyncManagedClient {
             .configured_config()
             .map(ToolFilter::from_config)
             .unwrap_or_default();
+        let managed_auth = runtime_auth_provider.clone();
         let cached_server_info = if is_codex_apps_mcp_server {
             if let Some(context) = codex_apps_tools_cache_context.clone() {
                 tokio::task::spawn_blocking(move || {
@@ -559,6 +662,7 @@ impl AsyncManagedClient {
             None
         };
         let startup_complete = Arc::new(AtomicBool::new(false));
+        let connection_generation = Arc::new(AtomicU64::new(0));
         let startup = Arc::new(ManagedClientStartup {
             server_name,
             codex_home,
@@ -573,6 +677,7 @@ impl AsyncManagedClient {
             client_elicitation_capability,
             supports_openai_form_elicitation,
             tool_catalog_revision: Arc::clone(&tool_catalog_revision),
+            connection_generation: Arc::clone(&connection_generation),
             cancel_token: cancel_token.clone(),
             startup_complete: Arc::clone(&startup_complete),
             discover_tools,
@@ -587,6 +692,7 @@ impl AsyncManagedClient {
                         codex_apps_tools_cache_context.clone(),
                         tool_filter.clone(),
                         tool_catalog_revision,
+                        Arc::clone(&connection_generation),
                     )
                     .with_startup_status_context(
                         startup_submit_id,
@@ -613,6 +719,8 @@ impl AsyncManagedClient {
             codex_apps_tools_cache_context,
             tool_filter,
             startup_complete,
+            managed_auth,
+            connection_generation,
             startup_reconnect,
             tool_plugin_provenance,
             cancel_token,
@@ -663,17 +771,36 @@ impl AsyncManagedClient {
         let Some(startup_reconnect) = self.startup_reconnect.as_ref() else {
             return;
         };
-        if !self.startup_complete.load(Ordering::Acquire) {
+        if !self.startup_complete.load(Ordering::Acquire)
+            || self.cancel_token.is_cancelled()
+            || !self.managed_auth_scope_is_current()
+        {
             return;
         }
-        if matches!(self.client().await, Err(StartupOutcomeError::Failed { .. })) {
-            startup_reconnect.reconnect_in_background();
+        match self.client().await {
+            Ok(client)
+                if !client.client.is_healthy().await
+                    && !client.client.session_recovery_in_progress() =>
+            {
+                startup_reconnect.reconnect_in_background(Some(client.client));
+            }
+            Err(StartupOutcomeError::Failed { .. }) => {
+                startup_reconnect.reconnect_in_background(None);
+            }
+            _ => {}
         }
     }
 
     /// Calls to an advertised cached capability join the shared recovery, while
     /// catalog inspection remains nonblocking through `client` and cached tools.
     pub(crate) async fn client_for_operation(&self) -> Result<ManagedClient, StartupOutcomeError> {
+        if !self.managed_auth_scope_is_current() {
+            return Err(StartupOutcomeError::Failed {
+                error: "MCP authentication scope changed; rebuild the runtime".to_string(),
+                is_authentication_required: true,
+                is_timeout: false,
+            });
+        }
         self.reconnect_failed_startup().await;
         if let Some(pending_client) = self
             .startup_reconnect
@@ -728,8 +855,20 @@ impl AsyncManagedClient {
     }
 
     pub(crate) async fn listed_tools(&self) -> Option<Vec<ToolInfo>> {
+        if !self.managed_auth_scope_is_current() {
+            return None;
+        }
         // Keep cache payloads raw; plugin provenance is resolved per-session at read time.
-        let tools = if let Some(startup_tools) = self.cached_tools() {
+        let tools = if self.startup_complete.load(Ordering::Acquire) {
+            match self.client().await {
+                Ok(client) if client.client.is_healthy().await => {
+                    client.current_catalog()?;
+                    Some(client.listed_tools())
+                }
+                Ok(_) => None,
+                Err(_) => self.cached_tools(),
+            }
+        } else if let Some(startup_tools) = self.cached_tools() {
             Some(startup_tools)
         } else {
             match self.client().await {
@@ -745,6 +884,22 @@ impl AsyncManagedClient {
     }
 
     pub(crate) async fn tool_info(&self, tool_name: &str) -> Option<ToolInfo> {
+        if !self.managed_auth_scope_is_current() {
+            return None;
+        }
+        let catalog = if self.startup_complete.load(Ordering::Acquire) || !self.has_cached_tools() {
+            match self.client().await {
+                Ok(client) => {
+                    if !client.client.is_healthy().await {
+                        return None;
+                    }
+                    Some(client.current_catalog()?)
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
         let tool = if let Some(snapshot) = self
             .codex_apps_tools_cache_context
             .as_ref()
@@ -756,11 +911,8 @@ impl AsyncManagedClient {
                 .find(|tool| tool.tool.name == tool_name)
                 .cloned()
         } else {
-            self.client()
-                .await
-                .ok()?
+            catalog?
                 .tools
-                .load_full()
                 .iter()
                 .find(|tool| tool.tool.name == tool_name)
                 .cloned()
@@ -772,6 +924,18 @@ impl AsyncManagedClient {
             prepare_regular_mcp_tools_for_model(tools, &self.tool_plugin_provenance)
         };
         tools.into_iter().next()
+    }
+
+    pub(crate) fn managed_auth_scope_is_current(&self) -> bool {
+        if let Some(client) = self.startup_reconnect.as_ref()
+            .and_then(|reconnect| reconnect.current_client())
+        {
+            return client.client.managed_auth_scope_is_current();
+        }
+        if let Some(Ok(client)) = self.client.peek() {
+            return client.client.managed_auth_scope_is_current();
+        }
+        self.managed_auth.as_ref().is_none_or(|auth| auth.validate_auth_scope().is_ok())
     }
 }
 
@@ -1165,61 +1329,59 @@ fn spawn_tool_catalog_refresh_worker(
     is_codex_apps_mcp_server: bool,
     client: Weak<RmcpClient>,
     tool_timeout: Duration,
-    server_instructions: Option<String>,
-    server_info: McpServerInfo,
+    discover_tools: bool,
     tool_filter: ToolFilter,
     codex_apps_tools_cache_context: Option<CodexAppsToolsCacheContext>,
-    tools: Arc<ArcSwap<Vec<ToolInfo>>>,
+    catalog: Arc<ArcSwap<NegotiatedCatalog>>,
     tool_catalog_revision: Arc<AtomicU64>,
+    connection_generation: Arc<AtomicU64>,
     notifications: Receiver<()>,
 ) {
     tokio::spawn(async move {
         run_tool_catalog_refresh_worker(&server_name, notifications, || async {
             let client = client.upgrade()?;
             let list_start = Instant::now();
-            let fetch_ticket = codex_apps_tools_cache_context
-                .as_ref()
-                .map(|cache_context| {
-                    cache_context.begin_fetch(CodexAppsToolsFetchSource::HardRefresh)
-                });
-            let refresh: Result<Vec<ToolInfo>> = async {
-                let refreshed = list_tools_for_client_uncached(
-                    &server_name,
-                    is_codex_apps_mcp_server,
-                    /*codex_apps_refresh_trigger*/ "notification",
-                    &client,
-                    tool_timeout,
-                    server_instructions.as_deref(),
-                )
-                .await?;
+            let refresh: Result<()> = async {
+                let (generation, peer) = client.negotiated_session().await?;
+                let mut next = negotiated_catalog(generation, peer, discover_tools, Vec::new());
+                let fetch_ticket = codex_apps_tools_cache_context.as_ref()
+                    .map(|cache| cache.begin_fetch(CodexAppsToolsFetchSource::HardRefresh));
+                let refreshed = if next.server_supports_tools_capability {
+                    list_tools_for_client_uncached(
+                        &server_name, is_codex_apps_mcp_server, "notification",
+                        &client, tool_timeout, next.server_instructions.as_deref(),
+                    ).await?
+                } else {
+                    Vec::new()
+                };
+                // A late discovery from the replaced service cannot republish its
+                // tools or capability metadata into the current generation.
+                if client.session_generation() != generation || !client.managed_auth_scope_is_current() {
+                    return Err(anyhow!("MCP session changed during tool discovery"));
+                }
                 let refreshed = match (codex_apps_tools_cache_context.as_ref(), fetch_ticket) {
-                    (Some(cache_context), Some(fetch_ticket)) => {
-                        cache_context
-                            .publish_if_newest_accepted(fetch_ticket, &server_info, refreshed)
-                            .await
-                    }
+                    (Some(cache), Some(ticket)) => cache
+                        .publish_if_newest_accepted(ticket, &next.server_info, refreshed).await,
                     (None, None) => refreshed,
                     _ => unreachable!("Codex Apps fetch ticket requires cache context"),
                 };
-                Ok(filter_tools(refreshed, &tool_filter))
-            }
-            .await;
-
+                if client.session_generation() != generation || !client.managed_auth_scope_is_current() {
+                    return Err(anyhow!("MCP session changed during catalog publication"));
+                }
+                next.tools = filter_tools(refreshed, &tool_filter);
+                let session_changed = catalog.load().generation != generation;
+                catalog.store(Arc::new(next));
+                tool_catalog_revision.fetch_add(1, Ordering::AcqRel);
+                if session_changed {
+                    connection_generation.fetch_add(1, Ordering::AcqRel);
+                }
+                Ok(())
+            }.await;
             if is_codex_apps_mcp_server {
-                emit_duration(
-                    MCP_TOOLS_LIST_DURATION_METRIC,
-                    list_start.elapsed(),
-                    &[("cache", "miss")],
-                );
+                emit_duration(MCP_TOOLS_LIST_DURATION_METRIC, list_start.elapsed(), &[("cache", "miss")]);
             }
-            let commit = if codex_apps_tools_cache_context.is_some() {
-                refresh.map(|_| ())
-            } else {
-                commit_tool_catalog_refresh(&tools, &tool_catalog_revision, refresh)
-            };
-            Some(commit)
-        })
-        .await;
+            Some(refresh)
+        }).await;
     });
 }
 
@@ -1267,20 +1429,6 @@ async fn run_tool_catalog_refresh_worker<F, Fut>(
             }
         }
     }
-}
-
-pub(crate) fn commit_tool_catalog_refresh(
-    tools: &Arc<ArcSwap<Vec<ToolInfo>>>,
-    tool_catalog_revision: &AtomicU64,
-    refresh: Result<Vec<ToolInfo>>,
-) -> Result<()> {
-    let refreshed = refresh?;
-    if tools.load_full().as_ref() == &refreshed {
-        return Ok(());
-    }
-    tools.store(Arc::new(refreshed));
-    tool_catalog_revision.fetch_add(1, Ordering::AcqRel);
-    Ok(())
 }
 
 fn advance_tool_catalog_revision_if_changed(
@@ -1337,6 +1485,7 @@ async fn start_server_task(
         client_elicitation_capability,
         supports_openai_form_elicitation,
         tool_catalog_revision,
+        connection_generation,
         discover_tools,
     } = params;
     let params = mcp_initialize_request_params(
@@ -1347,8 +1496,19 @@ async fn start_server_task(
     let send_elicitation = elicitation_requests.make_sender(server_name.clone(), tx_event.clone());
     let send_progress = make_progress_sender(tx_event);
     let (tool_list_changed_tx, tool_list_changed_rx) = async_channel::bounded(1);
+    let weak_client = Arc::downgrade(&client);
+    let changed_generation = Arc::clone(&connection_generation);
+    let changed_revision = Arc::clone(&tool_catalog_revision);
+    let observed_session = Arc::new(AtomicU64::new(1));
     let send_tool_list_changed: SendToolListChanged = Box::new(move || {
         let tool_list_changed_tx = tool_list_changed_tx.clone();
+        if let Some(client) = weak_client.upgrade() {
+            let generation = client.session_generation();
+            if generation != 0 && observed_session.swap(generation, Ordering::AcqRel) != generation {
+                changed_generation.fetch_add(1, Ordering::AcqRel);
+                changed_revision.fetch_add(1, Ordering::AcqRel);
+            }
+        }
         async move {
             let _ = tool_list_changed_tx.try_send(());
         }
@@ -1404,35 +1564,41 @@ async fn start_server_task(
     if !server_supports_tools_capability {
         tool_catalog_revision.fetch_add(1, Ordering::AcqRel);
     }
-    let tools = Arc::new(ArcSwap::from_pointee(tools));
+    let catalog = Arc::new(ArcSwap::from_pointee(NegotiatedCatalog {
+        generation: 1,
+        tools,
+        server_info,
+        server_instructions,
+        server_supports_sandbox_state_meta_capability,
+        server_supports_resources_capability,
+        server_supports_tools_capability,
+    }));
 
-    if server_supports_tools_capability {
+    {
         spawn_tool_catalog_refresh_worker(
             server_name.clone(),
             is_codex_apps_mcp_server,
             Arc::downgrade(&client),
             tool_timeout,
-            server_instructions.clone(),
-            server_info.clone(),
+            discover_tools,
             tool_filter.clone(),
             codex_apps_tools_cache_context.clone(),
-            Arc::clone(&tools),
+            Arc::clone(&catalog),
             tool_catalog_revision,
+            Arc::clone(&connection_generation),
             tool_list_changed_rx,
         );
     }
 
     let managed = ManagedClient {
         client: Arc::clone(&client),
-        server_info,
-        tools,
+        catalog,
         tool_timeout,
         tool_filter,
-        server_instructions,
-        server_supports_sandbox_state_meta_capability,
-        server_supports_resources_capability,
         codex_apps_tools_cache_context,
     };
+
+    connection_generation.fetch_add(1, Ordering::AcqRel);
 
     Ok(managed)
 }
@@ -1483,6 +1649,7 @@ struct StartServerTaskParams {
     client_elicitation_capability: ElicitationCapability,
     supports_openai_form_elicitation: bool,
     tool_catalog_revision: Arc<AtomicU64>,
+    connection_generation: Arc<AtomicU64>,
     discover_tools: bool,
 }
 

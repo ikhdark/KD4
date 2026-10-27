@@ -31,6 +31,20 @@ use tokio::sync::watch;
 
 const TOOL_HISTORY_JOURNAL_COMPACTION_RECORDS: u64 = 128;
 const TOOL_HISTORY_JOURNAL_COMPACTION_BYTES: u64 = 1024 * 1024;
+const TOOL_HISTORY_PENDING_COMMANDS: usize = 128;
+const TOOL_HISTORY_PENDING_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Default)]
+struct ToolHistoryByteCounter(usize);
+
+impl std::io::Write for ToolHistoryByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
 
 fn coordination_startup_result(
     source: &SessionSource,
@@ -58,6 +72,19 @@ enum ToolHistoryPersistenceCommand {
     },
 }
 
+impl ToolHistoryPersistenceCommand {
+    fn retained_bytes(&self) -> usize {
+        let mut counter = ToolHistoryByteCounter::default();
+        let result = match self {
+            Self::Mutation(mutation) => serde_json::to_writer(&mut counter, mutation),
+            Self::ReplaceSnapshot { snapshot, .. } => serde_json::to_writer(&mut counter, snapshot),
+            Self::Checkpoint => return std::mem::size_of::<Self>(),
+        };
+        if result.is_err() { return usize::MAX; }
+        counter.0.saturating_add(std::mem::size_of::<Self>())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ToolHistoryPersistenceEnqueueError {
     SequenceOverflow,
@@ -81,12 +108,16 @@ struct PendingToolHistoryPersistence {
     sequence: u64,
     command: ToolHistoryPersistenceCommand,
     description: &'static str,
+    retained_bytes: usize,
 }
 
 #[derive(Default)]
 struct ToolHistoryPersistenceState {
     next_sequence: u64,
     pending: Vec<PendingToolHistoryPersistence>,
+    // Includes the worker's active batch, not just the pending Vec.
+    resident_commands: usize,
+    resident_bytes: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -144,6 +175,7 @@ pub(super) struct ToolHistoryPersistenceQueue {
     state: Arc<tokio::sync::Mutex<ToolHistoryPersistenceState>>,
     wake_tx: mpsc::Sender<()>,
     progress: watch::Receiver<ToolHistoryPersistenceProgress>,
+    progress_tx: watch::Sender<ToolHistoryPersistenceProgress>,
     mirror: Arc<tokio::sync::Mutex<crate::tool_history::ToolHistoryState>>,
     _worker: Arc<ToolHistoryPersistenceWorker>,
 }
@@ -214,6 +246,7 @@ impl ToolHistoryPersistenceQueue {
         // Multiple enqueues can share a wakeup because the worker drains the batch.
         let (wake_tx, mut wake_rx) = mpsc::channel(/*buffer*/ 1);
         let (progress_tx, progress) = watch::channel(ToolHistoryPersistenceProgress::default());
+        let queue_progress_tx = progress_tx.clone();
         let shutdown = tokio_util::sync::CancellationToken::new();
         let worker_shutdown = shutdown.clone();
         let stopped = tokio_util::sync::CancellationToken::new();
@@ -252,6 +285,10 @@ impl ToolHistoryPersistenceQueue {
                     let Some(completed) = requests.last().map(|request| request.sequence) else {
                         break;
                     };
+                    let request_count = requests.len();
+                    let request_bytes = requests.iter().fold(0_usize, |bytes, request| {
+                        bytes.saturating_add(request.retained_bytes)
+                    });
                     let permit = tokio::select! {
                         biased;
                         _ = worker_shutdown.cancelled() => {
@@ -405,6 +442,11 @@ impl ToolHistoryPersistenceQueue {
                     // Never cancel an active persistence future: it may own a
                     // blocking writer. Release serialization only after it ends.
                     drop(permit);
+                    {
+                        let mut state = worker_state.lock().await;
+                        state.resident_commands = state.resident_commands.saturating_sub(request_count);
+                        state.resident_bytes = state.resident_bytes.saturating_sub(request_bytes);
+                    }
                     if let Some(error) = failure {
                         progress.failure = Some((completed, error));
                     } else {
@@ -422,6 +464,7 @@ impl ToolHistoryPersistenceQueue {
             state,
             wake_tx,
             progress,
+            progress_tx: queue_progress_tx,
             mirror,
             _worker: Arc::new(ToolHistoryPersistenceWorker {
                 shutdown,
@@ -432,9 +475,34 @@ impl ToolHistoryPersistenceQueue {
     }
 
     pub(super) async fn writer(&self) -> ToolHistoryPersistenceWriter<'_> {
-        ToolHistoryPersistenceWriter {
-            state: self.state.lock().await,
-            wake_tx: &self.wake_tx,
+        let mut progress = self.progress.clone();
+        loop {
+            let state = self.state.lock().await;
+            if (state.resident_commands < TOOL_HISTORY_PENDING_COMMANDS
+                && state.resident_bytes < TOOL_HISTORY_PENDING_BYTES)
+                || self.wake_tx.is_closed()
+            {
+                return ToolHistoryPersistenceWriter {
+                    state,
+                    wake_tx: &self.wake_tx,
+                    progress_tx: &self.progress_tx,
+                };
+            }
+            // Never hold queue/session state or I/O admission while waiting.
+            // A single oversized command is accepted intact; it stops further
+            // admission until its batch settles instead of dropping evidence.
+            drop(state);
+            let stopped = tokio::select! {
+                result = progress.changed() => result.is_err(),
+                _ = self._worker.stopped.cancelled() => true,
+            };
+            if stopped {
+                return ToolHistoryPersistenceWriter {
+                    state: self.state.lock().await,
+                    wake_tx: &self.wake_tx,
+                    progress_tx: &self.progress_tx,
+                };
+            }
         }
     }
 
@@ -491,10 +559,18 @@ impl ToolHistoryPersistenceQueue {
                     return Err(error.clone());
                 }
             }
-            progress
-                .changed()
-                .await
-                .map_err(|_| ToolHistoryPersistenceError::WorkerClosed)?;
+            tokio::select! {
+                result = progress.changed() => {
+                    result.map_err(|_| ToolHistoryPersistenceError::WorkerClosed)?;
+                }
+                _ = self._worker.stopped.cancelled() => {
+                    return if progress.borrow().completed_sequence >= target_sequence {
+                        Ok(())
+                    } else {
+                        Err(ToolHistoryPersistenceError::WorkerClosed)
+                    };
+                }
+            }
         }
     }
 
@@ -511,6 +587,7 @@ impl ToolHistoryPersistenceQueue {
 pub(super) struct ToolHistoryPersistenceWriter<'a> {
     state: tokio::sync::MutexGuard<'a, ToolHistoryPersistenceState>,
     wake_tx: &'a mpsc::Sender<()>,
+    progress_tx: &'a watch::Sender<ToolHistoryPersistenceProgress>,
 }
 
 impl<'queue> ToolHistoryPersistenceWriter<'queue> {
@@ -566,15 +643,24 @@ impl<'queue> ToolHistoryPersistenceWriter<'queue> {
         }
         let sequence = next_tool_history_persistence_sequence(self.state.next_sequence)
             .ok_or(ToolHistoryPersistenceEnqueueError::SequenceOverflow)?;
+        let retained_bytes = command.retained_bytes();
         self.state.next_sequence = sequence;
+        self.state.resident_commands = self.state.resident_commands.saturating_add(1);
+        self.state.resident_bytes = self.state.resident_bytes.saturating_add(retained_bytes);
         self.state.pending.push(PendingToolHistoryPersistence {
             sequence,
             command,
             description,
+            retained_bytes,
         });
         match self.wake_tx.try_send(()) {
             Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {}
             Err(mpsc::error::TrySendError::Closed(())) => {
+                let _ = self.state.pending.pop();
+                self.state.next_sequence = sequence - 1;
+                self.state.resident_commands = self.state.resident_commands.saturating_sub(1);
+                self.state.resident_bytes = self.state.resident_bytes.saturating_sub(retained_bytes);
+                self.progress_tx.send_modify(|_| {});
                 return Err(ToolHistoryPersistenceEnqueueError::WorkerClosed);
             }
         }
@@ -601,10 +687,14 @@ impl ToolHistorySnapshotReservation<'_, '_> {
 impl Drop for ToolHistorySnapshotReservation<'_, '_> {
     fn drop(&mut self) {
         if !self.committed {
-            self.writer
-                .state
-                .pending
-                .retain(|request| request.sequence != self.sequence);
+            if let Some(index) = self.writer.state.pending.iter()
+                .position(|request| request.sequence == self.sequence)
+            {
+                let request = self.writer.state.pending.remove(index);
+                self.writer.state.resident_commands = self.writer.state.resident_commands.saturating_sub(1);
+                self.writer.state.resident_bytes = self.writer.state.resident_bytes.saturating_sub(request.retained_bytes);
+                self.writer.progress_tx.send_modify(|_| {});
+            }
             self.writer.state.next_sequence = self.prior_sequence;
         }
     }
@@ -656,6 +746,8 @@ pub(crate) struct Session {
     pub(crate) submission_preparation_slots: Arc<Semaphore>,
     /// Stores reserved-ID admissions without keeping a mutex guard across startup awaits.
     pub(crate) task_start_state: Mutex<TaskStartState>,
+    pub(crate) input_receipt_gate: Mutex<()>,
+    pub(super) volatile_input_receipts: super::input_receipts::VolatileInputReceipts,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     /// Correlated pre-turn startup phases, frozen at the first model send.
     pub(crate) startup_timing: Arc<StartupTimingState>,
@@ -706,7 +798,8 @@ pub(crate) struct Session {
 
 #[derive(Default)]
 pub(crate) struct TaskStartState {
-    pub(crate) pending_start_only_admissions: HashMap<String, oneshot::Sender<CodexResult<()>>>,
+    pub(crate) pending_start_only_admissions:
+        HashMap<String, (oneshot::Sender<CodexResult<()>>, CancellationToken)>,
 }
 
 #[derive(Clone)]
@@ -1556,7 +1649,8 @@ impl Session {
         let mut runtime_init = SessionRuntimeInitGuard::default();
         let session_result: anyhow::Result<Arc<Self>> = async {
             let mut coordination_ready = true;
-            if initial_multi_agent_version == Some(MultiAgentVersion::V2)
+            if !config.ephemeral
+                && initial_multi_agent_version == Some(MultiAgentVersion::V2)
                 && let Some(state_runtime) = state_db_ctx.as_ref()
             {
                 coordination_ready = coordination_startup_result(
@@ -1567,7 +1661,10 @@ impl Session {
                         .await,
                 )?;
             }
-            if config.features.enabled(Feature::Kd4Runtime) && coordination_ready {
+            if !config.ephemeral
+                && config.features.enabled(Feature::Kd4Runtime)
+                && coordination_ready
+            {
                 let coordinator = agent_control.task_coordinator();
                 coordination_startup_result(
                     &session_configuration.session_source,
@@ -1577,6 +1674,7 @@ impl Session {
                             config.sqlite_home.clone(),
                             config.model_provider_id.clone(),
                             session_id.to_string(),
+                            config.ephemeral,
                         )
                         .await,
                 )?;
@@ -1997,6 +2095,8 @@ impl Session {
                 pending_work_retry: Default::default(),
                 submission_preparation_slots: Arc::new(Semaphore::new(SUBMISSION_CHANNEL_CAPACITY)),
                 task_start_state: Mutex::new(TaskStartState::default()),
+                input_receipt_gate: Mutex::new(()),
+                volatile_input_receipts: Default::default(),
                 active_turn: Mutex::new(None),
                 startup_timing: Arc::clone(&startup_timing),
                 startup_cancellation: CancellationToken::new(),
@@ -2070,9 +2170,7 @@ impl Session {
                 *cancel_guard = cancel_token.clone();
                 cancel_token
             };
-            let codex_apps_auth_manager =
-                codex_mcp::host_owned_codex_apps_enabled(&mcp_projection.config, auth)
-                    .then(|| Arc::clone(&sess.services.auth_manager));
+            let codex_apps_auth_manager = Some(Arc::clone(&sess.services.auth_manager));
             let elicitation_router = codex_mcp::ElicitationRequestRouter::default();
             let _startup_route = elicitation_router.startup_route(thread_id);
             let mcp_connection_manager = McpConnectionManager::new(

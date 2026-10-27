@@ -48,7 +48,10 @@ pub struct PluginInstallResult {
 }
 
 #[derive(Debug)]
-pub(crate) struct PendingPluginInstall {
+pub(crate) struct PendingPluginInstall<G = ()> {
+    // Keep publication authority through commit/rollback, but release it before
+    // transaction-directory cleanup recursively removes the previous root.
+    _publication_guard: G,
     result: PluginInstallResult,
     target_root: PathBuf,
     staged_root: PathBuf,
@@ -61,7 +64,7 @@ pub(crate) struct PendingPluginInstall {
     _entry_lock: fs::File,
 }
 
-impl PendingPluginInstall {
+impl<G> PendingPluginInstall<G> {
     pub(crate) fn result(&self) -> &PluginInstallResult {
         &self.result
     }
@@ -104,7 +107,7 @@ impl PendingPluginInstall {
     }
 }
 
-impl Drop for PendingPluginInstall {
+impl<G> Drop for PendingPluginInstall<G> {
     fn drop(&mut self) {
         if self.committed {
             return;
@@ -439,11 +442,27 @@ impl PluginStore {
         plugin_id: PluginId,
         plugin_version: String,
     ) -> Result<PendingPluginInstall, PluginStoreError> {
+        self.begin_install_with_version_and_publication_guard(
+            source_path,
+            plugin_id,
+            plugin_version,
+            || Ok(()),
+        )
+    }
+
+    pub(crate) fn begin_install_with_version_and_publication_guard<G>(
+        &self,
+        source_path: AbsolutePathBuf,
+        plugin_id: PluginId,
+        plugin_version: String,
+        before_publication: impl FnOnce() -> Result<G, PluginStoreError>,
+    ) -> Result<PendingPluginInstall<G>, PluginStoreError> {
         self.begin_install_with_version_and_manifest(
             source_path,
             plugin_id,
             plugin_version,
             InstallManifest::OnDisk,
+            before_publication,
         )
     }
 
@@ -475,6 +494,7 @@ impl PluginStore {
             plugin_id,
             plugin_version,
             InstallManifest::Fallback(manifest_contents),
+            || Ok(()),
         )
     }
 
@@ -491,16 +511,18 @@ impl PluginStore {
             plugin_id,
             plugin_version,
             manifest,
+            || Ok(()),
         )
     }
 
-    fn begin_install_with_version_and_manifest(
+    fn begin_install_with_version_and_manifest<G>(
         &self,
         source_path: AbsolutePathBuf,
         plugin_id: PluginId,
         plugin_version: String,
         manifest: InstallManifest<'_>,
-    ) -> Result<PendingPluginInstall, PluginStoreError> {
+        before_publication: impl FnOnce() -> Result<G, PluginStoreError>,
+    ) -> Result<PendingPluginInstall<G>, PluginStoreError> {
         if !source_path.as_path().is_dir() {
             return Err(PluginStoreError::Invalid(format!(
                 "plugin source path is not a directory: {}",
@@ -528,6 +550,7 @@ impl PluginStore {
                 plugin_version: plugin_version.clone(),
                 installed_path,
             },
+            before_publication,
         )
     }
 
@@ -731,13 +754,14 @@ pub(crate) fn try_lock_plugin_cache_entry(target_root: &Path) -> io::Result<fs::
     Ok(file)
 }
 
-fn replace_plugin_root_atomically(
+fn replace_plugin_root_atomically<G>(
     source: &Path,
     target_root: &Path,
     plugin_version: &str,
     manifest: InstallManifest<'_>,
     result: PluginInstallResult,
-) -> Result<PendingPluginInstall, PluginStoreError> {
+    before_publication: impl FnOnce() -> Result<G, PluginStoreError>,
+) -> Result<PendingPluginInstall<G>, PluginStoreError> {
     let Some(parent) = target_root.parent() else {
         return Err(PluginStoreError::Invalid(format!(
             "plugin cache path has no parent: {}",
@@ -792,6 +816,9 @@ fn replace_plugin_root_atomically(
     let publication_id = publication_id.to_string_lossy().into_owned();
     fs::write(staged_root.join(".codex-install-owner"), &publication_id)
         .map_err(|err| PluginStoreError::io("failed to identify staged plugin publication", err))?;
+    // Downloads, extraction and source copying do not hold snapshot authority.
+    // Revalidate only after staging, while the per-entry lock is still owned.
+    let publication_guard = before_publication()?;
     let backup_root = target_root
         .exists()
         .then(|| staged_dir.path().join("previous-plugin-root"));
@@ -801,6 +828,7 @@ fn replace_plugin_root_atomically(
     }
 
     let mut transaction = PendingPluginInstall {
+        _publication_guard: publication_guard,
         result,
         target_root: target_root.to_path_buf(),
         staged_root,

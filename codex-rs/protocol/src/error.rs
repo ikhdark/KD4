@@ -388,11 +388,12 @@ impl std::fmt::Display for ConnectionFailedError {
     }
 }
 
-/// Explicit provider rejection proves the request was not accepted for sampling.
+/// A provider rejection or local before-write refusal proves no sampling was accepted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WebsocketRecoveryReason {
     PreviousResponseNotFound,
     ConnectionLimitReached,
+    ConnectionClosedBeforeDispatch,
 }
 
 #[derive(Debug, Default)]

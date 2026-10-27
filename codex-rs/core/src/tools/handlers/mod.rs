@@ -78,6 +78,7 @@ pub use mcp_resource::ReadMcpResourceHandler;
 pub use plan::PlanHandler;
 pub(crate) use read_file::ReadFileHandler;
 pub(crate) use read_file::ReadStatusHandler;
+pub(crate) use read_file::compilation_module_paths;
 pub(crate) use read_file::canonical_read_file_arguments;
 pub(crate) use read_file::current_file_fingerprint;
 

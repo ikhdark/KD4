@@ -161,6 +161,13 @@ async fn handle_spawn_agent(
         ..
     } = invocation;
     let turn = Arc::clone(&step_context.turn);
+    // Enforce persistence intent even for a stale/deferred tool invocation,
+    // before reservations, task admission, capsules or worktrees can be created.
+    if turn.config.ephemeral {
+        return Err(FunctionCallError::RespondToModel(
+            "spawn_agent: unavailable in ephemeral sessions because task coordination requires disk persistence; no agent was started".to_string(),
+        ));
+    }
     let arguments = function_arguments(payload)?;
     let mut args: SpawnAgentArgs = parse_arguments(&arguments)?;
     // Reject the canonical lexical domain before configuration, environment
@@ -169,11 +176,6 @@ async fn handle_spawn_agent(
         .join(&args.task_name)
         .map_err(FunctionCallError::RespondToModel)?;
     args.validate_generic()?;
-    if turn.session_source.is_non_root_agent() && args.assignment.is_some() {
-        return Err(FunctionCallError::RespondToModel(
-            "spawn_agent: durable typed assignments are root-only".to_string(),
-        ));
-    }
     // Keep the historical Worker tag for durable-record compatibility. New
     // subagents all have the same runtime profile; this is not a role selector.
     let typed_role = AgentRole::Worker;
@@ -209,24 +211,9 @@ async fn handle_spawn_agent(
             return Err(FunctionCallError::RespondToModel("CSV workers cannot spawn nested agents until structured ancestry is supported; ask the root agent to delegate".into()));
         }
         let coordinator = session.services.agent_control.task_coordinator();
-        match coordinator.binding_for_turn(&turn) {
-            Some(binding) => {
-                let parent = coordinator
-                    .get_agent_task(binding.assignment_id, Some(0))
-                    .await
-                    .map_err(typed_task_store_error)?;
-                if !matches!(
-                    parent.assignment.admission_origin,
-                    AssignmentAdmissionOrigin::LegacyMessage { .. }
-                ) {
-                    return Err(FunctionCallError::RespondToModel(
-                        "spawn_agent: explicitly typed agents cannot spawn subagents".to_string(),
-                    ));
-                }
-                Some(binding.assignment_id)
-            }
-            None => None,
-        }
+        coordinator
+            .binding_for_turn(&turn)
+            .map(|binding| binding.assignment_id)
     } else {
         None
     };
@@ -362,6 +349,7 @@ async fn handle_spawn_agent(
                     config.sqlite_home.clone(),
                     config.model_provider_id.clone(),
                     session.services.agent_control.session_id().to_string(),
+                    config.ephemeral,
                 )
                 .await
                 .map_err(typed_task_store_error)?;
@@ -399,7 +387,6 @@ async fn handle_spawn_agent(
                 &session.terminal_tasks,
             ))
             .await?;
-            let previous_cwd = config.cwd.clone();
             config.cwd = match AbsolutePathBuf::from_absolute_path(&workspace.path) {
                 Ok(path) => path,
                 Err(error) => {
@@ -416,11 +403,9 @@ async fn handle_spawn_agent(
                 }
             };
             let mut roots = config.workspace_roots.clone();
-            for root in &mut roots {
-                if root == &previous_cwd {
-                    *root = config.cwd.clone();
-                }
-            }
+            // Isolation changes the working directory, not inherited authority.
+            // Keep root's workspace permissions and add the worker's worktree.
+            roots.push(config.cwd.clone());
             let mut seen = HashSet::new();
             roots.retain(|root| seen.insert(root.clone()));
             config.workspace_roots = roots.clone();
@@ -629,6 +614,7 @@ async fn handle_spawn_agent(
         fork_parent_spawn_call_id: fork_mode.as_ref().map(|_| call_id.clone()),
         fork_mode,
         parent_thread_id: Some(session.thread_id),
+        parent_turn_id: Some(turn.sub_id.clone()),
         environments: spawn_environments,
         captured_environments: Some(step_context.environments.clone()),
         typed_task_binding: typed_task.as_ref().map(|(assignment, attempt, _)| {

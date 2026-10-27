@@ -8,6 +8,7 @@ pub use powershell_parser::PowershellDirectArgvCandidate;
 pub use powershell_parser::PowershellAnalysisScope;
 pub(crate) use powershell_parser::PowershellResolutionState;
 pub(crate) use powershell_parser::is_trusted_powershell_host;
+pub(crate) use powershell_parser::trusted_powershell_host_path;
 pub use powershell_parser::powershell_command_has_syntax_error;
 pub use powershell_parser::powershell_command_syntax_error;
 pub use powershell_parser::prewarm_powershell_parser;

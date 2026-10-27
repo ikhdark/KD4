@@ -66,6 +66,14 @@ pub(crate) use wait_handler::NESTED_DEFAULT_POLL;
 
 pub(crate) const PUBLIC_TOOL_NAME: &str = codex_code_mode::PUBLIC_TOOL_NAME;
 pub(crate) const WAIT_TOOL_NAME: &str = codex_code_mode::WAIT_TOOL_NAME;
+/// Receipt custody remains with the broker until the carrier's owned history
+/// commit has published its result. Formatting is not an acknowledgment.
+#[derive(Debug)]
+pub(crate) struct PendingContinuationAcknowledgment {
+    pub(crate) owner_key: String,
+    pub(crate) receipts: Vec<codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt>,
+}
+
 const FAILED_CELL_ITEM_NAMESPACE: &str = "codex.internal";
 const FAILED_CELL_ITEM_TOOL: &str = "code_mode_cell";
 /// Essential-inline marker: the model-visible packet omits output that the
@@ -1685,6 +1693,15 @@ impl CodeModeService {
 
 fn refresh_ready_command_states(exec: &ExecContext, packet: &mut CodeModePacketReceipt) {
     use codex_tools::ToolOutput;
+    let hook_name = crate::tools::hook_names::HookToolName::exec_command();
+    if !exec.session.hooks()
+        .plan_post_tool_use(hook_name.name(), hook_name.matcher_aliases())
+        .is_empty()
+    {
+        // A first terminal observation must run the original command's hook
+        // through write_stdin's lifecycle. Ready-only projection cannot own it.
+        return;
+    }
     for state in &mut packet.command_states {
         let Some(process_id) = state["session_id"].as_u64().and_then(|id| u32::try_from(id).ok()) else { continue; };
         let Some(incarnation) = state.pointer("/session_capabilities/incarnation")
@@ -1939,7 +1956,6 @@ pub(super) fn handle_runtime_response(
             .into_iter()
             .map(|continuation| continuation.receipt)
             .collect::<Vec<_>>();
-        service.acknowledge_owner_drained_continuations(&completed_cell_id, &receipts);
         output.deterministic_continuation_receipts.extend(receipts);
     }
     output.body.extend(command_control_receipts(

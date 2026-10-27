@@ -142,6 +142,9 @@ pub(crate) fn final_message_from_turn_items(items: &[ThreadItem]) -> Option<Stri
 }
 
 fn final_message_candidate(item: &ThreadItem) -> Option<(&str, u8)> {
+    if matches!(item, ThreadItem::AgentMessage { interruption: Some(_), .. }) {
+        return None;
+    }
     use codex_protocol::models::MessagePhase;
     match item {
         ThreadItem::AgentMessage {

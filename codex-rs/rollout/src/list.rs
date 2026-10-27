@@ -564,8 +564,20 @@ async fn get_threads_in_root_by_summary(
             items, next_cursor, num_scanned_files: scanned_files, reached_scan_cap: false,
         });
     }
+    // A full RecencyAt scan must not evict still-unvisited cached summaries.
+    // This is only a work-order hint: build_thread_item revalidates each input.
+    let hinted_paths = if sort_key == ThreadSortKey::RecencyAt {
+        crate::metadata::cached_summary_paths(config.default_provider)
+    } else {
+        HashSet::new()
+    };
+    let (preferred, deferred): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .enumerate()
+        .partition(|(_, candidate)| hinted_paths.contains(&candidate.path));
+    drop(hinted_paths);
     let mut keyed_items = Vec::new();
-    for candidate in candidates {
+    for (ordinal, candidate) in preferred.into_iter().chain(deferred) {
         let updated_at = candidate.updated_at.and_then(format_rfc3339);
         let Some(item) = build_thread_item(
             candidate.path,
@@ -601,9 +613,10 @@ async fn get_threads_in_root_by_summary(
         }) {
             continue;
         }
-        keyed_items.push((key, item));
+        keyed_items.push((key, ordinal, item));
     }
-    keyed_items.sort_by_key(|(key, _)| *key);
+    // Preserve the original stable tie order despite reordered hydration.
+    keyed_items.sort_by_key(|(key, ordinal, _)| (*key, *ordinal));
     if !ascending {
         keyed_items.reverse();
     }
@@ -612,7 +625,7 @@ async fn get_threads_in_root_by_summary(
     keyed_items.truncate(page_size);
     let items = keyed_items
         .into_iter()
-        .map(|(_, item)| item)
+        .map(|(_, _, item)| item)
         .collect::<Vec<_>>();
     let next_cursor = more_matches_available
         .then(|| build_next_cursor(&items, sort_key))

@@ -185,7 +185,15 @@ impl AgentTaskCoordinator {
         sqlite_home: PathBuf,
         default_provider: String,
         root_session_id: String,
+        ephemeral: bool,
     ) -> StoreResult<()> {
+        // A missing session state runtime can mean intentionally nonpersistent,
+        // not permission to create a separate disk-backed coordination owner.
+        if ephemeral {
+            return Err(StoreError::InvalidAssignment(
+                "ephemeral sessions cannot initialize durable task coordination".to_string(),
+            ));
+        }
         let state_runtime = match state_runtime {
             Some(state_runtime) => state_runtime,
             None => self

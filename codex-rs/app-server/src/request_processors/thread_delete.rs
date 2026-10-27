@@ -88,6 +88,12 @@ impl ThreadRequestProcessor {
             }
         }
 
+        // Keep addressable runtime ownership while shutdown is uncertain. No
+        // durable deletion (including staging) may precede this subtree barrier.
+        for thread_id_to_delete in delete_order.iter().copied() {
+            self.quiesce_thread_for_removal(thread_id_to_delete).await?;
+        }
+
         if let Some(local_store) = self
             .thread_store
             .as_any()
@@ -241,7 +247,7 @@ impl ThreadRequestProcessor {
     }
 
     async fn prepare_thread_for_delete(&self, thread_id: ThreadId) {
-        self.prepare_thread_for_removal(thread_id, "delete").await;
+        self.prepare_thread_for_removal(thread_id).await;
     }
 }
 

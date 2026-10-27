@@ -205,6 +205,8 @@ pub struct Prompt {
 
     /// Keep schemas stable while forbidding calls on a terminal continuation.
     pub(crate) tool_calls_disabled: bool,
+    /// One explicitly selected soft-limit deferral; never bypasses the hard window.
+    pub(crate) soft_limit_waiver: bool,
 
     pub base_instructions: BaseInstructions,
 
@@ -236,6 +238,7 @@ impl Default for Prompt {
             tools: Arc::new(ToolSchemaArtifact::default()),
             parallel_tool_calls: false,
             tool_calls_disabled: false,
+            soft_limit_waiver: false,
             base_instructions: BaseInstructions::default(),
             output_schema: None,
             output_schema_strict: true,

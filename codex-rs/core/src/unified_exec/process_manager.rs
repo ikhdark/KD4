@@ -372,6 +372,7 @@ pub(super) struct PendingProcessCleanup {
     process_store: std::sync::Weak<tokio::sync::Mutex<ProcessStore>>,
     session: std::sync::Weak<crate::session::session::Session>,
     cleanup_owners: std::sync::Weak<PendingProcessCleanupOwners>,
+    reconciliation_started: Arc<AtomicBool>,
     attempt_key: crate::tools::command_execution::CommandAttemptKey,
     process_id: u32,
     processes: Vec<PendingProcessToTerminate>,
@@ -472,6 +473,7 @@ impl PendingProcessRegistration {
             process_store: Arc::downgrade(&self.process_store),
             session: Arc::downgrade(&self.session),
             cleanup_owners: Arc::downgrade(&self.cleanup_owners),
+            reconciliation_started: Arc::new(AtomicBool::new(false)),
             attempt_key: self.attempt_key.clone(),
             process_id: self.process_id,
             processes,
@@ -607,7 +609,14 @@ async fn drain_pending_process_cleanups(
 }
 
 async fn run_pending_process_cleanup(cleanup: Arc<PendingProcessCleanup>) {
-    match cleanup_pending_process_registration(&cleanup).await {
+    // Shutdown may discover the same retained payload as the Drop-owned runner.
+    // Only one runner may reconcile/release its reservation, including after reuse.
+    if cleanup.reconciliation_started.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let mut backoff = Duration::from_millis(100);
+    loop {
+        match cleanup_pending_process_registration(&cleanup).await {
         Ok(()) => {
             if let Some(owners) = cleanup.cleanup_owners.upgrade() {
                 owners
@@ -615,9 +624,18 @@ async fn run_pending_process_cleanup(cleanup: Arc<PendingProcessCleanup>) {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .retain(|owner| !Arc::ptr_eq(owner, &cleanup));
             }
+            return;
         }
-        Err(error) => tracing::error!(%error, process_id = cleanup.process_id,
-            "retaining cancelled unified exec startup after unconfirmed cleanup"),
+        Err(error) => {
+            tracing::error!(%error, process_id = cleanup.process_id,
+                retry_after_ms = backoff.as_millis(),
+                "retaining cancelled unified exec startup for cleanup reconciliation");
+            // The retained owner and exact process identities survive each retry.
+            // No process-store guard is held while terminating or sleeping.
+            tokio::time::sleep(backoff).await;
+            backoff = backoff.saturating_mul(2).min(Duration::from_secs(5));
+        }
+        }
     }
 }
 
@@ -2518,6 +2536,7 @@ impl UnifiedExecProcessManager {
                             .create_exec_approval_requirement_for_command(ExecApprovalRequest {
                                 command: proof.command_for_policy(),
                                 command_for_safety: None,
+                                execution_context: request.normalization_cwd.as_deref().map(|cwd| (cwd, &env)),
                                 approval_policy: context.turn.approval_policy.value(),
                                 permission_profile: context.turn.permission_profile(),
                                 windows_sandbox_level: context.turn.windows_sandbox_level,
@@ -2538,6 +2557,7 @@ impl UnifiedExecProcessManager {
         let exec_approval_request = ExecApprovalRequest {
             command: &request.command,
             command_for_safety: Some(&request.command_for_safety),
+            execution_context: request.normalization_cwd.as_deref().map(|cwd| (cwd, &env)),
             approval_policy: context.turn.approval_policy.value(),
             permission_profile: context.turn.permission_profile(),
             windows_sandbox_level: context.turn.windows_sandbox_level,
@@ -2602,6 +2622,7 @@ impl UnifiedExecProcessManager {
         let req = UnifiedExecToolRequest {
             command: request.command.clone(),
             command_for_approval: request.command_for_safety.clone(),
+            shell_wrapper_is_owned: request.shell_wrapper_is_owned,
 
             normalization_cwd: request.normalization_cwd.clone(),
 

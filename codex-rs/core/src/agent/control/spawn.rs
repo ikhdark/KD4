@@ -550,8 +550,16 @@ fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item:
 }
 
 fn keep_forked_replacement_item(item: &ResponseItem, hints: &[String]) -> bool {
-    matches!(item, ResponseItem::Message { .. }
-        | ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. })
+    let allowed = match item {
+        ResponseItem::Message { role, phase, .. } => match role.as_str() {
+            "system" | "developer" | "user" => true,
+            "assistant" => *phase == Some(MessagePhase::FinalAnswer),
+            _ => false,
+        },
+        ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. } => true,
+        _ => false,
+    };
+    allowed
         && crate::plan_store::plan_snapshot_from_item(item).is_none()
         && !is_multi_agent_v2_usage_hint_message(item, hints)
 }
@@ -960,26 +968,32 @@ impl AgentControl {
                 }
                 Err(err) => return Err(err),
             };
-            if !thread.is_running()
-                && state
+            if !thread.is_running() {
+                // Stream closure is a shutdown trigger, not a drain receipt.
+                // The bounded outer observer may expire, but registration and
+                // residency stay owned until actual accepted work has retired.
+                thread.request_shutdown().await?;
+                thread.wait_until_drained().await?;
+                if state
                     .remove_thread_if_same_with_cleanup(&thread_id, &thread, || {
                         self.forget_v2_residency(thread_id)
                     })
                     .await
-            {
-                match state.get_thread(thread_id).await {
-                    Ok(_) => continue,
-                    Err(CodexErr::ThreadNotFound(_)) => return Ok(false),
-                    Err(err) => return Err(err),
+                {
+                    match state.get_thread(thread_id).await {
+                        Ok(_) => continue,
+                        Err(CodexErr::ThreadNotFound(_)) => return Ok(false),
+                        Err(err) => return Err(err),
+                    }
                 }
-            }
-            if !thread.is_running() {
                 continue;
             }
             if !self.touch_loaded_v2_residency(state, thread_id).await {
                 continue;
             }
             if !thread.is_running() {
+                thread.request_shutdown().await?;
+                thread.wait_until_drained().await?;
                 if state
                     .remove_thread_if_same_with_cleanup(&thread_id, &thread, || {
                         self.forget_v2_residency(thread_id)
@@ -1142,6 +1156,7 @@ impl AgentControl {
                     let active = thread.codex.session.active_turn.lock().await;
                     active.as_ref().and_then(|active| active.task.as_ref()).map(|task| {
                         let turn = &task.turn_context;
+                        options.parent_turn_id.get_or_insert_with(|| turn.sub_id.clone());
                         super::super::task_coordinator::ValidationTurnContext {
                             scope: turn.validation_root_turn.clone(),
                             mode: turn.validation_mode,
@@ -1399,6 +1414,36 @@ impl AgentControl {
                             )))
                         .await);
                 }
+            }
+        }
+
+        if let Some(parent) = options.parent_thread_id
+            .or_else(|| notification_source.as_ref().and_then(SessionSource::parent_thread_id)) {
+            let ephemeral = new_thread.thread.config_snapshot().await.ephemeral;
+            let graph = state.agent_graph_store();
+            if !ephemeral
+                && let Some(graph) = graph.as_ref()
+            {
+                if let Some(turn_id) = options.parent_turn_id.as_deref() {
+                    match graph.set_thread_spawn_turn_owner(parent, new_thread.thread_id, turn_id).await {
+                        Ok(true) => {}
+                        result => return Err(pending_cleanup.rollback(CodexErr::Fatal(format!(
+                            "failed to retain child creation-turn ownership: {result:?}"
+                        ))).await),
+                    }
+                }
+                let snapshot = crate::thread_manager::capture_inherited_user_instructions(
+                    parent, new_thread.thread.codex.session.user_instructions().await,
+                )?;
+                match graph.retain_thread_spawn_instruction_snapshot(parent, new_thread.thread_id, &snapshot).await {
+                    Ok(true) => {}
+                    result => return Err(pending_cleanup.rollback(CodexErr::Fatal(format!(
+                        "failed to retain child inherited instructions: {result:?}"
+                    ))).await),
+                }
+            }
+            if (ephemeral || graph.is_none()) && let Some(turn_id) = options.parent_turn_id.as_deref() {
+                self.state.record_turn_spawn_owner(new_thread.thread_id, parent, turn_id.to_string());
             }
         }
 

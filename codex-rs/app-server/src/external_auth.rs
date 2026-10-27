@@ -14,18 +14,25 @@ use tokio::time::Duration;
 use tokio::time::timeout;
 
 use crate::outgoing_message::OutgoingMessageSender;
+use crate::transport::ConnectionId;
 
 const EXTERNAL_AUTH_REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) struct ExternalAuthBridge {
     outgoing: Arc<OutgoingMessageSender>,
+    owner: ConnectionId,
     auth: RwLock<CodexAuth>,
 }
 
 impl ExternalAuthBridge {
-    pub(crate) fn new(outgoing: Arc<OutgoingMessageSender>, auth: CodexAuth) -> Self {
+    pub(crate) fn new(
+        outgoing: Arc<OutgoingMessageSender>,
+        owner: ConnectionId,
+        auth: CodexAuth,
+    ) -> Self {
         Self {
             outgoing,
+            owner,
             auth: RwLock::new(auth),
         }
     }
@@ -39,8 +46,12 @@ impl ExternalAuthBridge {
             previous_account_id: context.previous_account_id.clone(),
         };
 
+        // Supplying external credentials explicitly transfers refresh ownership to
+        // that connection. Reconnecting clients must supply credentials again;
+        // subscriptions or being the first responder never confer that authority.
+        let owners = [self.owner];
         let request = self.outgoing.send_request_to_connections_and_wait(
-            None,
+            Some(&owners),
             ServerRequestPayload::ChatgptAuthTokensRefresh(params),
             None,
         );

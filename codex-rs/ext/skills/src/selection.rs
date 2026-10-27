@@ -22,23 +22,27 @@ use crate::catalog::SkillPackageId;
 pub(crate) fn collect_explicit_skill_mentions(
     inputs: &[UserInput],
     catalog: &SkillCatalog,
-) -> Vec<SkillCatalogEntry> {
+) -> Result<Vec<SkillCatalogEntry>, Vec<String>> {
     let catalog = std::cell::LazyCell::new(|| CanonicalSkillCatalog::new(catalog));
     let mut selected = Vec::new();
     let mut seen = HashSet::new();
     let mut blocked_plain_names = HashSet::new();
+    let mut unresolved = Vec::new();
 
     for input in inputs {
         match input {
             UserInput::Skill { name, path } => {
-                blocked_plain_names.insert(name.clone());
                 let path = path.to_string_lossy();
-                select_by_path(
+                if select_by_path(
                     &catalog,
                     CanonicalSkillPath::new(&path),
                     &mut seen,
                     &mut selected,
-                );
+                ) {
+                    blocked_plain_names.insert(name.clone());
+                } else {
+                    unresolved.push(format!("Selected skill `{name}` at {path} is unavailable, disabled, or ambiguous"));
+                }
             }
             UserInput::Mention { name, path } => {
                 if let Some(path) = CanonicalSkillPath::from_mention(path) {
@@ -78,7 +82,7 @@ pub(crate) fn collect_explicit_skill_mentions(
         }
     }
 
-    selected
+    if unresolved.is_empty() { Ok(selected) } else { Err(unresolved) }
 }
 
 fn select_by_path(
@@ -86,13 +90,15 @@ fn select_by_path(
     path: CanonicalSkillPath<'_>,
     seen: &mut HashSet<SkillCatalogEntryKey>,
     selected: &mut Vec<SkillCatalogEntry>,
-) {
+) -> bool {
     let mut matches = catalog.entries.iter().filter(|entry| entry.matches(path));
     if let Some(entry) = matches.next()
         && matches.next().is_none()
     {
         push_selected(entry.entry, seen, selected);
+        return true;
     }
+    false
 }
 
 fn push_selected(

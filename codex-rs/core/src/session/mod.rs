@@ -148,6 +148,7 @@ use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_rmcp_client::ElicitationResponse;
 use codex_rollout::state_integration;
 use codex_sandboxing::policy_transforms::intersect_uri_permission_profiles;
+use codex_sandboxing::policy_transforms::merge_uri_permission_profiles;
 use codex_shell_command::parse_command::parse_command;
 use codex_terminal_detection::user_agent;
 use codex_thread_store::CreateThreadParams;
@@ -236,6 +237,7 @@ pub(crate) mod turn;
 pub(crate) mod turn_context;
 pub(crate) mod turn_execution;
 mod user_decision;
+mod input_receipts;
 mod world_state;
 use self::code_mode_warning::unsupported_code_mode_warning;
 use self::config_lock::export_config_lock_if_configured;
@@ -372,6 +374,8 @@ pub enum SteerInputError {
     ExpectedTurnMismatch { expected: String, actual: String },
     ActiveTurnNotSteerable { turn_kind: NonSteerableTurnKind },
     EmptyInput,
+    IdempotencyConflict,
+    ReceiptUnavailable { message: String },
     AdditionalContextUnavailable { message: String },
     PendingInputLimitExceeded { max_items: usize, max_bytes: usize },
 }
@@ -379,6 +383,14 @@ pub enum SteerInputError {
 impl SteerInputError {
     fn to_error_event(&self) -> ErrorEvent {
         match self {
+            Self::IdempotencyConflict => ErrorEvent {
+                message: "clientUserMessageId was already used with different steering contents".into(),
+                codex_error_info: Some(CodexErrorInfo::BadRequest),
+            },
+            Self::ReceiptUnavailable { message } => ErrorEvent {
+                message: message.clone(),
+                codex_error_info: Some(CodexErrorInfo::InternalServerError),
+            },
             Self::AdditionalContextUnavailable { message } => ErrorEvent {
                 message: message.clone(),
                 codex_error_info: Some(CodexErrorInfo::InternalServerError),
@@ -468,7 +480,6 @@ use crate::unified_exec::UnifiedExecProcessManager;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
 use codex_core_plugins::PluginsManager;
 use codex_mcp::McpConfig;
-use codex_mcp::compute_auth_statuses;
 use codex_mcp::effective_mcp_servers;
 use codex_otel::SessionTelemetry;
 use codex_otel::THREAD_STARTED_METRIC;
@@ -967,14 +978,18 @@ impl Codex {
         &self,
         sub: Submission,
         execution_guard: Option<crate::agent::control::AgentExecutionGuard>,
+        cancellation: CancellationToken,
     ) -> CodexResult<()> {
+        if cancellation.is_cancelled() {
+            return Err(CodexErr::TurnAborted);
+        }
         let turn_id = sub.id.clone();
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         {
             let mut state = self.session.task_start_state.lock().await;
             match state.pending_start_only_admissions.entry(turn_id.clone()) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(tx);
+                    entry.insert((tx, cancellation));
                 }
                 std::collections::hash_map::Entry::Occupied(_) => {
                     return Err(CodexErr::InvalidRequest(format!(
@@ -1039,6 +1054,12 @@ impl Codex {
         &self,
         mut sub: Submission,
     ) -> CodexResult<Option<oneshot::Receiver<CodexResult<()>>>> {
+        if self.rx_event.is_closed() {
+            // Required stream failure is fatal to this runtime. Closing intake
+            // runs the existing submission-loop teardown, retaining its owners.
+            self.tx_sub.close();
+            return Err(CodexErr::InternalAgentDied);
+        }
         let preparation_permit = if is_submission_control(&sub.op) {
             None
         } else {
@@ -1131,10 +1152,14 @@ impl Codex {
     }
 
     pub async fn next_event(&self) -> CodexResult<Event> {
+        if self.rx_event.is_closed() {
+            self.tx_sub.close();
+        }
         let event = self
             .rx_event
             .recv()
             .await
+            .inspect_err(|_| { self.tx_sub.close(); })
             .map_err(|_| CodexErr::InternalAgentDied)?;
         Ok(event)
     }
@@ -2071,6 +2096,7 @@ impl Session {
                 if !unfinished_turn_boundary.is_empty() {
                     self.persist_rollout_items(&unfinished_turn_boundary).await;
                 }
+                self.reconcile_input_receipts(&rollout_items).await?;
 
                 // If resuming, warn when the last recorded model differs from the current one.
                 let curr: &str = turn_context.model_info.slug.as_str();
@@ -4100,18 +4126,72 @@ impl Session {
         &self,
         approval_scope_id: &str,
     ) -> Option<UriAdditionalPermissionProfile> {
-        let active = self.active_turn.lock().await;
-        let active = active.as_ref()?;
-        let ts = active.turn_state.lock().await;
-        ts.granted_permissions(approval_scope_id)
+        let (local, root_turn) = {
+            let active = self.active_turn.lock().await;
+            let active = active.as_ref()?;
+            let ts = active.turn_state.lock().await;
+            (
+                ts.granted_permissions(approval_scope_id),
+                active
+                    .task
+                    .as_ref()
+                    .map(|task| task.turn_context.validation_root_turn.clone()),
+            )
+        };
+        let Some(root_turn) = root_turn else {
+            return local;
+        };
+        // Release child locks before inspecting root. Never carry a turn grant
+        // into a different root turn or promote it to a session grant.
+        let Some(root) = self
+            .services
+            .agent_control
+            .root_session_for_permissions(self.thread_id)
+            .await
+        else {
+            return local;
+        };
+        if root.thread_id.to_string() != root_turn.0 {
+            return local;
+        }
+        let inherited = {
+            let active = root.active_turn.lock().await;
+            let Some(active) = active.as_ref() else {
+                return local;
+            };
+            if active.task.as_ref().is_none_or(|task| {
+                task.turn_context.sub_id != root_turn.1
+                    || task.turn_context.validation_root_turn != root_turn
+            }) {
+                return local;
+            }
+            let ts = active.turn_state.lock().await;
+            ts.granted_permissions(approval_scope_id)
+        };
+        merge_uri_permission_profiles(local.as_ref(), inherited.as_ref())
     }
 
     pub(crate) async fn granted_session_permissions(
         &self,
         approval_scope_id: &str,
     ) -> Option<UriAdditionalPermissionProfile> {
-        let state = self.state.lock().await;
-        state.granted_permissions(approval_scope_id)
+        let local = {
+            let state = self.state.lock().await;
+            state.granted_permissions(approval_scope_id)
+        };
+        let Some(root) = self
+            .services
+            .agent_control
+            .root_session_for_permissions(self.thread_id)
+            .await
+        else {
+            return local;
+        };
+        let inherited = {
+            let state = root.state.lock().await;
+            state.granted_permissions(approval_scope_id)
+        };
+        merge_uri_permission_profiles(local.as_ref(), inherited.as_ref())
     }
 
     #[expect(
@@ -4290,12 +4370,14 @@ impl Session {
                         })
                 }
                 .await;
+                let acquired = acquired.map_err(|error| std::io::Error::new(error.kind(),
+                    format!("Required image attachment {image_index} at {} could not be read: {error}", path.display())))?;
                 let path = path.clone();
                 let detail = detail.unwrap_or(codex_protocol::models::DEFAULT_IMAGE_DETAIL);
                 let content = tokio::task::spawn_blocking(move || {
                     codex_protocol::models::local_image_content_items_from_acquired_bytes(
                         &path,
-                        acquired,
+                        Ok(acquired),
                         image_index,
                         detail,
                         LocalImagePreparation::Defer,
@@ -4306,15 +4388,15 @@ impl Session {
                 images.push_back(content);
             }
         }
-        if images.is_empty() {
-            return Ok(ResponseItem::from(ResponseInputItem::from_user_input(
+        let mut response_item = if images.is_empty() {
+            ResponseItem::from(ResponseInputItem::from_user_input(
                 input,
                 LocalImagePreparation::Defer,
-            )));
-        }
+            ))
+        } else {
         // Only one raw file snapshot coexists with its base64 conversion.
         // Keep the original source/detail labels while assembling pure content.
-        Ok(ResponseItem::from(
+        ResponseItem::from(
             ResponseInputItem::from_user_input_with_local_image_content(
                 input,
                 |path, index, detail| {
@@ -4331,7 +4413,10 @@ impl Session {
                     })
                 },
             ),
-        ))
+        )
+        };
+        crate::image_preparation::prepare_required_user_images(&mut response_item)?;
+        Ok(response_item)
     }
 
     #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
@@ -4441,7 +4526,7 @@ impl Session {
         turn_context: &Arc<TurnContext>,
         items: &[ResponseItem],
     ) -> std::io::Result<()> {
-        self.record_conversation_items_committed(turn_context, items, true, None)
+        self.record_conversation_items_committed(turn_context, items, true, None, None)
             .await
     }
 
@@ -4453,7 +4538,7 @@ impl Session {
         turn_context: &Arc<TurnContext>,
         items: &[ResponseItem],
     ) -> std::io::Result<()> {
-        self.record_conversation_items_committed(turn_context, items, false, None)
+        self.record_conversation_items_committed(turn_context, items, false, None, None)
             .await
     }
 
@@ -4464,12 +4549,14 @@ impl Session {
         turn_context: &Arc<TurnContext>,
         call_id: &str,
         items: &[ResponseItem],
+        pending_continuation_ack: Option<crate::tools::code_mode::PendingContinuationAcknowledgment>,
     ) -> std::io::Result<()> {
         self.record_conversation_items_committed(
             turn_context,
             items,
             false,
             Some(call_id.to_owned()),
+            pending_continuation_ack,
         )
         .await
     }
@@ -4480,6 +4567,7 @@ impl Session {
         items: &[ResponseItem],
         wait_for_durability: bool,
         post_tool_context_call_id: Option<String>,
+        pending_continuation_ack: Option<crate::tools::code_mode::PendingContinuationAcknowledgment>,
     ) -> std::io::Result<()> {
         if self.live_thread().is_some() {
             codex_rollout::RolloutRecorder::validate_response_items(items)?;
@@ -4544,6 +4632,10 @@ impl Session {
                     .await
                     .contains(&commit_key)
                 {
+                    if let Some(ack) = pending_continuation_ack.as_ref() {
+                        session.services.code_mode_service
+                            .acknowledge_owner_drained_continuations(&ack.owner_key, &ack.receipts);
+                    }
                     if wait_for_durability {
                         let queued = turn_context
                             .turn_timing_state
@@ -4615,6 +4707,10 @@ impl Session {
                     .lock()
                     .await
                     .insert(commit_key);
+                if let Some(ack) = pending_continuation_ack.as_ref() {
+                    session.services.code_mode_service
+                        .acknowledge_owner_drained_continuations(&ack.owner_key, &ack.receipts);
+                }
                 if let Some(call_id) = post_tool_context_call_id.as_ref() {
                     let context = turn_context
                         .pending_post_tool_contexts
@@ -4700,7 +4796,23 @@ impl Session {
             .await
             .map_err(std::io::Error::other)?;
 
-        self.record_conversation_items_durable(turn_context, &missing_outputs)
+        // A synthetic terminal output satisfies provider call/output pairing,
+        // not result availability. Reuse the host receipt recognized on resume,
+        // adjacent to each output in the same durable ordered batch; never infer
+        // unknown effects from tool text or synthetic response-item IDs.
+        let mut missing_items = Vec::with_capacity(output_count * 2);
+        for output in missing_outputs {
+            let receipt = match &output {
+                ResponseItem::FunctionCallOutput { call_id, .. }
+                | ResponseItem::CustomToolCallOutput { call_id, .. } => {
+                    Some(crate::tools::registry::model_delivery_unavailable_receipt(call_id))
+                }
+                _ => None,
+            };
+            missing_items.push(output);
+            missing_items.extend(receipt);
+        }
+        self.record_conversation_items_durable(turn_context, &missing_items)
             .await?;
         Ok(output_count)
     }
@@ -5117,6 +5229,8 @@ impl Session {
             } else {
                 None
             };
+            // acquire_tool_history_io_permit drained the queue while excluding
+            // producers, so writer admission cannot block behind this I/O lease.
             let mut persistence_writer = if snapshot.is_some() {
                 Some(session.tool_history_persistence.writer().await)
             } else {
@@ -6709,10 +6823,10 @@ impl Session {
         let Ok(_permit) = self.tool_history_reconciliation_gate.acquire().await else {
             unreachable!("session-owned tool-history reconciliation semaphore is never closed");
         };
-        let mut writer = self.tool_history_persistence.writer().await;
-        let mut state = self.state.lock().await;
         for observation in observations {
             let mutation = crate::tool_history::ToolHistoryMutation::RegisterWorkspaceEvidence { observation };
+            let mut writer = self.tool_history_persistence.writer().await;
+            let mut state = self.state.lock().await;
             state.apply_tool_history_mutation(&mutation);
             if let Err(err) = writer.enqueue_mutation(mutation, "native source acquisition metadata") {
                 tracing::warn!("failed to enqueue native source acquisition metadata: {err}");
@@ -7150,13 +7264,14 @@ impl Session {
         })?
     }
 
-    pub(crate) async fn update_token_usage_info(
+    pub(crate) async fn record_failed_attempt_usage(
         &self,
         turn_context: &TurnContext,
         token_usage: Option<&TokenUsage>,
+        identity: Option<&crate::client_common::ResponseAttemptIdentity>,
     ) -> CodexResult<()> {
         let result = self
-            .record_token_usage_info(turn_context, token_usage)
+            .record_token_usage_with_context(turn_context, token_usage, false, identity)
             .await;
         self.send_token_count_event(turn_context).await;
         result
@@ -7179,7 +7294,7 @@ impl Session {
         turn_context: &TurnContext,
         token_usage: Option<&TokenUsage>,
     ) -> CodexResult<()> {
-        self.record_token_usage_with_context(turn_context, token_usage, true)
+        self.record_token_usage_with_context(turn_context, token_usage, true, None)
             .await
     }
 
@@ -7189,7 +7304,7 @@ impl Session {
         token_usage: Option<&TokenUsage>,
     ) -> CodexResult<()> {
         let result = self
-            .record_token_usage_with_context(turn_context, token_usage, false)
+            .record_token_usage_with_context(turn_context, token_usage, false, None)
             .await;
         self.send_token_count_event(turn_context).await;
         result
@@ -7265,12 +7380,14 @@ impl Session {
         turn_context: &TurnContext,
         token_usage: Option<&TokenUsage>,
         update_context: bool,
+        attempt_identity: Option<&crate::client_common::ResponseAttemptIdentity>,
     ) -> CodexResult<()> {
         if let Some(token_usage) = token_usage {
             // Release the timing lock before acquiring session state.
             let prepared_basis = turn_context.extension_data
                 .get::<crate::client_common::PromptCalibrationBasis>();
-            let calibration = prepared_basis.as_ref().and_then(|basis| {
+            let valid_anchor = token_usage.known_total().is_some();
+            let calibration = prepared_basis.as_ref().filter(|_| valid_anchor).and_then(|basis| {
                 turn_context.turn_timing_state.prompt_token_calibration_with_estimator(
                     &turn_context.model_info.slug, token_usage, basis.local_tokens,
                 )
@@ -7280,12 +7397,14 @@ impl Session {
                 // Claim only after acquiring the accounting owner lock.
                 let delivered = update_context.then(|| turn_context.extension_data
                     .get::<crate::client_common::ResponseAttemptIdentity>()).flatten();
-                if !turn_context.turn_timing_state.claim_current_model_usage(token_usage, delivered.as_deref()) {
+                if !turn_context.turn_timing_state.claim_current_model_usage(token_usage, attempt_identity.or(delivered.as_deref())) {
                     return Ok(());
                 }
                 turn_context.record_current_turn_usage(token_usage);
                 if update_context {
-                    if let Some(basis) = turn_context
+                    if !valid_anchor {
+                        state.prompt_token_calibration = Default::default();
+                    } else if let Some(basis) = turn_context
                         .extension_data
                         .get::<crate::client_common::PromptCalibrationBasis>()
                     {
@@ -7307,7 +7426,17 @@ impl Session {
                         token_usage,
                         turn_context.model_context_window(),
                     );
-                    if token_usage.known_input().is_some()
+                    if !valid_anchor {
+                        let estimated = state.history.estimate_prepared_token_count_with_base_instructions(
+                            &turn_context.model_info.input_modalities,
+                            &turn_context.base_instructions,
+                        ).unwrap_or(0);
+                        if let Some(mut info) = state.token_info() {
+                            info.estimated_context_tokens = Some(estimated.max(0));
+                            state.set_token_info(Some(info));
+                        }
+                    }
+                    if valid_anchor && token_usage.known_input().is_some()
                         && matches!(
                             turn_context.config.model_auto_compact_token_limit_scope,
                             AutoCompactTokenLimitScope::BodyAfterPrefix
@@ -7453,6 +7582,13 @@ impl Session {
         Some(TokenCountEvent { info, rate_limits })
     }
 
+    pub(crate) async fn bind_rate_limit_account(
+        &self,
+        account: Option<crate::responses_retry::AccountChangeIdentity>,
+    ) {
+        self.state.lock().await.bind_rate_limit_account(account);
+    }
+
     pub(crate) async fn update_rate_limits(
         &self,
         turn_context: &TurnContext,
@@ -7544,12 +7680,15 @@ impl Session {
         input: &[UserInput],
         client_id: Option<String>,
     ) -> std::io::Result<()> {
+        let receipt = self.pending_receipt_for_input(input, client_id.as_deref()).await?;
         turn_context.turn_timing_state.record_user_input();
         let mut user_message_item = UserMessageItem::new(input);
-        let response_item_id = ResponseItemId::with_suffix(
-            crate::event_mapping::USER_INPUT_ITEM_ID_BASE,
-            &user_message_item.id,
-        );
+        let response_item_id = match receipt.as_ref() {
+            Some((_, suffix)) => ResponseItemId::with_suffix(crate::event_mapping::USER_INPUT_ITEM_ID_BASE, suffix),
+            None => ResponseItemId::with_suffix(
+                crate::event_mapping::USER_INPUT_ITEM_ID_BASE, &user_message_item.id,
+            ),
+        };
         user_message_item.id = response_item_id.to_string();
         user_message_item.client_id = client_id;
         let mut response_item = self.response_item_from_user_input(input.to_vec()).await?;
@@ -7562,6 +7701,9 @@ impl Session {
         let turn_item = TurnItem::UserMessage(user_message_item);
         self.emit_turn_item_started(turn_context, &turn_item).await;
         self.emit_turn_item_completed(turn_context, turn_item).await;
+        if let Some((receipt, suffix)) = receipt {
+            self.complete_input_receipt(&receipt, &suffix).await?;
+        }
         // Keep the accepted input ordered in the rollout, then let the sampling or terminal
         // barrier materialize the complete prefix once. Materializing here would force an extra
         // disk transaction immediately before every initial model request.
@@ -7601,6 +7743,30 @@ impl Session {
         reason = "active turn checks and turn state updates must remain atomic"
     )]
     pub async fn steer_input(
+        self: &Arc<Self>,
+        input: Vec<UserInput>,
+        additional_context: IndexMap<String, AdditionalContextEntry>,
+        expected_turn_id: Option<&str>,
+        client_user_message_id: Option<String>,
+        responsesapi_client_metadata: Option<HashMap<String, String>>,
+    ) -> Result<String, SteerInputError> {
+        if client_user_message_id.is_none() {
+            return self.steer_input_inner(input, additional_context, expected_turn_id,
+                client_user_message_id, responsesapi_client_metadata).await;
+        }
+        // Acceptance outlives an RPC disconnect: once its durable write begins,
+        // the same owner must publish pending input or retain it for recovery.
+        let session = Arc::clone(self);
+        let expected_turn_id = expected_turn_id.map(str::to_owned);
+        self.terminal_tasks.spawn(async move {
+            session.steer_input_inner(input, additional_context, expected_turn_id.as_deref(),
+                client_user_message_id, responsesapi_client_metadata).await
+        }).await.map_err(|error| SteerInputError::ReceiptUnavailable {
+            message: format!("steering admission task failed: {error}"),
+        })?
+    }
+
+    async fn steer_input_inner(
         &self,
         input: Vec<UserInput>,
         additional_context: IndexMap<String, AdditionalContextEntry>,
@@ -7608,6 +7774,25 @@ impl Session {
         client_user_message_id: Option<String>,
         responsesapi_client_metadata: Option<HashMap<String, String>>,
     ) -> Result<String, SteerInputError> {
+        let _receipt_gate = if client_user_message_id.is_some() { Some(self.input_receipt_gate.lock().await) } else { None };
+        if client_user_message_id.is_some() && self.shutting_down.load(Ordering::Acquire) {
+            return Err(SteerInputError::ReceiptUnavailable { message: "the thread is shutting down".into() });
+        }
+        let fingerprint = if client_user_message_id.is_some() {
+            input_receipts::fingerprint(&(&input, &additional_context, &responsesapi_client_metadata))
+                .map_err(|error| SteerInputError::ReceiptUnavailable { message: error.to_string() })?
+        } else { String::new() };
+        let db = if client_user_message_id.is_some() {
+            Some(self.receipt_db().map_err(|error| SteerInputError::ReceiptUnavailable { message: error.to_string() })?)
+        } else { None };
+        if let (Some(db), Some(client_id), Some(scope)) = (&db, &client_user_message_id, expected_turn_id) {
+            if let Some(receipt) = db.input_receipt(self.thread_id, "steer", scope, client_id).await
+                .map_err(|error| SteerInputError::ReceiptUnavailable { message: error.to_string() })?
+            {
+                if receipt.fingerprint != fingerprint { return Err(SteerInputError::IdempotencyConflict); }
+                return Ok(receipt.turn_id);
+            }
+        }
         let mut active = self.active_turn.lock().await;
         let Some(active_turn) = active.as_mut() else {
             return Err(SteerInputError::NoActiveTurn(input));
@@ -7652,17 +7837,49 @@ impl Session {
             .map_err(|error| SteerInputError::AdditionalContextUnavailable {
                 message: error.to_string(),
             })?;
+        let receipt = match client_user_message_id.as_ref() {
+            Some(client_id) => {
+                let mut receipt = codex_state::InputReceipt { kind: "steer".into(), scope: active_turn_id.clone(),
+                    client_id: client_id.clone(), fingerprint, turn_id: active_turn_id.clone(), payload: None };
+                receipt.payload = Some(self.receipt_payload(&receipt, &input, &additional_context)
+                    .map_err(|error| SteerInputError::ReceiptUnavailable { message: error.to_string() })?);
+                Some(receipt)
+            }
+            None => None,
+        };
+        let receipt_suffix = receipt.as_ref().map(|receipt| {
+            input_receipts::fingerprint(&(self.thread_id.to_string(), &receipt.kind, &receipt.scope, &receipt.client_id))
+        }).transpose().map_err(|error| SteerInputError::ReceiptUnavailable { message: error.to_string() })?;
         // Keep the map with accepted input until its ordered recording commits.
-        let mut pending_input = vec![TurnInput::AdditionalContext(additional_context)];
+        let mut pending_input = vec![TurnInput::AdditionalContext { values: additional_context, start_fence: None }];
         pending_input.push(TurnInput::UserInput {
             content: input,
             client_id: client_user_message_id,
+            start_fence: None,
         });
         self.input_queue
             .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
                 active_turn.turn_state.as_ref(),
                 &pending_input,
+                async || {
+                    if let (Some(db), Some(receipt)) = (&db, &receipt) {
+                        let accepted = db.reserve_input_receipt(self.thread_id, receipt).await
+                            .map_err(|error| SteerInputError::ReceiptUnavailable { message: error.to_string() })?;
+                        if !accepted {
+                            let original = db.input_receipt(self.thread_id, "steer", &receipt.scope, &receipt.client_id).await
+                                .map_err(|error| SteerInputError::ReceiptUnavailable { message: error.to_string() })?;
+                            if !original.is_some_and(|original| original.fingerprint == receipt.fingerprint) {
+                                return Err(SteerInputError::IdempotencyConflict);
+                            }
+                        }
+                        return Ok(accepted);
+                    }
+                    Ok(true)
+                },
                 || {
+                    if let Some(suffix) = &receipt_suffix {
+                        self.input_queue.remember_input_receipt(suffix);
+                    }
                     if let Some(metadata) = responsesapi_client_metadata {
                         active_turn_context
                             .turn_metadata_state
@@ -7670,11 +7887,7 @@ impl Session {
                     }
                 },
             )
-            .await
-            .map_err(|err| SteerInputError::PendingInputLimitExceeded {
-                max_items: err.max_items,
-                max_bytes: err.max_bytes,
-            })?;
+            .await?;
         drop(active);
         active_turn_context
             .session_telemetry

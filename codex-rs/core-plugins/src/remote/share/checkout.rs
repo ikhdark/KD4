@@ -98,8 +98,9 @@ pub async fn checkout_remote_plugin_share(
         ))
     })??;
 
-    let mut created_checkout_path = false;
-    if !already_checked_out {
+    let bundle = if already_checked_out {
+        None
+    } else {
         let bundle = crate::remote_bundle::validate_remote_plugin_bundle(
             &remote_plugin_id,
             &detail.marketplace_name,
@@ -113,21 +114,11 @@ pub async fn checkout_remote_plugin_share(
                 "failed to prepare remote plugin bundle checkout: {err}"
             ))
         })?;
-        crate::remote_bundle::download_and_extract_remote_plugin_bundle_to_path(
-            bundle,
-            local_plugin_path.clone(),
-            &config.http_clients,
-        )
-        .await
-        .map_err(|err| {
-            RemotePluginCatalogError::UnexpectedResponse(format!(
-                "failed to check out remote plugin bundle: {err}"
-            ))
-        })?;
-        created_checkout_path = true;
-    }
+        Some(bundle)
+    };
 
-    tokio::task::spawn_blocking(move || {
+    let checkout_path = local_plugin_path.clone();
+    let finalize_checkout = move |created_checkout_path: bool| {
         let marketplace = match update_personal_marketplace(
             &home,
             &plugin_name,
@@ -176,13 +167,30 @@ pub async fn checkout_remote_plugin_share(
             marketplace_path: marketplace.path,
             remote_version,
         })
-    })
-    .await
-    .map_err(|err| {
-        RemotePluginCatalogError::UnexpectedResponse(format!(
-            "failed to join plugin share checkout finalization task: {err}"
-        ))
-    })?
+    };
+
+    if let Some(bundle) = bundle {
+        crate::remote_bundle::download_and_extract_remote_plugin_bundle_to_path(
+            bundle,
+            checkout_path,
+            &config.http_clients,
+            move |_| finalize_checkout(true),
+        )
+        .await
+        .map_err(|err| {
+            RemotePluginCatalogError::UnexpectedResponse(format!(
+                "failed to check out remote plugin bundle: {err}"
+            ))
+        })?
+    } else {
+        tokio::task::spawn_blocking(move || finalize_checkout(false))
+            .await
+            .map_err(|err| {
+                RemotePluginCatalogError::UnexpectedResponse(format!(
+                    "failed to join plugin share checkout finalization task: {err}"
+                ))
+            })?
+    }
 }
 
 fn is_checkout_supported_share_marketplace(marketplace_name: &str) -> bool {

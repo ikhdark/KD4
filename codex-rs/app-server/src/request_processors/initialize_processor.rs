@@ -173,7 +173,7 @@ impl InitializeRequestProcessor {
             )),
             runtime_info: Some(crate::runtime_provenance::current()),
             server_capabilities: Some(codex_app_server_protocol::ServerCapabilities {
-                enabled_features,
+                enabled_features: enabled_features.clone(),
             }),
             local_watermark: Some(ServerLocalWatermark {
                 version: LOCAL_WATERMARK_VERSION.to_string(),
@@ -187,12 +187,20 @@ impl InitializeRequestProcessor {
             .await;
 
         let receipt_codex_home = self.config.codex_home.clone();
+        let receipt_process_rpc_transport = match self.rpc_transport {
+            AppServerRpcTransport::Stdio => "stdio",
+            AppServerRpcTransport::Websocket => "socket",
+            AppServerRpcTransport::InProcess => "in_process",
+        };
         // Receipt publication is advisory and must not gate outbound readiness.
         // The blocking task owns publication after initialization returns.
         tokio::task::spawn_blocking(move || {
             if let Err(err) = crate::runtime_provenance::write_desktop_runtime_receipt(
                 receipt_codex_home.as_path(),
                 &name,
+                receipt_process_rpc_transport,
+                connection_id.0,
+                enabled_features,
             ) {
                 tracing::warn!(
                     error = %err,
