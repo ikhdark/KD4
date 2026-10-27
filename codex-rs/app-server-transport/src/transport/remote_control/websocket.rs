@@ -608,6 +608,21 @@ impl RemoteControlStatusPublisher {
         }
     }
 
+    fn publish_connection_stopped(&self) {
+        // Compare and update under the watch lock so a concurrent disable or
+        // policy/auth error cannot be overwritten by a late worker completion.
+        self.tx.send_if_modified(|status| {
+            if status.status != RemoteControlConnectionStatus::Connected {
+                return false;
+            }
+            *status = remote_control_status_with_connection_status(
+                status,
+                RemoteControlConnectionStatus::Connecting,
+            );
+            true
+        });
+    }
+
     pub(super) fn publish_environment_id(&self, environment_id: Option<String>) {
         let mut status_change = None;
         self.tx.send_if_modified(|status| {
@@ -1254,7 +1269,10 @@ impl RemoteControlWebsocket {
                     ConnectionEndReason::EnabledWatchClosed
                 }
             }
-            _ = join_set.join_next() => ConnectionEndReason::ConnectionWorkerStopped,
+            _ = join_set.join_next() => {
+                self.status_publisher.publish_connection_stopped();
+                ConnectionEndReason::ConnectionWorkerStopped
+            }
         };
         shutdown_token.cancel();
 

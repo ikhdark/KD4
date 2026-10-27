@@ -531,8 +531,29 @@ pub(super) async fn rollback_created_thread(
         if store.live_recorder(thread_id).await.is_ok() {
             super::live_writer::discard_thread(&store, thread_id).await?;
         }
-        let staged = stage_thread_deletes(&store, &[thread_id]).await?;
-        commit_thread_delete(staged, thread_id).await
+        // Background rollout maintenance may briefly own the moves lock just
+        // when startup needs to roll back an unadmitted thread. Retry only
+        // pre-staging ownership conflicts, never a database commit or an
+        // arbitrary persistence failure. Each failed attempt releases its
+        // guards before sleeping; the existing owned task retains cleanup if
+        // the request stops waiting.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match stage_thread_deletes(&store, &[thread_id]).await {
+                Ok(staged) => return commit_thread_delete(staged, thread_id).await,
+                Err(ThreadStoreError::Conflict { .. })
+                    if tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep_until(
+                        deadline.min(
+                            tokio::time::Instant::now() + std::time::Duration::from_millis(25),
+                        ),
+                    )
+                    .await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     })
     .await
     .map_err(|err| ThreadStoreError::Internal {
@@ -627,7 +648,15 @@ pub(super) async fn stage_thread_deletes<'a>(
     }
     let moves = codex_rollout::lock_rollout_moves(&store.config.codex_home)
         .await
-        .map_err(delete_recovery_error)?;
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                ThreadStoreError::Conflict {
+                    message: error.to_string(),
+                }
+            } else {
+                delete_recovery_error(error)
+            }
+        })?;
     let mut found_thread_ids = Vec::new();
     let mut candidates = Vec::new();
     let mut auxiliary_threads = Vec::new();

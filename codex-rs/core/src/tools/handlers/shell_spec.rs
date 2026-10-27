@@ -795,8 +795,9 @@ fn filesystem_safety_guidance() -> &'static str {
 
 fn rg_search_admission_guidance() -> &'static str {
     r#"Search guidance:
+- Discover filenames before reading/searching them: first use `rg --files <literal-root> --glob '<pattern>'`, for example `rg --files codex-rs --glob '*remote*'`, then use the returned paths. Never pass guessed filenames or wildcard paths directly to `rg`.
 - Use `rg -l` when only matching filenames are needed; use scoped `rg -n` when matching content is needed. `rg` skips hidden directories and ignored files by default, with or without matches; add `--hidden` when the scope can include dot-directories such as `.config` or `.github`.
-- An `rg` exit code of 1 means no matches; 2 means an error, not evidence of absence. In a batch, inspect each search's status and correct only the failed search.
+- Keep separate searches and reads in separate tool calls, optionally batched; do not semicolon-chain `rg` searches and file reads into one shell call. Inspect each result: `rg` exit 0 means matches, 1 means no matches, and 2 means the search failed. Correct only the failed search; retain successful sibling results and do not rerun the batch.
 - Prefer native `read_file` with batched selectors over `Get-Content | Select-Object` paging when available. Keep shell reads for required encoding, streaming, or transformations.
 - Omit `max_output_tokens` unless deliberately requesting a smaller display; the host enforces output caps. When output is truncated, recover only missing evidence from the retained artifact."#
 }

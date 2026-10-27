@@ -176,7 +176,7 @@ impl StdioDelivery {
 
 fn coalesce_stdio_text(left: &mut QueuedOutgoingMessage, right: &QueuedOutgoingMessage) -> bool {
     // Receipts and all non-text/lifecycle messages remain exact wire boundaries.
-    // Core publication, persistence and replay have already observed every delta.
+    // Canonical publication and output recovery remain with upstream owners.
     if left.write_complete_tx.is_some() || right.write_complete_tx.is_some()
         || left.encoded_json.is_some() || right.encoded_json.is_some()
     {
@@ -205,6 +205,8 @@ fn coalesce_stdio_text(left: &mut QueuedOutgoingMessage, right: &QueuedOutgoingM
         (ServerNotification::PlanDelta(a), ServerNotification::PlanDelta(b)) => append!(a, b),
         (ServerNotification::ReasoningSummaryTextDelta(a), ServerNotification::ReasoningSummaryTextDelta(b)) => append!(a, b, summary_index),
         (ServerNotification::ReasoningTextDelta(a), ServerNotification::ReasoningTextDelta(b)) => append!(a, b, content_index),
+        (ServerNotification::CommandExecutionOutputDelta(a), ServerNotification::CommandExecutionOutputDelta(b))
+            if a.stream == b.stream && a.decoding_lossy == b.decoding_lossy => append!(a, b),
         _ => false,
     }
 }
@@ -430,6 +432,7 @@ async fn send_message_to_connection(
         }
         // Queue saturation is a local, explicit delivery failure. Durable
         // thread state remains available to surviving/reconnecting clients.
+        warn!(?connection_id, "retiring stdio connection after bounded output admission failed");
         disconnect_connection(connections, connection_id)
     }
 }

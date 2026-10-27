@@ -73,11 +73,12 @@ const AGGREGATE_BUFFER_INITIAL_CAPACITY: usize = 8 * 1024; // 8 KiB
 /// OOM the process by dumping huge amounts of data to stdout/stderr.
 const EXEC_OUTPUT_MAX_BYTES: usize = DEFAULT_OUTPUT_BYTES_CAP;
 
-/// Limit the number of ExecCommandOutputDelta events emitted per exec call.
+/// Limit both event count and bytes emitted per exec call.
 /// Aggregation still collects full output; only the live event stream is capped.
 pub(crate) const MAX_EXEC_OUTPUT_DELTAS_PER_CALL: usize = 10_000;
+const MAX_EXEC_OUTPUT_DELTA_BYTES_PER_CALL: usize = EXEC_OUTPUT_MAX_BYTES;
 pub(crate) const EXEC_OUTPUT_DELTA_CAP_NOTICE: &[u8] =
-    b"\n[command output live updates capped after 10000 deltas; final output continues]\n";
+    b"\n[command output live updates capped; final output and retained-output recovery continue]\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OutputDeltaDecision {
@@ -95,6 +96,7 @@ enum OutputDeltaSendOutcome {
 #[derive(Debug, Default)]
 pub(crate) struct OutputDeltaLimiter {
     emitted: AtomicUsize,
+    emitted_bytes: AtomicUsize,
     cap_notice_emitted: AtomicBool,
 }
 
@@ -103,8 +105,16 @@ impl OutputDeltaLimiter {
         self.cap_notice_emitted.load(Ordering::Acquire)
     }
 
-    pub(crate) fn claim(&self) -> OutputDeltaDecision {
-        if self.emitted.fetch_add(1, Ordering::Relaxed) < MAX_EXEC_OUTPUT_DELTAS_PER_CALL {
+    pub(crate) fn claim(&self, chunk_bytes: usize) -> OutputDeltaDecision {
+        if self.is_suppressed() {
+            return OutputDeltaDecision::Suppress;
+        }
+        if self.emitted.fetch_add(1, Ordering::Relaxed) < MAX_EXEC_OUTPUT_DELTAS_PER_CALL
+            && self.emitted_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bytes| {
+                bytes.checked_add(chunk_bytes)
+                    .filter(|total| *total <= MAX_EXEC_OUTPUT_DELTA_BYTES_PER_CALL)
+            }).is_ok()
+        {
             OutputDeltaDecision::Emit
         } else if self
             .cap_notice_emitted
@@ -1480,14 +1490,14 @@ fn try_send_limited_output_delta(
     limiter: &OutputDeltaLimiter,
 ) -> OutputDeltaSendOutcome {
     if let Some(recovery) = &stream.delivery_recovery {
-        let admit = matches!(limiter.claim(), OutputDeltaDecision::Emit);
+        let admit = matches!(limiter.claim(chunk.len()), OutputDeltaDecision::Emit);
         return if recovery.publish(stream, is_stderr, chunk, admit) {
             OutputDeltaSendOutcome::Continue
         } else {
             OutputDeltaSendOutcome::Stop
         };
     }
-    let (chunk, outcome) = match limiter.claim() {
+    let (chunk, outcome) = match limiter.claim(chunk.len()) {
         OutputDeltaDecision::Emit => (chunk, OutputDeltaSendOutcome::Continue),
         OutputDeltaDecision::EmitCapNotice => (
             EXEC_OUTPUT_DELTA_CAP_NOTICE.to_vec(),

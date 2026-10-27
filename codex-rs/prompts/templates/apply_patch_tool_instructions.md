@@ -25,6 +25,7 @@ Example combining operations:
 Rules:
 
 - Prefer paths relative to the selected working directory. Absolute paths are supported, subject to the same filesystem permissions.
+- Read the relevant current function or configuration unit before patching. Submit only the intended nonempty hunk and inspect the patch receipt before continuing. If rejected, correct the request, not the safety check.
 - Each source or move destination may occur only once per patch, including path aliases; put edits to a renamed file in its source Update File hunk. Order chunks from top to bottom.
 - Use exact current bytes on removed lines, including indentation, trailing whitespace, and Unicode punctuation. Normalization is allowed only for unchanged context, whose original bytes are preserved.
 - Add File is create-only and refuses an occupied path. Use Update File with a current codex-range source hash for a whole-file replacement. Move to replaces its destination.

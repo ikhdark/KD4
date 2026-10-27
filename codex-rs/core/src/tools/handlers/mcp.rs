@@ -199,14 +199,31 @@ impl Drop for McpCallLease {
 
 pub struct McpHandler {
     tool_info: ToolInfo,
+    tool_name: ToolName,
     spec: Arc<codex_tools::LoadableToolSpec>,
     input_validator: jsonschema::Validator,
     canonical_input_schema: Value,
 }
 
 impl McpHandler {
-    pub fn new(tool_info: ToolInfo) -> Result<Self, serde_json::Error> {
-        let spec = Arc::new(create_tool_spec(&tool_info)?);
+    pub fn new(tool_info: ToolInfo, use_namespace: bool) -> Result<Self, serde_json::Error> {
+        let tool_name = if use_namespace {
+            tool_info.canonical_tool_name()
+        } else {
+            // The MCP normalization owner bounds the combined identity,
+            // including this delimiter, to the provider's 64-byte limit.
+            let name = format!(
+                "{}{}{}",
+                tool_info.callable_namespace, MCP_TOOL_NAME_DELIMITER, tool_info.callable_name
+            );
+            if name.len() > 64 {
+                return Err(serde::de::Error::custom(
+                    "flat MCP tool name exceeds 64 bytes",
+                ));
+            }
+            ToolName::plain(name)
+        };
+        let spec = Arc::new(create_tool_spec(&tool_info, &tool_name)?);
         let mut schema = Value::Object(tool_info.tool.input_schema.as_ref().clone());
         // Match the existing MCP compatibility rule for omitted/null properties.
         if schema.get("properties").is_some_and(Value::is_null) {
@@ -219,6 +236,7 @@ impl McpHandler {
         })?;
         Ok(Self {
             tool_info,
+            tool_name,
             spec,
             input_validator,
             canonical_input_schema: schema,
@@ -226,7 +244,9 @@ impl McpHandler {
     }
 
     fn hook_tool_name(&self) -> HookToolName {
-        HookToolName::new(ensure_mcp_prefix(&join_tool_name(&self.tool_name())))
+        HookToolName::new(ensure_mcp_prefix(&join_tool_name(
+            &self.tool_info.canonical_tool_name(),
+        )))
     }
 
     pub(crate) fn external_mutation_intent(&self) -> ExternalMutationIntent {
@@ -255,7 +275,7 @@ fn ensure_mcp_prefix(name: &str) -> String {
 
 impl ToolExecutor<ToolInvocation> for McpHandler {
     fn tool_name(&self) -> ToolName {
-        self.tool_info.canonical_tool_name()
+        self.tool_name.clone()
     }
 
     fn spec(&self) -> ToolSpec {
@@ -528,9 +548,12 @@ impl CoreToolRuntime for McpHandler {
 
 fn create_tool_spec(
     tool_info: &ToolInfo,
+    tool_name: &ToolName,
 ) -> Result<codex_tools::LoadableToolSpec, serde_json::Error> {
-    let tool_name = tool_info.canonical_tool_name();
-    let tool = mcp_tool_to_responses_api_tool(&tool_name, &tool_info.tool)?;
+    let tool = mcp_tool_to_responses_api_tool(tool_name, &tool_info.tool)?;
+    if tool_name.namespace.is_none() {
+        return Ok(codex_tools::LoadableToolSpec::Function(tool));
+    }
     let description = tool_info
         .namespace_description
         .as_deref()

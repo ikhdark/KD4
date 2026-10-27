@@ -1071,9 +1071,17 @@ fn add_tool_sources(context: &CoreToolPlanContext<'_>, planned_tools: &mut Plann
     add_mcp_resource_tools(context, planned_tools);
     add_core_utility_tools(context, planned_tools);
     add_collaboration_tools(context, planned_tools);
-    add_mcp_runtime_tools(context, planned_tools);
+    let flat_mcp_tools = !use_mcp_namespaces(context.step_context.turn.as_ref());
+    if !flat_mcp_tools {
+        add_mcp_runtime_tools(context, planned_tools);
+    }
     add_extension_tools(context, planned_tools);
     add_dynamic_tools(context, planned_tools);
+    if flat_mcp_tools {
+        // Existing registry deduplication must give native/extension/dynamic
+        // plain names priority over newly flattened MCP aliases.
+        add_mcp_runtime_tools(context, planned_tools);
+    }
 }
 
 pub(crate) fn requires_windows_shell_guidance(step_context: &StepContext) -> bool {
@@ -1551,6 +1559,7 @@ fn nested_agent_lifecycle_enabled(
     )
 )]
 fn add_mcp_runtime_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools) {
+    let use_namespace = use_mcp_namespaces(context.step_context.turn.as_ref());
     let authority = |tool: &codex_mcp::ToolInfo| {
         // Share the exact provider inputs used by remembered approvals. Do not
         // expose their raw transport/auth values in the model-visible revision.
@@ -1571,7 +1580,7 @@ fn add_mcp_runtime_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut 
     };
     if let Some(mcp_tools) = context.mcp_tools {
         for tool in mcp_tools {
-            match McpHandler::new(tool.clone()) {
+            match McpHandler::new(tool.clone(), use_namespace) {
                 Ok(handler) => {
                     planned_tools.add_mcp_runtime(handler, ToolExposure::Direct, authority(tool))
                 }
@@ -1582,7 +1591,7 @@ fn add_mcp_runtime_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut 
 
     if let Some(deferred_mcp_tools) = context.deferred_mcp_tools {
         for tool in deferred_mcp_tools {
-            match McpHandler::new(tool.clone()) {
+            match McpHandler::new(tool.clone(), use_namespace) {
                 Ok(handler) => {
                     planned_tools.add_mcp_runtime(handler, ToolExposure::Deferred, authority(tool))
                 }
@@ -1590,6 +1599,10 @@ fn add_mcp_runtime_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut 
             }
         }
     }
+}
+
+fn use_mcp_namespaces(turn_context: &TurnContext) -> bool {
+    namespace_tools_enabled(turn_context) || effective_tool_mode(turn_context) != ToolMode::Direct
 }
 
 #[instrument(

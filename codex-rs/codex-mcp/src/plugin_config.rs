@@ -4,6 +4,7 @@ use codex_config::McpServerTransportConfig;
 use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
+use serde::Deserializer;
 use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
@@ -38,7 +39,27 @@ pub struct PluginMcpConfigParseOutcome {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PluginMcpServersFile {
+    #[serde(alias = "mcp_servers", deserialize_with = "deserialize_server_map")]
     mcp_servers: BTreeMap<String, JsonValue>,
+}
+
+fn is_transport_declaration(servers: &BTreeMap<String, JsonValue>) -> bool {
+    servers.get("command").is_some_and(JsonValue::is_string)
+        || servers.get("url").is_some_and(JsonValue::is_string)
+}
+
+fn deserialize_server_map<'de, D>(deserializer: D) -> Result<BTreeMap<String, JsonValue>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let servers = BTreeMap::deserialize(deserializer)?;
+    // Let the untagged fallback retain a bare server named after a wrapper.
+    if is_transport_declaration(&servers) {
+        return Err(serde::de::Error::custom(
+            "expected a server map, not a transport",
+        ));
+    }
+    Ok(servers)
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,15 +70,33 @@ enum PluginMcpFile {
 }
 
 impl PluginMcpFile {
-    fn into_mcp_servers(self) -> BTreeMap<String, JsonValue> {
+    fn into_mcp_servers(self) -> Result<BTreeMap<String, JsonValue>, serde_json::Error> {
         match self {
-            Self::McpServersObject(file) => file.mcp_servers,
-            Self::ServerMap(mcp_servers) => mcp_servers,
+            Self::McpServersObject(file) => Ok(file.mcp_servers),
+            Self::ServerMap(servers) => {
+                // Duplicate aliases make the wrapped variant fail. Do not then
+                // reinterpret two wrapper maps as individual server configs.
+                let wrapper = |key: &str| {
+                    servers
+                        .get(key)
+                        .and_then(JsonValue::as_object)
+                        .is_some_and(|object| {
+                            !object.get("command").is_some_and(JsonValue::is_string)
+                                && !object.get("url").is_some_and(JsonValue::is_string)
+                        })
+                };
+                if wrapper("mcpServers") && wrapper("mcp_servers") {
+                    return Err(serde::de::Error::custom(
+                        "plugin MCP config must not contain both mcpServers and mcp_servers wrappers",
+                    ));
+                }
+                Ok(servers)
+            }
         }
     }
 }
 
-/// Parses the two supported plugin MCP file shapes and normalizes each server.
+/// Parses camelCase/snake_case wrappers or a bare server map and normalizes each server.
 ///
 /// Invalid individual servers are returned as errors without discarding valid
 /// siblings. A malformed top-level document fails the whole parse.
@@ -100,7 +139,7 @@ fn parse_plugin_mcp_config_from(
     let parsed = serde_json::from_str::<PluginMcpFile>(contents)?;
     let mut outcome = PluginMcpConfigParseOutcome::default();
 
-    for (name, config_value) in parsed.into_mcp_servers() {
+    for (name, config_value) in parsed.into_mcp_servers()? {
         match normalize_plugin_mcp_server(config_value, source) {
             Ok(config) => {
                 outcome.servers.insert(name, config);

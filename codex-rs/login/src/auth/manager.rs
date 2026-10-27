@@ -51,14 +51,12 @@ use crate::auth::storage::create_auth_storage;
 use crate::auth::storage::with_ephemeral_auth_entry;
 use crate::auth::util::try_parse_error_message;
 use crate::default_client::create_client;
-use crate::default_client::create_default_auth_client;
 use crate::outbound_proxy::AuthRouteConfig;
 use crate::token_data::TokenData;
 use crate::token_data::parse_chatgpt_jwt_claims;
 use crate::token_data::parse_jwt_expiration;
 use codex_config::ManagedAuthPolicy;
 use codex_config::types::AuthCredentialsStoreMode;
-use codex_http_client::HttpClient;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_protocol::account::PlanType as AccountPlanType;
@@ -178,7 +176,6 @@ pub struct ChatgptAuthTokens {
 #[derive(Debug, Clone)]
 struct ChatgptAuthState {
     auth_dot_json: Arc<Mutex<Option<AuthDotJson>>>,
-    client: HttpClient,
 }
 
 const TOKEN_REFRESH_INTERVAL: i64 = 8;
@@ -366,14 +363,13 @@ impl CodexAuth {
         }
 
         let storage_mode = auth_dot_json.storage_mode(auth_credentials_store_mode);
-        let endpoint = match &auth_dot_json.oauth_context {
-            Some(context) => context.endpoint("/oauth/token")?,
-            None => refresh_token_endpoint(),
-        };
-        let client = create_default_auth_client(&endpoint, auth_route_config).await?;
+        if let Some(context) = &auth_dot_json.oauth_context {
+            context.endpoint("/oauth/token")?;
+        }
+        // Refresh owns a route-aware pool; a client built while loading cached
+        // credentials was never used by that request or any other auth consumer.
         let state = ChatgptAuthState {
             auth_dot_json: Arc::new(Mutex::new(Some(auth_dot_json))),
-            client,
         };
 
         match auth_mode {
@@ -777,9 +773,11 @@ impl CodexAuth {
             chatgpt_account_id,
             chatgpt_plan_type,
         )?;
+        // Preserve the public external-token constructor's configuration errors;
+        // this separate path is not the managed-storage reload optimization.
+        let _validated_client = create_client().map_err(std::io::Error::other)?;
         let state = ChatgptAuthState {
             auth_dot_json: Arc::new(Mutex::new(Some(auth_dot_json))),
-            client: create_client().map_err(std::io::Error::other)?,
         };
         Ok(Self::ChatgptAuthTokens(ChatgptAuthTokens { state }))
     }
@@ -840,10 +838,6 @@ impl ChatgptAuth {
 
     fn storage(&self) -> &Arc<dyn AuthStorageBackend> {
         &self.storage
-    }
-
-    fn client(&self) -> &HttpClient {
-        &self.state.client
     }
 
     fn persist_agent_identity_record(
@@ -1553,7 +1547,6 @@ fn persist_tokens(
 // The caller is responsible for persisting any returned tokens.
 async fn request_chatgpt_token_refresh(
     refresh_token: String,
-    _client: &HttpClient,
     auth_route_config: &AuthRouteConfig,
     context: Option<&OAuthContext>,
     timeout: Duration,
@@ -3422,7 +3415,6 @@ impl AuthManager {
             .ok_or_else(|| std::io::Error::other("Token data is not available."))?;
         let refresh_response = request_chatgpt_token_refresh(
             expected_tokens.refresh_token.clone(),
-            auth.client(),
             &self.auth_route_config,
             expected.oauth_context.as_ref(),
             CHATGPT_TOKEN_REFRESH_TIMEOUT,

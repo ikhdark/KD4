@@ -339,6 +339,7 @@ async fn read_thread_from_rollout_path(
             thread.session_id = Some(meta_line.meta.session_id);
             thread.parent_thread_id = meta_line.meta.parent_thread_id;
             thread.history_mode = meta_line.meta.history_mode;
+            thread.thread_source = meta_line.meta.thread_source;
         }
         // The rollout summary recovered the filename identity. Preserve the
         // readable suffix without inventing missing creation-only fields.

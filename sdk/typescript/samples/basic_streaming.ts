@@ -11,6 +11,13 @@ const codex = new Codex({ codexPathOverride: codexPathOverride() });
 const thread = codex.startThread();
 const rl = createInterface({ input, output });
 
+// Keep provisional display separate from canonical completed messages on stdout.
+let liveItemId: string | undefined;
+const finishLiveText = (): void => {
+  if (liveItemId !== undefined) process.stderr.write("\n");
+  liveItemId = undefined;
+};
+
 const handleItemCompleted = (item: ThreadItem): void => {
   switch (item.type) {
     case "agent_message":
@@ -47,7 +54,19 @@ const handleItemUpdated = (item: ThreadItem): void => {
 };
 
 const handleEvent = (event: ThreadEvent): void => {
+  if (event.type !== "item.progress" || event.kind !== "agent_message") finishLiveText();
   switch (event.type) {
+    case "item.progress":
+      if (event.kind === "agent_message") {
+        if (liveItemId !== event.item_id) {
+          finishLiveText();
+          process.stderr.write("Assistant (provisional): ");
+          liveItemId = event.item_id;
+        }
+        process.stderr.write(event.delta);
+        if (event.truncated) process.stderr.write(" [preview truncated; final snapshot follows]");
+      }
+      break;
     case "item.completed":
       handleItemCompleted(event.item);
       break;
@@ -84,6 +103,7 @@ const main = async (): Promise<void> => {
       }
     }
   } finally {
+    finishLiveText();
     rl.close();
   }
 };

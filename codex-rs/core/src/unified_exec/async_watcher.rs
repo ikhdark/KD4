@@ -826,7 +826,7 @@ async fn emit_output_delta(
     stream: ExecOutputStream,
     chunk: &[u8],
 ) {
-    let chunk = match emitted_deltas.claim() {
+    let chunk = match emitted_deltas.claim(chunk.len()) {
         OutputDeltaDecision::Emit => chunk.to_vec(),
         OutputDeltaDecision::EmitCapNotice => EXEC_OUTPUT_DELTA_CAP_NOTICE.to_vec(),
         OutputDeltaDecision::Suppress => return,

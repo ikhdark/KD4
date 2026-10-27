@@ -26,16 +26,18 @@ and [CONTEXT.md](CONTEXT.md) for guidance and the current uncommitted state.
 
 ## Retained history
 
-- Loose audit reports are indexed in [audits/reports/](audits/reports/README.md).
-  Loose raw captures are in [audits/artifacts/](audits/artifacts/README.md).
+- The [audit library](audits/README.md) groups reports and raw captures by task.
+  All 105 retained tasks have matching copies here and in
+  `C:\Users\kuh\Desktop\KDR\audits`; see the library's organization report.
 - Historical reports and benchmark captures may refer to removed tests,
   support crates, and paths; preserve those records rather than treating them as
   current runnable instructions.
-- Existing evidence bundles stay at their original paths. Their source snapshots,
-  including any nested `.codex` directories, are historical evidence, not active
-  workspace configuration.
-- Reports and captures have not been discarded. Historical commands may still
-  name their old paths; see the [relocation guide](audits/README.md#relocated-files).
+- Related evidence bundles are collected inside their task folder. Their source
+  snapshots, including any nested `.codex` directories, are historical evidence,
+  not active workspace configuration.
+- Files older than seven days were removed on 2026-10-26 by last-modified time.
+  Newer reports and captures are retained. Historical commands may name old
+  paths; see the [relocation guide](audits/README.md#relocated-files).
 - Audit evidence, patch receipts, benchmark output, and locks are Git-ignored
-  by repository rules. One previously tracked audit closeout remains tracked;
-  local organization does not publish the other evidence.
+  by repository rules. The formerly tracked loose closeout is included in the
+  `remaining-fixes-2026-10-22` task folder; local organization publishes nothing.
