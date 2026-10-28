@@ -121,6 +121,10 @@ pub struct TurnDiffTracker {
     origin_by_current_path: HashMap<TrackedPath, TrackedPath>,
     mutation_revision: u64,
     attributed_mutation_revision: u64,
+    /// Command executions without admission proof that they were read-only.
+    /// Generation purpose labels use it; caches still use `mutation_revision`.
+    unproven_command_revision: u64,
+    read_only_command_calls: HashSet<String>,
     /// Exact patch effects since each validation baseline, in validation
     /// revisions. Unknown effects invalidate the proof without discarding the
     /// ordinary net diff.
@@ -161,6 +165,8 @@ impl Default for TurnDiffTracker {
             origin_by_current_path: HashMap::new(),
             mutation_revision: 0,
             attributed_mutation_revision: 0,
+            unproven_command_revision: 0,
+            read_only_command_calls: HashSet::new(),
             rendered_diffs: BTreeMap::new(),
             unavailable_paths: BTreeSet::new(),
             unattributed_paths: BTreeSet::new(),
@@ -473,8 +479,17 @@ impl TurnDiffTracker {
     }
 
     /// Commands invalidate cached observations, not the apply-patch-only diff.
-    pub(crate) fn record_command_execution(&mut self) {
+    pub(crate) fn record_command_execution(&mut self, call_id: &str) {
         self.mutation_revision = self.mutation_revision.saturating_add(1);
+        if !self.read_only_command_calls.contains(call_id) {
+            self.unproven_command_revision = self.unproven_command_revision.saturating_add(1);
+        }
+    }
+
+    /// Records the dispatch-time read-only proof for a command call, so its
+    /// execution does not count as a possible workspace change.
+    pub(crate) fn record_read_only_command_call(&mut self, call_id: &str) {
+        self.read_only_command_calls.insert(call_id.to_string());
     }
 
     pub(crate) fn record_unknown_mutation(&mut self) {
@@ -561,6 +576,10 @@ impl TurnDiffTracker {
 
     pub(crate) fn attributed_mutation_revision(&self) -> u64 {
         self.attributed_mutation_revision
+    }
+
+    pub(crate) fn unproven_command_revision(&self) -> u64 {
+        self.unproven_command_revision
     }
 
     pub(crate) fn has_untracked_changes(&self) -> bool {

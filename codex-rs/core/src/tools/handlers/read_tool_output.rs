@@ -928,6 +928,8 @@ struct ReadToolOutputArgs {
     ranges: Option<Vec<ReadToolOutputRangeArgs>>,
     #[serde(default)]
     max_bytes: Option<usize>,
+    #[serde(default)]
+    cell_recovery: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1291,6 +1293,18 @@ async fn handle_read_tool_output(
             super::read_file::attach_source_inspection_evidence(&mut output, &mut projected, proof, &invocation);
             inner = recovery_tool_output(output, successful, evidence).with_model_value(projected);
         }
+    }
+    // A truncated cell's recovery.arguments read its omitted pages in one call;
+    // give this delivery room beyond the cell budget so it prints whole.
+    if args.cell_recovery
+        && let ToolCallSource::CodeMode { cell_id, .. } = &invocation.source
+    {
+        let tokens = codex_utils_output_truncation::model_token_count(&inner.value().to_string());
+        invocation
+            .session
+            .services
+            .code_mode_service
+            .raise_output_budget(cell_id, tokens);
     }
     attempt.completed = true;
     Ok(boxed_tool_output(ReadToolOutputToolOutput {

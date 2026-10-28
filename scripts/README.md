@@ -14,7 +14,15 @@ belong here.
 
 Run Cargo directly from `codex-rs`, or use
 `just cargo-lane <lane> cargo <command> ...` to reuse bounded warm build
-directories. Repository test suites, test-only support files, and named test and
+directories. Resolved lanes include a source-root hash: legacy target caches are
+retained but not adopted, preventing cross-checkout timestamp-only reuse. Use
+the emitted target directory rather than deriving it from the requested name.
+Sealed snapshots (no `.git`) built with `rust_build_status.py run-lane --repo-root
+SNAPSHOT` reuse an exact frozen bundle, or build in the nearest free warm slot
+through a content-synced source mirror, and freeze their executables with
+`build-receipt.json` (`--freeze-bundle NEW_DIR`, else the local bundle store).
+`find-bundle` answers without building; `--include-legacy` covers older bundles.
+Repository test suites, test-only support files, and named test and
 coverage recipes have been removed. Generic Cargo tooling still accepts
 caller-selected commands without supplying a repository test suite.
 

@@ -2641,12 +2641,19 @@ impl ToolCallRuntime {
                         .is_empty();
                 if tracks_workspace {
                     timing.record_boundary(ToolLifecycleBoundary::DiffTrackerWaitStart);
-                    tracker
-                        .lock()
-                        .await
-                        .activate_workspace_evidence_generation_batch(
-                            &step_context.workspace_evidence_generation_batch,
-                        );
+                    let mut guard = tracker.lock().await;
+                    guard.activate_workspace_evidence_generation_batch(
+                        &step_context.workspace_evidence_generation_batch,
+                    );
+                    if read_only
+                        && router
+                            .semantic_capabilities(&evidence_call.tool_name)
+                            .command
+                            .is_some()
+                    {
+                        guard.record_read_only_command_call(&evidence_call.call_id);
+                    }
+                    drop(guard);
                     timing.record_boundary(ToolLifecycleBoundary::DiffTrackerWaitEnd);
                 }
                 timing.record_boundary(ToolLifecycleBoundary::WorkspaceGateWaitStart);
@@ -2689,6 +2696,12 @@ impl ToolCallRuntime {
                                             serde_json::json!({
                                                 "kind": "workspace_gate_timeout",
                                                 "did_run": false,
+                                                "execution_state": "not_started",
+                                                "process_exited": false,
+                                                "exit_code": null,
+                                                "output_complete": false,
+                                                "output_reduced": false,
+                                                "raw_output_artifact_retention_limit_hit": false,
                                                 "output": result.0,
                                             }),
                                             Some(false),

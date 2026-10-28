@@ -14,6 +14,8 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use crate::DISABLED_HOOKS_PATH;
+use crate::operations::GitCommandControl;
+use crate::operations::DEFAULT_GIT_OUTPUT_LIMIT;
 
 /// Parameters for invoking [`apply_git_patch`].
 #[derive(Debug, Clone)]
@@ -42,7 +44,26 @@ pub struct ApplyGitResult {
 /// existing staged/unstaged separation is preserved. When [`ApplyGitRequest::preflight`] is
 /// `true`, the same three-way/index state is checked without modifying the working tree.
 pub fn apply_git_patch(req: &ApplyGitRequest) -> io::Result<ApplyGitResult> {
-    let git_root = resolve_git_root(&req.cwd)?;
+    apply_git_patch_inner(req, &GitCommandControl::new())
+}
+
+/// Cancel contained Git work if the async caller is dropped. Cancellation is
+/// not rollback: a final apply can already have changed some working files.
+pub async fn apply_git_patch_async(req: ApplyGitRequest) -> io::Result<ApplyGitResult> {
+    struct CancelOnDrop(GitCommandControl);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.cancel();
+        }
+    }
+    let control = GitCommandControl::new();
+    let _cancellation = CancelOnDrop(control.clone());
+    tokio::task::spawn_blocking(move || apply_git_patch_inner(&req, &control))
+        .await.map_err(io::Error::other)?
+}
+
+fn apply_git_patch_inner(req: &ApplyGitRequest, control: &GitCommandControl) -> io::Result<ApplyGitResult> {
+    let git_root = resolve_git_root(&req.cwd, control)?;
 
     // Write unified diff into a temporary file
     let (tmpdir, patch_path) = write_temp_patch(&req.diff)?;
@@ -72,7 +93,7 @@ pub fn apply_git_patch(req: &ApplyGitRequest) -> io::Result<ApplyGitResult> {
     // reflects the current worktree for the touched paths so the real index is
     // never staged or otherwise reclassified by patch application.
     let (_index_dir, temporary_index) =
-        prepare_temporary_index(&git_root, &patch_path, &req.diff, &cfg_parts)?;
+        prepare_temporary_index(&git_root, &patch_path, &req.diff, &cfg_parts, control)?;
     let git_env = [
         (
             OsString::from("GIT_INDEX_FILE"),
@@ -101,7 +122,7 @@ pub fn apply_git_patch(req: &ApplyGitRequest) -> io::Result<ApplyGitResult> {
         }
         check_args.push(patch_path.to_string_lossy().to_string());
         let rendered = render_command_for_log(&git_root, &cfg_parts, &check_args);
-        let (c_code, c_out, c_err) = run_git(&git_root, &cfg_parts, &check_args, Some(&git_env))?;
+        let (c_code, c_out, c_err) = run_git(&git_root, &cfg_parts, &check_args, Some(&git_env), control)?;
         let (applied_paths, skipped_paths, conflicted_paths) =
             parse_git_apply_output(&c_out, &c_err);
         // Git's `--3way --check` performs the in-core merge but skips the
@@ -124,7 +145,7 @@ pub fn apply_git_patch(req: &ApplyGitRequest) -> io::Result<ApplyGitResult> {
     }
 
     let cmd_for_log = render_command_for_log(&git_root, &cfg_parts, &args);
-    let (code, stdout, stderr) = run_git(&git_root, &cfg_parts, &args, Some(&git_env))?;
+    let (code, stdout, stderr) = run_git(&git_root, &cfg_parts, &args, Some(&git_env), control)?;
 
     let (applied_paths, skipped_paths, conflicted_paths) =
         parse_git_apply_output(&stdout, &stderr);
@@ -140,12 +161,10 @@ pub fn apply_git_patch(req: &ApplyGitRequest) -> io::Result<ApplyGitResult> {
     })
 }
 
-fn resolve_git_root(cwd: &Path) -> io::Result<PathBuf> {
-    let out = std::process::Command::new(crate::git_executable())
-        .arg("rev-parse")
-        .arg("--show-toplevel")
-        .current_dir(cwd)
-        .output()?;
+fn resolve_git_root(cwd: &Path, control: &GitCommandControl) -> io::Result<PathBuf> {
+    let mut command = std::process::Command::new(crate::git_executable());
+    command.args(["rev-parse", "--show-toplevel"]).current_dir(cwd);
+    let out = crate::operations::run_git_output(command, DEFAULT_GIT_OUTPUT_LIMIT, control)?;
     let code = out.status.code().unwrap_or(-1);
     if code != 0 {
         return Err(io::Error::other(format!(
@@ -169,9 +188,10 @@ fn run_git(
     git_cfg: &[String],
     args: &[String],
     env: Option<&[(OsString, OsString)]>,
+    control: &GitCommandControl,
 ) -> io::Result<(i32, String, String)> {
     let args = args.iter().map(OsString::from).collect::<Vec<_>>();
-    run_git_os(cwd, git_cfg, &args, env)
+    run_git_os(cwd, git_cfg, &args, env, control)
 }
 
 fn run_git_os(
@@ -179,8 +199,9 @@ fn run_git_os(
     git_cfg: &[String],
     args: &[OsString],
     env: Option<&[(OsString, OsString)]>,
+    control: &GitCommandControl,
 ) -> io::Result<(i32, String, String)> {
-    let out = run_git_output_os(cwd, git_cfg, args, env)?;
+    let out = run_git_output_os(cwd, git_cfg, args, env, control)?;
     let code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -192,6 +213,7 @@ fn run_git_output_os(
     git_cfg: &[String],
     args: &[OsString],
     env: Option<&[(OsString, OsString)]>,
+    control: &GitCommandControl,
 ) -> io::Result<std::process::Output> {
     let mut cmd = std::process::Command::new(crate::git_executable());
     for p in git_cfg {
@@ -203,7 +225,8 @@ fn run_git_output_os(
     if let Some(env) = env {
         cmd.envs(env.iter().cloned());
     }
-    cmd.current_dir(cwd).output()
+    cmd.current_dir(cwd);
+    crate::operations::run_git_output(cmd, DEFAULT_GIT_OUTPUT_LIMIT, control)
 }
 
 fn prepare_temporary_index(
@@ -211,15 +234,16 @@ fn prepare_temporary_index(
     patch_path: &Path,
     diff: &str,
     git_cfg: &[String],
+    control: &GitCommandControl,
 ) -> io::Result<(tempfile::TempDir, PathBuf)> {
     let index_dir = tempfile::tempdir()?;
     let temporary_index = index_dir.path().join("index");
-    let source_index = resolve_index_path(git_root)?;
+    let source_index = resolve_index_path(git_root, control)?;
     if source_index.is_file() {
         std::fs::copy(&source_index, &temporary_index)?;
     }
 
-    let paths = paths_for_temporary_index(git_root, patch_path, diff, git_cfg)?;
+    let paths = paths_for_temporary_index(git_root, patch_path, diff, git_cfg, control)?;
     let git_env = [
         (
             OsString::from("GIT_INDEX_FILE"),
@@ -227,7 +251,7 @@ fn prepare_temporary_index(
         ),
         (OsString::from("GIT_LITERAL_PATHSPECS"), OsString::from("1")),
     ];
-    let tracked_paths = tracked_paths_in_index(git_root, git_cfg, &paths, &git_env)?;
+    let tracked_paths = tracked_paths_in_index(git_root, git_cfg, &paths, &git_env, control)?;
     materialize_worktree_in_temporary_index(
         git_root,
         git_cfg,
@@ -235,6 +259,7 @@ fn prepare_temporary_index(
         &tracked_paths,
         &git_env,
         index_dir.path(),
+        control,
     )?;
 
     Ok((index_dir, temporary_index))
@@ -245,6 +270,7 @@ fn paths_for_temporary_index(
     patch_path: &Path,
     diff: &str,
     git_cfg: &[String],
+    control: &GitCommandControl,
 ) -> io::Result<Vec<OsString>> {
     let args = vec![
         OsString::from("apply"),
@@ -252,7 +278,7 @@ fn paths_for_temporary_index(
         OsString::from("-z"),
         patch_path.as_os_str().to_os_string(),
     ];
-    let output = run_git_output_os(git_root, git_cfg, &args, None)?;
+    let output = run_git_output_os(git_root, git_cfg, &args, None, control)?;
     if output.status.success()
         && let Some(paths) = parse_numstat_paths(&output.stdout)
     {
@@ -315,6 +341,7 @@ fn materialize_worktree_in_temporary_index(
     tracked_paths: &std::collections::BTreeSet<OsString>,
     env: &[(OsString, OsString)],
     temp_dir: &Path,
+    control: &GitCommandControl,
 ) -> io::Result<()> {
     let mut worktree_patch = Vec::new();
     let tracked = paths
@@ -336,9 +363,15 @@ fn materialize_worktree_in_temporary_index(
             OsString::from("--"),
         ];
         args.extend(tracked);
-        let output = run_git_output_os(git_root, git_cfg, &args, Some(env))?;
+        let output = run_git_output_os(git_root, git_cfg, &args, Some(env), control)?;
         if !output.status.success() {
             return Err(git_output_error("diff worktree paths", &output));
+        }
+        if worktree_patch.len().checked_add(output.stdout.len())
+            .is_none_or(|bytes| bytes > DEFAULT_GIT_OUTPUT_LIMIT)
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                "Git worktree patch exceeds the supported capture limit"));
         }
         worktree_patch.extend(output.stdout);
     }
@@ -365,13 +398,19 @@ fn materialize_worktree_in_temporary_index(
             null_device.clone(),
             path.clone(),
         ];
-        let output = run_git_output_os(git_root, git_cfg, &args, Some(env))?;
+        let output = run_git_output_os(git_root, git_cfg, &args, Some(env), control)?;
         if !output
             .status
             .code()
             .is_some_and(|code| code == 0 || code == 1)
         {
             return Err(git_output_error("diff untracked worktree path", &output));
+        }
+        if worktree_patch.len().checked_add(output.stdout.len())
+            .is_none_or(|bytes| bytes > DEFAULT_GIT_OUTPUT_LIMIT)
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                "Git worktree patch exceeds the supported capture limit"));
         }
         worktree_patch.extend(output.stdout);
     }
@@ -389,7 +428,7 @@ fn materialize_worktree_in_temporary_index(
     ];
     let mut internal_git_cfg = git_cfg.to_vec();
     internal_git_cfg.extend(["-c".to_string(), "apply.directory=".to_string()]);
-    let output = run_git_output_os(git_root, &internal_git_cfg, &args, Some(env))?;
+    let output = run_git_output_os(git_root, &internal_git_cfg, &args, Some(env), control)?;
     if !output.status.success() {
         return Err(git_output_error(
             "apply worktree state to temporary index",
@@ -405,7 +444,7 @@ fn materialize_worktree_in_temporary_index(
         OsString::from("-q"),
         OsString::from("--refresh"),
     ];
-    let refresh = run_git_output_os(git_root, git_cfg, &refresh_args, Some(env))?;
+    let refresh = run_git_output_os(git_root, git_cfg, &refresh_args, Some(env), control)?;
     if refresh.status.success() {
         Ok(())
     } else {
@@ -442,6 +481,7 @@ fn tracked_paths_in_index(
     git_cfg: &[String],
     paths: &[OsString],
     env: &[(OsString, OsString)],
+    control: &GitCommandControl,
 ) -> io::Result<std::collections::BTreeSet<OsString>> {
     if paths.is_empty() {
         return Ok(std::collections::BTreeSet::new());
@@ -451,7 +491,7 @@ fn tracked_paths_in_index(
     cmd.args(paths)
         .envs(env.iter().cloned())
         .current_dir(git_root);
-    let out = cmd.output()?;
+    let out = crate::operations::run_git_output(cmd, DEFAULT_GIT_OUTPUT_LIMIT, control)?;
     let code = out.status.code().unwrap_or(-1);
     if code != 0 {
         return Err(io::Error::other(format!(
@@ -467,11 +507,10 @@ fn tracked_paths_in_index(
         .collect())
 }
 
-fn resolve_index_path(git_root: &Path) -> io::Result<PathBuf> {
-    let out = std::process::Command::new(crate::git_executable())
-        .args(["rev-parse", "--git-path", "index"])
-        .current_dir(git_root)
-        .output()?;
+fn resolve_index_path(git_root: &Path, control: &GitCommandControl) -> io::Result<PathBuf> {
+    let mut command = std::process::Command::new(crate::git_executable());
+    command.args(["rev-parse", "--git-path", "index"]).current_dir(git_root);
+    let out = crate::operations::run_git_output(command, DEFAULT_GIT_OUTPUT_LIMIT, control)?;
     let code = out.status.code().unwrap_or(-1);
     if code != 0 {
         return Err(io::Error::other(format!(

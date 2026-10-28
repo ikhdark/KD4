@@ -101,7 +101,12 @@ impl SendMessageHandler {
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let arguments = function_arguments(invocation.payload.clone())?;
-        let args: SendMessageArgs = parse_arguments(&arguments)?;
+        let args: SendMessageArgs = parse_arguments(&arguments).map_err(|error| {
+            serde_json::from_str(&arguments)
+                .ok()
+                .and_then(|value| ancestor_refusal(&invocation.step_context.turn, &value))
+                .map_or(error, FunctionCallError::RespondToModel)
+        })?;
         let target = args.single_target()?;
         match (target, args.targets) {
             (Some(target), None) => handle_message_string_tool(
@@ -181,7 +186,12 @@ impl FollowupTaskHandler {
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let arguments = function_arguments(invocation.payload.clone())?;
-        let args: FollowupTaskArgs = parse_arguments(&arguments)?;
+        let args: FollowupTaskArgs = parse_arguments(&arguments).map_err(|error| {
+            serde_json::from_str(&arguments)
+                .ok()
+                .and_then(|value| ancestor_refusal(&invocation.step_context.turn, &value))
+                .map_or(error, FunctionCallError::RespondToModel)
+        })?;
         handle_message_string_tool(
             invocation,
             MessageDeliveryMode::TriggerTurn,
@@ -208,6 +218,37 @@ pub(super) fn message_content(message: String) -> Result<String, FunctionCallErr
     Ok(message)
 }
 
+/// Recipient-like keys of misaddressed sub-agent progress reports.
+const RECIPIENT_KEYS: [&str; 8] = [
+    "recipient", "to", "target", "targets", "task_name", "agent", "agent_path", "parent",
+];
+
+/// The ancestor policy, in place of the schema or lookup error, for a
+/// sub-agent message whose every named recipient is an ancestor. Recorded
+/// children retried `recipient`, then `target: "parent"`, before reaching the
+/// policy at `/root` (audit 2026-10-28 #5).
+pub(crate) fn ancestor_refusal(
+    turn: &crate::session::turn_context::TurnContext,
+    arguments: &serde_json::Value,
+) -> Option<String> {
+    let author = turn.session_source.get_agent_path().filter(|path| !path.is_root())?;
+    let references = RECIPIENT_KEYS
+        .iter()
+        .filter_map(|key| arguments.get(key))
+        .flat_map(|value| match value {
+            serde_json::Value::Array(items) => items.iter().collect::<Vec<_>>(),
+            value => vec![value],
+        })
+        .collect::<Vec<_>>();
+    (!references.is_empty()
+        && references.iter().all(|reference| {
+            reference
+                .as_str()
+                .is_some_and(|reference| crate::agent::control::is_ancestor_reference(&author, reference))
+        }))
+    .then(|| crate::agent::control::ANCESTOR_PROGRESS_REFUSAL.to_string())
+}
+
 /// Handles the shared MultiAgentV2 message flow for both `send_message` and `followup_task`.
 pub(crate) async fn handle_message_string_tool(
     invocation: ToolInvocation,
@@ -225,7 +266,13 @@ pub(crate) async fn handle_message_string_tool(
         ..
     } = invocation;
     let turn = Arc::clone(&step_context.turn);
-    let receiver_thread_id = resolve_agent_target(&session, &turn, &target).await?;
+    let receiver_thread_id = match resolve_agent_target(&session, &turn, &target).await {
+        Ok(thread_id) => thread_id,
+        Err(error) => {
+            return Err(ancestor_refusal(&turn, &serde_json::json!({ "target": target }))
+                .map_or(error, FunctionCallError::RespondToModel));
+        }
+    };
     let receiver_agent = session
         .services
         .agent_control
@@ -296,7 +343,8 @@ pub(crate) async fn handle_message_string_tool(
         MessageDeliveryMode::QueueOnly => AgentCommunicationKind::Message,
         MessageDeliveryMode::TriggerTurn => AgentCommunicationKind::Followup,
     };
-    let context = AgentCommunicationContext::new(kind, session.thread_id);
+    let context = AgentCommunicationContext::new(kind, session.thread_id)
+        .with_sender_turn(turn.sub_id.clone());
     let communication = mode.apply(communication);
     let control = &session.services.agent_control;
     control

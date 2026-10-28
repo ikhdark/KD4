@@ -517,6 +517,7 @@ impl crate::FsmonitorProbeRunner for LocalFsmonitorProbeRunner<'_> {
             &args,
             self.cwd,
             crate::FsmonitorOverride::Disabled,
+            crate::operations::DEFAULT_GIT_OUTPUT_LIMIT,
         )
         .await?;
         output.status.success().then_some(output.stdout)
@@ -544,8 +545,20 @@ async fn run_git_command_with_timeout_os_from(
     cwd: &Path,
     fsmonitor: crate::FsmonitorOverride,
 ) -> Option<std::process::Output> {
+    run_git_command_with_timeout_os_from_limited(
+        git, args, cwd, fsmonitor, crate::operations::DEFAULT_GIT_OUTPUT_LIMIT,
+    ).await
+}
+
+async fn run_git_command_with_timeout_os_from_limited(
+    git: &Path,
+    args: &[OsString],
+    cwd: &Path,
+    fsmonitor: crate::FsmonitorOverride,
+    stdout_limit: usize,
+) -> Option<std::process::Output> {
     let command_args = git_inspection_args_os(args, fsmonitor, None);
-    let output = run_git_command_attempt(git, &command_args, cwd, fsmonitor).await?;
+    let output = run_git_command_attempt(git, &command_args, cwd, fsmonitor, stdout_limit).await?;
     let Some(retry_args) = safe_directory_retry_args_os(
         args,
         cwd,
@@ -556,7 +569,7 @@ async fn run_git_command_with_timeout_os_from(
         return Some(output);
     };
 
-    run_git_command_attempt(git, &retry_args, cwd, fsmonitor).await
+    run_git_command_attempt(git, &retry_args, cwd, fsmonitor, stdout_limit).await
 }
 
 fn safe_directory_retry_args_os(
@@ -642,6 +655,7 @@ async fn run_git_command_attempt(
     args: &[OsString],
     cwd: &Path,
     fsmonitor: crate::FsmonitorOverride,
+    stdout_limit: usize,
 ) -> Option<std::process::Output> {
     let mut command = Command::new(git);
     command
@@ -653,7 +667,7 @@ async fn run_git_command_attempt(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let result = timeout(GIT_COMMAND_TIMEOUT, run_git_child(command, fsmonitor)).await;
+    let result = timeout(GIT_COMMAND_TIMEOUT, run_git_child(command, fsmonitor, stdout_limit)).await;
 
     match result {
         Ok(Ok(output)) => Some(output),
@@ -668,6 +682,7 @@ async fn run_git_command_attempt(
 async fn run_git_child(
     mut command: Command,
     fsmonitor: crate::FsmonitorOverride,
+    stdout_limit: usize,
 ) -> std::io::Result<std::process::Output> {
     command.creation_flags(codex_utils_pty::WINDOWS_CREATE_SUSPENDED);
     let managed = codex_utils_pty::ManagedRootProcess::reserve_with_reclaim().await?;
@@ -675,7 +690,7 @@ async fn run_git_child(
     // Git can launch clean/process filters even when hooks, external diffs,
     // and text conversion are disabled. Attach the root before it can run,
     // and retain ownership across both output collection and cancellation.
-    let (managed, mut child, mut stdout, mut stderr) = tokio::task::spawn_blocking(move || {
+    let (managed, mut child, stdout, stderr) = tokio::task::spawn_blocking(move || {
         // Windows child-pipe reads use Tokio's non-cancellable blocking pool.
         // A cancelled metadata probe can otherwise leave those reads waiting
         // through runtime shutdown. Anonymous temporary files have no pipe
@@ -698,21 +713,16 @@ async fn run_git_child(
         let _ = child.wait().await;
         return Err(error);
     }
-    let status = child.wait().await?;
+    let status = loop {
+        tokio::select! {
+            status = child.wait() => break status?,
+            _ = tokio::time::sleep(TokioDuration::from_millis(10)) => {
+                crate::operations::check_git_output_limits(&stdout, &stderr, stdout_limit)?;
+            }
+        }
+    };
     let output = tokio::task::spawn_blocking(move || {
-        use std::io::Read;
-        use std::io::Seek;
-        stdout.rewind()?;
-        stderr.rewind()?;
-        let mut stdout_bytes = Vec::new();
-        let mut stderr_bytes = Vec::new();
-        stdout.read_to_end(&mut stdout_bytes)?;
-        stderr.read_to_end(&mut stderr_bytes)?;
-        Ok::<_, std::io::Error>(std::process::Output {
-            status,
-            stdout: stdout_bytes,
-            stderr: stderr_bytes,
-        })
+        crate::operations::read_git_output(stdout, stderr, status, stdout_limit)
     })
     .await
     .map_err(std::io::Error::other)??;
@@ -734,6 +744,7 @@ async fn run_git_child(
 async fn run_git_child(
     mut command: Command,
     _fsmonitor: crate::FsmonitorOverride,
+    _stdout_limit: usize,
 ) -> std::io::Result<std::process::Output> {
     command.output().await
 }
@@ -973,13 +984,17 @@ async fn find_closest_sha(cwd: &Path, branches: &[String], remotes: &[String]) -
 async fn diff_against_sha(cwd: &Path, sha: &GitSha) -> Option<String> {
     let git = crate::git_executable_async().await;
     let fsmonitor = detect_local_fsmonitor_override(git, cwd).await;
-    let output = run_git_command_with_timeout_from(
-        git,
-        &["diff", "--no-textconv", "--no-ext-diff", &sha.0],
-        cwd,
-        fsmonitor,
-    )
-    .await?;
+    let diff_args = ["diff", "--no-textconv", "--no-ext-diff", &sha.0]
+        .into_iter().map(OsString::from).collect::<Vec<_>>();
+    let untracked_args = ["ls-files", "-z", "--others", "--exclude-standard"]
+        .into_iter().map(OsString::from).collect::<Vec<_>>();
+    // Independent read-only prerequisites share the existing bounded runner.
+    // Both complete before ordered patch assembly; neither observation is cached.
+    let (output, untracked_output) = tokio::join!(
+        run_git_command_with_timeout_os_from_limited(git, &diff_args, cwd, fsmonitor, MAX_DIFF_OUTPUT_BYTES),
+        run_git_command_with_timeout_os_from_limited(git, &untracked_args, cwd, fsmonitor, MAX_DIFF_OUTPUT_BYTES),
+    );
+    let output = output?;
     // 0 is success and no diff.
     // 1 is success but there is a diff.
     let exit_ok = output.status.code().is_some_and(|c| c == 0 || c == 1);
@@ -991,13 +1006,7 @@ async fn diff_against_sha(cwd: &Path, sha: &GitSha) -> Option<String> {
     }
     let mut diff = String::from_utf8(output.stdout).ok()?;
 
-    let untracked_output = run_git_command_with_timeout_from(
-        git,
-        &["ls-files", "-z", "--others", "--exclude-standard"],
-        cwd,
-        fsmonitor,
-    )
-    .await?;
+    let untracked_output = untracked_output?;
     if !untracked_output.status.success() {
         return None;
     }
@@ -1021,7 +1030,11 @@ async fn diff_against_sha(cwd: &Path, sha: &GitSha) -> Option<String> {
                 null_device.clone(),
                 file,
             ];
-            async move { run_git_command_with_timeout_os_from(git, &args, cwd, fsmonitor).await }
+            async move {
+                run_git_command_with_timeout_os_from_limited(
+                    git, &args, cwd, fsmonitor, MAX_DIFF_OUTPUT_BYTES,
+                ).await
+            }
         });
         let mut results = stream::iter(futures).buffered(UNTRACKED_DIFF_CONCURRENCY);
         while let Some(extra) = results.next().await {

@@ -2257,7 +2257,13 @@ impl ExecCommandToolOutput {
             }
             // Poll byte offsets do not establish whole-log line numbers.
             // Offer a plain first page rather than inventing coordinates.
-            return (raw_output != output || self.output_ranges.as_ref().is_some_and(|r| r.gap.is_some()))
+            // The projection normalizes CRLF; that alone omits nothing.
+            let differs = if raw_output.contains("\r\n") {
+                raw_output.replace("\r\n", "\n") != output
+            } else {
+                raw_output != output
+            };
+            return (differs || self.output_ranges.as_ref().is_some_and(|r| r.gap.is_some()))
                 .then(|| serde_json::json!({"kind":"lines","start":1,"end":200}));
         }
         if self.raw_output.is_empty() {

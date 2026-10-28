@@ -12,7 +12,7 @@ pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript, not JS
 - JS bindings reset per exec; store(key,value)/load(key) retain JSON. Load large JSON once per computation and compare stable keys, not object references across loads. Keep one working body, retiring obsolete copies before storing replacements. Summarize already-consumed machine data without reprinting it. Keep compact state/provenance; deleteStored(key) drops duplicates. Failed quota cells discard staged stores; check listKeys before resuming. listKeys({after?,limit?}): 1-64, default 32; continue next_after. First-line // @exec: {"persist":true} preserves completed values across host restart.
 - Deferred tools: ALL_TOOL_NAMES/ALL_TOOLS or tool_search; resolve_tool(name) retains full contracts. Resolve known followups in-cell; never infer arguments from names. Follow namespace_instructions_ref and operation rules, or resolve the full contract.
 
-Optional helpers:
+Helpers (prefer over equivalent read/search/poll plumbing; preserve scope, budgets and failure evidence):
 - `await read_files(paths, {full?, concurrency?})`: 1–32 paths; {path,status,value?,reason?} each; value={initial,pages,file_complete}. full defaults false; true recovers an already-required full snapshot. Check every status and file_complete; byte coverage is not semantic review.
 - `await search_files(pattern, {path?, glob?, lines?, max_per_file?, ignore_case?, fixed?, hidden?, no_ignore?})`: ripgrep returning {files:[{path,count,lines?}],match_count,complete,errors?,hint?}. lines adds {line,text}, default max_per_file=10; hint suggests existing paths near errors.
 - `await await_command(r, {max_bytes?})`: drains a live command to {terminal,observations}; throws on failure with that object on the error's `.evidence`. The default/max 4 MiB budget counts unique observations once, not the duplicated terminal alias in JSON/storage; serialized evidence can be larger. At the bound, retain/page .evidence; resume only a live retained handle and never restart completed work.
@@ -32,7 +32,7 @@ pub fn build_exec_tool_description(
     direct_only_tool_names: &[String],
 ) -> String {
     let delivery_guidance = if direct_delivery_enabled {
-        "First-line // @exec: {\"deliver\": true} makes printed text the final answer, without a model call, when everything in the cell succeeded. For a settled answer, await closing work (including tools.update_plan), then print only that answer in this cell. Plan completion alone is not task completion. Delivery appears at cell end; use a normal final for long reports."
+        "First-line // @exec: {\"deliver\": true} makes printed text the final answer, without a model call, when everything in the cell succeeded. For a settled answer, await closing work (including tools.update_plan) and print only the answer in that same cell, not administrative receipts; avoid a separate generation just for plan closure or restatement. Plan completion alone is not task completion. Delivery appears at cell end; use a normal final for long reports."
     } else {
         "Final-answer delivery is unavailable in this session. `deliver: true` is rejected before the cell starts; omit it and return the answer in a normal final response after `exec` completes."
     };

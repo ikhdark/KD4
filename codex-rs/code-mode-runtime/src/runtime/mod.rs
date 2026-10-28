@@ -716,6 +716,20 @@ impl EnabledToolCatalog {
             .flatten()
     }
 
+    /// `resolve_tool` also accepts the spellings scripts copy from call sites
+    /// (`tools.x`) and provider namespaces (`functions.x`). Registered and
+    /// ambiguous identities keep their exact meaning.
+    fn resolve_script_spelling(&self, requested_name: &str) -> Option<usize> {
+        if self.by_requested_name.contains_key(requested_name) {
+            return self.resolve_requested_name(requested_name);
+        }
+        ["tools.", "functions."].into_iter().find_map(|prefix| {
+            requested_name
+                .strip_prefix(prefix)
+                .and_then(|name| self.resolve_requested_name(name))
+        })
+    }
+
     fn resolution_diagnostic(&self, requested: Option<&str>) -> serde_json::Value {
         let valid = requested.is_some_and(|name| !name.trim().is_empty() && name.len() <= 4096);
         let name = requested.filter(|_| valid).unwrap_or_default();

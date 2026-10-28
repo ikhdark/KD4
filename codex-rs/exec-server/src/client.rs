@@ -192,6 +192,9 @@ pub(crate) struct SessionState {
 #[derive(Default)]
 struct OrderedSessionEvents {
     last_published_seq: u64,
+    // A server-declared missing output interval, not a single missing event.
+    // Keep already-buffered output and lifecycle events inside that interval.
+    output_gap_through: u64,
     exit_published: bool,
     observed_exited: bool,
     last_exit_code: Option<i32>,
@@ -1570,6 +1573,11 @@ impl SessionState {
         }
 
         match &event {
+            ExecProcessEvent::OutputGap { through_seq } => {
+                ordered_events.output_gap_through =
+                    ordered_events.output_gap_through.max(*through_seq);
+                return Ok(self.publish_ready(&mut ordered_events));
+            }
             ExecProcessEvent::Exited { exit_code, sandbox_denied, .. } => {
                 ordered_events.observed_exited = true;
                 ordered_events.last_exit_code = Some(*exit_code);
@@ -1587,8 +1595,20 @@ impl SessionState {
     fn publish_ready(&self, ordered_events: &mut OrderedSessionEvents) -> bool {
         let mut published_closed = false;
         loop {
-            let next_seq = ordered_events.last_published_seq.saturating_add(1);
+            let Some(next_seq) = ordered_events.last_published_seq.checked_add(1) else {
+                break;
+            };
             let Some(event) = ordered_events.pending.remove(&next_seq) else {
+                if next_seq <= ordered_events.output_gap_through {
+                    // Never jump over a retained exit/output/close. Only the
+                    // absent prefix covered by the server's gap may advance.
+                    let through_seq = ordered_events.pending.first_key_value()
+                        .map_or(ordered_events.output_gap_through, |(seq, _)| seq.saturating_sub(1))
+                        .min(ordered_events.output_gap_through);
+                    ordered_events.last_published_seq = through_seq;
+                    self.events.publish(ExecProcessEvent::OutputGap { through_seq });
+                    continue;
+                }
                 break;
             };
             ordered_events.pending_bytes = ordered_events

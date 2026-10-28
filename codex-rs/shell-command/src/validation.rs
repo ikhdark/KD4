@@ -936,35 +936,97 @@ fn option_flags<'a>(args: &'a [String], value_options: &[&str]) -> Vec<&'a str> 
 
 /// Resolve only an interpreter's actual script operand, never `-c` program data.
 pub fn python_script_index(args: &[String]) -> Option<usize> {
-    python_operand_index(args, false)
+    match decode_python_invocation(args)?.operand? {
+        PythonOperand::Script(index) => Some(index),
+        _ => None,
+    }
 }
 
-fn python_operand_index(args: &[String], module: bool) -> Option<usize> {
+/// Decode the module and its own arguments using the same interpreter grammar
+/// as script, inline-code, interaction and compiler-input classification.
+pub fn python_module(args: &[String]) -> Option<(&str, &[String])> {
+    match decode_python_invocation(args)?.operand? {
+        PythonOperand::Module(name, tail) => Some((name, tail)),
+        _ => None,
+    }
+}
+
+enum PythonOperand<'a> {
+    Module(&'a str, &'a [String]),
+    Code(&'a str),
+    Script(usize),
+    Stdin,
+}
+
+struct PythonInvocation<'a> {
+    operand: Option<PythonOperand<'a>>,
+    interactive: bool,
+}
+
+fn decode_python_invocation(args: &[String]) -> Option<PythonInvocation<'_>> {
     let mut index = 0;
+    let mut interactive = false;
     while let Some(arg) = args.get(index) {
-        if module && arg == "-m" {
-            return args.get(index + 1).map(|_| index + 1);
+        let operand = if arg == "--" {
+            args.get(index + 1).map(|value| if value == "-" {
+                PythonOperand::Stdin
+            } else {
+                PythonOperand::Script(index + 1)
+            })
+        } else if arg == "-" {
+            Some(PythonOperand::Stdin)
+        } else if !arg.starts_with('-') {
+            Some(PythonOperand::Script(index))
+        } else {
+            None
+        };
+        if operand.is_some() || arg == "--" {
+            return Some(PythonInvocation { operand, interactive });
         }
-        if module && arg.starts_with("-m") && arg.len() > 2 {
-            return Some(index);
-        }
-        if arg == "--" {
-            return args.get(index + 1).and_then(|_| (!module).then_some(index + 1));
-        }
-        if !arg.starts_with('-') {
-            return (!module).then_some(index);
-        }
-        if matches!(arg.as_str(), "-W" | "-X" | "--check-hash-based-pycs") {
-            index += 2;
-        } else if arg.strip_prefix('-').is_some_and(|flags| !flags.is_empty() && flags.chars().all(|flag| "bBdEiIOPqsSuvx".contains(flag)))
-            || arg.starts_with("-W") || arg.starts_with("-X") || arg.starts_with("--check-hash-based-pycs=")
+        // Windows py selectors precede the interpreter's options. Recognizing
+        // these conservatively cannot grant an opaque child compilation proof.
+        if arg.strip_prefix('-').is_some_and(|value|
+            value.starts_with(|ch: char| ch.is_ascii_digit())
+                && value.chars().all(|ch| ch.is_ascii_digit() || matches!(ch, '.' | '-')))
+            || arg.strip_prefix("-V:").is_some_and(|value| !value.is_empty())
         {
             index += 1;
-        } else {
-            return None;
+            continue;
         }
+        if arg == "--check-hash-based-pycs" {
+            args.get(index + 1)?;
+            index += 2;
+            continue;
+        }
+        if arg.starts_with("--check-hash-based-pycs=") {
+            index += 1;
+            continue;
+        }
+        let flags = arg.strip_prefix('-').filter(|value| !value.is_empty())?;
+        let mut consumed_value = false;
+        for (offset, flag) in flags.char_indices() {
+            if matches!(flag, 'c' | 'm' | 'W' | 'X') {
+                let inline = &flags[offset + flag.len_utf8()..];
+                let (value, tail) = if inline.is_empty() {
+                    (args.get(index + 1)?.as_str(), index + 2)
+                } else {
+                    (inline, index + 1)
+                };
+                if matches!(flag, 'c' | 'm') {
+                    let operand = if flag == 'c' { PythonOperand::Code(value) }
+                        else { PythonOperand::Module(value, &args[tail..]) };
+                    return Some(PythonInvocation { operand: Some(operand), interactive });
+                }
+                index = tail;
+                consumed_value = true;
+                break;
+            }
+            if !"bBdEiIOPqsSuvx".contains(flag) { return None; }
+            interactive |= flag == 'i';
+        }
+        if !consumed_value { index += 1; }
     }
-    None
+    Some(PythonInvocation { operand: None, interactive })
 }
 
 /// Public KD4 lane recipes own exactly a recipe and lane before the child argv.
@@ -1314,31 +1376,7 @@ pub fn decode_execution_wrapper(binary: &str, args: &[String]) -> ExecutionWrapp
 }
 
 fn python_interactive(args: &[String]) -> bool {
-    let mut index = 0;
-    while let Some(arg) = args.get(index) {
-        if matches!(arg.as_str(), "-m" | "-c" | "--" | "-") || !arg.starts_with('-') {
-            break;
-        }
-        if matches!(arg.as_str(), "-W" | "-X" | "--check-hash-based-pycs") {
-            index += 2;
-            continue;
-        }
-        if arg.starts_with("-W")
-            || arg.starts_with("-X")
-            || arg.starts_with("--check-hash-based-pycs=")
-        {
-            index += 1;
-            continue;
-        }
-        if arg
-            .strip_prefix('-')
-            .is_some_and(|flags| flags.contains('i') && !flags.starts_with('-'))
-        {
-            return true;
-        }
-        index += 1;
-    }
-    false
+    decode_python_invocation(args).is_some_and(|invocation| invocation.interactive)
 }
 
 fn is_shell_assignment(argument: &str) -> bool {
@@ -1396,7 +1434,7 @@ fn recognize_operations(binary: &str, args: &[String]) -> (Vec<ValidationOperati
     }
 }
 
-fn is_python_launcher(binary: &str) -> bool {
+pub fn is_python_launcher(binary: &str) -> bool {
     if matches!(binary, "py" | "python") {
         return true;
     }
@@ -1497,77 +1535,12 @@ fn cargo_operation(argument: &str) -> Option<ValidationOperation> {
 }
 
 fn python_operation(args: &[String]) -> Option<ValidationOperation> {
-    let mut index = 0;
-    while let Some(argument) = args.get(index) {
-        if argument == "-m" {
-            args.get(index + 1)?;
-            if args[index + 2..]
-                .iter()
-                .take_while(|arg| arg.as_str() != "--")
-                .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version"))
-            {
-                return None;
-            }
-            return args
-                .get(index + 1)
-                .is_some_and(|module| matches!(module.as_str(), "pytest" | "unittest"))
-                .then_some(ValidationOperation::Test);
-        }
-        if argument == "--" {
-            return None;
-        }
-        if !argument.starts_with('-') {
-            return None;
-        }
-        if argument == "-" {
-            return None;
-        }
-
-        if argument.strip_prefix('-').is_some_and(|flags| {
-            !flags.is_empty() && flags.chars().all(|flag| "bBdEiIOPqsSuvx".contains(flag))
-        }) {
-            index += 1;
-            continue;
-        }
-        if matches!(
-            argument.as_str(),
-            "-b" | "-B"
-                | "-d"
-                | "-E"
-                | "-i"
-                | "-I"
-                | "-O"
-                | "-OO"
-                | "-P"
-                | "-q"
-                | "-s"
-                | "-S"
-                | "-u"
-                | "-v"
-                | "-x"
-        ) {
-            index += 1;
-            continue;
-        }
-
-        if matches!(argument.as_str(), "-W" | "-X" | "--check-hash-based-pycs") {
-            args.get(index + 1)?;
-            index += 2;
-            continue;
-        }
-        if argument
-            .strip_prefix("-W")
-            .or_else(|| argument.strip_prefix("-X"))
-            .is_some_and(|value| !value.is_empty())
-            || argument.starts_with("--check-hash-based-pycs=")
-        {
-            index += 1;
-            continue;
-        }
-
+    let (module, tail) = python_module(args)?;
+    if tail.iter().take_while(|arg| arg.as_str() != "--")
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version")) {
         return None;
     }
-    None
+    matches!(module, "pytest" | "unittest").then_some(ValidationOperation::Test)
 }
 
 fn jvm_test_operation(binary: &str, args: &[String]) -> Option<ValidationOperation> {
@@ -2220,13 +2193,20 @@ fn policy_argv_inner(
         });
     }
     if is_python_launcher(&binary) {
+        let interactive_policy = |policy| {
+            if python_interactive(args) && !matches!(policy, Policy::Tests | Policy::Checks) {
+                Policy::Restricted
+            } else {
+                policy
+            }
+        };
         if let Some(code) = python_inline_code(args) {
-            return policy_python_code(code, runners, depth + 1, leaves);
+            return interactive_policy(policy_python_code(code, runners, depth + 1, leaves));
         }
         if let Some(index) = python_script_index(args)
             && let Some(policy) = policy_repository_script(&args[index], &args[index + 1..], runners, depth, leaves)
         {
-            return policy;
+            return interactive_policy(policy);
         }
     }
     if let Some(runner) = runners.iter().find(|runner| runner.matches(program, args)) {
@@ -2279,8 +2259,8 @@ fn policy_argv_inner(
     } else {
         runner_flags(&binary, args)
     };
-    let known_python_module = is_python_launcher(&binary) && python_script_index(args).is_none()
-        && args.windows(2).any(|pair| pair[0] == "-m" && matches!(pair[1].as_str(), "pytest" | "unittest"));
+    let known_python_module = is_python_launcher(&binary)
+        && python_module(args).is_some_and(|(module, _)| matches!(module, "pytest" | "unittest"));
     if (known_python_module || matches!(binary.as_str(), "pytest" | "vitest" | "jest" | "make" | "task" | "go" | "dotnet" | "mvn" | "mvnw" | "gradle" | "gradlew" | "cmake" | "ninja" | "msbuild" | "npm" | "pnpm" | "yarn"))
         && help_options.iter().any(|flag| matches!(*flag, "--help" | "-h" | "--version"))
     {
@@ -2347,12 +2327,11 @@ fn policy_language_tool(binary: &str, args: &[String]) -> Option<ValidationPolic
         }
     }
     if is_python_launcher(binary) && !python_interactive(args)
-        && let Some(index) = python_operand_index(args, true)
+        && let Some((module, tail)) = python_module(args)
     {
-        let module = args[index].strip_prefix("-m").unwrap_or(&args[index]);
         return match module {
             "py_compile" | "compileall" => Some(Policy::TargetedCompilation),
-            "json.tool" => Some(if args[index + 1..].iter().any(|arg| matches!(arg.as_str(), "--help" | "-h")) { Policy::ReadOnly } else { Policy::Checks }),
+            "json.tool" => Some(if tail.iter().any(|arg| matches!(arg.as_str(), "--help" | "-h")) { Policy::ReadOnly } else { Policy::Checks }),
             _ => None,
         };
     }
@@ -2491,20 +2470,19 @@ fn policy_kdr(args: &[String]) -> ValidationPolicyClassification {
 
 fn policy_kdr_python(args: &[String]) -> Option<ValidationPolicyClassification> {
     // Use the actual interpreter operand, not a later argument or -c payload.
-    let index = if let Some(index) = python_operand_index(args, true) {
-        let module = args[index].strip_prefix("-m").unwrap_or(&args[index]);
+    let tail = if let Some((module, tail)) = python_module(args) {
         matches!(module, "kdr" | "rolloutdetect" | "tools.kdr_session_suite"
             | "tools.benchmark_frozen_analysis" | "tools.rollout_analysis.benchmark_scan")
-            .then_some(index)?
+            .then_some(tail)?
     } else {
         let index = python_script_index(args)?;
         let script = args[index].replace('\\', "/");
         ["tools/kdr_session_suite.py", "tools/benchmark_frozen_analysis.py",
             "tools/rollout_analysis/benchmark_scan.py"].iter().any(|path| {
                 script == *path || script.strip_suffix(*path).is_some_and(|prefix| prefix.ends_with('/'))
-            }).then_some(index)?
+            }).then_some(&args[index + 1..])?
     };
-    Some(policy_kdr(&args[index + 1..]))
+    Some(policy_kdr(tail))
 }
 
 fn policy_kda(mut args: &[String]) -> ValidationPolicyClassification {
@@ -2519,20 +2497,43 @@ fn policy_kda(mut args: &[String]) -> ValidationPolicyClassification {
     if args.first().is_some_and(|arg| arg == "op") {
         let json = args.windows(2).find(|pair| pair[0] == "--json").map(|pair| pair[1].as_str())
             .or_else(|| args.iter().find_map(|arg| arg.strip_prefix("--json=")));
-        if let Some(op) = json.and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
-            .and_then(|request| request.get("op")?.as_str().map(str::to_owned))
+        if let Some(policy) = json.and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+            .and_then(|request| policy_kda_request(&request, 0))
         {
-            return match op.as_str() {
-                "status" | "catalog" => Policy::ReadOnly,
-                "test" | "tests" | "suite" => Policy::Tests,
-                "gate" | "check" | "lint" | "validate" => Policy::Checks,
-                _ => Policy::Tooling,
-            };
+            return policy;
         }
     }
     if args.first().is_some_and(|arg| matches!(arg.as_str(), "test" | "tests" | "suite")) { return Policy::Tests; }
     if args.first().is_some_and(|arg| matches!(arg.as_str(), "check" | "lint" | "gate" | "validate")) { return Policy::Checks; }
     Policy::Tooling
+}
+
+/// Composite KDA requests execute their nested operations, so classify those
+/// too; a plan-only batch lists its steps without running them.
+fn policy_kda_request(request: &serde_json::Value, depth: usize) -> Option<ValidationPolicyClassification> {
+    use ValidationPolicyClassification as Policy;
+    let op = request.get("op")?.as_str()?;
+    let own = match op {
+        "status" | "catalog" => Policy::ReadOnly,
+        "test" | "tests" | "suite" => Policy::Tests,
+        "gate" | "check" | "lint" | "validate" => Policy::Checks,
+        _ => Policy::Tooling,
+    };
+    let nested: Vec<&serde_json::Value> = match op {
+        "batch" if request.get("plan_only") != Some(&serde_json::Value::Bool(true)) => request
+            .get("steps")
+            .and_then(serde_json::Value::as_array)
+            .map(|steps| steps.iter().collect())
+            .unwrap_or_default(),
+        "run" => request.get("request").into_iter().collect(),
+        _ => Vec::new(),
+    };
+    Some(combine_policy_classifications(std::iter::once(own).chain(nested.into_iter().map(|step| {
+        if depth >= MAX_WRAPPER_DEPTH {
+            return Policy::Restricted;
+        }
+        policy_kda_request(step, depth + 1).unwrap_or(Policy::Restricted)
+    }))))
 }
 
 fn policy_just(args: &[String], runners: &[RepositoryRunner], depth: usize, leaves: &mut Vec<Vec<String>>) -> ValidationPolicyClassification {
@@ -2562,9 +2563,11 @@ fn policy_just(args: &[String], runners: &[RepositoryRunner], depth: usize, leav
     }
     let tail = args.get(index..).unwrap_or_default();
     let Some(recipe) = tail.first() else { return Policy::Opaque; };
-    if !changed_owner && let Some(child) = just_lane_child(tail) && let Some((program, args)) = child.split_first() {
+    // An owner-changing option forfeits lane privileges, not inspection of the
+    // visible child: its tests and checks still propagate.
+    if let Some(child) = just_lane_child(tail) && let Some((program, args)) = child.split_first() {
         let policy = policy_argv(program, args, runners, depth + 1, leaves);
-        let owned_lane = owner.is_some_and(|runner|
+        let owned_lane = !changed_owner && owner.is_some_and(|runner|
             runner.admission_runner.as_deref() == Some("rust_build_status")
                 && runner.passthrough_args == Some(2));
         if policy == Policy::Checks && owned_lane {
@@ -2725,15 +2728,10 @@ fn policy_cmd_script(script: &str, runners: &[RepositoryRunner], depth: usize, l
 }
 
 fn python_inline_code(args: &[String]) -> Option<&str> {
-    let mut index = 0;
-    while let Some(arg) = args.get(index) {
-        if arg == "-c" { return args.get(index + 1).map(String::as_str); }
-        if let Some(code) = arg.strip_prefix("-c").filter(|code| !code.is_empty()) { return Some(code); }
-        if matches!(arg.as_str(), "-W" | "-X" | "--check-hash-based-pycs") { index += 2; }
-        else if arg.strip_prefix('-').is_some_and(|flags| !flags.is_empty() && flags.chars().all(|flag| "bBdEiIOPqsSuvx".contains(flag))) || arg.starts_with("-W") || arg.starts_with("-X") { index += 1; }
-        else { return None; }
+    match decode_python_invocation(args)?.operand? {
+        PythonOperand::Code(code) => Some(code),
+        _ => None,
     }
-    None
 }
 
 /// This is not a Python evaluator. Only literal subprocess calls and their
@@ -2833,6 +2831,8 @@ fn policy_python_code(
                             .is_some_and(|(_, rest)| rest.trim().is_empty())
                 })
         });
+        let shell_list = parsed_argv.is_some() && rest.split(',')
+            .any(|option| option.trim().replace(' ', "") == "shell=True");
         let policy = if let Some((argv, _)) = parsed_argv {
             argv.split_first().map_or(Policy::Opaque, |(program, args)| {
                 policy_argv(program, args, runners, depth + 1, leaves)
@@ -2853,7 +2853,12 @@ fn policy_python_code(
         } else {
             Policy::Opaque
         };
-        policies.push(if safe_options || matches!(policy, Policy::Restricted | Policy::Tests | Policy::Checks) {
+        policies.push(if shell_list && !matches!(policy, Policy::Tests | Policy::Checks) {
+            // Windows serializes lists using CRT quoting before COMSPEC /c;
+            // shell metacharacters are not inert argv. Do not grant compile-
+            // only or readonly authority from that list. Keep visible bans.
+            Policy::Restricted
+        } else if safe_options || matches!(policy, Policy::Restricted | Policy::Tests | Policy::Checks) {
             policy
         } else if matches!(policy, Policy::TargetedCompilation | Policy::Benchmark | Policy::Tooling) {
             // Effectful/unknown keyword expressions are not compile/benchmark/tooling-only.

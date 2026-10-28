@@ -845,7 +845,7 @@ async fn emit_exec_end(
         if let Some(tracker) = ctx.turn_diff_tracker {
             let revision = {
                 let mut tracker = tracker.lock().await;
-                tracker.record_command_execution();
+                tracker.record_command_execution(ctx.call_id);
                 tracker.current_mutation_revision()
             };
             ctx.session.services.command_execution

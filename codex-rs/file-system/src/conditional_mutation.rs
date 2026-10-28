@@ -11,6 +11,7 @@ use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
+use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
 use windows_sys::Win32::Foundation::ERROR_INVALID_OWNER;
 use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
 use windows_sys::Win32::Foundation::GENERIC_READ;
@@ -216,11 +217,16 @@ pub fn mutate_file_if_matches(
     };
     let source: Vec<u16> = staged_path.as_os_str().encode_wide().chain([0]).collect();
     let destination: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-    // SAFETY: both paths are live terminated UTF-16. Flags zero explicitly
-    // refuses replacement; a creator in the capture/publication gap wins.
-    let published = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) } != 0;
-    if !published {
-        let error = io::Error::last_os_error();
+    let published = retry_transient_denial(|| {
+        // SAFETY: both paths are live terminated UTF-16. Flags zero explicitly
+        // refuses replacement; a creator in the capture/publication gap wins.
+        if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) } != 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    });
+    if let Err(error) = published {
         return match retained {
             Some(retained_path) => Ok(FileMutationOutcome::RecoveryRequired {
                 retained_path,
@@ -230,7 +236,7 @@ pub fn mutate_file_if_matches(
         };
     }
     if let (Some(file), Some(retained_path)) = (&old, retained)
-        && let Err(error) = delete_handle(file)
+        && let Err(error) = retry_transient_denial(|| delete_handle(file))
     {
         return Ok(FileMutationOutcome::RecoveryRequired {
             retained_path,
@@ -430,6 +436,25 @@ fn recovery_path(parent: &Path) -> io::Result<PathBuf> {
     let retained = reservation.path().to_path_buf();
     reservation.close()?;
     Ok(retained)
+}
+
+/// Scanners and other short-lived holders of a mapped section or handle deny
+/// publication and cleanup briefly after a write. Retry only those denials,
+/// within a bound, before reporting the retained recovery object.
+fn retry_transient_denial(mut operation: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+    for delay_ms in [10, 40, 100, 250] {
+        match operation() {
+            Err(error)
+                if error.raw_os_error().is_some_and(|code| {
+                    code == ERROR_ACCESS_DENIED as i32 || code == ERROR_SHARING_VIOLATION as i32
+                }) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+            result => return result,
+        }
+    }
+    operation()
 }
 
 fn delete_handle(file: &File) -> io::Result<()> {

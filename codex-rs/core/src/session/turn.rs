@@ -800,6 +800,7 @@ pub(crate) fn run_turn(
                     turn_context.deferred_tool_activation_revision(),
                 );
                 baselines.set_attributed_mutation_revision(tracker.attributed_mutation_revision());
+                baselines.set_unproven_command_revision(tracker.unproven_command_revision());
                 baselines
             };
             let request_signals = if kd4_runtime {
@@ -9023,6 +9024,7 @@ fn try_run_sampling_request<'a>(
             SamplingRequestSettledState {
                 mutation_revision: tracker.current_mutation_revision(),
                 attributed_mutation_revision: tracker.attributed_mutation_revision(),
+                unproven_command_revision: tracker.unproven_command_revision(),
                 tool_exposure_revision: turn_context.deferred_tool_activation_revision(),
             }
         };

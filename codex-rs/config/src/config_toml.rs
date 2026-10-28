@@ -378,6 +378,11 @@ pub struct ConfigToml {
     /// exactly retrievable receipts in manually managed prompt history.
     pub completed_tool_history_projection: Option<bool>,
 
+    /// Opt-in: when a context-pressure retirement rewrites prompt history,
+    /// also leave reasoning older than the newest kept generations out of
+    /// sampling requests. Stored history is unchanged. Default: false.
+    pub pressure_reasoning_retirement: Option<bool>,
+
     /// Maximum poll window for background terminal output (`write_stdin`), in milliseconds.
     /// Default: `300000` (5 minutes).
     pub background_terminal_max_timeout: Option<u64>,

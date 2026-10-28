@@ -269,10 +269,30 @@ ON CONFLICT(child_thread_id) DO UPDATE SET
         &self,
         parent: ThreadId,
         turn_id: &str,
+        live_turn_owners: &std::collections::HashMap<ThreadId, (ThreadId, String)>,
     ) -> anyhow::Result<Vec<ThreadId>> {
+        let live_turn_owners = live_turn_owners.iter()
+            .map(|(child, (owner, turn))| (child.to_string(), (owner.to_string(), turn)))
+            .collect::<std::collections::BTreeMap<_, _>>();
         let rows = sqlx::query(
-            "WITH RECURSIVE owned(child_thread_id) AS (SELECT child_thread_id FROM thread_spawn_edges WHERE parent_thread_id = ? AND parent_turn_id = ? AND status = 'open' UNION SELECT edge.child_thread_id FROM thread_spawn_edges AS edge JOIN owned ON edge.parent_thread_id = owned.child_thread_id WHERE edge.status = 'open' AND edge.child_thread_id != ?) SELECT child_thread_id FROM owned WHERE child_thread_id != ? ORDER BY child_thread_id",
+            r#"
+WITH RECURSIVE live_owner(child, parent, turn) AS (
+    SELECT key, json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?)
+), owned(child_thread_id) AS (
+    SELECT edge.child_thread_id FROM thread_spawn_edges AS edge
+    LEFT JOIN live_owner ON live_owner.child = edge.child_thread_id
+        AND live_owner.parent = edge.parent_thread_id
+    WHERE edge.parent_thread_id = ? AND COALESCE(live_owner.turn, edge.parent_turn_id) = ?
+        AND edge.status = 'open'
+    UNION
+    SELECT edge.child_thread_id FROM thread_spawn_edges AS edge
+    JOIN owned ON edge.parent_thread_id = owned.child_thread_id
+    WHERE edge.status = 'open' AND edge.child_thread_id != ?
+)
+SELECT child_thread_id FROM owned WHERE child_thread_id != ? ORDER BY child_thread_id
+            "#,
         )
+        .bind(serde_json::to_string(&live_turn_owners)?)
         .bind(parent.to_string())
         .bind(turn_id)
         .bind(parent.to_string())

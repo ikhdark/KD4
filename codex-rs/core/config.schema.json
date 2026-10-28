@@ -4169,6 +4169,10 @@
       "description": "User-level plugin config entries keyed by plugin name.",
       "type": "object"
     },
+    "pressure_reasoning_retirement": {
+      "description": "Opt-in: when a context-pressure retirement rewrites prompt history, also leave reasoning older than the newest kept generations out of sampling requests. Stored history is unchanged. Default: false.",
+      "type": "boolean"
+    },
     "project_doc_fallback_filenames": {
       "default": [],
       "description": "Ordered list of fallback filenames to look for when AGENTS.md is missing.",

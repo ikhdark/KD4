@@ -11,5 +11,5 @@ background_terminal_max_timeout = 300000
 max_depth = 1
 
 [features]
-enable_fanout = true
+enable_fanout = false
 runtime_metrics = true

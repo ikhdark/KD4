@@ -933,6 +933,16 @@ def _safe_lane_name(value: str) -> str:
     return value
 
 
+def source_root_identity(repo_root: Path) -> str:
+    return os.path.normcase(os.path.abspath(repo_root))
+
+
+def source_lane_name(base_lane: str, source_identity: str) -> str:
+    """Qualify a lane family by the source it compiles (`<base>-ws-<sha256>`)."""
+    source_key = hashlib.sha256(source_identity.encode("utf-8")).hexdigest()
+    return _safe_lane_name(f"{_safe_lane_name(base_lane)}-ws-{source_key}")
+
+
 def _cargo_profile_options(command: Sequence[str]) -> list[str]:
     """Cargo artifact profile only; never Nextest policy or program arguments."""
     if len(command) >= 4 and Path(command[0]).stem.lower() == "rustup" and command[1] == "run":
@@ -1246,18 +1256,24 @@ def reserve_cargo_lane(
     allow_cold_overflow: bool = False,
     build_context: Mapping[str, object] | None = None,
     max_active_lanes: int | None = None,
+    source_identity: str | None = None,
+    rank: Callable[[Path], int] | None = None,
 ) -> Iterator[tuple[str, Path]]:
+    """Reserve a lane; `rank` orders warm candidates (lower first) before LRU."""
     warm_wait_seconds = _nonnegative_wait_seconds(warm_wait_seconds)
     lock_timeout_seconds = _nonnegative_wait_seconds(lock_timeout_seconds)
     if max_active_lanes is not None and max_active_lanes < 1:
         raise ValueError("max active lanes must be at least 1")
     explicit = requested_lane != "auto"
-    base_lane = _safe_lane_name(
-        requested_lane if explicit else _auto_lane_base(command)
-    )
     root = initialize_cargo_lanes_root(
         repo_root,
         lane_root if lane_root is not None else cargo_lanes_root(repo_root),
+    )
+    # Relative dep-info cannot authenticate a legacy or another checkout's
+    # backdated sources. All roots, including the default, need custody.
+    base_lane = source_lane_name(
+        requested_lane if explicit else _auto_lane_base(command),
+        source_identity or source_root_identity(repo_root),
     )
     active_handle: BinaryIO | None = None
     target_dir: Path | None = None
@@ -1269,19 +1285,8 @@ def reserve_cargo_lane(
         busy_reusable = False
         with cargo_lane_coordination_lock(root, timeout_seconds=lock_timeout_seconds):
             candidates = _lane_reservation_candidates(root, base_lane, prefer_warm=True)
-            # Profile names are configurable. Inspect only immediate, direct
-            # profile directories; their names alone do not prove reusable work.
             warm_paths = {
-                candidate.path
-                for candidate in candidates
-                if candidate.path.is_dir()
-                and not is_indirect_directory(candidate.path)
-                and any(
-                    profile.is_dir()
-                    and not is_indirect_directory(profile)
-                    and is_cargo_artifact_dir(profile)
-                    for profile in candidate.path.iterdir()
-                )
+                candidate.path for candidate in candidates if _is_warm_lane_dir(candidate.path)
             }
             compatible_paths = {
                 path
@@ -1293,6 +1298,7 @@ def reserve_cargo_lane(
                 key=lambda candidate: (
                     candidate.path not in compatible_paths,
                     candidate.path not in warm_paths,
+                    rank(candidate.path) if rank is not None and candidate.path in warm_paths else 0,
                     # Cold placeholders keep deterministic base/overflow order.
                     0
                     if not explicit
@@ -2082,7 +2088,8 @@ def cargo_build_context(
             except OSError:
                 configs[str(path)] = None
     return {
-        "version": 1,
+        "version": 2,
+        "sourceRoot": os.path.normcase(os.path.abspath(repo_root)),
         "environment": settings,
         "tools": tools,
         "configs": configs,
@@ -2091,6 +2098,621 @@ def cargo_build_context(
     }
 
 
+# Sealed snapshots share one warm lane through a content-synced mirror. Only
+# content-changed files are rewritten, after the lane's last build ended, so
+# Cargo's mtime freshness stays sound across snapshots whatever their mtimes.
+SOURCE_MIRROR_MODES = ("auto", "always", "never")
+SOURCE_MIRRORS_ROOT_ENV = "CODEX_CARGO_LANE_SOURCE_MIRRORS_ROOT"
+SOURCE_MIRROR_SUBCOMMANDS = frozenset({"build", "b", "check", "c", "rustc", "clippy", "doc", "d"})
+# Compiled inputs: codex-rs and its vendored path dependencies, plus root-level
+# toolchain/configuration that rustup and Cargo discover from the build cwd.
+SOURCE_TREE_DIRS = ("codex-rs", "third_party", ".cargo")
+SOURCE_TREE_FILES = ("rust-toolchain", "rust-toolchain.toml")
+SOURCE_TREE_SKIP_DIRS = frozenset({".git", "node_modules", "__pycache__"})
+BUNDLE_RECEIPT_NAME = "build-receipt.json"
+BUNDLE_RECEIPT_VERSION = 1
+FREEZE_MESSAGE_FORMAT = "--message-format=json-render-diagnostics"
+
+
+def source_mirrors_root(env: Mapping[str, str] = os.environ) -> Path:
+    raw = env.get(SOURCE_MIRRORS_ROOT_ENV, "").strip()
+    if raw:
+        return Path(raw).expanduser().absolute()
+    base = env.get("LOCALAPPDATA", "").strip()
+    return ((Path(base) if base else Path.home() / ".cache") / "codex-kd" / "lane-sources").absolute()
+
+
+def source_tree_files(root: Path) -> dict[str, Path]:
+    """Compiled-input files below a source root, keyed by POSIX relative path.
+
+    Cargo target directories (CACHEDIR.TAG, codex-rs/target) and VCS/package
+    caches are skipped. Links are refused: their content is not root-owned.
+    """
+    files: dict[str, Path] = {}
+    pending: list[tuple[Path, str]] = []
+    for name in (*SOURCE_TREE_DIRS, *SOURCE_TREE_FILES):
+        path = root / name
+        observation = _lane_path_observation(path)
+        if observation is None:
+            continue
+        if _observation_is_indirect(observation):
+            raise ValueError(f"source tree contains a link or junction: {path}")
+        if name in SOURCE_TREE_FILES and stat.S_ISREG(observation.st_mode):
+            files[name] = path
+        elif name in SOURCE_TREE_DIRS and stat.S_ISDIR(observation.st_mode):
+            pending.append((path, f"{name}/"))
+    while pending:
+        directory, prefix = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                relative = f"{prefix}{entry.name}"
+                observation = entry.stat(follow_symlinks=False)
+                if _observation_is_indirect(observation):
+                    raise ValueError(f"source tree contains a link or junction: {entry.path}")
+                if stat.S_ISDIR(observation.st_mode):
+                    if not (
+                        entry.name in SOURCE_TREE_SKIP_DIRS
+                        or relative.casefold() == "codex-rs/target"
+                        or os.path.isfile(os.path.join(entry.path, "CACHEDIR.TAG"))
+                    ):
+                        pending.append((Path(entry.path), f"{relative}/"))
+                elif stat.S_ISREG(observation.st_mode):
+                    files[relative] = Path(entry.path)
+    return files
+
+
+class _SourceManifest:
+    """Order-independent digest of (relative path, content SHA-256) pairs."""
+
+    def __init__(self) -> None:
+        self.entries: dict[str, str] = {}
+        self.bytes = 0
+
+    def add(self, relative: str, data: bytes) -> None:
+        self.entries[relative] = hashlib.sha256(data).hexdigest()
+        self.bytes += len(data)
+
+    def summary(self) -> dict[str, object]:
+        digest = hashlib.sha256()
+        for relative in sorted(self.entries):
+            digest.update(f"{relative}\0{self.entries[relative]}\n".encode("utf-8"))
+        return {"sha256": digest.hexdigest(), "files": len(self.entries), "bytes": self.bytes}
+
+
+def _source_manifest(root: Path) -> _SourceManifest:
+    manifest = _SourceManifest()
+    for relative, path in source_tree_files(root).items():
+        manifest.add(relative, path.read_bytes())
+    return manifest
+
+
+def source_tree_manifest(root: Path) -> dict[str, object]:
+    return _source_manifest(root).summary()
+
+
+def _manifest_sha256(entries: Mapping[str, str]) -> str:
+    manifest = _SourceManifest()
+    manifest.entries = dict(entries)
+    return str(manifest.summary()["sha256"])
+
+
+def _posix_parents(relative: str) -> Iterator[str]:
+    while "/" in relative:
+        relative = relative.rsplit("/", 1)[0]
+        yield relative
+
+
+def sync_source_mirror(
+    source_root: Path, mirror_root: Path, *, not_before_ns: int = 0
+) -> dict[str, object]:
+    """Make the mirror's compiled inputs equal the source's by content.
+
+    Unchanged files keep their mirror mtimes; changed files are rewritten after
+    `not_before_ns` (the lane's last build end), so Cargo sees them as newer
+    than every artifact compiled from earlier mirror content.
+    """
+    started = time.perf_counter()
+    source = source_tree_files(source_root)
+    mirror_root.mkdir(parents=True, exist_ok=True)
+    existing = source_tree_files(mirror_root)
+    removed = 0
+    for relative in sorted(existing.keys() - source.keys()):
+        existing[relative].unlink()
+        removed += 1
+    source_dirs = {parent for relative in source for parent in _posix_parents(relative)}
+    stale_dirs = {parent for relative in existing for parent in _posix_parents(relative)}
+    for directory in sorted(stale_dirs - source_dirs, key=len, reverse=True):
+        try:
+            (mirror_root / directory).rmdir()
+        except OSError:
+            pass
+    manifest = _SourceManifest()
+    floor_ns = not_before_ns + 1_000_000_000 if not_before_ns else 0
+    written = 0
+    for relative in sorted(source):
+        data = source[relative].read_bytes()
+        manifest.add(relative, data)
+        target = mirror_root / relative
+        try:
+            if target.stat().st_size == len(data) and target.read_bytes() == data:
+                continue
+        except FileNotFoundError:
+            pass
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f".{target.name}.mirror-{os.getpid()}")
+        temporary.write_bytes(data)
+        os.replace(temporary, target)
+        if time.time_ns() < floor_ns:
+            os.utime(target, ns=(floor_ns, floor_ns))
+        written += 1
+    return {
+        "root": str(mirror_root),
+        **manifest.summary(),
+        "written": written,
+        "removed": removed,
+        "syncMs": round((time.perf_counter() - started) * 1000, 1),
+        "entries": manifest.entries,
+    }
+
+
+def _cargo_configs_from(directory: Path) -> list[tuple[str, str]]:
+    """Cargo/rustup discovery files in a directory and its ancestors, by content."""
+    directory = Path(os.path.abspath(directory))
+    found = []
+    for current in (directory, *directory.parents):
+        for name in (".cargo/config.toml", ".cargo/config", *SOURCE_TREE_FILES):
+            path = current / name
+            if path.is_file():
+                found.append((name, hashlib.sha256(path.read_bytes()).hexdigest()))
+    return found
+
+
+def _source_mirror_ineligibility(command: Sequence[str], repo_root: Path) -> str | None:
+    """Why a command cannot build from a relocated copy of its source root."""
+    if not command or Path(command[0]).stem.lower() != "cargo":
+        return "not a direct Cargo command"
+    index = _cargo_subcommand_index(command)
+    if index is None or command[index] not in SOURCE_MIRROR_SUBCOMMANDS:
+        return "not a Cargo build/check command"
+    root = source_root_identity(repo_root.resolve())
+    tokens = iter(command[1:])
+    for token in tokens:
+        if token in ("--manifest-path", "-C", "-Z") or token.startswith(
+            ("--manifest-path=", "-C", "-Z", "--target-dir")
+        ):
+            return f"explicit Cargo path option {token.split('=', 1)[0]}"
+        if token == "--config" or token.startswith("--config="):
+            value = token.split("=", 1)[1] if "=" in token else next(tokens, "")
+            if "=" not in value:
+                return "Cargo --config file"
+        if root in os.path.normcase(token):
+            return "argument names the source root"
+    cwd = source_root_identity(Path.cwd().resolve())
+    if cwd != root and not cwd.startswith(root.rstrip(os.sep) + os.sep):
+        return "working directory is outside the source root"
+    return None
+
+
+def _is_warm_lane_dir(path: Path) -> bool:
+    # Profile names are configurable. Inspect only immediate, direct profile
+    # directories; their names alone do not prove reusable work.
+    return (
+        path.is_dir()
+        and not is_indirect_directory(path)
+        and any(
+            profile.is_dir() and not is_indirect_directory(profile) and is_cargo_artifact_dir(profile)
+            for profile in path.iterdir()
+        )
+    )
+
+
+def _source_mirror_skip_reason(
+    mode: str,
+    *,
+    command: Sequence[str],
+    repo_root: Path,
+    external: bool,
+    mirrors_root: Path,
+    source_lane: Path | None,
+) -> str | None:
+    """None when the build should use the shared mirror lanes, else why not."""
+    if mode == "never":
+        return "disabled by --source-mirror never"
+    reason = _source_mirror_ineligibility(command, repo_root)
+    if reason is None and mode == "auto":
+        if not external:
+            reason = "owning checkout builds in place"
+        elif (repo_root / ".git").exists():
+            reason = "checkout with .git builds in place"
+        elif source_lane is not None and _is_warm_lane_dir(source_lane):
+            reason = "existing warm lane for this source root"
+    # Mirrors are created below mirrors_root; the source's own root is copied.
+    if reason is None and _cargo_configs_from(repo_root.parent) != _cargo_configs_from(mirrors_root):
+        reason = "Cargo/rustup files above the source root differ from the mirror's"
+    if reason is not None and mode == "always":
+        raise ValueError(f"--source-mirror always: {reason}")
+    return reason
+
+
+def _mirror_state_path(mirrors_root: Path, target_dir: Path) -> Path:
+    key = hashlib.sha256(source_root_identity(target_dir).encode("utf-8")).hexdigest()[:16]
+    return mirrors_root / f"{key}.json"
+
+
+def _mirror_slot_distance(mirrors_root: Path, wanted: Mapping[str, str]) -> Callable[[Path], int]:
+    """Files whose content differs between a mirror slot's last sync and `wanted`.
+
+    Picking the nearest free slot keeps alternating arms in their own warm slot.
+    Slots without recorded entries rank last.
+    """
+    cache: dict[str, tuple[int, int]] = {}
+
+    def distance(lane_dir: Path) -> int:
+        state_path = _mirror_state_path(mirrors_root, lane_dir.resolve())
+        try:
+            stamp = state_path.stat().st_mtime_ns
+        except OSError:
+            return len(wanted) + 1
+        cached = cache.get(str(state_path))
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+        try:
+            entries = json.loads(state_path.read_text(encoding="utf-8")).get("entries")
+        except (OSError, ValueError, AttributeError):
+            entries = None
+        value = (
+            sum(1 for key in wanted.keys() | entries.keys() if wanted.get(key) != entries.get(key))
+            if isinstance(entries, dict)
+            else len(wanted) + 1
+        )
+        cache[str(state_path)] = (stamp, value)
+        return value
+
+    return distance
+
+
+def _cargo_command_with_message_format(command: Sequence[str]) -> list[str]:
+    result = list(command)
+    options = result[: result.index("--")] if "--" in result else result
+    if any(token == "--message-format" or token.startswith("--message-format=") for token in options):
+        raise ValueError("--freeze-bundle sets Cargo's --message-format; remove it from the command")
+    index = _cargo_subcommand_index(result) if result and Path(result[0]).stem.lower() == "cargo" else None
+    if index is None:
+        raise ValueError("--freeze-bundle requires a direct Cargo build command")
+    return [*result[: index + 1], FREEZE_MESSAGE_FORMAT, *result[index + 1 :]]
+
+
+def _cargo_executables(messages: Path) -> list[Path]:
+    executables: dict[str, Path] = {}
+    with messages.open(encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            if not line.startswith("{"):
+                continue
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            if message.get("reason") == "compiler-artifact" and message.get("executable"):
+                path = Path(message["executable"])
+                executables.setdefault(source_root_identity(path), path)
+    return list(executables.values())
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def freeze_bundle(bundle_dir: Path, executables: Sequence[Path]) -> list[dict[str, object]]:
+    """Copy built executables into a new read-only bundle while the lane is held."""
+    bundle_dir.mkdir(parents=True, exist_ok=False)
+    frozen = []
+    for source in executables:
+        destination = bundle_dir / source.name
+        if destination.exists():
+            raise ValueError(f"bundle artifact name collision: {source.name}")
+        shutil.copyfile(source, destination)
+        frozen.append({
+            "name": source.name,
+            "sha256": _file_sha256(destination),
+            "bytes": destination.stat().st_size,
+            "cargoPath": str(source),
+        })
+        os.chmod(destination, stat.S_IREAD)
+    return frozen
+
+
+def bundle_store_root(env: Mapping[str, str] = os.environ) -> Path:
+    """Default home of frozen bundles for builds without --freeze-bundle."""
+    return source_mirrors_root(env).parent / "bundles"
+
+
+def _prune_bundle_store(root: Path, *, max_age_days: float) -> None:
+    """Drop store bundles older than the lane age limit (never explicit bundles)."""
+    cutoff = time.time() - max_age_days * 86400
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if not entry.is_dir(follow_symlinks=False) or entry.stat().st_mtime >= cutoff:
+                continue
+            for child in Path(entry.path).iterdir():
+                os.chmod(child, stat.S_IWRITE | stat.S_IREAD)
+            shutil.rmtree(entry.path)
+        except OSError:
+            continue
+
+
+def _write_receipt(bundle_dir: Path, receipt: Mapping[str, object]) -> None:
+    receipt_path = bundle_dir / BUNDLE_RECEIPT_NAME
+    receipt_path.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+    os.chmod(receipt_path, stat.S_IREAD)
+    try:
+        index_bundle(bundle_dir, _reuse_key(receipt))
+    except OSError as error:
+        print(f"warning: could not index frozen bundle: {error}", file=sys.stderr)
+
+
+def _reuse_bundle(
+    source: Path, receipt: Mapping[str, object], destination: Path | None
+) -> tuple[Path, list[dict[str, object]]]:
+    """Hand out a verified bundle; copy it when the caller named a new directory."""
+    if destination is None:
+        return source, list(receipt["binaries"])
+    copies = freeze_bundle(destination, [source / entry["name"] for entry in receipt["binaries"]])
+    if [(entry["name"], entry["sha256"]) for entry in copies] != [
+        (entry["name"], entry["sha256"]) for entry in receipt["binaries"]
+    ]:
+        raise RuntimeError(f"copied bundle hashes differ from {source}")
+    _write_receipt(destination, {
+        **receipt,
+        "createdUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "binaries": copies,
+        "reusedFrom": str(source),
+    })
+    return destination, copies
+
+
+def _rustc_identity(env: Mapping[str, str], cwd: Path) -> str | None:
+    """`rustc -vV` as rustup resolves it from the build cwd (toolchain files)."""
+    try:
+        completed = subprocess.run(
+            [env.get("RUSTC", "rustc"), "-vV"], cwd=cwd, env=dict(env),
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return completed.stdout.strip() if completed.returncode == 0 else None
+
+
+def bundle_index_path(env: Mapping[str, str] = os.environ) -> Path:
+    return source_mirrors_root(env).parent / "bundle-index.jsonl"
+
+
+def _reuse_key(receipt: Mapping[str, object]) -> str:
+    context = dict(receipt.get("buildContext") or {})
+    context.pop("sourceRoot", None)
+    manifest = receipt.get("sourceManifest") or {}
+    key = [
+        receipt.get("command"),
+        manifest.get("sha256") if isinstance(manifest, dict) else None,
+        context,
+        receipt.get("rustc"),
+    ]
+    return hashlib.sha256(json.dumps(key, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def index_bundle(bundle_dir: Path, key: str) -> None:
+    """Append one line; lookups verify the receipt and hashes, never trust this."""
+    path = bundle_index_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"bundle": str(bundle_dir), "key": key}) + "\n")
+
+
+def _verified_receipt(bundle: Path, key: str) -> Mapping[str, object] | None:
+    try:
+        receipt = json.loads((bundle / BUNDLE_RECEIPT_NAME).read_text(encoding="utf-8"))
+        if (
+            receipt.get("version") == BUNDLE_RECEIPT_VERSION
+            and receipt.get("exitCode") == 0
+            and receipt.get("binaries")
+            and _reuse_key(receipt) == key
+            and all(
+                _file_sha256(bundle / entry["name"]) == entry["sha256"]
+                for entry in receipt["binaries"]
+            )
+        ):
+            return receipt
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    return None
+
+
+def _newest_indexed_bundle(key: str) -> tuple[Path, Mapping[str, object]] | None:
+    try:
+        lines = bundle_index_path().read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return None
+    candidates: dict[str, Path] = {}
+    for line in lines:
+        try:
+            entry = json.loads(line)
+            if entry.get("key") == key:
+                candidates[source_root_identity(Path(entry["bundle"]))] = Path(entry["bundle"])
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+    matches = [
+        (str(receipt.get("createdUtc", "")), bundle, receipt)
+        for bundle in candidates.values()
+        if (receipt := _verified_receipt(bundle, key)) is not None
+    ]
+    if not matches:
+        return None
+    _, bundle, receipt = max(matches, key=lambda match: (match[0], str(match[1])))
+    return bundle, receipt
+
+
+def _cargo_tail(command: object) -> list[str] | None:
+    """The Cargo invocation inside a recorded (possibly wrapped) argv list."""
+    if not isinstance(command, list) or not all(isinstance(token, str) for token in command):
+        return None
+    for index, token in enumerate(command):
+        if Path(token).stem.lower() == "cargo" and index + 1 < len(command):
+            return command[index:]
+    return None
+
+
+def _legacy_entries(provenance: Mapping[str, object]) -> dict[str, str] | None:
+    """Per-file SHA-256 map from pre-receipt provenance (inline or manifest file)."""
+    manifest: object = provenance.get("source_snapshot")
+    if not isinstance(manifest, dict):
+        manifest = provenance.get("source_manifest")
+    if isinstance(manifest, str) and manifest.lower().endswith(".json"):
+        try:
+            manifest = json.loads(Path(manifest).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+    if isinstance(manifest, dict) and isinstance(manifest.get("files"), list):
+        manifest = {
+            item.get("path"): item.get("sha256")
+            for item in manifest["files"]
+            if isinstance(item, dict)
+        }
+    if not isinstance(manifest, dict) or not manifest:
+        return None
+    if not all(
+        isinstance(path, str) and isinstance(digest, str) and len(digest) == 64
+        for path, digest in manifest.items()
+    ):
+        return None
+    return dict(manifest)
+
+
+def find_legacy_bundles(
+    *, repo_root: Path, command: Sequence[str], search_roots: Sequence[Path]
+) -> list[tuple[Path, Path, str]]:
+    """Pre-receipt bundles whose recorded source files, Cargo command and binary
+    hashes match. Build settings and Cargo's actual source consumption were not
+    receipt-bound, so callers must treat these as candidates, not exact hits.
+    Returns (bundle directory, provenance file, caveat), newest first.
+    """
+    entries = _source_manifest(repo_root).entries
+    wanted_sha = _manifest_sha256(entries)
+    env = os.environ.copy()
+    env.update(local_rust_env(env, repo_root=repo_root, which=shutil.which))
+    rustc = (_rustc_identity(env, Path.cwd()) or "").splitlines()[:1]
+    found: list[tuple[float, Path, Path, str]] = []
+    for search_root in search_roots:
+        for directory, names, files in os.walk(search_root):
+            names[:] = [
+                name for name in names
+                if name not in SOURCE_TREE_SKIP_DIRS and name not in SOURCE_TREE_DIRS
+                and name != "target"
+                and not os.path.isfile(os.path.join(directory, name, "CACHEDIR.TAG"))
+            ]
+            for name in files:
+                if not name.lower().endswith(".json") or "provenance" not in name.lower():
+                    continue
+                path = Path(directory) / name
+                try:
+                    provenance = json.loads(path.read_text(encoding="utf-8"))
+                    binaries = provenance["binaries"]
+                    items = list(binaries.values()) if isinstance(binaries, dict) else binaries
+                    paths = [Path(item["path"]) for item in items]
+                    if (
+                        not paths
+                        or provenance.get("exit_code", 0) != 0
+                        or _cargo_tail(provenance.get("command")) != list(command)
+                        or (legacy := _legacy_entries(provenance)) is None
+                        or _manifest_sha256(legacy) != wanted_sha
+                    ):
+                        continue
+                    toolchain = provenance.get("toolchain")
+                    recorded = (
+                        str(toolchain.get("rustc", "")).splitlines()[:1]
+                        if isinstance(toolchain, dict)
+                        else []
+                    )
+                    if recorded and rustc and recorded != rustc:
+                        continue
+                    if any(_file_sha256(binary) != item["sha256"] for binary, item in zip(paths, items)):
+                        continue
+                except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                    continue
+                bundle = paths[0].parent
+                if any(binary.parent != bundle for binary in paths):
+                    continue
+                qualified = "-ws-" in json.dumps(provenance)
+                caveat = (
+                    "legacy bundle: recorded source files, command and binary hashes match; "
+                    "build settings are not receipt-bound"
+                    + ("" if recorded else " and rustc is unrecorded")
+                    + (
+                        "; built in a source-qualified lane"
+                        if qualified
+                        else "; no source-qualified lane recorded, so Cargo may have reused "
+                        "another snapshot's artifacts (BC1)"
+                    )
+                )
+                found.append(((qualified, path.stat().st_mtime), bundle, path, caveat))
+    # Source-qualified lane builds first: older shared-lane builds carry BC1 risk.
+    found.sort(key=lambda item: item[0], reverse=True)
+    return [(bundle, path, caveat) for _, bundle, path, caveat in found]
+
+
+def find_reusable_bundle(
+    *, repo_root: Path, command: Sequence[str], search_roots: Sequence[Path] = ()
+) -> tuple[Path | None, int]:
+    """Newest frozen bundle built from identical compiled inputs and settings.
+
+    Matches the command, source manifest, recorded build settings and resolved
+    rustc; every listed binary must still exist with its recorded SHA-256.
+    Candidates come from the bundle index; search roots add unindexed receipts.
+    """
+    env = os.environ.copy()
+    env.update(local_rust_env(env, repo_root=repo_root, which=shutil.which))
+    wanted = _reuse_key({
+        "command": list(command),
+        "sourceManifest": source_tree_manifest(repo_root),
+        "buildContext": cargo_build_context(repo_root, command, env),
+        "rustc": _rustc_identity(env, Path.cwd()),
+    })
+    indexed: set[str] = set()
+    try:
+        for line in bundle_index_path().read_text(encoding="utf-8").splitlines():
+            try:
+                indexed.add(source_root_identity(Path(json.loads(line)["bundle"])))
+            except (ValueError, KeyError, TypeError):
+                continue
+    except FileNotFoundError:
+        pass
+    scanned = len(indexed)
+    for search_root in search_roots:
+        for directory, names, files in os.walk(search_root):
+            names[:] = [
+                name for name in names
+                if name not in SOURCE_TREE_SKIP_DIRS and name not in SOURCE_TREE_DIRS
+                and name != "target"
+                and not os.path.isfile(os.path.join(directory, name, "CACHEDIR.TAG"))
+            ]
+            bundle = Path(directory)
+            if BUNDLE_RECEIPT_NAME not in files or source_root_identity(bundle) in indexed:
+                continue
+            scanned += 1
+            try:
+                receipt = json.loads((bundle / BUNDLE_RECEIPT_NAME).read_text(encoding="utf-8"))
+                index_bundle(bundle, _reuse_key(receipt))
+            except (OSError, ValueError, TypeError, AttributeError):
+                continue
+            indexed.add(source_root_identity(bundle))
+    newest = _newest_indexed_bundle(wanted)
+    return (newest[0] if newest is not None else None), scanned
 
 
 def run_in_cargo_lane(
@@ -2104,27 +2726,134 @@ def run_in_cargo_lane(
     warm_wait_seconds: float = 0.0,
     allow_cold_overflow: bool = False,
     max_active_lanes: int | None = None,
+    source_mirror: str = "auto",
+    freeze_bundle_dir: Path | None = None,
+    rebuild: bool = False,
 ) -> int:
-    """Reuse a compatible warm build directory and run the command once."""
+    """Reuse a compatible warm build directory and run the command once.
+
+    Sealed external snapshots (no .git) reuse an exact frozen bundle when one
+    exists; otherwise they build in the nearest free content-synced mirror slot
+    and freeze their executables (into --freeze-bundle or the bundle store).
+    """
     if not command:
         raise ValueError("run-lane requires a command after --")
+    if source_mirror not in SOURCE_MIRROR_MODES:
+        raise ValueError(f"unknown source mirror mode {source_mirror!r}")
+    if freeze_bundle_dir is not None:
+        freeze_bundle_dir = freeze_bundle_dir.absolute()
+        if freeze_bundle_dir.exists():
+            raise ValueError(f"--freeze-bundle must name a new directory: {freeze_bundle_dir}")
     stream = timing_path.open("x", encoding="utf-8") if timing_path else None
     started = time.perf_counter()
     record = {"command": list(command), "requestedLane": requested_lane, "exitCode": None}
     try:
+        if not repo_root.is_dir():
+            # The lane is named for this root; a mistyped root would silently
+            # share one mislabeled lane between different sources.
+            raise ValueError(f"--repo-root is not a directory: {repo_root}")
         _guard_cargo_checkout_cwd(command, repo_root)
+        owner_root = repo_root
+        external = source_root_identity(repo_root.resolve()) != source_root_identity(REPO_ROOT)
+        if external:
+            # Snapshot lanes and maintenance stay with the owning checkout:
+            # short target paths and nothing written into the sealed tree.
+            owner_root = REPO_ROOT
+            if lane_root is None:
+                lane_root = cargo_lanes_root(REPO_ROOT)
         child_env = os.environ.copy()
         child_env.update(local_rust_env(child_env, repo_root=repo_root, which=shutil.which))
         child_env.setdefault("RUST_MIN_STACK", RUST_MIN_STACK_BYTES)
         build_context = cargo_build_context(repo_root, command, child_env)
+        mirrors_root = source_mirrors_root()
+        skipped = _source_mirror_skip_reason(
+            source_mirror, command=command, repo_root=repo_root, external=external,
+            mirrors_root=mirrors_root,
+            source_lane=(
+                Path(lane_root).absolute()
+                / source_lane_name(
+                    requested_lane if requested_lane != "auto" else _auto_lane_base(command),
+                    source_root_identity(repo_root),
+                )
+                if lane_root is not None
+                else None
+            ),
+        )
+        # Snapshot lanes are shared or rebuilt later: only executables copied
+        # while the lane is held stay bound to this source, so snapshots freeze.
+        freeze = (
+            freeze_bundle_dir is not None
+            or skipped is None
+            or (external and not (repo_root / ".git").exists())
+        )
+        source = _source_manifest(repo_root) if freeze else None
+        rustc = _rustc_identity(child_env, Path.cwd()) if freeze else None
+        if source is not None and not rebuild:
+            reuse = _newest_indexed_bundle(_reuse_key({
+                "command": list(command),
+                "sourceManifest": source.summary(),
+                "buildContext": build_context,
+                "rustc": rustc,
+            }))
+            if reuse is not None:
+                bundle_dir, binaries = _reuse_bundle(reuse[0], reuse[1], freeze_bundle_dir)
+                record.update(
+                    exitCode=0, reusedFrom=str(reuse[0]),
+                    bundle={"dir": str(bundle_dir), "binaries": binaries},
+                )
+                print(
+                    f"Reused frozen bundle {bundle_dir}: exact source/settings match, "
+                    "no build (--rebuild builds anyway)",
+                    file=sys.stderr,
+                )
+                return 0
+        source_identity = source_root_identity(repo_root)
+        rank = None
+        if skipped is None:
+            source_identity = f"mirror:{source_root_identity(mirrors_root)}"
+            build_context["sourceRoot"] = source_identity
+            assert source is not None
+            rank = _mirror_slot_distance(mirrors_root, source.entries)
+            # A busy slot never blocks while the family has room: the next slot
+            # starts cold once, then concurrent snapshot builds stay warm.
+            allow_cold_overflow = True
+            max_active_lanes = max_active_lanes or max_active_lanes_per_base()
+        else:
+            record["sourceMirrorSkipped"] = skipped
         with reserve_cargo_lane(
-            repo_root=repo_root, requested_lane=requested_lane, command=command,
+            repo_root=owner_root, requested_lane=requested_lane, command=command,
             lane_root=lane_root, lock_timeout_seconds=lock_timeout_seconds,
             warm_wait_seconds=warm_wait_seconds, allow_cold_overflow=allow_cold_overflow,
             build_context=build_context, max_active_lanes=max_active_lanes,
+            source_identity=source_identity, rank=rank,
         ) as (resolved_lane, target_dir):
             record.update(resolvedLane=resolved_lane, targetDir=str(target_dir))
+            record["sourceRoot"] = source_root_identity(repo_root)
             print(f"Cargo lane {resolved_lane}: {target_dir}", file=sys.stderr)
+            build_root, child_cwd, state_path = repo_root, None, None
+            if skipped is None:
+                state_path = _mirror_state_path(mirrors_root, target_dir)
+                build_root = state_path.with_suffix("")
+                try:
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    state = {}
+                not_before_ns = state.get("lastBuildEndedNs", 0) if isinstance(state, dict) else 0
+                mirror = sync_source_mirror(
+                    repo_root, build_root,
+                    not_before_ns=not_before_ns if isinstance(not_before_ns, int) else 0,
+                )
+                mirror_entries = mirror.pop("entries")
+                record["sourceMirror"] = mirror
+                child_cwd = build_root / os.path.relpath(Path.cwd().resolve(), repo_root.resolve())
+                print(
+                    f"Source mirror {build_root}: rewrote {mirror['written']} of "
+                    f"{mirror['files']} files, removed {mirror['removed']} "
+                    f"({mirror['syncMs']} ms)",
+                    file=sys.stderr,
+                )
+            elif source_mirror != "never" and external:
+                print(f"Source mirror skipped: {skipped}", file=sys.stderr)
             # An exported target directory fragments compiler-cache keys.
             child_env.pop("CARGO_TARGET_DIR", None)
             child_env.pop("CODEX_CARGO_LANE_TARGET_DIR", None)
@@ -2137,28 +2866,94 @@ def run_in_cargo_lane(
                 if program is not None:
                     child_command[0] = program
             try:
-                request_cargo_lane_maintenance(repo_root, target_dir.parent)
+                request_cargo_lane_maintenance(owner_root, target_dir.parent)
             except OSError as error:
                 print(f"warning: could not request Cargo maintenance: {error}", file=sys.stderr)
+            messages_path = None
+            if freeze:
+                child_command = _cargo_command_with_message_format(child_command)
+                messages_path = target_dir / f".cargo-messages-{uuid.uuid4().hex}.jsonl"
             try:
-                code = run_owned(
-                    child_command, env=child_env,
-                    creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0),
-                    prepare_sccache=True, check=False, stdout=sys.stdout, stderr=sys.stderr,
-                ).returncode
+                with (
+                    messages_path.open("x", encoding="utf-8")
+                    if messages_path is not None
+                    else open(os.devnull, "w", encoding="utf-8")
+                ) as messages:
+                    code = run_owned(
+                        child_command, env=child_env, cwd=child_cwd,
+                        creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0),
+                        prepare_sccache=True, check=False,
+                        stdout=messages if messages_path is not None else sys.stdout,
+                        stderr=sys.stderr,
+                    ).returncode
+                record["exitCode"] = code
+                if code == 0:
+                    try:
+                        (target_dir / ".lane-build-context.json").write_text(
+                            json.dumps(build_context, indent=2) + "\n", encoding="utf-8"
+                        )
+                    except OSError as error:
+                        print(f"warning: could not record lane build context: {error}", file=sys.stderr)
+                if code == 0 and messages_path is not None:
+                    assert source is not None
+                    if skipped is None:
+                        manifest = {key: mirror[key] for key in ("sha256", "files", "bytes")}
+                    else:
+                        manifest = source_tree_manifest(repo_root)
+                        if manifest != source.summary():
+                            raise RuntimeError(
+                                "source changed during the build; no bundle was frozen"
+                            )
+                    executables = _cargo_executables(messages_path)
+                    bundle_dir = freeze_bundle_dir
+                    if bundle_dir is None and executables:
+                        store = bundle_store_root()
+                        try:
+                            max_age = float(os.environ.get("CODEX_CARGO_LANE_MAX_AGE_DAYS", "7"))
+                        except ValueError:
+                            max_age = 7.0
+                        _prune_bundle_store(store, max_age_days=max(1.0, max_age))
+                        bundle_dir = store / f"{manifest['sha256'][:16]}-{uuid.uuid4().hex[:8]}"
+                    if bundle_dir is not None:
+                        binaries = freeze_bundle(bundle_dir, executables)
+                        _write_receipt(bundle_dir, {
+                            "version": BUNDLE_RECEIPT_VERSION,
+                            "createdUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "command": list(command),
+                            "exitCode": code,
+                            "sourceRoot": str(repo_root),
+                            "buildRoot": str(build_root),
+                            "sourceManifest": manifest,
+                            "buildContext": build_context,
+                            "rustc": rustc,
+                            "resolvedLane": resolved_lane,
+                            "targetDir": str(target_dir),
+                            "binaries": binaries,
+                        })
+                        record["bundle"] = {"dir": str(bundle_dir), "binaries": binaries}
+                        print(
+                            f"Frozen bundle {bundle_dir}: {len(binaries)} executables"
+                            + (f"; use it, not the shared {target_dir}" if skipped is None else ""),
+                            file=sys.stderr,
+                        )
             except CleanupFailed:
                 (target_dir / ".lane-cleanup-unconfirmed").write_text(
                     "Process cleanup was not confirmed; inspect descendants before removing this quarantine.\n"
                 )
                 raise
-            record["exitCode"] = code
-            if code == 0:
-                try:
-                    (target_dir / ".lane-build-context.json").write_text(
-                        json.dumps(build_context, indent=2) + "\n", encoding="utf-8"
-                    )
-                except OSError as error:
-                    print(f"warning: could not record lane build context: {error}", file=sys.stderr)
+            finally:
+                if messages_path is not None:
+                    messages_path.unlink(missing_ok=True)
+                if state_path is not None:
+                    # Later rewrites must postdate this build's compilations.
+                    # Entries let the next snapshot pick its nearest slot.
+                    state_path.write_text(json.dumps({
+                        "targetDir": str(target_dir),
+                        "lastBuildEndedNs": time.time_ns(),
+                        "manifestSha256": mirror["sha256"],
+                        "sourceRoot": str(repo_root),
+                        "entries": mirror_entries,
+                    }) + "\n", encoding="utf-8")
             return code
     finally:
         if stream is not None:
@@ -2872,7 +3667,51 @@ def main(argv: list[str] | None = None) -> int:
         default=LANE_COORDINATION_GRACE_SECONDS,
         help="Short creation/prune lock grace (default: 1 second). Does not wait for busy builds.",
     )
+    run_lane_parser.add_argument(
+        "--source-mirror",
+        choices=SOURCE_MIRROR_MODES,
+        default=os.environ.get("CODEX_CARGO_LANE_SOURCE_MIRROR", "auto"),
+        help="auto (default): a sealed external snapshot (no .git, no warm lane of "
+        "its own) builds incrementally in the nearest free shared slot through a "
+        "content-synced copy; always: require that; never: build in place in the "
+        "source-root lane.",
+    )
+    run_lane_parser.add_argument(
+        "--freeze-bundle",
+        type=Path,
+        help="New directory: copy the built (or reused) executables there "
+        f"(read-only) with {BUNDLE_RECEIPT_NAME} before the lane is released. "
+        "Sealed snapshots without it freeze into the local bundle store.",
+    )
+    run_lane_parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Build even when an exact frozen bundle already exists.",
+    )
     run_lane_parser.add_argument("command_args", nargs=argparse.REMAINDER)
+    find_parser = subparsers.add_parser(
+        "find-bundle",
+        help="Print a frozen bundle built from identical compiled inputs and settings.",
+        description="Run from the source's codex-rs with the exact run-lane command. "
+        "Candidates come from the local bundle index (written by every freeze). "
+        "Exit 0 prints the newest matching bundle directory; exit 1 means build it; "
+        "exit 3 (--include-legacy only) prints a pre-receipt bundle candidate.",
+    )
+    find_parser.add_argument(
+        "--include-legacy",
+        action="store_true",
+        help="On a miss, also match pre-receipt *provenance*.json files below the "
+        "search roots by recorded per-file source hashes, command and binary hashes.",
+    )
+    find_parser.add_argument("--repo-root", type=Path, required=True)
+    find_parser.add_argument(
+        "--search-root",
+        type=Path,
+        action="append",
+        default=[],
+        help="Also scan (and index) receipts below this directory; repeatable.",
+    )
+    find_parser.add_argument("command_args", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     keep_warm_per_base = getattr(args, "keep_warm_per_base", None)
     max_age_days = getattr(args, "max_age_days", None)
@@ -2950,7 +3789,36 @@ def main(argv: list[str] | None = None) -> int:
                 allow_cold_overflow=args.allow_cold_overflow,
                 max_active_lanes=args.max_active_lanes
                 or (max_active_lanes_per_base() if args.allow_cold_overflow else None),
+                source_mirror=args.source_mirror,
+                freeze_bundle_dir=args.freeze_bundle,
+                rebuild=args.rebuild,
             )
+        elif args.command == "find-bundle":
+            command_args = list(args.command_args)
+            if command_args[:1] == ["--"]:
+                command_args = command_args[1:]
+            if not command_args:
+                raise ValueError("find-bundle requires the build command after --")
+            bundle, scanned = find_reusable_bundle(
+                repo_root=args.repo_root.absolute(),
+                command=command_args,
+                search_roots=args.search_root,
+            )
+            if bundle is None and args.include_legacy:
+                legacy = find_legacy_bundles(
+                    repo_root=args.repo_root.absolute(),
+                    command=command_args,
+                    search_roots=args.search_root,
+                )
+                if legacy:
+                    bundle, provenance, caveat = legacy[0]
+                    print(f"{caveat} ({provenance})", file=sys.stderr)
+                    print(bundle)
+                    return 3
+            if bundle is None:
+                print(f"no matching bundle ({scanned} receipts scanned)", file=sys.stderr)
+                return 1
+            print(bundle)
         else:
             parser.error(f"unknown command {args.command}")
     except (CargoLanesRootValidationError, OSError, RuntimeError, ValueError) as exc:

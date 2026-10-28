@@ -194,7 +194,7 @@ pub fn create_followup_task_tool() -> ToolSpec {
 pub fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "wait_agent".to_string(),
-        description: "Wait for mailbox input or durable task progress. Returns at the first event, not when agents finish. On a mailbox, deferred-result or new-input wake, return from the exec cell; empty typed_deltas is not a reason to wait again. Admission-only bookkeeping is folded internally. Omit cursor to receive new deltas from the retained position; supply one only to replay. Does not return the content: a finished agent's answer arrives as a message on your next request."
+        description: "Wait for mailbox input or durable task progress. Returns at the first event, not when agents finish. On a mailbox, deferred-result or new-input wake, return from the exec cell; empty typed_deltas is not a reason to wait again. Admission bookkeeping and completion events for results already delivered as messages are folded internally. Omit cursor to receive new deltas from the retained position; supply one only to replay. Does not return the content: a finished agent's answer arrives as a message on your next request."
             .to_string(),
         strict: false,
         defer_loading: None,

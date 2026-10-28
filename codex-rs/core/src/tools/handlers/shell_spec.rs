@@ -421,6 +421,11 @@ fn unified_exec_output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
+            "kind": {"enum": ["workspace_gate_timeout"]},
+            "did_run": {
+                "type": "boolean",
+                "description": "False on a workspace admission refusal: the command was never started."
+            },
             "error": {
                 "type": ["string", "null"],
                 "description": "Command failure, including watchdog or cleanup failure. Inspect execution_state and session_id; do not replay uncertain effects."
@@ -474,8 +479,8 @@ fn unified_exec_output_schema() -> Value {
             },
             "execution_state": {
                 "type": "string",
-                "enum": ["running", "exited", "unknown"],
-                "description": "Command process state, independent of the exec cell. Unknown explicitly means no live handle or terminal outcome is available."
+                "enum": ["running", "exited", "unknown", "not_started"],
+                "description": "Command process state, independent of the exec cell. Unknown means no live handle or terminal outcome is available; not_started confirms workspace admission refused before launch."
             },
             "process_exited": { "type": "boolean" },
             "search_no_match": { "type": "boolean" },
@@ -567,6 +572,19 @@ fn unified_exec_output_schema() -> Value {
         },
         "required": ["output", "execution_state", "process_exited", "exit_code", "output_complete", "output_reduced", "raw_output_artifact_retention_limit_hit"],
         "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "kind": {"const": "workspace_gate_timeout"},
+                    "did_run": {"const": false},
+                    "execution_state": {"const": "not_started"},
+                    "process_exited": {"const": false},
+                    "exit_code": {"type": "null"},
+                    "output_complete": {"const": false}
+                },
+                "required": ["kind", "did_run"],
+                "not": {"required": ["session_id"]}
+            },
             {
                 "type": "object",
                 "properties": {

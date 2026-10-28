@@ -310,6 +310,7 @@ struct CommandCompletionReceipt {
     process_id: u32,
     incarnation: uuid::Uuid,
     exit_code: Option<i32>,
+    local_cwd: Option<PathBuf>,
     artifact: RawOutputArtifact,
     terminal_facts: Option<CommandTerminalFacts>,
 }
@@ -789,6 +790,29 @@ impl CommandExecutionLedger {
             .cloned()
     }
 
+    /// Diagnostic context survives watcher completion, but never an incarnation
+    /// change or eviction of the existing bounded completion receipt.
+    pub(crate) async fn process_local_cwd(
+        &self,
+        process_id: u32,
+        incarnation: uuid::Uuid,
+    ) -> Option<PathBuf> {
+        let state = self.state.lock().await;
+        if let Some(running) = state.process.running.get(&process_id) {
+            return (running.incarnation == incarnation).then(|| running.key.local_cwd()).flatten();
+        }
+        if let Some(pending) = state.process.pending_by_execution_id.values()
+            .find(|pending| pending.process_id == process_id)
+        {
+            return (pending.command.incarnation == incarnation)
+                .then(|| pending.command.key.local_cwd()).flatten();
+        }
+        state.process.completion_receipt_order.iter().rev()
+            .filter_map(|id| state.process.completion_receipts.get(id))
+            .find(|receipt| receipt.process_id == process_id && receipt.incarnation == incarnation)
+            .and_then(|receipt| receipt.local_cwd.clone())
+    }
+
     pub(crate) async fn identical_running_process(
         &self,
         _key: &CommandAttemptKey,
@@ -1225,6 +1249,7 @@ fn insert_completion_receipt(
     state.process.completion_receipts.insert(
         execution_id,
         CommandCompletionReceipt {
+            local_cwd: command.key.local_cwd(),
             parent_tool_execution_id: command.parent_tool_execution_id,
             process_id,
             incarnation: command.incarnation,

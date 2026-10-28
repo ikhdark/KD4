@@ -1888,6 +1888,9 @@ impl Session {
                 session_configuration.clone(),
                 initial_auto_compact_window_ids,
             );
+            state
+                .history
+                .set_pressure_reasoning_retirement(config.pressure_reasoning_retirement);
             if let Some(tool_history) = initial_tool_history {
                 let (tool_history, ledger_warning) = tool_history.into_state_and_warning();
                 if let Some(message) = ledger_warning {

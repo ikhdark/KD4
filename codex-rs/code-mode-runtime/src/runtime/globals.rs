@@ -67,6 +67,20 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     }
     set_global(scope, global, "ALL_TOOL_NAMES", all_tool_names)?;
     set_global(scope, global, "resolve_tool", resolve_tool.into())?;
+    // Recorded cells call `tools.resolve_tool(...)` (audit 2026-10-28 #5). Alias
+    // the global helper there, unlisted and never shadowing a real tool.
+    let resolve_tool_key = v8::String::new(scope, "resolve_tool")
+        .ok_or_else(|| "failed to allocate resolve_tool key".to_string())?;
+    if tools.has_own_property(scope, resolve_tool_key.into()) == Some(false)
+        && tools.define_own_property(
+            scope,
+            resolve_tool_key.into(),
+            resolve_tool.into(),
+            v8::PropertyAttribute::DONT_ENUM,
+        ) != Some(true)
+    {
+        return Err("failed to alias tools.resolve_tool".to_string());
+    }
     set_global(scope, global, "clearTimeout", clear_timeout.into())?;
     set_global(scope, global, "setTimeout", set_timeout.into())?;
     set_global(scope, global, "text", text.into())?;
@@ -227,7 +241,7 @@ fn resolve_tool_callback(
     let Some(index) = enabled_tools.as_deref().and_then(|enabled_tools| {
         requested_name
             .as_deref()
-            .and_then(|name| enabled_tools.resolve_requested_name(name))
+            .and_then(|name| enabled_tools.resolve_script_spelling(name))
     }) else {
         if diagnostic {
             let value = enabled_tools

@@ -16,9 +16,22 @@ pub(super) fn evaluate_main_module(
     let origin = script_origin(&mut tc, "exec_main.mjs")?;
     let mut source = v8::script_compiler::Source::new(source, Some(&origin));
     let module = v8::script_compiler::compile_module(&tc, &mut source).ok_or_else(|| {
-        tc.exception()
+        // A compile error has no stack frame (audit 2026-10-28 #5); name where
+        // the parser stopped, as a runtime frame would.
+        let location = tc.message().and_then(|message| {
+            let line = message.get_line_number(&tc)?;
+            let source_line = message
+                .get_source_line(&tc)
+                .map(|text| text.to_rust_string_lossy(&tc))
+                .unwrap_or_default();
+            Some(compile_error_location(line, message.get_start_column(), &source_line))
+        });
+        let mut text = tc
+            .exception()
             .map(|exception| value_to_error_text(&mut tc, exception))
-            .unwrap_or_else(|| "unknown code mode exception".to_string())
+            .unwrap_or_else(|| "unknown code mode exception".to_string());
+        text.push_str(&location.unwrap_or_default());
+        text
     })?;
     module
         .instantiate_module(&tc, resolve_module_callback)
@@ -48,6 +61,21 @@ pub(super) fn evaluate_main_module(
     }
 
     Ok(None)
+}
+
+/// `exec_main.mjs:line:column` plus a bounded excerpt of the line with a caret.
+fn compile_error_location(line: usize, column: usize, source_line: &str) -> String {
+    const CONTEXT_CHARS: usize = 80;
+    let chars = source_line.trim_end_matches('\r').chars().collect::<Vec<_>>();
+    let column = column.min(chars.len());
+    let start = column.saturating_sub(CONTEXT_CHARS);
+    let end = column.saturating_add(CONTEXT_CHARS).min(chars.len());
+    let excerpt = chars[start..end].iter().collect::<String>();
+    format!(
+        "\n    at exec_main.mjs:{line}:{}\n{excerpt}\n{}^",
+        column + 1,
+        " ".repeat(column - start)
+    )
 }
 
 pub(super) fn exit_requested(scope: &v8::PinScope<'_, '_>) -> bool {

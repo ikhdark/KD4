@@ -26,6 +26,7 @@ impl AgentCommunicationKind {
 pub(crate) struct AgentCommunicationContext {
     kind: AgentCommunicationKind,
     sender_thread_id: ThreadId,
+    sender_turn_id: Option<String>,
 }
 
 impl AgentCommunicationContext {
@@ -33,7 +34,19 @@ impl AgentCommunicationContext {
         Self {
             kind,
             sender_thread_id,
+            sender_turn_id: None,
         }
+    }
+
+    pub(crate) fn with_sender_turn(mut self, turn_id: String) -> Self {
+        self.sender_turn_id = Some(turn_id);
+        self
+    }
+
+    pub(crate) fn followup_turn_owner(&self) -> Option<(ThreadId, &str)> {
+        (self.kind == AgentCommunicationKind::Followup)
+            .then(|| self.sender_turn_id.as_deref().map(|turn| (self.sender_thread_id, turn)))
+            .flatten()
     }
 
     pub(crate) fn is_terminal_result(&self) -> bool {

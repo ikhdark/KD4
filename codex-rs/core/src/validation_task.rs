@@ -38,7 +38,7 @@ pub(crate) fn mode_refusal(
         ValidationMode::Compile if classification != Class::TargetedCompilation =>
             "COMPILE permits only targeted compile checks, not tests, gates, formatting, non-compilation checks, or full builds. No command was launched.",
         ValidationMode::FullHalf if matches!(classification, Class::Tests | Class::Checks) =>
-            "Full .5 allows compile checks, permitted non-test KD4 scripts workflows, and other task-authorized operations, but not tests/full test suites or other non-compilation checks in any language. Select FULL explicitly for those checks or tests. No command was launched.",
+            "Full .5 allows compile checks, permitted non-test KD4 scripts workflows, and other task-authorized operations, but not tests/full test suites or other non-compilation checks in any language. Only the user can select FULL, by starting a new message with `/validation full` on its own first line; it lasts until their next message. No command was launched.",
         _ => return None,
     };
     Some(policy_refusal(turn, reason))

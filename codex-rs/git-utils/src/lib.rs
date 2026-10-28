@@ -13,6 +13,7 @@ pub const DISABLED_HOOKS_PATH: &str = "NUL";
 pub use apply::ApplyGitRequest;
 pub use apply::ApplyGitResult;
 pub use apply::apply_git_patch;
+pub use apply::apply_git_patch_async;
 pub use apply::extract_paths_from_patch;
 pub use apply::parse_git_apply_output;
 pub use apply::unescape_c_bytes;

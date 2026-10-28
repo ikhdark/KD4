@@ -50,10 +50,13 @@ pub trait AgentGraphStore: Send + Sync {
     ) -> AgentGraphStoreFuture<'a, bool>;
 
     /// List the identified turn's admitted child subtrees, traversing only open edges.
+    /// Accepted live follow-up ownership supersedes creation ownership only
+    /// while its parent still matches the current durable incoming edge.
     fn list_turn_owned_thread_spawn_descendants<'a>(
         &'a self,
         parent: ThreadId,
         turn_id: &'a str,
+        live_turn_owners: std::collections::HashMap<ThreadId, (ThreadId, String)>,
     ) -> AgentGraphStoreFuture<'a, Vec<ThreadId>>;
 
     /// Retain a versioned instruction snapshot before admitting the child's first work.

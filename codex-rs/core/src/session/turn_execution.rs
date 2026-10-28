@@ -106,6 +106,7 @@ pub(crate) enum SamplingGenerationDisposition {
 pub(crate) struct SamplingRequestBaselines {
     mutation_revision: u64,
     attributed_mutation_revision: u64,
+    unproven_command_revision: u64,
     plan_revision: u64,
     input_revision: u64,
     instruction_revision: u64,
@@ -116,6 +117,10 @@ pub(crate) struct SamplingRequestBaselines {
 impl SamplingRequestBaselines {
     pub(crate) fn set_attributed_mutation_revision(&mut self, revision: u64) {
         self.attributed_mutation_revision = revision;
+    }
+
+    pub(crate) fn set_unproven_command_revision(&mut self, revision: u64) {
+        self.unproven_command_revision = revision;
     }
 
     fn revision_key(&self) -> String {
@@ -145,6 +150,7 @@ impl SamplingRequestBaselines {
 pub(crate) struct SamplingRequestSettledState {
     pub(crate) mutation_revision: u64,
     pub(crate) attributed_mutation_revision: u64,
+    pub(crate) unproven_command_revision: u64,
     pub(crate) tool_exposure_revision: u64,
 }
 
@@ -1020,10 +1026,12 @@ impl SamplingRequestSignalCollector {
         result: Option<&Value>,
         nested: bool,
     ) {
-        // A nested report/export completes its own operation, not the
-        // enclosing cell's assignment. Only that cell may opt in to delivery
-        // of its final result after all of its work has settled.
-        if nested && matches!(adapter, "agent_job_report" | "agent_job_csv_export") {
+        // A nested export completes its own operation, not the enclosing
+        // cell's assignment. A worker's accepted `deliver: true` report is its
+        // declared final result: `authoritative_wait_observation` surfaces it
+        // only when that cell's other tool calls were plan updates and every
+        // outcome succeeded, the same proof the direct path requires.
+        if nested && adapter == "agent_job_csv_export" {
             return;
         }
         let Some(observation) =
@@ -1772,10 +1780,14 @@ impl SamplingRequestSignalCollector {
             .any(|outcome| outcome.is_failure_evidence() && !outcome.failure_diagnosis_reused);
         // Mixed generations use the protocol's conservative precedence. The
         // initial/compaction cases are selected by the caller before this
-        // post-tool classifier runs.
+        // post-tool classifier runs. Commands proven read-only at admission
+        // still advance `mutation_revision` for invalidation, not this label.
         if has_pending_input {
             Some(TurnTimingGenerationPurpose::InitialReasoning)
-        } else if state.saw_mutation || settled.mutation_revision > baselines.mutation_revision {
+        } else if state.saw_mutation
+            || settled.attributed_mutation_revision > baselines.attributed_mutation_revision
+            || settled.unproven_command_revision > baselines.unproven_command_revision
+        {
             Some(if observed_failure {
                 TurnTimingGenerationPurpose::Repair
             } else {
@@ -3073,6 +3085,7 @@ impl TurnExecutionControl {
         SamplingRequestBaselines {
             mutation_revision,
             attributed_mutation_revision: mutation_revision,
+            unproven_command_revision: 0,
             plan_revision: self.plan_revision,
             input_revision: self.input_revision,
             instruction_revision: self.instruction_revision,

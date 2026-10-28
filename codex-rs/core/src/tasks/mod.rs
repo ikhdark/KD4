@@ -1753,7 +1753,7 @@ impl Session {
         }.to_string();
         if !interrupted.is_empty() {
             message.push_str(&format!(
-                " Enqueued interrupt requests for agents it started: {}. This does not confirm they have stopped. They keep their work and can be resumed.",
+                " Enqueued interrupt requests for agents it started or reused: {}. This does not confirm they have stopped. They keep their work and can be resumed.",
                 crate::session::turn_execution::bounded_path_list(&interrupted)
             ));
         }

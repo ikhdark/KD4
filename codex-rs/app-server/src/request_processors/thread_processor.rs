@@ -146,14 +146,6 @@ fn collect_resume_override_mismatches(
             ));
         }
     }
-    if let Some(requested_approval) = request.approval_policy.as_ref() {
-        let active_approval: AskForApproval = config_snapshot.approval_policy.into();
-        if requested_approval != &active_approval {
-            mismatch_details.push(format!(
-                "approval_policy requested={requested_approval:?} active={active_approval:?}"
-            ));
-        }
-    }
     if let Some(requested_permission_profile) = request.permission_profile.as_ref()
         && requested_permission_profile != &config_snapshot.permission_profile
     {
@@ -161,6 +153,38 @@ fn collect_resume_override_mismatches(
             "permission_profile requested={requested_permission_profile:?} active={:?}",
             config_snapshot.permission_profile
         ));
+    }
+    if request.permissions.is_some() {
+        mismatch_details.push(format!(
+            "permissions override was provided and ignored while running; active={:?}",
+            config_snapshot.active_permission_profile
+        ));
+    }
+    if let Some(requested_personality) = request.personality.as_ref()
+        && config_snapshot.personality.as_ref() != Some(requested_personality)
+    {
+        mismatch_details.push(format!(
+            "personality requested={requested_personality:?} active={:?}",
+            config_snapshot.personality
+        ));
+    }
+
+    mismatch_details
+}
+
+fn collect_resume_ignored_overrides(
+    request: &ThreadResumeParams,
+    config_snapshot: &ThreadConfigSnapshot,
+) -> Vec<&'static str> {
+    let mut ignored = Vec::new();
+    // Desktop can resend legacy permission defaults when attaching to a live
+    // runtime. Keep its permissions and report them in ThreadResumeResponse.
+    // Only mismatches belong here: matching hints must not retire an idle cache.
+    if let Some(requested_approval) = request.approval_policy.as_ref() {
+        let active_approval: AskForApproval = config_snapshot.approval_policy.into();
+        if requested_approval != &active_approval {
+            ignored.push("approvalPolicy");
+        }
     }
     if request.permission_profile.is_none()
         && let Some(requested_sandbox) = request.sandbox.as_ref()
@@ -183,31 +207,9 @@ fn collect_resume_override_mismatches(
             )
         );
         if !sandbox_matches {
-            mismatch_details.push(format!(
-                "sandbox requested={requested_sandbox:?} active={active_sandbox:?}"
-            ));
+            ignored.push("sandbox");
         }
     }
-    if request.permissions.is_some() {
-        mismatch_details.push(format!(
-            "permissions override was provided and ignored while running; active={:?}",
-            config_snapshot.active_permission_profile
-        ));
-    }
-    if let Some(requested_personality) = request.personality.as_ref()
-        && config_snapshot.personality.as_ref() != Some(requested_personality)
-    {
-        mismatch_details.push(format!(
-            "personality requested={requested_personality:?} active={:?}",
-            config_snapshot.personality
-        ));
-    }
-
-    mismatch_details
-}
-
-fn collect_resume_ignored_overrides(request: &ThreadResumeParams) -> Vec<&'static str> {
-    let mut ignored = Vec::new();
     if request
         .config
         .as_ref()
@@ -3717,7 +3719,7 @@ impl ThreadRequestProcessor {
             }
             let config_snapshot = existing_thread.config_snapshot().await;
             let mismatch_details = collect_resume_override_mismatches(params, &config_snapshot);
-            let ignored_overrides = collect_resume_ignored_overrides(params);
+            let ignored_overrides = collect_resume_ignored_overrides(params, &config_snapshot);
             if !mismatch_details.is_empty() || !ignored_overrides.is_empty() {
                 let has_subscribers = !self
                     .thread_state_manager
@@ -3766,14 +3768,14 @@ impl ThreadRequestProcessor {
                         mismatch_details.join("; ")
                     )));
                 }
-                // Desktop can resend config and instruction fields when attaching.
-                // Their presence alone is not evidence of a conflicting setting.
+                // Desktop can resend legacy permission hints, config and instructions
+                // when attaching. These do not replace the live configuration.
                 // Rejoin without mutating or interrupting the loaded session; cold
                 // resume above still applies them when it is safe to replace it.
                 warn!(
                     thread_id = %existing_thread_id,
                     ignored_overrides = ?ignored_overrides,
-                    "rejoining loaded thread without applying config or instruction overrides"
+                    "rejoining loaded thread without applying legacy permission, config or instruction overrides"
                 );
             }
             let thread_state = self

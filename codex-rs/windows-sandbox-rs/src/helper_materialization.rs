@@ -2,12 +2,20 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::PoisonError;
+use std::time::SystemTime;
 use tempfile::NamedTempFile;
+use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
 use crate::logging::log_note;
 use crate::sandbox_bin_dir;
@@ -127,6 +135,19 @@ pub fn resolve_exe_for_launch_with_status(
             HelperMaterializationStatus::SourceFallback,
         );
     };
+    // Every sandboxed filesystem call launches this executable. Hashing the
+    // ~300 MB source and copy each time cost seconds per call, so reuse a copy
+    // verified earlier in this process while the source file is unchanged.
+    let bin_dir = helper_bin_dir(codex_home);
+    let slot = verified_copy_slot(source, &bin_dir);
+    let mut verified = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    let source_stamp = file_stamp(source).ok();
+    if let Some(copy) = verified.as_ref()
+        && source_stamp == Some(copy.source_stamp)
+    {
+        return (copy.destination.clone(), HelperMaterializationStatus::Reused);
+    }
+    *verified = None;
     let digest = match content_digest(source) {
         Ok(digest) => digest,
         Err(_) => return (source.to_path_buf(), HelperMaterializationStatus::SourceFallback),
@@ -134,10 +155,31 @@ pub fn resolve_exe_for_launch_with_status(
     let mut name = source.file_stem().unwrap_or(file_name).to_os_string();
     name.push(format!("-{digest}"));
     if let Some(extension) = source.extension() { name.push("."); name.push(extension); }
-    let destination = helper_bin_dir(codex_home).join(name);
-    match copy_from_source_with_digest(source, &destination, &digest) {
-        Ok(CopyOutcome::Reused) => (destination, HelperMaterializationStatus::Reused),
-        Ok(CopyOutcome::ReCopied) => (destination, HelperMaterializationStatus::ReCopied),
+    let destination = bin_dir.join(name);
+    let pinned = pin_matching_copy(&destination, &digest).ok().flatten();
+    let outcome = if pinned.is_some() {
+        Ok(CopyOutcome::Reused)
+    } else {
+        copy_from_source_with_digest(source, &destination, &digest)
+    };
+    match outcome {
+        Ok(outcome) => {
+            let pin = pinned.or_else(|| pin_matching_copy(&destination, &digest).ok().flatten());
+            if let (Some(stamp), Some(pin)) = (source_stamp, pin)
+                && file_stamp(source).is_ok_and(|after| after == stamp)
+            {
+                *verified = Some(VerifiedCopy {
+                    source_stamp: stamp,
+                    destination: destination.clone(),
+                    _pin: pin,
+                });
+            }
+            let status = match outcome {
+                CopyOutcome::Reused => HelperMaterializationStatus::Reused,
+                CopyOutcome::ReCopied => HelperMaterializationStatus::ReCopied,
+            };
+            (destination, status)
+        }
         Err(err) => {
             let sandbox_log_dir = crate::sandbox_dir(codex_home);
             log_note(
@@ -338,15 +380,56 @@ fn destination_matches_digest(destination: &Path, expected: &str) -> Result<bool
 }
 
 fn content_digest(path: &Path) -> Result<String> {
-    use std::io::Read;
     let mut file = fs::File::open(path).with_context(|| format!("open helper image {}", path.display()))?;
+    Ok(reader_digest(&mut file)?)
+}
+
+fn reader_digest(reader: &mut impl std::io::Read) -> std::io::Result<String> {
     let mut hash = Sha256::new();
     let mut bytes = [0; 64 * 1024];
     loop {
-        let count = file.read(&mut bytes)?;
+        let count = reader.read(&mut bytes)?;
         if count == 0 { break; }
         hash.update(&bytes[..count]);
     }
     Ok(hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// An executable copy verified against its source digest in this process.
+struct VerifiedCopy {
+    source_stamp: FileStamp,
+    destination: PathBuf,
+    /// Shares only reads, so the verified bytes cannot be rewritten, renamed or
+    /// deleted while this process reuses the copy without hashing it again.
+    _pin: fs::File,
+}
+
+type VerifiedCopySlot = Arc<Mutex<Option<VerifiedCopy>>>;
+
+/// One slot per source and helper directory; concurrent first launches wait
+/// for a single verification instead of hashing the same image in parallel.
+fn verified_copy_slot(source: &Path, bin_dir: &Path) -> VerifiedCopySlot {
+    static SLOTS: OnceLock<Mutex<HashMap<(PathBuf, PathBuf), VerifiedCopySlot>>> = OnceLock::new();
+    let mut slots = SLOTS.get_or_init(Default::default).lock().unwrap_or_else(PoisonError::into_inner);
+    slots.entry((source.to_path_buf(), bin_dir.to_path_buf())).or_default().clone()
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct FileStamp {
+    len: u64,
+    modified: SystemTime,
+    created: SystemTime,
+}
+
+fn file_stamp(path: &Path) -> std::io::Result<FileStamp> {
+    let metadata = fs::metadata(path)?;
+    Ok(FileStamp { len: metadata.len(), modified: metadata.modified()?, created: metadata.created()? })
+}
+
+/// Opens `destination` without write or delete sharing and returns the handle
+/// only when the bytes read through it match `expected`.
+fn pin_matching_copy(destination: &Path, expected: &str) -> std::io::Result<Option<fs::File>> {
+    let mut file = fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(destination)?;
+    Ok((reader_digest(&mut file)? == expected).then_some(file))
 }
 

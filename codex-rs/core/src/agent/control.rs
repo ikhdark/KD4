@@ -52,6 +52,21 @@ use self::residency::V2Residency;
 
 const ROOT_LAST_TASK_MESSAGE: &str = "Main thread";
 const TYPED_ACTOR_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const ANCESTOR_PROGRESS_REFUSAL: &str = "Sub-agents report to ancestors only at the end. Finish with one final answer, including any blockers; the host delivers the terminal result automatically. This progress message was not queued.";
+
+/// Whether `reference` can only mean an ancestor of `author`: a parent or
+/// root alias (`root` and `..` are reserved agent names), or an absolute path
+/// above it.
+pub(crate) fn is_ancestor_reference(author: &AgentPath, reference: &str) -> bool {
+    let reference = reference.trim();
+    let path = reference.trim_end_matches('/');
+    matches!(reference, "parent" | "root" | ".." | "/")
+        || (!path.is_empty()
+            && author
+                .as_str()
+                .strip_prefix(path)
+                .is_some_and(|suffix| suffix.starts_with('/')))
+}
 mod execution;
 mod legacy;
 mod residency;
@@ -579,9 +594,7 @@ impl AgentControl {
             .strip_prefix(communication.recipient.as_str())
             .is_some_and(|suffix| suffix.starts_with('/'));
         if reports_to_ancestor && !agent_communication_context.is_terminal_result() {
-            return Err(CodexErr::InvalidRequest(
-                "Sub-agents report to ancestors only at the end. Finish with one final answer, including any blockers; the host delivers the terminal result automatically. This progress message was not queued.".into(),
-            ));
+            return Err(CodexErr::InvalidRequest(ANCESTOR_PROGRESS_REFUSAL.into()));
         }
         Ok(())
     }
@@ -648,6 +661,7 @@ impl AgentControl {
     ) -> CodexResult<String> {
         let communication_log_metadata = crate::agent_communication::logging_enabled()
             .then(|| crate::agent_communication::agent_communication_log_metadata(&communication));
+        let turn_owner = communication.trigger_turn.then(|| context.followup_turn_owner()).flatten();
         let queue = (!communication.trigger_turn)
             .then(|| self.state.input_queue_for_delivery(agent_id))
             .flatten();
@@ -680,6 +694,11 @@ impl AgentControl {
             );
         }
         if result.is_ok() {
+            // Publish ownership only for accepted work, without an intervening
+            // await or rewriting immutable creation-turn provenance.
+            if let Some((parent, turn)) = turn_owner {
+                self.state.record_turn_followup_owner(agent_id, parent, turn);
+            }
             match last_task_message {
                 Some(last_task_message) => self
                     .state
@@ -888,7 +907,7 @@ impl AgentControl {
         let mut edges = parents.into_iter().map(|(child, parent)| (parent, child)).collect();
         let mut durable_allowed = None;
         if let Some(graph) = state.agent_graph_store() {
-            let allowed = graph.list_turn_owned_thread_spawn_descendants(parent, turn_id).await
+            let allowed = graph.list_turn_owned_thread_spawn_descendants(parent, turn_id, ephemeral_owners.clone()).await
                 .map_err(|error| CodexErr::Fatal(format!("failed to read turn-owned children: {error}")))?
                 .into_iter().collect::<HashSet<_>>();
             roots.extend(allowed.iter().copied());

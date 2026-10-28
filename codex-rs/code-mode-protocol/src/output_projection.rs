@@ -300,46 +300,78 @@ fn project_search_metadata(result: &mut serde_json::Map<String, Value>) {
     }
 }
 
-/// Keep the committed delta, retry receipt and diagnostics. Only a byte-exact
+/// Keep the committed delta, retry receipt and diagnostics. Only the generic
 /// rendering of an authoritative delta is redundant; custom success messages
 /// and partial/failing patches are not interchangeable with generic success.
 fn patch_without_repeated_summary(raw: &Value) -> Option<Value> {
     let object = raw.as_object()?;
     let mut projected = object.clone();
-    if raw["success"] == true && raw["changes_exact"] == true {
-        let summary = raw["changes"].as_array().and_then(|changes| {
-            let mut summary = String::from("Success. Updated the following files:\n");
-            for change in changes {
-                let prefix = match change["kind"].as_str()? {
-                    "add" => "A",
-                    "delete" => "D",
-                    "update" => "M",
-                    _ => return None,
-                };
-                summary.push_str(prefix);
-                summary.push(' ');
-                summary.push_str(change["path"].as_str()?);
-                if let Some(destination) = change.get("move_path").filter(|v| !v.is_null()) {
-                    if prefix != "M" {
-                        return None;
-                    }
-                    summary.push_str(" -> ");
-                    summary.push_str(destination.as_str()?);
-                }
-                summary.push('\n');
-            }
-            Some(summary)
-        });
-        if summary
-            .as_deref()
-            .is_some_and(|summary| raw["text"].as_str() == Some(summary))
-        {
-            projected.remove("text");
-        }
+    if raw["success"] == true
+        && raw["changes_exact"] == true
+        && let (Some(text), Some(changes)) = (raw["text"].as_str(), raw["changes"].as_array())
+        && generic_patch_summary(text, changes)
+    {
+        projected.remove("text");
     }
     // Register even when nothing can be removed: fallback display must not
     // replace a partial delta or custom diagnostic with a generic success.
     Some(Value::Object(projected))
+}
+
+/// The generic summary names each file as the patch wrote it, while the delta
+/// carries resolved paths. Lines must match the delta's kinds and order.
+fn generic_patch_summary(text: &str, changes: &[Value]) -> bool {
+    let Some(lines) = text.strip_prefix("Success. Updated the following files:\n") else {
+        return false;
+    };
+    let lines = match lines.strip_suffix('\n') {
+        Some(lines) => lines.split('\n').collect::<Vec<_>>(),
+        None if lines.is_empty() => Vec::new(),
+        None => return false,
+    };
+    lines.len() == changes.len()
+        && lines.iter().zip(changes).all(|(line, change)| {
+            let (prefix, Some(path)) = (
+                match change["kind"].as_str() {
+                    Some("add") => "A ",
+                    Some("delete") => "D ",
+                    Some("update") => "M ",
+                    _ => return false,
+                },
+                change["path"].as_str(),
+            ) else {
+                return false;
+            };
+            let Some(written) = line.strip_prefix(prefix) else {
+                return false;
+            };
+            match change.get("move_path").filter(|v| !v.is_null()) {
+                None => names_resolved_path(written, path),
+                Some(destination) => {
+                    prefix == "M "
+                        && destination.as_str().is_some_and(|destination| {
+                            written.split_once(" -> ").is_some_and(|(from, to)| {
+                                names_resolved_path(from, path)
+                                    && names_resolved_path(to, destination)
+                            })
+                        })
+                }
+            }
+        })
+}
+
+/// A written path names a resolved one when equal to it, or to its trailing
+/// components, ignoring separator spelling and ASCII case (Windows paths).
+fn names_resolved_path(written: &str, resolved: &str) -> bool {
+    let normalize = |path: &str| path.replace('\\', "/").to_ascii_lowercase();
+    let (written, resolved) = (normalize(written), normalize(resolved));
+    let written = written.strip_prefix("./").unwrap_or(&written);
+    !written.is_empty()
+        && !written.split('/').any(|component| component == "..")
+        && (resolved == written
+            || resolved
+                .strip_suffix(written)
+                .is_some_and(|head| head.ends_with('/')))
 }
 
 /// A compact plan receipt includes the identities needed for the next update.

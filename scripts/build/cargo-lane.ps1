@@ -1079,6 +1079,14 @@ $requestedLane = $Lane
 $activeLaneNames = @(Get-ActiveCargoLaneNames -LanesRoot $cargoLanesRoot)
 $excludedLaneNames = if ([string]::IsNullOrWhiteSpace($env:CODEX_CARGO_LANE_ACTIVE_NAMES)) { @() } else { $activeLaneNames }
 $candidateLane = if ($requestedLane -ceq "auto") { Get-AffinityLaneBase -CommandArgs $commandArgs } else { $requestedLane }
+# Match Python's source-qualified family, including default/legacy target roots.
+$sha256 = [Security.Cryptography.SHA256]::Create()
+try {
+    $identity = (Get-NormalizedCargoLanePath $repoRoot).ToLowerInvariant()
+    $sourceKey = [BitConverter]::ToString($sha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($identity))).Replace('-', '').ToLowerInvariant()
+}
+finally { $sha256.Dispose() }
+$candidateLane = "$candidateLane-ws-$sourceKey"
 # Affinity names come from command text; hold them to the explicit-name rules.
 Assert-CargoLaneName -Lane $candidateLane
 $previousLaneTargetDir = $env:CODEX_CARGO_LANE_TARGET_DIR
@@ -1108,7 +1116,7 @@ try {
     # Arbitrary wrappers are not shell-rewritten: they must pass this existing
     # reservation value to each nested Cargo invocation as --target-dir.
     $env:CODEX_CARGO_LANE_TARGET_DIR = $targetDir
-    if ($requestedLane -cne "auto" -and $resolvedLane -ne $requestedLane) {
+    if ($requestedLane -cne "auto" -and $resolvedLane -ne $candidateLane) {
         Write-Warning "Requested Cargo lane '$requestedLane' is busy; using '$resolvedLane'."
     }
     Update-CargoLaneLastUsed -TargetDir $targetDir

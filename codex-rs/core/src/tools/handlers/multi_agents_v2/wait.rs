@@ -206,6 +206,7 @@ impl Handler {
             // and the compare-and-swap expectation until a result is delivered.
             let mut scan_cursor = cursor;
             let mut folded_admission_events = 0_usize;
+            let mut folded_completion_events = 0_usize;
             let deadline = earliest_deadline(
                 explicit_timeout_ms
                     .map(|timeout_ms| wait_started + Duration::from_millis(timeout_ms as u64)),
@@ -559,6 +560,35 @@ impl Handler {
                     scan_cursor = wake_read.latest_event_id;
                     continue;
                 }
+                // The child's result mail precedes these durable completion events
+                // in the parent's mailbox and wins the wake; the events then end the
+                // next wait at once with nothing new. Fold them the same way.
+                if drain_outcome == WaitOutcome::DurableActivity
+                    && hydrated_assignments.failures.is_empty()
+                    && before_delivery!(is_delivered_completion_only(store, &wake_read, &hydrated_assignments, &consuming_agent_path), cursor)
+                {
+                    for event in &wake_read.updated_agents {
+                        if let Some(task) = hydrated_assignments.tasks.get(&event.assignment_id) {
+                            coordinator.record_first_meaningful_progress_once(
+                                event.attempt_id,
+                                event.reason,
+                                &task.assignment.created_at,
+                                &event.created_at,
+                                &turn.session_telemetry,
+                            );
+                            if task.receipt.is_some() {
+                                coordinator.record_root_receipt_hydration_once(
+                                    event.attempt_id,
+                                    &turn.session_telemetry,
+                                );
+                            }
+                        }
+                    }
+                    folded_completion_events =
+                        folded_completion_events.saturating_add(wake_read.updated_agents.len());
+                    scan_cursor = wake_read.latest_event_id;
+                    continue;
+                }
                 break (drain_outcome, wake_read, hydrated_assignments, None);
             };
             turn.turn_timing_state
@@ -666,6 +696,11 @@ impl Handler {
                 result
                     .message
                     .push_str(&admission_fold_note(folded_admission_events));
+            }
+            if folded_completion_events > 0 {
+                result
+                    .message
+                    .push_str(&completion_fold_note(folded_completion_events));
             }
             result.authoritative_wait_signal = unresolved_descendants.is_empty().then(|| authoritative_wait_signal(
                 root_session_id.as_deref(),
@@ -1323,6 +1358,12 @@ fn admission_fold_note(count: usize) -> String {
     )
 }
 
+fn completion_fold_note(count: usize) -> String {
+    format!(
+        " Skipped {count} completion event(s) whose agent results were already delivered as messages."
+    )
+}
+
 /// Admission, including a legacy follow-up's new attempt, is lifecycle
 /// bookkeeping rather than progress (`ObservationKind::is_meaningful_progress`).
 /// A page that lost events to retention still carries a deliverable signal.
@@ -1333,6 +1374,65 @@ fn is_admission_only(wake_read: &WakeRead) -> bool {
             .updated_agents
             .iter()
             .all(|event| event.reason == codex_agent_task_store::ObservationKind::Accepted)
+}
+
+/// A page of admission and completion bookkeeping for attempts whose terminal
+/// result mail already reached this consumer (the completion forwarder
+/// acknowledges the retained outcome only after delivery). The mail carries
+/// the outcome and receipt pointer, so these events are not new progress. A
+/// current attempt with pending required gates or a next action stays visible.
+async fn is_delivered_completion_only(
+    store: &codex_agent_task_store::LocalAgentTaskStore,
+    wake_read: &WakeRead,
+    hydrated: &HydratedAssignments,
+    consuming_agent_path: &str,
+) -> bool {
+    use codex_agent_task_store::ObservationKind;
+    if wake_read.lost_to_retention_count != 0 || wake_read.updated_agents.is_empty() {
+        return false;
+    }
+    let mut delivered = HashMap::new();
+    let mut any_completion = false;
+    for event in &wake_read.updated_agents {
+        match event.reason {
+            ObservationKind::Accepted => continue,
+            ObservationKind::HostCompletion
+            | ObservationKind::Completed
+            | ObservationKind::ReceiptSealed => {}
+            _ => return false,
+        }
+        let Some(task) = hydrated.tasks.get(&event.assignment_id) else {
+            return false;
+        };
+        if task.current_attempt.attempt_id == event.attempt_id
+            && (!task.current_attempt.state.is_terminal()
+                || has_pending_required_gates(task)
+                || task.workspace_status.next_required_action.is_some())
+        {
+            return false;
+        }
+        let recipient_matches = match delivered.get(&event.attempt_id) {
+            Some(matches) => *matches,
+            None => {
+                let matches = match store
+                    .delivered_terminal_outcome_agent_path(event.attempt_id)
+                    .await
+                {
+                    Ok(Some(agent_path)) => agent_path
+                        .rsplit_once('/')
+                        .is_some_and(|(parent, _)| parent == consuming_agent_path),
+                    Ok(None) | Err(_) => false,
+                };
+                delivered.insert(event.attempt_id, matches);
+                matches
+            }
+        };
+        if !recipient_matches {
+            return false;
+        }
+        any_completion = true;
+    }
+    any_completion
 }
 
 #[derive(Default)]

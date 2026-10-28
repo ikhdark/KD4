@@ -38,8 +38,8 @@ pub(crate) async fn acquire_python_test_resource(
             .map_err(|error| format!("invalid Python test resource selection: {error}"))?;
         if !leaves.iter().any(|argv| argv.split_first().is_some_and(|(program, args)| {
             program == "pytest" || ((program == "py" || program.starts_with("python"))
-                && args.windows(2).any(|pair| pair[0] == "-m"
-                    && matches!(pair[1].as_str(), "pytest" | "unittest")))
+                && codex_shell_command::validation::python_module(args)
+                    .is_some_and(|(module, _)| matches!(module, "pytest" | "unittest")))
         })) { return Ok(None); }
         if !codex_shell_command::validation::validation_resource_cwd_is_unambiguous(program, args) {
             return Err("Python test resource cwd is ambiguous inside this shell/wrapper command. Use the tool's workdir with direct argv or a single test command; this validation did not run.".to_owned());

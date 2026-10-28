@@ -5720,10 +5720,11 @@ fn selector_range(
 ) -> Result<Option<CanonicalByteRange>, ToolOutputSelectorStatus> {
     match selector {
         ToolOutputSelector::Bytes { start, end } => {
-            if start > end || *end > metadata.retained_bytes {
+            // Like a lines end past EOF, a bytes end past the retained output clamps.
+            if start > end || *start > metadata.retained_bytes {
                 Err(ToolOutputSelectorStatus::Invalid)
             } else {
-                Ok(Some(CanonicalByteRange::new(*start, *end)))
+                Ok(Some(CanonicalByteRange::new(*start, (*end).min(metadata.retained_bytes))))
             }
         }
         ToolOutputSelector::Lines { start, end } => {

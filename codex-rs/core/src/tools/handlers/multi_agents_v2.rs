@@ -30,6 +30,7 @@ pub(crate) use interrupt_agent::Handler as InterruptAgentHandler;
 pub(crate) use list_agents::Handler as ListAgentsHandler;
 pub(crate) use message_tool::FollowupTaskHandler;
 pub(crate) use message_tool::SendMessageHandler;
+pub(crate) use message_tool::ancestor_refusal;
 pub(crate) use spawn::Handler as SpawnAgentHandler;
 pub(crate) use task::AbandonAgentTaskHandler;
 pub(crate) use task::AmendAgentTaskHandler;

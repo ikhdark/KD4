@@ -4974,9 +4974,9 @@ impl Session {
                 .await?;
             Ok::<_, CodexErr>((selected_capability_roots, mcp))
         };
-        // Keep the session's instructions while their environment/configuration scope
-        // is unchanged. Deferred executors may introduce a new scope; capture it
-        // inside instruction serialization before preparing its tools.
+        // Refresh project instructions before each sampling step, including
+        // same-scope file changes. Capture deferred environments inside instruction
+        // serialization so instruction discovery and tools use the same scope.
         let (environments, agents_md_observation, prepared_tools) = if deferred_executor_enabled {
             self.services
                 .agents_md_manager

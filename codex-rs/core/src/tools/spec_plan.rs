@@ -808,10 +808,6 @@ fn build_code_mode_executors(
             if let Some(properties) = &mut tool.parameters.properties {
                 properties.remove("force_fresh");
             }
-            tool.description = tool.description.replace(
-                "Workspace results are freshness-tracked and may reuse dependency-current evidence; force_fresh bypasses replay and reads current contents.",
-                "Nested calls read current contents; retained-result replay does not apply.",
-            );
         }
 
         if exposure == ToolExposure::Deferred {
@@ -912,7 +908,7 @@ fn build_code_mode_executors(
         eager_nested_tool_descriptions.push("Nested apply_patch is unavailable in this session; use its direct interface only if advertised.".to_string());
     }
     if has_nested_list_files {
-        eager_nested_tool_descriptions.push("- `await tools.list_files({path, include?, exclude?, exclude_directories?, max_depth?, max_entries?})`: tree walk with basename patterns, no gitignore (default depth 8, 2000 entries), returning `{entries:[{path,kind}], truncated, complete}`.".to_string());
+        eager_nested_tool_descriptions.push("- `await tools.list_files({path, include?, exclude?, exclude_directories?, max_depth?, max_entries?})`: tree walk with basename patterns, no gitignore (default depth 8, 2000 entries), returning `{entries:[{path,kind}], truncated, complete}`. Combine known include patterns for the same root/options in one call; check completeness under the combined limits.".to_string());
     }
     if !lazy_builtin_tool_names.is_empty() {
         // Names only: built-ins keep this line stable when external inventories change.

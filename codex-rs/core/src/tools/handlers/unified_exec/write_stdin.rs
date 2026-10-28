@@ -308,6 +308,14 @@ impl WriteStdinHandler {
             response.wall_time = passive_wait_started.elapsed();
         }
 
+        if response.process_id.is_none()
+            && let Some(cwd) = session.services.command_execution
+                .process_local_cwd(args.session_id, incarnation).await
+        {
+            super::exec_command::attach_missing_rg_path_advisory(&mut response, &cwd, &turn)
+                .await;
+        }
+
         if let Some(running) = session
             .services
             .command_execution

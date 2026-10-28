@@ -1841,6 +1841,19 @@ impl ToolRegistry {
                 !external_tool,
             )
         {
+            // A sub-agent's misaddressed progress report gets the ancestor
+            // policy rather than a schema error it would retry around.
+            let message = (!external_tool
+                && matches!(tool_name.name.as_str(), "send_message" | "followup_task"))
+            .then(|| parsed_function_arguments.as_ref()?.value().ok())
+            .flatten()
+            .and_then(|arguments| {
+                crate::tools::handlers::multi_agents_v2::ancestor_refusal(
+                    &invocation.step_context.turn,
+                    arguments,
+                )
+            })
+            .unwrap_or(message);
             let log_payload = invocation.payload.log_payload();
             otel.tool_result_with_tags(
                 tool_name_flat.as_ref(),
@@ -3408,16 +3421,20 @@ fn fragment_section_heading(kind: ToolOutputProjectionFragmentKind) -> &'static 
 /// Room a truncated-cell recovery page leaves in a default cell for the read
 /// result's envelope and the script's own status lines.
 const CELL_RECOVERY_PAGE_RESERVE_TOKENS: usize = 2_000;
-/// Pages one cell raised to the output ceiling prints together; a notice names
-/// at most this many and leaves the rest to `continuation`.
+/// Pages one `cell_recovery` read delivers together: a nested result keeps 4/5
+/// of the exec ceiling, less the reserve for its envelope. A notice names at
+/// most this many and leaves the rest to `continuation`.
 const CELL_RECOVERY_MAX_PAGES: usize = {
-    let pages = codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL
-        / codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL;
+    let pages = (codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL * 4 / 5
+        - CELL_RECOVERY_PAGE_RESERVE_TOKENS)
+        / (codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL
+            - CELL_RECOVERY_PAGE_RESERVE_TOKENS);
     if pages == 0 { 1 } else { pages }
 };
 
 struct CellRecoveryPages {
     selectors: Vec<Value>,
+    /// Total bytes of `selectors`, so one read delivers every page.
     max_bytes: usize,
     continuation: Option<Value>,
 }
@@ -3425,7 +3442,8 @@ struct CellRecoveryPages {
 /// Recorded recoveries of truncated cells read the omitted lines whole and were
 /// cut by the cell budget again (audit 2026-10-22 #45). Split the omitted range
 /// of the saved output into contiguous byte pages that each print within a
-/// default cell when read with the shared `max_bytes`.
+/// default cell. Models then read one page per generation and rarely raised
+/// the cell budget (audit 2026-10-28 #3), so one `cell_recovery` read takes all.
 fn cell_recovery_pages(
     canonical: &CanonicalToolResult,
     selector: &Value,
@@ -3464,7 +3482,7 @@ fn cell_recovery_pages(
     let mut page_start = start;
     while page_start < end && selectors.len() < CELL_RECOVERY_MAX_PAGES {
         let page_end = cell_recovery_page_end(text, page_start, end, page_tokens);
-        max_bytes = max_bytes.max(page_end - page_start);
+        max_bytes += page_end - page_start;
         selectors.push(serde_json::json!({"kind":"bytes", "start":page_start, "end":page_end}));
         page_start = page_end;
     }
@@ -3516,12 +3534,10 @@ fn cell_recovery_page_end(text: &str, start: usize, end: usize, page_tokens: usi
 
 fn cell_recovery_note(pages: usize, has_continuation: bool) -> String {
     format!(
-        "Read these {pages} pages in order with max_bytes; each prints within a default cell, \
-         and a cell that starts with // @exec: {{\"max_output_tokens\": {}}} prints them all \
-         together.{}",
-        codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
+        "One call with these arguments reads all {pages} pages; cell_recovery gives them room \
+         in that cell beyond its default output budget.{}",
         if has_continuation {
-            " Page `continuation` the same way."
+            " Then read `continuation` with the same max_bytes and cell_recovery."
         } else {
             ""
         }
@@ -3778,22 +3794,20 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             });
             match pages {
                 Some(CellRecoveryPages {
-                    mut selectors,
+                    selectors,
                     max_bytes,
                     continuation,
                 }) => {
-                    let later_pages = selectors.split_off(1);
+                    let pages = selectors.len();
                     notice["recovery"] = serde_json::json!({"tool":"read_tool_output", "arguments": {
                         "artifact_id":artifact_id,
                         "selectors":selectors,
                         "max_bytes":max_bytes,
+                        "cell_recovery":true,
                     }});
-                    if !later_pages.is_empty() {
-                        notice["note"] = Value::String(cell_recovery_note(
-                            later_pages.len() + 1,
-                            continuation.is_some(),
-                        ));
-                        notice["page_selectors"] = Value::Array(later_pages);
+                    if pages > 1 || continuation.is_some() {
+                        notice["note"] =
+                            Value::String(cell_recovery_note(pages, continuation.is_some()));
                     }
                     if let Some(continuation) = continuation {
                         notice["continuation"] = continuation;

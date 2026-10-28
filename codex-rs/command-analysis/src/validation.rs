@@ -636,11 +636,10 @@ pub fn explicit_compilation_inputs(selection: &str, launch_command: &[String]) -
             [flag, path] if matches!(flag.as_str(), "--check" | "-c") => std::slice::from_ref(path),
             _ => return None,
         }
-    } else if matches!(binary, "python" | "python3" | "py") {
-        let start = args.iter().position(|arg| !matches!(arg.as_str(), "-I" | "-B" | "-u"))?;
-        if args.get(start).is_none_or(|arg| arg != "-m")
-            || args.get(start + 1).is_none_or(|arg| arg != "py_compile") { return None; }
-        &args[start + 2..]
+    } else if codex_shell_command::validation::is_python_launcher(&binary.to_ascii_lowercase()) {
+        let (module, tail) = codex_shell_command::validation::python_module(args)?;
+        if module != "py_compile" { return None; }
+        tail
     } else if matches!(binary, "tsc" | "vue-tsc" | "javac" | "deno") {
         let args = if binary == "deno" {
             if args.first().is_none_or(|arg| arg != "check") { return None; }

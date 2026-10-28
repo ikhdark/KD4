@@ -187,6 +187,9 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
                 ("selectors".to_string(), selectors),
                 ("max_bytes".to_string(), bounded_integer(1, u64::MAX,
                     format!("Maximum delivered source bytes, default {READ_TOOL_OUTPUT_MAX_BYTES}. Direct calls are capped at that default. Code-mode scripts may explicitly request up to {READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES} bytes under a separate 1 MiB serialized payload cap; print only the needed evidence. Metadata/escaping can produce a smaller page with continuation."))),
+                ("cell_recovery".to_string(), JsonSchema::boolean(Some(
+                    "Set by a truncated exec cell's recovery.arguments: the read gets room in its cell beyond the output budget, up to the exec ceiling.".to_string(),
+                ))),
             ]),
             Some(vec!["artifact_id".to_string(), "selectors".to_string()]),
             Some(false.into()),

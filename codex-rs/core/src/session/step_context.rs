@@ -81,7 +81,7 @@ pub(crate) struct StepContext {
     pub(crate) loaded_agents_md: Option<Arc<LoadedAgentsMd>>,
     /// The repository-instruction rendering and identity derived for this exact step.
     pub(crate) agents_md_stable_context: Option<RepositoryStableContextBundle>,
-    /// Whether this scope has a complete session snapshot or uses unverified fallback state.
+    /// Whether project instructions were completely reread for this step or use unverified fallback state.
     pub(crate) agents_md_freshness: AgentsMdFreshness,
 }
 

@@ -98,6 +98,7 @@ pub(crate) fn normalize_provider_context_item_id(item: &mut ResponseItem) {
 pub(crate) fn provider_context_item_id_needs_normalization(item: &ResponseItem) -> bool {
     if let ResponseItem::Message { id: Some(id), .. } = item
         && (is_trusted_stable_context_id(id)
+            || codex_context_fragments::is_code_mode_notification_id(id)
             || crate::event_mapping::is_user_input_item_id(id)
             || codex_rollout::is_rollout_reconstruction_notice_id(id)
             || id.as_str().starts_with("msg_compaction_summary_")

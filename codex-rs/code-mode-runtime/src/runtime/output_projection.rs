@@ -438,7 +438,19 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
     if (fragment) {
       const raw = rawText({results: fragment === 'rows' ? projected : [projected]}, undefined, source);
       if (!raw) return undefined;
-      return {envelope: fragment === 'rows' ? raw.envelope.results : raw.envelope.results[0], texts: raw.texts};
+      const rows = fragment === 'rows' ? projected : [projected];
+      const unframed = rows.some(row => typeof row?.text !== 'string' &&
+        !(row?.selector?.kind === 'search' && row.value?.hydrated_ranges?.some(range => typeof range?.text === 'string')));
+      const selected = fragment === 'rows' ? raw.envelope.results : raw.envelope.results[0];
+      // Non-text rows have no source body label. Preserve their trusted parent
+      // identity in presentation only, after the existing mutation guards.
+      const envelope = unframed ? {source: {
+        path: source.path, artifact_id: source.artifact_id,
+        source_sha256: source.source_sha256 || source.canonical_sha256,
+        environment_id: source.environment_id,
+        canonical_uri: source.path === undefined ? source.canonical_uri : undefined,
+      }, [fragment === 'rows' ? 'results' : 'result']: selected} : selected;
+      return {envelope, texts: raw.texts};
     }
     if (projected === null || typeof projected !== 'object' || Array.isArray(projected)) {
       return undefined;

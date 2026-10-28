@@ -71,6 +71,11 @@ pub(crate) fn is_dangerous_powershell_words(words: &[String]) -> bool {
         return false;
     };
     let command = command.to_ascii_lowercase();
+    // Explicit executable spellings retain native option semantics. Bare `rm`
+    // can be a PowerShell alias, so do not reinterpret its cmdlet parameters.
+    if is_explicit_executable_spelling(&command) && super::is_dangerous_to_call_with_exec(words) {
+        return true;
+    }
     if matches!(
         command.as_str(),
         "start-process" | "start" | "saps" | "invoke-item" | "ii"
@@ -86,6 +91,11 @@ pub(crate) fn is_dangerous_powershell_words(words: &[String]) -> bool {
         return true;
     }
     is_direct_gui_launch(words)
+}
+
+fn is_explicit_executable_spelling(command: &str) -> bool {
+    command.contains(['/', '\\'])
+        || [".exe", ".com", ".cmd", ".bat"].iter().any(|suffix| command.ends_with(suffix))
 }
 
 /// PowerShell binds any unambiguous parameter prefix (`-Fo`, `-forc`) and treats the en dash,
@@ -131,7 +141,40 @@ fn is_dangerous_powershell_script_tokens(words: &[String]) -> bool {
     }
 
     // Check for force delete operations (e.g., Remove-Item -Force)
-    has_force_delete_cmdlet(&tokens_lc)
+    has_force_delete_cmdlet(&tokens_lc) || has_force_remove_executable(&tokens_lc)
+}
+
+/// Scripts the restricted AST parser cannot lower (try/catch, loops) reach this
+/// scan, so apply the explicit-executable `rm` check per command segment too.
+fn has_force_remove_executable(tokens: &[String]) -> bool {
+    // Only `rm`, directly or through `sudo`, can match below; skip segmenting otherwise.
+    if !tokens.iter().any(|token| token.contains("rm") || token.contains("sudo")) {
+        return false;
+    }
+    fn force_removes(segment: &[String]) -> bool {
+        segment.iter().enumerate().any(|(index, word)| {
+            is_explicit_executable_spelling(word)
+                && super::is_dangerous_to_call_with_exec(&segment[index..])
+        })
+    }
+    let mut segment = Vec::new();
+    for token in tokens {
+        for (index, part) in token.split([';', '|', '&', '\n', '\r']).enumerate() {
+            if index > 0 {
+                if force_removes(&segment) {
+                    return true;
+                }
+                segment.clear();
+            }
+            segment.extend(
+                part.split(['{', '}', '(', ')', '[', ']', ','])
+                    .map(str::trim)
+                    .filter(|atom| !atom.is_empty())
+                    .map(str::to_owned),
+            );
+        }
+    }
+    force_removes(&segment)
 }
 
 fn is_dangerous_cmd(command: &[String]) -> bool {

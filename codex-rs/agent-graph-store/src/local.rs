@@ -76,9 +76,10 @@ impl AgentGraphStore for LocalAgentGraphStore {
         &'a self,
         parent: ThreadId,
         turn_id: &'a str,
+        live_turn_owners: std::collections::HashMap<ThreadId, (ThreadId, String)>,
     ) -> AgentGraphStoreFuture<'a, Vec<ThreadId>> {
         Box::pin(async move {
-            self.state_db.list_turn_owned_thread_spawn_descendants(parent, turn_id).await
+            self.state_db.list_turn_owned_thread_spawn_descendants(parent, turn_id, &live_turn_owners).await
                 .map_err(|err| internal_error("list turn-owned thread-spawn children", err))
         })
     }

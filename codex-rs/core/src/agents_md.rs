@@ -100,7 +100,7 @@ impl AgentsMdFreshness {
     pub(crate) const fn model_visible_description(self) -> &'static str {
         match self {
             Self::Refreshed => {
-                "Result provenance: active_instruction_snapshot; freshness: complete_session_snapshot_for_current_scope; project_files_not_rechecked_each_sampling_step."
+                "Result provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step."
             }
             Self::IncompleteRead => {
                 "Result provenance: direct_file_read; freshness: incomplete_read_may_omit_instructions."
@@ -112,12 +112,12 @@ impl AgentsMdFreshness {
     }
 
     /// Strip only known persisted provenance prefixes, including the former
-    /// per-step-read claim. Older rollouts must not turn that metadata into rules.
+    /// session-snapshot claim. Older rollouts must not turn that metadata into rules.
     pub(crate) fn strip_model_visible_description(self, text: &str) -> Option<&str> {
         text.strip_prefix(self.model_visible_description())
             .or_else(|| {
                 (self == Self::Refreshed)
-                    .then(|| text.strip_prefix("Result provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step."))
+                    .then(|| text.strip_prefix("Result provenance: active_instruction_snapshot; freshness: complete_session_snapshot_for_current_scope; project_files_not_rechecked_each_sampling_step."))
                     .flatten()
             })
             .and_then(|text| text.strip_prefix("\n\n"))

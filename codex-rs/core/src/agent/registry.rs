@@ -50,7 +50,8 @@ struct ActiveAgents {
     agent_tree: HashMap<String, AgentMetadata>,
     // Residency is not lineage: keep the edge through cold/pathless intermediates.
     parents: HashMap<ThreadId, ThreadId>,
-    // Ephemeral turn ownership retires with its existing lineage edge.
+    // Live turn ownership (ephemeral spawns and accepted follow-ups) retires
+    // with its existing lineage edge; durable creation provenance is unchanged.
     turn_spawn_owners: HashMap<ThreadId, (ThreadId, String)>,
     used_agent_nicknames: HashSet<String>,
     nickname_reset_count: usize,
@@ -438,6 +439,14 @@ impl AgentRegistry {
     pub(crate) fn record_turn_spawn_owner(&self, child: ThreadId, parent: ThreadId, turn: String) {
         self.active_agents.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
             .turn_spawn_owners.insert(child, (parent, turn));
+    }
+
+    pub(crate) fn record_turn_followup_owner(&self, child: ThreadId, parent: ThreadId, turn: &str) {
+        let mut agents = self.active_agents.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A sibling/ancestor message cannot acquire another parent's subtree.
+        if agents.parents.get(&child) == Some(&parent) {
+            agents.turn_spawn_owners.insert(child, (parent, turn.to_string()));
+        }
     }
 
     pub(crate) fn turn_spawn_owners(&self) -> HashMap<ThreadId, (ThreadId, String)> {

@@ -58,7 +58,9 @@ pub(crate) fn is_contextual_user_message(item: &ResponseItem) -> bool {
     matches!(item, ResponseItem::Message { id, role, content, .. }
         if role == "user"
             && !id.as_ref().is_some_and(|id| is_user_input_item_id(id))
-            && is_contextual_user_message_content(content))
+            && (id.as_ref().is_some_and(|id|
+                    codex_context_fragments::is_code_mode_notification_id(id))
+                || is_contextual_user_message_content(content)))
 }
 
 /// Returns true when a developer message contains any rollback-trimmable contextual fragment.
@@ -170,6 +172,8 @@ pub fn parse_turn_item(item: &ResponseItem) -> Option<TurnItem> {
             phase,
             ..
         } => match role.as_str() {
+            "user" if id.as_ref().is_some_and(|id|
+                codex_context_fragments::is_code_mode_notification_id(id)) => None,
             "user" if id.as_ref().is_some_and(|id| is_user_input_item_id(id)) => {
                 Some(TurnItem::UserMessage(parse_user_message_content(content)))
             }

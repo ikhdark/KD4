@@ -9,10 +9,17 @@ use std::path::PathBuf;
 use crate::merge_base_with_head;
 use crate::operations::resolve_head;
 use crate::operations::resolve_repository_root;
-use crate::operations::run_git_for_stdout_exact as run_git_for_stdout;
+use crate::operations::run_git_for_stdout_exact_limited;
 use crate::resolve_commit;
 use codex_protocol::protocol::ReviewOutputEvent;
 use codex_protocol::protocol::ReviewTarget;
+
+fn run_git_for_stdout<I, S>(root: &Path, args: I, env: Option<&[(std::ffi::OsString, std::ffi::OsString)]>)
+    -> Result<String, crate::GitToolingError>
+where I: IntoIterator<Item = S>, S: AsRef<std::ffi::OsStr>,
+{
+    run_git_for_stdout_exact_limited(root, args, env, 8 * 1024 * 1024)
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReviewSourceScope {

@@ -273,7 +273,7 @@ impl AgentsMdManager {
         let refresh = async {
             let _permit = self.refresh_gate.acquire().await.ok()?;
             Some(
-                self.observe_with_gate_held(Arc::clone(config), environments)
+                self.refresh_with_gate_held(Arc::clone(config), environments)
                     .await,
             )
         };
@@ -309,7 +309,7 @@ impl AgentsMdManager {
             if let Some(_permit) = permit
                 && let Ok(observation) = tokio::time::timeout_at(
                     deadline,
-                    self.observe_with_gate_held(Arc::clone(config), &snapshot),
+                    self.refresh_with_gate_held(Arc::clone(config), &snapshot),
                 )
                 .await
             {
@@ -322,32 +322,6 @@ impl AgentsMdManager {
         // the refresh gate held while waiting for preparation after instructions are ready.
         let (observation, prepared) = tokio::join!(refresh, Box::pin(prepare(snapshot.clone())));
         (snapshot, observation, prepared)
-    }
-
-    /// Instructions are session-scoped. Reload only for a new environment or
-    /// instruction configuration, or to recover an incomplete initial load.
-    async fn observe_with_gate_held(
-        &self,
-        config: Arc<Config>,
-        environments: &TurnEnvironmentSnapshot,
-    ) -> AgentsMdObservation {
-        let key = AgentsMdCacheKey::capture_with_markers(
-            &config,
-            environments,
-            &self.project_root_markers(&config),
-        );
-        {
-            let cache = self.cache.lock().await;
-            if cache.complete && cache.key.as_ref() == Some(&key) {
-                // Refreshed denotes a complete load for this scope, not a
-                // claim that files were reread for the current model request.
-                drop(cache);
-                // Verify only an overflow manifest, using the existing bounded
-                // recovery owner. Instruction files stay session-snapshotted.
-                return self.cached_observation_with_recovery(AgentsMdFreshness::Refreshed).await;
-            }
-        }
-        self.refresh_with_gate_held(config, environments).await
     }
 
     fn scoped_fallback(
@@ -398,8 +372,9 @@ impl AgentsMdManager {
             project_root_markers.as_ref(),
         )
         .await;
-        // Explicit refreshes and new scopes read the instruction bytes rather
-        // than using metadata as a content identity.
+        // Metadata is discovery evidence, not a content identity: editors can
+        // preserve size and mtime. Reread instruction bytes at every sampling
+        // boundary so same-scope edits, additions and removals become visible.
         let previous = {
             let cache = self.cache.lock().await;
             (cache.key.as_ref() == Some(&key))

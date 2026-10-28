@@ -377,6 +377,7 @@ struct CodeModePacketReceipt {
     omitted_nested_result_count: usize,
     first_required_terminal: Option<CodeModeNestedTerminal>,
     tool_output_recovery_count: u32,
+    output_budget: Option<usize>,
     unsettled_nested_calls: Vec<JsonValue>,
     unobserved_settlements: Vec<FunctionCallOutputContentItem>,
     omitted_unobserved_settlement_count: usize,
@@ -782,6 +783,27 @@ impl CodeModeService {
             && budget.is_some()
         {
             metrics.output_budget = budget;
+        }
+    }
+
+    /// Gives a `cell_recovery` read's `tokens` room beyond the cell's own
+    /// budget, up to the exec ceiling. Kept for the cell like a pragma.
+    pub(crate) fn raise_output_budget(&self, cell_id: &str, tokens: usize) {
+        if let Some(metrics) = self
+            .packet_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cells
+            .get_mut(cell_id)
+        {
+            let base = metrics
+                .output_budget
+                .unwrap_or_default()
+                .max(codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL);
+            metrics.output_budget = Some(
+                base.saturating_add(tokens)
+                    .min(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL),
+            );
         }
     }
 
@@ -1616,6 +1638,7 @@ impl CodeModeService {
             omitted_nested_result_count: metrics.omitted_nested_result_count,
             first_required_terminal: metrics.first_required_terminal,
             tool_output_recovery_count: metrics.tool_output_recovery_count,
+            output_budget: metrics.output_budget,
             unsettled_nested_calls: metrics.pending_call_identities.into_values().collect(),
             unobserved_settlements: metrics.unobserved_settlements,
             omitted_unobserved_settlement_count: metrics.omitted_unobserved_settlement_count,
@@ -1816,7 +1839,26 @@ pub(super) fn handle_runtime_response(
         serde_json::json!({"calls":calls,"retry_safe":false})
     });
     let needs_retained_results = response_needs_retained_nested_results(&response);
+    let mut nested_presentations = std::collections::BTreeMap::new();
     let nested_results = if needs_retained_results {
+        let content_items = match &response {
+            RuntimeResponse::Result { content_items, .. }
+            | RuntimeResponse::Terminated { content_items, .. }
+            | RuntimeResponse::Yielded { content_items, .. }
+            | RuntimeResponse::ExplicitYield { content_items, .. } => content_items,
+        };
+        let emitted_items = into_function_call_output_content_items(content_items.clone());
+        let emitted_text = emitted_items.iter().filter_map(|item| match item {
+            FunctionCallOutputContentItem::InputText { text } => Some(text.as_str()),
+            _ => None,
+        }).collect::<Vec<_>>();
+        for (ordinal, entry) in &mut packet.nested_recovery {
+            if let Some(presentation) = compact_emitted_native_read(entry, &emitted_text) {
+                let (text, truncated, _) = bounded_serialized_json(&presentation);
+                nested_presentations.insert(*ordinal, (text, truncated));
+                entry["outcome"]["result"] = presentation;
+            }
+        }
         if packet.omitted_nested_result_count > 0
             || packet
                 .nested_results
@@ -1896,6 +1938,7 @@ pub(super) fn handle_runtime_response(
         if (state["exit_code"].as_i64().is_some_and(|code| code != 0)
             && !(state["search_no_match"] == true && state["exit_code"] == 1))
             || state["execution_state"] == "unknown"
+            || state["execution_state"] == "not_started"
             || state.get("error").is_some_and(|error| !error.is_null())
         {
             post_tool_use_feedback.push(FunctionCallOutputContentItem::InputText {
@@ -1924,8 +1967,10 @@ pub(super) fn handle_runtime_response(
         } => codex_utils_output_truncation::model_token_count(&format!("Script error:\n{error}")),
         _ => 0,
     };
+    // A `cell_recovery` read may have raised the cell's recorded budget.
     let requested = max_output_tokens
         .unwrap_or(codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL)
+        .max(packet.output_budget.unwrap_or_default())
         .min(hard_limit);
     let text_budget = requested
         .saturating_sub(control_tokens)
@@ -1940,6 +1985,7 @@ pub(super) fn handle_runtime_response(
         started_at,
         post_tool_use_feedback,
         nested_results,
+        nested_presentations,
         packet.first_required_terminal,
     );
     // The cell budget is the only projection in-cell recovery crosses after
@@ -2273,24 +2319,88 @@ fn response_needs_retained_nested_results(response: &RuntimeResponse) -> bool {
 
 fn nested_result_content_items(
     nested_results: Vec<CodeModeNestedResultEvidence>,
+    presentations: &std::collections::BTreeMap<usize, (String, bool)>,
 ) -> Vec<FunctionCallOutputContentItem> {
     nested_results
         .into_iter()
         .map(|result| {
-            let value = serde_json::from_str(&result.output)
-                .unwrap_or_else(|_| JsonValue::String(result.output));
+            let (text, output_truncated) = presentations.get(&result.ordinal)
+                .map(|(text, truncated)| (text.as_str(), *truncated))
+                .unwrap_or((&result.output, result.output_truncated));
+            let value = serde_json::from_str(text)
+                .unwrap_or_else(|_| JsonValue::String(text.to_owned()));
             let value = model_visible_nested_result(&ToolName::plain(&result.tool_name), value);
             FunctionCallOutputContentItem::InputText {
                 text: serde_json::json!({
                     "call_id": result.call_id,
                     "tool_name": result.tool_name,
-                    "output_truncated": result.output_truncated,
+                    "output_truncated": output_truncated,
                     "result": value,
                 })
                 .to_string(),
             }
         })
         .collect()
+}
+
+/// Reference only complete source bodies already present in one admitted item.
+/// Metadata and unprinted siblings remain explicit; raw JS and canonical nested
+/// receipts are unchanged. Short bodies cost less than a reference.
+fn compact_emitted_native_read(entry: &JsonValue, emitted: &[&str]) -> Option<JsonValue> {
+    if entry["failed"] != false
+        || !matches!(entry["tool_name"].as_str(), Some("read_file" | "read_tool_output"))
+    {
+        return None;
+    }
+    let result = entry.pointer("/outcome/result")?;
+    if result["complete"] != true || emitted.is_empty() {
+        return None;
+    }
+    // Preserve the existing smaller whole-result reference when exact JSON
+    // was printed (for example an unregistered clone of the native packet).
+    let serialized = result.to_string();
+    if emitted.iter().any(|item| item.contains(&serialized)) {
+        return None;
+    }
+    let mut presentation = result.clone();
+    let mut changed = false;
+    for row in presentation.get_mut("results")?.as_array_mut()? {
+        if row["status"] != "ok" || row["complete"] != true {
+            continue;
+        }
+        changed |= compact_emitted_source_text(row, emitted);
+        if row["selector"]["kind"] == "search"
+            && let Some(ranges) = row.pointer_mut("/value/hydrated_ranges").and_then(JsonValue::as_array_mut)
+        {
+            for range in ranges {
+                changed |= compact_emitted_source_text(range, emitted);
+            }
+        }
+    }
+    changed.then_some(presentation)
+}
+
+fn compact_emitted_source_text(row: &mut JsonValue, emitted: &[&str]) -> bool {
+    let Some(text) = row.get("text").and_then(JsonValue::as_str) else { return false; };
+    if text.len() < 256 {
+        return false;
+    }
+    let found = emitted.iter().any(|item| item.contains(text))
+        || serde_json::to_string(text).is_ok_and(|escaped| {
+            emitted.iter().any(|item| item.contains(&escaped[1..escaped.len() - 1]))
+        });
+    if !found {
+        return false;
+    }
+    let reference = serde_json::json!({
+        "already_emitted_in_cell": true,
+        "canonical_bytes": text.len(),
+        "canonical_sha256": hex::encode(Sha256::digest(text.as_bytes())),
+    });
+    let Some(row) = row.as_object_mut() else { return false; };
+    row.remove("text");
+    row.insert("text_reference".into(), reference);
+    true
 }
 
 /// Keep an index entry, not a second copy, of a settled successful result.
@@ -2380,6 +2490,7 @@ fn format_runtime_response(
     started_at: std::time::Instant,
     post_tool_use_feedback: Vec<FunctionCallOutputContentItem>,
     nested_results: Vec<CodeModeNestedResultEvidence>,
+    nested_presentations: std::collections::BTreeMap<usize, (String, bool)>,
     required_terminal: Option<CodeModeNestedTerminal>,
 ) -> FunctionToolOutput {
     let continuation_owner_key = match &response {
@@ -2496,7 +2607,7 @@ fn format_runtime_response(
         })
         .filter(|result| !nested_result_already_emitted(result, &emitted))
         .collect();
-    content_items.extend(nested_result_content_items(nested_results));
+    content_items.extend(nested_result_content_items(nested_results, &nested_presentations));
     content_items.extend(post_tool_use_feedback);
     let mut diagnostic = required_terminal.as_ref().map(|terminal| {
         success = false;

@@ -2,11 +2,25 @@
 use crate::AdditionalContextUserFragment;
 use crate::ContextualUserFragment;
 use crate::fragment::matches_marked_text;
+use codex_protocol::ResponseItemId;
 use codex_protocol::items::parse_hook_prompt_fragment;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::RolloutItem;
+
+const CODE_MODE_NOTIFICATION_ITEM_ID_BASE: &str = "msg_cmn";
+const CODE_MODE_NOTIFICATION_ITEM_ID_PREFIX: &str = "msg_cmn_";
+
+/// Assign identity before admission so identical emissions remain distinct.
+pub fn new_code_mode_notification_id() -> ResponseItemId {
+    ResponseItemId::new(CODE_MODE_NOTIFICATION_ITEM_ID_BASE)
+}
+
+/// Reserved host notification origin; does not confer instruction authority.
+pub fn is_code_mode_notification_id(id: &str) -> bool {
+    id.starts_with(CODE_MODE_NOTIFICATION_ITEM_ID_PREFIX)
+}
 
 pub fn is_user_turn_boundary(item: &ResponseItem) -> bool {
     match item {
@@ -14,6 +28,8 @@ pub fn is_user_turn_boundary(item: &ResponseItem) -> bool {
         // only by trusted context producers. Text alone is not provenance.
         ResponseItem::Message { id: Some(id), .. }
             if id.as_str().starts_with("msg_sctx_") => false,
+        ResponseItem::Message { id: Some(id), role, .. }
+            if role == "user" && is_code_mode_notification_id(id) => false,
         ResponseItem::AgentMessage { .. } => true,
         ResponseItem::Message {
             id, role, content, ..

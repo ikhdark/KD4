@@ -63,7 +63,14 @@ pub(crate) struct PreparedHistoryPolicy {
     version: u16,
     supports_images: bool,
     stable_context_target: StableContextTarget,
+    pressure_reasoning_retirement: bool,
 }
+
+/// Newest generations whose reasoning a context-pressure retirement keeps in
+/// the sampling projection; matches proactive retirement's inline outputs
+/// (`CONTEXT_PRESSURE_KEPT_GENERATIONS`). Failed-summary retirement keeps fewer
+/// outputs inline but writes the same checkpoint, so it keeps this window too.
+const PRESSURE_RETIREMENT_KEPT_REASONING_GENERATIONS: usize = 3;
 
 #[derive(Debug)]
 enum PreparedPromptItemsSource {
@@ -257,6 +264,10 @@ impl PreparedHistoryFingerprint {
             StableContextTarget::Sampling => 1,
             StableContextTarget::FailOpen => 0,
         }]);
+        // Hashed only when enabled so default fingerprints stay unchanged.
+        if policy.pressure_reasoning_retirement {
+            hasher.update(b"pressure_reasoning_retirement");
+        }
         hasher.update(manifest.fingerprint());
         hash_prepared_history_items(&mut hasher, items)?;
         let digest = hasher.clone().finalize().into();
@@ -428,6 +439,10 @@ pub(crate) struct ContextManager {
     realized_context_baseline: RealizedContextBaseline,
     /// World state most recently appended to model-visible history.
     world_state_baseline: Option<Arc<WorldStateSnapshot>>,
+    /// Opt-in `pressure_reasoning_retirement`: sampling prompts leave out
+    /// reasoning older than the generations the latest context-pressure
+    /// retirement kept. Stored history keeps every item.
+    pressure_reasoning_retirement: bool,
 }
 
 impl ContextManager {
@@ -447,7 +462,12 @@ impl ContextManager {
             ),
             realized_context_baseline: RealizedContextBaseline::Unknown,
             world_state_baseline: None,
+            pressure_reasoning_retirement: false,
         }
+    }
+
+    pub(crate) fn set_pressure_reasoning_retirement(&mut self, enabled: bool) {
+        self.pressure_reasoning_retirement = enabled;
     }
 
     pub(crate) fn token_info(&self) -> Option<TokenUsageInfo> {
@@ -632,6 +652,8 @@ impl ContextManager {
             version: PREPARED_HISTORY_POLICY_VERSION,
             supports_images: input_modalities.contains(&InputModality::Image),
             stable_context_target,
+            pressure_reasoning_retirement: self.pressure_reasoning_retirement
+                && stable_context_target == StableContextTarget::Sampling,
         };
         let source_items = Arc::downgrade(&self.items);
         let prepared = self
@@ -668,6 +690,21 @@ impl ContextManager {
             let mut index = 0;
             Arc::make_mut(&mut self.items).retain(|item| {
                 let keep = !is_resolved_reasoning(index, item, Some(boundary));
+                index += 1;
+                keep
+            });
+        }
+        if policy.pressure_reasoning_retirement
+            && let Some(boundary) = pressure_retired_reasoning_boundary(&self.items)
+        {
+            // The latest context-pressure retirement already rewrote this
+            // prompt's prefix; reasoning from the generations it retired goes
+            // with it. Their calls and outputs stay. Projection only: the
+            // boundary moves only with a new retirement checkpoint, which
+            // already ends prepared-history appends, so prefixes stay stable.
+            let mut index = 0;
+            Arc::make_mut(&mut self.items).retain(|item| {
+                let keep = index >= boundary || !matches!(item, ResponseItem::Reasoning { .. });
                 index += 1;
                 keep
             });
@@ -838,6 +875,7 @@ impl ContextManager {
             version: PREPARED_HISTORY_POLICY_VERSION,
             supports_images: input_modalities.contains(&InputModality::Image),
             stable_context_target: StableContextTarget::FailOpen,
+            pressure_reasoning_retirement: false,
         };
         let source_items = Arc::downgrade(&self.items);
         if let Some(items) = self.local_compaction_items.lock()
@@ -2599,6 +2637,38 @@ fn evict_resolved_reasoning(items: &mut Vec<ResponseItem>) {
         index = index.saturating_add(1);
         retain
     });
+}
+
+/// Start of the oldest generation whose reasoning the latest context-pressure
+/// retirement keeps: the newest generations before its checkpoint, each a run
+/// of consecutive model-generated items. `None` without such a checkpoint or
+/// without an older generation to leave out.
+fn pressure_retired_reasoning_boundary(items: &[ResponseItem]) -> Option<usize> {
+    let checkpoint = items.iter().rposition(|item| {
+        matches!(item, ResponseItem::Message { role, content, .. }
+            if role == "developer"
+                && matches!(content.as_slice(),
+                    [codex_protocol::models::ContentItem::InputText { text }]
+                        if crate::tool_history::is_pressure_retirement_checkpoint_text(text)))
+    })?;
+    let mut generations = 0usize;
+    let mut in_generation = false;
+    let mut boundary = None;
+    for (index, item) in items[..checkpoint].iter().enumerate().rev() {
+        if !is_model_generated_item(item) {
+            in_generation = false;
+            continue;
+        }
+        if !in_generation {
+            in_generation = true;
+            generations += 1;
+            if generations > PRESSURE_RETIREMENT_KEPT_REASONING_GENERATIONS {
+                return boundary;
+            }
+        }
+        boundary = Some(index);
+    }
+    None
 }
 
 /// End of a task established by authoritative terminal evidence, if available.

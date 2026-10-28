@@ -3132,6 +3132,22 @@ impl LocalAgentTaskStore {
         Ok(())
     }
 
+    /// Agent path of an attempt whose terminal outcome mail reached its parent.
+    pub async fn delivered_terminal_outcome_agent_path(
+        &self,
+        attempt: AttemptId,
+    ) -> StoreResult<Option<String>> {
+        let binding = sqlx::query_scalar::<_, String>(
+            "SELECT binding_json FROM pending_terminal_outcomes WHERE attempt_id = ? AND acknowledged = 1 LIMIT 1",
+        )
+        .bind(attempt.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        binding
+            .map(|binding| decode::<AgentTaskBinding>(&binding).map(|binding| binding.agent_path))
+            .transpose()
+    }
+
     pub async fn unstarted_assignments(
         &self,
         root: &str,

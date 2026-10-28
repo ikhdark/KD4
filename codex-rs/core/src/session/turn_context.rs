@@ -1309,6 +1309,9 @@ impl Session {
         final_output_json_schema: Option<Option<Arc<PreparedOutputSchema>>>,
         multi_agent_runtime: TurnMultiAgentRuntime,
     ) -> Arc<TurnContext> {
+        // Preview exists only to prepare the startup router/transport. Its
+        // metadata state is discarded; the admitted turn owns fresh enrichment.
+        let enrich_git_metadata = matches!(&multi_agent_runtime, TurnMultiAgentRuntime::ResolveAndStore);
         let turn_environments = self.services.turn_environments.snapshot().await;
         let git_metadata_source = self
             .services
@@ -1436,7 +1439,7 @@ impl Session {
             .turn_timing_state
             .bind_live_phase_events(turn_context.sub_id.clone(), self.tx_event.clone());
         let turn_context = Arc::new(turn_context);
-        if turn_context
+        if enrich_git_metadata && turn_context
             .environments
             .single_local_environment_cwd()
             .is_some()

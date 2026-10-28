@@ -13,7 +13,7 @@ not another instruction or configuration owner.
 | [test-runners.json](test-runners.json) | Validation runner registration; kept at its runtime path. |
 | [audits/](audits/README.md) | Reports, captured artifacts, and per-run evidence bundles. |
 | `gitdiff/` (when present) | Runtime output path for named patch receipts from the diff-saving tool. |
-| [benchmark-runs/](benchmark-runs/) | Existing benchmark cases and their captured results. |
+| `benchmark-runs/` (when present) | Benchmark cases and their captured results. |
 | [locks/](locks/) | Tool-managed coordination files; not disposable audit clutter. |
 
 ## Current repository state
@@ -21,14 +21,15 @@ not another instruction or configuration owner.
 Repository-owned test-only files and dedicated test commands have been removed
 across all languages. Build/lint checks, production examples/generators, and
 mixed-purpose validation-runner registrations remain. SDK check recipes perform
-lint/type checks, not tests. See [AGENTS.md](../AGENTS.md#repository-test-state)
-and [CONTEXT.md](CONTEXT.md) for guidance and the current uncommitted state.
+lint/type checks, not tests. See [AGENTS.md](../AGENTS.md) for guidance and
+[CONTEXT.md](CONTEXT.md) for the rolling brief.
 
 ## Retained history
 
 - The [audit library](audits/README.md) groups reports and raw captures by task.
-  All 105 retained tasks have matching copies here and in
-  `C:\Users\kuh\Desktop\KDR\audits`; see the library's organization report.
+  At the 2026-10-26 organization, all 105 retained tasks had matching copies here
+  and in `C:\Users\kuh\Desktop\KDR\audits` (see the library's organization
+  report); later task folders are not guaranteed to be mirrored.
 - Historical reports and benchmark captures may refer to removed tests,
   support crates, and paths; preserve those records rather than treating them as
   current runnable instructions.

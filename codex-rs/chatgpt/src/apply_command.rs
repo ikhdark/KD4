@@ -5,7 +5,7 @@ use codex_backend_client::CodeTaskDetailsResponseExt;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
 use codex_git_utils::ApplyGitRequest;
-use codex_git_utils::apply_git_patch;
+use codex_git_utils::apply_git_patch_async;
 use codex_utils_cli::CliConfigOverrides;
 
 use crate::get_task::GetTaskResponse;
@@ -60,7 +60,7 @@ async fn apply_diff(diff: String, cwd: Option<PathBuf>) -> anyhow::Result<()> {
         revert: false,
         preflight: false,
     };
-    let res = tokio::task::spawn_blocking(move || apply_git_patch(&req)).await??;
+    let res = apply_git_patch_async(req).await?;
     if res.exit_code != 0 {
         anyhow::bail!(
             "Git apply failed (applied={}, skipped={}, conflicts={})\nstdout:\n{}\nstderr:\n{}",

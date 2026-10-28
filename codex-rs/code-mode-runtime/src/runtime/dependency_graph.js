@@ -20,7 +20,7 @@ Object.defineProperty(globalThis, "run_graph", {
       );
     const commandsSucceeded = (value) =>
       (Array.isArray(value) ? value : [value]).every(
-        (item) => !isCommand(item) || item.exit_code === 0,
+        (item) => !isCommand(item) || (item.error == null && item.exit_code === 0),
       );
     // Capture definitions before running callbacks. Reject the entire graph
     // before starting any effect, including errors in disconnected components.
