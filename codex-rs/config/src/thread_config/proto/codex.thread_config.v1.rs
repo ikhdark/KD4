@@ -79,6 +79,8 @@ pub struct ModelProvider {
     pub supports_standalone_web_search: bool,
     #[prost(message, optional, tag = "19")]
     pub aws: ::core::option::Option<ModelProviderAwsAuthInfo>,
+    #[prost(bool, optional, tag = "20")]
+    pub request_output_logprobs: ::core::option::Option<bool>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ModelProviderAwsAuthInfo {

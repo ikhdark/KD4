@@ -29,6 +29,7 @@ result
 !.vscode/settings.json
 !.vscode/tasks.json
 .idea/
+.vs/
 .history/
 .zed/
 *.swp
@@ -50,6 +51,7 @@ AGENTS.override.md
 .ruff_cache/
 *.tsbuildinfo
 /target/
+/target-*/
 /lanes/
 # Cargo output from repository-relative target paths run inside codex-rs.
 /codex-rs/codex-rs/target/
@@ -73,7 +75,11 @@ yarn-error.log*
 # ci
 .vercel/
 .netlify/
-/.tmp/sdk-ci/
+
+# temporary files
+/.tmp/
+*.tmp
+*.bak
 
 # patches
 apply_patch/
@@ -96,6 +102,11 @@ coverage/
 /.scratch/
 personal/
 /kd-ui/
+# Local configuration and generated evidence (tracked files stay tracked).
+/.kda/
+/.codex/config.toml
+/.codex/auth.json
+/.codex/harness/targets/
 .codex/locks/
 /.codex/diagnostics/
 /.codex/audits/
@@ -106,6 +117,9 @@ personal/
 # os
 .DS_Store
 Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
 Icon?
 .Spotlight-V100/
 

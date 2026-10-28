@@ -244,6 +244,7 @@ fn model_provider_from_proto(
         websocket_connect_timeout_ms: provider.websocket_connect_timeout_ms,
         requires_openai_auth: provider.requires_openai_auth,
         supports_websockets: provider.supports_websockets,
+        request_output_logprobs: provider.request_output_logprobs,
         kind: Default::default(),
         supports_standalone_web_search: provider.supports_standalone_web_search,
         // This remote source does not advertise the optional hosted capability.

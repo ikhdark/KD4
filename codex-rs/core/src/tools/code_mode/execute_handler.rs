@@ -377,6 +377,15 @@ impl CodeModeExecuteHandler {
                     // tool with the same leaf name. Explicit call options still
                     // override this host-owned zero in the runtime callback.
                     tool_timeouts.insert(tool.tool_name.clone(), 0);
+                } else if tool.tool_name == ToolName::plain("spawn_agents_on_csv")
+                    && router.classify_tool_name(&turn, &tool.tool_name)
+                        == TypedToolClass::RootTaskControl
+                {
+                    // The batch owner enforces worker runtime limits and joins
+                    // cancellation/cleanup. A generic 60-second deadline can
+                    // cancel a healthy batch after only some rows finish.
+                    // Retain native limits and explicit per-call overrides.
+                    tool_timeouts.insert(tool.tool_name.clone(), 0);
                 }
             }
         }

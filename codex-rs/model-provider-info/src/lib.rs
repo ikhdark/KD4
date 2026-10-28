@@ -162,6 +162,9 @@ pub struct ModelProviderInfo {
     /// Whether this provider supports the Responses API WebSocket transport.
     #[serde(default)]
     pub supports_websockets: bool,
+    /// Opt in to output-text token logprobs on a supporting Responses provider; absent is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_output_logprobs: Option<bool>,
     /// Whether this provider accepts the hosted Responses `web_search` tool.
     /// Custom providers must opt in; Responses transport alone does not imply support.
     #[serde(default)]
@@ -416,6 +419,7 @@ impl ModelProviderInfo {
             websocket_connect_timeout_ms: None,
             requires_openai_auth: true,
             supports_websockets: true,
+            request_output_logprobs: None,
             supports_standalone_web_search: false,
             supports_hosted_web_search: true,
         }
@@ -449,6 +453,7 @@ impl ModelProviderInfo {
             websocket_connect_timeout_ms: None,
             requires_openai_auth: false,
             supports_websockets: false,
+            request_output_logprobs: None,
             supports_standalone_web_search: false,
             supports_hosted_web_search: true,
         }
@@ -641,6 +646,7 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        request_output_logprobs: None,
         supports_standalone_web_search: false,
         supports_hosted_web_search: false,
     }

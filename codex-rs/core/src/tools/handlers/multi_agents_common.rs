@@ -25,7 +25,7 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 
 pub(crate) const DEFAULT_SPAWN_AGENT_MODEL: &str = "gpt-6.1-sol";
-pub(crate) const DEFAULT_SPAWN_AGENT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::XHigh;
+pub(crate) const DEFAULT_SPAWN_AGENT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
 
 pub(crate) fn function_arguments(payload: ToolPayload) -> Result<String, FunctionCallError> {
     match payload {

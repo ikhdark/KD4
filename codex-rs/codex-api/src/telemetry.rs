@@ -71,6 +71,16 @@ pub struct ProviderObservation {
     pub completed_at: Option<f64>,
     pub safety_buffering: bool,
     pub invalid_source_fields: bool,
+    /// Provider-identified tokens in one admitted output-text delta. Never chunks.
+    pub output_token_receipts: Option<u64>,
+    pub token_receipts_complete: bool,
+    pub reported_output_tokens: Option<u64>,
+    /// Optional provider extension; bounded, content-free receipts, not token estimates.
+    pub scoped_token_receipt: Option<serde_json::Value>,
+    pub reported_reasoning_tokens: Option<u64>,
+    pub text_token_receipts_complete: bool,
+    pub text_delta_bytes: u64,
+    pub text_final_bytes: u64,
 }
 
 pub trait SseTelemetry: Send + Sync {

@@ -1335,7 +1335,8 @@ Expected result schema (JSON Schema or {{}}):\n\
 You MUST record the result with `report_agent_job_result`; only `accepted: true` confirms the result is recorded. `acknowledgment: accepted_new` records a new report; `accepted_replay` confirms the same retained report, not new work. Call it with:\n\
 1. `job_id` = \"{job_id}\"\n\
 2. `item_id` = \"{item_id}\"\n\
-3. `result` = a JSON object that contains your analysis result for this row.\n\n\
+3. `result` = a JSON object that contains your analysis result for this row.\n\
+4. `deliver` = true when this top-level report completes your entire assignment, so an accepted report is terminal without another model generation. Do not opt in while required work remains.\n\n\
 If schema validation rejects your result, correct the payload and call it again. A returned `accepted: false` did not record the result; follow its rejection reason. Do not claim success or automatically replay after cancellation or loss of assignment.\n\n\
 If you need to stop the job early, include `stop` = true in the tool call.\n\n\
 After `accepted: true`, stop. If submission remains blocked, explain the blocker without claiming the result was recorded.",

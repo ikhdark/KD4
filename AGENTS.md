@@ -16,6 +16,7 @@ Upstream is https://github.com/openai/codex
 
 ## Session analysis
 
+- For broad KD4 audits and autonomous multi-path investigations, use the harness's hybrid ordinary-subagent/CSV-worker workflow unless the user restricts delegation. Keep small or tightly coupled work local.
 - Use `C:\Users\kuh\Desktop\KDR\kdr.cmd` for Codex session audits/benchmarks; keep brief and consise audit documentation in `.codex/audits`. Session-analysis scripts belong in KDR, not this repo.
 - Compare matched tasks by correct outcomes, wall time, tokens, requests/tool calls, validation, retries, recovery, and compactions. Separate workflow choices from runtime effects; microbenchmarks do not establish end-to-end gains.
 - Rollouts live in the fork home's `sessions`

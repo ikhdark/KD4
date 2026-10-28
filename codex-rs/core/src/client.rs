@@ -1456,6 +1456,7 @@ struct ProviderObservations {
 #[derive(Debug, Default)]
 struct ModelAttemptOffsets {
     provider_observations: Option<ProviderObservations>,
+    token_receipts: Option<ModelTokenReceipts>,
     stream_delivery_json: Option<String>,
     transport_attempt: u64,
     request_send_started_ns: Option<u64>,
@@ -1487,14 +1488,49 @@ struct ModelAttemptClock {
 
 impl ModelAttemptClock {
     fn record_provider_observation(&self, observation: codex_api::ProviderObservation) {
-        // Fixed phase vocabulary bounds memory. Only control/item boundaries call
-        // this, never deltas. Reuse the clock lock, without IO, awaits or new locks.
+        if let Some(count) = observation.output_token_receipts {
+            let now_us = self.elapsed_us();
+            let mut offsets = self.offsets.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let receipts = offsets.token_receipts.get_or_insert_with(|| ModelTokenReceipts {
+                version: 1, basis: "provider_output_text_logprobs", ..Default::default()
+            });
+            receipts.invalid |= receipts.scopes.is_some();
+            receipts.record_batch(count, now_us);
+            return;
+        }
+        // Fixed control vocabulary bounds memory; receipt batches above share
+        // this existing clock lock without IO, awaits or nested locks.
         if !matches!(observation.phase, "created" | "queued" | "in_progress" | "completed"
-            | "failed" | "incomplete" | "reasoning_started" | "reasoning_finished" | "safety_buffering") {
+            | "failed" | "incomplete" | "reasoning_started" | "reasoning_finished" | "safety_buffering"
+            | "scoped_output_tokens") {
             return;
         }
         let now_us = self.elapsed_us();
         let mut offsets = self.offsets.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(packet) = observation.scoped_token_receipt.as_ref() {
+            let expected = offsets.provider_observations.as_ref().filter(|evidence| !evidence.invalid)
+                .and_then(|evidence| evidence.response_id.clone());
+            let receipts = offsets.token_receipts.get_or_insert_with(|| ModelTokenReceipts {
+                version: 1, basis: "provider_scoped_token_receipts_v1", ..Default::default()
+            });
+            receipts.record_scoped(packet, expected.as_deref(), &observation, now_us);
+        }
+        if observation.phase == "scoped_output_tokens" {
+            return;
+        }
+        if observation.phase == "completed" && let Some(receipts) = offsets.token_receipts.as_mut() {
+            if receipts.scopes.is_none() {
+                receipts.text_delta_bytes = observation.text_delta_bytes;
+                receipts.text_final_bytes = observation.text_final_bytes;
+                receipts.text_complete = observation.text_token_receipts_complete && !receipts.invalid
+                    && receipts.basis == "provider_output_text_logprobs"
+                    && observation.text_delta_bytes > 0
+                    && observation.text_delta_bytes == observation.text_final_bytes;
+                receipts.reported_output_tokens = observation.reported_output_tokens;
+                receipts.complete = observation.token_receipts_complete && !receipts.invalid
+                    && observation.reported_output_tokens == Some(receipts.token_count);
+            }
+        }
         let evidence = offsets.provider_observations.get_or_insert_with(|| ProviderObservations {
             version: 1, ..Default::default()
         });
@@ -1688,11 +1724,118 @@ const MODEL_STREAM_GAP_BOUNDS_US: [u64; 13] = [
     250_000, 500_000, 1_000_000, 2_000_000, 5_000_000, 10_000_000,
 ];
 
+/// Complete, provider-identified token receipts, aggregated without token content.
+/// Tokens in one provider batch share the same client receipt timestamp.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+struct ModelTokenReceipts {
+    version: u32,
+    basis: &'static str,
+    token_count: u64,
+    first_token_us: Option<u64>,
+    last_token_us: Option<u64>,
+    max_inter_token_gap_us: Option<u64>,
+    inter_token_stall_count: u64,
+    inter_token_stall_us: u64,
+    reported_output_tokens: Option<u64>,
+    complete: bool,
+    text_complete: bool,
+    text_delta_bytes: u64,
+    text_final_bytes: u64,
+    invalid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scopes: Option<ModelTokenScopes>,
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize)]
+struct ModelTokenScopes {
+    response_id: String,
+    evidence_ref: String,
+    next_sequence: u64,
+    counts: [u64; 3],
+    reported_counts: Option<[u64; 3]>,
+    reported_reasoning_tokens: Option<u64>,
+}
+
+impl ModelTokenReceipts {
+    fn record_batch(&mut self, count: u64, now_us: u64) {
+        if let Some(previous) = self.last_token_us {
+            self.invalid |= now_us < previous;
+            let gap = now_us.saturating_sub(previous);
+            self.max_inter_token_gap_us = Some(self.max_inter_token_gap_us.unwrap_or(0).max(gap));
+            if gap >= 1_000_000 {
+                self.inter_token_stall_count = self.inter_token_stall_count.saturating_add(1);
+                self.inter_token_stall_us = self.inter_token_stall_us.saturating_add(gap);
+            }
+        }
+        self.token_count = self.token_count.saturating_add(count);
+        self.first_token_us.get_or_insert(now_us);
+        self.last_token_us = Some(now_us);
+        if self.token_count > 1 {
+            self.max_inter_token_gap_us.get_or_insert(0);
+        }
+        self.invalid |= count == 0 || self.token_count > 262_144
+            || now_us == u64::MAX || self.inter_token_stall_us == u64::MAX;
+    }
+
+    fn record_scoped(&mut self, packet: &serde_json::Value, expected: Option<&str>,
+                     observation: &codex_api::ProviderObservation, now_us: u64) {
+        self.invalid |= self.basis != "provider_scoped_token_receipts_v1" || self.complete;
+        let identity = packet.get("response_id").and_then(serde_json::Value::as_str);
+        let reference = packet.get("evidence_ref").and_then(serde_json::Value::as_str);
+        let scope = packet.get("scope").and_then(serde_json::Value::as_str);
+        let count = packet.get("token_count").and_then(serde_json::Value::as_u64);
+        let sequence = packet.get("sequence").and_then(serde_json::Value::as_u64);
+        let scopes = self.scopes.get_or_insert_with(ModelTokenScopes::default);
+        self.invalid |= packet.get("version").and_then(serde_json::Value::as_u64) != Some(1)
+            || expected.is_none() || identity != expected || observation.response_id.as_deref() != expected
+            || !reference.is_some_and(|value| !value.trim().is_empty() && value.len() <= 256)
+            || sequence != Some(scopes.next_sequence) || scopes.next_sequence > 262_144;
+        if self.invalid {
+            return;
+        }
+        let identity = identity.unwrap_or_default();
+        let reference = reference.unwrap_or_default();
+        if scopes.next_sequence == 0 {
+            scopes.response_id = identity.to_owned();
+            scopes.evidence_ref = reference.to_owned();
+        }
+        self.invalid |= scopes.response_id != identity || scopes.evidence_ref != reference;
+        scopes.next_sequence = scopes.next_sequence.saturating_add(1);
+        if scope == Some("complete") {
+            let reported = packet.get("scope_counts").cloned()
+                .and_then(|value| serde_json::from_value::<[u64; 3]>(value).ok());
+            scopes.reported_counts = reported;
+            scopes.reported_reasoning_tokens = observation.reported_reasoning_tokens;
+            self.reported_output_tokens = observation.reported_output_tokens;
+            self.complete = !self.invalid && observation.phase == "completed" && count == Some(0)
+                && reported == Some(scopes.counts)
+                && scopes.reported_reasoning_tokens == Some(scopes.counts[1])
+                && self.reported_output_tokens == Some(self.token_count)
+                && scopes.counts.iter().copied().sum::<u64>() == self.token_count;
+            self.invalid |= !self.complete;
+            return;
+        }
+        let index = match scope {
+            Some("text") => 0, Some("reasoning") => 1, Some("tool") => 2,
+            _ => { self.invalid = true; return; }
+        };
+        if observation.phase != "scoped_output_tokens" || !count.is_some_and(|value| (1..=262_144).contains(&value)) {
+            self.invalid = true;
+            return;
+        }
+        let count = count.unwrap_or_default();
+        scopes.counts[index] = scopes.counts[index].saturating_add(count);
+        self.record_batch(count, now_us);
+    }
+}
+
 /// Constant-space mapper observations: deltas are chunks, never provider tokens.
 /// No per-delta mutex, allocation, logging or extra task is introduced.
 #[derive(Default, serde::Serialize)]
 struct ModelStreamDelivery {
     version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_receipts: Option<ModelTokenReceipts>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider_observations: Option<ProviderObservations>,
     physical_attempt_id: String,
@@ -1815,6 +1958,11 @@ impl ModelStreamDeliveryObserver {
         self.summary.first_response_body_byte_ns = offsets.first_response_body_byte_ns;
         self.summary.provider_processing_us = offsets.provider_processing_us;
         self.summary.provider_observations = offsets.provider_observations.clone();
+        self.summary.token_receipts = offsets.token_receipts.clone().map(|mut receipts| {
+            receipts.complete &= complete;
+            receipts.text_complete &= complete;
+            receipts
+        });
         self.summary.physical_attempt_id = if offsets.transport_attempt == 0 {
             identity.physical_attempt_id.clone()
         } else {
@@ -2232,6 +2380,7 @@ fn finish_queue_span(offsets: &mut ModelAttemptOffsets, now_us: u64) {
 /// offsets (TTFT included) exclude client-side recovery. Phase totals are unchanged.
 fn redispatch_offsets(offsets: &mut ModelAttemptOffsets, now_us: u64) {
     offsets.provider_observations = None;
+    offsets.token_receipts = None;
     offsets.request_send_started_ns = None;
     offsets.response_headers_received_ns = None;
     offsets.first_response_body_byte_ns = None;
@@ -4074,11 +4223,14 @@ impl ModelClient {
                 reasoning_summary_delivery: codex_api::ReasoningSummaryDelivery::SequentialCutoff,
             });
         let reasoning = Self::build_reasoning(model_info, effort, summary);
-        let include = if reasoning.is_some() {
+        let mut include = if reasoning.is_some() {
             vec!["reasoning.encrypted_content".to_string()]
         } else {
             Vec::new()
         };
+        if self.state.provider.info().request_output_logprobs == Some(true) && !model_info.use_responses_lite {
+            include.push("message.output_text.logprobs".to_string());
+        }
         let prompt_cache_key = Some(self.prompt_cache_key(responses_metadata));
         let service_tier = model_info.service_tier_for_request(service_tier);
         let request = ResponsesApiRequest {

@@ -143,6 +143,10 @@ pub(crate) struct ResponsesEventInterpreter {
     events: Vec<ResponseEvent>,
     lifecycle: response_lifecycle::ResponseLifecycle,
     compaction_progress: bool,
+    token_receipts_complete: bool,
+    text_token_receipts_complete: bool,
+    text_delta_bytes: u64,
+    text_final_bytes: u64,
 }
 
 impl ResponsesEventInterpreter {
@@ -167,6 +171,10 @@ impl ResponsesEventInterpreter {
             events: Vec::new(),
             lifecycle: response_lifecycle::ResponseLifecycle::default(),
             compaction_progress: false,
+            token_receipts_complete: true,
+            text_token_receipts_complete: true,
+            text_delta_bytes: 0,
+            text_final_bytes: 0,
         }
     }
 
@@ -320,8 +328,57 @@ impl ResponsesEventInterpreter {
         } else {
             None
         };
-        let provider_observation = event.provider_observation(self.events.iter()
-            .any(|event| matches!(event, ResponseEvent::SafetyBuffering(_))));
+        let token_receipts = event.output_token_receipts();
+        let mut token_receipts_complete = self.token_receipts_complete;
+        let mut text_complete = self.text_token_receipts_complete;
+        let mut text_delta_bytes = self.text_delta_bytes;
+        if event.kind == "response.output_text.delta" && let Some(delta) = event.delta.as_ref() {
+            if !delta.is_empty() {
+                text_complete &= token_receipts.is_some();
+                text_delta_bytes = text_delta_bytes.saturating_add(delta.len() as u64);
+            }
+        }
+        let mut text_final_bytes = self.text_final_bytes;
+        if event.kind == "response.output_item.done"
+            && let Some(item) = event.item.as_ref().filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+            && let Some(content) = item.get("content").and_then(Value::as_array)
+        {
+            for part in content {
+                if part.get("type").and_then(Value::as_str) == Some("output_text")
+                    && let Some(text) = part.get("text").and_then(Value::as_str)
+                {
+                    text_final_bytes = text_final_bytes.saturating_add(text.len() as u64);
+                }
+            }
+        }
+        text_complete &= text_delta_bytes != u64::MAX && text_final_bytes != u64::MAX;
+        if event.kind.ends_with(".delta") && event.delta.as_ref().is_some_and(|s| !s.is_empty()) {
+            token_receipts_complete &= token_receipts.is_some();
+        }
+        if event.kind == "response.output_item.added" {
+            token_receipts_complete &= event.item.as_ref().and_then(|v| v.get("type"))
+                .and_then(Value::as_str) == Some("message");
+        }
+        let mut provider_observation = event.provider_observation(self.events.iter()
+            .any(|event| matches!(event, ResponseEvent::SafetyBuffering(_))), token_receipts);
+        if let Some(observation) = provider_observation.as_mut() {
+            observation.reported_output_tokens = completion_usage.as_ref().and_then(|usage| {
+                let coverage = usage.coverage.as_ref()?;
+                (coverage.output_tokens == 1 && coverage.reasoning_output_tokens == 1
+                    && coverage.invalid_receipts == 0 && !coverage.saturated
+                    && (usage.reasoning_output_tokens == 0 || observation.scoped_token_receipt.is_some()))
+                    .then(|| u64::try_from(usage.output_tokens).ok()).flatten()
+            });
+            observation.reported_reasoning_tokens = completion_usage.as_ref().and_then(|usage| {
+                let coverage = usage.coverage.as_ref()?;
+                (coverage.reasoning_output_tokens == 1 && coverage.invalid_receipts == 0
+                    && !coverage.saturated).then(|| u64::try_from(usage.reasoning_output_tokens).ok()).flatten()
+            });
+            observation.token_receipts_complete = token_receipts_complete;
+            observation.text_token_receipts_complete = text_complete && text_delta_bytes == text_final_bytes;
+            observation.text_delta_bytes = text_delta_bytes;
+            observation.text_final_bytes = text_final_bytes;
+        }
         let compaction_progress = self.lifecycle.owns_compaction_progress(&event);
         let interpreted = self
             .lifecycle
@@ -337,6 +394,13 @@ impl ResponsesEventInterpreter {
                 (error, _) => error,
             });
         if interpreted.is_ok() || (terminal_failure && ownership_admitted) {
+            self.token_receipts_complete = token_receipts_complete;
+            self.text_token_receipts_complete = text_complete;
+            self.text_delta_bytes = text_delta_bytes;
+            // A legal replayed item/done returns None; never count its bytes twice.
+            if matches!(interpreted.as_ref(), Ok(Some(ResponseEvent::OutputItemDone(_)))) {
+                self.text_final_bytes = text_final_bytes;
+            }
             if let Some(observation) = provider_observation {
                 observe(observation);
             }
@@ -399,6 +463,10 @@ pub(crate) struct ResponsesStreamEvent<'a> {
     content_index: Option<i64>,
     output_index: Option<u64>,
     safety_buffering: Option<Value>,
+    #[serde(borrow)]
+    logprobs: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow)]
+    token_receipt: Option<&'a serde_json::value::RawValue>,
 }
 
 // Terminal snapshots, when supplied, must agree with admitted ordered items.
@@ -660,9 +728,39 @@ pub(crate) struct RateLimitStreamEvent {
 }
 
 impl ResponsesStreamEvent<'_> {
-    fn provider_observation(&self, safety_buffering: bool) -> Option<crate::telemetry::ProviderObservation> {
-        // Control/item boundaries only: no per-delta timing, allocation or callback.
+    fn output_token_receipts(&self) -> Option<u64> {
+        if self.kind != "response.output_text.delta" {
+            return None;
+        }
+        #[derive(Deserialize)]
+        struct Token<'a> {
+            #[serde(borrow)]
+            token: Cow<'a, str>,
+            logprob: f64,
+        }
+        let raw = self.logprobs?;
+        // Metadata is optional: malformed/unsupported receipts never reject text.
+        // The carrier already bounds frame bytes; nothing is persisted per token.
+        let tokens: Vec<Token<'_>> = serde_json::from_str(raw.get()).ok()?;
+        if tokens.is_empty() || tokens.len() > 262_144 {
+            return None;
+        }
+        let mut remaining = self.delta.as_deref()?;
+        for token in &tokens {
+            if token.token.is_empty() || !token.logprob.is_finite() {
+                return None;
+            }
+            remaining = remaining.strip_prefix(token.token.as_ref())?;
+        }
+        remaining.is_empty().then_some(tokens.len() as u64)
+    }
+
+    fn provider_observation(&self, safety_buffering: bool, token_receipts: Option<u64>) -> Option<crate::telemetry::ProviderObservation> {
+        // Default streams keep control-only callbacks. Token metadata opts into
+        // one content-free receipt callback per admitted batch, before queues.
         let phase = match self.kind.as_ref() {
+            "response.in_progress" if self.token_receipt.is_some() => "scoped_output_tokens",
+            "response.output_text.delta" if token_receipts.is_some() => "output_tokens",
             "response.created" => "created",
             "response.queued" => "queued",
             "response.in_progress" => "in_progress",
@@ -690,6 +788,21 @@ impl ResponsesStreamEvent<'_> {
         Some(crate::telemetry::ProviderObservation {
             phase, response_id: response_id.map(str::to_owned), created_at, completed_at,
             safety_buffering,
+            output_token_receipts: token_receipts,
+            token_receipts_complete: false,
+            reported_output_tokens: None,
+            scoped_token_receipt: self.token_receipt.filter(|_| matches!(self.kind.as_ref(),
+                "response.in_progress" | "response.completed")).map(|raw| {
+                    if raw.get().len() <= 4096 {
+                        serde_json::from_str(raw.get()).unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    }
+                }),
+            reported_reasoning_tokens: None,
+            text_token_receipts_complete: false,
+            text_delta_bytes: 0,
+            text_final_bytes: 0,
             invalid_source_fields: raw_id.is_some() && response_id.is_none()
                 || response.and_then(|v| v.id.as_ref()).is_some_and(|v| !v.is_null() && !v.is_string())
                 || created.is_some_and(|v| !v.is_null()) && created_at.is_none()
