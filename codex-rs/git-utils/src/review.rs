@@ -345,7 +345,8 @@ impl ReviewSourceScope {
     }
 }
 
-type ChangedReviewRanges = Result<(bool, Vec<(u32, u32)>), String>;
+type ReviewLineRange = (u32, u32);
+type ChangedReviewRanges = Result<(bool, Vec<ReviewLineRange>), String>;
 
 #[derive(Default)]
 struct ReviewDiffIndex {
@@ -412,7 +413,7 @@ impl ReviewDiffIndex {
         }
     }
 
-    fn changed_ranges(&self, name: &str) -> Result<(bool, &[(u32, u32)]), String> {
+    fn changed_ranges(&self, name: &str) -> Result<(bool, &[ReviewLineRange]), String> {
         match self.files.get(name) {
             Some(Err(error)) => Err(error.clone()),
             Some(Ok((deleted, ranges))) if !ranges.is_empty() || self.header_error.is_none() => {

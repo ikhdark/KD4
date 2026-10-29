@@ -463,7 +463,6 @@ where
                             omitted_instructions = true;
                             continue;
                         };
-                        remaining_prompt_bytes -= fragment.rendered_len();
                         if truncated {
                             self.emit_turn_warning(
                                 thread_store,
@@ -513,7 +512,6 @@ where
                             source_scope: entry.source_scope,
                         };
                         if failure.rendered_len() <= budget {
-                            remaining_prompt_bytes -= failure.rendered_len();
                             fragments.push(Box::new(failure));
                         } else {
                             omitted_instructions = true;

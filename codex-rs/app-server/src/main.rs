@@ -61,13 +61,14 @@ fn main() -> anyhow::Result<()> {
         let loader_overrides = LoaderOverrides::default();
         let transport = listen;
         let auth = auth.try_into_settings()?;
-        let mut runtime_options = AppServerRuntimeOptions::default();
-        runtime_options.remote_control_startup_mode =
-            match (remote_control, remote_control_disabled) {
+        let runtime_options = AppServerRuntimeOptions {
+            remote_control_startup_mode: match (remote_control, remote_control_disabled) {
                 (true, _) => codex_app_server::RemoteControlStartupMode::EnabledEphemeral,
                 (false, true) => codex_app_server::RemoteControlStartupMode::DisabledEphemeral,
                 (false, false) => codex_app_server::RemoteControlStartupMode::ResolvePersisted,
-            };
+            },
+            ..Default::default()
+        };
 
         run_main(
             arg0_paths,

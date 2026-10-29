@@ -192,7 +192,9 @@ fn enqueue_remote_installed_plugin_bundle_sync(mut request: RemoteInstalledPlugi
         is_workspace_account: request.auth.is_workspace_account(),
     };
     {
-        let mut mutations = lock_cache_mutations();
+        let mut mutations_guard = lock_cache_mutations();
+        // Borrow the guarded fields disjointly so the entry stays live.
+        let mutations = &mut *mutations_guard;
         let state = mutations.syncs.entry(key.clone()).or_default();
         if state.authority.as_ref() != Some(&authority) {
             state.authority = Some(authority);
@@ -203,7 +205,6 @@ fn enqueue_remote_installed_plugin_bundle_sync(mut request: RemoteInstalledPlugi
                 .or_default();
             *generation = generation.wrapping_add(1);
         }
-        let state = mutations.syncs.get_mut(&key).expect("sync state was inserted");
         request.epoch = state.epoch;
         if request.on_local_cache_changed.is_none()
             && let Some(previous) = state.requested.as_ref()
@@ -214,7 +215,7 @@ fn enqueue_remote_installed_plugin_bundle_sync(mut request: RemoteInstalledPlugi
         // One physical owner per home; a changed account/config supersedes
         // its publication authority immediately, not just its callback.
         state.requested = Some(request);
-        let Some(ready) = take_ready_sync_request(&mut mutations, &key) else {
+        let Some(ready) = take_ready_sync_request(mutations, &key) else {
             return;
         };
         request = ready;

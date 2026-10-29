@@ -16,8 +16,6 @@ pub enum CommandMutation {
         declared_paths: BTreeSet<PathBuf>,
         unattributed_paths: BTreeSet<PathBuf>,
     },
-    /// A workspace snapshot changed, without proof that this command caused it.
-    UnattributedWorkspaceChange,
     Uncertain,
 }
 
@@ -29,10 +27,7 @@ impl CommandMutation {
     pub fn paths(&self) -> Option<&BTreeSet<PathBuf>> {
         match self {
             Self::KnownMutation { paths } => paths.as_ref(),
-            Self::ReadOnly
-            | Self::Uncertain
-            | Self::UnattributedWorkspaceChange
-            | Self::ObservedChanges { .. } => None,
+            Self::ReadOnly | Self::Uncertain | Self::ObservedChanges { .. } => None,
         }
     }
 }
@@ -259,14 +254,6 @@ pub fn command_mutation(command: &[String], cwd: Option<&Path>) -> CommandMutati
         CommandMutation::KnownMutation { paths }
     } else {
         CommandMutation::Uncertain
-    }
-}
-
-pub fn resolve_uncertain_command_observation(workspace_changed: Option<bool>) -> CommandMutation {
-    match workspace_changed {
-        Some(false) => CommandMutation::ReadOnly,
-        Some(true) => CommandMutation::UnattributedWorkspaceChange,
-        None => CommandMutation::Uncertain,
     }
 }
 

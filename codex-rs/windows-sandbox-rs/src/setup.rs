@@ -710,8 +710,10 @@ fn quote_arg(arg: &str) -> String {
 fn find_setup_exe() -> Result<PathBuf> {
     if let Ok(exe) = std::env::current_exe()
         && let Some(setup_exe) = find_setup_exe_for_current_exe(&exe)
+        && setup_exe.is_absolute()
+        && setup_exe.is_file()
     {
-        if setup_exe.is_absolute() && setup_exe.is_file() { return Ok(setup_exe); }
+        return Ok(setup_exe);
     }
     Err(failure(SetupErrorCode::OrchestratorHelperLaunchFailed,
         "packaged Windows sandbox setup helper was not found; refusing ambient executable lookup"))
@@ -752,7 +754,7 @@ fn verify_setup_completed(codex_home: &Path) -> Result<()> {
 }
 
 pub(crate) fn check_setup_cancellation(cancellation: Option<&crate::WindowsSandboxCancellationToken>) -> Result<()> {
-    anyhow::ensure!(!cancellation.is_some_and(|token| token.is_cancelled()), "sandbox setup cancelled");
+    anyhow::ensure!(!cancellation.is_some_and(crate::WindowsSandboxCancellationToken::is_cancelled), "sandbox setup cancelled");
     Ok(())
 }
 

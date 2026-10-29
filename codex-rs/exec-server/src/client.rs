@@ -783,6 +783,10 @@ impl ExecServerClient {
         self.call(EXEC_METHOD, &params).await
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Single-flight initialization: waiters reuse one environment info fetch"
+    )]
     pub async fn environment_info(&self) -> Result<EnvironmentInfo, ExecServerError> {
         if let Some(info) = self.inner.environment_info.get() {
             return Ok(info.clone());
@@ -1594,10 +1598,7 @@ impl SessionState {
 
     fn publish_ready(&self, ordered_events: &mut OrderedSessionEvents) -> bool {
         let mut published_closed = false;
-        loop {
-            let Some(next_seq) = ordered_events.last_published_seq.checked_add(1) else {
-                break;
-            };
+        while let Some(next_seq) = ordered_events.last_published_seq.checked_add(1) {
             let Some(event) = ordered_events.pending.remove(&next_seq) else {
                 if next_seq <= ordered_events.output_gap_through {
                     // Never jump over a retained exit/output/close. Only the

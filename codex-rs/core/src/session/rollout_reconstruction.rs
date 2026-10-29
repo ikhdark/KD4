@@ -670,7 +670,6 @@ impl Session {
         Self::reconstruct_rollout(
             rollout_items,
             turn_context.model_info.truncation_policy.into(),
-            Some(self.thread_id),
         )
     }
 
@@ -682,7 +681,6 @@ impl Session {
         Self::reconstruct_rollout(
             rollout_items,
             codex_utils_output_truncation::TruncationPolicy::Bytes(usize::MAX),
-            None,
         )
         .history
     }
@@ -690,7 +688,6 @@ impl Session {
     fn reconstruct_rollout(
         rollout_items: &[RolloutItem],
         truncation_policy: codex_utils_output_truncation::TruncationPolicy,
-        thread_id: Option<codex_protocol::ThreadId>,
     ) -> RolloutReconstruction {
         // A loader diagnostic describes gaps in the entire source, including missing
         // rollback markers. It must not acquire the lifecycle of whichever turn was
@@ -955,9 +952,6 @@ impl Session {
                     if matches!(&event.item, codex_protocol::items::TurnItem::UserMessage(message)
                         if crate::event_mapping::is_user_input_item_id(&message.id)) =>
                 {
-                    let codex_protocol::items::TurnItem::UserMessage(message) = &event.item else {
-                        unreachable!()
-                    };
                     let segment = active_segment.get_or_insert_with(ActiveReplaySegment::default);
                     segment.counts_as_user_turn = true;
                 }

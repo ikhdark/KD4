@@ -229,19 +229,6 @@ impl Drop for CellDispatchLeaseState {
 }
 
 impl CodeModeExecuteHandler {
-    pub(crate) fn new(
-        spec: ToolSpec,
-        direct_nested_tool_specs: Vec<ToolSpec>,
-        deferred_nested_tool_specs: Vec<ToolSpec>,
-    ) -> Result<Self, String> {
-        Self::new_with_input_schemas(
-            spec,
-            direct_nested_tool_specs,
-            deferred_nested_tool_specs,
-            &HashMap::new(),
-        )
-    }
-
     pub(crate) fn new_with_input_schemas(
         spec: ToolSpec,
         direct_nested_tool_specs: Vec<ToolSpec>,
@@ -431,7 +418,6 @@ impl CodeModeExecuteHandler {
             .services
             .code_mode_service
             .bind_cell_environments(&cell_id, &step_context);
-        let runtime_cell_id = cell_id.to_string();
         exec.session
             .services
             .code_mode_service

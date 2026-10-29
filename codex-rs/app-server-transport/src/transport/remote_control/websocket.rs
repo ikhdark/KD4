@@ -265,12 +265,6 @@ impl BoundedOutboundBuffer {
         }
         removed != 0
     }
-
-    fn server_envelopes(&self) -> impl Iterator<Item = &BufferedServerEnvelope> {
-        self.buffer_by_stream
-            .values()
-            .flat_map(|buffer| buffer.iter())
-    }
 }
 
 struct ClientDeliveryMetadata {
@@ -556,7 +550,7 @@ fn state_repaired_error(message: String) -> io::Error {
 }
 
 fn take_repaired_retry(err: &io::Error, available: &mut bool) -> bool {
-    if *available && err.get_ref().is_some_and(|err| err.is::<RemoteControlStateRepaired>()) {
+    if *available && matches!(err.get_ref(), Some(err) if err.is::<RemoteControlStateRepaired>()) {
         *available = false;
         return true;
     }
@@ -1299,10 +1293,6 @@ impl RemoteControlWebsocket {
         connection_end_reason
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "Serialize client cancellation against tracker access while closing all virtual clients"
-    )]
     async fn retire_transport(&mut self) {
         // Workers have stopped. Cancel virtual clients before draining their queued output.
         self.client_tracker.lock().await.retire_clients();
@@ -1536,6 +1526,10 @@ impl RemoteControlWebsocket {
         let pong_deadline = tokio::time::sleep(pong_timeout);
         tokio::pin!(pong_deadline);
         loop {
+            #[expect(
+                clippy::expect_used,
+                reason = "The frontier branch is enabled only while pending is nonempty, and only its handler pops it"
+            )]
             let incoming_message = tokio::select! {
                 _ = shutdown_token.cancelled() => return Ok(()),
                 _ = &mut ingress_worker => {

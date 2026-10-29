@@ -11,18 +11,12 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::time::Instant;
 
-use crate::FunctionCallError;
-use crate::tools::context::ToolCallSource;
-use crate::tools::context::ToolInvocation;
-use crate::tools::context::ToolOutput;
 use crate::turn_timing::TurnTimingState;
 use codex_protocol::protocol::SamplingGenerationId;
 use codex_protocol::protocol::ToolExecutionId;
 use codex_protocol::protocol::ToolLifecycleBoundary;
 use codex_protocol::protocol::ToolLifecycleTimerWait;
 use codex_protocol::protocol::TurnTimingToolLifecycleEvent;
-use codex_tools::ToolOutputOutcome;
-use codex_tools::ToolOutputSkipDisposition;
 
 static NEXT_TOOL_EXECUTION_ID: AtomicU64 = AtomicU64::new(1);
 

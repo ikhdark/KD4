@@ -65,7 +65,7 @@ impl GlobalRemotePluginCatalogObservation {
             && self.key == RemotePluginCatalogCacheKey::global(config, auth)
     }
 
-    pub(crate) fn take_plugins(&mut self) -> Option<Vec<RemotePluginDirectoryItem>> {
+    pub(super) fn take_plugins(&mut self) -> Option<Vec<RemotePluginDirectoryItem>> {
         self.plugins.take()
     }
 }

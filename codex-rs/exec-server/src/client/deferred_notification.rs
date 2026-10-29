@@ -74,7 +74,6 @@ impl<'de> Deserializer<'de> for NotificationField<'_> {
                 Err(error) => return Err(serde::de::Error::custom(error)),
             }
         }
-        drop(decoder);
         deferred.set(Some(encoded));
         // ByteChunk's existing deserializer now observes valid empty base64;
         // rehydration, if a route appeared, uses that same deserializer again.

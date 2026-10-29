@@ -162,8 +162,6 @@ use permission_profile_catalog::permission_profile_catalog_from_permissions;
 use permission_profile_catalog::permission_profile_is_allowed;
 use permission_profile_catalog::validate_permission_profile_for_deny_read;
 pub(crate) use permissions::is_builtin_permission_profile_name;
-pub(crate) use permissions::reject_unknown_builtin_permission_profile;
-pub(crate) use permissions::resolve_permission_profile;
 pub use resolved_permission_profile::PermissionProfileSnapshot;
 pub(crate) use resolved_permission_profile::PermissionProfileState;
 
@@ -1992,20 +1990,6 @@ pub struct AgentRoleConfig {
 }
 
 impl AgentRoleConfig {
-    pub(crate) fn config_file_contents(&self) -> Result<&str, String> {
-        let path = self.config_file.as_ref().ok_or("role has no config file")?;
-        let (snapshot_path, contents) = self.config_snapshot.get_or_init(|| {
-            (
-                path.clone(),
-                std::fs::read_to_string(path).map_err(|error| error.to_string()),
-            )
-        });
-        if path != snapshot_path {
-            return Err("role file path changed without a new configuration generation".into());
-        }
-        contents.as_deref().map_err(Clone::clone)
-    }
-
     pub(crate) fn capture_config_file_contents(&self, contents: String) {
         if let Some(path) = self.config_file.as_ref() {
             let _ = self.config_snapshot.set((path.clone(), Ok(contents)));

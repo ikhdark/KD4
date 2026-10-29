@@ -2838,7 +2838,7 @@ impl RolloutWriterState {
         }
         let items = session_meta_item
             .iter()
-            .chain(compacted.iter().map(|captured| captured.as_ref()))
+            .chain(compacted.iter().map(AsRef::as_ref))
             .collect::<Vec<_>>();
         if items.is_empty() {
             drop(items);

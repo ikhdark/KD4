@@ -50,7 +50,7 @@ struct CachedWorkspaceSettings {
 
 impl WorkspaceSettingsCache {
     fn active_refresh(&self, key: &WorkspaceSettingsCacheKey) -> Option<Arc<WorkspaceRefresh>> {
-        let mut refreshes = self.refreshes.lock().unwrap_or_else(|error| error.into_inner());
+        let mut refreshes = self.refreshes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         refreshes.retain(|_, refresh| refresh.strong_count() != 0);
         if let Some(refresh) = refreshes.get(key).and_then(Weak::upgrade) {
             return Some(refresh);

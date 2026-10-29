@@ -2249,11 +2249,11 @@ impl ExecCommandToolOutput {
                 && self.output_ranges.as_ref().is_some_and(|ranges| {
                     ranges.range == (0..retained) && ranges.gap.is_none()
                 })
+                && let Some((start, end)) = marked_lines.or_else(|| {
+                    codex_utils_output_truncation::first_omitted_line_range(raw_output, output)
+                })
             {
-                if let Some((start, end)) = marked_lines.or_else(||
-                    codex_utils_output_truncation::first_omitted_line_range(raw_output, output)) {
-                    return Some(serde_json::json!({"kind":"lines","start":start,"end":end}));
-                }
+                return Some(serde_json::json!({"kind":"lines","start":start,"end":end}));
             }
             // Poll byte offsets do not establish whole-log line numbers.
             // Offer a plain first page rather than inventing coordinates.

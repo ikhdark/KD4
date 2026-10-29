@@ -965,10 +965,9 @@ pub fn formatted_truncate_text_content_items_with_policy(
         return (items.to_vec(), None);
     };
 
+    // Allocated text and separators always fit usize; saturation is unreachable.
     let combined_bytes = text_segments.fold(first.len(), |bytes, text| {
-        bytes.checked_add(usize::from(bytes != 0))
-            .and_then(|bytes| bytes.checked_add(text.len()))
-            .expect("allocated text and separators fit usize")
+        bytes.saturating_add(usize::from(bytes != 0)).saturating_add(text.len())
     });
 
     let estimate_token_count = || {

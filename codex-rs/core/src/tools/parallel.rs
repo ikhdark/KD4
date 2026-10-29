@@ -7,7 +7,6 @@ use std::time::Instant;
 
 
 use futures::FutureExt;
-use futures::StreamExt;
 use tokio::sync::OwnedRwLockReadGuard;
 use tokio::sync::OwnedRwLockWriteGuard;
 use tokio::sync::RwLock;
@@ -432,13 +431,6 @@ impl WorkspaceEvidenceGenerationBatch {
         &self, _cache: &crate::git_workspace::GitWorkspaceCache, _turn: Option<&TurnContext>,
         _classification: &crate::tool_history::WorkspaceCallClassification, _tool_name: &str, _mutation_revision: u64,
     ) -> WorkspaceEvidenceBaseline { WorkspaceEvidenceBaseline::default() }
-    async fn capture_baseline(
-        &self, _cache: &crate::git_workspace::GitWorkspaceCache, _turn: Option<&TurnContext>,
-        _cwd: &std::path::Path, _dependencies: std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
-        _mutation_revision: u64,
-    ) -> WorkspaceEvidenceBaseline { WorkspaceEvidenceBaseline::default() }
-    pub(crate) async fn captured_identity(&self, _cwd: &std::path::Path, _mutation_revision: u64)
-        -> Option<Option<crate::git_workspace::WorkspaceEvidenceIdentity>> { None }
     pub(crate) async fn record_captured_identity(&self, _cwd: &std::path::Path, _mutation_revision: u64,
         _identity: Option<crate::git_workspace::WorkspaceEvidenceIdentity>) {}
     pub(crate) async fn prefetch_identity_after_mutation(&self, _session: &Session, _turn: &TurnContext,
@@ -459,38 +451,6 @@ impl WorkspaceEvidenceGenerationBatch {
             prefetched_workspace_identity: None,
         })
     }
-}
-
-fn response_input_call_id(response: &ResponseInputItem) -> Option<&str> {
-    match response {
-        ResponseInputItem::FunctionCallOutput { call_id, .. }
-        | ResponseInputItem::McpToolCallOutput { call_id, .. }
-        | ResponseInputItem::CustomToolCallOutput { call_id, .. }
-        | ResponseInputItem::ToolSearchOutput { call_id, .. } => Some(call_id),
-        ResponseInputItem::Message { .. } => None,
-    }
-}
-
-async fn canonical_workspace_evidence_key_cached(
-    cwd: &std::path::Path,
-    cache: &mut std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>,
-    workspace: &crate::git_workspace::GitWorkspaceCache,
-) -> std::path::PathBuf {
-    if let Some(key) = cache.get(cwd) {
-        return key.clone();
-    }
-    let key = match workspace.resolve_workspace_root(cwd).await {
-        Ok(Some(root)) => root,
-        _ => {
-            let cwd = cwd.to_path_buf();
-            let fallback = cwd.clone();
-            tokio::task::spawn_blocking(move || dunce::canonicalize(&cwd).unwrap_or(cwd))
-                .await
-                .unwrap_or(fallback)
-        }
-    };
-    cache.insert(cwd.to_path_buf(), key.clone());
-    key
 }
 
 fn workspace_tool_may_use_parallel_gate(supports_parallel: bool, workspace_capable: bool) -> bool {
@@ -1163,31 +1123,6 @@ async fn capture_workspace_evidence_baseline(
     _reuse_latest: bool,
 ) -> WorkspaceEvidenceBaseline {
     WorkspaceEvidenceBaseline::default()
-}
-
-async fn begin_source_path_observations(
-    cache: &crate::git_workspace::GitWorkspaceCache,
-    workspace_root: &std::path::Path,
-    source_dependencies: &std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
-) -> Vec<crate::git_workspace::SourcePathChangeObservation> {
-    if source_dependencies.is_empty() {
-        return Vec::new();
-    }
-    let paths = source_dependencies
-        .iter()
-        .map(|dependency| {
-            let uri =
-                codex_utils_path_uri::PathUri::parse(dependency.locator_uri.as_deref()?).ok()?;
-            Some((uri.to_abs_path().ok()?.to_path_buf(), dependency.recursive))
-        })
-        .collect::<Option<Vec<_>>>();
-    let Some(paths) = paths else {
-        return Vec::new();
-    };
-    cache
-        .begin_source_path_change_observations(workspace_root, &paths)
-        .await
-        .unwrap_or_default()
 }
 
 fn finish_workspace_evidence_capture(
@@ -1986,7 +1921,8 @@ impl ToolCallRuntime {
                     let owner_key = response.deterministic_continuation_owner_key();
                     let mut pending_receipts = Vec::new();
                     let carried_identities = response.deterministic_continuation_receipts()
-                        .iter().filter_map(|receipt| receipt.runtime_identity())
+                        .iter()
+                        .filter_map(codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt::runtime_identity)
                         .collect::<std::collections::HashSet<_>>();
                     if let Some(owner_key) = owner_key.as_deref() {
                         let mut continuations = self
@@ -3070,7 +3006,6 @@ impl ToolCallRuntime {
                                 },
                                 abort_invocation.clone(),
                                 Arc::clone(&cancellation_timing),
-                                Arc::clone(&dispatch_state),
                             );
                             if owns_unified_exec_processes || requires_commit_barrier || retains_cancelled_cell_output {
                                 // A retained exec process is part of the turn's terminal
@@ -3169,7 +3104,6 @@ async fn supervise_cancelled_dispatch_cleanup(
     policy: CancelledDispatchCleanupPolicy,
     invocation: ToolInvocation,
     timing: Arc<ToolDispatchTiming>,
-    dispatch_state: Arc<ToolDispatchState>,
 ) -> Option<serde_json::Value> {
     let CancelledDispatchCleanupPolicy {
         wait_for_runtime_cancellation,
@@ -3208,9 +3142,9 @@ async fn supervise_cancelled_dispatch_cleanup(
             Ok(Ok(Ok(result))) => {
                 let value = result.cancellation_result();
                 settlement = if result.success_for_logging() {
-                    CancelledHandlerSettlement::SettledSuccess { call_id: result.call_id.clone(), result: value.clone() }
+                    CancelledHandlerSettlement::SettledSuccess { call_id: result.call_id, result: value.clone() }
                 } else {
-                    CancelledHandlerSettlement::SettledFailure { call_id: result.call_id.clone(), result: Some(value.clone()), error: None }
+                    CancelledHandlerSettlement::SettledFailure { call_id: result.call_id, result: Some(value.clone()), error: None }
                 };
                 effects = recovery_for(Some(&value), None);
                 recovery.push(serde_json::json!({
@@ -3317,7 +3251,6 @@ async fn supervise_cancelled_dispatch_cleanup(
     // state so ProcessExit remains ordered before HandlerReturn.
     timing.mark_handler_exit_if_entered();
     // The handler has joined and any required process cleanup has been awaited.
-    // An aborted future cannot execute the registry's ordinary trace terminal.
     // Commit-barrier handlers finish their state commit before answering, so a
     // joined result or error states the committed effects. Processes and
     // external calls can still have unreported effects.
@@ -3366,8 +3299,7 @@ impl ToolCallRuntime {
                 let error = Self::tool_task_join_error(error);
                 // A joined panic cannot execute the registry's terminal branch;
                 // it must still obey the same completion/cancellation election.
-                if dispatch_state.try_complete() {
-                }
+                dispatch_state.try_complete();
                 Err(error)
             }
         }

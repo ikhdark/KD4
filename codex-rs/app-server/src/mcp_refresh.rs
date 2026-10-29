@@ -35,6 +35,10 @@ fn refresh_trace_id() -> u64 {
 
 const REFRESH_PLAN_CONCURRENCY: usize = 4;
 
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "The runtime-refresh owner spans capture and publication so an older plan cannot overwrite a newer batch"
+)]
 pub(crate) async fn queue_strict_refresh(
     thread_manager: &Arc<ThreadManager>,
     config_manager: &ConfigManager,
@@ -73,6 +77,10 @@ pub(crate) async fn queue_strict_refresh(
     Ok(())
 }
 
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "The runtime-refresh owner spans capture and publication so an older plan cannot overwrite a newer batch"
+)]
 pub(crate) async fn queue_best_effort_refresh(
     thread_manager: &Arc<ThreadManager>,
     config_manager: &ConfigManager,

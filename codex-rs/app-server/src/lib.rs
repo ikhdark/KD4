@@ -256,6 +256,11 @@ fn prepare_connection(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "The initial remote-control status snapshot holds publication ownership until it is sent"
+)]
 async fn process_connection_request(
     processor: &Arc<MessageProcessor>,
     outgoing: &Arc<OutgoingMessageSender>,
@@ -1074,6 +1079,10 @@ pub async fn run_main(
             let outgoing = Arc::clone(&initialize_notification_sender);
             let stop = init_watchdog_shutdown.clone();
             let publication = Arc::clone(&remote_status_publication);
+            #[expect(
+                clippy::await_holding_invalid_type,
+                reason = "Status changes hold publication ownership until sent so initial snapshots cannot interleave"
+            )]
             connection_cleanup_tasks.spawn(async move {
                 loop {
                     tokio::select! {

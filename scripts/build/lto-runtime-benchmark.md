@@ -6,9 +6,9 @@
 python -B scripts/build/benchmark_lto_runtime.py --matrix screening --experiment-dir codex-rs/target/runtime-screening
 ```
 
-This compares five same-source candidates: the current `local-release` profile
+This compares five same-source candidates: the current `release` profile
 (baseline), that baseline with native CPU targeting, FatLTO, FatLTO with
-one workspace codegen unit, and the baseline at optimization level 2. The
+one codegen unit for workspace/runtime dependencies, and the baseline at optimization level 2. The
 FatLTO/one-unit comparison is against FatLTO/16 units, not an isolated LTO test
 against the baseline. Native builds append to target-specific Rust flags,
 preserving the configured Windows stack and static CRT; conflicting global
@@ -49,29 +49,32 @@ python -B scripts/build/benchmark_lto_runtime.py
 
 This builds **the actual `codex` CLI and `codex-code-mode-host`**, sequentially
 through the existing `lto-runtime` build lane: `baseline` and `fat`.
-The baseline inherits the frozen source's `local-release` profile without any
+Variants use the `release` profile with separate target directories under
+`variants/<name>`; no extra Cargo profiles are created.
+The baseline uses the frozen source's `release` profile without any
 profile overrides. Currently that means `lto = "thin"`, one codegen unit for
-workspace crates, one for dependencies, and incremental compilation disabled. Windows
+workspace crates and runtime dependencies, with incremental compilation disabled.
+Build-only dependencies retain Cargo's defaults. Windows
 target flags also enable `target-cpu=native` for every variant. There is no separate LTO-disabled
 candidate. The baseline is rebuilt from matched source, not taken from the
 installed executable. Ambient `CARGO_PROFILE_*` and `CARGO_INCREMENTAL` overrides
 are cleared for all builds; baseline means repository configuration.
 
-The FatLTO candidate also inherits `local-release`, but overrides LTO,
-speed optimization to 3, workspace codegen units to 16, and incremental
+The FatLTO candidate also uses `release`, but overrides LTO,
+speed optimization to 3, workspace/runtime dependency codegen units to 16, and incremental
 compilation to off. With the default 16 codegen units, both LTO and partitioning
 differ from the current baseline; use `--codegen-units 1` to change only LTO.
 The native CPU screening candidate
 is redundant with the current Windows baseline; opt-level 2 changes only that
 setting relative to baseline. Null variant fields
 in the report mean inherited settings, not disabled optimization.
-Dependency overrides are inherited unchanged. No tracked
+Build-only dependencies retain Cargo's build defaults for every candidate. No tracked
 profile, installed executable, Desktop configuration, or shared cache setting is
 changed. The lane returns busy rather than waiting; do not interpret that as a
 completed benchmark. Compilation can take substantial time and disk space, but
 **build time never contributes to the result**.
 
-To compare FatLTO at one workspace codegen unit instead, leaving the
+To compare FatLTO at one codegen unit for workspace/runtime dependencies instead, leaving the
 baseline unchanged:
 
 ```powershell
@@ -79,8 +82,8 @@ python -B scripts/build/benchmark_lto_runtime.py --codegen-units 1
 ```
 
 Keep results from those two experiments separate: changing both LTO and codegen
-units is not an isolated test of LTO. Dependencies retain their inherited
-codegen-unit override.
+units is not an isolated test of LTO. Build-only dependencies retain Cargo's
+build defaults.
 
 ## What actually runs
 

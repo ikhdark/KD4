@@ -1760,12 +1760,17 @@ fn refresh_ready_command_states(exec: &ExecContext, packet: &mut CodeModePacketR
     }
 }
 
+/// Packaged exec output, the nested call ids it delivered, and the delivery
+/// decision consumed by `attach_delivery_decision`.
+pub(super) type RuntimeResponseOutput =
+    (FunctionToolOutput, Vec<String>, Result<Option<String>, JsonValue>);
+
 pub(super) fn handle_runtime_response(
     exec: &ExecContext,
     response: RuntimeResponse,
     max_output_tokens: Option<usize>,
     started_at: std::time::Instant,
-) -> Result<(FunctionToolOutput, Vec<String>, Result<Option<String>, JsonValue>), String> {
+) -> Result<RuntimeResponseOutput, String> {
     // Nested tool results have already crossed their owning tool boundary. Keep
     // one coherent, model-safe exec packet here instead of applying the much
     // smaller generic per-tool diagnostic budget a second time.

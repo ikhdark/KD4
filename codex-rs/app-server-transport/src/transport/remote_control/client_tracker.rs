@@ -383,16 +383,6 @@ impl ClientTracker {
         (client_id, stream_id, connection_id)
     }
 
-    pub(crate) async fn close_expired_clients(
-        &mut self,
-    ) -> Result<Vec<(ClientId, StreamId)>, Stopped> {
-        let expired_client_ids = self.expired_client_keys();
-        for client_key in &expired_client_ids {
-            self.close_client(client_key).await?;
-        }
-        Ok(expired_client_ids)
-    }
-
     pub(super) fn expired_client_keys(&self) -> Vec<(ClientId, StreamId)> {
         let now = Instant::now();
         self

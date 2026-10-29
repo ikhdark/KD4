@@ -597,8 +597,11 @@ async fn run_agent_job_loop(
                     let slots = options.max_concurrency.saturating_sub(active_items.len() + spawns.len())
                         .min(8usize.saturating_sub(spawns.len()));
                     if failed_spawns.is_empty() {
-                        for item in pending_items.into_iter().filter(|item| !reserved_rows.contains(&item.item_id))
-                            .take(slots).collect::<Vec<_>>() {
+                        // Select against the reservations before this loop adds to them.
+                        let admitted = pending_items.into_iter()
+                            .filter(|item| !reserved_rows.contains(&item.item_id))
+                            .take(slots).collect::<Vec<_>>();
+                        for item in admitted {
                             let prompt = build_worker_prompt(&job, &item)?;
                             reserved_rows.insert(item.item_id.clone());
                             spawns.push(make_spawn(item, prompt));

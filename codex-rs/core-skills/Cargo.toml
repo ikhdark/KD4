@@ -14,7 +14,6 @@ workspace = true
 
 [dependencies]
 codex-utils-string = { workspace = true }
-anyhow = { workspace = true }
 codex-analytics = { workspace = true }
 codex-config = { workspace = true }
 codex-context-fragments = { workspace = true }
@@ -28,7 +27,6 @@ codex-utils-absolute-path = { workspace = true }
 codex-utils-output-truncation = { workspace = true }
 codex-utils-path-uri = { workspace = true }
 dirs = { workspace = true }
-dunce = { workspace = true }
 futures = { workspace = true }
 pulldown-cmark = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

@@ -380,12 +380,11 @@ impl McpConnectionManager {
         let mut pending = Vec::new();
         let mut failed = Vec::new();
         for (name, client) in &self.clients {
-            if !client.startup_complete.load(Ordering::Acquire) {
-                pending.push(name.clone());
-            } else if client
-                .startup_reconnect
-                .as_ref()
-                .is_some_and(|reconnect| reconnect.pending_client().is_some())
+            if !client.startup_complete.load(Ordering::Acquire)
+                || client
+                    .startup_reconnect
+                    .as_ref()
+                    .is_some_and(|reconnect| reconnect.pending_client().is_some())
             {
                 pending.push(name.clone());
             } else {

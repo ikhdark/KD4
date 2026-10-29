@@ -21,7 +21,7 @@ pub(crate) enum InternalApplyPatchInvocation {
     /// appears that it should be allowed based on the user's sandbox policy
     /// *or* because the user explicitly approved it. The runtime realizes the
     /// patch through the selected environment filesystem.
-    DelegateToRuntime(ApplyPatchRuntimeInvocation),
+    DelegateToRuntime(Box<ApplyPatchRuntimeInvocation>),
 }
 
 #[derive(Debug)]
@@ -47,26 +47,28 @@ pub(crate) async fn apply_patch(
         SafetyCheck::AutoApprove {
             user_explicitly_approved,
             ..
-        } => InternalApplyPatchInvocation::DelegateToRuntime(ApplyPatchRuntimeInvocation {
-            action,
-            auto_approved: !user_explicitly_approved,
-            exec_approval_requirement: ExecApprovalRequirement::Skip {
-                bypass_sandbox: false,
-                proposed_execpolicy_amendment: None,
-            },
-        }),
+        } => {
+            InternalApplyPatchInvocation::DelegateToRuntime(Box::new(ApplyPatchRuntimeInvocation {
+                action,
+                auto_approved: !user_explicitly_approved,
+                exec_approval_requirement: ExecApprovalRequirement::Skip {
+                    bypass_sandbox: false,
+                    proposed_execpolicy_amendment: None,
+                },
+            }))
+        }
         SafetyCheck::AskUser => {
             // Delegate the approval prompt (including cached approvals) to the
             // tool runtime, consistent with how shell/unified_exec approvals
             // are orchestrator-driven.
-            InternalApplyPatchInvocation::DelegateToRuntime(ApplyPatchRuntimeInvocation {
+            InternalApplyPatchInvocation::DelegateToRuntime(Box::new(ApplyPatchRuntimeInvocation {
                 action,
                 auto_approved: false,
                 exec_approval_requirement: ExecApprovalRequirement::NeedsApproval {
                     reason: None,
                     proposed_execpolicy_amendment: None,
                 },
-            })
+            }))
         }
         SafetyCheck::Reject { reason } => InternalApplyPatchInvocation::Output(Err(
             FunctionCallError::RespondToModel(format!("patch rejected: {reason}")),

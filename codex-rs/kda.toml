@@ -14,7 +14,43 @@ version = 1
 
 # Reuse KDA's exact KD4 runtime contracts instead of duplicating guessed symbols.
 policy-pack = ["kd4@1"]
-exclude = ["target/**", "target-*/**", ".kda/**"]
+# Mirrors the .gitignore directory rules that apply inside codex-rs: its own and
+# the repository root's unanchored rules. ../kda.toml owns the root inventory.
+exclude = [
+    "target/**",
+    "target-*/**",
+    "codex-rs/target/**",
+    ".kda/**",
+    "**/node_modules/**",
+    "**/.pnpm-store/**",
+    "**/.yarn/**",
+    "**/.venv/**",
+    "**/.env*",
+    "**/.direnv/**",
+    "**/__pycache__/**",
+    "**/.pytest_cache/**",
+    "**/.ruff_cache/**",
+    "**/.cache/**",
+    "**/.turbo/**",
+    "**/.parcel-cache/**",
+    "**/.jest/**",
+    "**/.nyc_output/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/out/**",
+    "**/storybook-static/**",
+    "**/coverage/**",
+    "**/result",
+    "**/.vercel/**",
+    "**/.netlify/**",
+    "**/.idea/**",
+    "**/.vs/**",
+    "**/.history/**",
+    "**/.zed/**",
+    "**/.claude/**",
+    "**/personal/**",
+    "**/apply_patch/**",
+]
 
 # Security review is out of scope, including security checks that default to deny.
 # Keep unrelated correctness, reliability, and data-integrity checks enabled.

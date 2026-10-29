@@ -616,7 +616,7 @@ impl Environment {
             return "local".to_string();
         }
         if let Some(id) = self.remote_client.as_ref()
-            .and_then(|owner| owner.cached_client())
+            .and_then(LazyRemoteExecServerClient::cached_client)
             .and_then(|client| client.cached_coordination_resource_id())
         {
             return format!("exec-server:{id}");

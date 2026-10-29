@@ -527,11 +527,9 @@ async fn get_threads_in_root_by_summary(
             .map(|timestamp| (timestamp, candidate.id))
     };
     if sort_key == ThreadSortKey::UpdatedAt
-        && candidates.iter().all(|candidate| updated_key(candidate).is_some())
+        && let Some(keys) = candidates.iter().map(updated_key).collect::<Option<Vec<_>>>()
     {
-        let mut candidates = candidates.into_iter().map(|candidate| {
-            (updated_key(&candidate).expect("checked timestamp"), candidate)
-        }).collect::<Vec<_>>();
+        let mut candidates = keys.into_iter().zip(candidates).collect::<Vec<_>>();
         candidates.sort_by_key(|(key, _)| *key);
         if !ascending { candidates.reverse(); }
         let mut items = Vec::with_capacity(page_size.min(candidates.len()));
@@ -801,6 +799,10 @@ async fn traverse_directories_for_paths_created(
 ///
 /// NOTE: This can be optimized in the future if we store additional state on disk
 /// to cache updated_at timestamps.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep the traversal arguments aligned with the existing pagination and filter inputs"
+)]
 async fn traverse_directories_for_paths_updated(
     root: PathBuf,
     page_size: usize,
@@ -924,6 +926,10 @@ async fn traverse_flat_paths_created(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep the traversal arguments aligned with the existing pagination and filter inputs"
+)]
 async fn traverse_flat_paths_updated(
     root: PathBuf,
     page_size: usize,

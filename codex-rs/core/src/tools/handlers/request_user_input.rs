@@ -46,7 +46,6 @@ impl RequestUserInputHandler {
             step_context,
             call_id,
             payload,
-            cancellation_token: _,
             ..
         } = invocation;
         let turn = Arc::clone(&step_context.turn);

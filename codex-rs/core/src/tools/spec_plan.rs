@@ -245,12 +245,15 @@ pub(crate) fn build_tool_router(
     Ok(router)
 }
 
+/// Model-visible specs, their registry, build warnings, and prepared search sources.
+type ToolSpecsAndRegistry = (Vec<ToolSpec>, ToolRegistry, Vec<String>, Option<String>);
+
 #[instrument(level = "trace", skip_all)]
 fn build_tool_specs_and_registry(
     step_context: &StepContext,
     params: ToolRouterParams<'_>,
     tool_search_handler_cache: &ToolSearchHandlerCache,
-) -> Result<(Vec<ToolSpec>, ToolRegistry, Vec<String>, Option<String>), String> {
+) -> Result<ToolSpecsAndRegistry, String> {
     let turn_context = step_context.turn.as_ref();
     let ToolRouterParams {
         mcp_tools,
@@ -805,10 +808,9 @@ fn build_code_mode_executors(
         if executor.authorization_class() != TypedToolClass::DynamicExternal
             && executor.tool_name().name == "read_file"
             && let ToolSpec::Function(tool) = &mut spec
+            && let Some(properties) = &mut tool.parameters.properties
         {
-            if let Some(properties) = &mut tool.parameters.properties {
-                properties.remove("force_fresh");
-            }
+            properties.remove("force_fresh");
         }
 
         if exposure == ToolExposure::Deferred {

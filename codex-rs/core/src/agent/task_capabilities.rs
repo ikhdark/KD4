@@ -4,11 +4,6 @@ use codex_agent_task_store::AttemptId;
 use codex_agent_task_store::AttributionConfidence;
 use codex_agent_task_store::CapabilityProfile;
 use codex_agent_task_store::MutationEvidence;
-use codex_agent_task_store::RepoScope;
-use codex_agent_task_store::RiskDomain;
-use codex_agent_task_store::RiskFacts;
-use codex_agent_task_store::RiskGateDecision;
-use codex_agent_task_store::evaluate_risk_gate;
 use codex_agent_task_store::repository_lineage_id;
 use codex_agent_task_store::repository_workspace_id;
 use codex_protocol::protocol::SessionSource;
@@ -37,8 +32,6 @@ pub(crate) enum TypedToolClass {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExternalMutationIntent {
     ProvenReadOnly,
-    /// Provider metadata is useful for consent, but is not host-established authority.
-    ProviderAssertedReadOnly,
     MayMutate,
 }
 
@@ -255,88 +248,6 @@ pub(crate) fn build_cold_review_context(
     })
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct RiskPolicyInput<'a> {
-    pub changed_paths: &'a [String],
-    pub configured_high_risk_paths: &'a [RepoScope],
-    pub touched_contracts: &'a [String],
-    pub configured_high_risk_contracts: &'a [String],
-    pub cross_owner_scope: bool,
-    pub named_domains: &'a [RiskDomain],
-    pub non_generated_changed_files: u32,
-    pub non_generated_changed_lines: u32,
-    pub focused_validation_succeeded: bool,
-    pub ownership_conflict: bool,
-    pub drift: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DerivedRiskPolicy {
-    pub facts: RiskFacts,
-    pub decision: RiskGateDecision,
-    pub matched_high_risk_path: bool,
-    pub matched_high_risk_contract: bool,
-}
-
-/// Derives deterministic risk-gate facts. Runtime wiring must supply facts from stored mutation,
-/// validation, ownership, and drift evidence rather than from an agent's prose claim.
-pub(crate) fn derive_risk_policy(
-    assignment: &Assignment,
-    repo_root: &Path,
-    input: RiskPolicyInput<'_>,
-) -> Result<DerivedRiskPolicy, CapabilityPolicyError> {
-    verify_assignment_authority(assignment, repo_root)?;
-    let canonical_root = canonical_repository_root(repo_root)?;
-    let normalized_changed_paths = input
-        .changed_paths
-        .iter()
-        .map(|path| normalize_repo_relative_path(&canonical_root, path))
-        .collect::<Result<Vec<_>, _>>()?;
-    let normalized_scopes = input
-        .configured_high_risk_paths
-        .iter()
-        .map(|scope| {
-            Ok((
-                normalize_repo_relative_path(&canonical_root, &scope.path)?,
-                scope.recursive,
-            ))
-        })
-        .collect::<Result<Vec<_>, CapabilityPolicyError>>()?;
-    let matched_high_risk_path = normalized_changed_paths.iter().any(|path| {
-        normalized_scopes
-            .iter()
-            .any(|(scope, recursive)| scope_covers_path(scope, *recursive, path))
-    });
-    let configured_contracts = input
-        .configured_high_risk_contracts
-        .iter()
-        .filter_map(|contract| normalize_contract_id(contract))
-        .collect::<BTreeSet<_>>();
-    let matched_high_risk_contract = input
-        .touched_contracts
-        .iter()
-        .filter_map(|contract| normalize_contract_id(contract))
-        .any(|contract| configured_contracts.contains(&contract));
-    let facts = RiskFacts {
-        configured_high_risk_path: matched_high_risk_path || matched_high_risk_contract,
-        cross_owner_scope: input.cross_owner_scope
-            || assignment.capability_profile == CapabilityProfile::IntegratorSourceWrite,
-        domains: input.named_domains.iter().copied().collect::<BTreeSet<_>>(),
-        non_generated_changed_files: input.non_generated_changed_files,
-        non_generated_changed_lines: input.non_generated_changed_lines,
-        focused_validation_succeeded: input.focused_validation_succeeded,
-        ownership_conflict: input.ownership_conflict,
-        drift: input.drift,
-    };
-    let decision = evaluate_risk_gate(&facts);
-    Ok(DerivedRiskPolicy {
-        facts,
-        decision,
-        matched_high_risk_path,
-        matched_high_risk_contract,
-    })
-}
-
 // The caller canonicalizes the root once for this operation.
 fn normalize_repo_relative_path(
     canonical_root: &Path,
@@ -497,22 +408,10 @@ fn ensure_canonical_containment(
     Ok(canonical_existing.join(suffix))
 }
 
-fn scope_covers_path(scope: &str, recursive: bool, path: &str) -> bool {
-    repo_paths_equal(scope, path)
-        || recursive
-            && normalized_comparison_path(path)
-                .strip_prefix(&normalized_comparison_path(scope))
-                .is_some_and(|suffix| suffix.starts_with('/'))
-}
-
 fn compare_repo_paths(left: &str, right: &str) -> Ordering {
     normalized_comparison_path(left)
         .cmp(&normalized_comparison_path(right))
         .then_with(|| left.cmp(right))
-}
-
-fn repo_paths_equal(left: &str, right: &str) -> bool {
-    normalized_comparison_path(left) == normalized_comparison_path(right)
 }
 
 fn normalized_comparison_path(path: &str) -> String {
@@ -521,23 +420,6 @@ fn normalized_comparison_path(path: &str) -> String {
     } else {
         path.to_owned()
     }
-}
-
-fn normalize_contract_id(contract: &str) -> Option<String> {
-    let mut normalized = String::new();
-    let mut pending_separator = false;
-    for character in contract.trim().chars() {
-        if character.is_whitespace() || matches!(character, '-' | '_') {
-            pending_separator = !normalized.is_empty();
-            continue;
-        }
-        if pending_separator {
-            normalized.push('-');
-            pending_separator = false;
-        }
-        normalized.extend(character.to_lowercase());
-    }
-    (!normalized.is_empty()).then_some(normalized)
 }
 
 fn invalid_path(path: &str, reason: impl Into<String>) -> CapabilityPolicyError {

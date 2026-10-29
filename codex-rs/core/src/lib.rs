@@ -79,7 +79,6 @@ pub mod skills;
 pub(crate) use skills::SkillMetadata;
 pub(crate) use skills::SkillsService;
 pub(crate) use skills::apply_skill_injection_observability;
-pub(crate) use skills::build_available_skills;
 pub(crate) use skills::build_skill_name_counts;
 pub(crate) use skills::collect_explicit_skill_mentions;
 pub(crate) use skills::default_skill_metadata_budget;

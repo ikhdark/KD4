@@ -355,7 +355,7 @@ fn has_force_delete_cmdlet(tokens: &[String]) -> bool {
 /// token (`rd /s/q`, `del /f/q`) and switch values after a colon (`del /a:h`).
 fn has_cmd_switch(args: &[impl AsRef<str>], switch: char) -> bool {
     args.iter()
-        .map(|arg| arg.as_ref())
+        .map(AsRef::as_ref)
         .filter(|arg| arg.starts_with('/'))
         .flat_map(|arg| arg.split('/'))
         .filter_map(|group| group.chars().next())

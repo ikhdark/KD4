@@ -570,10 +570,6 @@ impl ThreadScopedOutgoingMessageSender {
         }
     }
 
-    pub(crate) async fn send_global_server_notification(&self, notification: ServerNotification) {
-        self.outgoing.send_server_notification(notification).await;
-    }
-
     pub(crate) async fn abort_pending_server_requests(&self) {
         self.outgoing
             .cancel_requests_for_thread(
@@ -723,6 +719,10 @@ impl OutgoingMessageSender {
         true
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Hold active connections while registering so a closed connection cannot regain dynamic tool ownership"
+    )]
     pub(crate) async fn register_dynamic_tool_owner(
         &self,
         thread_id: ThreadId,
@@ -1963,27 +1963,30 @@ impl OutgoingMessageSender {
             self.finish_request_context(context.as_ref()).await;
             return;
         };
-        let accepting = self.delivery_accepting.lock().await;
-        if !*accepting {
-            self.fail_connection_delivery(request_id.connection_id).await;
-            self.finish_request_context(context.as_ref()).await;
-            return;
-        }
         let route_closed = self.active_connections.lock().await
             .get(&request_id.connection_id).map(|connection| connection.delivery_failure.clone())
             .unwrap_or_default();
-        let outgoing = Arc::clone(self);
-        self.delivery_tasks.spawn(async move {
-            let _slot = slot;
-            // Keep registration until terminal admission/failure, so a second
-            // envelope cannot claim this ID while delivery is still pending.
-            tokio::select! {
-                biased;
-                _ = route_closed.cancelled() => {}
-                _ = outgoing.send_error_inner(context.clone(), request_id, error) => {}
+        {
+            // Spawn under the admission lock so settlement cannot miss this task.
+            let accepting = self.delivery_accepting.lock().await;
+            if *accepting {
+                let outgoing = Arc::clone(self);
+                self.delivery_tasks.spawn(async move {
+                    let _slot = slot;
+                    // Keep registration until terminal admission/failure, so a second
+                    // envelope cannot claim this ID while delivery is still pending.
+                    tokio::select! {
+                        biased;
+                        _ = route_closed.cancelled() => {}
+                        _ = outgoing.send_error_inner(context.clone(), request_id, error) => {}
+                    }
+                    outgoing.finish_request_context(context.as_ref()).await;
+                });
+                return;
             }
-            outgoing.finish_request_context(context.as_ref()).await;
-        });
+        }
+        self.fail_connection_delivery(request_id.connection_id).await;
+        self.finish_request_context(context.as_ref()).await;
     }
 
     /// Claim a rejected envelope too: otherwise an oversized duplicate could

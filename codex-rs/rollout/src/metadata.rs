@@ -612,10 +612,12 @@ pub(crate) async fn backfill_sessions_until(
         ..Default::default()
     };
 
-    if memo.discovery.as_ref().is_none_or(|discovery| discovery.home != codex_home) {
-        memo.discovery = Some(BackfillDiscovery::new(codex_home));
-    }
-    if !memo.discovery.as_mut().expect("discovery initialized").advance(&mut should_stop).await {
+    let discovery = match &mut memo.discovery {
+        Some(discovery) if discovery.home == codex_home => discovery,
+        slot => slot.insert(BackfillDiscovery::new(codex_home)),
+    };
+    let completed = discovery.advance(&mut should_stop).await;
+    let Some(discovery) = memo.discovery.take_if(|_| completed) else {
         // A partial tree cannot certify a contiguous durable watermark. Retain
         // the in-memory traversal but release the cross-process claim promptly.
         memo.last_pass = Some(PassRemainder::DiscoveryPending);
@@ -623,8 +625,7 @@ pub(crate) async fn backfill_sessions_until(
             warn!(%error, "failed to release paused rollout discovery claim");
         }
         return BackfillPassReport::default();
-    }
-    let discovery = memo.discovery.take().expect("completed discovery");
+    };
     let mut unresolved_failures = discovery.failed;
     let mut rollout_paths = discovery.paths.into_values().collect::<Vec<_>>();
     if !unresolved_failures {
@@ -994,7 +995,7 @@ impl BackfillDiscovery {
                         }
                     }
                 }
-                let (reader, archived) = self.current.as_mut().expect("discovery owns a directory");
+                let Some((reader, archived)) = self.current.as_mut() else { continue; };
                 let archived = *archived;
                 match reader.next_entry().await {
                     Ok(Some(entry)) => self.entry = Some((entry, archived)),
@@ -1007,7 +1008,7 @@ impl BackfillDiscovery {
                     }
                 }
             }
-            let (entry, archived) = self.entry.as_ref().expect("discovery owns an entry");
+            let Some((entry, archived)) = self.entry.as_ref() else { continue; };
             let archived = *archived;
             let path = entry.path();
             let inspected = entry.file_type().await;

@@ -603,12 +603,19 @@ pub fn migrate_config_document(
         .map_err(io::Error::other)?
         .parse::<toml_edit::DocumentMut>()
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    let (Some(original_table), Some(migrated_table)) = (original.as_table(), migrated.as_table())
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "config root is not a table",
+        ));
+    };
     reconcile_migrated_table(
         document.as_table_mut(),
-        original.as_table().expect("config root is a table"),
-        migrated.as_table().expect("migrated config root is a table"),
+        original_table,
+        migrated_table,
         canonical.as_table(),
-    );
+    )?;
     Ok(true)
 }
 
@@ -617,7 +624,7 @@ fn reconcile_migrated_table(
     original: &toml::map::Map<String, TomlValue>,
     migrated: &toml::map::Map<String, TomlValue>,
     canonical: &dyn toml_edit::TableLike,
-) {
+) -> io::Result<()> {
     for key in original.keys().filter(|key| !migrated.contains_key(*key)) {
         document.remove(key);
     }
@@ -625,17 +632,23 @@ fn reconcile_migrated_table(
         if original.get(key) == Some(value) {
             continue;
         }
-        let replacement = canonical.get(key).expect("serialized migrated entry");
+        let replacement = canonical.get(key).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("migrated config entry `{key}` was not serialized"),
+            )
+        })?;
         if let (Some(TomlValue::Table(before)), TomlValue::Table(after)) =
             (original.get(key), value)
             && let Some(table) = document.get_mut(key).and_then(toml_edit::Item::as_table_like_mut)
             && let Some(canonical_table) = replacement.as_table_like()
         {
-            reconcile_migrated_table(table, before, after, canonical_table);
+            reconcile_migrated_table(table, before, after, canonical_table)?;
         } else {
             document.insert(key, replacement.clone());
         }
     }
+    Ok(())
 }
 
 pub(crate) fn migrate_config_toml_for_source(

@@ -63,8 +63,10 @@ pub(crate) fn helper_bin_dir(codex_home: &Path) -> PathBuf {
 pub(crate) fn legacy_lookup(kind: HelperExecutable) -> Result<PathBuf> {
     if let Ok(exe) = std::env::current_exe()
         && let Some(candidate) = bundled_executable_path_for_exe(&exe, kind.file_name())
+        && candidate.is_absolute()
+        && candidate.is_file()
     {
-        if candidate.is_absolute() && candidate.is_file() { return Ok(candidate); }
+        return Ok(candidate);
     }
     Err(anyhow!("packaged {} helper not found; refusing ambient executable lookup", kind.label()))
 }

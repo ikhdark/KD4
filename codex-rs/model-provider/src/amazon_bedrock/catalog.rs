@@ -25,43 +25,43 @@ pub(crate) fn static_model_catalog() -> ModelsResponse {
     let mut catalog = ModelsResponse {
         models: vec![
             bedrock_model(
-                bundled_openai_model(&bundled, "gpt-6-astra"),
+                bundled_openai_model(bundled, "gpt-6-astra"),
                 AMAZON_BEDROCK_GPT_6_ASTRA_MODEL_ID,
                 "GPT-6-Astra",
                 /*priority*/ 0,
             ),
             bedrock_model(
-                bundled_openai_model(&bundled, "gpt-6-sol"),
+                bundled_openai_model(bundled, "gpt-6-sol"),
                 AMAZON_BEDROCK_GPT_6_SOL_MODEL_ID,
                 "GPT-6 Sol",
                 /*priority*/ 1,
             ),
             bedrock_model(
-                bundled_openai_model(&bundled, "gpt-6-luna"),
+                bundled_openai_model(bundled, "gpt-6-luna"),
                 AMAZON_BEDROCK_GPT_6_LUNA_MODEL_ID,
                 "GPT-6 Luna",
                 /*priority*/ 2,
             ),
             bedrock_model(
-                bundled_openai_model(&bundled, "gpt-5.6-sol"),
+                bundled_openai_model(bundled, "gpt-5.6-sol"),
                 AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID,
                 "GPT-5.6 Sol",
                 /*priority*/ 3,
             ),
             bedrock_model(
-                bundled_openai_model(&bundled, "gpt-5.6-terra"),
+                bundled_openai_model(bundled, "gpt-5.6-terra"),
                 AMAZON_BEDROCK_GPT_5_6_TERRA_MODEL_ID,
                 "GPT-5.6 Terra",
                 /*priority*/ 4,
             ),
             bedrock_model(
-                bundled_openai_model(&bundled, "gpt-5.6-luna"),
+                bundled_openai_model(bundled, "gpt-5.6-luna"),
                 AMAZON_BEDROCK_GPT_5_6_LUNA_MODEL_ID,
                 "GPT-5.6 Luna",
                 /*priority*/ 5,
             ),
             bedrock_model(
-                bundled_openai_model(&bundled, GPT_5_5_OPENAI_MODEL_ID),
+                bundled_openai_model(bundled, GPT_5_5_OPENAI_MODEL_ID),
                 AMAZON_BEDROCK_GPT_5_5_MODEL_ID,
                 "GPT-5.5",
                 /*priority*/ 6,

@@ -246,7 +246,7 @@ async fn exec_server_env_for_request(
     let env_config = request.exec_server_env_config.clone();
     tokio::task::spawn_blocking(move || {
         if let Some(exec_server_env_config) = &env_config {
-            let mut env =
+            let env =
                 env_overlay_for_exec_server(&request_env, &exec_server_env_config.local_policy_env);
             let policy = exec_server_env_config.policy.clone();
             (Some(policy), env)
@@ -332,7 +332,6 @@ struct PreparedProcessHandles {
     output_closed_notify: Arc<Notify>,
     cancellation_token: CancellationToken,
     pause_state: Option<watch::Receiver<bool>>,
-    session: Option<Arc<crate::session::session::Session>>,
     call_id: String,
     hook_command: String,
     process_id: u32,
@@ -733,7 +732,6 @@ async fn emit_failed_initial_exec_end_if_unstored(
         context.call_id.clone(),
         request.command_for_safety.clone(),
         cwd,
-        request.turn_environment.environment_id.clone(),
         Some(request.process_id.to_string()),
         transcript,
         fallback_output,
@@ -908,8 +906,7 @@ impl UnifiedExecProcessManager {
                     None
                 }
             };
-            if let Some(entry) = removed {
-            }
+            drop(removed);
         }
         UnifiedExecError::ProcessFailedWithOutput {
             message,
@@ -987,19 +984,19 @@ impl UnifiedExecProcessManager {
             pruned_entry
         };
         // Never await a process/output owner while holding the global store.
-        if let Some(entry) = pruned_entry {
-            if let Some(session) = entry.session.upgrade() {
-                session
-                    .services
-                    .command_execution
-                    .finish_running_process_with_execution_id(
-                        entry.process_id,
-                        entry.command_execution_id,
-                        &entry.parent_tool_execution_id,
-                        entry.process.exit_code(),
-                    )
-                    .await;
-            }
+        if let Some(entry) = pruned_entry
+            && let Some(session) = entry.session.upgrade()
+        {
+            session
+                .services
+                .command_execution
+                .finish_running_process_with_execution_id(
+                    entry.process_id,
+                    entry.command_execution_id,
+                    &entry.parent_tool_execution_id,
+                    entry.process.exit_code(),
+                )
+                .await;
         }
         Ok(())
     }
@@ -1011,8 +1008,8 @@ impl UnifiedExecProcessManager {
             let mut store = self.process_store.lock().await;
             store.remove(process_id)
         };
-        if let Some(entry) = removed {
-        }
+        // The entry may own the last process handle; drop it outside the store lock.
+        drop(removed);
     }
 
     pub(super) async fn release_failed_completion(
@@ -1030,8 +1027,7 @@ impl UnifiedExecProcessManager {
                 .then(|| store.remove(process_id))
                 .flatten()
         };
-        if let Some(entry) = removed {
-        }
+        drop(removed);
     }
 
     pub(crate) async fn exec_command(
@@ -1211,7 +1207,6 @@ impl UnifiedExecProcessManager {
             cwd.clone(),
             ExecCommandSource::UnifiedExecStartup,
             Some(request.process_id.to_string()),
-            request.turn_environment.environment_id.clone(),
         )
         .with_captured_environment(&request.turn_environment);
         let event_delivery_guard = event_delivery.lock().await;
@@ -1244,7 +1239,6 @@ impl UnifiedExecProcessManager {
                     &request.command_for_safety,
                     request.hook_command.clone(),
                     cwd.clone(),
-                    request.turn_environment.environment_id.clone(),
                     start,
                     request.process_id,
                     process_id_reservation,
@@ -1382,7 +1376,7 @@ impl UnifiedExecProcessManager {
                     process_id,
                     ..
                 } => (Some(process_id), exit_code, true),
-                ProcessStatus::Exited { exit_code, entry } => {
+                ProcessStatus::Exited { exit_code, .. } => {
                     process.check_for_sandbox_denial_with_text(&text).await?;
                     (Some(process_id), exit_code, true)
                 }
@@ -1401,7 +1395,6 @@ impl UnifiedExecProcessManager {
                 context.call_id.clone(),
                 request.command_for_safety.clone(),
                 cwd.clone(),
-                request.turn_environment.environment_id.clone(),
                 Some(process_id.to_string()),
                 Arc::clone(&transcript),
                 text.clone(),
@@ -1663,7 +1656,6 @@ impl UnifiedExecProcessManager {
             output_closed_notify,
             cancellation_token,
             pause_state,
-            session,
             call_id,
             hook_command,
             process_id,
@@ -2132,7 +2124,6 @@ impl UnifiedExecProcessManager {
             .session
             .upgrade()
             .map(|session| session.subscribe_elicitation_pause_state());
-        let session = entry.session.upgrade();
 
         Ok(PreparedProcessHandles {
             process: Arc::clone(&entry.process),
@@ -2142,7 +2133,6 @@ impl UnifiedExecProcessManager {
             output_closed_notify,
             cancellation_token,
             pause_state,
-            session,
             call_id: entry.call_id.clone(),
             hook_command: entry.hook_command.clone(),
             process_id: entry.process_id,
@@ -2160,7 +2150,6 @@ impl UnifiedExecProcessManager {
         command: &[String],
         hook_command: String,
         cwd: PathUri,
-        environment_id: String,
         started_at: Instant,
         process_id: u32,
         process_id_reservation: &mut ProcessIdReservation,
@@ -2263,7 +2252,6 @@ impl UnifiedExecProcessManager {
             context.call_id.clone(),
             command.to_vec(),
             cwd,
-            environment_id,
             process_id,
             command_execution_id,
             parent_tool_execution_id,
@@ -2291,7 +2279,6 @@ impl UnifiedExecProcessManager {
             &codex_protocol::request_permissions::UriAdditionalPermissionProfile,
         >,
         attempt: &SandboxAttempt<'_>,
-        environment_id: Option<&str>,
         exec_server_env_config: Option<ExecServerEnvConfig>,
         tty: bool,
         spawn_lifecycle: SpawnLifecycleHandle,
@@ -2498,11 +2485,7 @@ impl UnifiedExecProcessManager {
             local_policy_env,
         };
         let mut orchestrator = ToolOrchestrator::new();
-        let mut runtime = UnifiedExecRuntime::new_with_pending_spawns(
-            self,
-            pending_spawns,
-            context.tracker.clone(),
-        );
+        let mut runtime = UnifiedExecRuntime::new_with_pending_spawns(self, pending_spawns);
 
         let direct_argv_analysis = async {
             if request.shell_wrapper_is_owned
@@ -3072,8 +3055,7 @@ impl UnifiedExecProcessManager {
                     .is_some_and(|entry| Arc::ptr_eq(&entry.process, &process));
                 is_same_process.then(|| store.remove(process_id)).flatten()
             };
-            if let Some(entry) = entry {
-            }
+            drop(entry);
         }
         let pending = self
             .pending_cleanup_owners

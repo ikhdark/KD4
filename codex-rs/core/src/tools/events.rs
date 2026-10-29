@@ -132,24 +132,6 @@ fn tracker_update_for_known_delta<'a>(
     }
 }
 
-fn apply_patch_intent_paths(changes: &HashMap<PathBuf, FileChange>) -> Vec<PathBuf> {
-    let mut paths = Vec::with_capacity(changes.len());
-    for (path, change) in changes {
-        paths.push(path.clone());
-        if let FileChange::Update {
-            move_path: Some(move_path),
-            ..
-        } = change
-            && !move_path.as_os_str().is_empty()
-        {
-            paths.push(move_path.clone());
-        }
-    }
-    paths.sort();
-    paths.dedup();
-    paths
-}
-
 fn apply_patch_local_cwd(
     ctx: ToolEventCtx<'_>,
     environment_id: Option<&str>,
@@ -220,7 +202,6 @@ pub(crate) enum ToolEmitter {
         cwd: PathUri,
         source: ExecCommandSource,
         parsed_cmd: Vec<ParsedCommand>,
-        environment_id: String,
     },
     ApplyPatch {
         changes: HashMap<PathBuf, FileChange>,
@@ -236,17 +217,11 @@ pub(crate) enum ToolEmitter {
         source: ExecCommandSource,
         parsed_cmd: Vec<ParsedCommand>,
         process_id: Option<String>,
-        environment_id: String,
     },
 }
 
 impl ToolEmitter {
-    pub fn shell(
-        command: Vec<String>,
-        cwd: AbsolutePathBuf,
-        source: ExecCommandSource,
-        environment_id: String,
-    ) -> Self {
+    pub fn shell(command: Vec<String>, cwd: AbsolutePathBuf, source: ExecCommandSource) -> Self {
         let parsed_cmd = parse_command(&command);
         Self::Shell {
             captured_environment: None,
@@ -256,7 +231,6 @@ impl ToolEmitter {
             cwd: PathUri::from_abs_path(&cwd),
             source,
             parsed_cmd,
-            environment_id,
         }
     }
 
@@ -298,7 +272,6 @@ impl ToolEmitter {
         cwd: PathUri,
         source: ExecCommandSource,
         process_id: Option<String>,
-        environment_id: String,
     ) -> Self {
         let parsed_cmd = parse_command(command);
         Self::UnifiedExec {
@@ -309,7 +282,6 @@ impl ToolEmitter {
             source,
             parsed_cmd,
             process_id,
-            environment_id,
         }
     }
 
@@ -361,7 +333,6 @@ impl ToolEmitter {
                     cwd,
                     source,
                     parsed_cmd,
-                    environment_id,
                     ..
                 },
                 stage,
@@ -371,7 +342,6 @@ impl ToolEmitter {
                     ExecCommandInput::new(
                         command,
                         cwd,
-                        environment_id,
                         parsed_cmd,
                         *source,
                         /*interaction_input*/ None,
@@ -514,7 +484,6 @@ impl ToolEmitter {
                     source,
                     parsed_cmd,
                     process_id,
-                    environment_id,
                     ..
                 },
                 stage,
@@ -524,7 +493,6 @@ impl ToolEmitter {
                     ExecCommandInput::new(
                         command,
                         cwd,
-                        environment_id,
                         parsed_cmd,
                         *source,
                         /*interaction_input*/ None,
@@ -699,7 +667,6 @@ impl ToolEmitter {
 struct ExecCommandInput<'a> {
     command: &'a [String],
     cwd: &'a PathUri,
-    environment_id: &'a str,
     parsed_cmd: &'a [ParsedCommand],
     source: ExecCommandSource,
     interaction_input: Option<&'a str>,
@@ -710,7 +677,6 @@ impl<'a> ExecCommandInput<'a> {
     fn new(
         command: &'a [String],
         cwd: &'a PathUri,
-        environment_id: &'a str,
         parsed_cmd: &'a [ParsedCommand],
         source: ExecCommandSource,
         interaction_input: Option<&'a str>,
@@ -719,7 +685,6 @@ impl<'a> ExecCommandInput<'a> {
         Self {
             command,
             cwd,
-            environment_id,
             parsed_cmd,
             source,
             interaction_input,
@@ -736,7 +701,6 @@ struct ExecCommandResult {
     duration: Duration,
     formatted_output: String,
     status: ExecCommandStatus,
-    timed_out: bool,
 }
 
 
@@ -793,7 +757,6 @@ async fn emit_exec_stage(
                 } else {
                     ExecCommandStatus::Failed
                 },
-                timed_out: output.timed_out,
             };
             emit_exec_end(ctx, exec_input, exec_result).await?;
         }
@@ -807,7 +770,6 @@ async fn emit_exec_stage(
                 duration: Duration::ZERO,
                 formatted_output: text,
                 status: ExecCommandStatus::Failed,
-                timed_out: false,
             };
             emit_exec_end(ctx, exec_input, exec_result).await?;
         }
@@ -821,14 +783,12 @@ async fn emit_exec_stage(
                 duration: Duration::ZERO,
                 formatted_output: text,
                 status: ExecCommandStatus::Declined,
-                timed_out: false,
             };
             emit_exec_end(ctx, exec_input, exec_result).await?;
         }
     }
     Ok(())
 }
-
 
 async fn emit_exec_end(
     ctx: ToolEventCtx<'_>,
@@ -955,7 +915,6 @@ async fn emit_patch_end(
                 };
                 std::iter::once(change.path.clone()).chain(destination.cloned())
             })
-                .into_iter()
                 .map(|path| {
                     if path.is_absolute() {
                         path

@@ -17,7 +17,6 @@ use codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt;
 use codex_protocol::protocol::TurnTimingGenerationDisposition;
 use codex_protocol::protocol::TurnTimingGenerationPurpose;
 use codex_protocol::protocol::TurnTimingProgressKind;
-use codex_protocol::validation::ValidationMode;
 use codex_tools::ToolName;
 use codex_tools::ToolOutputOutcome;
 use codex_tools::ToolOutputOutcomeContext;
@@ -30,7 +29,6 @@ use sha2::Digest;
 use sha2::Sha256;
 
 use crate::tool_history::SourceDependencyV1;
-use crate::tool_history::source_locator_key;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::turn_timing::TurnTimingState;
 use crate::validation::ValidationClassification;
@@ -182,7 +180,6 @@ struct SamplingToolOutcome {
     code_mode_cell_id: Option<String>,
     wraps_nested_terminal: bool,
     tests_executed: bool,
-    compile_validation: bool,
     validation_failure_excerpt: Option<String>,
     process_observation_progress: bool,
     validation_mutation_revision: Option<u64>,
@@ -214,48 +211,6 @@ pub(crate) fn validation_scope_signal(
         signal["observed_process_id"] = serde_json::json!(process_id);
     }
     Some(signal)
-}
-
-// Locators preserve case; compare with the platform's case-folding key.
-fn source_scope_contains(scope: &SourceDependencyV1, path: &str) -> bool {
-    let scope_key = source_locator_key(&scope.path);
-    let scope_path: &str = &scope_key;
-    let path_key = source_locator_key(path);
-    let path: &str = &path_key;
-    path == scope_path
-        || scope.recursive
-            && path
-                .strip_prefix(scope_path)
-                .is_some_and(|suffix| scope_path.ends_with('/') || suffix.starts_with('/'))
-}
-
-fn documentation_only_path(path: &std::path::Path) -> bool {
-    let normalized = path.to_string_lossy().replace('\\', "/");
-    let components = normalized.split('/').collect::<Vec<_>>();
-    // This repository's prompt crate embeds templates into runtime requests.
-    // Instruction files also control the harness; neither is a README.
-    let embedded_runtime_input = [
-        "codex-rs/ext/web-search/web_run_description.md",
-        "codex-rs/ext/image-generation/imagegen_description.md",
-    ]
-    .iter()
-    .any(|input| normalized == *input || normalized.ends_with(&format!("/{input}")));
-    let runtime_input = embedded_runtime_input
-        || components
-            .iter()
-            .any(|component| matches!(*component, "prompts" | "templates"))
-        || components.last().is_some_and(|name| {
-            ["AGENTS.md", "AGENTS.override.md", "SKILL.md"]
-                .iter()
-                .any(|instruction| name.eq_ignore_ascii_case(instruction))
-        });
-    !runtime_input
-        && path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| {
-                matches!(extension.to_ascii_lowercase().as_str(), "md" | "rst")
-            })
 }
 
 impl SamplingToolOutcome {
@@ -292,8 +247,6 @@ impl SamplingToolOutcome {
                 .and_then(Value::as_u64)
                 .is_some(),
             tests_executed: signal.is_some_and(|signal| signal["command_validation"]["tests"] == true),
-            compile_validation: signal
-                .is_some_and(|signal| signal["command_validation"]["compile"] == true),
             validation_failure_excerpt: None,
             process_observation_progress: signal
                 .is_some_and(|signal| signal["process_observation_progress"] == true),
@@ -641,7 +594,6 @@ pub(crate) struct SamplingRequestSignalCollector {
     state: Arc<Mutex<SamplingRequestSignalState>>,
     dispatch_ledger: Option<Arc<Mutex<DeterministicDispatchLedger>>>,
     request_state_revision: String,
-    request_mutation_revision: u64,
     request_ordinal: u64,
 }
 
@@ -1183,17 +1135,6 @@ impl SamplingRequestSignalCollector {
         ) {
             state.authoritative_wait_observations.push(observation);
         }
-    }
-
-    /// Ordinal already registered for `call_id`, for an owner that must attach
-    /// evidence to a call it recorded rather than minting a new identity.
-    pub(crate) fn ordinal_for_call(&self, call_id: &str) -> Option<u64> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .call_ordinals
-            .get(call_id)
-            .copied()
     }
 
     pub(crate) fn code_mode_source_dependencies(
@@ -2140,17 +2081,6 @@ fn validation_failure_excerpt(value: &Value) -> Option<String> {
     }
 }
 
-
-
-
-
-
-
-
-fn validation_site_key(path: &std::path::Path) -> String {
-    source_locator_key(&SourceDependencyV1::new(path, false).path).into_owned()
-}
-
 fn response_failure_fingerprint(response: &ResponseInputItem) -> Option<String> {
     let value = response_output_text(response)
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())?;
@@ -2417,11 +2347,7 @@ fn validation_status_from_arguments(tool_name: &ToolName, arguments: &Value) -> 
         return (false, false, false);
     };
     match classify_validation(&invocation) {
-        ValidationClassification::Validation {
-            leaves,
-            exit_code_is_authoritative,
-            ..
-        } if !leaves.is_empty() => (
+        ValidationClassification::Validation { leaves, .. } if !leaves.is_empty() => (
             true,
             true,
             leaves.iter().any(|leaf| {
@@ -2666,7 +2592,6 @@ impl DeliveredSourceCoverage {
 
 pub(crate) struct TurnExecutionControl {
     issued_directives: BTreeSet<String>,
-    validation_mode: ValidationMode,
 
 
 
@@ -2734,7 +2659,6 @@ impl TurnExecutionControl {
     pub(crate) fn new_with_timing(timing: Arc<TurnTimingState>) -> Self {
         Self {
             issued_directives: BTreeSet::new(),
-            validation_mode: ValidationMode::Full,
 
 
 
@@ -2771,14 +2695,6 @@ impl TurnExecutionControl {
         }
     }
 
-    pub(crate) fn set_validation_policy(&mut self, mode: ValidationMode) {
-        self.validation_mode = mode;
-    }
-
-    pub(crate) fn validation_repair_available(&self) -> bool {
-        self.validation_mode != ValidationMode::Off
-    }
-
     pub(crate) fn with_active_plan(
         mut self,
         plan: Option<crate::plan_store::PlanExecutionSnapshot>,
@@ -2803,18 +2719,6 @@ impl TurnExecutionControl {
     /// unchanged advances only the mutation revision.
     pub(crate) fn validation_revision_at(&self, mutation_revision: u64) -> u64 {
         mutation_revision
-    }
-
-    /// Whether this turn changed sources by the settled `mutation_revision`.
-    /// Each turn's diff tracker starts at validation revision zero. Patches,
-    /// declared writes, workspace changes no command declared, and command
-    /// effects neither a Git baseline nor a bounded non-Git tree capture could
-    /// rule out advance it; an uncertain command whose Git-visible workspace
-    /// (outside Git, its bounded workspace tree) was unchanged does not.
-    /// Without a change, every current failure was observed against the
-    /// turn-start sources.
-    pub(crate) fn changed_sources(&self, mutation_revision: u64) -> bool {
-        self.validation_revision_at(mutation_revision) != 0
     }
 
 
@@ -3114,7 +3018,6 @@ impl TurnExecutionControl {
             state: Arc::new(Mutex::new(SamplingRequestSignalState::default())),
             dispatch_ledger: Some(Arc::clone(&self.dispatch_ledger)),
             request_state_revision: baselines.revision_key(),
-            request_mutation_revision: baselines.mutation_revision,
             request_ordinal: self.next_validation_request.fetch_add(1, Ordering::Relaxed),
         }
     }
@@ -3639,13 +3542,6 @@ impl TurnExecutionControl {
             settled.tool_exposure_revision,
         )
     }
-
-    /// Retain only validation whose full dependency graph is disjoint from
-    /// exact effects recorded by the existing turn diff owner. Package names
-    /// and net-diff equality alone are not independence proofs. Each settlement
-    /// first adopts the tracker's validation revisions; `revision` is the settled
-    /// mutation revision.
-
 
     pub(crate) fn settle(
         &mut self,

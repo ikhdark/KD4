@@ -538,7 +538,7 @@ async fn run_exec_like_with_exit_code_inner(
 ) -> Result<RunExecLikeResult, FunctionCallError> {
     let RunExecLikeArgs {
         max_output_tokens,
-        validation: command_validation,
+        validation: _,
         tool_name,
         exec_params,
         stall_timeout_ms,
@@ -699,7 +699,6 @@ async fn run_exec_like_with_exit_code_inner(
         safety_command.clone(),
         exec_params.cwd.clone(),
         source,
-        turn_environment.environment_id.clone(),
     )
     .with_model_command_text(hook_command.clone())
     .with_captured_environment(&turn_environment)

@@ -110,7 +110,7 @@ impl OutputDeltaLimiter {
             return OutputDeltaDecision::Suppress;
         }
         if self.emitted.fetch_add(1, Ordering::Relaxed) < MAX_EXEC_OUTPUT_DELTAS_PER_CALL
-            && self.emitted_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bytes| {
+            && self.emitted_bytes.try_update(Ordering::Relaxed, Ordering::Relaxed, |bytes| {
                 bytes.checked_add(chunk_bytes)
                     .filter(|total| *total <= MAX_EXEC_OUTPUT_DELTA_BYTES_PER_CALL)
             }).is_ok()
@@ -474,7 +474,7 @@ pub fn build_exec_request(
         command,
         codex_home,
         cwd,
-        mut env,
+        env,
         expiration,
         capture_policy,
         windows_sandbox_level,
@@ -729,7 +729,7 @@ async fn exec_windows_sandbox(
         command,
         codex_home,
         cwd,
-        mut env,
+        env,
         expiration,
         capture_policy,
         windows_sandbox_level,
@@ -1099,7 +1099,7 @@ async fn exec(
         command,
         codex_home: _,
         cwd,
-        mut env,
+        env,
         arg0,
         expiration,
         capture_policy,

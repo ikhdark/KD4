@@ -103,8 +103,10 @@ impl SnapshotCache {
             let removed = {
                 let mut state = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let mut removed = take_path_entries(&mut state, path);
-                if state.entries.len() >= MAX_ENTRIES {
-                    if let Some(entry) = state.entries.pop_front() { removed.push(entry); }
+                if state.entries.len() >= MAX_ENTRIES
+                    && let Some(entry) = state.entries.pop_front()
+                {
+                    removed.push(entry);
                 }
                 removed
             };
@@ -173,7 +175,7 @@ impl SnapshotCache {
                         let mut index = 0;
                         while index < state.entries.len() {
                             if state.entries[index].expires <= now {
-                                removed.push(state.entries.remove(index).expect("present cache entry"));
+                                removed.extend(state.entries.remove(index));
                             } else { index += 1; }
                         }
                         let next = state.entries.iter().map(|entry| entry.expires).min();
@@ -208,7 +210,7 @@ fn take_path_entries(state: &mut State, path: &Path) -> Vec<Arc<Entry>> {
     let mut index = 0;
     while index < state.entries.len() {
         if state.entries[index].path == path {
-            removed.push(state.entries.remove(index).expect("present cache entry"));
+            removed.extend(state.entries.remove(index));
         } else {
             index += 1;
         }

@@ -142,6 +142,10 @@ struct CommandExecutionCompletionItem {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "Rollback responses hold the thread-list mutation permit while capturing a coherent thread view"
+)]
 pub(crate) async fn apply_bespoke_event_handling(
     event: Event,
     conversation_id: ThreadId,

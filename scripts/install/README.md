@@ -18,51 +18,35 @@ The standalone package layout is supported from Codex `0.133.0` onward. The
 installer rejects older releases before requesting release assets; the retired
 platform npm archive layout is not probed or installed.
 
+## Build profiles
+
+The configured Cargo profiles and publisher `-Profile` values are `dev`,
+`release` (final), and `pgo`. The publisher defaults to `release`.
+
 ## Final builds
 
-`release` and `local-release` share the same settings: optimization level 3,
-Thin LTO, one codegen unit for workspace crates and dependencies, and
-incremental compilation disabled. `release` owns these settings; `local-release` inherits them
-without overrides so they cannot drift. Windows builds retain native CPU tuning,
+`release` uses optimization level 3, no debug info (`debug = 0`), Thin LTO,
+one codegen unit for workspace crates and runtime dependencies, and incremental
+compilation disabled. Build scripts, proc macros, and build-only dependencies
+retain Cargo's build defaults. `pgo` inherits these settings.
+Windows builds retain native CPU tuning,
 the 8 MiB stack, and static CRT from the shared Cargo configuration.
 
 The local publisher explicitly enables `/OPT:REF` (unused-code removal) and
-`/OPT:ICF` (identical COMDAT folding) for Windows MSVC `local-release` builds and
-both PGO passes. These flags join the shared target flags; debug and `local-fast`
-publishes are unchanged. Direct Cargo builds do not use this publisher overlay.
+`/OPT:ICF` (identical COMDAT folding) for Windows MSVC `release` builds and
+both PGO passes. These flags join the shared target flags; dev publishes are
+unchanged. Direct Cargo builds do not use this publisher overlay.
 
 `just publish-local-codex-final` remains the normal local publish command. It uses
-the `local-release` name and its separate build directory; `cargo build --release`
+the `release` profile and `codex-rs/target/publish-release` build directory; `cargo build --release`
 uses the same optimization settings but does not install or restart Desktop.
 
-The publisher does not accept `-Profile release`. Use
-`just publish-local-codex-final` (or `-Profile local-release`) for final publishing.
+Use `just publish-local-codex-final` (or `-Profile release`) for final publishing.
 
-## Fast repeated local publishes
+## Local publishing
 
-From the checkout root, run `just publish-local-codex-fast`, or invoke
-`scripts/install/publish-local-codex-fast.ps1` directly in PowerShell.
-Publisher options are forwarded, for example:
-
-```powershell
-just publish-local-codex-fast -BuildOnly
-just publish-local-codex-fast
-```
-
-The `local-fast` profile prioritizes build speed, not runtime speed. It inherits
-release behavior (debug assertions and overflow checks remain disabled), uses
-optimization level 0, disables debug info and LTO, enables incremental compilation,
-and uses 16 workspace codegen units
-and four dependency codegen units rather than the final profile's one.
-It targets shorter rebuilds after local edits, at the cost of runtime optimization
-and source-level backtraces. No speedup has been benchmarked. All crates, including
-`icu_calendar`, use optimization level 0; final builds are unaffected.
-The first build warms a separate `codex-rs/target/publish-local-fast` cache;
-keep that directory for subsequent builds. Unchanged inputs and artifacts reuse
-the existing content-bound build stamp and skip Cargo entirely.
-
-This uses the existing publisher for the CLI, Code Mode host, and both sandbox
-helpers, including freshness checks, rollback, Desktop configuration, and restart
+The publisher builds the CLI, Code Mode host, and both sandbox helpers,
+including freshness checks, rollback, Desktop configuration, and restart
 safety. Desktop uses the fork home (`C:\Users\kuh\Desktop\LOCAL-KD`), not the
 upstream home. Publishing can restart Desktop; `-BuildOnly` only prepares the
 bundle. Existing protections may defer activation when invoked inside Codex.
@@ -90,8 +74,8 @@ recovery first. Mutex ownership is released even when recovery fails.
 `publish-local-codex-pgo.ps1` orchestrates four explicit stages. Running
 `just publish-local-codex-pgo` defaults to **Prepare**, not installation. It uses
 the existing publisher for Cargo builds, build stamps, transactional installation,
-fork-home routing, rollback, and live-chat/restart protection. Fast/final recipes
-remain available unchanged. No speedup is assumed or promised.
+fork-home routing, rollback, and live-chat/restart protection. The final recipe
+remains available unchanged. No speedup is assumed or promised.
 
 Install the matching profiler tools once, from `codex-rs` (not a random system LLVM):
 
@@ -109,7 +93,7 @@ just publish-local-codex-pgo -Stage Optimize
 just publish-local-codex-pgo -Stage Publish
 ```
 
-Prepare builds `local-pgo-instrumented` and copies the CLI, Code Mode host, and
+Prepare builds an instrumented `pgo` bundle and copies the CLI, Code Mode host, and
 sandbox helpers into a private training bundle. It cannot install that bundle.
 Train runs **your selected PowerShell script**, which must perform representative
 workloads, check their outcomes, fail with a nonzero exit code on failure, and wait
@@ -137,10 +121,13 @@ The wrapper does not launch Desktop, copy credentials, or invent a training corp
 credentials/configuration remain in use unless you select `-LocalCodexHome`.
 
 Optimize merges only the last successful training run with the pinned toolchain's
-`llvm-profdata`, then builds `local-pgo` without installing it. Both PGO profiles
-use the same `local-pgo` Cargo profile (inheriting final optimization settings), with
+`llvm-profdata`, then builds optimized `pgo` binaries without installing them. Both passes
+use the same `pgo` Cargo profile (inheriting `release` settings), with
 incremental compilation disabled and separate, explicitly targeted Cargo output
-directories. Using the same Cargo profile preserves crate identities across the
+directories and build stamps. `publish-pgo-instrumented` is an output directory,
+not another profile. `-PgoGenerateDirectory` selects instrumentation;
+`-PgoProfileData` selects optimization, and the publisher requires exactly one.
+Using the same Cargo profile preserves crate identities across the
 instrumentation/use passes. Windows stack,
 static CRT, and native-CPU flags are preserved; sccache is bypassed. Ambient global
 Rust flags and Cargo profile/incremental overrides are rejected.

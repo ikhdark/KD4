@@ -97,6 +97,10 @@ impl CodexHomeUserInstructionsProvider {
 }
 
 impl UserInstructionsProvider for CodexHomeUserInstructionsProvider {
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serialize observations with commits so an older read cannot restore removed instructions"
+    )]
     fn load_user_instructions(&self) -> LoadInstructionsFuture<'_> {
         Box::pin(async move {
             // Serialize observations as well as commits, so an older read cannot

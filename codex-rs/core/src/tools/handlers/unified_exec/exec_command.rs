@@ -843,7 +843,7 @@ impl ExecCommandHandler {
             &command,
         ).await {
             Ok(permit) => permit,
-            Err(refusal) => return Ok(boxed_tool_output(refusal)),
+            Err(refusal) => return Ok(refusal),
         };
         let attempt_phase =
             crate::tools::tool_dispatch_trace::begin_tool_phase("exec_attempt_freshness");

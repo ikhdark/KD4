@@ -146,7 +146,7 @@ fn credential_fingerprint(tokens: &StoredOAuthTokens) -> Result<String> {
     let payload = serde_json::json!({
         "server_name": tokens.server_name, "url": tokens.url, "client_id": tokens.client_id,
         "access_token": response.access_token().secret(),
-        "refresh_token": response.refresh_token().map(|value| value.secret()),
+        "refresh_token": response.refresh_token().map(RefreshToken::secret),
         "scopes": response.scopes().map(|values| values.iter().map(|scope| scope.to_string()).collect::<Vec<_>>()).unwrap_or_default(),
         "expires_at": tokens.expires_at,
     });
@@ -937,7 +937,7 @@ impl OAuthPersistenceState {
 }
 
 impl OAuthPersistor {
-
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         server_name: String,
         url: String,

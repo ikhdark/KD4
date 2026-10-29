@@ -173,7 +173,7 @@ mod windows_impl {
             };
             let admission = crate::runner_client::RunnerAdmission::new({
                 let cancellation = cancellation.clone();
-                move || cancellation.as_ref().is_some_and(|token| token.is_cancelled())
+                move || cancellation.as_ref().is_some_and(crate::WindowsSandboxCancellationToken::is_cancelled)
             });
             let transport = retry_runner_spawn_once(
                 sandbox_creds,
@@ -254,7 +254,7 @@ mod windows_impl {
                             // frames and closes that pipe while output already in flight is
                             // still delivered; it needs no further credits, and its Exit frame
                             // (or pipe EOF) still ends this loop.
-                            if !cancellation.as_ref().is_some_and(|token| token.is_cancelled())
+                            if !cancellation.as_ref().is_some_and(crate::WindowsSandboxCancellationToken::is_cancelled)
                                 && let Ok(pipe) = pipe_write.lock()
                                 && let Err(err) = crate::runner_client::write_control_frame(&pipe, &ack)
                                 && !err.downcast_ref::<std::io::Error>().is_some_and(|err| err.kind() == std::io::ErrorKind::BrokenPipe)

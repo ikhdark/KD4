@@ -1,9 +1,7 @@
 use super::*;
 use crate::agent::task_capabilities::ColdReviewContext;
 use crate::agent::task_capabilities::ColdReviewContextInput;
-use crate::agent::task_capabilities::RiskPolicyInput;
 use crate::agent::task_capabilities::build_cold_review_context;
-use crate::agent::task_capabilities::derive_risk_policy;
 use codex_agent_task_store::AcceptanceCriterion;
 use codex_agent_task_store::AgentGate;
 use codex_agent_task_store::AgentReceipt;
@@ -25,14 +23,12 @@ use codex_agent_task_store::GateStatus;
 use codex_agent_task_store::MAX_OBSERVATION_LIMIT;
 use codex_agent_task_store::ReceiptDraft;
 use codex_agent_task_store::RelationKind;
-use codex_agent_task_store::RepoScope;
 use codex_agent_task_store::RiskDomain;
 use codex_agent_task_store::StoreError;
 use codex_agent_task_store::TaskActor;
 use codex_agent_task_store::ValidationCall;
 use codex_git_utils::get_git_repo_root;
 use codex_protocol::ThreadId;
-use codex_protocol::validation::ValidationResult;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
@@ -295,15 +291,6 @@ async fn handle_submit_agent_receipt(
     Ok(boxed_tool_output(SubmitAgentReceiptResult { receipt }))
 }
 
-#[derive(Default)]
-struct ParsedRiskHints {
-    high_risk_paths: Vec<RepoScope>,
-    contracts: Vec<String>,
-    domains: Vec<RiskDomain>,
-}
-
-
-
 async fn build_evaluation_context(
     session: &crate::session::session::Session,
     cwd: &Path,
@@ -367,7 +354,7 @@ async fn build_evaluation_context(
         })
         .into_iter()
         .collect();
-    let mut relevant_contracts = parse_risk_hints(&target.assignment.risk_hints).contracts;
+    let mut relevant_contracts = parse_risk_hint_contracts(&target.assignment.risk_hints);
     if let Some(contract) = target
         .receipt
         .as_ref()
@@ -510,10 +497,10 @@ fn build_receipt_handoff(
     })
 }
 
-fn parse_risk_hints(hints: &[String]) -> ParsedRiskHints {
-    let mut paths = BTreeSet::new();
+/// Contract risks named by root-authored hints. Path and risk-domain hints are
+/// not contracts.
+fn parse_risk_hint_contracts(hints: &[String]) -> Vec<String> {
     let mut contracts = BTreeSet::new();
-    let mut domains = BTreeSet::new();
     for hint in hints {
         let hint = hint.trim();
         if hint.is_empty() {
@@ -522,7 +509,6 @@ fn parse_risk_hints(hints: &[String]) -> ParsedRiskHints {
         if let Some((kind, value)) = hint.split_once(':') {
             let value = value.trim();
             if kind.trim().eq_ignore_ascii_case("path") && !value.is_empty() {
-                paths.insert(value.to_string());
                 continue;
             }
             if kind.trim().eq_ignore_ascii_case("contract") && !value.is_empty() {
@@ -530,24 +516,12 @@ fn parse_risk_hints(hints: &[String]) -> ParsedRiskHints {
                 continue;
             }
         }
-        if let Some(domain) = risk_domain_from_hint(hint) {
-            domains.insert(domain);
-        } else {
+        if risk_domain_from_hint(hint).is_none() {
             // Unstructured root-authored hints are conservatively treated as contract risks.
             contracts.insert(hint.to_string());
         }
     }
-    ParsedRiskHints {
-        high_risk_paths: paths
-            .into_iter()
-            .map(|path| RepoScope {
-                path,
-                recursive: true,
-            })
-            .collect(),
-        contracts: contracts.into_iter().collect(),
-        domains: domains.into_iter().collect(),
-    }
+    contracts.into_iter().collect()
 }
 
 fn risk_domain_from_hint(hint: &str) -> Option<RiskDomain> {
@@ -1067,7 +1041,6 @@ impl Serialize for SubmitAgentReceiptResult {
 const TASK_OUTPUT_INLINE_LIMIT_BYTES: usize = 8 * 1024;
 const MAX_PROJECTED_CHANGED_PATHS: usize = 8;
 const MAX_PROJECTED_PROOF_REFERENCES: usize = 8;
-const MAX_PROJECTED_VALIDATION_CALLS: usize = 8;
 const MAX_PROJECTED_RECENT_OBSERVATIONS: usize = 4;
 const MAX_PROJECTED_OBLIGATIONS_PER_KIND: usize = 4;
 const MAX_PROJECTED_EXACT_STRING_BYTES: usize = 192;
@@ -1090,7 +1063,7 @@ fn bounded_receipt_projection_with_proof_limit(
             .map(|change| change.path.as_str()),
         MAX_PROJECTED_CHANGED_PATHS,
     );
-    let (proof_references, omitted_proof_references) = bounded_exact_strings(
+    let (_, omitted_proof_references) = bounded_exact_strings(
         receipt.validation_call_ids.iter().map(String::as_str),
         proof_limit,
     );

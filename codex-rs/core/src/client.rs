@@ -1392,7 +1392,7 @@ fn measure_responses_request_after_dispatch(
                     let serialized_input = measured_full_encoded_input
                         .then_some(())
                         .filter(|_| request.input.as_ref() == prompt.input.as_ref())
-                        .and_then(|_| encoded_request.as_deref())
+                        .and(encoded_request.as_deref())
                         .and_then(|encoded| {
                             serde_json::from_slice::<EncodedManifestInput<'_>>(encoded).ok()
                         });
@@ -1518,18 +1518,19 @@ impl ModelAttemptClock {
         if observation.phase == "scoped_output_tokens" {
             return;
         }
-        if observation.phase == "completed" && let Some(receipts) = offsets.token_receipts.as_mut() {
-            if receipts.scopes.is_none() {
-                receipts.text_delta_bytes = observation.text_delta_bytes;
-                receipts.text_final_bytes = observation.text_final_bytes;
-                receipts.text_complete = observation.text_token_receipts_complete && !receipts.invalid
-                    && receipts.basis == "provider_output_text_logprobs"
-                    && observation.text_delta_bytes > 0
-                    && observation.text_delta_bytes == observation.text_final_bytes;
-                receipts.reported_output_tokens = observation.reported_output_tokens;
-                receipts.complete = observation.token_receipts_complete && !receipts.invalid
-                    && observation.reported_output_tokens == Some(receipts.token_count);
-            }
+        if observation.phase == "completed"
+            && let Some(receipts) = offsets.token_receipts.as_mut()
+            && receipts.scopes.is_none()
+        {
+            receipts.text_delta_bytes = observation.text_delta_bytes;
+            receipts.text_final_bytes = observation.text_final_bytes;
+            receipts.text_complete = observation.text_token_receipts_complete && !receipts.invalid
+                && receipts.basis == "provider_output_text_logprobs"
+                && observation.text_delta_bytes > 0
+                && observation.text_delta_bytes == observation.text_final_bytes;
+            receipts.reported_output_tokens = observation.reported_output_tokens;
+            receipts.complete = observation.token_receipts_complete && !receipts.invalid
+                && observation.reported_output_tokens == Some(receipts.token_count);
         }
         let evidence = offsets.provider_observations.get_or_insert_with(|| ProviderObservations {
             version: 1, ..Default::default()
@@ -4927,7 +4928,6 @@ impl ModelClientSession {
         >,
     ) -> Result<(
         ResponsesWsRequest,
-        bool,
         Option<ResponsesApiRequest>,
         Option<VerifiedRequestHistory>,
     )> {
@@ -4954,13 +4954,10 @@ impl ModelClientSession {
         let Some(last_response) = last_response else {
             return Ok((
                 ResponsesWsRequest::ResponseCreate(payload),
-                false,
                 logical_request_override,
                 None,
             ));
         };
-        let previous_response_id_from_untraced_warmup =
-            self.websocket_session.last_response_from_untraced_warmup;
         if !tool_history_substitutions.is_empty() && !self.tool_history_fail_open_pending {
             if !crate::tool_history::substitutions_match_items(
                 tool_history_substitutions,
@@ -5004,7 +5001,6 @@ impl ModelClientSession {
                     payload.input = incremental_items.into();
                     return Ok((
                         ResponsesWsRequest::ResponseCreate(payload),
-                        previous_response_id_from_untraced_warmup,
                         Some(fallback_request),
                         verified_history,
                     ));
@@ -5016,7 +5012,6 @@ impl ModelClientSession {
                 payload.input = fallback_request.input.clone();
                 return Ok((
                     ResponsesWsRequest::ResponseCreate(payload),
-                    false,
                     Some(fallback_request),
                     None,
                 ));
@@ -5032,7 +5027,6 @@ impl ModelClientSession {
             );
             return Ok((
                 ResponsesWsRequest::ResponseCreate(payload),
-                false,
                 logical_request_override,
                 None,
             ));
@@ -5042,7 +5036,6 @@ impl ModelClientSession {
             trace!("incremental request failed, no previous response id");
             return Ok((
                 ResponsesWsRequest::ResponseCreate(payload),
-                false,
                 logical_request_override,
                 None,
             ));
@@ -5054,7 +5047,6 @@ impl ModelClientSession {
                 input: incremental_items.into(),
                 ..payload
             }),
-            previous_response_id_from_untraced_warmup,
             logical_request_override,
             verified_history,
         ))
@@ -5279,9 +5271,10 @@ impl ModelClientSession {
                 .await
             {
                 Ok(_) => return Ok(()),
-                Err(ApiError::Transport(TransportError::Http { status, .. }))
-                    if matches!(status, StatusCode::FORBIDDEN | StatusCode::UPGRADE_REQUIRED) =>
-                {
+                Err(ApiError::Transport(TransportError::Http {
+                    status: StatusCode::FORBIDDEN | StatusCode::UPGRADE_REQUIRED,
+                    ..
+                })) => {
                     // An upgrade can be blocked even when ordinary HTTPS works. No prompt
                     // was sent; let HTTP report any actual authorization failure.
                     self.client.force_http_fallback(session_telemetry);
@@ -5480,7 +5473,7 @@ impl ModelClientSession {
                     self.dispatched_account = client_setup.auth.as_ref()
                         .and_then(crate::responses_retry::AccountChangeIdentity::from_auth);
                     let compression = self.responses_request_compression(client_setup.auth.as_ref());
-                    let mut options = self
+                    let options = self
                         .build_responses_options(
                             responses_metadata,
                             compression,
@@ -5738,8 +5731,6 @@ impl ModelClientSession {
                         Err(ApiError::Transport(unauthorized_transport))
                             if is_recoverable_authentication_failure(&unauthorized_transport) =>
                         {
-                            let response_debug_context =
-                                extract_response_debug_context(&unauthorized_transport);
                             finish_failed_model_attempt(&mut attempt, Vec::new());
                             pending_retry = PendingUnauthorizedRetry::from_recovery(
                                 handle_unauthorized(
@@ -5756,7 +5747,6 @@ impl ModelClientSession {
                             continue;
                         }
                         Err(err) => {
-                            let response_debug_context = extract_response_debug_context_from_api_error(&err);
                             let err = self.client.state.provider.map_api_error(err);
                             finish_failed_model_attempt(&mut attempt, Vec::new());
                             return Err(err);
@@ -5958,9 +5948,10 @@ impl ModelClientSession {
             }
             match connection_result {
                 Ok(_) => {}
-                Err(ApiError::Transport(TransportError::Http { status, .. }))
-                    if matches!(status, StatusCode::FORBIDDEN | StatusCode::UPGRADE_REQUIRED) =>
-                {
+                Err(ApiError::Transport(TransportError::Http {
+                    status: StatusCode::FORBIDDEN | StatusCode::UPGRADE_REQUIRED,
+                    ..
+                })) => {
                     // Only a rejected handshake is replayable here, never a 403 from an
                     // established response stream or the subsequent HTTP request.
                     return Ok(WebsocketStreamOutcome::FallbackToHttp);
@@ -6016,18 +6007,14 @@ impl ModelClientSession {
                     Ok(fallback_request)
                 }))
             };
-            let (
-                mut ws_request,
-                previous_response_id_from_untraced_warmup,
-                tool_history_fail_open_override,
-                mut verified_history,
-            ) = self.prepare_websocket_request(
-                ws_payload,
-                &request,
-                prompt.stable_context_manifest.fingerprint(),
-                tool_history_substitutions,
-                build_tool_history_fail_open_request,
-            )?;
+            let (mut ws_request, tool_history_fail_open_override, mut verified_history) =
+                self.prepare_websocket_request(
+                    ws_payload,
+                    &request,
+                    prompt.stable_context_manifest.fingerprint(),
+                    tool_history_substitutions,
+                    build_tool_history_fail_open_request,
+                )?;
             let mut selected_representation = SelectedInputRepresentation::default();
             if let Some(fallback_request) = tool_history_fail_open_override {
                 request = fallback_request;
@@ -6420,8 +6407,6 @@ impl ModelClientSession {
             let stream_result = match stream_result {
                 Ok(stream) => stream,
                 Err(err) => {
-                    let response_debug_context =
-                        extract_response_debug_context_from_api_error(&err);
                     let err = self.client.state.provider.map_api_error(err);
                     finish_failed_model_attempt(&mut attempt, Vec::new());
                     return Err(err);

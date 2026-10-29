@@ -124,7 +124,6 @@ impl StartupClock for SystemStartupClock {
 pub(crate) enum StartupPhase {
     TransportPreconnect,
     PrewarmPreparation,
-    PrewarmRequest,
     FirstTurnPrewarmWait,
     ExecutorReadiness,
 }
@@ -134,6 +133,8 @@ pub(crate) struct StartupPhaseTiming {
     pub(crate) session_initialization_ns: u128,
     pub(crate) transport_preconnect_ns: u128,
     pub(crate) prewarm_preparation_ns: u128,
+    /// Always zero: startup no longer sends a prewarm request. Kept because
+    /// schema-3 consumers require `startup_prewarm_request_ns`.
     pub(crate) prewarm_request_ns: u128,
     pub(crate) first_turn_prewarm_wait_ns: u128,
     pub(crate) executor_readiness_ns: u128,
@@ -208,7 +209,6 @@ impl std::fmt::Debug for StartupTimingState {
 struct ActivePhases {
     transport_preconnect: u32,
     prewarm_preparation: u32,
-    prewarm_request: u32,
     first_turn_prewarm_wait: u32,
     executor_readiness: u32,
 }
@@ -342,7 +342,6 @@ impl StartupTimingState {
         inner.prewarm_status = Some(status.to_string());
         inner.active.transport_preconnect = 0;
         inner.active.prewarm_preparation = 0;
-        inner.active.prewarm_request = 0;
         let event = inner.lifecycle_event(self.clock.sample(), "cancellation_requested", None, None, Some(status));
         drop(inner);
         if let Some(event) = event { event.trace(); }
@@ -479,13 +478,6 @@ impl StartupTimingInner {
                 &mut self.saturation_count,
             );
         }
-        if self.active.prewarm_request > 0 {
-            add_saturating(
-                &mut self.phases.prewarm_request_ns,
-                elapsed_ns,
-                &mut self.saturation_count,
-            );
-        }
         if self.active.first_turn_prewarm_wait > 0 {
             add_saturating(
                 &mut self.phases.first_turn_prewarm_wait_ns,
@@ -528,9 +520,8 @@ impl StartupTimingInner {
         // Mandatory pre-turn compaction can enter the transport before the
         // regular-turn prewarm handoff. Observe unfinished speculative work
         // truthfully at this cutoff; only unfinished required work is invalid.
-        let speculative_active = self.active.transport_preconnect > 0
-            || self.active.prewarm_preparation > 0
-            || self.active.prewarm_request > 0;
+        let speculative_active =
+            self.active.transport_preconnect > 0 || self.active.prewarm_preparation > 0;
         if self.active.first_turn_prewarm_wait > 0 || self.active.executor_readiness > 0 {
             self.invalid_transition();
         }
@@ -565,7 +556,6 @@ impl StartupTimingInner {
         match phase {
             StartupPhase::TransportPreconnect => &mut self.active.transport_preconnect,
             StartupPhase::PrewarmPreparation => &mut self.active.prewarm_preparation,
-            StartupPhase::PrewarmRequest => &mut self.active.prewarm_request,
             StartupPhase::FirstTurnPrewarmWait => &mut self.active.first_turn_prewarm_wait,
             StartupPhase::ExecutorReadiness => &mut self.active.executor_readiness,
         }
@@ -578,10 +568,7 @@ impl StartupTimingInner {
 
 impl StartupPhase {
     fn is_speculative(self) -> bool {
-        matches!(
-            self,
-            Self::TransportPreconnect | Self::PrewarmPreparation | Self::PrewarmRequest
-        )
+        matches!(self, Self::TransportPreconnect | Self::PrewarmPreparation)
     }
 }
 

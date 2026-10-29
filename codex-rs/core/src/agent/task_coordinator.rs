@@ -71,6 +71,10 @@ struct InitializedTaskStore {
 type SuiteBudgets =
     HashMap<(String, String), Arc<codex_command_analysis::command_preflight::FullSuiteBudget>>;
 
+/// Last successful heartbeat renewal per assignment; each slot serializes one actor's renewals.
+type HeartbeatReceipts =
+    HashMap<AssignmentId, Arc<tokio::sync::Mutex<Option<TypedActorHeartbeatReceipt>>>>;
+
 /// Trusted validation policy captured from the current root turn before child startup.
 #[derive(Clone, Debug)]
 pub(crate) struct ValidationTurnContext {
@@ -98,7 +102,7 @@ pub(crate) struct AgentTaskCoordinator {
     /// pending for their delivery owner; another pass would only rewrite the
     /// same idempotent evidence and bump the task revision.
     reconciled_terminal_outcomes: Arc<Mutex<HashSet<(AttemptId, String)>>>,
-    heartbeat_receipts: Arc<Mutex<HashMap<AssignmentId, Arc<tokio::sync::Mutex<Option<TypedActorHeartbeatReceipt>>>>>>,
+    heartbeat_receipts: Arc<Mutex<HeartbeatReceipts>>,
 }
 
 struct TypedActorHeartbeatReceipt {
@@ -329,6 +333,10 @@ impl AgentTaskCoordinator {
         Ok(admitted)
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serialize durable assignment recovery and binding cache invalidation"
+    )]
     pub(crate) async fn recover_unstarted_assignments(&self) -> StoreResult<()> {
         self.reconcile_pending_terminal_outcomes().await?;
         let Some(initialized) = self.store.get() else {
@@ -569,6 +577,10 @@ impl AgentTaskCoordinator {
         self.heartbeat_typed_actor_binding_inner(binding, progress, false).await
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Single-flight renewal per actor so concurrent callers share one receipt"
+    )]
     async fn heartbeat_typed_actor_binding_inner(
         &self,
         binding: &AgentTaskBinding,

@@ -467,26 +467,6 @@ pub async fn git_diff_to_remote(cwd: &Path) -> Option<GitDiffToRemote> {
     })
 }
 
-/// Read staged index entries for literal paths using the bounded Git runner.
-/// A timeout or failed query leaves callers free to use their fallback modes.
-pub async fn git_index_entries(cwd: &Path, paths: &[PathBuf]) -> Option<Vec<u8>> {
-    if paths.is_empty() {
-        return Some(Vec::new());
-    }
-    let mut args = ["--literal-pathspecs", "ls-files", "--stage", "-z", "--"]
-        .map(OsString::from)
-        .to_vec();
-    args.extend(paths.iter().map(|path| path.as_os_str().to_owned()));
-    let output = run_git_command_with_timeout_os_from(
-        crate::git_executable_async().await,
-        &args,
-        cwd,
-        crate::FsmonitorOverride::Disabled,
-    )
-    .await?;
-    output.status.success().then_some(output.stdout)
-}
-
 /// Run a git command with a timeout to prevent blocking on large repositories
 async fn run_git_command_with_timeout(args: &[&str], cwd: &Path) -> Option<std::process::Output> {
     // These callers only inspect repository metadata. Worktree workflows probe

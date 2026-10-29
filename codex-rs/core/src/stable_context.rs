@@ -857,10 +857,6 @@ pub(crate) fn project_compaction_context(items: Arc<[ResponseItem]>) -> Vec<Resp
 /// one the model already received rewrites the request at its position, so
 /// the provider re-bills everything after it uncached. Each snapshot states
 /// that it replaces earlier ones; compaction keeps only the latest.
-pub(crate) fn project_sampling_history_context(items: Arc<[ResponseItem]>) -> Vec<ResponseItem> {
-    project_sampling_history_with_receipt(items).items.to_vec()
-}
-
 pub(crate) fn project_sampling_history_with_receipt(items: Arc<[ResponseItem]>) -> StableContextProjection {
     project_stable_context_inner(items, StableContextTarget::Sampling, true, true, true)
 }

@@ -22,11 +22,9 @@ pub(crate) use codex_command_analysis::command_mutation::CommandMutation;
 pub(crate) use codex_command_analysis::command_mutation::command_is_read_only_git;
 pub(crate) use codex_command_analysis::command_mutation::command_mutation;
 pub(crate) use codex_command_analysis::command_mutation::command_reads_repository_history;
-pub(crate) use codex_command_analysis::command_mutation::resolve_uncertain_command_observation;
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 const DEV_NULL: &str = "/dev/null";
-const REGULAR_FILE_MODE: &str = "100644";
 // Normal edits finish well within 100 ms; pathological inputs fall back to a coarse,
 // content-exact diff without stalling tool completion.
 const DIFF_TIMEOUT: Duration = Duration::from_millis(100);
@@ -55,15 +53,6 @@ impl TrackedPath {
             path,
             comparison_key,
         }
-    }
-
-    fn is_within(&self, root: &Self, windows: bool) -> bool {
-        if self.environment_id != root.environment_id { return false; }
-        let Some(rest) = self.comparison_key.strip_prefix(&root.comparison_key) else {
-            return false;
-        };
-        rest.is_empty() || rest.starts_with("2f") || root.comparison_key.ends_with("2f")
-            || (windows && (rest.starts_with("5c") || root.comparison_key.ends_with("5c")))
     }
 }
 
@@ -206,20 +195,6 @@ impl TurnDiffTracker {
             .filter(|batch| batch.accepts_call(call_id))
     }
 
-    pub(crate) fn clear_workspace_evidence_generation_batch(
-        &mut self,
-        batch: &Arc<crate::tools::parallel::WorkspaceEvidenceGenerationBatch>,
-    ) {
-        let active_is_batch = self
-            .workspace_evidence_generation_batch
-            .as_ref()
-            .and_then(Weak::upgrade)
-            .is_some_and(|active| Arc::ptr_eq(&active, batch));
-        if active_is_batch {
-            self.workspace_evidence_generation_batch = None;
-        }
-    }
-
     pub fn with_environment_display_roots(
         display_roots: impl IntoIterator<Item = (String, PathBuf)>,
     ) -> Self {
@@ -285,10 +260,6 @@ impl TurnDiffTracker {
         if roots_changed || remote_changed {
             self.rerender_display_scope();
         }
-    }
-
-    pub fn track_delta(&mut self, environment_id: &str, delta: &AppliedPatchDelta) {
-        self.track_delta_for_call(environment_id, delta, None);
     }
 
     pub(crate) fn track_delta_for_call(
@@ -410,40 +381,6 @@ impl TurnDiffTracker {
         }
     }
 
-    pub(crate) fn missing_mode_paths(
-        &self,
-        environment_id: &str,
-        delta: &AppliedPatchDelta,
-    ) -> Vec<PathBuf> {
-        if !self.valid || !delta.is_exact() {
-            return Vec::new();
-        }
-        delta
-            .changes()
-            .iter()
-            .filter_map(|change| {
-                if !matches!(
-                    &change.change,
-                    AppliedPatchFileChange::Delete { .. }
-                        | AppliedPatchFileChange::Update {
-                            move_path: Some(_),
-                            ..
-                        }
-                ) {
-                    return None;
-                }
-                let path = TrackedPath::new(environment_id, &change.path);
-                if self.current_by_path.contains_key(&path)
-                    || self.baseline_by_path.contains_key(&path)
-                    || std::fs::symlink_metadata(&change.path).is_ok()
-                {
-                    return None;
-                }
-                Some(change.path.clone())
-            })
-            .collect()
-    }
-
     pub(crate) fn set_patch_modes(
         &mut self,
         environment_id: &str,
@@ -453,12 +390,6 @@ impl TurnDiffTracker {
             .into_iter()
             .map(|(path, mode)| (TrackedPath::new(environment_id, &path), mode))
             .collect();
-    }
-
-    pub(crate) fn patch_mode_root(&self, environment_id: &str) -> Option<&Path> {
-        self.display_roots_by_environment
-            .get(environment_id)
-            .map(PathBuf::as_path)
     }
 
     pub fn invalidate(&mut self) {
@@ -735,19 +666,8 @@ impl TurnDiffTracker {
         }))
     }
 
-    /// Returns the net diff of this turn's tracked edits when it is exact, or
-    /// the display paths whose changes it cannot diff. An empty list means
-    /// command effects invalidated the whole diff. Does not affect publication.
-    pub(crate) fn exact_unified_diff(&self) -> Result<Option<String>, Vec<String>> {
-        self.ensure_exact_diff()?;
-        let diff = if self.aggregate_dirty {
-            self.flatten_diff()
-        } else {
-            self.unified_diff.clone()
-        };
-        Ok(diff.filter(|diff| !diff.is_empty()))
-    }
-
+    /// Errs with the display paths whose changes it cannot diff. An empty list
+    /// means command effects invalidated the whole diff.
     fn ensure_exact_diff(&self) -> Result<(), Vec<String>> {
         if !self.valid {
             return Err(Vec::new());
@@ -1295,7 +1215,7 @@ impl TurnDiffTracker {
 }
 
 fn git_quote_path(path: &str) -> String {
-    if !path.bytes().any(|byte| byte < 32 || byte >= 127 || matches!(byte, b'"' | b'\\')) {
+    if !path.bytes().any(|byte| !(32..127).contains(&byte) || matches!(byte, b'"' | b'\\')) {
         return path.to_string();
     }
     let mut quoted = String::from("\"");
@@ -1322,111 +1242,8 @@ fn git_hunk_range(range: std::ops::Range<usize>) -> String {
     }
 }
 
-pub(crate) async fn resolve_patch_index_modes(
-    root: &Path,
-    paths: Vec<PathBuf>,
-) -> HashMap<PathBuf, String> {
-    let root = normalize_tracked_path(root);
-    let paths = paths
-        .into_iter()
-        .filter_map(|path| {
-            let path = normalize_tracked_path(&path);
-            strip_tracked_root(&path, &root).map(Path::to_path_buf)
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let mut modes = HashMap::new();
-    // Keep both the path count and command-line size bounded on Windows.
-    let mut start = 0;
-    while start < paths.len() {
-        let mut end = start;
-        let mut length = 0;
-        while end < paths.len() && end - start < 64 {
-            let next = paths[end].as_os_str().len() + 3;
-            if end > start && length + next > 16_000 {
-                break;
-            }
-            length += next;
-            end += 1;
-        }
-        if let Some(output) = codex_git_utils::git_index_entries(&root, &paths[start..end]).await {
-            for record in output.split(|byte| *byte == 0) {
-                let Some(tab) = memchr::memchr(b'\t', record) else {
-                    continue;
-                };
-                let fields = record[..tab]
-                    .split(|byte| *byte == b' ')
-                    .collect::<Vec<_>>();
-                if fields.len() != 3 || fields[2] != b"0" {
-                    continue;
-                }
-                let mode = match fields[0] {
-                    b"100644" => "100644",
-                    b"100755" => "100755",
-                    b"120000" => "120000",
-                    b"160000" => "160000",
-                    _ => continue,
-                };
-                #[cfg(unix)]
-                let path = {
-                    use std::os::unix::ffi::OsStrExt;
-                    PathBuf::from(std::ffi::OsStr::from_bytes(&record[tab + 1..]))
-                };
-                #[cfg(not(unix))]
-                let path = match std::str::from_utf8(&record[tab + 1..]) {
-                    Ok(path) => PathBuf::from(path),
-                    Err(_) => continue,
-                };
-                modes.insert(root.join(path), mode.to_owned());
-            }
-        }
-        start = end;
-    }
-    modes
-}
-
 fn normalize_tracked_path(path: &Path) -> PathBuf {
     lexically_normalize_path(dunce::simplified(path))
-}
-
-#[cfg(windows)]
-fn windows_path_comparison_key(path: &std::ffi::OsStr) -> std::ffi::OsString {
-    use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::ffi::OsStringExt;
-    // Retain Windows case aliases without converting invalid native units to U+FFFD.
-    let mut folded = Vec::new();
-    for character in char::decode_utf16(path.encode_wide()) {
-        match character {
-            Ok(character) => {
-                for lower in character.to_lowercase() {
-                    folded.extend_from_slice(lower.encode_utf16(&mut [0; 2]));
-                }
-            }
-            Err(error) => folded.push(error.unpaired_surrogate()),
-        }
-    }
-    std::ffi::OsString::from_wide(&folded)
-}
-
-fn strip_tracked_root<'a>(path: &'a Path, root: &Path) -> Option<&'a Path> {
-    if let Ok(relative) = path.strip_prefix(root) {
-        return Some(relative);
-    }
-    #[cfg(windows)]
-    {
-        let mut components = path.components();
-        for root_component in root.components() {
-            if windows_path_comparison_key(components.next()?.as_os_str())
-                != windows_path_comparison_key(root_component.as_os_str())
-            {
-                return None;
-            }
-        }
-        Some(components.as_path())
-    }
-    #[cfg(not(windows))]
-    None
 }
 
 fn lexically_normalize_path(path: &Path) -> PathBuf {
@@ -1449,33 +1266,6 @@ fn lexically_normalize_path(path: &Path) -> PathBuf {
         }
     }
     normalized
-}
-
-/// Whether a tracked path still holds this turn's expected content (`None`:
-/// deleted). Without a readable filesystem the content cannot be proven.
-async fn content_matches(
-    path: &Path,
-    executor_path: Option<&codex_utils_path_uri::PathUri>,
-    expected: Option<&str>,
-    fs: Option<&dyn codex_exec_server::ExecutorFileSystem>,
-) -> bool {
-    let Some(fs) = fs else { return false; };
-    let uri = executor_path.cloned().or_else(|| fs.uses_host_native_paths()
-        .then(|| codex_utils_path_uri::PathUri::from_host_native_path(path).ok()).flatten());
-    let Some(uri) = uri else {
-        return false;
-    };
-    let limit = expected.map_or(0, str::len);
-    match fs.get_metadata(&uri, None).await {
-        Ok(metadata) if expected.is_some() && metadata.is_file && !metadata.is_symlink => {}
-        Err(error) if expected.is_none() && error.kind() == std::io::ErrorKind::NotFound => return true,
-        _ => return false,
-    }
-    match (expected, fs.read_file_bounded(&uri, limit, None).await) {
-        (Some(expected), Ok(Some(actual))) => actual == expected.as_bytes(),
-        (None, Err(error)) => error.kind() == std::io::ErrorKind::NotFound,
-        _ => false,
-    }
 }
 
 fn git_blob_oid(data: &[u8]) -> String {

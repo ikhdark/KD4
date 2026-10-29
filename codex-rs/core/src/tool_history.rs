@@ -385,36 +385,6 @@ impl ToolHistoryCandidate {
         }).clone()
     }
 
-    fn render_receipt(
-        &self,
-        require_consumed: bool,
-        require_savings: bool,
-    ) -> Option<(&str, &str, u64)> {
-        if !self.complete
-            || !self.projection_eligible
-            || (require_consumed && self.consumed_by_generation.is_none())
-        {
-            return None;
-        }
-        let bounded_tokens = self.derived.bounded_model_output_tokens;
-        if require_savings && bounded_tokens < MINIMUM_RAW_TOKENS {
-            return None;
-        }
-        let rendered = self.derived.receipt.as_deref()?;
-        let receipt_tokens = self.derived.receipt_tokens;
-        let saved = bounded_tokens.saturating_sub(receipt_tokens);
-        let relative = saved
-            .saturating_mul(100)
-            .checked_div(bounded_tokens.max(1))
-            .unwrap_or(0);
-        if require_savings
-            && (saved < MINIMUM_SAVED_TOKENS || relative < MINIMUM_RELATIVE_SAVINGS_PERCENT)
-        {
-            return None;
-        }
-        Some((self.derived.receipt_id.as_str(), rendered, receipt_tokens))
-    }
-
     fn refresh_derived(&mut self) {
         let receipt_id = receipt_id_for(
             &self.call_id,
@@ -912,89 +882,6 @@ impl WorkspaceEvidenceObservation {
         self.source_scope_complete && self.source_scope_version == 2
     }
 
-    fn dependency_notice(
-        &self,
-        output: &str,
-        workspace_identity: Option<&WorkspaceEvidenceIdentity>,
-        git_workspace: Option<&GitWorkspaceCache>,
-    ) -> serde_json::Value {
-        use crate::git_workspace::SourceFreshness;
-        let output = serde_json::from_str::<serde_json::Value>(output).ok();
-        let environment = output
-            .as_ref()
-            .and_then(|value| value.get("environment_id"))
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| value.len() <= 256);
-        // The list is bounded, so name the dependencies that changed before the others.
-        let mut changed = git_workspace
-            .map(|cache| {
-                self.source_path_observations
-                    .iter()
-                    .filter(|path| cache.source_path_freshness(path) == SourceFreshness::Changed)
-                    .map(SourcePathChangeObservation::source_dependency)
-                    .collect::<BTreeSet<_>>()
-            })
-            .unwrap_or_default();
-        changed.extend(self.captured_source_changes(workspace_identity));
-        let mut bytes = 0;
-        let paths = self.source_dependencies.iter().filter(|dependency| changed.contains(*dependency))
-            .chain(self.source_dependencies.iter().filter(|dependency| !changed.contains(*dependency)))
-            .take(8).filter_map(|dependency| {
-            let watcher_freshness = git_workspace.and_then(|cache| self.source_path_observations.iter()
-                    .find(|path| path.source_dependency() == *dependency)
-                    .map(|path| cache.source_path_freshness(path)))
-                .unwrap_or(SourceFreshness::Unknown);
-            let watcher_knowledge = if self.source_dependencies_current
-                && self.source_workspace_matches(workspace_identity) {
-                watcher_freshness
-            } else {
-                SourceFreshness::Unknown
-            };
-            let freshness = if changed.contains(dependency) {
-                SourceFreshness::Changed
-            } else {
-                SourceFreshness::Unknown
-            };
-            let row = serde_json::json!({"path":dependency.path, "recursive":dependency.recursive,
-                "environment_id":environment, "freshness":freshness, "watcher_knowledge":watcher_knowledge});
-            bytes += row.to_string().len();
-            (bytes <= 4096).then_some(row)
-        }).collect::<Vec<_>>();
-        serde_json::json!({"omitted_dependencies":self.source_dependencies.len() - paths.len(),
-            "source_scope_complete":self.has_complete_source_scope(),
-            "dependencies":paths, "dependency_scope":if self.source_dependencies.is_empty() {"unknown"} else {"recorded"}})
-    }
-
-    fn is_current(
-        &self,
-        workspace_identity: Option<&WorkspaceEvidenceIdentity>,
-        git_workspace: Option<&GitWorkspaceCache>,
-    ) -> bool {
-        // Admission for authentic historical evidence, not checked-current bytes.
-        // Model-visible dependency/nested projections qualify present freshness.
-        self.has_complete_source_scope()
-            && self.source_dependencies_current
-            && self
-                .source_dependencies
-                .iter()
-                .all(|dependency| dependency.locator_uri.is_some())
-            && workspace_identity.is_none_or(|identity| !identity.unavailable)
-            && self
-                .revision
-                .as_ref()
-                .is_none_or(|identity| !identity.unavailable)
-            && if self.source_path_observations.is_empty() {
-                git_workspace.is_none()
-                    && !self.source_dependencies.is_empty()
-                    && self.revision.is_some()
-                    && self.revision.as_ref() == workspace_identity
-            } else {
-                // A Git-visible digest can stay unchanged when an ignored input
-                // changes. Never let it override the captured dependency watcher.
-                self.source_paths_are_current(workspace_identity, git_workspace)
-            }
-    }
-
     pub(crate) fn from_response_item_with_freshness(
         revision: Option<WorkspaceEvidenceIdentity>,
         item: &ResponseItem,
@@ -1035,67 +922,6 @@ impl WorkspaceEvidenceObservation {
         self.source_path_observations = source_path_observations;
         self
     }
-
-    fn source_workspace_matches(
-        &self,
-        workspace_identity: Option<&WorkspaceEvidenceIdentity>,
-    ) -> bool {
-        match (self.revision.as_ref(), workspace_identity) {
-            // None is a successful non-Git capture, not a failed capture. This
-            // matches scope only: live, complete dependency watches still have
-            // to prove freshness, including external writes and watcher epochs.
-            (None, None) => true,
-            (Some(captured), Some(current)) => {
-                !captured.unavailable
-                    && !current.unavailable
-                    && captured
-                        .repository_root
-                        .as_ref()
-                        .is_some_and(|root| current.repository_root.as_ref() == Some(root))
-            }
-            _ => false,
-        }
-    }
-
-    /// A capture can prove a relevant change before its asynchronous watch
-    /// notification arrives. Reuse that evidence without another source read.
-    fn captured_source_changes(
-        &self,
-        workspace_identity: Option<&WorkspaceEvidenceIdentity>,
-    ) -> BTreeSet<SourceDependencyV1> {
-        let Some(changed) = workspace_identity
-            .zip(self.revision.as_ref())
-            .and_then(|(current, captured)| current.changed_paths_since(captured))
-        else {
-            return BTreeSet::new();
-        };
-        let changed = changed.iter().map(|path| source_path_key(path)).collect();
-        self.source_dependencies
-            .iter()
-            .filter(|dependency| affected_paths_overlap_dependency(&changed, dependency))
-            .cloned()
-            .collect()
-    }
-
-    fn source_paths_are_current(
-        &self,
-        workspace_identity: Option<&WorkspaceEvidenceIdentity>,
-        git_workspace: Option<&GitWorkspaceCache>,
-    ) -> bool {
-        self.source_workspace_matches(workspace_identity)
-            && self.captured_source_changes(workspace_identity).is_empty()
-            && !self.source_dependencies.is_empty()
-            && self
-                .source_dependencies
-                .iter()
-                .all(|dependency| dependency.locator_uri.is_some())
-            && self.source_path_observations.len() == self.source_dependencies.len()
-            && git_workspace.is_some_and(|cache| {
-                self.source_path_observations
-                    .iter()
-                    .all(|observation| cache.source_path_change_observation_is_current(observation))
-            })
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1127,7 +953,8 @@ pub(crate) enum ToolHistoryMutation {
         source: SourceInspectionOrigin,
     },
     RegisterCandidate {
-        candidate: ToolHistoryCandidate,
+        // Boxed: a candidate is far larger than every other mutation.
+        candidate: Box<ToolHistoryCandidate>,
     },
     RegisterWorkspaceEvidence {
         observation: WorkspaceEvidenceObservation,
@@ -1266,7 +1093,7 @@ impl ToolHistoryMutation {
                 true
             }
             Self::RegisterCandidate { candidate } => {
-                state.register(candidate.clone());
+                state.register((**candidate).clone());
                 true
             }
             Self::RegisterWorkspaceEvidence { observation } => {
@@ -1488,166 +1315,6 @@ pub(crate) fn compact_read_evidence(value: &serde_json::Value) -> serde_json::Va
         pin.insert("recovery_tool".into(), "read_tool_output".into());
     }
     serde_json::Value::Object(pin)
-}
-
-/// Factor only identical metadata. Per-call nested-current exceptions remain
-/// attached to their call; an identity is never promoted to dependency proof.
-fn factor_workspace_notices(mut notices: Vec<serde_json::Value>) -> serde_json::Value {
-    let keys = [
-        "reason",
-        "reason_code",
-        "workspace_evidence_freshness",
-        "historical_authenticity",
-        "stale_workspace_evidence",
-        "valid_for_current_workspace",
-    ];
-    let metadata = notices
-        .iter()
-        .map(|notice| {
-            let mut shared = serde_json::Map::new();
-            for key in keys {
-                if let Some(value) = notice.get(key) {
-                    shared.insert(key.into(), value.clone());
-                }
-            }
-            serde_json::Value::Object(shared)
-        })
-        .collect::<Vec<_>>();
-    let mut observations = Vec::new();
-    for (index, shared) in metadata.iter().enumerate() {
-        if shared.as_object().is_none_or(serde_json::Map::is_empty)
-            || metadata.iter().filter(|value| *value == shared).count() < 2
-        {
-            continue;
-        }
-        let group = observations
-            .iter()
-            .position(|value| value == shared)
-            .unwrap_or_else(|| {
-                observations.push(shared.clone());
-                observations.len() - 1
-            });
-        if let Some(fields) = notices[index].as_object_mut() {
-            for key in keys {
-                fields.remove(key);
-            }
-            fields.insert("observation".into(), group.into());
-        }
-    }
-    if observations.is_empty() {
-        serde_json::json!({"notices":notices})
-    } else {
-        serde_json::json!({"observations":observations,"notices":notices})
-    }
-}
-
-pub(crate) fn expand_workspace_notices(batch: serde_json::Value) -> Vec<serde_json::Value> {
-    let Some(notices) = batch.get("notices").and_then(serde_json::Value::as_array) else {
-        return vec![batch];
-    };
-    notices
-        .iter()
-        .cloned()
-        .map(|mut notice| {
-            if let Some(index) = notice
-                .get("observation")
-                .and_then(serde_json::Value::as_u64)
-                && let Some(shared) = batch
-                    .get("observations")
-                    .and_then(serde_json::Value::as_array)
-                    .and_then(|groups| groups.get(index as usize))
-                    .and_then(serde_json::Value::as_object)
-                && let Some(fields) = notice.as_object_mut()
-            {
-                fields.remove("observation");
-                for (key, value) in shared {
-                    fields.entry(key.clone()).or_insert_with(|| value.clone());
-                }
-            }
-            notice
-        })
-        .collect()
-}
-
-
-fn workspace_notice_text(item: &ResponseItem) -> Option<&str> {
-    let ResponseItem::Message { role, content, .. } = item else {
-        return None;
-    };
-    if role != "developer" {
-        return None;
-    }
-    content.iter().find_map(|content| match content {
-        codex_protocol::models::ContentItem::InputText { text }
-            if text.starts_with("<workspace_evidence_invalidation>\n") =>
-        {
-            Some(text.as_str())
-        }
-        _ => None,
-    })
-}
-
-
-
-fn stale_nested_result_count(notice: &serde_json::Value) -> u64 {
-    let listed = notice["stale_nested_results"]
-        .as_array()
-        .map_or(0, |rows| rows.len() as u64);
-    let omitted = notice["omitted_stale_nested_results"].as_u64();
-    listed.saturating_add(omitted.unwrap_or(0))
-}
-
-
-
-/// A carrier's incomplete scope is not a change to its independently watched
-/// children. Keep that uncertainty explicit without repeating their path lists.
-/// This only changes the notice, never the freshness verdict or stored evidence.
-fn compact_current_carrier_notice(notice: &mut serde_json::Value) {
-    if notice["historical_authenticity"] != "authenticated"
-        || notice["workspace_evidence_freshness"] != "unknown"
-        || notice["source_scope"]["source_scope_complete"] != false
-        || notice.get("failure_applicability").is_some()
-        || notice.get("stale_nested_results").is_some()
-        || notice["reason_code"] != "carrier_scope_incomplete"
-        || !notice["retained_nested_results"]
-            .as_array()
-            .is_some_and(|results| !results.is_empty())
-    {
-        return;
-    }
-    notice["reason_code"] = "carrier_scope_incomplete".into();
-    notice["reason"] = "The carrier scope is incomplete. Listed nested results are authentic historical evidence with no observed relevant change; present source freshness is unverified. No source change is established and this notice requests no reread.".into();
-    notice["source_scope"] =
-        serde_json::json!({"source_scope_complete": false, "dependency_scope": "unknown"});
-    if let Some(results) = notice["retained_nested_results"].as_array_mut() {
-        for result in results {
-            if let Some(fields) = result.as_object_mut() {
-                fields.remove("source_scope");
-            }
-        }
-    }
-    if let Some(fields) = notice.as_object_mut() {
-        fields.remove("omitted_current_nested_scopes");
-    }
-}
-
-/// A carrier record that adds no signal. Its incomplete scope is a standing
-/// limit, not an observed change: it names no stale or changed dependency, no
-/// failure and no weaker authenticity, and requests no reread. Its current
-/// nested results are watched, so the layout's source-verification qualifier
-/// already marks them historical. An update is never quiet: it adds staleness.
-fn is_quiet_carrier_notice(notice: &serde_json::Value) -> bool {
-    notice["reason_code"] == "carrier_scope_incomplete"
-        && notice["historical_authenticity"] == "authenticated"
-        && notice["workspace_evidence_freshness"] == "unknown"
-        && notice.get("failure_applicability").is_none()
-        && notice.get("updates_earlier_notice").is_none()
-        && stale_nested_result_count(notice) == 0
-        && !notice["source_scope"]["dependencies"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|row| row["freshness"] == "changed")
 }
 
 fn phase_checkpoint_payload(item: &ResponseItem) -> Option<serde_json::Value> {
@@ -1926,27 +1593,6 @@ impl ToolHistoryState {
                 "next_snapshot_offset":(total > query.snapshot_offset.saturating_add(8)).then(|| query.snapshot_offset.saturating_add(8))})
         }).collect::<Vec<_>>();
         serde_json::json!({"paths":rows, "scope":"obtained snapshot bytes, not model-visible or semantic read coverage; missing history is unknown; no freshness check performed"})
-    }
-
-
-
-    pub(crate) fn checkpoint_evidence(
-        &self,
-        reference: &str,
-    ) -> Result<&ToolHistoryCandidate, String> {
-        let candidate = self
-            .candidates
-            .get(reference)
-            .or_else(|| {
-                self.artifact_call_ids
-                    .get(reference)
-                    .and_then(|id| self.candidates.get(id))
-            })
-            .ok_or_else(|| format!("unknown tool evidence {reference}"))?;
-        if !candidate.complete || !candidate.projection_eligible {
-            return Err(format!("{reference} has no complete recovery artifact"));
-        }
-        Ok(candidate)
     }
 
     /// A later, consumed success for exactly the same invocation resolves a
@@ -2521,8 +2167,8 @@ impl ToolHistoryState {
         &self,
         anchor: &SamplingProjectionAnchor,
         prepared_items: Arc<[ResponseItem]>,
-        workspace_identity: Option<&WorkspaceEvidenceIdentity>,
-        git_workspace: &GitWorkspaceCache,
+        _workspace_identity: Option<&WorkspaceEvidenceIdentity>,
+        _git_workspace: &GitWorkspaceCache,
     ) -> Option<ToolHistoryProjection> {
         let anchored_len = anchor.prepared_items.len();
         if !Arc::ptr_eq(&prepared_items, &anchor.prepared_items)
@@ -2542,7 +2188,7 @@ impl ToolHistoryState {
             return None;
         }
         let extend = |base: &Arc<[ResponseItem]>| -> Arc<[ResponseItem]> {
-            let items = if Arc::ptr_eq(base, &anchor.prepared_items) {
+            if Arc::ptr_eq(base, &anchor.prepared_items) {
                 // No earlier projection changed the prefix (including by
                 // appending freshness notices). The transport-ready input is
                 // already base + tail; do not deep-copy it a second time.
@@ -2554,8 +2200,7 @@ impl ToolHistoryState {
                 items.extend(base.iter().cloned());
                 items.extend(tail.iter().cloned());
                 items.into()
-            };
-            items
+            }
         };
         let items = extend(&anchor.projection.items);
         let unreplaced_items = if Arc::ptr_eq(
@@ -2982,10 +2627,9 @@ impl ToolHistoryState {
     }
 
     fn prune_recovered_artifacts(&mut self) {
-        let stale = self.recovered_artifacts.iter().filter_map(|(id, coverage)| {
-            (self.artifact_identity(id) != Some((coverage.bytes, coverage.sha256.as_str())))
-                .then(|| id.clone())
-        }).collect::<Vec<_>>();
+        let stale = self.recovered_artifacts.iter().filter(|&(id, coverage)| {
+            self.artifact_identity(id) != Some((coverage.bytes, coverage.sha256.as_str()))
+        }).map(|(id, _)| id.clone()).collect::<Vec<_>>();
         for id in stale {
             self.recovered_artifacts.remove(&id);
         }
@@ -3045,13 +2689,6 @@ impl ToolHistoryState {
 
     // A code-mode carrier records no dependencies of its own; its workspace
     // observation owns freshness. A pin must not outlive that invalidation as current.
-    fn artifact_pin_value_for(
-        &self,
-        candidate: &ToolHistoryCandidate,
-    ) -> Option<serde_json::Value> {
-        Some(self.decorate_artifact_pin_value(candidate, candidate.artifact_pin_value()?))
-    }
-
     fn decorate_artifact_pin_value(
         &self,
         candidate: &ToolHistoryCandidate,
@@ -3103,10 +2740,6 @@ impl ToolHistoryState {
         })
     }
 
-    pub(crate) fn artifact_recovery_directory(&self) -> serde_json::Value {
-        self.artifact_recovery_directory_reusing(&mut BTreeMap::new())
-    }
-
     pub(crate) fn artifact_recovery_directory_reusing(
         &self,
         rendered: &mut BTreeMap<String, serde_json::Value>,
@@ -3139,10 +2772,6 @@ impl ToolHistoryState {
     /// Builds a deterministic, exact recovery sidecar for artifacts referenced by a projected
     /// prompt. Compaction appends this separately from model-authored prose so retention does not
     /// depend on the model copying a receipt byte-for-byte into its summary.
-    pub(crate) fn artifact_pin_payload_for_items(&self, items: &[ResponseItem]) -> Option<String> {
-        serde_json::to_string(&self.prepare_artifact_pin_payload_for_items(items)?.payload).ok()
-    }
-
     pub(crate) fn prepare_artifact_pin_payload_for_items(&self, items: &[ResponseItem]) -> Option<PreparedArtifactPins> {
         if self.candidates.is_empty() && self.internal_artifact_origins.is_empty() {
             return None;
@@ -3838,7 +3467,7 @@ fn replay_tool_history_journal_bytes(
             }
             if apply {
                 if let ToolHistoryMutation::RegisterCandidate { candidate } = &record.mutation {
-                    state.register_candidate(candidate.clone(), false);
+                    state.register_candidate((**candidate).clone(), false);
                 } else {
                     record.mutation.apply(state);
                 }

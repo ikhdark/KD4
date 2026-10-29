@@ -31,7 +31,7 @@ pub(super) fn detect(home: &Path, params: ExternalAgentConfigDetectParams) -> io
         let paths = Paths::new(home, cwd.as_deref());
         let settings = settings(&paths.source)?;
         let migrated = config_from_settings(settings.as_ref())?;
-        if !migrated.as_table().is_some_and(|table| table.is_empty()) {
+        if !migrated.as_table().is_some_and(toml::map::Map::is_empty) {
             let mut existing = read_toml(&paths.config)?;
             if merge_missing(&mut existing, &migrated)? {
                 items.push(item(ExternalAgentConfigMigrationItemType::Config, cwd.clone(), None,
@@ -175,7 +175,7 @@ fn import_item(home: &Path, item: &ExternalAgentConfigMigrationItem, cancellatio
                     failure_stage: "mcp_conversion".to_string(), message, cwd: item.cwd.clone(), source: Some(name),
                 });
             }
-            if migrated.as_table().is_some_and(|table| table.is_empty()) { return Ok(()); }
+            if migrated.as_table().is_some_and(toml::map::Map::is_empty) { return Ok(()); }
             let (target, _lock) = lock_target(&paths.config, cancellation)?;
             let serialized = match fs::read_to_string(&target) {
                 Ok(serialized) => serialized,
@@ -249,7 +249,7 @@ fn import_item(home: &Path, item: &ExternalAgentConfigMigrationItem, cancellatio
         Subagents | Commands => {
             let agents = item.item_type == Subagents;
             let source = paths.source.join(if agents { "agents" } else { "commands" });
-            let target = if agents { paths.config.parent().ok_or_else(|| invalid_data_error("config has no parent"))?.join("agents") } else { paths.skills.clone() };
+            let target = if agents { paths.config.parent().ok_or_else(|| invalid_data_error("config has no parent"))?.join("agents") } else { paths.skills };
             let conversions = formats::documents(&source, &target, agents)?;
             for (source, message) in conversions.failures {
                 result.failures.push(ExternalAgentConfigImportItemTypeFailure {
@@ -902,7 +902,7 @@ fn has_enabled_plugin_for_marketplace(settings: &JsonValue, marketplace: &str) -
 fn marketplace_import_sources(
         settings: &JsonValue,
         source_root: &Path,
-        external_agent_home: &PathBuf,
+        external_agent_home: &Path,
     ) -> BTreeMap<String, MarketplaceImportSource> {
         let known_marketplaces_path = external_agent_home
             .join(EXTERNAL_AGENT_KNOWN_MARKETPLACES_PATH);
@@ -922,7 +922,7 @@ fn marketplace_import_sources(
             .map(|known_marketplaces| {
                 collect_marketplace_import_sources(
                     known_marketplaces,
-                    external_agent_home.as_path(),
+                    external_agent_home,
                 )
             })
             .unwrap_or_default();

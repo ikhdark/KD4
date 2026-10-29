@@ -14,12 +14,10 @@ use codex_execpolicy::Decision;
 use codex_execpolicy::Error as ExecPolicyRuleError;
 use codex_execpolicy::Evaluation;
 use codex_execpolicy::MatchOptions;
-use codex_execpolicy::NetworkRuleProtocol;
 use codex_execpolicy::Policy;
 use codex_execpolicy::PolicyParser;
 use codex_execpolicy::RuleMatch;
 use codex_execpolicy::blocking_append_allow_prefix_rule;
-use codex_execpolicy::blocking_append_network_rule;
 use codex_protocol::approvals::ExecPolicyAmendment;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
@@ -573,52 +571,6 @@ impl ExecPolicyManager {
         self.policy.store(Arc::new(updated_policy));
         Ok(())
     }
-
-    pub(crate) async fn append_network_rule_and_update(
-        &self,
-        codex_home: &Path,
-        host: &str,
-        protocol: NetworkRuleProtocol,
-        decision: Decision,
-        justification: Option<String>,
-    ) -> Result<(), ExecPolicyUpdateError> {
-        let _update_guard =
-            self.update_lock
-                .acquire()
-                .await
-                .map_err(|_| ExecPolicyUpdateError::AddRule {
-                    source: ExecPolicyRuleError::InvalidRule(
-                        "exec policy update semaphore closed".to_string(),
-                    ),
-                })?;
-        let policy_path = default_policy_path(codex_home);
-        let host = host.to_string();
-        spawn_blocking({
-            let policy_path = policy_path.clone();
-            let host = host.clone();
-            let justification = justification.clone();
-            move || {
-                blocking_append_network_rule(
-                    &policy_path,
-                    &host,
-                    protocol,
-                    decision,
-                    justification.as_deref(),
-                )
-            }
-        })
-        .await
-        .map_err(|source| ExecPolicyUpdateError::JoinBlockingTask { source })?
-        .map_err(|source| ExecPolicyUpdateError::AppendRule {
-            path: policy_path,
-            source,
-        })?;
-
-        let mut updated_policy = self.current().as_ref().clone();
-        updated_policy.add_network_rule(&host, protocol, decision, justification)?;
-        self.policy.store(Arc::new(updated_policy));
-        Ok(())
-    }
 }
 
 impl Default for ExecPolicyManager {
@@ -706,14 +658,6 @@ pub fn format_exec_policy_error_with_source(error: &ExecPolicyError) -> String {
         }
         _ => error.to_string(),
     }
-}
-
-pub(crate) async fn load_exec_policy_with_warning(
-    config_stack: &ConfigLayerStack,
-) -> Result<(Policy, Option<ExecPolicyError>), ExecPolicyError> {
-    load_exec_policy(config_stack)
-        .await
-        .map(|policy| (policy, None))
 }
 
 pub async fn load_exec_policy(config_stack: &ConfigLayerStack) -> Result<Policy, ExecPolicyError> {

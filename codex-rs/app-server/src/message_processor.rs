@@ -498,14 +498,14 @@ impl MessageProcessor {
             outgoing.clone(),
             config_manager.clone(),
             thread_manager.clone(),
-            analytics_events_client.clone(),
+            analytics_events_client,
         );
         let environment_processor =
             EnvironmentRequestProcessor::new(thread_manager.environment_manager());
         let external_agent_config_processor = ExternalAgentConfigRequestProcessor::new(
             outgoing.clone(),
             config_processor.clone(),
-            state_db.clone(),
+            state_db,
             config.codex_home.to_path_buf(),
             thread_processor.background_tasks.clone(),
             bug_worker_shutdown.clone(),

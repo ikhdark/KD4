@@ -1782,8 +1782,7 @@ impl ToolRegistry {
                         /*extra_trace_fields*/ &[],
                     );
                     let err = FunctionCallError::RespondToModel(message);
-                    if dispatch_state.try_complete() {
-                    }
+                    dispatch_state.try_complete();
                     return Err(err);
                 }
             };
@@ -1825,8 +1824,7 @@ impl ToolRegistry {
                 &extra_trace_fields,
             );
             let err = FunctionCallError::RespondToModel(message);
-            if dispatch_state.try_complete() {
-            }
+            dispatch_state.try_complete();
             return Err(err);
         }
 
@@ -1866,8 +1864,7 @@ impl ToolRegistry {
                 &extra_trace_fields,
             );
             let err = FunctionCallError::RespondToModel(message);
-            if dispatch_state.try_complete() {
-            }
+            dispatch_state.try_complete();
             return Err(err);
         }
 

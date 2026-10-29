@@ -1121,6 +1121,10 @@ impl ThreadQueueRequestProcessor {
     }
 }
 
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "Serialize queue-change publication so revisions are delivered in increasing order"
+)]
 async fn publish_queue_change(
     thread_state_manager: &ThreadStateManager,
     outgoing: &OutgoingMessageSender,

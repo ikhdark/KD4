@@ -34,6 +34,17 @@ struct SaveTurnDiffArgs {
     environment_id: Option<String>,
 }
 
+/// One request's export, read under a single tracker lock. Each refusal
+/// carries the operation summary it reports.
+enum TrackedExport {
+    /// A retained historical receipt, or the summary when it is not retained.
+    Operation(u64, Result<serde_json::Value, serde_json::Value>),
+    /// The net diff with its environment, if this turn tracked any edits.
+    Net(Option<(String, String)>),
+    /// Paths the net diff cannot cover exactly, with the summary.
+    Unexportable(Vec<String>, serde_json::Value),
+}
+
 impl ToolExecutor<ToolInvocation> for SaveTurnDiffHandler {
     fn tool_name(&self) -> ToolName {
         ToolName::plain(SAVE_TURN_DIFF_TOOL_NAME)
@@ -82,59 +93,53 @@ impl ToolExecutor<ToolInvocation> for SaveTurnDiffHandler {
             };
             let args: SaveTurnDiffArgs = parse_arguments(arguments)?;
             let name = validated_patch_name(&args.name)?;
-            let (diff, unattributed, receipt, operations) = {
+            let (export, unattributed) = {
                 let tracker = invocation.tracker.lock().await;
-                let receipt = args.operation
-                    .and_then(|sequence| tracker.owned_operation_receipt(sequence));
-                let diff = args.operation.is_none()
-                    .then(|| tracker.exact_export_diff(args.environment_id.as_deref()));
-                let needs_operations = if args.operation.is_some() {
-                    receipt.is_none()
-                } else {
-                    matches!(&diff, Some(Err(_)))
+                let export = match args.operation {
+                    Some(sequence) => TrackedExport::Operation(
+                        sequence,
+                        tracker
+                            .owned_operation_receipt(sequence)
+                            .ok_or_else(|| tracker.owned_operation_summary()),
+                    ),
+                    None => match tracker.exact_export_diff(args.environment_id.as_deref()) {
+                        Ok(diff) => TrackedExport::Net(diff),
+                        Err(paths) => {
+                            TrackedExport::Unexportable(paths, tracker.owned_operation_summary())
+                        }
+                    },
                 };
-                (
-                    diff,
-                    tracker.unattributed_display_paths(),
-                    receipt,
-                    needs_operations.then(|| tracker.owned_operation_summary()),
-                )
+                (export, tracker.unattributed_display_paths())
             };
-            let receipt_files = receipt
-                .as_ref()
-                .and_then(|receipt| receipt["changes"].as_array())
-                .map_or(0, Vec::len);
+            let mut receipt_files = 0;
             let mut export_environment = args.environment_id.clone();
-            let diff = if let Some(sequence) = args.operation {
-                let receipt = receipt.ok_or_else(|| {
-                    let operations = operations.as_ref().expect("missing operation prepares its summary");
-                    FunctionCallError::RespondToModel(format!(
-                        "operation {sequence} is not retained; {operations}"
-                    ))
-                })?;
-                serde_json::to_string_pretty(&receipt)
-                    .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
-            } else {
-                match diff.expect("net export is prepared only when no operation is selected") {
-                    Ok(Some((environment, diff))) => { export_environment = Some(environment); diff },
-                    Ok(None) => {
-                        return Err(FunctionCallError::RespondToModel(
-                            "This turn has no tracked apply_patch edits to save.".into(),
-                        ));
-                    }
-                    Err(paths) if paths.is_empty() => {
-                        let operations = operations.as_ref().expect("failed export prepares its summary");
-                        return Err(FunctionCallError::RespondToModel(format!(
-                            "The turn diff is unavailable because command effects could not be tracked. Historical operation receipts are not integrated patches: {operations}. Select operation explicitly to save a retained receipt; do not infer ownership from current reads."
-                        )));
-                    }
-                    Err(paths) => {
-                        let operations = operations.as_ref().expect("failed export prepares its summary");
-                        return Err(FunctionCallError::RespondToModel(format!(
-                            "The turn diff is partial. These paths have no exact integrated diff: {}. Historical operation receipts are available separately: {operations}. Select operation explicitly; do not reconstruct ownership from current reads.",
-                            paths.join(", "),
-                        )));
-                    }
+            let diff = match export {
+                TrackedExport::Operation(sequence, receipt) => {
+                    let receipt = receipt.map_err(|operations| {
+                        FunctionCallError::RespondToModel(format!(
+                            "operation {sequence} is not retained; {operations}"
+                        ))
+                    })?;
+                    receipt_files = receipt["changes"].as_array().map_or(0, Vec::len);
+                    serde_json::to_string_pretty(&receipt)
+                        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
+                }
+                TrackedExport::Net(Some((environment, diff))) => { export_environment = Some(environment); diff },
+                TrackedExport::Net(None) => {
+                    return Err(FunctionCallError::RespondToModel(
+                        "This turn has no tracked apply_patch edits to save.".into(),
+                    ));
+                }
+                TrackedExport::Unexportable(paths, operations) if paths.is_empty() => {
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "The turn diff is unavailable because command effects could not be tracked. Historical operation receipts are not integrated patches: {operations}. Select operation explicitly to save a retained receipt; do not infer ownership from current reads."
+                    )));
+                }
+                TrackedExport::Unexportable(paths, operations) => {
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "The turn diff is partial. These paths have no exact integrated diff: {}. Historical operation receipts are available separately: {operations}. Select operation explicitly; do not reconstruct ownership from current reads.",
+                        paths.join(", "),
+                    )));
                 }
             };
             let environment = wait_for_tool_environment(

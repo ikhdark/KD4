@@ -24,6 +24,8 @@ examples, fuzzers, dev dependencies or test helpers. Eighteen complete test-only
 modules, three test-only derive attributes and four executable rustdoc blocks
 were omitted BEFORE files were added. Test-bearing targets and auto-discovery are
 disabled in the production-only manifest. No tests were copied or created.
+The manifest also allows rustc's `deprecated` lint so upstream's unchanged
+`std::usize` uses do not warn in local builds.
 
 The workspace patches both crates.io and the pinned Git dependency sources to
 this owned copy, so tokio-tungstenite and direct consumers share one implementation.

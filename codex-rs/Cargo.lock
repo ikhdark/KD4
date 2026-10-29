@@ -1523,7 +1523,6 @@ dependencies = [
  "chrono",
  "codex-file-system",
  "codex-state",
- "futures",
  "hex",
  "serde",
  "serde_json",
@@ -1848,7 +1847,6 @@ dependencies = [
  "http",
  "serde",
  "serde_json",
- "tokio",
  "url",
 ]
 
@@ -2217,13 +2215,11 @@ dependencies = [
  "csv",
  "dunce",
  "eventsource-stream",
- "fs2",
  "futures",
  "glob",
  "hex",
  "http",
  "iana-time-zone",
- "image",
  "indexmap 2.14.2",
  "jsonschema",
  "libc",
@@ -2253,7 +2249,6 @@ dependencies = [
  "unicode-segmentation",
  "url",
  "uuid",
- "which 8.0.6",
  "windows-sys 0.61.2",
 ]
 
@@ -2305,7 +2300,6 @@ dependencies = [
 name = "codex-core-skills"
 version = "0.0.0"
 dependencies = [
- "anyhow",
  "codex-analytics",
  "codex-config",
  "codex-context-fragments",
@@ -2320,7 +2314,6 @@ dependencies = [
  "codex-utils-path-uri",
  "codex-utils-string",
  "dirs",
- "dunce",
  "futures",
  "noyalib",
  "pulldown-cmark",
@@ -2758,7 +2751,6 @@ dependencies = [
  "codex-mcp",
  "codex-plugin",
  "codex-protocol",
- "codex-utils-absolute-path",
  "codex-utils-path-uri",
  "serde_json",
  "thiserror 2.0.21",
@@ -2954,7 +2946,6 @@ version = "0.0.0"
 dependencies = [
  "base64 0.23.1",
  "codex-api",
- "http",
  "serde_json",
 ]
 

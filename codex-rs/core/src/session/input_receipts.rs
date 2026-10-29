@@ -131,6 +131,10 @@ impl Session {
         Ok(None)
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Serialize receipt lookup and reservation for one client submission identity"
+    )]
     pub(crate) async fn reserve_start_receipt(&self, client_id: &str, fingerprint: &str, turn_id: &str) -> CodexResult<String> {
         let _gate = self.input_receipt_gate.lock().await;
         if let Some(original) = self.find_start_receipt(client_id, fingerprint).await? { return Ok(original); }

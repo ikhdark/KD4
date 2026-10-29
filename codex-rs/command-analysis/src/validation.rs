@@ -161,7 +161,7 @@ pub fn repository_runners(cwd: &std::path::Path) -> Runners {
         const BODY: &str = r#"    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo clippy --keep-going @forwarded_args; exit $LASTEXITCODE"#;
         let lines = source.lines().collect::<Vec<_>>();
         source.replace("\r\n", "\n").starts_with(SHELL)
-            && lines.iter().any(|line| *line == "rust_validation_wait_seconds := \"0\"")
+            && lines.contains(&"rust_validation_wait_seconds := \"0\"")
             && lines.windows(5).any(|lines| !lines[0].starts_with('[')
                 && lines[1] == "[windows]" && lines[2] == "clippy *args:" && lines[3] == BODY
                 && !lines[4].starts_with(char::is_whitespace))

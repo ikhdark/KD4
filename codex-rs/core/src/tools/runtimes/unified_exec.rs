@@ -13,7 +13,6 @@ use crate::sandboxing::SandboxPermissions;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
 use crate::tools::command_output_artifact::RawOutputArtifact;
-use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::runtimes::ShellCommandPreparation;
 use crate::tools::runtimes::prepare_shell_command;
 use crate::tools::runtimes::shell_snapshot_additional_read_roots;
@@ -27,7 +26,6 @@ use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::ToolRuntime;
 use crate::tools::sandboxing::with_cached_approval;
-use crate::unified_exec::NoopSpawnLifecycle;
 use crate::unified_exec::ObservedSpawnLifecycle;
 use crate::unified_exec::PendingSpawnRegistration;
 use crate::unified_exec::UnifiedExecProcess;
@@ -123,7 +121,6 @@ pub struct UnifiedExecApprovalKey {
 pub struct UnifiedExecRuntime<'a> {
     manager: &'a UnifiedExecProcessManager,
     pending_spawns: PendingSpawnRegistration,
-    tracker: Option<SharedTurnDiffTracker>,
 }
 
 fn unified_exec_options() -> ExecOptions {
@@ -156,12 +153,10 @@ impl<'a> UnifiedExecRuntime<'a> {
     pub(crate) fn new_with_pending_spawns(
         manager: &'a UnifiedExecProcessManager,
         pending_spawns: PendingSpawnRegistration,
-        tracker: Option<SharedTurnDiffTracker>,
     ) -> Self {
         Self {
             manager,
             pending_spawns,
-            tracker,
         }
     }
 }
@@ -375,7 +370,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
             attempt.sandbox,
         );
         let permissions = req.canonical_additional_permissions();
-        let mut command = build_unified_exec_sandbox_command(
+        let command = build_unified_exec_sandbox_command(
             &command,
             &req.cwd,
             &env,
@@ -395,7 +390,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
         let validation_resource = crate::validation_task::acquire_execution_resources(
             ctx, &req.command_for_approval,
             native_cwd.as_ref().filter(|_| !req.turn_environment.environment.is_remote())
-                .map(|cwd| cwd.as_path()),
+                .map(codex_utils_absolute_path::AbsolutePathBuf::as_path),
         ).await.map_err(ToolError::Rejected)?;
         crate::validation_task::begin_policy_attempt(ctx).await.map_err(ToolError::Rejected)?;
         let spawned = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -408,7 +403,6 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
                 options,
                 permissions.as_ref(),
                 attempt,
-                /*environment_id*/ Some(&req.turn_environment.environment_id),
                 req.exec_server_env_config.clone(),
                 req.tty,
                 Box::new(ObservedSpawnLifecycle::new(Arc::clone(&spawned), validation_resource)),

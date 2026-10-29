@@ -105,7 +105,11 @@ pub(super) fn index_preserving_siblings(
 ) -> Option<(RawJsonPointerIndex, BTreeSet<String>)> {
     let mut combined = RawJsonPointerIndex { pointers: BTreeMap::new(), ambiguous: BTreeSet::new() };
     let mut failed = BTreeSet::new();
-    for target in targets.iter().collect::<BTreeSet<_>>() {
+    // Index each distinct target once, in a stable order: a repeated target
+    // would charge the shared budget again and could report an indexed target
+    // as failed.
+    let unique_targets = targets.iter().collect::<BTreeSet<_>>();
+    for target in unique_targets {
         let used = combined.pointers.keys().fold(0usize, |cost, pointer|
             cost.saturating_add(pointer.len().saturating_mul(3).saturating_add(256)));
         let Some(mut selected) = index_with_limits(

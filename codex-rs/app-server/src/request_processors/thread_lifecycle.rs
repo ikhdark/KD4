@@ -673,27 +673,17 @@ pub(super) async fn ensure_listener_task_running(
         .map_err(|err| internal_error(format!("failed to register skills watcher: {err}")))?;
     let thread_settings_baseline =
         thread_settings_from_config_snapshot(&conversation.config_snapshot().await);
-    let (mut listener_command_rx, listener_generation, listener_overflow) = {
+    let (mut listener_command_rx, listener_generation) = {
         let mut thread_state = thread_state.lock().await;
         if thread_state.listener_matches(&conversation) {
             return Ok(());
         }
-        let (listener_command_rx, listener_generation) = thread_state.set_listener(
+        thread_state.set_listener(
             listener_cancellation.clone(),
             &conversation,
             watch_registration,
             thread_settings_baseline,
-        );
-        let Some(listener_command_tx) = thread_state.listener_command_tx() else {
-            tracing::warn!(
-                "thread listener command sender missing immediately after listener registration"
-            );
-            return Ok(());
-        };
-        let listener_overflow = listener_task_context
-            .thread_state_manager
-            .register_listener_command_tx(conversation_id, listener_command_tx);
-        (listener_command_rx, listener_generation, listener_overflow)
+        )
     };
     let event_context = listener_task_context.clone();
     let ListenerTaskContext {
@@ -716,14 +706,6 @@ pub(super) async fn ensure_listener_task_running(
                 biased;
                 _ = listener_cancellation.cancelled() => {
                     // Listener was superseded or the thread is being torn down.
-                    break;
-                }
-                _ = listener_overflow.cancelled() => {
-                    // A listener command was not admitted. Disconnect subscribers
-                    // so a subsequent resume can restore an ordered snapshot.
-                    for connection_id in thread_state_manager.subscribed_connection_ids(conversation_id).await {
-                        outgoing_for_task.fail_connection_delivery(connection_id).await;
-                    }
                     break;
                 }
                 listener_command = listener_command_rx.recv() => {
@@ -827,9 +809,6 @@ pub(super) async fn ensure_listener_task_running(
         unloading_state.unregister().await;
         let mut thread_state = thread_state.lock().await;
         if thread_state.listener_generation == listener_generation {
-            if let Some(tx) = thread_state.listener_command_tx().as_ref() {
-                thread_state_manager.unregister_listener_command_tx(conversation_id, tx);
-            }
             thread_state.clear_listener();
         }
     });
@@ -1236,6 +1215,10 @@ pub(super) async fn handle_thread_listener_command(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "Retain the listener generation guard through the live-connection claim and response enqueue"
+)]
 pub(super) async fn handle_pending_thread_resume_request(
     conversation_id: ThreadId,
     conversation: &Arc<CodexThread>,

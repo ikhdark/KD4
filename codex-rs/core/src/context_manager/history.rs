@@ -1250,19 +1250,6 @@ impl ContextManager {
         )
     }
 
-
-    pub(crate) fn estimate_token_count_after_pending_user_boundary(
-        &self,
-        input_modalities: &[InputModality],
-        base_instructions: &BaseInstructions,
-    ) -> Option<i64> {
-        self.estimate_projected_prompt_token_count(
-            input_modalities,
-            base_instructions,
-            /*pending_user_boundary*/ true,
-        )
-    }
-
     fn estimate_indexed_items_token_count_cached<'a>(
         &self,
         items: impl Iterator<Item = (usize, &'a ResponseItem)>,
@@ -1537,6 +1524,7 @@ impl ContextManager {
     /// This function enforces a couple of invariants on the in-memory history:
     /// 1. every call (function/custom) has a corresponding output entry
     /// 2. every output has a corresponding call entry
+    ///
     /// Image evidence is preserved; model compatibility is a request-admission decision.
     fn normalize_history(&mut self, _input_modalities: &[InputModality]) {
         let items = Arc::make_mut(&mut self.items);

@@ -466,7 +466,7 @@ fn native_executable_against_trusted(
             let candidate = directory.join(stem).with_extension("exe");
             if candidate.is_file()
                 && canonical_exe(&candidate)
-                    .is_none_or(|candidate| !same_windows_path(&candidate, &trusted))
+                    .is_none_or(|candidate| !same_windows_path(&candidate, trusted))
             {
                 return None;
             }
@@ -479,7 +479,7 @@ fn native_executable_against_trusted(
             let candidate = directory.join(filename);
             if candidate.is_file() {
                 return canonical_exe(&candidate)
-                    .filter(|candidate| same_windows_path(candidate, &trusted));
+                    .filter(|candidate| same_windows_path(candidate, trusted));
             }
             if requested.extension().is_none() {
                 // Mirror the PTY extension search as well as the pipe launcher's
@@ -492,7 +492,7 @@ fn native_executable_against_trusted(
                     let candidate = candidate.with_extension(extension);
                     if candidate.is_file() {
                         return canonical_exe(&candidate)
-                            .filter(|candidate| same_windows_path(candidate, &trusted));
+                            .filter(|candidate| same_windows_path(candidate, trusted));
                     }
                 }
             }

@@ -795,12 +795,12 @@ impl ThreadRequestProcessor {
     }
 
     pub(super) async fn quiesce_thread_for_removal(&self, thread_id: ThreadId) -> Result<(), JSONRPCErrorError> {
-        if let Ok(conversation) = self.thread_manager.get_thread(thread_id).await {
-            if wait_for_thread_shutdown(&conversation).await != ThreadShutdownResult::Complete {
-                return Err(internal_error(format!(
-                    "thread {thread_id} shutdown or persistence retirement is unconfirmed; deletion was not performed"
-                )));
-            }
+        if let Ok(conversation) = self.thread_manager.get_thread(thread_id).await
+            && wait_for_thread_shutdown(&conversation).await != ThreadShutdownResult::Complete
+        {
+            return Err(internal_error(format!(
+                "thread {thread_id} shutdown or persistence retirement is unconfirmed; deletion was not performed"
+            )));
         }
         Ok(())
     }
@@ -1522,6 +1522,10 @@ impl ThreadRequestProcessor {
         }
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Archive is an exclusive thread-list mutation; hold the permit until it completes"
+    )]
     async fn thread_archive_inner(
         &self,
         params: ThreadArchiveParams,
@@ -3394,7 +3398,14 @@ impl ThreadRequestProcessor {
             {
                 tracing::debug!(target: "codex_app_server::desktop_benchmark",
                     kdr_desktop_event = "resume_revalidation_restart");
-                params = running_resume_params.expect("persisted resume request retained");
+                // Persisted sources come only from history-less requests, which
+                // retain their parameters for this restart.
+                let Some(retry_params) = running_resume_params else {
+                    return Err(internal_error(
+                        "persisted resume request was not retained for revalidation restart",
+                    ));
+                };
+                params = retry_params;
                 continue 'resume;
             }
             resume_source_thread = Some(current);
@@ -3425,7 +3436,7 @@ impl ThreadRequestProcessor {
                 was_already_running,
             }) => {
                 if was_already_running {
-                    let Some(live_params) = running_resume_params.as_ref() else {
+                    let Some(live_params) = running_resume_params else {
                         self.outgoing.send_error(request_id, invalid_request(
                             "cannot replace a running thread's history",
                         )).await;
@@ -3433,7 +3444,7 @@ impl ThreadRequestProcessor {
                     };
                     match self.resume_running_thread(
                         &request_id,
-                        live_params,
+                        &live_params,
                         &parsed_thread_id,
                         app_server_client_name.clone(),
                         app_server_client_version.clone(),
@@ -3445,7 +3456,7 @@ impl ThreadRequestProcessor {
                             // leaving this iteration releases its list-state permit.
                             tracing::debug!(target: "codex_app_server::desktop_benchmark",
                                 kdr_desktop_event = "resume_runtime_restart");
-                            params = running_resume_params.expect("live resume request retained");
+                            params = live_params;
                             continue 'resume;
                         }
                         Err(error) => self.outgoing.send_error(request_id, error).await,

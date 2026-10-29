@@ -23,7 +23,6 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
-use codex_rollout::state_integration::StateDbHandle;
 use codex_utils_path_uri::LegacyAppPathString;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -1313,14 +1312,6 @@ pub(crate) struct ConnectionCapabilities {
 #[derive(Clone, Default)]
 pub(crate) struct ThreadStateManager {
     state: Arc<Mutex<ThreadStateManagerInner>>,
-    // Extension event sinks are synchronous, so they need an await-free way to
-    // enqueue work on the active per-thread listener.
-    listener_commands: Arc<StdMutex<HashMap<ThreadId, ListenerCommandRoute>>>,
-}
-
-struct ListenerCommandRoute {
-    tx: mpsc::Sender<ThreadListenerCommand>,
-    overflow: CancellationToken,
 }
 
 fn core_lease_id(lease: &OutOfBandElicitationLeaseKey) -> OutOfBandElicitationLeaseId {
@@ -1713,69 +1704,6 @@ impl ThreadStateManager {
         affected
     }
 
-    pub(crate) fn current_listener_command_tx(
-        &self,
-        thread_id: ThreadId,
-    ) -> Option<mpsc::Sender<ThreadListenerCommand>> {
-        self.listener_commands
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&thread_id)
-            .map(|route| route.tx.clone())
-    }
-
-    pub(crate) fn register_listener_command_tx(
-        &self,
-        thread_id: ThreadId,
-        tx: mpsc::Sender<ThreadListenerCommand>,
-    ) -> CancellationToken {
-        let overflow = CancellationToken::new();
-        self.listener_commands
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                thread_id,
-                ListenerCommandRoute {
-                    tx,
-                    overflow: overflow.clone(),
-                },
-            );
-        overflow
-    }
-
-    pub(crate) fn fail_listener_command_delivery(
-        &self,
-        thread_id: ThreadId,
-        tx: &mpsc::Sender<ThreadListenerCommand>,
-    ) {
-        if let Some(route) = self
-            .listener_commands
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&thread_id)
-            && route.tx.same_channel(tx)
-        {
-            route.overflow.cancel();
-        }
-    }
-
-    pub(crate) fn unregister_listener_command_tx(
-        &self,
-        thread_id: ThreadId,
-        retiring_tx: &mpsc::Sender<ThreadListenerCommand>,
-    ) {
-        let mut routes = self
-            .listener_commands
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if routes
-            .get(&thread_id)
-            .is_some_and(|route| route.tx.same_channel(retiring_tx))
-        {
-            routes.remove(&thread_id);
-        }
-    }
-
     pub(crate) async fn remove_thread_state(&self, thread_id: ThreadId) {
         let thread_state = {
             let mut state = self.state.lock().await;
@@ -1802,9 +1730,6 @@ impl ThreadStateManager {
         };
         if let Some(thread_state) = thread_state {
             let mut thread_state = thread_state.lock().await;
-            if let Some(tx) = thread_state.listener_command_tx.as_ref() {
-                self.unregister_listener_command_tx(thread_id, tx);
-            }
             tracing::debug!(
                 thread_id = %thread_id,
                 listener_generation = thread_state.listener_generation,
@@ -1828,9 +1753,6 @@ impl ThreadStateManager {
 
         for (thread_id, thread_state) in thread_states {
             let mut thread_state = thread_state.lock().await;
-            if let Some(tx) = thread_state.listener_command_tx.as_ref() {
-                self.unregister_listener_command_tx(thread_id, tx);
-            }
             tracing::debug!(
                 thread_id = %thread_id,
                 listener_generation = thread_state.listener_generation,

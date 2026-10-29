@@ -133,13 +133,11 @@ impl ShellCommandHandler {
     }
 
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn to_exec_params_with_shell(
         params: &ShellCommandToolCallParams,
         invocation: &CommandInvocation,
         session: &crate::session::session::Session,
         turn_context: &TurnContext,
-        turn_environment: &TurnEnvironment,
         cwd: AbsolutePathBuf,
         allow_login_shell: bool,
         shell: &Shell,
@@ -414,7 +412,6 @@ impl ShellCommandHandler {
             &command_invocation,
             session.as_ref(),
             turn.as_ref(),
-            &turn_environment,
             cwd,
             allow_login_shell,
             &safety_shell,
@@ -492,7 +489,7 @@ impl ShellCommandHandler {
             &exec_params.command,
         ).await {
             Ok(permit) => permit,
-            Err(refusal) => return Ok(boxed_tool_output(refusal)),
+            Err(refusal) => return Ok(refusal),
         };
         let run_args = RunExecLikeArgs {
             max_output_tokens: params.max_output_tokens,

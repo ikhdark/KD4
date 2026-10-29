@@ -44,7 +44,6 @@ pub use info::get_has_changes;
 pub use info::get_head_commit_hash;
 pub use info::get_head_commit_hash_result;
 pub use info::git_diff_to_remote;
-pub use info::git_index_entries;
 pub use info::recent_commits;
 pub use info::resolve_root_git_project_for_trust;
 pub use info::resolve_root_git_project_for_trust_from_checkout;

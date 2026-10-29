@@ -108,7 +108,7 @@ function Resolve-PgoProfdataTool {
     return Invoke-PgoOwner -Action {
         Push-Location -LiteralPath (Join-Path $RepoRoot "codex-rs")
         try {
-            $target = Get-LocalPublishBuildTarget -RepoRoot $RepoRoot -Profile "local-pgo"
+            $target = Get-LocalPublishBuildTarget -RepoRoot $RepoRoot -Profile "pgo"
             $sysroot = @(& rustc --print sysroot)
             if ($LASTEXITCODE -ne 0 -or $sysroot.Count -ne 1) { throw "Could not resolve the pinned Rust sysroot." }
         }
@@ -243,7 +243,7 @@ try {
             profileData = $null; profileDataSha256 = $null; optimizedBuild = $null
         }
         Write-PgoState -State $state -Path $statePath
-        $options = @{ Profile = "local-pgo-instrumented"; PgoGenerateDirectory = $generation }
+        $options = @{ Profile = "pgo"; PgoGenerateDirectory = $generation }
         Invoke-PgoPublisher -Options $options
         $proof = Get-PgoBuildProof -Options $options
         foreach ($entry in $proof.entries) {
@@ -323,7 +323,7 @@ try {
             Remove-Item -LiteralPath $temporaryProfile
         }
         else { [IO.File]::Move($temporaryProfile, $profilePath) }
-        $options = @{ Profile = "local-pgo"; PgoProfileData = $profilePath }
+        $options = @{ Profile = "pgo"; PgoProfileData = $profilePath }
         Invoke-PgoPublisher -Options $options
         $state.optimizedBuild = Get-PgoBuildProof -Options $options
         Assert-PgoSource $state
@@ -337,7 +337,7 @@ try {
     if (-not $state.profileData -or $null -eq $state.optimizedBuild -or (Get-PgoFileHash $state.profileData) -cne $state.profileDataSha256) {
         throw "The optimized PGO build/profile is missing or changed. Run Optimize first."
     }
-    $options = @{ Profile = "local-pgo"; PgoProfileData = $state.profileData }
+    $options = @{ Profile = "pgo"; PgoProfileData = $state.profileData }
     $proof = Get-PgoBuildProof -Options $options
     if ($proof.fingerprint -cne $state.optimizedBuild.fingerprint) { throw "Optimized build identity changed. Rerun Optimize." }
     foreach ($entry in $proof.entries) {

@@ -123,32 +123,6 @@ impl HttpClient {
         )
     }
 
-    pub(crate) async fn execute(
-        &self,
-        mut request: reqwest::Request,
-    ) -> Result<reqwest::Response, reqwest::Error> {
-        apply_default_headers(request.headers_mut(), &self.default_headers);
-        let method = request.method().clone();
-        let diagnostic_url = self
-            .request_logging_enabled()
-            .then(|| request.url().to_string());
-
-        match self.execute_without_request_logging(request).await {
-            Ok(response) => {
-                if let Some(url) = diagnostic_url.as_deref() {
-                    self.log_response(&method, url, &response);
-                }
-                Ok(response)
-            }
-            Err(error) => {
-                if let Some(url) = diagnostic_url.as_deref() {
-                    self.log_error(&method, url, &error);
-                }
-                Err(error)
-            }
-        }
-    }
-
     pub(crate) async fn execute_without_request_logging(
         &self,
         mut request: reqwest::Request,

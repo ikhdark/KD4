@@ -13,7 +13,6 @@ doctest = false
 chrono = { workspace = true, features = ["serde"] }
 codex-file-system = { workspace = true }
 codex-state = { workspace = true }
-futures = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

@@ -189,6 +189,10 @@ fn matching_entries<'a>(
         .collect()
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep page assembly aligned with the listing, warning, and continuation inputs"
+)]
 fn page_response<'a>(
     skills: &[&'a SkillCatalogEntry],
     warnings: Vec<String>,
@@ -299,7 +303,7 @@ fn bounded_warnings(warnings: &[String]) -> (Vec<String>, usize) {
             if warning.len() <= MAX_WARNING_BYTES {
                 warning.clone()
             } else {
-                let (prefix, _) = truncate_utf8_to_bytes(&warning, MAX_WARNING_BYTES - 3);
+                let (prefix, _) = truncate_utf8_to_bytes(warning, MAX_WARNING_BYTES - 3);
                 format!("{prefix}...")
             }
         })

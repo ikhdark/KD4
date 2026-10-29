@@ -676,16 +676,6 @@ fn cached_system_proxy_decision_from_cache(
     None
 }
 
-fn cache_system_proxy_decision(request_url: &str, decision: SystemProxyDecision) {
-    let cache = SYSTEM_PROXY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut cache = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let cache_key = system_proxy_cache_key(request_url);
-    insert_system_proxy_cache_entry(&mut cache, &cache_key, decision, Instant::now());
-}
-
-
 fn insert_system_proxy_cache_entry(
     cache: &mut HashMap<[u8; 32], CachedSystemProxyDecision>,
     cache_key: &[u8; 32],

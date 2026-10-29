@@ -2430,28 +2430,33 @@ impl ThreadManagerState {
             let _thread_registry_lease = self
                 .acquire_thread_registry_lease(resumed.conversation_id)
                 .await;
-            let threads = self.threads.write().await;
-            if let Some(thread) = threads.get(&resumed.conversation_id).cloned() {
-                if thread.is_running() {
-                    if let Some(requested_rollout_path) = resumed.rollout_path.as_deref()
-                        && thread.rollout_path().as_deref() != Some(requested_rollout_path)
-                    {
-                        return Err(CodexErr::InvalidRequest(format!(
-                            "thread {} is already running with a different rollout path",
-                            resumed.conversation_id
-                        )));
+            let stopped_thread = {
+                let threads = self.threads.write().await;
+                let thread = threads.get(&resumed.conversation_id).cloned();
+                match thread {
+                    Some(thread) if thread.is_running() => {
+                        if let Some(requested_rollout_path) = resumed.rollout_path.as_deref()
+                            && thread.rollout_path().as_deref() != Some(requested_rollout_path)
+                        {
+                            return Err(CodexErr::InvalidRequest(format!(
+                                "thread {} is already running with a different rollout path",
+                                resumed.conversation_id
+                            )));
+                        }
+                        return Ok(NewThread {
+                            thread_id: resumed.conversation_id,
+                            session_configured: thread.session_configured(),
+                            thread,
+                            was_already_running: true,
+                        });
                     }
-                    return Ok(NewThread {
-                        thread_id: resumed.conversation_id,
-                        session_configured: thread.session_configured(),
-                        thread,
-                        was_already_running: true,
-                    });
+                    thread => thread,
                 }
+            };
+            if let Some(thread) = stopped_thread {
                 // A closed event stream is not proof that accepted effects or
                 // durable writers have stopped. Retain registration while the
                 // exact instance drains; never wait with the global map locked.
-                drop(threads);
                 thread.request_shutdown().await?;
                 thread.wait_until_drained().await?;
                 let mut threads = self.threads.write().await;

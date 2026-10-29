@@ -17,6 +17,9 @@ const EXTERNAL_AGENT_MIGRATED_HOOKS_SUBDIR: &str = "hooks";
 const COMMAND_SKILL_PREFIX: &str = "source-command";
 const MAX_SKILL_NAME_LEN: usize = 64;
 
+/// Source files that could not be converted, each with the reason.
+type ConversionFailures = Vec<(PathBuf, String)>;
+
 pub(super) struct DocumentPlan {
     pub name: String,
     pub target: PathBuf,
@@ -25,7 +28,7 @@ pub(super) struct DocumentPlan {
 
 pub(super) struct DocumentConversions {
     pub plans: Vec<DocumentPlan>,
-    pub failures: Vec<(PathBuf, String)>,
+    pub failures: ConversionFailures,
 }
 
 pub(super) fn documents(source: &Path, target: &Path, agents: bool) -> io::Result<DocumentConversions> {
@@ -79,7 +82,7 @@ pub(super) fn documents(source: &Path, target: &Path, agents: bool) -> io::Resul
     Ok(DocumentConversions { plans, failures })
 }
 
-pub(super) fn hooks(source: &Path, target_config_dir: &Path) -> io::Result<(Vec<String>, String, Vec<(PathBuf, String)>)> {
+pub(super) fn hooks(source: &Path, target_config_dir: &Path) -> io::Result<(Vec<String>, String, ConversionFailures)> {
     let (migration, failures) = hook_migration(source, Some(target_config_dir))?;
     let names = migration.keys().cloned().collect();
     let mut payload = serde_json::Map::new();
@@ -116,7 +119,7 @@ struct AgentMetadata {
 fn hook_migration(
     source_external_agent_dir: &Path,
     target_config_dir: Option<&Path>,
-) -> io::Result<(serde_json::Map<String, JsonValue>, Vec<(PathBuf, String)>)> {
+) -> io::Result<(serde_json::Map<String, JsonValue>, ConversionFailures)> {
     let mut settings_files = Vec::new();
     let mut disabled = false;
     for name in ["settings.json", "settings.local.json"] {
@@ -193,10 +196,10 @@ fn append_convertible_hook_groups(
                 if let Some(key) = hook.keys().find(|key| !matches!(key.as_str(), "type" | "command" | "timeout" | "timeoutSec" | "statusMessage" | "async")) {
                     return Err(io::Error::new(io::ErrorKind::Unsupported, format!("hook event {event_name:?} uses unsupported handler control {key:?}")));
                 }
-                if let Some(value) = hook.get("async") {
-                    if value.as_bool() != Some(false) {
-                        return Err(io::Error::new(io::ErrorKind::Unsupported, format!("hook event {event_name:?} requires asynchronous handler semantics")));
-                    }
+                if let Some(value) = hook.get("async")
+                    && value.as_bool() != Some(false)
+                {
+                    return Err(io::Error::new(io::ErrorKind::Unsupported, format!("hook event {event_name:?} requires asynchronous handler semantics")));
                 }
                 let command = hook.get("command").and_then(JsonValue::as_str).map(str::trim).filter(|command| !command.is_empty())
                     .ok_or_else(|| invalid_data_error("command hook requires a non-empty command"))?;

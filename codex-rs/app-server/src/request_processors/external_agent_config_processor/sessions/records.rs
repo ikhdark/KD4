@@ -23,7 +23,6 @@ const EXTERNAL_AGENT_TOOL_CALL_TAG: &str = "external_agent_tool_call";
 const EXTERNAL_AGENT_TOOL_RESULT_TAG: &str = "external_agent_tool_result";
 
 pub struct SessionSummary {
-    pub latest_timestamp: i64,
     pub migration: ExternalAgentSessionMigration,
 }
 
@@ -43,7 +42,7 @@ pub fn summarize_session(path: &Path) -> io::Result<Option<SessionSummary>> {
     let mut ai_title = None;
     let mut fallback_title = None;
     let mut saw_user_message = false;
-    let mut latest_timestamp = None;
+    let mut saw_timestamp = false;
     let mut line = String::new();
 
     loop {
@@ -81,14 +80,11 @@ pub fn summarize_session(path: &Path) -> io::Result<Option<SessionSummary>> {
                 fallback_title = fallback_title_from_user_message(&message.text);
             }
         }
-        if let Some(timestamp) = record
+        saw_timestamp |= record
             .get("timestamp")
             .and_then(JsonValue::as_str)
             .and_then(parse_timestamp)
-        {
-            latest_timestamp =
-                Some(latest_timestamp.map_or(timestamp, |current: i64| current.max(timestamp)));
-        }
+            .is_some();
     }
 
     let Some(cwd) = cwd else {
@@ -97,11 +93,11 @@ pub fn summarize_session(path: &Path) -> io::Result<Option<SessionSummary>> {
     if !saw_user_message {
         return Ok(None);
     }
-    let Some(latest_timestamp) = latest_timestamp else {
+    // Detection requires at least one timestamped conversation message.
+    if !saw_timestamp {
         return Ok(None);
-    };
+    }
     Ok(Some(SessionSummary {
-        latest_timestamp,
         migration: ExternalAgentSessionMigration {
             path: path.to_path_buf(),
             cwd,

@@ -392,7 +392,6 @@ use codex_protocol::user_input::UserInput as CoreInputItem;
 use codex_rmcp_client::perform_oauth_login_return_url_with_http_client;
 use codex_rollout::is_persisted_rollout_item;
 use codex_rollout::state_integration::StateDbHandle;
-use codex_rollout::state_integration::reconcile_rollout;
 use codex_state::log_db::LogDbLayer;
 use codex_thread_store::ArchiveThreadParams as StoreArchiveThreadParams;
 use codex_thread_store::ClearableField as StoreClearableField;

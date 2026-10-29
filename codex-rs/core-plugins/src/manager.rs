@@ -1906,7 +1906,11 @@ impl PluginsManager {
                     path: request.marketplace_path.to_path_buf(),
                     message: "local curated marketplace sha is not available".to_string(),
                 })?;
-                Some((snapshot.expect("curated source is leased"), curated_plugin_cache_version(&version)))
+                let snapshot = snapshot.ok_or_else(|| MarketplaceError::InvalidMarketplaceFile {
+                    path: request.marketplace_path.to_path_buf(),
+                    message: "curated marketplace source is not leased".to_string(),
+                })?;
+                Some((snapshot, curated_plugin_cache_version(&version)))
             } else {
                 // Non-curated downloads/copies need no curated snapshot lease.
                 drop(snapshot);

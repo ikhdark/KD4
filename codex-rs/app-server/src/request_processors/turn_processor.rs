@@ -931,6 +931,7 @@ impl TurnRequestProcessor {
         Ok(TurnStartResponse { turn })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn turn_start_inner(
         &self,
         request_id: ConnectionRequestId,

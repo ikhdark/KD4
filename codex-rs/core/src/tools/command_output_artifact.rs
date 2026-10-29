@@ -43,7 +43,6 @@ use serde_json::Value;
 use sha2::Digest;
 use sha2::Sha256;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 
@@ -558,15 +557,6 @@ impl RetentionIndex {
             self.threads.remove(&record.thread_directory);
         }
         Some(record)
-    }
-
-    fn update_streaming_size(&mut self, path: &Path, bytes: u64, modified: SystemTime) -> bool {
-        let Some(mut record) = self.remove(path) else {
-            return false;
-        };
-        record.bytes = bytes;
-        record.modified = modified;
-        self.insert(record)
     }
 
     fn thread_cache_totals(&self, directory: &Path) -> (u64, usize) {
@@ -1278,7 +1268,6 @@ pub(crate) enum RawOutputArtifact {
         bytes: u64,
         truncated: bool,
         handle: Arc<File>,
-        digest: Sha256,
         finalized: bool,
     },
     Failed {
@@ -1802,7 +1791,7 @@ async fn create_raw_output_artifact_inner(
                     Some(id),
                     retained.len() as u64,
                     !truncated,
-                    hex::encode(digest.clone().finalize()),
+                    hex::encode(digest.finalize()),
                 )
                 .await
             {
@@ -1847,7 +1836,6 @@ async fn create_raw_output_artifact_inner(
                 bytes: retained.len() as u64,
                 truncated,
                 handle,
-                digest,
                 finalized: durable,
             }
         }
@@ -5040,7 +5028,7 @@ pub(crate) async fn replace_raw_output_artifact(
                 Some(*id),
                 retained.len() as u64,
                 !truncated,
-                hex::encode(digest.clone().finalize()),
+                hex::encode(digest.finalize()),
             )
             .await
             {
@@ -5078,7 +5066,6 @@ pub(crate) async fn replace_raw_output_artifact(
                 bytes: retained.len() as u64,
                 truncated,
                 handle: handle.clone(),
-                digest,
                 finalized: true,
             }
         }
@@ -6928,14 +6915,6 @@ impl ToolOutputSnapshot {
         }
     }
 
-    pub(super) fn canonical_result(&self) -> CanonicalToolResult {
-        let mut result = CanonicalToolResult::bytes(self.bytes.clone());
-        result.complete =
-            self.metadata.version != 0 && self.metadata.capture_complete && self.metadata.complete;
-        result.unavailable_ranges = self.metadata.unavailable_ranges.clone();
-        result
-    }
-
     pub(crate) fn page_selectors(
         &self,
         start: u64,
@@ -7884,120 +7863,6 @@ fn publish_known_remove(
     }
 }
 
-async fn publish_streaming_size_async(
-    token: &RetentionIndexToken,
-    path: &Path,
-    bytes: u64,
-    modified: SystemTime,
-    completed: bool,
-) {
-    if token.generation.is_none() {
-        return;
-    }
-    let owned_token = token.clone();
-    let path = path.to_path_buf();
-    // Keep normalization and publication in one owned operation so cancelling
-    // the async writer cannot discard an admitted size update.
-    if let Err(error) = run_blocking_artifact_io(move || {
-        let path = normalized_retention_path(&path);
-        publish_streaming_size(&owned_token, &path, bytes, modified, completed);
-        Ok(())
-    })
-    .await
-    {
-        reject_stale_delta(token);
-        tracing::warn!(%error, "streaming artifact size publication worker failed");
-    }
-}
-
-fn publish_streaming_size(
-    token: &RetentionIndexToken,
-    path: &Path,
-    bytes: u64,
-    modified: SystemTime,
-    completed: bool,
-) {
-    let Some(generation) = token.generation else {
-        return;
-    };
-    let mut registry = lock_retention_registry();
-    let Some(state) = registry.roots.get_mut(&token.root) else {
-        transition_current_root_to_dirty(&mut registry, &token.root);
-        return;
-    };
-    debug_assert_eq!(token.generation, Some(generation));
-    let disposition = retention_delta_disposition(token, state);
-    if disposition == RetentionDeltaDisposition::RejectStale {
-        transition_current_root_to_dirty(&mut registry, &token.root);
-        return;
-    }
-    match disposition {
-        RetentionDeltaDisposition::ApplyIndexed => {}
-        RetentionDeltaDisposition::IgnoreScanOnly => return,
-        RetentionDeltaDisposition::RejectCurrent => {
-            transition_current_root_to_dirty_for_conflict(&mut registry, &token.root);
-            return;
-        }
-        RetentionDeltaDisposition::RejectStale => unreachable!("handled above"),
-    }
-    let missing_record = match &mut state.mode {
-        RetentionRootMode::Indexed(index) => {
-            if !index.update_streaming_size(path, bytes, modified) {
-                true
-            } else {
-                if completed {
-                    index.note_logical_mutation();
-                }
-                if index.is_near_limit() && !index.near_limit_reconciled {
-                    index.near_limit_pending = true;
-                }
-                false
-            }
-        }
-        RetentionRootMode::Dirty | RetentionRootMode::ScanOnly { .. } => false,
-        RetentionRootMode::Reconciling { invalidated } => {
-            *invalidated = true;
-            false
-        }
-    };
-    if missing_record {
-        transition_current_root_to_dirty_for_conflict(&mut registry, &token.root);
-    }
-}
-
-fn publish_streaming_abandonment(token: &RetentionIndexToken) {
-    let Some(generation) = token.generation else {
-        return;
-    };
-    let mut registry = lock_retention_registry();
-    let Some(state) = registry.roots.get_mut(&token.root) else {
-        transition_current_root_to_dirty(&mut registry, &token.root);
-        return;
-    };
-    debug_assert_eq!(token.generation, Some(generation));
-    let disposition = retention_delta_disposition(token, state);
-    if disposition == RetentionDeltaDisposition::RejectStale {
-        transition_current_root_to_dirty(&mut registry, &token.root);
-        return;
-    }
-    match disposition {
-        RetentionDeltaDisposition::ApplyIndexed => {}
-        RetentionDeltaDisposition::IgnoreScanOnly => return,
-        RetentionDeltaDisposition::RejectCurrent => {
-            transition_current_root_to_dirty_for_conflict(&mut registry, &token.root);
-            return;
-        }
-        RetentionDeltaDisposition::RejectStale => unreachable!("handled above"),
-    }
-    match &mut state.mode {
-        RetentionRootMode::Indexed(index) => index.note_logical_mutation(),
-        RetentionRootMode::Reconciling { invalidated } => *invalidated = true,
-        RetentionRootMode::Dirty | RetentionRootMode::ScanOnly { .. } => {}
-    }
-}
-
-
-
 /// Rebuilds the root's index from a full scan, and reports the artifacts
 /// whose transaction markers the scan listed.
 fn reconcile_retention_root_listing_transactions_blocking(
@@ -8141,8 +8006,6 @@ fn prepare_retention_mode_blocking(root: &Path, force_reconciliation: bool) -> R
         recover_listed_logical_artifact_transactions_blocking(&root, &transactions);
     }
     if reconciled != RetentionModeKind::Indexed {
-        if reconciled == RetentionModeKind::ScanOnly {
-        }
         return reconciled;
     }
     RetentionModeKind::Indexed
@@ -8413,41 +8276,6 @@ fn refresh_retention_thread_directory_blocking(root: &Path, directory: &Path) ->
     }
     transition_current_root_to_dirty(&mut registry, root);
     RetentionModeKind::Dirty
-}
-
-/// Rebuilds the index under this process's admission only. Holding the shared
-/// lock for the scan queued every other process's artifact commit behind it:
-/// on a root of ~100K files, for seconds at each process start and rescan.
-/// The scan instead starts from an observed shared generation; a commit by
-/// another process during or after it advances that generation and marks the
-/// index stale, which leaves it incomplete rather than wrong, as after any
-/// external write. A listed transaction marker may belong to a commit still
-/// holding the lock, so it is recovered only afterwards, under that lock.
-fn reconcile_external_retention_changes_blocking(
-    root: &Path,
-    process_permit: OwnedSemaphorePermit,
-    only_if_unindexed: bool,
-) {
-    if only_if_unindexed && lock_retention_registry().roots.contains_key(root) {
-        return;
-    }
-    if let Err(error) = observe_retention_interprocess_generation(root) {
-        // The stale mark stays set, so a later pass rescans.
-        tracing::debug!(%error, "artifact retention generation is unavailable");
-    }
-    let mut transactions = Vec::new();
-    reconcile_retention_root_listing_transactions_blocking(root, &mut transactions);
-    if transactions.is_empty() {
-        return;
-    }
-    let _permit = match retention_sweep_permit_blocking(root, process_permit) {
-        Ok(permit) => permit,
-        Err(error) => {
-            record_retention_sweep_permit_failure(root, &error);
-            return;
-        }
-    };
-    recover_listed_logical_artifact_transactions_blocking(root, &transactions);
 }
 
 /// Recovers transactions that a scan without the shared lock listed. The caller

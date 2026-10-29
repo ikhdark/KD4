@@ -90,25 +90,30 @@ impl OpenAiUploadCleanup {
         // Remote IDs are independent and deletion is idempotent. Keep each ID
         // in the guard until its own delete is confirmed, even if this waiter
         // is dropped; Drop can then retry all unconfirmed work safely.
-        let pending = self.file_ids.iter().rev().cloned().collect::<Vec<_>>();
         let base_url = &self.base_url;
         let auth = &self.auth;
         let clients = &self.clients;
-        let deletes = futures::stream::iter(pending.into_iter().map(|file_id| async move {
-            let result =
-                delete_openai_file_with_pool(base_url, auth.as_ref(), clients, &file_id).await;
-            (file_id, result)
-        }))
-        .buffer_unordered(MAX_CONCURRENT_OPENAI_FILE_UPLOADS);
-        tokio::pin!(deletes);
         let mut deleted = std::collections::HashSet::new();
-        while let Some((file_id, result)) = deletes.next().await {
-            match result {
-                Ok(()) => {
-                    deleted.insert(file_id);
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "uploaded file cleanup failed; retaining cleanup ownership")
+        {
+            // The stream borrows the IDs, so it must end before they are pruned.
+            let deletes = futures::stream::iter(self.file_ids.iter().rev().cloned().map(
+                |file_id| async move {
+                    let result =
+                        delete_openai_file_with_pool(base_url, auth.as_ref(), clients, &file_id)
+                            .await;
+                    (file_id, result)
+                },
+            ))
+            .buffer_unordered(MAX_CONCURRENT_OPENAI_FILE_UPLOADS);
+            tokio::pin!(deletes);
+            while let Some((file_id, result)) = deletes.next().await {
+                match result {
+                    Ok(()) => {
+                        deleted.insert(file_id);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "uploaded file cleanup failed; retaining cleanup ownership")
+                    }
                 }
             }
         }

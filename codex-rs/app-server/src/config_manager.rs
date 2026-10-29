@@ -473,6 +473,10 @@ impl ConfigManager {
     }
 
     #[instrument(level = "trace", skip_all)]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Single-flight gate: equal concurrent loads wait for the first build and reuse its cached config"
+    )]
     pub(crate) async fn load_with_cli_overrides(
         &self,
         cli_overrides: &[(String, TomlValue)],

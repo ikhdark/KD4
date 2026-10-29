@@ -118,7 +118,7 @@ pub(super) async fn assess_with_calls_tx(
                         && call.evidence.end_epoch == Some(reference.evidence_epoch)
                 })
             } else if allow_uncited {
-                calls.iter().filter(owned).next_back()
+                calls.iter().rfind(owned)
             } else { None };
             let satisfied = policy.freshness == EvidenceFreshness::Historical
                 && (allow_uncited || result.is_some_and(|result| result.status == CriterionStatus::Passed))

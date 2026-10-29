@@ -7,6 +7,10 @@ use toml::Value as TomlValue;
 
 /// Lossless dotted map-key path. Non-bare keys are JSON quoted; array origins
 /// use separate `[index]` components, never indistinguishable numeric keys.
+#[expect(
+    clippy::expect_used,
+    reason = "serializing a string to JSON cannot fail"
+)]
 pub fn config_origin_key(path: &[&str]) -> String {
     path.iter().map(|key| {
         if !key.is_empty() && key.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')) {

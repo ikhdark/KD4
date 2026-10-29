@@ -80,6 +80,10 @@ impl StateRuntime {
         self.agent_job_runner_instance_id.as_str()
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the spawned registration owns enrollment until the runner row and heartbeat are published"
+    )]
     async fn ensure_agent_job_runner_registered(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.agent_job_runner_registered, "non-owning state runtime cannot own agent jobs");
         {

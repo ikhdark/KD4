@@ -4,6 +4,10 @@ use super::thread_processor::unsupported_thread_store_operation;
 use super::*;
 
 impl ThreadRequestProcessor {
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Deletion is an exclusive thread-list mutation; hold the permit until it completes"
+    )]
     pub(crate) async fn thread_delete(
         &self,
         request_id: ConnectionRequestId,

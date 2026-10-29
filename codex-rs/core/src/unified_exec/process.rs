@@ -67,12 +67,6 @@ pub(crate) trait SpawnLifecycle: std::fmt::Debug + Send + Sync {
 
 pub(crate) type SpawnLifecycleHandle = Box<dyn SpawnLifecycle>;
 
-#[derive(Debug, Default)]
-/// Spawn lifecycle that performs no extra setup around process launch.
-pub(crate) struct NoopSpawnLifecycle;
-
-impl SpawnLifecycle for NoopSpawnLifecycle {}
-
 /// Records process creation, so an owner can tell a definite pre-creation
 /// failure from a possible start.
 #[derive(Debug)]
@@ -1143,6 +1137,7 @@ impl UnifiedExecProcess {
         Ok(managed)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn spawn_exec_server_output_task(
         started: StartedExecProcess,
         output_handles: OutputHandles,
@@ -1357,6 +1352,7 @@ impl UnifiedExecProcess {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn spawn_local_output_task(
         mut stdout_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
         mut stderr_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,

@@ -42,15 +42,6 @@ pub(crate) struct CodeItem {
     pub end: usize,
 }
 
-pub(crate) fn parse(
-    path: &str,
-    source: &str,
-    sha256: &str,
-    deadline: Instant,
-) -> Option<Vec<CodeItem>> {
-    parse_with_completeness(path, source, sha256, deadline).map(|(items, _)| items)
-}
-
 pub(super) fn parse_with_completeness(
     path: &str,
     source: &str,

@@ -1281,6 +1281,10 @@ impl RmcpClient {
         result
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Single-flight OAuth runtime creation: reinitialization reuses one live credential store"
+    )]
     async fn create_pending_transport(
         transport_recipe: &TransportRecipe,
     ) -> Result<PendingTransport> {

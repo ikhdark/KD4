@@ -727,7 +727,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 });
             }
             let mut successful = result.selection_status() == "complete";
-            let mut file_complete = selector_errors.is_empty() && file_selection_complete(&result);
+            let file_complete = selector_errors.is_empty() && file_selection_complete(&result);
             // Explicit selections retain the existing immutable-snapshot contract.
             // Complete default reads stay inline; omitted bytes need one durable
             // snapshot, but selecting them never rereads the file just written.
@@ -892,7 +892,6 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                             projected["snapshot_error"] = json!(retained.error.unwrap_or_else(|| "snapshot retention unavailable".into()));
                         }
                     }
-                    file_complete = false;
                     successful = false;
                     projected["complete"] = json!(false);
                     projected["delivered_selection_complete"] = json!(false);
@@ -1290,10 +1289,7 @@ pub(crate) async fn current_file_fingerprint(
             .find(|environment| environment.environment_id == id),
         None => step.environments.primary(),
     };
-    let Some(environment) = environment.filter(|environment| !environment.environment.is_remote())
-    else {
-        return None;
-    };
+    let environment = environment.filter(|environment| !environment.environment.is_remote())?;
     let Ok(path) = environment.cwd().join(&args.path) else {
         return None;
     };

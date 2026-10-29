@@ -183,9 +183,10 @@ fn parse_patch_text(patch: &str, mode: ParseMode) -> Result<ApplyPatchArgs, Pars
                 }
                 // Split/join previously reconstructed this same contiguous
                 // byte span, including CR and extra-CR line endings.
-                let start = patch.find('\n').expect("four lines have a newline") + 1;
-                let end = patch.rfind('\n').expect("four lines have a newline");
-                let inner = &patch[start..end];
+                let (Some(start), Some(end)) = (patch.find('\n'), patch.rfind('\n')) else {
+                    return Err(original_error);
+                };
+                let inner = &patch[start + 1..end];
                 boundaries(inner)?;
                 inner
             }

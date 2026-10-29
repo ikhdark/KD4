@@ -1,7 +1,6 @@
 use super::input_queue::InputQueue;
 use super::*;
 use crate::agents_md_manager::AgentsMdManager;
-use crate::config::ConstraintError;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::exec_env::create_env;
@@ -477,21 +476,22 @@ impl ToolHistoryPersistenceQueue {
     pub(super) async fn writer(&self) -> ToolHistoryPersistenceWriter<'_> {
         let mut progress = self.progress.clone();
         loop {
-            let state = self.state.lock().await;
-            if (state.resident_commands < TOOL_HISTORY_PENDING_COMMANDS
-                && state.resident_bytes < TOOL_HISTORY_PENDING_BYTES)
-                || self.wake_tx.is_closed()
             {
-                return ToolHistoryPersistenceWriter {
-                    state,
-                    wake_tx: &self.wake_tx,
-                    progress_tx: &self.progress_tx,
-                };
+                let state = self.state.lock().await;
+                if (state.resident_commands < TOOL_HISTORY_PENDING_COMMANDS
+                    && state.resident_bytes < TOOL_HISTORY_PENDING_BYTES)
+                    || self.wake_tx.is_closed()
+                {
+                    return ToolHistoryPersistenceWriter {
+                        state,
+                        wake_tx: &self.wake_tx,
+                        progress_tx: &self.progress_tx,
+                    };
+                }
             }
             // Never hold queue/session state or I/O admission while waiting.
             // A single oversized command is accepted intact; it stops further
             // admission until its batch settles instead of dropping evidence.
-            drop(state);
             let stopped = tokio::select! {
                 result = progress.changed() => result.is_err(),
                 _ = self._worker.stopped.cancelled() => true,
@@ -880,10 +880,6 @@ impl SessionConfiguration {
 
     pub(crate) fn codex_home(&self) -> &AbsolutePathBuf {
         &self.codex_home
-    }
-
-    pub(super) fn permission_profile_state(&self) -> &PermissionProfileState {
-        &self.permission_profile_state
     }
 
     pub(super) fn permission_profile(&self) -> PermissionProfile {

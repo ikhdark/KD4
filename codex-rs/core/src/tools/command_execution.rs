@@ -494,8 +494,10 @@ impl CommandExecutionLedger {
         epoch: u64,
         observed: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
     ) -> u64 {
-        let _refresh = self.workspace_identity_refresh.acquire().await
-            .expect("workspace refresh semaphore is never closed");
+        // The semaphore is never closed; if it were, skip this refresh.
+        let Ok(_refresh) = self.workspace_identity_refresh.acquire().await else {
+            return epoch;
+        };
         {
             let state = self.state.lock().await;
             if state.repository.epoch != epoch || turn.is_some_and(|(id, revision)| {

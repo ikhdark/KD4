@@ -18,6 +18,7 @@ use sqlx::sqlite::SqliteSynchronous;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::hash_map;
 use std::future::Future;
 use std::io::Write;
 use std::path::Path;
@@ -4483,20 +4484,22 @@ async fn dependency_reaches_tx(
         if !seen.insert(next) {
             continue;
         }
-        if !cached_dependencies.contains_key(&next) {
-            let json = sqlx::query_scalar::<_, String>(
-                "SELECT body_json FROM assignments WHERE assignment_id = ?",
-            )
-            .bind(next.to_string())
-            .fetch_optional(&mut **transaction)
-            .await?;
-            let dependencies = match json {
-                Some(json) => decode::<Assignment>(&json)?.dependencies,
-                None => Vec::new(),
-            };
-            cached_dependencies.insert(next, dependencies);
-        }
-        let dependencies = cached_dependencies.get(&next).expect("visited dependency cached");
+        let dependencies = match cached_dependencies.entry(next) {
+            hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            hash_map::Entry::Vacant(entry) => {
+                let json = sqlx::query_scalar::<_, String>(
+                    "SELECT body_json FROM assignments WHERE assignment_id = ?",
+                )
+                .bind(next.to_string())
+                .fetch_optional(&mut **transaction)
+                .await?;
+                let dependencies = match json {
+                    Some(json) => decode::<Assignment>(&json)?.dependencies,
+                    None => Vec::new(),
+                };
+                entry.insert(dependencies)
+            }
+        };
         if dependencies.contains(&target) {
             return Ok(true);
         }

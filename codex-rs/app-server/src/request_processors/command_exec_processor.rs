@@ -68,11 +68,6 @@ fn legacy_command_exec_config(
     let mut config = base_config.clone();
     config.cwd = cwd.clone();
     config.set_legacy_sandbox_policy(sandbox_policy)?;
-    if matches!(
-        config.permissions.permission_profile(),
-        codex_protocol::models::PermissionProfile::Disabled
-    ) {
-    }
     Ok(config)
 }
 

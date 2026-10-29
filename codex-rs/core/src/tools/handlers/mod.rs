@@ -40,7 +40,6 @@ mod view_image;
 pub(crate) mod view_image_spec;
 mod wait_for_environment;
 
-use codex_git_utils::get_git_repo_root;
 use codex_protocol::request_permissions::UriAdditionalPermissionProfile;
 use codex_sandboxing::policy_transforms::intersect_uri_permission_profiles;
 use codex_sandboxing::policy_transforms::merge_uri_permission_profiles;
@@ -53,7 +52,6 @@ use serde_json::Map;
 use serde_json::Value;
 use std::future::Future;
 use std::path::Path;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::FunctionCallError;
@@ -80,10 +78,6 @@ pub(crate) use read_file::ReadFileHandler;
 pub(crate) use read_file::ReadStatusHandler;
 pub(crate) use read_file::compilation_module_paths;
 pub(crate) use read_file::canonical_read_file_arguments;
-pub(crate) use read_file::current_file_fingerprint;
-
-
-
 pub(crate) use read_file::existing_tests_changed;
 
 pub(crate) use read_file::validate_read_file_arguments;
@@ -210,18 +204,6 @@ where
     serde_json::from_str(arguments).map_err(|err| {
         FunctionCallError::RespondToModel(format!("failed to parse function arguments: {err}"))
     })
-}
-
-pub(crate) fn resolve_repository_root(cwd: &Path) -> PathBuf {
-    resolve_repository_root_with(cwd, get_git_repo_root)
-}
-
-
-fn resolve_repository_root_with(
-    cwd: &Path,
-    discover: impl FnOnce(&Path) -> Option<PathBuf>,
-) -> PathBuf {
-    discover(cwd).unwrap_or_else(|| cwd.to_path_buf())
 }
 
 fn updated_hook_command(updated_input: &Value) -> Result<&str, FunctionCallError> {

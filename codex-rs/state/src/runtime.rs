@@ -350,6 +350,10 @@ SELECT
     }
 
     /// Close all SQLite pools and wait for outstanding pool workers to exit.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "enrollment custody serializes runner unregistration against heartbeat registration"
+    )]
     pub async fn close(&self) {
         // Registration and close share custody: a cancelled observer cannot
         // enroll a heartbeat after shutdown or leave enrollment half-settled.

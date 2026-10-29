@@ -59,7 +59,6 @@ mod process_state;
 
 
 pub(crate) use errors::UnifiedExecError;
-pub(crate) use process::NoopSpawnLifecycle;
 pub(crate) use process::ObservedSpawnLifecycle;
 pub(crate) use process::ProcessOutputSnapshot;
 pub(crate) use process::UnifiedExecProcess;

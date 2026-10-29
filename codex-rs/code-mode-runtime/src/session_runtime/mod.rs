@@ -995,7 +995,9 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
                 }
             });
         drop(stored_values);
-        if let (Some(durable), Some((gate, staged, storage_owner))) = (durable, staged) {
+        if let (Some(durable), Some((gate, staged, storage_owner)), Some(completed)) =
+            (durable, staged, completed)
+        {
             if matches!(commit, CompletionCommit::Rejected(_)) {
                 // Temporary-file cleanup is I/O too, and never publishes.
                 self.inner
@@ -1005,7 +1007,6 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
             }
             // The atomic decision has been made. Never label a later publication
             // cancelled: termination and timeout observe an uncertain receipt.
-            let completed = completed.expect("staged publication retains its completion event");
             let inner = Arc::clone(&self.inner);
             let cell_id = self.cell_id.clone();
             let publication = self.inner.storage_tasks.spawn_blocking(move || {

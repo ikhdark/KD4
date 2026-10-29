@@ -371,9 +371,9 @@ def source_fingerprint(root=ROOT):
     return digest.hexdigest()
 
 
-def build_command(lto, codegen_units, opt_level=3, name=None):
-    profile = f"lto-runtime-{name or lto}"
-    command = ["cargo", "--config", f'profile.{profile}.inherits="local-release"']
+def build_command(lto, codegen_units, opt_level=3):
+    profile = "release"
+    command = ["cargo"]
     # None means inherit the current profile, not a hard-coded approximation.
     for key, value in (
         ("lto", lto),
@@ -445,9 +445,9 @@ def build_environment(spec, host, inherited=None):
 
 
 def build_in_lane(spec, host, destination, source_root):
-    target = Path(os.environ["CODEX_CARGO_LANE_TARGET_DIR"])
+    target = Path(os.environ["CODEX_CARGO_LANE_TARGET_DIR"]) / "variants" / spec["name"]
     command = build_command(
-        spec["lto"], spec["codegen_units"], spec["opt_level"], spec["name"]
+        spec["lto"], spec["codegen_units"], spec["opt_level"]
     ) + ["--target-dir", str(target)]
     subprocess.run(
         command,
@@ -457,7 +457,7 @@ def build_in_lane(spec, host, destination, source_root):
     )
     destination.mkdir(exist_ok=True)
     for name in PROGRAMS:
-        shutil.copy2(target / f"lto-runtime-{spec['name']}" / name, destination / name)
+        shutil.copy2(target / "release" / name, destination / name)
 
 
 def binary_identities(bundle):
@@ -645,7 +645,7 @@ def main(argv=None):
         "--matrix",
         choices=("lto", "screening"),
         default="lto",
-        help="Compare current local-release and fat; screening adds baseline/native CPU, fat/cgu1 and baseline/opt-level 2",
+        help="Compare current release and fat; screening adds baseline/native CPU, fat/cgu1 and baseline/opt-level 2",
     )
     parser.add_argument(
         "--experiment-dir",
@@ -656,7 +656,7 @@ def main(argv=None):
         "--codegen-units",
         type=int,
         default=16,
-        help="Workspace codegen units for fat candidates only; baseline inherits current local-release unchanged.",
+        help="Codegen units for workspace/runtime dependencies in fat candidates; baseline inherits release and build-only dependencies retain Cargo defaults.",
     )
     parser.add_argument(
         "--timeout",

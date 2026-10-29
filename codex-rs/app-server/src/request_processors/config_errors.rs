@@ -14,10 +14,10 @@ fn cloud_config_bundle_load_error(err: &std::io::Error) -> Option<&CloudConfigBu
 }
 
 fn config_load_error(err: &std::io::Error) -> JSONRPCErrorError {
-    if err
-        .get_ref()
-        .is_some_and(|source| source.is::<crate::config_manager::ConfigGenerationChanged>())
-    {
+    if matches!(
+        err.get_ref(),
+        Some(source) if source.is::<crate::config_manager::ConfigGenerationChanged>()
+    ) {
         let mut error = internal_error(err.to_string());
         error.data = Some(serde_json::json!({ "reason": "configurationChanged" }));
         return error;

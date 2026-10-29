@@ -29,7 +29,6 @@ use crate::context::AvailableSkillsInstructions;
 use crate::context::CollaborationModeInstructions;
 use crate::context::ContextualUserFragment;
 use crate::context::MultiAgentModeInstructions;
-use crate::context::NetworkRuleSaved;
 use crate::context::PermissionsInstructions;
 use crate::context::PersonalitySpecInstructions;
 use crate::context::SkillsUsageInstructions;
@@ -48,7 +47,6 @@ use crate::skills::SkillRenderSideEffects;
 use crate::skills_load_input_from_config;
 use crate::turn_metadata::TurnMetadataState;
 use crate::turn_timing::now_unix_timestamp_ms;
-use anyhow::Context;
 use async_channel::Receiver;
 use async_channel::Sender;
 use chrono::Local;
@@ -169,7 +167,6 @@ use serde_json::Value;
 use sha2::Digest;
 use sha2::Sha256;
 use tokio::sync::Mutex;
-use tokio::sync::RwLock;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -2004,17 +2001,6 @@ impl Session {
         history.estimate_token_count(turn_context)
     }
 
-    pub(crate) async fn get_estimated_token_count_after_pending_user_boundary(
-        &self,
-        turn_context: &TurnContext,
-    ) -> Option<i64> {
-        let history = self.state.lock().await.history.clone();
-        history.estimate_token_count_after_pending_user_boundary(
-            &turn_context.model_info.input_modalities,
-            turn_context.base_instructions.as_ref(),
-        )
-    }
-
     pub(crate) async fn get_base_instructions(&self) -> BaseInstructions {
         let state = self.state.lock().await;
         BaseInstructions {
@@ -3488,36 +3474,6 @@ impl Session {
         };
         let message: ResponseItem =
             ContextualUserFragment::into(ApprovedCommandPrefixSaved::new(prefixes));
-        let turn_context = self.turn_context_for_sub_id(sub_id).await;
-        if let Err(error) = self
-            .inject_no_new_turn(vec![message], turn_context.as_deref())
-            .await
-        {
-            self.send_event_raw(Event {
-                id: sub_id.to_string(),
-                msg: EventMsg::Warning(codex_protocol::protocol::WarningEvent {
-                    message: format!("Saved policy notification was not delivered: {error}"),
-                }),
-            })
-            .await;
-        }
-    }
-
-    pub(crate) async fn persist_network_policy_amendment(
-        &self,
-        _amendment: &NetworkPolicyAmendment,
-        _network_approval_context: &NetworkApprovalContext,
-    ) -> anyhow::Result<()> {
-        anyhow::bail!("managed network proxy support was removed; network policy amendments cannot be enforced")
-    }
-
-
-    pub(crate) async fn record_network_policy_amendment_message(
-        &self,
-        sub_id: &str,
-        amendment: &NetworkPolicyAmendment,
-    ) {
-        let message: ResponseItem = ContextualUserFragment::into(NetworkRuleSaved::new(amendment));
         let turn_context = self.turn_context_for_sub_id(sub_id).await;
         if let Err(error) = self
             .inject_no_new_turn(vec![message], turn_context.as_deref())
@@ -6765,7 +6721,9 @@ impl Session {
         else {
             unreachable!("session-owned tool-history reconciliation semaphore is never closed");
         };
-        let mutation = crate::tool_history::ToolHistoryMutation::RegisterCandidate { candidate };
+        let mutation = crate::tool_history::ToolHistoryMutation::RegisterCandidate {
+            candidate: Box::new(candidate),
+        };
         let mut persistence_writer = self.tool_history_persistence.writer().await;
         let mut state = self.state.lock().await;
         state.apply_tool_history_mutation(&mutation);
@@ -7744,10 +7702,6 @@ impl Session {
     /// Inject additional user input into the currently active turn.
     ///
     /// Returns the active turn id when accepted.
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "active turn checks and turn state updates must remain atomic"
-    )]
     pub async fn steer_input(
         self: &Arc<Self>,
         input: Vec<UserInput>,
@@ -7772,6 +7726,10 @@ impl Session {
         })?
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "active turn checks and turn state updates must remain atomic"
+    )]
     async fn steer_input_inner(
         &self,
         input: Vec<UserInput>,
@@ -7791,13 +7749,12 @@ impl Session {
         let db = if client_user_message_id.is_some() {
             Some(self.receipt_db().map_err(|error| SteerInputError::ReceiptUnavailable { message: error.to_string() })?)
         } else { None };
-        if let (Some(db), Some(client_id), Some(scope)) = (&db, &client_user_message_id, expected_turn_id) {
-            if let Some(receipt) = db.input_receipt(self.thread_id, "steer", scope, client_id).await
+        if let (Some(db), Some(client_id), Some(scope)) = (&db, &client_user_message_id, expected_turn_id)
+            && let Some(receipt) = db.input_receipt(self.thread_id, "steer", scope, client_id).await
                 .map_err(|error| SteerInputError::ReceiptUnavailable { message: error.to_string() })?
-            {
-                if receipt.fingerprint != fingerprint { return Err(SteerInputError::IdempotencyConflict); }
-                return Ok(receipt.turn_id);
-            }
+        {
+            if receipt.fingerprint != fingerprint { return Err(SteerInputError::IdempotencyConflict); }
+            return Ok(receipt.turn_id);
         }
         let mut active = self.active_turn.lock().await;
         let Some(active_turn) = active.as_mut() else {

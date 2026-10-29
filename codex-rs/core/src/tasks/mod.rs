@@ -1803,7 +1803,7 @@ impl Session {
         }
         turn_context.turn_timing_state.begin_finalization();
         let timing_snapshot = turn_context.turn_timing_state.complete_snapshot();
-        let mut timing = crate::turn_timing::retain_turn_timing_details(
+        let timing = crate::turn_timing::retain_turn_timing_details(
             timing_snapshot.protocol_timing(),
             &turn_context.config.codex_home,
             &self.thread_id.to_string(),

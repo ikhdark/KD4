@@ -7,7 +7,6 @@ use std::future::Future;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 use codex_config::ProjectDiscoveryContext;
 use codex_file_system::ExecutorFileSystem;
@@ -157,9 +156,6 @@ pub(crate) struct WorkspaceEvidenceIdentity {
     pub(crate) head_identity: Option<String>,
     pub(crate) index_identity: Option<String>,
     pub(crate) worktree_identity: Option<String>,
-    /// Capture-local detail, never serialized into model history or cache keys.
-    #[serde(skip)]
-    pub(crate) path_fingerprints: Option<BTreeMap<String, String>>,
 }
 
 impl PartialEq for WorkspaceEvidenceIdentity {
@@ -174,56 +170,13 @@ impl PartialEq for WorkspaceEvidenceIdentity {
 
 impl Eq for WorkspaceEvidenceIdentity {}
 
-impl WorkspaceEvidenceIdentity {
-    fn unavailable(repository_root: Option<&Path>) -> Self {
-        Self {
-            unavailable: true,
-            repository_root: repository_root.map(|root| root.to_string_lossy().into_owned()),
-            head_identity: None,
-            index_identity: None,
-            worktree_identity: None,
-            path_fingerprints: None,
-        }
-    }
-
-    pub(crate) fn changed_paths_since(&self, before: &Self) -> Option<BTreeSet<PathBuf>> {
-        if self.unavailable
-            || before.unavailable
-            || self.repository_root != before.repository_root
-            || self.head_identity != before.head_identity
-        {
-            return None;
-        }
-        let root = Path::new(self.repository_root.as_deref()?);
-        let before = before.path_fingerprints.as_ref()?;
-        let after = self.path_fingerprints.as_ref()?;
-        Some(
-            before
-                .keys()
-                .chain(after.keys())
-                .filter(|path| before.get(*path) != after.get(*path))
-                .map(|path| root.join(path))
-                .collect(),
-        )
-    }
-}
-
+/// Git dependencies are no longer captured, so none can time out.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum WorkspaceEvidenceGitDependency {
-    Head,
-    Index,
-    Worktree,
-    Untracked,
-}
+pub(crate) enum WorkspaceEvidenceGitDependency {}
 
 impl WorkspaceEvidenceGitDependency {
     pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Head => "head",
-            Self::Index => "index",
-            Self::Worktree => "worktree",
-            Self::Untracked => "untracked",
-        }
+        match self {}
     }
 }
 
@@ -345,15 +298,6 @@ impl SourcePathChangeObservation {
         let path = self.alias.as_ref().map_or(&self.path, |alias| &alias.path);
         crate::tool_history::SourceDependencyV1::new(path, self.recursive)
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum SourceFreshness {
-    /// The live journal has no delivered relevant change. Events may be pending.
-    NoObservedChange,
-    Changed,
-    Unknown,
 }
 
 #[derive(Default)]
@@ -517,10 +461,6 @@ impl GitWorkspaceCache {
     pub(crate) async fn workspace_evidence_for_turn(
         &self, _turn: &crate::session::turn_context::TurnContext, _cwd: &Path,
     ) -> WorkspaceEvidenceCapture { WorkspaceEvidenceCapture::default() }
-    pub(crate) async fn workspace_evidence_for_uri(
-        &self, _turn: &crate::session::turn_context::TurnContext, _cwd: &PathUri, _environment_id: &str,
-    ) -> Option<WorkspaceEvidenceIdentity> { None }
-    pub(crate) async fn workspace_evidence_identity(&self, _cwd: &Path) -> Option<WorkspaceEvidenceIdentity> { None }
     pub(crate) async fn workspace_root_identity(&self, _cwd: &Path) -> Option<WorkspaceEvidenceIdentity> { None }
     /// Root identity for closed input-determined receipts, not source freshness
     /// or authority to reuse execution results.
@@ -532,27 +472,15 @@ impl GitWorkspaceCache {
             head_identity: None,
             index_identity: None,
             worktree_identity: None,
-            path_fingerprints: None,
         })
     }
-    pub(crate) async fn workspace_evidence_identity_with_attribution(&self, _cwd: &Path) -> WorkspaceEvidenceCapture {
-        WorkspaceEvidenceCapture::default()
-    }
-    pub(crate) async fn latest_workspace_evidence_identity(&self, _cwd: &Path) -> Option<WorkspaceEvidenceIdentity> { None }
-    pub(crate) async fn begin_source_path_change_observations(
-        &self, _root: &Path, _paths: &[(PathBuf, bool)],
-    ) -> Option<Vec<SourcePathChangeObservation>> { None }
-    pub(crate) fn source_path_change_observation_is_current(&self, _observation: &SourcePathChangeObservation) -> bool { false }
-    pub(crate) fn source_path_freshness(&self, _observation: &SourcePathChangeObservation) -> SourceFreshness { SourceFreshness::Unknown }
     pub(crate) fn begin_host_workspace_mutation(self: &Arc<Self>) -> PendingSourceMutation { PendingSourceMutation }
     pub(crate) fn note_host_workspace_mutation(&self) {}
     pub(crate) async fn note_host_workspace_mutation_paths(self: &Arc<Self>, _root: &Path, _paths: &[String]) {}
 }
 pub(crate) struct PendingSourceMutation;
 impl PendingSourceMutation { pub(crate) fn settle(self) {} }
-pub(crate) async fn capture_workspace_evidence_identity(_cwd: &Path) -> Option<WorkspaceEvidenceIdentity> { None }
 pub(crate) async fn git_ignored_paths(_root: &Path, _paths: &[PathBuf]) -> BTreeSet<PathBuf> { BTreeSet::new() }
-pub(crate) async fn git_ignores_all_changed_paths(_root: &Path, _paths: &[PathBuf]) -> bool { false }
 async fn collect_workspace_work_in_order<T>(
     work: impl IntoIterator<Item = impl Future<Output = T> + Send>,
     concurrency: usize,

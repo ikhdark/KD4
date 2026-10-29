@@ -217,6 +217,10 @@ impl Session {
         Ok(())
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "active turn checks and turn state updates must remain atomic"
+    )]
     async fn admit_reserved_idle_input(
         &self,
         turn_state: &Arc<tokio::sync::Mutex<TurnState>>,

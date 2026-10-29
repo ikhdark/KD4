@@ -3399,44 +3399,6 @@ impl TurnTimingState {
         Some((local as u64, input as u64))
     }
 
-    /// Pair only an unambiguous completed physical request. Partial responses,
-    /// retries, missing diagnostics, and a changed model cannot train estimates.
-    pub(crate) fn prompt_token_calibration_sample(
-        &self,
-        model: &str,
-        usage: &TokenUsage,
-    ) -> Option<(u64, u64)> {
-        let state = self.state();
-        let request = state.model_requests.last()?;
-        if request.completed_ns.is_none()
-            || request.attempt_kind != TurnTimingAttemptKind::Primary
-            || request.physical_attempt_ids.len() != 1
-            || usage.input_tokens <= 0
-        {
-            return None;
-        }
-        let sections = request
-            .request_section_sha256_by_attempt
-            .get(request.physical_attempt_ids.last()?)?;
-        let expected_model = hex::encode(Sha256::digest(
-            serde_json::json!(model).to_string().as_bytes(),
-        ));
-        if sections.get("model") != Some(&expected_model)
-            || request.token_usage.as_ref()?.input_tokens != usage.input_tokens as u64
-        {
-            return None;
-        }
-        let categories = request.request_token_categories.as_ref()?;
-        if categories.accounting_basis
-            != codex_protocol::protocol::TurnTimingTokenCategoryBasis::FullLogicalPrompt
-            || categories.local_input_estimate == 0
-            || categories.local_input_estimate > i64::MAX as u64
-        {
-            return None;
-        }
-        Some((categories.local_input_estimate, usage.input_tokens as u64))
-    }
-
     pub(crate) fn record_model_request_diagnostics_unavailable(
         &self,
         sampling_request_id: &str,

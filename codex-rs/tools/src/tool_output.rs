@@ -940,13 +940,11 @@ fn essential_projection_fields_bounded(
                     if key_bytes > *remaining {
                         return None;
                     }
-                    if is_essential_key(key) {
-                        if small_control_value(value, 0, &mut 2048) {
-                            let bytes = value.to_string().len();
-                            if bytes <= 2048 && bytes + key_bytes <= *remaining {
-                                *remaining -= bytes + key_bytes;
-                                return Some((key.clone(), value.clone()));
-                            }
+                    if is_essential_key(key) && small_control_value(value, 0, &mut 2048) {
+                        let bytes = value.to_string().len();
+                        if bytes <= 2048 && bytes + key_bytes <= *remaining {
+                            *remaining -= bytes + key_bytes;
+                            return Some((key.clone(), value.clone()));
                         }
                     }
                     *remaining -= key_bytes;
@@ -1377,7 +1375,7 @@ fn telemetry_preview_joined_parts<'a>(
         found = true;
         let available = limit.saturating_sub(prefix.len());
         prefix.push_str(&part[..part.floor_char_boundary(available.min(part.len()))]);
-        if prefix.len() >= TELEMETRY_PREVIEW_MAX_BYTES + 1 {
+        if prefix.len() > TELEMETRY_PREVIEW_MAX_BYTES {
             break;
         }
     }

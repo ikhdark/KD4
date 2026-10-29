@@ -188,12 +188,13 @@ impl RawOutputArtifactTask {
 
     pub(crate) fn write_chunk(&mut self, output: &[u8]) {
         if output.is_empty() { return; }
-        if self.writer.is_none() && self.failure.is_none() {
-            if let Err(error) = self.initialize_writer() {
-                self.failure = Some(error.to_string());
-                self.incomplete = true;
-                return;
-            }
+        if self.writer.is_none()
+            && self.failure.is_none()
+            && let Err(error) = self.initialize_writer()
+        {
+            self.failure = Some(error.to_string());
+            self.incomplete = true;
+            return;
         }
         let Some(writer) = self.writer.as_mut() else { return; };
         if let Err(error) = writer.write_all(output) {
@@ -228,7 +229,7 @@ impl RawOutputArtifactTask {
             *state = RawOutputArtifact::Stored {
                 id: self.id, path: self.path.clone(), bytes: self.bytes,
                 truncated: self.incomplete, handle: Arc::clone(handle),
-                digest: self.digest.clone(), finalized: false,
+                finalized: false,
             };
         }
     }
@@ -264,7 +265,7 @@ impl RawOutputArtifactTask {
             match result {
                 Ok(handle) => RawOutputArtifact::Stored {
                     id: self.id, path: self.path.clone(), bytes: self.bytes,
-                    truncated: self.incomplete, handle, digest: self.digest.clone(), finalized: true,
+                    truncated: self.incomplete, handle, finalized: true,
                 },
                 Err(error) => self.failed(error.to_string()),
             }
@@ -291,10 +292,10 @@ impl Drop for RawOutputArtifactTask {
                 "complete": false, "bytes": self.bytes,
                 "sha256": hex::encode(self.digest.clone().finalize()),
             });
-            if self.handle.is_some() {
-                if let Ok(bytes) = serde_json::to_vec(&status) {
-                    let _ = codex_file_system::write_bytes_atomically(&self.path.with_extension("status"), &bytes);
-                }
+            if self.handle.is_some()
+                && let Ok(bytes) = serde_json::to_vec(&status)
+            {
+                let _ = codex_file_system::write_bytes_atomically(&self.path.with_extension("status"), &bytes);
             }
             if let Ok(mut state) = self.state.try_lock() {
                 *state = self.failed("command output capture ended before finalization".into());
@@ -415,7 +416,7 @@ fn open_command_log(path: &Path) -> std::io::Result<(File, Option<CommandLogIden
     let identity = if identified {
         // SAFETY: both successful queries initialized these complete buffers.
         let (id, basic) = unsafe { (id.assume_init(), basic.assume_init()) };
-        file.metadata().ok().filter(|metadata| metadata.is_file()).map(|metadata| CommandLogIdentity {
+        file.metadata().ok().filter(std::fs::Metadata::is_file).map(|metadata| CommandLogIdentity {
             path: path.to_owned(), volume: id.VolumeSerialNumber, file_id: id.FileId.Identifier,
             created: basic.CreationTime, changed: basic.ChangeTime, bytes: metadata.len(),
         }).filter(|identity| identity.created > 0 && identity.changed > 0

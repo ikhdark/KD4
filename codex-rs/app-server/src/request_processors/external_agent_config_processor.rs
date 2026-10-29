@@ -31,6 +31,7 @@ pub(crate) struct ExternalAgentConfigRequestProcessor {
 }
 
 impl ExternalAgentConfigRequestProcessor {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         outgoing: Arc<OutgoingMessageSender>,
         config_processor: ConfigRequestProcessor,
@@ -242,9 +243,20 @@ impl ExternalAgentConfigRequestProcessor {
 }
 
 fn item_type_name(item_type: ExternalAgentConfigMigrationItemType) -> String {
-    // The enum's wire names are also the existing SQLite record contract.
-    serde_json::to_value(item_type).expect("item type serializes")
-        .as_str().expect("item type is a string").to_string()
+    // The enum's serde wire names are also the existing SQLite record contract
+    // decoded by `parse_item_type`; keep these strings identical to them.
+    match item_type {
+        ExternalAgentConfigMigrationItemType::AgentsMd => "AGENTS_MD",
+        ExternalAgentConfigMigrationItemType::Config => "CONFIG",
+        ExternalAgentConfigMigrationItemType::Skills => "SKILLS",
+        ExternalAgentConfigMigrationItemType::Plugins => "PLUGINS",
+        ExternalAgentConfigMigrationItemType::McpServerConfig => "MCP_SERVER_CONFIG",
+        ExternalAgentConfigMigrationItemType::Subagents => "SUBAGENTS",
+        ExternalAgentConfigMigrationItemType::Hooks => "HOOKS",
+        ExternalAgentConfigMigrationItemType::Commands => "COMMANDS",
+        ExternalAgentConfigMigrationItemType::Sessions => "SESSIONS",
+    }
+    .to_string()
 }
 
 fn parse_item_type(item_type: String) -> Result<ExternalAgentConfigMigrationItemType, JSONRPCErrorError> {

@@ -100,8 +100,10 @@ fn check(
                 return Err(rejected("PowerShell EncodedCommand is not UTF-16LE."));
             }
             let units = bytes
-                .chunks_exact(2)
-                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u16::from_le_bytes(*pair))
                 .collect::<Vec<_>>();
             let script = String::from_utf16(&units)
                 .map_err(|_| rejected("PowerShell EncodedCommand is not UTF-16LE."))?;
@@ -1039,10 +1041,6 @@ fn potential_build(argv: &[String]) -> bool {
             .is_some_and(|program| program_name(program).eq_ignore_ascii_case("cargo"))
             && cargo_subcommand(&argv[1..]).is_some_and(|(_, name)| !cargo_builtin(name))
 }
-
-/// Programs that only report on existing processes or text. None of them can
-/// start a build, so a Cargo name appearing in their filters or arguments is
-/// data, not an invocation, and must not reach the build rejection.
 
 fn visibly_builds_cmd(script: &str) -> bool {
     super::possible_cmd_commands(script).is_none_or(|commands| {

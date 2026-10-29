@@ -648,12 +648,6 @@ impl PromptContextBreakdown {
             .map_or(0, |entry| entry.estimated_tokens)
     }
 
-    pub(crate) fn total_estimated_tokens(&self) -> u64 {
-        self.categories.values().fold(0_u64, |total, entry| {
-            total.saturating_add(entry.estimated_tokens)
-        })
-    }
-
     pub(crate) fn record_sequence_envelope(
         &mut self,
         category: PromptContextCategory,

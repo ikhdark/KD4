@@ -18,13 +18,15 @@ use crate::provider::SkillReadRequest;
 
 const HOST_AUTHORITY_ID: &str = "host";
 
+type SnapshotCatalog = (Weak<HostSkillsSnapshot>, Arc<SkillCatalog>);
+
 /// Host-owned skill provider backed by an immutable service snapshot.
 ///
 /// Discovery and caching belong to `SkillsService`; this provider only maps a
 /// snapshot into the authority-aware catalog/read contract.
 #[derive(Clone, Default)]
 pub struct HostSkillProvider {
-    catalogs: Arc<Mutex<Vec<(Weak<HostSkillsSnapshot>, Arc<SkillCatalog>)>>>,
+    catalogs: Arc<Mutex<Vec<SnapshotCatalog>>>,
 }
 
 impl HostSkillProvider {

@@ -332,11 +332,12 @@ impl ResponsesEventInterpreter {
         let mut token_receipts_complete = self.token_receipts_complete;
         let mut text_complete = self.text_token_receipts_complete;
         let mut text_delta_bytes = self.text_delta_bytes;
-        if event.kind == "response.output_text.delta" && let Some(delta) = event.delta.as_ref() {
-            if !delta.is_empty() {
-                text_complete &= token_receipts.is_some();
-                text_delta_bytes = text_delta_bytes.saturating_add(delta.len() as u64);
-            }
+        if event.kind == "response.output_text.delta"
+            && let Some(delta) = event.delta.as_ref()
+            && !delta.is_empty()
+        {
+            text_complete &= token_receipts.is_some();
+            text_delta_bytes = text_delta_bytes.saturating_add(delta.len() as u64);
         }
         let mut text_final_bytes = self.text_final_bytes;
         if event.kind == "response.output_item.done"

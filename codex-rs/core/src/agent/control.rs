@@ -112,7 +112,6 @@ pub(crate) struct SpawnAgentOptions {
 pub(crate) struct LiveAgent {
     pub(crate) thread_id: ThreadId,
     pub(crate) metadata: AgentMetadata,
-    pub(crate) status: AgentStatus,
     pub(crate) execution_started_at: tokio::time::Instant,
 }
 
@@ -506,20 +505,6 @@ impl AgentControl {
             Err(error) => return Err(error),
         }
         Ok(())
-    }
-
-    /// Send rich user input items to an existing agent thread.
-    pub(crate) async fn send_input(
-        &self,
-        agent_id: ThreadId,
-        input: Vec<UserInput>,
-    ) -> CodexResult<String> {
-        let state = self.upgrade()?;
-        let execution_guard = self
-            .reserve_execution_capacity_for_turn_start(agent_id, /*starts_turn*/ true)
-            .await?;
-        self.send_input_after_capacity_check(agent_id, &state, input, execution_guard)
-            .await
     }
 
     async fn send_input_after_capacity_check(
@@ -950,14 +935,6 @@ impl AgentControl {
     /// unavailable session usage makes the totals a lower bound. Even with a
     /// retained graph, ephemeral children are not persisted, so complete membership
     /// cannot currently be certified.
-    pub(crate) async fn aggregate_live_subtree_usage(
-        &self,
-        agent_id: ThreadId,
-    ) -> CodexResult<SubtreeUsage> {
-        self.aggregate_live_subtree_usage_from_snapshot(agent_id, &HashMap::new())
-            .await
-    }
-
     async fn aggregate_live_subtree_usage_from_snapshot(
         &self,
         agent_id: ThreadId,
@@ -1325,15 +1302,6 @@ impl AgentControl {
             })
             .collect::<Vec<_>>()
             .join("\n")
-    }
-
-    pub(crate) async fn list_agents(
-        &self,
-        current_session_source: &SessionSource,
-        path_prefix: Option<&str>,
-    ) -> CodexResult<Vec<ListedAgent>> {
-        self.list_agents_with_task_snapshots(current_session_source, path_prefix)
-            .await.map(|(agents, _)| agents)
     }
 
     pub(crate) async fn list_agents_with_task_snapshots(
@@ -1940,11 +1908,4 @@ fn last_task_message_from_communication(communication: &InterAgentCommunication)
 
 fn non_empty_task_message(message: String) -> Option<String> {
     (!message.is_empty()).then_some(message)
-}
-
-fn thread_spawn_depth(session_source: &SessionSource) -> Option<i32> {
-    match session_source {
-        SessionSource::SubAgent(SubAgentSource::ThreadSpawn { depth, .. }) => Some(*depth),
-        _ => None,
-    }
 }

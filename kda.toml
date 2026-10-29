@@ -1,15 +1,67 @@
 # Repository-root language inventory. Rust profile policy remains in
 # codex-rs/kda.toml. Exclude installed dependencies and generated build/evidence
 # outputs, not authored maintenance tooling such as scripts/build.
+# Mirrors the .gitignore directory rules (root, codex-cli, codex-rs and
+# tools/argument-comment-lint) because the Python gate honors only these
+# exclusions. KDA has no negation, so `build/` (which re-includes /scripts/build/)
+# stays unlisted; file-only ignore patterns cannot match analyzed sources.
 version = 1
 exclude = [
-    "**/.venv/**",
+    # Dependencies, environments, caches and vendored sources.
     "**/node_modules/**",
+    "**/.pnpm-store/**",
+    "**/.yarn/**",
+    "**/.venv/**",
+    "**/.env*",
+    "**/.direnv/**",
+    "**/__pycache__/**",
+    "**/.pytest_cache/**",
+    "**/.ruff_cache/**",
+    "**/.cache/**",
+    "**/.turbo/**",
+    "**/.parcel-cache/**",
+    "**/.jest/**",
+    "**/.nyc_output/**",
+    "codex-cli/vendor/**",
+    "third_party/**",
+    # Build outputs.
     "target/**",
+    "target-*/**",
     "codex-rs/target/**",
     "codex-rs/target-*/**",
+    "codex-rs/codex-rs/target/**",
+    "tools/argument-comment-lint/target/**",
+    "_build/**",
+    "**/dist/**",
+    "**/out/**",
+    "**/storybook-static/**",
+    "**/coverage/**",
+    "**/result",
+    "**/.vercel/**",
+    "**/.netlify/**",
+    # Editor and agent state.
+    "**/.idea/**",
+    "**/.vs/**",
+    "**/.history/**",
+    "**/.zed/**",
+    "**/.claude/**",
+    # Local evidence, scratch and personal files.
     ".kda/**",
     "codex-rs/.kda/**",
     ".codex/audits/**",
-    "third_party/**",
+    ".codex/benchmark-runs/**",
+    ".codex/diagnostics/**",
+    ".codex/gitdiff/**",
+    ".codex/harness/targets/**",
+    ".codex/locks/**",
+    ".codex/tmp/**",
+    ".scratch/**",
+    ".tmp/**",
+    "lanes/**",
+    "audits/**",
+    "audits_benchmarks/**",
+    "docs/**",
+    "kd-ui/**",
+    "**/personal/**",
+    "**/apply_patch/**",
 ]

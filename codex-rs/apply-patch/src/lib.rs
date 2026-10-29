@@ -467,12 +467,16 @@ pub enum AppliedPatchFileChange {
 pub struct ApplyPatchFailure {
     #[source]
     error: ApplyPatchError,
-    delta: AppliedPatchDelta,
+    // Boxed so every `Result<AppliedPatchDelta, ApplyPatchFailure>` stays small.
+    delta: Box<AppliedPatchDelta>,
 }
 
 impl ApplyPatchFailure {
     fn new(error: ApplyPatchError, delta: AppliedPatchDelta) -> Self {
-        Self { error, delta }
+        Self {
+            error,
+            delta: Box::new(delta),
+        }
     }
 
     fn without_delta(error: ApplyPatchError) -> Self {
@@ -484,7 +488,7 @@ impl ApplyPatchFailure {
     }
 
     pub fn into_parts(self) -> (ApplyPatchError, AppliedPatchDelta) {
-        (self.error, self.delta)
+        (self.error, *self.delta)
     }
 }
 
@@ -582,6 +586,10 @@ pub async fn apply_verified_patch_with_cancellation(
     ).await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Patch application threads output sinks, filesystem, sandbox, and cancellation"
+)]
 async fn apply_hunks_with_verified_action(
     hunks: &[Hunk],
     cwd: &PathUri,
@@ -613,11 +621,11 @@ async fn apply_hunks_with_verified_action(
             for (path, change) in action.changes() {
                 if let ApplyPatchFileChange::Delete { content } = change {
                     anyhow::ensure!(fs.read_file_text(path, sandbox).await? == *content,
-                        "delete source changed after verification; refusing to delete {}", path);
+                        "delete source changed after verification; refusing to delete {path}");
                     let index = hunks.iter().position(|hunk| hunk.resolve_path(cwd).ok().as_ref() == Some(path))
                         .context("verified delete is missing from patch")?;
                     anyhow::ensure!(prepared[index].as_ref().is_some_and(|source| source.original_contents == *content),
-                        "delete source changed during preparation; refusing to delete {}", path);
+                        "delete source changed during preparation; refusing to delete {path}");
                 }
             }
             ensure_rebased_updates_keep_their_sites(hunks, cwd, &previous_updates, &prepared, action)?;
@@ -804,6 +812,10 @@ async fn rollback_committed_changes(
 
 /// Apply the hunks to the filesystem, recording committed changes in the delta.
 /// Returns an error if the patch could not be applied.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Patch application threads filesystem, sandbox, prepared state, and cancellation"
+)]
 async fn apply_hunks_to_files(
     hunks: &[Hunk],
     cwd: &PathUri,
@@ -1546,36 +1558,6 @@ async fn remove_failure_was_side_effect_free(
             .get_metadata(path, sandbox)
             .await
             .is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
-    }
-}
-
-async fn read_optional_file_text_for_delta(
-    path: &PathUri,
-    fs: &dyn ExecutorFileSystem,
-    sandbox: Option<&FileSystemSandboxContext>,
-    exact: &mut bool,
-) -> io::Result<Option<String>> {
-    match fs.read_file_text(path, sandbox).await {
-        Ok(content) => {
-            note_existing_path_delta_support(path, fs, sandbox, exact).await;
-            Ok(Some(content))
-        }
-        Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            // A dangling symlink is not an absent destination. Do not infer
-            // absence merely because reading through it failed.
-            match fs.get_metadata(path, sandbox).await {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-                Err(error) => Err(error),
-                Ok(_) => Err(source),
-            }
-        }
-        Err(source) => Err(io::Error::new(
-            source.kind(),
-            format!(
-                "refusing to overwrite {}: destination preimage is unreadable: {source}",
-                path.inferred_native_path_string(),
-            ),
-        )),
     }
 }
 

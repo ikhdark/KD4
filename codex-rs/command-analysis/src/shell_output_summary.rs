@@ -1256,7 +1256,7 @@ fn compiler_location_error(line: &str) -> bool {
             return false;
         }
         let location = line[..separator].trim();
-        let located = if let Some(location) = location.strip_suffix(')') {
+        if let Some(location) = location.strip_suffix(')') {
             location
                 .rsplit_once('(')
                 .is_some_and(|(path, coordinates)| {
@@ -1273,8 +1273,7 @@ fn compiler_location_error(line: &str) -> bool {
                     && !number.is_empty()
                     && number.bytes().all(|byte| byte.is_ascii_digit())
             })
-        };
-        located
+        }
     })
 }
 

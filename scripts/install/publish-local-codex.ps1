@@ -8,8 +8,8 @@ param(
     [switch]$NoSccache,
     [switch]$BuildOnly,
 
-    [ValidateSet("debug", "local-release", "local-fast", "local-pgo-instrumented", "local-pgo")]
-    [string]$Profile = "local-release",
+    [ValidateSet("dev", "release", "pgo")]
+    [string]$Profile = "release",
     [string]$PgoGenerateDirectory,
     [string]$PgoProfileData,
     [switch]$PrintBuiltCodexPath,
@@ -218,7 +218,7 @@ function Get-LocalPublishBuildRecipeFingerprint {
     # forms) feed the vendored C builds; the rest are compiler, build-script,
     # and compile-time inputs outside those namespaces.
     $ignoredEnvironmentNames = @("CARGO_TARGET_DIR", "CARGO_TERM_COLOR")
-    if ($NoSccache -or $Profile -in @("local-pgo-instrumented", "local-pgo")) {
+    if ($NoSccache -or $Profile -eq "pgo") {
         $ignoredEnvironmentNames += @(
             "RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER",
             "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"
@@ -481,18 +481,15 @@ function Get-DefaultLocalCodexSqliteHome {
 function Get-LocalPublishCommand {
     param([string]$Profile)
 
-    if ($Profile -eq "local-fast") {
-        return "just publish-local-codex-fast"
-    }
-    if ($Profile -eq "local-release") {
+    if ($Profile -eq "release") {
         return "just publish-local-codex-final"
     }
 
     $publisherPath = Join-Path $PSScriptRoot "publish-local-codex.ps1"
-    if ($Profile -eq "local-pgo-instrumented") {
+    if ($Profile -eq "pgo" -and -not [string]::IsNullOrWhiteSpace($PgoGenerateDirectory)) {
         return "powershell -NoProfile -ExecutionPolicy Bypass -File `"$publisherPath`" -Concise -AutoSkipBuild -NoSccache -BuildOnly -Profile $Profile -PgoGenerateDirectory `"$PgoGenerateDirectory`""
     }
-    if ($Profile -eq "local-pgo") {
+    if ($Profile -eq "pgo") {
         return "powershell -NoProfile -ExecutionPolicy Bypass -File `"$publisherPath`" -Concise -SkipBuild -NoSccache -Profile $Profile -PgoProfileData `"$PgoProfileData`" -ConfigureDesktopLocalCli -RestartDesktopIfNeeded"
     }
     return "powershell -NoProfile -ExecutionPolicy Bypass -File `"$publisherPath`" -Concise -AutoSkipBuild -Profile $Profile -ConfigureDesktopLocalCli -RestartDesktopIfNeeded"
@@ -501,7 +498,7 @@ function Get-LocalPublishCommand {
 function Get-LocalPublishBuildTarget {
     param([string]$RepoRoot, [string]$Profile)
 
-    if ($Profile -notin @("local-pgo-instrumented", "local-pgo")) { return $null }
+    if ($Profile -ne "pgo") { return $null }
     if (-not $script:LocalPublishBuildTargetCache.ContainsKey($RepoRoot)) {
         Push-Location -LiteralPath (Join-Path $RepoRoot "codex-rs")
         try { $target = Get-WindowsRustyV8Target }
@@ -515,8 +512,8 @@ function Get-LocalPublishBuildTarget {
 function Get-LocalPublishPgoConfiguration {
     param([string]$RepoRoot, [string]$Profile, [string]$GenerateDirectory, [string]$ProfileData)
 
-    if ($Profile -notin @("local-pgo-instrumented", "local-pgo")) {
-        if ($GenerateDirectory -or $ProfileData) { throw "PGO inputs require a local-pgo profile." }
+    if ($Profile -ne "pgo") {
+        if ($GenerateDirectory -or $ProfileData) { throw "PGO inputs require the pgo profile." }
         return $null
     }
     # Both passes must use the same Cargo profile settings, not ambient overrides.
@@ -524,8 +521,8 @@ function Get-LocalPublishPgoConfiguration {
         throw "Unset CARGO_PROFILE_* and CARGO_INCREMENTAL overrides for PGO."
     }
     $target = Get-LocalPublishBuildTarget -RepoRoot $RepoRoot -Profile $Profile
-    if ($Profile -eq "local-pgo-instrumented") {
-        if ([string]::IsNullOrWhiteSpace($GenerateDirectory) -or $ProfileData) {
+    if (-not [string]::IsNullOrWhiteSpace($GenerateDirectory)) {
+        if ($ProfileData) {
             throw "Instrumented PGO builds require only -PgoGenerateDirectory."
         }
         return [ordered]@{ mode = "generate"; target = $target; path = [IO.Path]::GetFullPath($GenerateDirectory); sha256 = $null }
@@ -544,21 +541,23 @@ function Get-LocalPublishPgoConfiguration {
     return [ordered]@{ mode = "use"; target = $target; path = $path; sha256 = $hash }
 }
 
-function Get-LocalPublishCargoProfile {
+function Get-LocalPublishBuildName {
     param([string]$Profile)
-    if ($Profile -eq "debug") { return "dev" }
-    if ($Profile -eq "local-pgo-instrumented") { return "local-pgo" }
+    # Keep instrumentation artifacts and stamps separate without another profile.
+    if ($Profile -eq "pgo" -and -not [string]::IsNullOrWhiteSpace($PgoGenerateDirectory)) {
+        return "pgo-instrumented"
+    }
     return $Profile
 }
 
 function Get-LocalPublishArtifactDirectory {
     param([string]$RepoRoot, [string]$Profile)
 
-    $directory = Join-Path $RepoRoot "codex-rs\target\publish-$Profile"
+    $buildName = Get-LocalPublishBuildName -Profile $Profile
+    $directory = Join-Path $RepoRoot "codex-rs\target\publish-$buildName"
     $target = Get-LocalPublishBuildTarget -RepoRoot $RepoRoot -Profile $Profile
     if ($target) { $directory = Join-Path $directory $target }
-    $cargoProfile = Get-LocalPublishCargoProfile -Profile $Profile
-    $profileDir = if ($cargoProfile -eq "dev") { "debug" } else { $cargoProfile }
+    $profileDir = if ($Profile -eq "dev") { "debug" } else { $Profile }
     return Join-Path $directory $profileDir
 }
 
@@ -980,7 +979,8 @@ function Get-BuildStampPath {
         [string]$Profile
     )
 
-    return Join-Path $RepoRoot (Join-Path "codex-rs\target" "codex-local-publish-$Profile.stamp")
+    $buildName = Get-LocalPublishBuildName -Profile $Profile
+    return Join-Path $RepoRoot (Join-Path "codex-rs\target" "codex-local-publish-$buildName.stamp")
 }
 
 function Get-BuildStampNewestWriteUtc {
@@ -3063,7 +3063,7 @@ function Get-LocalPublishCargoConfigLines {
         $lines.Add("rustc-wrapper = `"`"")
         $lines.Add("rustc-workspace-wrapper = `"`"")
     }
-    if ($Profile -in @("local-release", "local-pgo-instrumented", "local-pgo")) {
+    if ($Profile -in @("release", "pgo")) {
         # Cargo appends these to the shared stack/static-CRT/native-CPU flags.
         # Scope MSVC linker syntax to Windows MSVC, not GNU or other platforms.
         $lines.Add("[target.'cfg(all(windows, target_env = `"msvc`"))']")
@@ -3094,20 +3094,16 @@ function Invoke-CodexBuild {
             throw "$name is set and would replace the target rustflags in codex-rs/.cargo/config.toml (8 MiB stack, static CRT). Unset it; add flags with CARGO_TARGET_<TRIPLE>_RUSTFLAGS, which Cargo joins with them."
         }
     }
-    $cargoProfile = Get-LocalPublishCargoProfile -Profile $Profile
     $pgo = Get-LocalPublishPgoConfiguration -RepoRoot $RepoRoot -Profile $Profile `
         -GenerateDirectory $PgoGenerateDirectory -ProfileData $PgoProfileData
     $cargoConfigArgs = @()
     $publishCargoConfigPath = $null
     $effectiveNoSccache = [bool]$NoSccache -or $null -ne $pgo
     $cargoConfigLines = @(Get-LocalPublishCargoConfigLines -Profile $Profile -DisableSccache $effectiveNoSccache -Pgo $pgo)
-    if ($Profile -eq "local-release") {
-        Write-ProofLine "releaseProfile" "local-final: opt-level=3, thin LTO, codegen-units=1, dependency-codegen-units=1, incremental=false"
+    if ($Profile -eq "release") {
+        Write-ProofLine "releaseProfile" "release: opt-level=3, debug=0, thin LTO, codegen-units=1, runtime-dependency-codegen-units=1, build-dependencies=Cargo defaults, incremental=false"
     }
-    elseif ($Profile -eq "local-fast") {
-        Write-ProofLine "releaseProfile" "local-fast: opt-level=0, debug=none, LTO=off, codegen-units=16, dependency-codegen-units=4, incremental=true"
-    }
-    if ($Profile -in @("local-release", "local-pgo-instrumented", "local-pgo")) {
+    if ($Profile -in @("release", "pgo")) {
         Write-ProofLine "linkerOptimization" "Windows MSVC: /OPT:REF, /OPT:ICF"
     }
     try {
@@ -3122,11 +3118,12 @@ function Invoke-CodexBuild {
             }
         }
         $publishPackages = @("-p", "codex-cli", "-p", "codex-code-mode-host", "-p", "codex-windows-sandbox")
-        $buildArgs = $cargoConfigArgs + @("build") + $publishPackages + @("--profile", $cargoProfile)
+        $buildArgs = $cargoConfigArgs + @("build") + $publishPackages + @("--profile", $Profile)
         if ($null -ne $pgo) { $buildArgs += @("--target", $pgo.target) }
 
         $codexRs = Join-Path $RepoRoot "codex-rs"
-        $publishTargetDir = Join-Path $codexRs "target\publish-$Profile"
+        $buildName = Get-LocalPublishBuildName -Profile $Profile
+        $publishTargetDir = Join-Path $codexRs "target\publish-$buildName"
         $buildCommandArgs = @(Add-CargoTargetDirArgument -CommandArgs (@("cargo") + $buildArgs) -TargetDir $publishTargetDir)
         $buildCommand = Format-CargoCommandForProof -CommandArgs $buildCommandArgs
         $selectedV8Archive = @{ Path = $null; Sha256 = $null }
@@ -3722,7 +3719,7 @@ if ($ImportOnly) {
 $repoRoot = Get-RepoRoot -Override $RepoRoot
 $pgoConfiguration = Get-LocalPublishPgoConfiguration -RepoRoot $repoRoot -Profile $Profile `
     -GenerateDirectory $PgoGenerateDirectory -ProfileData $PgoProfileData
-if ($Profile -eq "local-pgo-instrumented" -and -not $BuildOnly -and -not $PrintBuiltCodexPath) {
+if ($null -ne $pgoConfiguration -and $pgoConfiguration.mode -eq "generate" -and -not $BuildOnly -and -not $PrintBuiltCodexPath) {
     throw "Instrumented PGO bundles are training-only; use -BuildOnly, never publish them to Desktop."
 }
 if ($null -ne $pgoConfiguration -and $SourceBundleManifest) {

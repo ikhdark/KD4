@@ -318,34 +318,6 @@ fn apply_rollback_to_instruction_turn_positions(
     Some(rollback_start_idx)
 }
 
-/// Return a prefix of `items` obtained by cutting strictly before the nth user message.
-///
-/// The boundary index is 0-based from the start of `items` (so `n_from_start = 0` returns
-/// a prefix that excludes the first user message and everything after it).
-///
-/// If `n_from_start` is `usize::MAX`, this returns the full rollout (no truncation).
-/// If fewer than or equal to `n_from_start` user messages exist, this returns the full
-/// rollout unchanged.
-pub(crate) fn truncate_rollout_before_nth_user_message_from_start(
-    items: &[RolloutItem],
-    n_from_start: usize,
-) -> Vec<RolloutItem> {
-    if n_from_start == usize::MAX {
-        return items.to_vec();
-    }
-
-    let user_positions = user_message_positions_in_rollout(items);
-
-    // If fewer than or equal to n user messages exist, keep the full rollout.
-    if user_positions.len() <= n_from_start {
-        return items.to_vec();
-    }
-
-    // Cut strictly before the nth user message (do not keep the nth itself).
-    let cut_idx = user_positions[n_from_start];
-    carry_source_integrity_notice(items, items[..cut_idx].to_vec())
-}
-
 /// A crop cannot prove the source complete: the loader may have skipped records
 /// anywhere in it. Carry only its authenticated diagnostic, never excluded turns.
 pub(crate) fn carry_source_integrity_notice(

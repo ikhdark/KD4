@@ -57,10 +57,10 @@ pub(crate) async fn reserve_policy(
     environment_id: &str,
     cwd: &codex_utils_path_uri::PathUri,
     command: &[String],
-) -> Result<Option<codex_command_analysis::command_preflight::FullSuitePermit>, crate::tools::context::FunctionToolOutput> {
+) -> Result<Option<codex_command_analysis::command_preflight::FullSuitePermit>, Box<crate::tools::context::FunctionToolOutput>> {
     use codex_command_analysis::validation::ValidationPolicyClassification as Class;
     if classification == Class::ReadOnly { return Ok(None); }
-    if let Some(refusal) = mode_refusal(turn, classification, declared) { return Err(refusal); }
+    if let Some(refusal) = mode_refusal(turn, classification, declared) { return Err(Box::new(refusal)); }
     if !declared && !classification.is_validation() {
         return Ok(None);
     }
@@ -113,7 +113,7 @@ pub(crate) async fn reserve_policy(
         reservation_owner(session, turn, call_id),
         serde_json::json!([execution_scope, selection]).to_string(), revision,
         classification == Class::TargetedCompilation,
-    ).map(Some).map_err(|reason| policy_refusal(turn, reason))
+    ).map(Some).map_err(|reason| Box::new(policy_refusal(turn, reason)))
 }
 
 pub(crate) fn reservation_owner(session: &Session, turn: &TurnContext, call: &str) -> String {
@@ -136,6 +136,10 @@ pub(crate) async fn acquire_execution_resources(
 }
 
 /// Checkpoint consumption before launch. Only proven nonexecution permits retry.
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "The checkpoint guard serializes the budget transition with its durable publication"
+)]
 pub(crate) async fn begin_policy_attempt(ctx: &ToolCtx) -> Result<(), String> {
     let owner = reservation_owner(&ctx.session, &ctx.turn, &ctx.call_id);
     let budget = &ctx.turn.full_suite_budget;
@@ -157,6 +161,10 @@ pub(crate) async fn begin_policy_attempt(ctx: &ToolCtx) -> Result<(), String> {
     Ok(())
 }
 
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "The checkpoint guard serializes the budget transition with its durable publication"
+)]
 pub(crate) async fn policy_attempt_not_started(ctx: &ToolCtx) {
     let owner = reservation_owner(&ctx.session, &ctx.turn, &ctx.call_id);
     if !ctx.turn.full_suite_budget.started_for(&owner) {

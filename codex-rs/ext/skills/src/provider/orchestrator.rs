@@ -250,7 +250,7 @@ fn catalog_entry_from_resource(resource: &Resource) -> Option<SkillCatalogEntry>
         SkillResourceId::new(main_prompt),
     )
     .with_display_path(uri);
-    if meta.get("allow_implicit_invocation").and_then(|value| value.as_bool()) == Some(false) {
+    if meta.get("allow_implicit_invocation").and_then(serde_json::Value::as_bool) == Some(false) {
         entry = entry.hidden_from_prompt();
     }
     Some(entry)

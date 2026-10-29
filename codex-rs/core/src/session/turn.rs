@@ -84,6 +84,7 @@ use crate::session::turn_execution::SamplingGenerationDisposition;
 use crate::session::turn_execution::SamplingRequestSettledState;
 use crate::session::turn_execution::SamplingRequestSignalCollector;
 use crate::session::turn_execution::TurnExecutionControl;
+use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
 use crate::session_startup_prewarm::SessionStartupPrewarmResolution;
 use crate::stable_context::StableContextKind;
 use crate::stable_context::StableContextTarget;
@@ -524,7 +525,7 @@ pub(crate) fn run_turn(
                 .await
                 .startup_prewarm
                 .as_ref()
-                .is_some_and(|prewarm| prewarm.is_finished());
+                .is_some_and(SessionStartupPrewarmHandle::is_finished);
         if !startup_owns_transport {
             let metadata = turn_context.turn_metadata_state.to_responses_metadata(
                 sess.installation_id.clone(),
@@ -682,7 +683,6 @@ pub(crate) fn run_turn(
                 } else {
                     sess.services.plan_store.execution_snapshot().await
                 });
-        refresh_validation_policy(&turn_context, &mut turn_execution);
         turn_execution.rehydrate_argument_failures(sess.state.lock().await.history.raw_items());
 
 
@@ -1105,7 +1105,6 @@ pub(crate) fn run_turn(
                         .await;
                         break 'sampling_loop;
                     }
-                    refresh_validation_policy(&turn_context, &mut turn_execution);
                     let terminal_feedback = sess
                         .settle_extension_terminal_intents(&turn_extension_data)
                         .or_cancel(&cancellation_token)
@@ -2003,10 +2002,6 @@ pub(crate) fn run_turn(
     })
 }
 
-fn refresh_validation_policy(turn: &TurnContext, execution: &mut TurnExecutionControl) {
-    execution.set_validation_policy(turn.validation_mode);
-}
-
 fn validation_mode_base_instructions(turn: &TurnContext) -> Arc<BaseInstructions> {
     let directive = match turn.validation_mode {
         codex_protocol::validation::ValidationMode::Off =>
@@ -2295,18 +2290,6 @@ async fn record_forced_terminal_budget_boundary(
         .await;
 }
 
-/// The first user-authored text of a turn, which names what it is doing.
-fn turn_input_first_text(input: &[TurnInput]) -> Option<&str> {
-    input.iter().find_map(|item| match item {
-        TurnInput::UserInput { content, .. } => content.iter().find_map(|content| match content {
-            UserInput::Text { text, .. } if !text.trim().is_empty() => Some(text.as_str()),
-            _ => None,
-        }),
-        _ => None,
-    })
-}
-
-
 /// Test files by common convention: a test directory or a test-named file.
 /// This only selects paths for the advisory below; it discovers no tests.
 fn conventional_test_path(path: &str) -> bool {
@@ -2486,27 +2469,6 @@ async fn supersede_context_notice_if_present(
         return Ok(false);
     }
     record_context_notice_if_changed(sess, turn, marker, text).await
-}
-
-/// Bodies of the `<marker>` notices in history, oldest first, as
-/// `record_context_notice_if_changed` renders them.
-fn retained_context_notices(items: &[ResponseItem], marker: &str) -> Vec<String> {
-    let (opening, closing) = (format!("<{marker}>\n"), format!("\n</{marker}>"));
-    items
-        .iter()
-        .filter_map(|item| match item {
-            ResponseItem::Message { role, content, .. } if role == "developer" => Some(content),
-            _ => None,
-        })
-        .flatten()
-        .filter_map(|content| match content {
-            ContentItem::InputText { text } => text
-                .strip_prefix(&opening)?
-                .strip_suffix(&closing)
-                .map(str::to_string),
-            _ => None,
-        })
-        .collect()
 }
 
 /// Rough text capacity illustration, not a measured token or timing model.
@@ -3544,6 +3506,7 @@ async fn build_pure_pending_turn_plan(
     })))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stabilize_pending_turn_plan<'a>(
     sess: &'a Arc<Session>,
     turn_context: &'a Arc<TurnContext>,
@@ -4088,10 +4051,11 @@ fn build_bounded_skill_context_items<'a>(
             let mut item: ResponseItem = ContextualUserFragment::into(
                 RenderedContextFragment::new(fragment.role(), text),
             );
-            if complete && let Some(revision) = fragment.revision_identity() {
-                if let ResponseItem::Message { id, .. } = &mut item {
-                    *id = Some(revision.message_id());
-                }
+            if complete
+                && let Some(revision) = fragment.revision_identity()
+                && let ResponseItem::Message { id, .. } = &mut item
+            {
+                *id = Some(revision.message_id());
             }
             item
         })
@@ -4343,6 +4307,7 @@ async fn run_history_pre_sampling_compact(
 }
 
 #[instrument(level = "trace", skip_all)]
+#[allow(clippy::too_many_arguments)]
 async fn run_pending_input_pre_sampling_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
@@ -5259,40 +5224,6 @@ pub(super) fn collect_explicit_app_ids_from_skill_items(
     }
 
     connector_ids
-}
-
-#[instrument(level = "trace", skip_all)]
-pub(crate) fn build_prompt(
-    input: impl Into<Arc<[ResponseItem]>>,
-    router: &ToolRouter,
-    turn_context: &TurnContext,
-    base_instructions: BaseInstructions,
-) -> Prompt {
-    let input = input.into();
-    Prompt {
-        input: Arc::clone(&input),
-        formatted_inputs: Default::default(),
-        stable_context_fallback_input: Arc::clone(&input),
-        tool_history_fallback_input: Arc::clone(&input),
-        stable_context_tool_history_fallback_input: input,
-        tool_history_substitutions: Arc::from([]),
-        stable_context_fallback_tool_history_substitutions: Arc::from([]),
-        stable_context_manifest: Default::default(),
-        deferred_dynamic_history: None,
-        prompt_provenance: Default::default(),
-        digests: PromptDigests::default(),
-        tools: router.model_visible_schemas_for_turn(turn_context),
-        parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
-        tool_calls_disabled: false,
-        soft_limit_waiver: false,
-        base_instructions,
-        output_schema: turn_context
-            .final_output_json_schema
-            .as_ref()
-            .map(|schema| schema.original().clone()),
-        output_schema_strict: true,
-        stream_progress_timeout: None,
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6915,7 +6846,6 @@ impl ProposedPlanItemState {
 /// In plan mode we defer agent message starts until the parser emits non-plan
 /// text. The parser buffers each line until it can rule out a tag prefix, so
 /// plan-only outputs never show up as empty assistant messages.
-
 async fn maybe_emit_pending_agent_message_start(
     sess: &Session,
     turn_context: &TurnContext,

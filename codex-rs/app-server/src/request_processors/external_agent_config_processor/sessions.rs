@@ -119,6 +119,10 @@ use codex_rollout::{StateDbHandle, is_persisted_rollout_item};
 use codex_thread_store::{AppendThreadItemsParams, CreateThreadParams, DeleteThreadParams, ThreadMetadataPatch, ThreadPersistenceMetadata, ThreadStore, ThreadStoreError, UpdateThreadMetadataParams};
 
 impl ExternalAgentConfigRequestProcessor {
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Session imports are single-flight so concurrent imports cannot persist the same source twice"
+    )]
     pub(super) async fn import_session_item(&self, item: ExternalAgentConfigMigrationItem) -> ExternalAgentConfigImportTypeResult {
         let mut result = ExternalAgentConfigImportTypeResult { item_type: item.item_type, successes: Vec::new(), failures: Vec::new() };
         let cancellation = self.shutdown.child_token();

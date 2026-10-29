@@ -26,6 +26,11 @@ bench = false
 [package.metadata.docs.rs]
 all-features = true
 
+# Keep upstream source byte-identical: its `std::usize` uses are deprecated
+# aliases of `usize::MAX`, so do not report them in local builds.
+[lints.rust]
+deprecated = "allow"
+
 [features]
 default = ["handshake"]
 handshake = ["data-encoding", "headers", "httparse", "sha1"]

@@ -132,7 +132,7 @@ impl FeedbackRequestProcessor {
             };
             let query_logs = async {
                 let state_db_ctx = self.state_db.clone();
-                let sqlite_feedback_logs = if let Some(state_db_ctx) = state_db_ctx.as_ref()
+                if let Some(state_db_ctx) = state_db_ctx.as_ref()
                     && !feedback_thread_ids.is_empty()
                 {
                     let thread_id_texts = feedback_thread_ids
@@ -159,8 +159,7 @@ impl FeedbackRequestProcessor {
                     }
                 } else {
                     None
-                };
-                sqlite_feedback_logs
+                }
             };
             let prepare_attachments = async {
                 let mut attachment_paths = Vec::new();

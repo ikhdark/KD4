@@ -2005,7 +2005,7 @@ pub fn validation_resource_cwd_is_unambiguous(program: &str, args: &[String]) ->
                 if !quoted && matches!(character, '&' | '|') { return false; }
             }
             let mut leaves = Vec::new();
-            let policy = policy_cmd_script(&body, &[], depth + 1, &mut leaves);
+            let policy = policy_cmd_script(body, &[], depth + 1, &mut leaves);
             return policy.is_validation() && leaves.len() == 1
                 && leaves[0].split_first().is_some_and(|(program, args)| argv(program, args, depth + 1));
         }
@@ -2319,7 +2319,7 @@ fn policy_language_tool(binary: &str, args: &[String]) -> Option<ValidationPolic
         let value = |flag: &str| args.iter().enumerate().filter_map(|(index, arg)| {
             if arg == flag { args.get(index + 1).map(String::as_str) }
             else { arg.split_once('=').filter(|(key, _)| *key == flag).map(|(_, value)| value) }
-        }).last();
+        }).next_back();
         if value("-run") == Some("^$") && value("-bench").is_some_and(|value| !value.is_empty()) && value("-fuzz").is_none()
             && !args.iter().any(|arg| matches!(arg.as_str(), "--" | "-args" | "-test.run") || arg.starts_with("-test.run="))
         {
@@ -2660,7 +2660,7 @@ fn policy_repository_script(script: &str, args: &[String], runners: &[Repository
         let policy = args.iter().position(|arg| arg == "--")
             .and_then(|index| args[index + 1..].split_first())
             .map_or(Policy::Opaque, |(program, args)| policy_argv(program, args, runners, depth + 1, leaves));
-        let invocation = std::iter::once(script.clone()).chain(args.iter().cloned()).collect::<Vec<_>>();
+        let invocation = std::iter::once(script).chain(args.iter().cloned()).collect::<Vec<_>>();
         let owned_lane = runners.iter().any(|runner| {
                 runner.admission_runner.as_deref() == Some("rust_build_status")
                     && runner.passthrough_after.as_deref() == Some("--")

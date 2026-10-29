@@ -141,12 +141,7 @@ install:
 [no-cd]
 [windows]
 publish-local-codex-final *args:
-    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\install\publish-local-codex.ps1" -Concise -AutoSkipBuild -Profile local-release -CloseRunningTargetTimeoutSeconds 30 -ConfigureDesktopLocalCli -DesktopCliEnvironmentTarget User -RestartDesktopIfNeeded {args}
-
-[no-cd]
-[windows]
-publish-local-codex-fast *args:
-    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\install\publish-local-codex-fast.ps1" {args}
+    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\install\publish-local-codex.ps1" -Concise -AutoSkipBuild -Profile release -CloseRunningTargetTimeoutSeconds 30 -ConfigureDesktopLocalCli -DesktopCliEnvironmentTarget User -RestartDesktopIfNeeded {args}
 
 [no-cd]
 [windows]
@@ -200,18 +195,8 @@ rust-perf-env *args:
 cargo-fetch:
     cargo fetch
 
-build-dev-small package:
-    cargo build --profile dev-small -p {{ package }}
-
-# The named `package` parameter is also part of the forwarded positionals, so
-# each platform must skip it explicitly instead of using the plain {args}
-# expansion (which would pass the package name to the binary again).
-[windows]
-run-dev-small package *args:
-    $forwarded_args = @($args | Select-Object -Skip 2); cargo run --profile dev-small -p {{ package }} -- @forwarded_args
-
-local-release package:
-    cargo build --profile local-release -p {{ package }}
+release package:
+    cargo build --profile release -p {{ package }}
 
 [windows]
 cargo-lane lane *args:
