@@ -25,6 +25,7 @@ mod task_capsule;
 mod turn_aborted;
 mod user_instructions;
 mod user_shell_command;
+mod workflow_checkpoint;
 pub(crate) mod world_state;
 
 pub(crate) use approved_command_prefix_saved::ApprovedCommandPrefixSaved;
@@ -74,6 +75,7 @@ pub(crate) use turn_aborted::TurnAborted;
 pub(crate) use turn_aborted::lost_turn_recovery;
 pub(crate) use user_instructions::UserInstructions;
 pub(crate) use user_shell_command::UserShellCommand;
+pub(crate) use workflow_checkpoint::WorkflowCheckpoint;
 
 /// Preserve source syntax in model-facing prose while keeping embedded copies of
 /// the fragment's own delimiters from closing or reopening its sections.

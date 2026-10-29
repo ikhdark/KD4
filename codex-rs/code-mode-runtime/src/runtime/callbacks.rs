@@ -383,9 +383,10 @@ pub(super) fn store_callback(
     let serialized = match super::value::v8_value_to_json_with_limit(scope, value, max_bytes) {
         Ok(Some(value)) => value,
         Ok(None) => {
+            let kind = value.type_of(scope).to_rust_string_lossy(scope);
             throw_type_error(
                 scope,
-                &format!("Unable to store {key:?}. Only plain serializable objects can be stored."),
+                &format!("Unable to store {key:?}: {kind} is not a plain JSON-serializable value."),
             );
             return;
         }

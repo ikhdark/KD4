@@ -31,7 +31,12 @@ use crate::local_file_system::current_sandbox_cwd;
 use crate::rpc::internal_error;
 use crate::rpc::invalid_request;
 
-const FS_HELPER_ENV_ALLOWLIST: &[&str] = &["PATH", "TMP", "TEMP"];
+const FS_HELPER_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "TMP",
+    "TEMP",
+    "CODEX_WINDOWS_SANDBOX_DENY_PROVISIONING",
+];
 
 #[derive(Debug, PartialEq, Eq)]
 struct SandboxCwd {

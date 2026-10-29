@@ -967,7 +967,12 @@ async fn shutdown_thread_persistence(
                 *sess.persistence_retirement_result.lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result.clone());
                 match result {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => {
+                        // No status/timeout shortcut: the same owner has joined
+                        // terminal producers, ordered commits and writer retirement.
+                        sess.services.agent_control.registry().resource_locks.release_session(&sess);
+                        return Ok(());
+                    }
                     Err(error) => warn!(%error, "owned thread persistence shutdown failed; retaining ownership for retry"),
                 }
                 tokio::time::sleep(retry_delay).await;

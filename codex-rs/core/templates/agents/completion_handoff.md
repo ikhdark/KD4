@@ -1,0 +1,1 @@
+Host handoff checkpoint: Process the returned report before assigning more work. Reuse completed evidence and investigate concrete gaps or integration risks, not the worker's entire assignment again. A freed slot, a temporary pause, or completed status alone does not justify another task. Preserve the user's checkpoints and stop instructions; this notice grants no new authority.

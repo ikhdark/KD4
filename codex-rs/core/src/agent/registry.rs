@@ -23,6 +23,7 @@ use std::sync::atomic::Ordering;
 /// is).
 pub(crate) struct AgentRegistry {
     active_agents: Mutex<ActiveAgents>,
+    pub(crate) resource_locks: super::resource_locks::AgentResourceLocks,
     total_count: AtomicUsize,
     capacity_updates: tokio::sync::watch::Sender<u64>,
     /// Latches on the first registered sub-agent and never clears.
@@ -38,6 +39,7 @@ impl Default for AgentRegistry {
     fn default() -> Self {
         Self {
             active_agents: Mutex::default(),
+            resource_locks: Default::default(),
             total_count: AtomicUsize::new(0),
             capacity_updates: tokio::sync::watch::channel(0).0,
             ever_had_live_agents: AtomicBool::new(false),

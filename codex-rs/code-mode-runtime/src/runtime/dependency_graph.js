@@ -10,17 +10,19 @@ Object.defineProperty(globalThis, "run_graph", {
         "run_graph concurrency must be an integer from 1 to 16",
       );
     }
-    // Without `accept`, a command result (or each one in an array) must have
-    // exited 0; other values pass. Resolution alone never certifies a command.
+    // Without `accept`, explicit failed tool receipts reject the prerequisite.
+    // Commands must also exit 0 without an interaction error. Apply the same
+    // checks to each array entry; domain-specific outcomes use explicit accept.
     const isCommand = (value) =>
       value !== null &&
       typeof value === "object" &&
       ["exit_code", "execution_state", "process_exited"].some(
         (key) => key in value,
       );
-    const commandsSucceeded = (value) =>
+    const resultsSucceeded = (value) =>
       (Array.isArray(value) ? value : [value]).every(
-        (item) => !isCommand(item) || (item.error == null && item.exit_code === 0),
+        (item) => item?.success !== false &&
+          (!isCommand(item) || (item.error == null && item.exit_code === 0)),
       );
     // Capture definitions before running callbacks. Reject the entire graph
     // before starting any effect, including errors in disconnected components.
@@ -119,7 +121,7 @@ Object.defineProperty(globalThis, "run_graph", {
         deps,
         requires,
         run: node.run,
-        accept: node.accept ?? commandsSucceeded,
+        accept: node.accept ?? resultsSucceeded,
         step_id: node.step_id,
         estimated_ms,
         claims,
@@ -296,7 +298,7 @@ Object.defineProperty(globalThis, "run_graph", {
         value = await node.run(Object.freeze(dependencies));
         produced = true;
         // Promise resolution is not tool success. `accept` establishes the
-        // node's behavioral postcondition; by default, command exit codes.
+        // node's behavioral postcondition; defaults reject explicit failures.
         if ((await node.accept(value)) !== true) {
           results[id] = {
             status: "rejected",

@@ -50,7 +50,7 @@ use tokio::sync::Semaphore;
 const ARTIFACT_EXPIRED_MESSAGE: &str = "artifact expired or does not belong to this thread. The producing operation already ran; a missing artifact does not mean it failed or had no effects. Use output already in context or inspect the state it changed; rerun it only if it is read-only or safely repeatable.";
 // A command's output writer holds its artifact until the process exits; a
 // yielded poll does not release it.
-const ARTIFACT_WRITING_MESSAGE: &str = "artifact is still being written; a running command's output artifact becomes readable after the command exits, not when it yields; other writes finish shortly";
+const ARTIFACT_WRITING_MESSAGE: &str = "artifact is still being written; a running command's output artifact becomes readable after the command exits, not when it yields. For a live command, resume it with write_stdin using its original session_id and incarnation; do not poll this artifact or rerun the producer. Other artifact writes finish shortly";
 const ACTIVE_TOOL_HISTORY_PROTECTION_EXTENSION: &str = "active-tool-history";
 const ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES: &[u8] = b"KD4_ACTIVE_TOOL_HISTORY_ARTIFACT_V1\n";
 pub(crate) const MAX_RAW_OUTPUT_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;

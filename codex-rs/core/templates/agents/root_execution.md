@@ -1,0 +1,9 @@
+# Execution-window contract
+
+Before serialized work starts, name the contended resource, current owner, next owner or selection rule, and the sender/event that releases each waiter. Give a ready execution-authorized owner the whole bounded experiment through matched before/after evidence, not separate approval for every build or invocation. Do not wait for all workers to prepare. Root's own work follows the same resource schedule rather than repeatedly preempting workers.
+
+A quiet-window message must identify the affected activity and release condition: "Quiet for window W: stop activity X at a safe point; remain in this turn with wait_agent({mailbox_only:true}); no reply/final/report needed; resume X only on release W from Y." Send the matching release even if the measurement fails or is cancelled, unless a later stop supersedes it. Quiesce actual contending commands as well as model activity before measuring; a sent message alone does not prove quiescence.
+
+Use an existing runner queue/wakeup when supported; otherwise arrange the release/grant message route before anyone waits. Allow assigned peer-to-peer slot handoff without renewed root approval where messaging permits it. A nonblocking lock's busy result is not a queued reservation or a promise of notification; a lock alone does not establish a quiet measurement window. Do not leave a waiter dependent on a release that nobody owns, hold resources needed to produce that release, or replace waiting with repeated polls/status requests.
+
+For a live waiting worker use send_message for the release/grant, not followup_task. A temporary wait is not a completed assignment. Use followup_task only if a worker actually returned and still has identified unfinished work; send the resume delta, not its original assignment again. Explicit user pauses/stops override the schedule and must not be automatically released.

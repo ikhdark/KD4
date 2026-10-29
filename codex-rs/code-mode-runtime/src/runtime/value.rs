@@ -48,6 +48,9 @@ fn copy_image_url(
 // These bound Rust conversion copies, not V8 allocations or buffered output.
 pub(super) const MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 pub(super) const MAX_NOTIFICATION_BYTES: usize = 1024 * 1024;
+// Retained helper evidence is independent of display conversion limits. The
+// existing encoded-output admission still bounds its content/IPC publication.
+const MAX_HELPER_EVIDENCE_BYTES: usize = 16 * 1024 * 1024;
 
 pub(super) fn bounded_string(
     scope: &mut v8::PinScope<'_, '_>,
@@ -541,7 +544,7 @@ pub(super) fn value_to_error_text(
             let Some(attached) = attached.filter(|value| !value.is_undefined()) else {
                 continue;
             };
-            let remaining = MAX_PAYLOAD_BYTES.saturating_sub(text.len() + field.len() + 32);
+            let remaining = MAX_HELPER_EVIDENCE_BYTES.saturating_sub(text.len() + field.len() + 32);
             let mut serialized = if field == "results" {
                 // Graph receipts are canonical evidence, not a tool-display
                 // projection. One JSON node per line allows selective recovery
@@ -580,7 +583,7 @@ pub(super) fn value_to_error_text(
             }
             text.push_str(&format!("\nHelper {field}:\n"));
             text.push_str(serialized.as_deref().unwrap_or(
-                "[evidence unavailable: unserializable or exceeds remaining 8 MiB error budget]",
+                "[evidence unavailable: unserializable or exceeds remaining 16 MiB error-evidence budget]",
             ));
         }
     }

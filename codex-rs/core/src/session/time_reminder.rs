@@ -15,21 +15,41 @@ pub(crate) struct CurrentTimeReminderState {
     last_delivery_time: Option<DateTime<Utc>>,
     last_window_id: Option<String>,
     pending_user_or_tool_output_boundary: bool,
+    tool_outputs_since_user: u64,
+    last_workflow_checkpoint: u64,
 }
 
 impl CurrentTimeReminderState {
     pub(super) fn note_recorded_items(&mut self, items: &[ResponseItem]) {
-        if items.iter().any(|item| {
-            is_user_turn_boundary(item)
-                || matches!(
-                    item,
-                    ResponseItem::FunctionCallOutput { .. }
-                        | ResponseItem::CustomToolCallOutput { .. }
-                        | ResponseItem::ToolSearchOutput { .. }
-                )
-        }) {
-            self.pending_user_or_tool_output_boundary = true;
+        for item in items {
+            let user_boundary = is_user_turn_boundary(item);
+            let tool_output = matches!(
+                item,
+                ResponseItem::FunctionCallOutput { .. }
+                    | ResponseItem::CustomToolCallOutput { .. }
+                    | ResponseItem::ToolSearchOutput { .. }
+            );
+            if user_boundary {
+                self.tool_outputs_since_user = 0;
+                self.last_workflow_checkpoint = 0;
+            }
+            if tool_output {
+                self.tool_outputs_since_user = self.tool_outputs_since_user.saturating_add(1);
+            }
+            self.pending_user_or_tool_output_boundary |= user_boundary || tool_output;
         }
+    }
+
+    fn take_workflow_checkpoint_due(&mut self) -> bool {
+        // A sparse advisory, never a generation budget or an assertion that
+        // inspection made no progress. Doubling bounds repeated prompt cost.
+        let due = self.tool_outputs_since_user >= 16
+            && (self.last_workflow_checkpoint == 0
+                || self.tool_outputs_since_user / 2 >= self.last_workflow_checkpoint);
+        if due {
+            self.last_workflow_checkpoint = self.tool_outputs_since_user;
+        }
+        due
     }
 
     fn take_reminder_due(
@@ -73,6 +93,18 @@ pub(super) async fn maybe_record_current_time_reminder(
     turn_context: &TurnContext,
     window_id: &str,
 ) -> CodexResult<()> {
+    // Reuse the existing pre-sampling hook. Workflow checkpoints do not enable
+    // clock reminders, read the clock, or alter the current-time feature gate.
+    let workflow_checkpoint_due = {
+        let mut state = sess.state.lock().await;
+        state.current_time_reminder.take_workflow_checkpoint_due()
+    };
+    if workflow_checkpoint_due {
+        let item = ContextualUserFragment::into(crate::context::WorkflowCheckpoint);
+        sess.record_conversation_items(turn_context, std::slice::from_ref(&item))
+            .await?;
+    }
+
     let Some(config) = turn_context.config.current_time_reminder else {
         return Ok(());
     };

@@ -1,0 +1,1 @@
+Ownership checkpoint: Tool-call success is not lock admission. Start dependent protected work only when the receipt confirms this runtime holds the resource; retain its current acquisition token. A busy result is not ownership.

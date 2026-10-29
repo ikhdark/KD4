@@ -146,6 +146,11 @@ impl Handler {
                         "wait_agent cursor is invalid or no longer retained: {error}"
                     ))
                 })?;
+            let deadline = earliest_deadline(
+                explicit_timeout_ms
+                    .map(|timeout_ms| wait_started + Duration::from_millis(timeout_ms as u64)),
+                crate::unified_exec::nested_poll_bound(source.nested_deadline()),
+            );
             macro_rules! before_delivery {
                 ($future:expr, $cursor:expr) => {
                     tokio::select! {
@@ -160,6 +165,24 @@ impl Handler {
                 return Err(FunctionCallError::RespondToModel("wait_agent cancelled".to_string()));
             }
             if let Some(outcome) = input.current().await {
+                return Ok(input_only_result(&turn, outcome, parsed_cursor, wait_started));
+            }
+            if args.mailbox_only {
+                // Quiet/slot waits depend on new input, not descendant task
+                // settlement. Reuse the input owner without scanning or advancing
+                // durable task state; cancellation and caller deadlines still apply.
+                let (outcome, _) = tokio::select! {
+                    biased;
+                    _ = cancellation_token.cancelled() => return Err(FunctionCallError::RespondToModel("wait_agent cancelled".to_string())),
+                    result = wait_for_activity(&mut input, deadline, None, None, parsed_cursor) => {
+                        result.map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
+                    }
+                };
+                let outcome = if outcome == WaitOutcome::BoundaryElapsed {
+                    WaitOutcome::TimedOut
+                } else {
+                    outcome
+                };
                 return Ok(input_only_result(&turn, outcome, parsed_cursor, wait_started));
             }
             let coordinator = session.services.agent_control.task_coordinator();
@@ -207,11 +230,6 @@ impl Handler {
             let mut scan_cursor = cursor;
             let mut folded_admission_events = 0_usize;
             let mut folded_completion_events = 0_usize;
-            let deadline = earliest_deadline(
-                explicit_timeout_ms
-                    .map(|timeout_ms| wait_started + Duration::from_millis(timeout_ms as u64)),
-                crate::unified_exec::nested_poll_bound(source.nested_deadline()),
-            );
             let mut maintenance_deadline = Some(wait_started + maintenance_interval);
             let mut unchanged_store_polls = 0_u32;
             let mut drained_event_pages = 0_u32;
@@ -1269,6 +1287,7 @@ fn input_only_result(
             match outcome {
                 WaitOutcome::Steered => "steered",
                 WaitOutcome::MailboxActivity => "mailbox",
+                WaitOutcome::TimedOut => "timed_out",
                 _ => "deferred_completion",
             },
         )],
@@ -1308,6 +1327,8 @@ impl CoreToolRuntime for Handler {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WaitArgs {
+    #[serde(default)]
+    mailbox_only: bool,
     timeout_ms: Option<i64>,
     cursor: Option<String>,
 }

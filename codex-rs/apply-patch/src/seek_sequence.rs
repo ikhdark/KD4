@@ -168,19 +168,46 @@ fn tier_matches(
                 }
             }
         }
-        "Unicode-normalized" => {
+        "Unicode-normalized" if !pattern.is_empty() => {
             let normalized_pattern = pattern
                 .iter()
-                .map(|line| normalise(line).collect::<Vec<_>>())
+                .map(|line| normalise(line).collect::<String>())
                 .collect::<Vec<_>>();
-            for index in search_start..=last_start {
-                if lines[index..index + pattern.len()]
-                    .iter()
-                    .zip(&normalized_pattern)
-                    .all(|(line, normalized)| normalise(line).eq(normalized.iter().copied()))
-                    && record(index)
-                {
-                    break;
+            // Overlapping candidate windows share one left-to-right pass
+            // (Knuth-Morris-Pratt over normalized lines), so each source line
+            // is compared about once instead of once per window. Comparisons
+            // stay lazy and stop at the first differing character.
+            let mut fallback = vec![0; normalized_pattern.len()];
+            let mut length = 0;
+            for index in 1..normalized_pattern.len() {
+                while length > 0 && normalized_pattern[index] != normalized_pattern[length] {
+                    length = fallback[length - 1];
+                }
+                if normalized_pattern[index] == normalized_pattern[length] {
+                    length += 1;
+                }
+                fallback[index] = length;
+            }
+            let mut matched = 0;
+            for (offset, line) in lines[search_start..last_start + pattern.len()]
+                .iter()
+                .enumerate()
+            {
+                loop {
+                    if normalise(line).eq(normalized_pattern[matched].chars()) {
+                        matched += 1;
+                        break;
+                    }
+                    if matched == 0 {
+                        break;
+                    }
+                    matched = fallback[matched - 1];
+                }
+                if matched == pattern.len() {
+                    if record(search_start + offset + 1 - pattern.len()) {
+                        break;
+                    }
+                    matched = fallback[matched - 1];
                 }
             }
         }

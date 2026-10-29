@@ -161,9 +161,10 @@ pub(crate) fn create_exec_command_tool_for_policy(
     ToolSpec::Function(ResponsesApiTool {
         name: "exec_command".to_string(),
         description: format!(
-            "Runs a command through `cmd`, returning output or a session ID for ongoing interaction. Resume a returned session_id with write_stdin; do not restart the command while it is live or its effects are uncertain.\n\n{}\n\n{}",
+            "Runs a command through `cmd`, returning output or a session ID for ongoing interaction. Resume a returned session_id with write_stdin; do not restart the command while it is live or its effects are uncertain.\n\n{}\n\n{}\n\n{}",
             rg_search_admission_guidance(),
             filesystem_safety_guidance(),
+            include_str!("../../../templates/command_admission_checkpoint.md").trim(),
         ),
         strict: false,
         defer_loading: None,

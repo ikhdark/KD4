@@ -4,7 +4,7 @@
 //! fields they actually carried, while each `ThreadSettingsApplied` snapshot is
 //! replayed in rollout order. Callers pass only the history prefix that belongs
 //! to their resume or fork boundary, then remove fields covered by explicit
-//! request overrides before applying the result.
+//! request or startup CLI overrides before applying the result.
 
 use crate::config_types::CollaborationMode;
 use crate::config_types::Personality;
@@ -103,7 +103,7 @@ impl PersistedThreadSettings {
     }
 }
 
-/// Persistent settings that an explicit resume or fork request supplies.
+/// Persistent settings supplied explicitly by a resume/fork request or startup CLI.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PersistedThreadSettingsOverrideMask {
     pub model: bool,

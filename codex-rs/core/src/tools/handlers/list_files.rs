@@ -164,8 +164,28 @@ impl ToolExecutor<ToolInvocation> for ListFilesHandler {
                 _ = invocation.cancellation_token.cancelled() => {
                     return Err(FunctionCallError::RespondToModel("list_files cancelled".into()));
                 }
-                result = filesystem.walk(&path, options.clone(), Some(&sandbox)) => result
-                    .map_err(|error| FunctionCallError::RespondToModel(format!("unable to list {}: {error}", path.inferred_native_path_string())))?,
+                result = filesystem.walk(&path, options.clone(), Some(&sandbox)) => result,
+            };
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let mut message = format!("unable to list {}: {error}", path.inferred_native_path_string());
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && !environment.environment.is_remote()
+                        && !invocation.cancellation_token.is_cancelled()
+                        && invocation.step_context.turn.file_system_sandbox_policy().has_full_disk_read_access()
+                        && let (Ok(missing), Ok(cwd)) = (path.to_abs_path(), environment.cwd().to_abs_path())
+                    {
+                        let suggestions = crate::tools::run_blocking_command_analysis(move || {
+                            super::command_search::nearest_existing_paths(missing.as_path(), cwd.as_path())
+                        }).await.unwrap_or_default();
+                        if !suggestions.is_empty() {
+                            message.push_str("\nPossible existing paths (not verified replacements): ");
+                            message.push_str(&suggestions.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", "));
+                        }
+                    }
+                    return Err(FunctionCallError::RespondToModel(message));
+                }
             };
             // read_file and list_files take native paths, not URIs. The
             // cwd-relative spelling also keeps every entry from repeating the root.

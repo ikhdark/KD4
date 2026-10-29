@@ -8,7 +8,7 @@
   };
   const integer = (n, low, high, name) => {
     if (!Number.isInteger(n) || n < low || n > high)
-      throw new TypeError(`invalid ${name}`);
+      throw new TypeError(`invalid ${name}: expected an integer from ${low} through ${high}`);
   };
   const nonAscii = RegExp.prototype.exec.bind(/[^\x00-\x7f]/);
   const charCodeAt = Function.prototype.call.bind(String.prototype.charCodeAt);
@@ -677,16 +677,22 @@
       initial,
       { max_observations = 256, max_wait_ms = 300_000, max_bytes = 4 * 1024 * 1024, on_progress } = {},
     ) {
-      integer(max_observations, 1, 1024, "max_observations");
-      integer(max_wait_ms, 5_000, 300_000, "max_wait_ms");
-      integer(max_bytes, 65536, 4 * 1024 * 1024, "max_bytes");
+      try {
+        integer(max_observations, 1, 1024, "max_observations");
+        integer(max_wait_ms, 5_000, 300_000, "max_wait_ms");
+        integer(max_bytes, 65536, 4 * 1024 * 1024, "max_bytes");
+        if (on_progress !== undefined && typeof on_progress !== "function")
+          throw new TypeError("on_progress must be a function");
+      } catch (error) {
+        // The producer may already be running. A bad collection option must
+        // not erase the caller's only receipt or invite a second launch.
+        error.evidence = { terminal: initial, observations: [initial] };
+        throw error;
+      }
       // Capture the host's steady clock for this observation chain. Wall-clock
       // corrections must not lengthen the budget or invalidate a live handle.
       const now = globalThis.__codex_monotonic_now;
       const deadline = now() + max_wait_ms;
-      if (on_progress !== undefined && typeof on_progress !== "function") {
-        throw new TypeError("on_progress must be a function");
-      }
       const observations = [];
       // The evidence budget counts the unique observation representation.
       // Preserve the public terminal alias in JSON/storage; serializing both

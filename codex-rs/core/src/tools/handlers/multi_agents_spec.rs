@@ -138,7 +138,7 @@ pub fn create_send_message_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "send_message".to_string(),
-        description: "Queue information for a child or peer, or the same information for explicit targets, without starting a new turn. Sub-agents cannot message ancestors: finish with one final answer including any blockers; the host reports the terminal outcome automatically. Do not send progress updates or request acknowledgment. Use followup_task for new assignments, corrections requiring action, or urgent work that must start."
+        description: "Queue a message for a child or peer, or the same message for explicit targets, without starting a new turn. Use this for quiet-window requests and matching releases/slot grants to live waiting workers; these continue the existing assignment, not a new turn. Sub-agents cannot message ancestors: finish with one final answer including any blockers; the host reports the terminal outcome automatically. Do not send progress updates or request acknowledgment. Use followup_task for new assignments, corrections requiring action, or urgent work that must start."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -180,7 +180,7 @@ pub fn create_followup_task_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "followup_task".to_string(),
-        description: "Send a new assignment, correction requiring action, or urgent intervention to an existing non-root agent; trigger a turn if idle. If running, deliver promptly at message boundaries while sampling, or after the pending tool call completes. Use send_message for informational updates that need no new turn; ask for clarification when needed. A typed (`assignment`) agent accepts a follow-up only while its attempt is active; once its receipt is sealed, spawn a new assignment instead."
+        description: "Send a new assignment, correction requiring action, or urgent intervention to an existing non-root agent; trigger a turn if idle. If running, deliver promptly at message boundaries while sampling, or after the pending tool call completes. Use send_message for information or quiet-window releases/slot grants to live waiting workers; a temporary wait does not require a follow-up. A typed (`assignment`) agent accepts a follow-up only while its attempt is active; once its receipt is sealed, spawn a new assignment instead."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -194,7 +194,7 @@ pub fn create_followup_task_tool() -> ToolSpec {
 pub fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "wait_agent".to_string(),
-        description: "Wait for mailbox input or durable task progress. Returns at the first event, not when agents finish. On a mailbox, deferred-result or new-input wake, return from the exec cell; empty typed_deltas is not a reason to wait again. Admission bookkeeping and completion events for results already delivered as messages are folded internally. Omit cursor to receive new deltas from the retained position; supply one only to replay. Does not return the content: a finished agent's answer arrives as a message on your next request."
+        description: "Wait for input or durable task progress without ending the caller's turn. For a quiet-window release or slot grant, set mailbox_only:true and omit timeout_ms: this waits for mailbox, deferred-result or new user input even when the caller's descendants have all settled. The default also observes durable task progress and returns immediately when owned assignments have settled. Returns at the first event, not when agents finish. On an input wake, return from the exec cell and process that input; empty typed_deltas alone is not a reason to wait again. If the required release/grant has not arrived, keep waiting in-turn, not a final Paused response. Default-mode admission bookkeeping and already-delivered completion events are folded internally. Omit cursor to use the retained position; supply one only to replay. Does not return message content: it arrives on your next request."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -224,7 +224,7 @@ pub fn create_list_agents_tool() -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "list_agents".to_string(),
         description:
-            "List live agents in the current root thread tree. For routine liveness polling use status_only:true and reuse since_revision; terminal reports are delivered automatically. Full details remain the default, and compact:true alone preserves final results. Recover omitted reports with completed_report_recovery through the advertised read_tool_output entrypoint; for a current full snapshot request status_only:false with a targeted path_prefix and no since_revision before waking the worker just to resend text. Revisions and completed lifecycle statuses do not certify source freshness or task completion."
+            "List live agents in the current root thread tree, including /root and possibly the caller. For subagent cancellation, select only the intended active descendants; do not forward every returned row to interrupt_agent. For routine liveness polling use status_only:true and reuse since_revision; terminal reports are delivered automatically. Full details remain the default, and compact:true alone preserves final results. Recover omitted reports with completed_report_recovery through the advertised read_tool_output entrypoint; for a current full snapshot request status_only:false with a targeted path_prefix and no since_revision before waking the worker just to resend text. Revisions and completed lifecycle statuses do not certify source freshness or task completion."
                 .to_string(),
         strict: false,
         defer_loading: None,
@@ -244,7 +244,7 @@ pub fn create_interrupt_agent_tool_v2() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "interrupt_agent".to_string(),
-        description: "Interrupt an agent's current turn, if any, and return its previous status. The agent remains available for messages and follow-up tasks.".to_string(),
+        description: "Interrupt a spawned agent's current turn, if any, and return its previous status. Neither /root nor the caller itself is a valid target. The agent remains available for messages and follow-up tasks.".to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(properties, Some(vec!["target".to_string()]), Some(false.into())),
@@ -606,7 +606,7 @@ The spawned agent receives a durable task binding.
 Only call this tool for a concrete, bounded subtask that can run independently alongside useful local work; otherwise continue locally.
 Apply the base instructions for audit/review scope, verification, validation, and completion, and the team guidance for ownership and coordination.
 Fit assignments to actual worker context, reserving reasoning/evidence/reporting space; partition by cohesive subsystems and execution paths, not just file size.
-The `message` must include the task type, intended read/write scope, category inclusions/exclusions, detection criteria, user restrictions, required evidence, and stop condition. Read-only tasks remain read-only by instruction; no specialized profile is selected.
+The `message` must include the task type, intended read/write scope, category inclusions/exclusions, detection criteria, conversation-only user restrictions, required evidence, and stop condition. Give task-specific deltas, not copies of inherited project instructions, permissions or base policy. Read-only tasks remain read-only by instruction; no specialized profile is selected.
 Launch authorized independent assignments in the same batch, not a serial spawn loop. In exec, use bounded Promise.allSettled and retain every success and failure; failed siblings do not justify respawning successes.
 Sequence only real dependencies or shared-resource conflicts. Integrate completions with the next substantive step/final, not an acknowledgment-only model round.
 It can message its children and peers, but cannot message ancestors. Its final answer and terminal outcome are delivered to its parent automatically when it finishes.
@@ -631,6 +631,12 @@ Omitted `fork_turns` and `fork_turns="none"` create a lineage-preserving TaskCap
 
 fn wait_agent_tool_parameters_v2(options: WaitAgentTimeoutOptions) -> JsonSchema {
     let properties = BTreeMap::from([
+        (
+            "mailbox_only".to_string(),
+            JsonSchema::boolean(Some(
+                "Default false. True waits only for mailbox, deferred-result or new user input; no task-state scan, maintenance nudge or cursor advancement. Use for a release/grant wait regardless of descendant task state. Cancellation and explicit deadlines still apply.".to_string(),
+            )),
+        ),
         (
             "timeout_ms".to_string(),
             JsonSchema {

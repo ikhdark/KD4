@@ -3439,11 +3439,17 @@ struct CellRecoveryPages {
     continuation: Option<Value>,
 }
 
+/// Selectors one notice may name when several truncated results each leave a
+/// small gap; their total size stays within `CELL_RECOVERY_MAX_PAGES` pages.
+const CELL_RECOVERY_MAX_SELECTORS: usize = 16;
+
 /// Recorded recoveries of truncated cells read the omitted lines whole and were
 /// cut by the cell budget again (audit 2026-10-22 #45). Split the omitted range
 /// of the saved output into contiguous byte pages that each print within a
 /// default cell. Models then read one page per generation and rarely raised
 /// the cell budget (audit 2026-10-28 #3), so one `cell_recovery` read takes all.
+/// When several results were cut, `ranges` names each gap and pages skip the
+/// lines shown between them.
 fn cell_recovery_pages(
     canonical: &CanonicalToolResult,
     selector: &Value,
@@ -3453,11 +3459,15 @@ fn cell_recovery_pages(
     {
         return None;
     }
-    let first = usize::try_from(selector.get("start")?.as_u64()?).ok()?;
-    let last = usize::try_from(selector.get("end")?.as_u64()?).ok()?;
-    if first == 0 || last < first {
-        return None;
-    }
+    let line = |value: Option<&Value>| usize::try_from(value?.as_u64()?).ok();
+    let ranges = match selector.get("ranges").and_then(Value::as_array) {
+        // `[first, last]` pairs from `omitted_line_selector`.
+        Some(ranges) => ranges
+            .iter()
+            .map(|range| Some((line(range.get(0))?, line(range.get(1))?)))
+            .collect::<Option<Vec<_>>>()?,
+        None => vec![(line(selector.get("start"))?, line(selector.get("end"))?)],
+    };
     let text = std::str::from_utf8(&canonical.bytes).ok()?;
     // Byte offset where the 1-based `line` begins.
     let line_start = |line: usize| {
@@ -3469,29 +3479,61 @@ fn cell_recovery_pages(
                 .map(|(index, _)| index + 1)
         }
     };
-    let start = line_start(first)?;
-    let end = line_start(last.saturating_add(1)).unwrap_or(text.len());
-    if start >= end {
-        return None;
+    let mut spans = Vec::with_capacity(ranges.len());
+    for (first, last) in ranges {
+        if first == 0 || last < first {
+            return None;
+        }
+        let start = line_start(first)?;
+        let end = line_start(last.saturating_add(1)).unwrap_or(text.len());
+        if start < end {
+            spans.push((start, end));
+        }
     }
+    let end = spans.last()?.1;
     let page_tokens = codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL
         .saturating_sub(CELL_RECOVERY_PAGE_RESERVE_TOKENS)
         .max(1);
+    // One read carries what `CELL_RECOVERY_MAX_PAGES` full pages would; small
+    // gaps share that room instead of each claiming a whole page.
+    let budget_tokens = page_tokens.saturating_mul(CELL_RECOVERY_MAX_PAGES);
+    let mut used_tokens = 0_usize;
     let mut selectors = Vec::new();
     let mut max_bytes = 0;
-    let mut page_start = start;
-    while page_start < end && selectors.len() < CELL_RECOVERY_MAX_PAGES {
-        let page_end = cell_recovery_page_end(text, page_start, end, page_tokens);
-        max_bytes += page_end - page_start;
-        selectors.push(serde_json::json!({"kind":"bytes", "start":page_start, "end":page_end}));
-        page_start = page_end;
+    let mut resume_at = None;
+    'spans: for (span_start, span_end) in spans {
+        let mut page_start = span_start;
+        while page_start < span_end {
+            let page_end = cell_recovery_page_end(text, page_start, span_end, page_tokens);
+            let tokens = cell_recovery_page_tokens(&text[page_start..page_end]);
+            if !selectors.is_empty()
+                && (selectors.len() >= CELL_RECOVERY_MAX_SELECTORS
+                    || used_tokens.saturating_add(tokens) > budget_tokens)
+            {
+                resume_at = Some(page_start);
+                break 'spans;
+            }
+            used_tokens = used_tokens.saturating_add(tokens);
+            max_bytes += page_end - page_start;
+            selectors.push(serde_json::json!({"kind":"bytes", "start":page_start, "end":page_end}));
+            page_start = page_end;
+        }
     }
-    let continuation = (page_start < end)
-        .then(|| serde_json::json!({"kind":"bytes", "start":page_start, "end":end}));
+    // The rest is one contiguous selector; it may span shown lines between
+    // later gaps, which only happens beyond a full recovery read.
+    let continuation =
+        resume_at.map(|start| serde_json::json!({"kind":"bytes", "start":start, "end":end}));
     Some(CellRecoveryPages {
         selectors,
         max_bytes,
         continuation,
+    })
+}
+
+/// Model tokens of one recovery page as `read_tool_output` returns it: JSON-escaped text.
+fn cell_recovery_page_tokens(page: &str) -> usize {
+    serde_json::to_string(page).map_or(usize::MAX, |escaped| {
+        codex_utils_output_truncation::model_token_count(&escaped)
     })
 }
 
@@ -3520,9 +3562,7 @@ fn cell_recovery_page_end(text: &str, start: usize, end: usize, page_tokens: usi
             }
         };
         let page = &text[start..page_end];
-        let tokens = serde_json::to_string(page).map_or(usize::MAX, |escaped| {
-            codex_utils_output_truncation::model_token_count(&escaped)
-        });
+        let tokens = cell_recovery_page_tokens(page);
         if tokens <= page_tokens || page.chars().nth(1).is_none() {
             return page_end;
         }
@@ -3534,8 +3574,8 @@ fn cell_recovery_page_end(text: &str, start: usize, end: usize, page_tokens: usi
 
 fn cell_recovery_note(pages: usize, has_continuation: bool) -> String {
     format!(
-        "One call with these arguments reads all {pages} pages; cell_recovery gives them room \
-         in that cell beyond its default output budget.{}",
+        "One call with these arguments reads all {pages} omitted pages, not lines already \
+         shown; cell_recovery gives them room in that cell beyond its default output budget.{}",
         if has_continuation {
             " Then read `continuation` with the same max_bytes and cell_recovery."
         } else {
@@ -3814,7 +3854,13 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
                     }
                 }
                 None => {
-                    let selector = missing_selector.cloned().unwrap_or_else(|| {
+                    let selector = missing_selector.cloned().map(|mut selector| {
+                        // `ranges` is internal paging input, not a read_tool_output field.
+                        if let Some(selector) = selector.as_object_mut() {
+                            selector.remove("ranges");
+                        }
+                        selector
+                    }).unwrap_or_else(|| {
                         serde_json::json!({
                             "kind":"bytes", "start":0, "end":canonical.exact_bytes.min(4096)
                         })

@@ -22,6 +22,11 @@ SNAPSHOT` reuse an exact frozen bundle, or build in the nearest free warm slot
 through a content-synced source mirror, and freeze their executables with
 `build-receipt.json` (`--freeze-bundle NEW_DIR`, else the local bundle store).
 `find-bundle` answers without building; `--include-legacy` covers older bundles.
+Explicit `--freeze-bundle` builds also select that mirror automatically when
+eligible, including live checkouts, so edits after the copy cannot invalidate
+the compiled bundle. Ordinary checkout builds without freezing stay in place;
+`--source-mirror never` remains an explicit opt-out. Relocation/configuration
+checks and in-place source-change rejection remain unchanged.
 Repository test suites, test-only support files, and named test and
 coverage recipes have been removed. Generic Cargo tooling still accepts
 caller-selected commands without supplying a repository test suite.

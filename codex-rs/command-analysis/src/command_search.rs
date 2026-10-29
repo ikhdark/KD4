@@ -443,7 +443,8 @@ fn suggestion_candidates(
 }
 
 /// Exact names first, then the same stem (`code_mode.rs` -> `code_mode/`),
-/// then a stem that extends or shortens the request (`spec` -> `spec_plan`).
+/// then a boundary-delimited prefix or suffix (`spec` -> `spec_plan`,
+/// `report` -> `implementation-report`).
 fn suggestion_score(candidate: &str, is_dir: bool, name: &str, stem: &str) -> Option<u8> {
     if candidate == name {
         return Some(3);
@@ -465,7 +466,14 @@ fn suggestion_score(candidate: &str, is_dir: bool, name: &str, stem: &str) -> Op
                 .strip_prefix(shorter)
                 .is_some_and(|rest| rest.starts_with(['_', '-', '.']))
     };
-    (extends(candidate_stem, stem) || extends(stem, candidate_stem)).then_some(1)
+    let ends_with = |longer: &str, shorter: &str| {
+        shorter.len() >= 3
+            && longer
+                .strip_suffix(shorter)
+                .is_some_and(|rest| rest.ends_with(['_', '-', '.']))
+    };
+    (extends(candidate_stem, stem) || extends(stem, candidate_stem)
+        || ends_with(candidate_stem, stem) || ends_with(stem, candidate_stem)).then_some(1)
 }
 
 pub(super) fn display_suggestion(path: &Path, cwd: &Path) -> String {

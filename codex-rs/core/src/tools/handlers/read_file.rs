@@ -35,7 +35,12 @@ use crate::tools::registry::ToolExecutor;
 const MAX_FILE_MIB: usize = 8;
 const MAX_FILE_BYTES: usize = MAX_FILE_MIB * 1024 * 1024;
 // Path-only reads are previews, not an implicit request to fill the context.
-const DEFAULT_FILE_READ_TOKEN_CEILING: usize = 2_000;
+// Sized so typical source and docs files arrive whole: six 2026-10-28
+// sessions cut 40 previews at 2,000 tokens (29 were files under 16 KiB) and
+// each recovery read cost a model round trip. Still bounded by the cell.
+const DEFAULT_FILE_READ_TOKEN_CEILING: usize = 8_000;
+// The former fixed preview: small cell budgets never shrink a script preview.
+const MIN_FILE_READ_PREVIEW_TOKENS: usize = 2_000;
 
 
 
@@ -401,7 +406,10 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             .extend([json!("path"), json!("total_lines"), json!("file_complete")]);
         ToolSpec::Function(ResponsesApiTool {
             name: "read_file".to_string(),
-            description: format!("Read a UTF-8 file without shell quoting. The entire file must be UTF-8 and at most {MAX_FILE_MIB} MiB, even for a small byte selector. Structural selectors (symbol, enclosing, section outline/item IDs, and search with enclosing:true) support only Rust (.rs) and Python (.py). For PowerShell (.ps1) and other languages, use fixed-string search without enclosing or explicit line ranges; unsupported structural requests are rejected. Prefer explicit line ranges or supported symbols for known code; do not dump whole files to locate one function. Path alone returns a first page capped at about {DEFAULT_FILE_READ_TOKEN_CEILING} tokens plus continuation; small files fit inline. Host-owned skill/context guidance keeps its existing delivery budget. Default HTML outside the workspace may be rendered as text: hashes, ranges and recovery then describe that text; use explicit selectors for exact original markup. Use read_tool_output with the artifact_id and continuation only for needed remaining ranges of the immutable snapshot. complete describes the requested page or selectors; file_complete describes acquired source coverage, not final script display or semantic review. A complete inline read may have no retained artifact; that is not a read failure. Explicit lines, bytes and fixed-string search selectors remain exact; check each results[] status and recover only missing selections. In code mode explicit selections return up to 1 MiB to the script independently of its display budget: consume it there and print only needed evidence, not the entire recovered result. Each call reads current contents; retained snapshots are historical. Pass a skill: locator to read its SKILL.md; omit environment_id for host-owned skills."),
+            description: format!(
+                "Read a UTF-8 file without shell quoting. The entire file must be UTF-8 and at most {MAX_FILE_MIB} MiB, even for a small byte selector. Structural selectors (symbol, enclosing, section outline/item IDs, and search with enclosing:true) support only Rust (.rs) and Python (.py). For PowerShell (.ps1) and other languages, use fixed-string search without enclosing or explicit line ranges; unsupported structural requests are rejected. Prefer explicit line ranges or supported symbols for known code; do not dump whole files to locate one function. Path alone returns a first page capped at about {DEFAULT_FILE_READ_TOKEN_CEILING} tokens plus continuation; small files fit inline. Host-owned skill/context guidance keeps its existing delivery budget. Default HTML outside the workspace may be rendered as text: hashes, ranges and recovery then describe that text; use explicit selectors for exact original markup. Use read_tool_output with the artifact_id and continuation only for needed remaining ranges of the immutable snapshot. complete describes the requested page or selectors; file_complete describes acquired source coverage, not final script display or semantic review. A complete inline read may have no retained artifact; that is not a read failure. Explicit lines, bytes and fixed-string search selectors remain exact. In code mode explicit selections return up to 1 MiB to the script independently of its display budget: consume it there and print only needed evidence, not the entire recovered result. Each call reads current contents; retained snapshots are historical. Pass a skill: locator to read its SKILL.md; omit environment_id for host-owned skills.\n\n{}",
+                include_str!("../../../templates/result_binding_checkpoint.md").trim(),
+            ),
             strict: false,
             defer_loading: None,
             parameters: JsonSchema {
@@ -410,7 +418,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     ..JsonSchema::object(BTreeMap::new(), None, None)
                 }).collect()),
                 ..JsonSchema::object(BTreeMap::from([
-                ("path".to_string(), JsonSchema::string(Some("File path, relative to the environment cwd or absolute, a `skill:` locator, `skill:catalog` for enabled skill metadata, `context:desktop` for Desktop guidance, or the `context:unsettled-tools/<offset>` recovery_path from a resume notice. Omit environment_id for host-owned locators.".to_string()))),
+                ("path".to_string(), JsonSchema::string(Some("File path, relative to the environment cwd or absolute, a `skill:` locator, `skill:catalog` for enabled skill metadata, `context:desktop` for Desktop guidance, `context:workflow-evidence` for diagnostic/evidence-role and metric-attribution guidance, or the `context:unsettled-tools/<offset>` recovery_path from a resume notice. Omit environment_id for host-owned locators.".to_string()))),
                 ("file_path".to_string(), JsonSchema::string(Some("Legacy alias for path; use only one.".to_string()))),
                 ("offset".to_string(), JsonSchema { minimum: Some(1.into()), maximum: Some(usize::MAX.into()), ..JsonSchema::integer(Some("Legacy 1-based starting line; use instead of selectors, defaults to 1.".to_string())) }),
                 ("limit".to_string(), JsonSchema { minimum: Some(1.into()), maximum: Some(usize::MAX.into()), ..JsonSchema::integer(Some("Legacy positive line count; defaults to 2000 when offset is supplied.".to_string())) }),
@@ -552,6 +560,23 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     "host-context".to_string(),
                     args.path.clone(),
                 )
+            } else if args.path == "context:workflow-evidence" {
+                if args.environment_id.is_some() {
+                    return Err(FunctionCallError::RespondToModel(
+                        "omit environment_id for host-owned workflow evidence guidance".to_string(),
+                    ));
+                }
+                let contents = concat!(
+                    include_str!("../../../templates/diagnostic_triage.md"),
+                    "\n",
+                    include_str!("../../../templates/metric_attribution.md"),
+                );
+                (
+                    contents.to_string(),
+                    args.path.clone(),
+                    "host-context".to_string(),
+                    args.path.clone(),
+                )
             } else if args
                 .path
                 .starts_with(codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX)
@@ -608,7 +633,8 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 && !matches!(environment_id.as_str(), "host-context" | "host-skills");
             let selection_ceiling = if default_preview {
                 if script_consumer {
-                    DEFAULT_FILE_READ_TOKEN_CEILING
+                    token_ceiling
+                        .clamp(MIN_FILE_READ_PREVIEW_TOKENS, DEFAULT_FILE_READ_TOKEN_CEILING)
                 } else {
                     token_ceiling.min(DEFAULT_FILE_READ_TOKEN_CEILING)
                 }

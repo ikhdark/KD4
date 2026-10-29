@@ -851,10 +851,13 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
         };
         let writes_fit =
             stored_values_with_writes_within_limits(&stored_values, &stored_value_writes);
-        // Payload identity detects ABA and equal-valued concurrent writes.
+        // Shared serialized-payload identity detects ABA and equal-valued writes.
         let changed = |key: &String| match (stored_values.get(key), self.snapshot.get(key)) {
             (None, None) => false,
-            (Some(current), Some(original)) => !Arc::ptr_eq(&current.value, &original.value),
+            (Some(current), Some(original)) => match (&current.serialized, &original.serialized) {
+                (Some(current), Some(original)) => !Arc::ptr_eq(current, original),
+                _ => true,
+            },
             _ => true,
         };
         // All writes from a cell share its captured read set. Read-only cells

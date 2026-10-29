@@ -12,7 +12,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
         ("step".into(), JsonSchema::string(Some("Task step text.".into()))),
         ("status".into(), status()),
         ("continues".into(), JsonSchema::array(JsonSchema::string(None),
-            Some("Prior step IDs whose unfinished requirements this row carries forward, including splits/merges. A single one-to-one continuation preserves identity.".into()))),
+            Some("Use exact IDs from the previous result's step_ids or durable lineage, not invented labels such as step-1. These carry forward unfinished requirements, including splits/merges; a single one-to-one continuation preserves identity.".into()))),
     ]), Some(vec!["step".into(), "status".into()]), Some(false.into()));
     let mut updates = JsonSchema::array(JsonSchema {
         one_of: Some(["index", "step_id"].into_iter().map(|key| JsonSchema {
@@ -57,7 +57,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
     ]);
     ToolSpec::Function(ResponsesApiTool {
         name: "update_plan".into(),
-        description: "Update a progress checklist for multi-step work. Unavailable in Plan mode. Use plan or set, not both; at most one step may be in_progress. Checklist statuses are model reports, not proof of task correctness.".into(),
+        description: format!("{}\n\n{}", "Update a progress checklist for multi-step work. Unavailable in Plan mode. Use plan or set, not both; at most one step may be in_progress. Checklist statuses are model reports, not proof of task correctness.", include_str!("../../../templates/plan_progress.md").trim()),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema {

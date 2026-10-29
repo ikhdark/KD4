@@ -1222,9 +1222,7 @@ impl SessionRuntimeInitGuard {
     fn cleanup(&mut self) -> Option<tokio::task::JoinHandle<()>> {
         let session = self.0.take()?;
         session.startup_cancellation.cancel();
-        session
-            .shutting_down
-            .store(true, std::sync::atomic::Ordering::Release);
+        session.services.agent_control.registry().resource_locks.fence_session(&session);
         session.services.turn_environments.shutdown();
         Some(tokio::spawn(async move {
             super::handlers::shutdown_unpublished_session(&session).await;

@@ -1,6 +1,7 @@
 pub(crate) mod agent_resolver;
 pub(crate) mod control;
 mod registry;
+pub(crate) mod resource_locks;
 pub(crate) mod role;
 pub(crate) mod status;
 pub(crate) mod task_capabilities;

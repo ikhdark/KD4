@@ -460,18 +460,14 @@ ignored = [
 ]
 
 [profile.dev]
-# Keep line tables/backtraces while avoiding expensive full variable debug info
-# across local dev builds.
-debug = "limited"
-
-[profile.dev.package."*"]
-debug = "line-tables-only"
-
-[profile.dev.package.libsqlite3-sys]
-opt-level = 3
-
-[profile.dev.package.sha2]
-opt-level = 3
+# Minimize local build work; optimized runtime builds use release profiles.
+opt-level = 0
+debug = "none"
+lto = "off"
+codegen-units = 256
+incremental = true
+debug-assertions = false
+overflow-checks = false
 
 [profile.dev-small]
 inherits = "dev"

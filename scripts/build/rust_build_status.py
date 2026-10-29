@@ -2314,12 +2314,15 @@ def _source_mirror_skip_reason(
     external: bool,
     mirrors_root: Path,
     source_lane: Path | None,
+    freeze_requested: bool = False,
 ) -> str | None:
     """None when the build should use the shared mirror lanes, else why not."""
     if mode == "never":
         return "disabled by --source-mirror never"
     reason = _source_mirror_ineligibility(command, repo_root)
-    if reason is None and mode == "auto":
+    # Explicit bundles need a stable build source even in a live checkout.
+    # Reuse the existing mirror; ordinary in-place builds keep their warm lane.
+    if reason is None and mode == "auto" and not freeze_requested:
         if not external:
             reason = "owning checkout builds in place"
         elif (repo_root / ".git").exists():
@@ -2744,9 +2747,12 @@ def run_in_cargo_lane(
         freeze_bundle_dir = freeze_bundle_dir.absolute()
         if freeze_bundle_dir.exists():
             raise ValueError(f"--freeze-bundle must name a new directory: {freeze_bundle_dir}")
+    if timing_path is not None:
+        timing_path.parent.mkdir(parents=True, exist_ok=True)
     stream = timing_path.open("x", encoding="utf-8") if timing_path else None
     started = time.perf_counter()
-    record = {"command": list(command), "requestedLane": requested_lane, "exitCode": None}
+    record = {"command": list(command), "requestedLane": requested_lane,
+              "exitCode": None, "cargoExitCode": None, "status": "running"}
     try:
         if not repo_root.is_dir():
             # The lane is named for this root; a mistyped root would silently
@@ -2769,6 +2775,7 @@ def run_in_cargo_lane(
         skipped = _source_mirror_skip_reason(
             source_mirror, command=command, repo_root=repo_root, external=external,
             mirrors_root=mirrors_root,
+            freeze_requested=freeze_bundle_dir is not None,
             source_lane=(
                 Path(lane_root).absolute()
                 / source_lane_name(
@@ -2798,7 +2805,7 @@ def run_in_cargo_lane(
             if reuse is not None:
                 bundle_dir, binaries = _reuse_bundle(reuse[0], reuse[1], freeze_bundle_dir)
                 record.update(
-                    exitCode=0, reusedFrom=str(reuse[0]),
+                    exitCode=0, status="complete", reusedFrom=str(reuse[0]),
                     bundle={"dir": str(bundle_dir), "binaries": binaries},
                 )
                 print(
@@ -2886,6 +2893,7 @@ def run_in_cargo_lane(
                         stdout=messages if messages_path is not None else sys.stdout,
                         stderr=sys.stderr,
                     ).returncode
+                record["cargoExitCode"] = code
                 record["exitCode"] = code
                 if code == 0:
                     try:
@@ -2902,7 +2910,8 @@ def run_in_cargo_lane(
                         manifest = source_tree_manifest(repo_root)
                         if manifest != source.summary():
                             raise RuntimeError(
-                                "source changed during the build; no bundle was frozen"
+                                "source changed during the build; no bundle was frozen. "
+                                "Coordinate source writes, or use an eligible --source-mirror always build."
                             )
                     executables = _cargo_executables(messages_path)
                     bundle_dir = freeze_bundle_dir
@@ -2954,7 +2963,13 @@ def run_in_cargo_lane(
                         "sourceRoot": str(repo_root),
                         "entries": mirror_entries,
                     }) + "\n", encoding="utf-8")
+            record["status"] = "complete" if code == 0 else "failed"
             return code
+    except (CargoLanesRootValidationError, OSError, RuntimeError, ValueError) as error:
+        # Match main's runner-failure status, retaining the child result separately.
+        # Cargo success alone does not prove freezing/provenance/cleanup succeeded.
+        record.update(exitCode=2, status="failed", error=str(error))
+        raise
     finally:
         if stream is not None:
             record["totalMs"] = (time.perf_counter() - started) * 1000
@@ -3671,9 +3686,10 @@ def main(argv: list[str] | None = None) -> int:
         "--source-mirror",
         choices=SOURCE_MIRROR_MODES,
         default=os.environ.get("CODEX_CARGO_LANE_SOURCE_MIRROR", "auto"),
-        help="auto (default): a sealed external snapshot (no .git, no warm lane of "
-        "its own) builds incrementally in the nearest free shared slot through a "
-        "content-synced copy; always: require that; never: build in place in the "
+        help="auto (default): eligible --freeze-bundle builds and sealed external "
+        "snapshots (no .git, no warm lane of their own) build incrementally in the "
+        "nearest free shared slot through a content-synced copy; always: require "
+        "that; never: build in place in the "
         "source-root lane.",
     )
     run_lane_parser.add_argument(

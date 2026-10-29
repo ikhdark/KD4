@@ -1,0 +1,1 @@
+Plan-progress checkpoint: A no_progress receipt does not request another revision. Continue the next substantive owning action instead of cycling checklist/status updates; surface an actual blocker rather than manufacturing a new planning task.

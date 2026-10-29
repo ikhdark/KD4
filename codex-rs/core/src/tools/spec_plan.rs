@@ -49,6 +49,7 @@ use crate::tools::handlers::extension_tools::ExtensionToolAdapter;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
 use crate::tools::handlers::multi_agents_v2::AbandonAgentTaskHandler;
+use crate::tools::handlers::multi_agents_v2::AgentLockHandler;
 use crate::tools::handlers::multi_agents_v2::AmendAgentTaskHandler;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
 use crate::tools::handlers::multi_agents_v2::GetAgentTaskHandler;
@@ -908,7 +909,7 @@ fn build_code_mode_executors(
         eager_nested_tool_descriptions.push("Nested apply_patch is unavailable in this session; use its direct interface only if advertised.".to_string());
     }
     if has_nested_list_files {
-        eager_nested_tool_descriptions.push("- `await tools.list_files({path, include?, exclude?, exclude_directories?, max_depth?, max_entries?})`: tree walk with basename patterns, no gitignore (default depth 8, 2000 entries), returning `{entries:[{path,kind}], truncated, complete}`. Combine known include patterns for the same root/options in one call; check completeness under the combined limits.".to_string());
+        eager_nested_tool_descriptions.push("- `await tools.list_files({path, include?, exclude?, exclude_directories?, max_depth?, max_entries?})`: include/exclude/exclude_directories are arrays of basename-pattern strings, never booleans. max_depth:0 lists only the selected directory; default depth 8 and 2000 entries. No gitignore. Returns `{entries:[{path,kind}], truncated, complete}`. With include patterns only matching files are listed, but subdirectories are still traversed unless pruned by exclude_directories. Combine known patterns for the same root/options; check completeness under the combined limits. Resolve the full contract for other options.".to_string());
     }
     if !lazy_builtin_tool_names.is_empty() {
         // Names only: built-ins keep this line stable when external inventories change.
@@ -1426,6 +1427,11 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
             ToolExposure::Direct
         };
         let tool_namespace = active_collaboration_namespace(turn_context, agent_surface_stage);
+        planned_tools.add_arc_with_exposure_and_authorization_class(
+            multi_agent_v2_handler(AgentLockHandler, tool_namespace),
+            exposure,
+            TypedToolClass::AgentCommunication,
+        );
         if can_spawn
             && context
                 .step_context

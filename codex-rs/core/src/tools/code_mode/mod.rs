@@ -2627,6 +2627,16 @@ fn format_runtime_response(
             None => diagnostic = Some(script_error),
         }
     }
+    if !success {
+        let guidance = include_str!("../../../templates/failed_cell_recovery.md").trim();
+        match &mut diagnostic {
+            Some(diagnostic) => {
+                diagnostic.push_str("\n\n");
+                diagnostic.push_str(guidance);
+            }
+            None => diagnostic = Some(guidance.to_string()),
+        }
+    }
     let diagnostic_index = diagnostic.map(|text| {
         let index = content_items.len();
         content_items.push(FunctionCallOutputContentItem::InputText { text });
@@ -2753,15 +2763,17 @@ fn format_runtime_response(
             VISIBLE_OUTPUT_TRUNCATED_KEY.to_string(),
             JsonValue::Bool(true),
         );
-        let recovery_selector = match (omitted_lines, helper_recovery_selector) {
-            (Some((a, b)), Some(helper)) if helper["kind"] == "lines" => {
-                let start = a.min(helper["start"].as_u64().unwrap_or(a as u64) as usize);
-                let end = b.max(helper["end"].as_u64().unwrap_or(b as u64) as usize);
-                Some(serde_json::json!({"kind":"lines", "start":start, "end":end}))
+        let mut omitted_lines = omitted_lines;
+        let recovery_selector = match (omitted_lines.is_empty(), helper_recovery_selector) {
+            (false, Some(helper)) if helper["kind"] == "lines" => {
+                if let (Some(start), Some(end)) = (helper["start"].as_u64(), helper["end"].as_u64()) {
+                    omitted_lines.push((start as usize, end as usize));
+                }
+                omitted_line_selector(omitted_lines)
             }
-            (Some(_), Some(_)) => Some(serde_json::json!({"kind":"json_pointer", "pointer":""})),
-            (None, helper) => helper,
-            (Some((start, end)), None) => Some(serde_json::json!({"kind":"lines", "start":start, "end":end})),
+            (false, Some(_)) => Some(serde_json::json!({"kind":"json_pointer", "pointer":""})),
+            (true, helper) => helper,
+            (false, None) => omitted_line_selector(omitted_lines),
         };
         if let Some(selector) = recovery_selector {
             output.essential_inline.insert(
@@ -2815,6 +2827,28 @@ fn prepend_script_status(
 }
 
 
+/// Internal recovery selector for a truncated cell. `start`/`end` span every
+/// omitted line; `ranges` (only with several gaps) lists just the omitted
+/// lines, so recovery pages skip the shown lines between gaps (recorded
+/// recoveries re-read up to 17% already-shown bytes, audit 2026-10-28).
+fn omitted_line_selector(mut ranges: Vec<(usize, usize)>) -> Option<JsonValue> {
+    ranges.retain(|(start, end)| start <= end);
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1.saturating_add(1) => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    let (start, end) = (merged.first()?.0, merged.last()?.1);
+    let mut selector = serde_json::json!({"kind":"lines", "start":start, "end":end});
+    if merged.len() > 1 {
+        selector["ranges"] = serde_json::json!(merged);
+    }
+    Some(selector)
+}
+
 fn truncate_code_mode_result_at_lines(
     items: Vec<FunctionCallOutputContentItem>,
     max_output_tokens: Option<usize>,
@@ -2825,7 +2859,7 @@ fn truncate_code_mode_result_at_lines(
 ) -> (
     Vec<FunctionCallOutputContentItem>,
     bool,
-    Option<(usize, usize)>,
+    Vec<(usize, usize)>,
 ) {
     let diagnostic_text = code_mode_text_content(&items);
     let requested_limit =
@@ -2865,19 +2899,19 @@ fn truncate_code_mode_result_at_lines(
         // Keep original item boundaries for a fitting packet, including empty
         // items. The zero-budget path retains its existing empty projection.
         if !omitted && limits.applied_limit != 0 {
-            return (items, false, None);
+            return (items, false, Vec::new());
         }
         return (
             vec![FunctionCallOutputContentItem::InputText { text: truncated }],
             omitted,
-            omitted_lines,
+            omitted_lines.into_iter().collect(),
         );
     }
 
     if limits.applied_limit != 0
         && codex_utils_output_truncation::model_token_count(&diagnostic_text) <= whole_packet_limit
     {
-        return (items, false, None);
+        return (items, false, Vec::new());
     }
     if let Some(error_index) = diagnostic_index {
         return truncate_code_mode_failure(items, error_index, limits.applied_limit, source_lines);
@@ -2887,11 +2921,13 @@ fn truncate_code_mode_result_at_lines(
 
 /// Preserve each registered text result and its position relative to media.
 /// Complete small results yield their unused share before large ones truncate.
+/// Returns each item's omitted line range separately: lines between two gaps
+/// were shown, so recovery must not name them again.
 fn truncate_code_mode_text_items(
     items: Vec<FunctionCallOutputContentItem>,
     token_limit: usize,
     source_lines: Option<(usize, usize)>,
-) -> (Vec<FunctionCallOutputContentItem>, bool, Option<(usize, usize)>) {
+) -> (Vec<FunctionCallOutputContentItem>, bool, Vec<(usize, usize)>) {
     let costs = items.iter().enumerate().filter_map(|(index, item)| match item {
         FunctionCallOutputContentItem::InputText { text } => {
             Some((index, codex_utils_output_truncation::model_token_count(text)))
@@ -2909,7 +2945,7 @@ fn truncate_code_mode_text_items(
     let (mut offset, total) = source_lines.unwrap_or_else(|| (0, code_mode_text_content(&items).lines().count()));
     let mut seen_text = false;
     let mut omitted = false;
-    let mut omitted_lines: Option<(usize, usize)> = None;
+    let mut omitted_lines: Vec<(usize, usize)> = Vec::new();
     let projected = items.into_iter().enumerate().map(|(index, item)| {
         let FunctionCallOutputContentItem::InputText { text } = item else { return item };
         offset += usize::from(seen_text);
@@ -2917,12 +2953,7 @@ fn truncate_code_mode_text_items(
             &text, budgets[index], offset, total, Some("{cell_output_artifact_id}"),
         );
         omitted |= projected != text;
-        if let Some((start, end)) = gap {
-            omitted_lines = Some(match omitted_lines {
-                Some((first, last)) => (first.min(start), last.max(end)),
-                None => (start, end),
-            });
-        }
+        omitted_lines.extend(gap);
         offset += text.bytes().filter(|byte| *byte == b'\n').count();
         seen_text = true;
         FunctionCallOutputContentItem::InputText { text: projected }
@@ -2938,7 +2969,7 @@ fn truncate_code_mode_failure(
 ) -> (
     Vec<FunctionCallOutputContentItem>,
     bool,
-    Option<(usize, usize)>,
+    Vec<(usize, usize)>,
 ) {
     let FunctionCallOutputContentItem::InputText { text: error_text } = items.remove(error_index)
     else {
@@ -2966,7 +2997,9 @@ fn truncate_code_mode_failure(
             total,
             Some("{cell_output_artifact_id}"),
         );
-        omitted_lines = omitted_lines.or(gap);
+        // The error follows every other item, so its gap stays last. Keeping
+        // only the earlier gaps would leave the error's omitted lines unnamed.
+        omitted_lines.extend(gap);
         text
     };
     if !error_text.is_empty() {

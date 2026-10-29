@@ -1863,8 +1863,7 @@ impl Session {
     pub(crate) async fn begin_shutdown(&self) {
         // Fence starts before observing an admitted transaction's permit. A
         // rollback may own that permit long after its caller stops waiting.
-        self.shutting_down
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.services.agent_control.registry().resource_locks.fence_session(self);
         let Ok(_task_start_permit) = self.task_start_gate.acquire().await else {
             unreachable!("session-owned task-start semaphore is never closed");
         };

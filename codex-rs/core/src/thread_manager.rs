@@ -20,6 +20,7 @@ use crate::session::resolve_multi_agent_version;
 use crate::session::session::SessionSettingsUpdate;
 use crate::tasks::InterruptedTurnHistoryMarker;
 use crate::tasks::interrupted_turn_history_marker;
+use crate::windows_sandbox::WindowsSandboxLevelExt;
 use codex_agent_graph_store::AgentGraphStore;
 use codex_agent_graph_store::LocalAgentGraphStore;
 use codex_analytics::AnalyticsEventsClient;
@@ -562,6 +563,16 @@ fn apply_reconstructed_settings_to_config(
             .can_set(&windows_sandbox_mode)
             .map_err(invalid_reconstructed_setting)?;
         config.permissions.windows_sandbox_mode = windows_sandbox_mode;
+    }
+
+    // Reconstruction can change both the backend and the permission profile
+    // after Config's startup validation. Reject unusable restored combinations
+    // before spawning a model turn, rather than failing every native tool later.
+    if let Some(error) = crate::config::legacy_windows_sandbox_unusable_warning(
+        config,
+        WindowsSandboxLevel::from_config(config),
+    ) {
+        return Err(invalid_reconstructed_setting(error));
     }
 
     Ok(())
@@ -2195,6 +2206,17 @@ impl ThreadManagerState {
                 .session
                 .persist_thread_settings_snapshot()
                 .await?;
+        }
+        if tracing::enabled!(target: "codex_app_server::desktop_benchmark", tracing::Level::DEBUG) {
+            let effective = new_thread.thread.config_snapshot().await;
+            tracing::debug!(target: "codex_app_server::desktop_benchmark",
+                kdr_desktop_event = "reconstructed_runtime_settings",
+                "KDR_RUNTIME_SETTINGS_V1 {}", serde_json::json!({
+                    "schema": 1,
+                    "thread_id": new_thread.thread_id.to_string(),
+                    "windows_sandbox_level": effective.windows_sandbox_level,
+                    "reasoning_effort": effective.reasoning_effort,
+                }));
         }
         Ok(())
     }

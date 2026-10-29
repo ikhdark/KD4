@@ -108,12 +108,12 @@ pub(crate) enum RuntimeEvent {
 /// stored so later cells and commits never reserialize it.
 #[derive(Clone, Debug)]
 pub(crate) struct StoredValue {
-    pub(crate) value: Arc<JsonValue>,
     /// Trusted display edit recipes captured from the tool-owned projector.
     /// Plain JSON values never infer or synthesize these registrations.
     pub(crate) presentation: Option<Arc<JsonValue>>,
-    /// Immutable wire representation shared by loads and cell snapshots. Each
-    /// load still parses a fresh JS value, so callers cannot mutate the store.
+    /// Immutable wire representation shared by loads and cell snapshots. A new
+    /// allocation also identifies each write revision, including equal values.
+    /// Each load parses a fresh JS value, so callers cannot mutate the store.
     pub(crate) serialized: Option<Arc<serde_json::value::RawValue>>,
     /// Transaction-only tombstone; never installed in the committed values map.
     pub(crate) deleted: bool,
@@ -138,7 +138,6 @@ impl StoredValue {
             .unwrap_or(usize::MAX);
         Self {
             bytes,
-            value: Arc::new(value),
             presentation: None,
             serialized,
             deleted: false,

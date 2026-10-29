@@ -1,14 +1,12 @@
 # Local Codex workspace
 
-Start with [CONTEXT.md](CONTEXT.md) for the rolling brief and the repository
-[AGENTS.md](../AGENTS.md) for durable instructions. This guide is navigation,
-not another instruction or configuration owner.
+See the repository [AGENTS.md](../AGENTS.md) for durable instructions.
+This guide is navigation, not another instruction or configuration owner.
 
 ## Layout
 
 | Path | Purpose |
 | --- | --- |
-| [CONTEXT.md](CONTEXT.md) | Small, manually maintained shared context. |
 | [config.toml](config.toml) | Repository-local Codex configuration; kept at its runtime path. |
 | [test-runners.json](test-runners.json) | Validation runner registration; kept at its runtime path. |
 | [audits/](audits/README.md) | Reports, captured artifacts, and per-run evidence bundles. |
@@ -21,8 +19,7 @@ not another instruction or configuration owner.
 Repository-owned test-only files and dedicated test commands have been removed
 across all languages. Build/lint checks, production examples/generators, and
 mixed-purpose validation-runner registrations remain. SDK check recipes perform
-lint/type checks, not tests. See [AGENTS.md](../AGENTS.md) for guidance and
-[CONTEXT.md](CONTEXT.md) for the rolling brief.
+lint/type checks, not tests. See [AGENTS.md](../AGENTS.md) for guidance.
 
 ## Retained history
 

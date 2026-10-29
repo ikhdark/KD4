@@ -244,11 +244,15 @@ fn persisted_settings_fallback(stored_thread: &StoredThread) -> PersistedThreadS
 
 fn raw_override_contains(
     overrides: Option<&HashMap<String, serde_json::Value>>,
+    cli_overrides: &[(String, codex_config::TomlValue)],
     key: &str,
 ) -> bool {
-    overrides.is_some_and(|overrides| {
-        let key = key.split('.').collect::<Vec<_>>();
-        overrides.keys().any(|candidate| {
+    let key = key.split('.').collect::<Vec<_>>();
+    overrides
+        .into_iter()
+        .flat_map(|overrides| overrides.keys())
+        .chain(cli_overrides.iter().map(|(key, _)| key))
+        .any(|candidate| {
             codex_config::parse_override_key(candidate).is_ok_and(|candidate| {
                 candidate
                     .iter()
@@ -258,46 +262,48 @@ fn raw_override_contains(
                     && candidate.len() >= key.len()
             })
         })
-    })
 }
 
 fn persisted_settings_override_mask(
     request_overrides: Option<&HashMap<String, serde_json::Value>>,
     typesafe_overrides: &ConfigOverrides,
+    cli_overrides: &[(String, codex_config::TomlValue)],
 ) -> PersistedThreadSettingsOverrideMask {
+    // Startup -c values are explicit too. Replaying a saved backend or effort
+    // must not override settings already selected by the current invocation.
+    let has_override = |key| raw_override_contains(request_overrides, cli_overrides, key);
     let permission_override = typesafe_overrides.permission_profile.is_some()
         || typesafe_overrides.default_permissions.is_some()
         || typesafe_overrides.sandbox_mode.is_some()
-        || raw_override_contains(request_overrides, "permission_profile")
-        || raw_override_contains(request_overrides, "default_permissions")
-        || raw_override_contains(request_overrides, "permissions")
-        || raw_override_contains(request_overrides, "sandbox_mode");
+        || has_override("permission_profile")
+        || has_override("default_permissions")
+        || has_override("permissions")
+        || has_override("sandbox_mode");
     PersistedThreadSettingsOverrideMask {
-        model: typesafe_overrides.model.is_some()
-            || raw_override_contains(request_overrides, "model"),
+        model: typesafe_overrides.model.is_some() || has_override("model"),
         model_provider_id: typesafe_overrides.model_provider.is_some()
-            || raw_override_contains(request_overrides, "model_provider"),
-        service_tier: typesafe_overrides.service_tier.is_some()
-            || raw_override_contains(request_overrides, "service_tier"),
+            || has_override("model_provider"),
+        service_tier: typesafe_overrides.service_tier.is_some() || has_override("service_tier"),
         developer_instructions: typesafe_overrides.developer_instructions.is_some()
-            || raw_override_contains(request_overrides, "developer_instructions"),
+            || has_override("developer_instructions"),
         approval_policy: typesafe_overrides.approval_policy.is_some()
-            || raw_override_contains(request_overrides, "approval_policy"),
+            || has_override("approval_policy"),
         permission_profile: permission_override,
         active_permission_profile: permission_override,
-        environments: typesafe_overrides.cwd.is_some()
-            || raw_override_contains(request_overrides, "cwd"),
+        environments: typesafe_overrides.cwd.is_some() || has_override("cwd"),
         workspace_roots: typesafe_overrides.workspace_roots.is_some()
-            || raw_override_contains(request_overrides, "workspace_roots"),
+            || has_override("workspace_roots"),
         profile_workspace_roots: permission_override,
         sandbox_policy: permission_override,
-        windows_sandbox_level: raw_override_contains(request_overrides, "windows.sandbox")
-            || raw_override_contains(request_overrides, "windows"),
-        reasoning_effort: raw_override_contains(request_overrides, "model_reasoning_effort"),
-        reasoning_summary: raw_override_contains(request_overrides, "model_reasoning_summary"),
-        personality: typesafe_overrides.personality.is_some()
-            || raw_override_contains(request_overrides, "personality"),
-        collaboration_mode: raw_override_contains(request_overrides, "collaboration_mode"),
+        windows_sandbox_level: has_override("windows.sandbox")
+            || has_override("windows")
+            || has_override("features.elevated_windows_sandbox")
+            || has_override("features.experimental_windows_sandbox")
+            || has_override("features.enable_experimental_windows_sandbox"),
+        reasoning_effort: has_override("model_reasoning_effort"),
+        reasoning_summary: has_override("model_reasoning_summary"),
+        personality: typesafe_overrides.personality.is_some() || has_override("personality"),
+        collaboration_mode: has_override("collaboration_mode"),
     }
 }
 
@@ -3324,8 +3330,11 @@ impl ThreadRequestProcessor {
             developer_instructions,
             personality,
         );
-        let explicit_overrides =
-            persisted_settings_override_mask(request_overrides.as_ref(), &typesafe_overrides);
+        let explicit_overrides = persisted_settings_override_mask(
+            request_overrides.as_ref(),
+            &typesafe_overrides,
+            &self.config_manager.current_cli_overrides(),
+        );
 
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
         let config = match self
@@ -4267,8 +4276,11 @@ impl ThreadRequestProcessor {
             /*personality*/ None,
         );
         typesafe_overrides.ephemeral = ephemeral.then_some(true);
-        let explicit_overrides =
-            persisted_settings_override_mask(request_overrides.as_ref(), &typesafe_overrides);
+        let explicit_overrides = persisted_settings_override_mask(
+            request_overrides.as_ref(),
+            &typesafe_overrides,
+            &self.config_manager.current_cli_overrides(),
+        );
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
         let config = self
             .config_manager

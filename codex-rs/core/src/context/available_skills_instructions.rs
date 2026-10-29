@@ -23,7 +23,7 @@ impl AvailableSkillsInstructions {
 
     pub fn from_available_skills(_available_skills: &AvailableSkills) -> Self {
         Self {
-            body: "\n## Skills\nBefore task actions, discover applicable or named skills with read_file(path=\"skill:catalog\") and read their full instructions; use provider-specific discovery for other skill sources.\n".to_string(),
+            body: "\n## Skills\nWhen the user names a skill or the task plausibly matches one, find it with a fixed-string search of the catalog, e.g. read_file(path=\"skill:catalog\", selectors=[{kind:\"search\", query:\"<keyword>\"}]), then read its full instructions. Do not read the whole catalog by default; use provider-specific discovery for other skill sources.\n".to_string(),
         }
     }
 }

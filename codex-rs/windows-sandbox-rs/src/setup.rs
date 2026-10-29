@@ -802,6 +802,13 @@ fn run_setup_exe(payload: &SetupPayload, needs_elevation: bool, codex_home: &Pat
     use windows_sys::Win32::UI::Shell::ShellExecuteExW;
     check_setup_cancellation(cancellation)?;
     let exe = find_setup_exe()?;
+    if std::env::var("CODEX_WINDOWS_SANDBOX_DENY_PROVISIONING").as_deref() == Ok("1")
+        && matches!(&payload.mode, SetupMode::Full | SetupMode::ProvisionOnly)
+    {
+        anyhow::bail!(
+            "Windows sandbox provisioning is disabled for this process; reuse an already provisioned home or explicitly authorize setup"
+        );
+    }
     let staged_payload = crate::setup_protocol::PreparedSetupRequest::new(payload).map_err(|err| {
         failure(
             SetupErrorCode::OrchestratorPayloadSerializeFailed,

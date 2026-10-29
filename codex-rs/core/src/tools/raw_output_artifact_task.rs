@@ -458,17 +458,19 @@ pub(crate) async fn read_command_log(
         let mut byte_ranges = Vec::new();
         for selector in &selectors {
             if let ToolOutputSelector::Bytes { start, end } = selector {
-                if start > end || *end > metadata.len() {
+                if start > end || *start > metadata.len() {
                     return Err(super::ReadToolOutputError::InvalidRange(format!(
                         "byte range must be within retained bytes 0..{}", metadata.len()
                     )));
                 }
-                byte_ranges.push((*start, *end));
+                // Match the indexed artifact owner: an oversized upper bound
+                // reads the available tail; a start beyond EOF stays invalid.
+                byte_ranges.push((*start, (*end).min(metadata.len())));
                 continue;
             }
             let ToolOutputSelector::Lines { start, end } = selector else {
                 return Err(super::ReadToolOutputError::InvalidRange(
-                    "Command logs support bytes and lines selectors; source snapshots retain advanced selectors.".into()));
+                    "Command logs support bytes and lines selectors; source snapshots retain advanced selectors. Read bounded lines with selectors:[{kind:\"lines\",start:1,end:200}] and filter the returned text in exec for a keyword; preserve this artifact_id and do not rerun its producer.".into()));
             };
             if *start == 0 || end < start {
                 return Err(super::ReadToolOutputError::InvalidRange("expected 1-based start <= end".into()));
@@ -523,7 +525,7 @@ pub(crate) async fn read_command_log(
         for selector in selectors {
             let ToolOutputSelector::Lines { start, end } = selector else {
                 return Err(super::ReadToolOutputError::InvalidRange(
-                    "Command logs support bytes and lines selectors; source snapshots retain advanced selectors.".into()));
+                    "Command logs support bytes and lines selectors; source snapshots retain advanced selectors. Read bounded lines with selectors:[{kind:\"lines\",start:1,end:200}] and filter the returned text in exec for a keyword; preserve this artifact_id and do not rerun its producer.".into()));
             };
             if start == 0 || end < start { return Err(super::ReadToolOutputError::InvalidRange("expected 1-based start <= end".into())); }
             let position = offsets.get(&start).copied().flatten();
