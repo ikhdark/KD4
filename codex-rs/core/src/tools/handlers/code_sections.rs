@@ -1,4 +1,4 @@
-//! On-demand source sections shared by file structure selectors.
+//! On-demand source parsing shared by structure selectors and patch advisories.
 //! No cache, filesystem traversal, or macro expansion belongs in the parser.
 use std::path::Path;
 use std::time::Instant;
@@ -42,22 +42,23 @@ pub(crate) struct CodeItem {
     pub end: usize,
 }
 
-pub(super) fn parse_with_completeness(
-    path: &str,
-    source: &str,
-    sha256: &str,
-    deadline: Instant,
-) -> Option<(Vec<CodeItem>, bool)> {
-    let rust = path.ends_with(".rs");
-    let language = if rust {
-        tree_sitter_rust::LANGUAGE
+fn source_language(path: &str) -> Option<(&'static str, tree_sitter::Language)> {
+    if path.ends_with(".rs") {
+        Some(("Rust", tree_sitter_rust::LANGUAGE.into()))
     } else if path.ends_with(".py") {
-        tree_sitter_python::LANGUAGE
+        Some(("Python", tree_sitter_python::LANGUAGE.into()))
     } else {
+        None
+    }
+}
+
+fn parse_source(path: &str, source: &str, deadline: Instant) -> Option<tree_sitter::Tree> {
+    if Instant::now() >= deadline {
         return None;
-    };
+    }
+    let (_, language) = source_language(path)?;
     let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&language.into()).ok()?;
+    parser.set_language(&language).ok()?;
     let mut cancelled = |_: &tree_sitter::ParseState| {
         if Instant::now() >= deadline {
             std::ops::ControlFlow::Break(())
@@ -65,11 +66,101 @@ pub(super) fn parse_with_completeness(
             std::ops::ControlFlow::Continue(())
         }
     };
-    let tree = parser.parse_with_options(
+    parser.parse_with_options(
         &mut |offset, _| &source.as_bytes()[offset..],
         None,
         Some(tree_sitter::ParseOptions::new().progress_callback(&mut cancelled)),
-    )?;
+    )
+}
+
+/// Count recovery nodes, not compiler diagnostics. Do not count nested ERROR
+/// nodes again: parser recovery can otherwise multiply one broken construct.
+fn recovery_error_count(tree: &tree_sitter::Tree, deadline: Instant) -> Option<usize> {
+    let mut count = 0;
+    let mut cursor = tree.walk();
+    loop {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let node = cursor.node();
+        if node.is_error() || node.is_missing() {
+            count += 1;
+        } else if node.has_error() && cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return Some(count);
+            }
+        }
+    }
+}
+
+/// Deliberately conservative: only an increased recovery count is advisory
+/// evidence of a possible regression. Equal/decreased counts may hide new errors,
+/// but must not blame moved or differently recovered pre-existing errors.
+///
+/// The caller compares one receipt's files against one shared deadline and
+/// owns `budget_reported`: exhaustion is reported once, on the first file it
+/// stops; later files under that expired deadline return None.
+pub(crate) fn syntax_regression(
+    before_path: &str,
+    path: &str,
+    before: &str,
+    after: &str,
+    deadline: Instant,
+    budget_reported: &mut bool,
+) -> Option<serde_json::Value> {
+    if before == after {
+        return None;
+    }
+    let (language, _) = source_language(path)?;
+    let skipped = |reason| json!({
+        "kind": "syntax_check_skipped", "path": path, "language": language,
+        "advisory": true, "reason": reason,
+        "message": "Syntax comparison unavailable; no compilation or correctness evidence.",
+    });
+    if source_language(before_path).map(|(name, _)| name) != Some(language) {
+        return Some(skipped("language_changed"));
+    }
+    // Bound synchronous advisory work across the entire receipt, using the
+    // caller's shared deadline. Never make patch success depend on parsing.
+    if before.len().max(after.len()) > 1024 * 1024 {
+        return Some(skipped("source_size_limit"));
+    }
+    let compare = || {
+        let old = parse_source(path, before, deadline)?;
+        let old_count = recovery_error_count(&old, deadline)?;
+        let new = parse_source(path, after, deadline)?;
+        let new_count = recovery_error_count(&new, deadline)?;
+        Some((old_count, new_count))
+    };
+    let Some((before_errors, after_errors)) = compare() else {
+        let mut skip = skipped("parser_unavailable_or_budget_exhausted");
+        if Instant::now() >= deadline {
+            if std::mem::replace(budget_reported, true) {
+                return None;
+            }
+            skip["message"] = json!("Shared syntax-check time budget exhausted; this and later Rust/Python files in this patch were not compared. No compilation or correctness evidence.");
+        }
+        return Some(skip);
+    };
+    (after_errors > before_errors).then(|| json!({
+        "kind": "syntax_regression", "path": path, "language": language,
+        "parser": "tree-sitter", "advisory": true,
+        "before_errors": before_errors, "after_errors": after_errors,
+        "message": format!("Possible {language} syntax regression: parser recovery errors increased from {before_errors} to {after_errors}. Parsing is not compilation or correctness evidence."),
+    }))
+}
+
+pub(super) fn parse_with_completeness(
+    path: &str,
+    source: &str,
+    sha256: &str,
+    deadline: Instant,
+) -> Option<(Vec<CodeItem>, bool)> {
+    let rust = path.ends_with(".rs");
+    let tree = parse_source(path, source, deadline)?;
     let complete = !tree.root_node().has_error();
     let mut items = Vec::new();
     let mut test_contexts = std::collections::HashMap::new();
@@ -212,6 +303,11 @@ pub(super) fn parse_with_completeness(
             if rust {
                 let mut sibling = node.prev_named_sibling();
                 while let Some(previous) = sibling {
+                    // Each step rescans earlier siblings, so a long comment or
+                    // attribute run is quadratic; it must not outlive the deadline.
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
                     if !matches!(
                         previous.kind(),
                         "attribute_item" | "line_comment" | "block_comment"
@@ -273,7 +369,7 @@ pub(super) fn parse_with_completeness(
             let mut linked_path_candidates = Vec::new();
             let module_candidate_group_size = if module_path.is_some() { 1 } else { 2 };
             if rust && kind == "mod" && body.is_none() && !conditional_path {
-                let bases = module_directories(path, node, source, module_path.is_none())
+                let bases = module_directories(path, node, source, module_path.is_none(), deadline)
                     .unwrap_or_default();
                 if let Some(value) = module_path {
                     for base in bases {
@@ -504,6 +600,7 @@ fn module_directories(
     node: tree_sitter::Node<'_>,
     source: &str,
     conventional: bool,
+    deadline: Instant,
 ) -> Option<Vec<std::path::PathBuf>> {
     let path = Path::new(path);
     let base = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
@@ -524,6 +621,9 @@ fn module_directories(
         let mut override_path = None;
         let mut sibling = module.prev_named_sibling();
         while let Some(previous) = sibling {
+            if Instant::now() >= deadline {
+                return None;
+            }
             if !matches!(
                 previous.kind(),
                 "attribute_item" | "line_comment" | "block_comment"

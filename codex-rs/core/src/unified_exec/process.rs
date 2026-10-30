@@ -1,5 +1,8 @@
 #![allow(clippy::module_inception)]
 
+#[path = "process_events.rs"]
+pub(super) mod events;
+
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -39,6 +42,7 @@ use super::UNIFIED_EXEC_OUTPUT_MAX_TOKENS;
 use super::UnifiedExecError;
 use super::async_watcher::lagged_output_marker;
 use super::head_tail_buffer::HeadTailBuffer;
+use super::head_tail_buffer::StreamLayout;
 use super::head_tail_buffer::split_valid_utf8_prefix_with_max;
 use super::process_state::ProcessState;
 
@@ -205,11 +209,11 @@ async fn flush_aggregate_output(
     decoder.stderr.clear();
 }
 
-async fn snapshot_retained_output(buffer: &OutputBuffer) -> (Vec<u8>, bool) {
+async fn snapshot_retained_output(buffer: &OutputBuffer) -> (Vec<u8>, bool, StreamLayout) {
     let guard = buffer.lock().await;
     let omitted_bytes = guard.omitted_bytes();
     let bytes = guard.to_bytes_with_loss_notice(&[]);
-    (bytes, omitted_bytes == 0 && guard.lagged_chunks() == 0)
+    (bytes, omitted_bytes == 0 && guard.lagged_chunks() == 0, guard.stream_layout())
 }
 
 #[derive(Clone, Debug)]
@@ -227,6 +231,10 @@ pub(crate) struct ProcessOutputSnapshot {
     pub(crate) stderr: Vec<u8>,
     pub(crate) aggregated_output_is_exact: bool,
     pub(crate) streams_are_exact: bool,
+    /// Output closed before the streams were read, so they hold every byte.
+    pub(crate) output_closed: bool,
+    pub(crate) stdout_layout: StreamLayout,
+    pub(crate) stderr_layout: StreamLayout,
 }
 
 /// Shared output state exposed to polling and streaming consumers.
@@ -636,10 +644,14 @@ impl UnifiedExecProcess {
 
 
     pub(super) async fn snapshot_completion_output(&self) -> ProcessOutputSnapshot {
-        let (aggregated_output, aggregated_output_is_exact) =
+        // Only closure observed before the reads proves no byte is still due.
+        let output_closed = self.output_is_closed();
+        let (aggregated_output, aggregated_output_is_exact, _) =
             snapshot_retained_output(&self.completion_output_buffer).await;
-        let (stdout, stdout_exact) = snapshot_retained_output(&self.stdout_buffer).await;
-        let (stderr, stderr_exact) = snapshot_retained_output(&self.stderr_buffer).await;
+        let (stdout, stdout_exact, stdout_layout) =
+            snapshot_retained_output(&self.stdout_buffer).await;
+        let (stderr, stderr_exact, stderr_layout) =
+            snapshot_retained_output(&self.stderr_buffer).await;
         ProcessOutputSnapshot {
             process_duration: self.observed_lifetime(),
             aggregated_output,
@@ -647,14 +659,18 @@ impl UnifiedExecProcess {
             stderr,
             aggregated_output_is_exact,
             streams_are_exact: stdout_exact && stderr_exact,
+            output_closed,
+            stdout_layout,
+            stderr_layout,
         }
     }
 
     pub(super) async fn snapshot_tool_output(&self, tty: bool) -> Arc<ProcessOutputSnapshot> {
         let mut snapshot = self.snapshot_completion_output().await;
         // A PTY merges streams; pipe-backed local and exec-server processes do not.
-        snapshot.streams_are_exact &=
-            !tty && self.output_is_closed() && self.state_rx.borrow().failure_message.is_none();
+        snapshot.streams_are_exact &= !tty
+            && snapshot.output_closed
+            && self.state_rx.borrow().failure_message.is_none();
         Arc::new(snapshot)
     }
 
@@ -697,6 +713,9 @@ impl UnifiedExecProcess {
             stderr: stderr.to_bytes_with_loss_notice(&[]),
             aggregated_output_is_exact: exact(&aggregated),
             streams_are_exact: !tty && exact(&stdout) && exact(&stderr) && state.failure_message.is_none(),
+            output_closed: true,
+            stdout_layout: stdout.stream_layout(),
+            stderr_layout: stderr.stream_layout(),
         }), artifact))
     }
 

@@ -429,6 +429,22 @@ impl SandboxedFileSystem {
                 "filesystem helper did not apply requested walk filters; update the helper or use an unfiltered audit",
             ));
         }
+        if options.apply_gitignore && !response.gitignore_applied {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "filesystem helper did not apply gitignore rules; update it or set include_ignored=true",
+            ));
+        }
+        if options.summary_only && response.summary.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "filesystem helper did not aggregate the walk; update the helper",
+            ));
+        }
+        if options.include_metadata && !response.metadata_included {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,
+                "filesystem helper did not include requested entry metadata; update the helper"));
+        }
         Ok(response)
     }
 
@@ -482,6 +498,73 @@ impl SandboxedFileSystem {
 }
 
 impl ExecutorFileSystem for SandboxedFileSystem {
+    fn read_file_range<'a>(
+        &'a self, path: &'a PathUri, start: u64, len: usize,
+        expected_revision: Option<&'a str>, sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, codex_file_system::FileRangeRead> {
+        Box::pin(async move {
+            let sandbox = require_platform_sandbox(sandbox)?;
+            validate_native_path(path)?;
+            let response = self.run_sandboxed(sandbox,
+                FsHelperRequest::ReadFileRange(crate::protocol::FsReadFileRangeParams {
+                    path: path.clone(), start, len, expected_revision: expected_revision.map(str::to_owned), sandbox: None,
+                })).await?.expect_read_file_range().map_err(map_sandbox_error)?;
+            crate::remote_file_system::decode_file_range(response, start, len, expected_revision)
+        })
+    }
+
+    /// One helper launch hashes the whole file; dropping this future
+    /// terminates the helper, so cancellation does not wait for the pass.
+    fn checksum_file<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<codex_file_system::FileDigest>> {
+        Box::pin(async move {
+            let sandbox = require_platform_sandbox(sandbox)?;
+            validate_native_path(path)?;
+            let response = self
+                .run_sandboxed(
+                    sandbox,
+                    FsHelperRequest::ChecksumFile(crate::protocol::FsChecksumFileParams {
+                        path: path.clone(),
+                        sandbox: None,
+                        cancel_id: None,
+                    }),
+                )
+                .await?
+                .expect_checksum_file()
+                .map_err(map_sandbox_error)?;
+            crate::remote_file_system::validate_file_digest(response.digest)
+        })
+    }
+
+    /// One helper launch probes every candidate instead of one per candidate.
+    fn first_regular_file<'a>(
+        &'a self,
+        candidates: &'a [PathUri],
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<PathUri>> {
+        Box::pin(async move {
+            let sandbox = require_platform_sandbox(sandbox)?;
+            if candidates.is_empty() {
+                return Ok(None);
+            }
+            for candidate in candidates {
+                validate_native_path(candidate)?;
+            }
+            self.run_sandboxed(
+                sandbox,
+                FsHelperRequest::FirstRegularFile {
+                    candidates: candidates.to_vec(),
+                },
+            )
+            .await?
+            .expect_first_regular_file()
+            .map_err(map_sandbox_error)
+        })
+    }
+
     fn mutate_file_if_matches<'a>(
         &'a self,
         path: &'a PathUri,

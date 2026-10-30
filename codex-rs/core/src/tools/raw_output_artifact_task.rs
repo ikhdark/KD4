@@ -457,7 +457,56 @@ pub(crate) async fn read_command_log(
         let mut offsets = std::collections::BTreeMap::new();
         let mut ranges = Vec::with_capacity(selectors.len());
         let mut byte_ranges = Vec::new();
+        let mut search_snapshot = None;
         for selector in &selectors {
+            if selector.is_search() {
+                let limit = if matches!(selector, ToolOutputSelector::Search { regex: true, .. }) {
+                    super::ARTIFACT_REGEX_MAX_SEARCH_BYTES
+                } else { super::MAX_RAW_OUTPUT_ARTIFACT_BYTES };
+                let selected = if metadata.len() > limit as u64 {
+                    super::invalid_selector_result(selector.clone(), format!(
+                        "search is limited to {limit} retained bytes; use exact byte/line selections of this artifact, never rerun its producer"
+                    ))
+                } else {
+                    if search_snapshot.is_none() {
+                        let (file, _identity) = open_command_log(&path)
+                            .map_err(|error| super::ReadToolOutputError::Io(error.to_string()))?;
+                        let mut bytes = Vec::new();
+                        file.take(super::MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64 + 1)
+                            .read_to_end(&mut bytes)
+                            .map_err(|error| super::ReadToolOutputError::Io(error.to_string()))?;
+                        if bytes.len() as u64 != metadata.len() {
+                            return Err(super::ReadToolOutputError::Io("command log changed during search".into()));
+                        }
+                        search_snapshot = Some(bytes);
+                    }
+                    super::search_command_snapshot(search_snapshot.as_deref().unwrap_or_default(), selector.clone(),
+                        status["complete"] == true && status["bytes"].as_u64() == Some(metadata.len()), remaining)
+                };
+                let bytes = serde_json::to_vec(&selected)
+                    .map_err(|error| super::ReadToolOutputError::Io(error.to_string()))?;
+                remaining = remaining.saturating_sub(bytes.len());
+                results.push(serde_json::to_value(selected)
+                    .map_err(|error| super::ReadToolOutputError::Io(error.to_string()))?);
+                continue;
+            }
+            if matches!(selector, ToolOutputSelector::Structured { .. }) {
+                let file = File::open(&path)
+                    .map_err(|error| super::ReadToolOutputError::Io(error.to_string()))?;
+                let selected = super::structured::select(
+                    BufReader::new(file), selector.clone(),
+                    status["complete"] == true && status["bytes"].as_u64() == Some(metadata.len()),
+                    |frame| frame.value.as_ref().map_or(remaining, |value| serde_json::to_vec(value)
+                        .map_or(0, |bytes| remaining.saturating_sub(bytes.len()))),
+                );
+                // Like the snapshot owner, charge only a delivered (ok) page.
+                remaining = remaining.saturating_sub(selected.value.as_ref()
+                    .filter(|_| selected.status == super::ToolOutputSelectorStatus::Ok)
+                    .and_then(|value| serde_json::to_vec(value).ok()).map_or(0, |bytes| bytes.len()));
+                results.push(serde_json::to_value(selected)
+                    .map_err(|error| super::ReadToolOutputError::Io(error.to_string()))?);
+                continue;
+            }
             if let ToolOutputSelector::Bytes { start, end } = selector {
                 if start > end || *start > metadata.len() {
                     return Err(super::ReadToolOutputError::InvalidRange(format!(
@@ -471,7 +520,7 @@ pub(crate) async fn read_command_log(
             }
             let ToolOutputSelector::Lines { start, end } = selector else {
                 return Err(super::ReadToolOutputError::InvalidRange(
-                    "Command logs support bytes and lines selectors; source snapshots retain advanced selectors. Read bounded lines with selectors:[{kind:\"lines\",start:1,end:200}] and filter the returned text in exec for a keyword; preserve this artifact_id and do not rerun its producer.".into()));
+                    "Command logs support bytes, lines, search and structured selectors; source snapshots retain sections and JSON pointers. Preserve this artifact_id and do not rerun its producer.".into()));
             };
             if *start == 0 || end < start {
                 return Err(super::ReadToolOutputError::InvalidRange("expected 1-based start <= end".into()));

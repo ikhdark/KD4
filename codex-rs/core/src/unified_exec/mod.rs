@@ -54,6 +54,7 @@ mod async_watcher;
 mod errors;
 pub(crate) mod head_tail_buffer;
 mod process;
+pub(crate) mod process_inventory;
 mod process_manager;
 mod process_state;
 
@@ -62,6 +63,7 @@ pub(crate) use errors::UnifiedExecError;
 pub(crate) use process::ObservedSpawnLifecycle;
 pub(crate) use process::ProcessOutputSnapshot;
 pub(crate) use process::UnifiedExecProcess;
+pub(crate) use process::events::ProcessEventFilter;
 pub(crate) use process_manager::NESTED_POLL_MARGIN;
 pub(crate) use process_manager::nested_poll_bound;
 
@@ -338,8 +340,7 @@ impl ProcessStore {
         self.reserved_process_slots.remove(&process_id);
         let entry = self.processes.remove(&process_id)?;
         // A transport ID can never authorize a previous owner's completion.
-        // Successful retirement republishes this owner's result immediately;
-        // failure retirement must not leave an older same-ID replay behind.
+        // Retirement republishes this owner's result after removal.
         self.finished.retain(|(id, _)| *id != process_id);
         self.used_process_ids.insert(
             process_id,

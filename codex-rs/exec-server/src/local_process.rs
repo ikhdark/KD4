@@ -1361,6 +1361,9 @@ async fn forward_process_notifications(
     const SEND_TIMEOUT: Duration = Duration::from_secs(30);
     let mut last_seq = 0;
     let mut pending = VecDeque::new();
+    // Resume rebinds the sink. A failed delivery retires only that sink; the
+    // resumed client's recovery read replays the events it skipped.
+    let mut failed_notifications: Option<RpcNotificationSender> = None;
     loop {
         let event = if let Some(event) = pending.pop_front() {
             event
@@ -1442,7 +1445,11 @@ async fn forward_process_notifications(
         if seq.is_some_and(|seq| seq <= last_seq) { continue; }
         let terminal = matches!(event.as_ref(), ExecProcessEvent::Closed { .. } | ExecProcessEvent::Failed(_));
         let Some(owner) = inner.upgrade() else { return; };
-        let notifications = notification_sender(&owner);
+        let notifications = notification_sender(&owner).filter(|notifications| {
+            failed_notifications
+                .as_ref()
+                .is_none_or(|failed| !failed.same_channel(notifications))
+        });
         drop(owner);
         let Some(notifications) = notifications else {
             if let Some(seq) = seq { last_seq = seq; }
@@ -1472,7 +1479,7 @@ async fn forward_process_notifications(
             if !matches!(result, Ok(Ok(()))) {
                 tracing::warn!(%process_id, ?result, last_seq, replay_required = true,
                     "process notification delivery failed; retained reads remain authoritative");
-                return;
+                failed_notifications = Some(notifications);
             }
         }
         if let Some(seq) = seq { last_seq = seq; }

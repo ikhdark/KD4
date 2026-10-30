@@ -1,6 +1,9 @@
 begin_patch: "*** Begin Patch" LF
 end_patch: "*** End Patch" LF?
 
+revision_guard: "*** Guard File: " filename LF "*** Expect: " revision LF
+revision: /sha256:[0-9a-fA-F]{64}/ | "absent"
+
 hunk: add_hunk | delete_hunk | update_hunk
 add_hunk: "*** Add File: " filename LF add_line*
 delete_hunk: "*** Delete File: " filename LF

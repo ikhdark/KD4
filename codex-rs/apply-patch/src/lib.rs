@@ -21,6 +21,7 @@ use codex_exec_server::FileSystemSandboxContext;
 use codex_utils_path_uri::PathUri;
 use codex_utils_path_uri::PathUriParseError;
 pub use parser::Hunk;
+pub use parser::FileRevisionGuard;
 pub use parser::ParseError;
 use parser::ParseError::*;
 pub use parser::UpdateFileChunk;
@@ -61,6 +62,10 @@ pub enum ApplyPatchError {
     /// Error that occurs while computing replacements when applying patch chunks
     #[error("{0}")]
     ComputeReplacements(String),
+    /// A revision guard no longer matches. Retry receipts replay the same
+    /// guards, so only a fresh reconciled patch can recover.
+    #[error("{0}")]
+    RevisionGuardMismatch(String),
     /// Preflight found several independent conflicts against one source
     /// snapshot. `report` is the same aggregated text a `ComputeReplacements`
     /// failure carried before, so model-facing output is unchanged; the typed
@@ -193,6 +198,7 @@ impl PartialEq for IoError {
 pub struct ApplyPatchArgs {
     pub patch: String,
     pub hunks: Vec<Hunk>,
+    pub revision_guards: Vec<FileRevisionGuard>,
     pub workdir: Option<String>,
     pub environment_id: Option<String>,
 }
@@ -515,8 +521,8 @@ pub async fn apply_patch_with_cancellation(
     sandbox: Option<&FileSystemSandboxContext>,
     is_cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<AppliedPatchDelta, ApplyPatchFailure> {
-    let hunks = match parse_patch(patch) {
-        Ok(source) => source.hunks,
+    let args = match parse_patch(patch) {
+        Ok(source) => source,
         Err(e) => {
             match &e {
                 InvalidPatchError(message) => {
@@ -542,7 +548,9 @@ pub async fn apply_patch_with_cancellation(
         }
     };
 
-    apply_hunks_with_cancellation(&hunks, cwd, stdout, stderr, fs, sandbox, is_cancelled).await
+    apply_hunks_with_verified_action(
+        &args.hunks, &args.revision_guards, cwd, stdout, stderr, fs, sandbox, is_cancelled, None,
+    ).await
 }
 
 /// Applies hunks and continues to update stdout/stderr
@@ -566,7 +574,7 @@ async fn apply_hunks_with_cancellation(
     sandbox: Option<&FileSystemSandboxContext>,
     is_cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<AppliedPatchDelta, ApplyPatchFailure> {
-    apply_hunks_with_verified_action(hunks, cwd, stdout, stderr, fs, sandbox, is_cancelled, None).await
+    apply_hunks_with_verified_action(hunks, &[], cwd, stdout, stderr, fs, sandbox, is_cancelled, None).await
 }
 
 /// Execute the verified destructive preimages, rather than selecting a newer
@@ -582,7 +590,7 @@ pub async fn apply_verified_patch_with_cancellation(
     let args = parse_patch(&action.patch)
         .map_err(|error| ApplyPatchFailure::without_delta(error.into()))?;
     apply_hunks_with_verified_action(
-        &args.hunks, &action.cwd, stdout, stderr, fs, sandbox, is_cancelled, Some(action),
+        &args.hunks, &args.revision_guards, &action.cwd, stdout, stderr, fs, sandbox, is_cancelled, Some(action),
     ).await
 }
 
@@ -592,6 +600,7 @@ pub async fn apply_verified_patch_with_cancellation(
 )]
 async fn apply_hunks_with_verified_action(
     hunks: &[Hunk],
+    revision_guards: &[FileRevisionGuard],
     cwd: &PathUri,
     stdout: &mut impl std::io::Write,
     stderr: &mut impl std::io::Write,
@@ -610,7 +619,8 @@ async fn apply_hunks_with_verified_action(
         }
         let previous_updates =
             invocation::validate_mutation_endpoints(hunks, cwd, fs, sandbox).await?;
-        _transaction = transaction::acquire(hunks, cwd, fs, sandbox).await?;
+        _transaction = transaction::acquire(hunks, revision_guards, cwd, fs, sandbox).await?;
+        validate_revision_guards(revision_guards, cwd, fs, sandbox).await?;
         let destinations = capture_destination_preimages(hunks, cwd, fs, sandbox).await?;
         if let Some(action) = verified {
             anyhow::ensure!(destinations == action.destination_preimages,
@@ -630,7 +640,7 @@ async fn apply_hunks_with_verified_action(
             }
             ensure_rebased_updates_keep_their_sites(hunks, cwd, &previous_updates, &prepared, action)?;
         }
-        apply_hunks_to_files(hunks, cwd, fs, sandbox, &mut delta, prepared, &destinations, is_cancelled, verified.is_some()).await
+        apply_hunks_to_files(hunks, revision_guards, cwd, fs, sandbox, &mut delta, prepared, &destinations, is_cancelled, verified.is_some() || !revision_guards.is_empty()).await
     }
     .await;
     match result {
@@ -818,6 +828,7 @@ async fn rollback_committed_changes(
 )]
 async fn apply_hunks_to_files(
     hunks: &[Hunk],
+    revision_guards: &[FileRevisionGuard],
     cwd: &PathUri,
     fs: &dyn ExecutorFileSystem,
     sandbox: Option<&FileSystemSandboxContext>,
@@ -891,6 +902,10 @@ async fn apply_hunks_to_files(
         }
         prepared[index] = Some(update);
     }
+
+    // Recheck read-only dependencies and absence as well as mutation sources.
+    // Guard endpoints share the existing leases through publication/rollback.
+    validate_revision_guards(revision_guards, cwd, fs, sandbox).await?;
 
     // A failed write may truncate its destination, but failures such as Windows
     // sharing violations leave it unchanged. Reconcile the known source before
@@ -1188,6 +1203,60 @@ async fn apply_hunks_to_files(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Check exact raw-byte revisions, including files that the patch only reads.
+/// A mismatch always precedes publication; this is not CAS against external writers.
+pub(crate) async fn validate_revision_guards(
+    guards: &[FileRevisionGuard],
+    cwd: &PathUri,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
+) -> Result<(), ApplyPatchError> {
+    let mut failures = Vec::new();
+    for guard in guards {
+        let path = cwd.join(&guard.path.to_string_lossy())?;
+        let current = if guard.expected_sha256.is_some() {
+            match fs.read_file(&path, sandbox).await {
+                Ok(bytes) => Some(hex::encode(Sha256::digest(&bytes))),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(source) => return Err(ApplyPatchError::IoError(IoError {
+                    context: format!(
+                        "Failed to read revision guard {}",
+                        path.inferred_native_path_string()
+                    ),
+                    source,
+                })),
+            }
+        } else {
+            match fs.get_metadata(&path, sandbox).await {
+                Ok(_) => Some("present".to_string()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(source) => return Err(ApplyPatchError::IoError(IoError {
+                    context: format!(
+                        "Failed to inspect revision guard {}",
+                        path.inferred_native_path_string()
+                    ),
+                    source,
+                })),
+            }
+        };
+        if current != guard.expected_sha256 {
+            failures.push(format!(
+                "Revision guard failed for {}: expected {}, current {}",
+                path.inferred_native_path_string(),
+                guard.expected_sha256.as_deref().unwrap_or("absent"),
+                current.as_deref().unwrap_or("absent"),
+            ));
+        }
+    }
+    if !failures.is_empty() {
+        return Err(ApplyPatchError::RevisionGuardMismatch(format!(
+            "{}\nNo files were changed. Re-read changed guard files and reconcile the patch before submitting fresh revisions.",
+            failures.join("\n"),
+        )));
     }
     Ok(())
 }

@@ -255,6 +255,7 @@ async fn try_verify_apply_patch_args(
     let ApplyPatchArgs {
         patch,
         hunks,
+        revision_guards,
         workdir,
         ..
     } = args;
@@ -272,12 +273,14 @@ async fn try_verify_apply_patch_args(
     }
 
     let previous_updates = validate_mutation_endpoints(&hunks, &effective_cwd, fs, sandbox).await?;
+    crate::validate_revision_guards(&revision_guards, &effective_cwd, fs, sandbox).await?;
     // Preflight has already read every delete and update source and derived
     // each update, so the proposed changes reuse that snapshot.
     let prepared =
         crate::preflight_hunks(&hunks, &previous_updates, &effective_cwd, fs, sandbox).await?;
     let destination_preimages =
         crate::capture_destination_preimages(&hunks, &effective_cwd, fs, sandbox).await?;
+    crate::validate_revision_guards(&revision_guards, &effective_cwd, fs, sandbox).await?;
 
     let mut changes = HashMap::new();
     let mut updates = HashMap::new();

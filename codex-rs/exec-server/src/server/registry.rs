@@ -88,6 +88,12 @@ pub(crate) fn build_router() -> RpcRouter<ExecServerHandler> {
         },
     );
     router.request(
+        crate::protocol::LOOKUP_EXECUTABLE_METHOD,
+        |handler: Arc<ExecServerHandler>, params: crate::LookupExecutableParams| async move {
+            handler.lookup_executable(params).await
+        },
+    );
+    router.request(
         ENVIRONMENT_INFO_METHOD,
         |handler: Arc<ExecServerHandler>, _params: ()| async move { handler.environment_info() },
     );
@@ -123,6 +129,24 @@ pub(crate) fn build_router() -> RpcRouter<ExecServerHandler> {
         FS_READ_FILE_METHOD,
         |handler: Arc<ExecServerHandler>, params: FsReadFileParams| async move {
             handler.fs_read_file(params).await
+        },
+    );
+    router.request(
+        crate::protocol::FS_READ_FILE_RANGE_METHOD,
+        |handler: Arc<ExecServerHandler>, params: crate::protocol::FsReadFileRangeParams| async move {
+            handler.fs_read_file_range(params).await
+        },
+    );
+    router.request(
+        crate::protocol::FS_CHECKSUM_FILE_METHOD,
+        |handler: Arc<ExecServerHandler>, params: crate::protocol::FsChecksumFileParams| async move {
+            handler.fs_checksum_file(params).await
+        },
+    );
+    router.request(
+        crate::protocol::FS_CHECKSUM_FILE_CANCEL_METHOD,
+        |handler: Arc<ExecServerHandler>, params: crate::protocol::FsChecksumFileCancelParams| async move {
+            handler.cancel_checksum_file(&params.cancel_id)
         },
     );
     router.request(

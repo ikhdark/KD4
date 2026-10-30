@@ -25,6 +25,7 @@ Example combining operations:
 Rules:
 
 - Prefer paths relative to the selected working directory. Absolute paths are supported, subject to the same filesystem permissions.
+- For revision-bound multi-file edits, put `*** Guard File: <path>` followed by `*** Expect: sha256:<HASH>` (the whole-file `read_file` source hash) or `*** Expect: absent` before all file hunks, after any Environment ID. Guard each source, read-only dependency and move destination whose revision matters. All guards are checked before any write; a mismatch refuses the entire patch. Retained retries preserve guards; a stale guard or partially committed guarded patch requires a fresh reconciled patch, not just a hunk amendment.
 - Read the relevant current function or configuration unit before patching. Submit only the intended nonempty hunk and inspect the patch receipt before continuing. If rejected, correct the request, not the safety check.
 - Each source or move destination may occur only once per patch, including path aliases; put edits to a renamed file in its source Update File hunk. Order chunks from top to bottom.
 - Use exact current bytes on removed lines, including indentation, trailing whitespace, and Unicode punctuation. Normalization is allowed only for unchanged context, whose original bytes are preserved.

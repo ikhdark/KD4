@@ -171,12 +171,20 @@ pub(crate) async fn build_compaction_initial_context(
     // Return the rendered state with its items so history and its baseline stay identical.
     match initial_context_injection {
         InitialContextInjection::AtStart(world_state) => {
-            let (items, delivered_snapshot, fragment_digests) = sess
+            let (mut items, delivered_snapshot, fragment_digests) = sess
                 .build_initial_context_with_world_state_and_provenance(
                     turn_context,
                     world_state.as_ref(),
                 )
                 .await;
+            if let Some(inventory) = sess
+                .services
+                .unified_exec_manager
+                .compaction_process_inventory()
+                .await
+            {
+                items.push(inventory);
+            }
             (items, Some(delivered_snapshot), fragment_digests)
         }
     }
@@ -2820,6 +2828,10 @@ pub(crate) fn insert_compaction_initial_context(
     mut initial_context: Vec<ResponseItem>,
     initial_context_injection: &InitialContextInjection,
 ) -> Vec<ResponseItem> {
+    // A new owner snapshot supersedes earlier inventories, including an empty
+    // snapshot. Never retain a stale running observation beside the new one.
+    compacted_history
+        .retain(|item| !crate::unified_exec::process_inventory::is_process_inventory(item));
     if has_authoritative_task_state_context(&initial_context) {
         compacted_history.retain_mut(|item| {
             if !is_trusted_stable_context_item(item) {

@@ -512,7 +512,16 @@ fn append_matcher_groups(
             }
         };
         for handler in group.hooks.iter().cloned() {
-            let key = keys.next(&source.key_source, event_name, matcher, &handler);
+            let key = match keys.next(&source.key_source, event_name, matcher, &handler) {
+                Ok(key) => key,
+                Err(err) => {
+                    warnings.push(format!(
+                        "skipping unsupported hook in {}: {err}",
+                        source.path.display()
+                    ));
+                    continue;
+                }
+            };
             match handler {
                 HookHandlerConfig::Command {
                     command,

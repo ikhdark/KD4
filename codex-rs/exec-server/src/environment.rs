@@ -494,6 +494,20 @@ impl Environment {
         }
     }
 
+    /// Uses this environment's filesystem and process environment without launching anything.
+    pub async fn lookup_executable(
+        &self,
+        mut params: crate::LookupExecutableParams,
+    ) -> Result<crate::LookupExecutableResponse, ExecServerError> {
+        if let Some(client) = &self.remote_client {
+            params.sandbox = params.sandbox.map(crate::FileSystemSandboxContext::drop_cwd_if_unused);
+            return client.get().await?.lookup_executable(params).await;
+        }
+        crate::executable_lookup::lookup_executable(self.filesystem.as_ref(), &params)
+            .await
+            .map_err(|error| ExecServerError::Protocol(error.to_string()))
+    }
+
     pub async fn current_runtime(&self) -> Result<Option<EnvironmentRuntime>, ExecServerError> {
         match &self.remote_client {
             Some(client) => {

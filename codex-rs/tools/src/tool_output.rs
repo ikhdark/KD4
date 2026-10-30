@@ -1064,6 +1064,7 @@ fn is_essential_key(key: &str) -> bool {
             "retentionlimithit",
             "retentionlimitreason",
             "selected_test_count",
+            "search_complete",
             "sha256",
             "state",
             "state_revision",

@@ -249,11 +249,13 @@ impl EventProcessorWithHumanOutput {
                         );
                     }
                     CommandExecutionStatus::Failed => {
-                        let exit_code = exit_code.unwrap_or(1);
-                        eprintln!(
-                            "{}",
-                            format!(" exited {exit_code}{duration_suffix}:").style(self.red)
-                        );
+                        // Failures before spawn or without an observed exit carry no
+                        // code; never present an invented one.
+                        let outcome = match exit_code {
+                            Some(exit_code) => format!(" exited {exit_code}{duration_suffix}:"),
+                            None => format!(" failed without an exit code{duration_suffix}:"),
+                        };
+                        eprintln!("{}", outcome.style(self.red));
                     }
                     CommandExecutionStatus::Declined => {
                         eprintln!(

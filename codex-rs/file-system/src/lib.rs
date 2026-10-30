@@ -4,11 +4,13 @@ mod confined_file;
 mod copy_failure;
 mod directory_guard;
 mod find_up;
+mod walk_gitignore;
 
 pub use conditional_mutation::FileMutationOutcome;
 pub use conditional_mutation::guard_patch_read;
 pub use conditional_mutation::mutate_file_if_matches;
 pub use conditional_mutation::prepare_patch_capture;
+pub use conditional_mutation::prepare_patch_capture_namespace;
 pub use conditional_mutation::try_acquire_patch_capture;
 pub use confined_file::directory_case_sensitive;
 pub use confined_file::open_confined_file;
@@ -35,6 +37,7 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use futures::Stream;
 use futures::StreamExt;
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::future::Future;
@@ -46,6 +49,27 @@ use std::task::Poll;
 
 /// Maximum chunk size returned by [`ExecutorFileSystem::read_file_stream`].
 pub const FILE_READ_CHUNK_SIZE: usize = 1024 * 1024;
+/// Maximum payload of one revision-bound seek read (not a whole-file snapshot).
+pub const FILE_RANGE_MAX_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileRangeRead {
+    pub bytes: Vec<u8>,
+    pub file_bytes: u64,
+    /// Opaque opened-object identity and metadata revision, not a content hash.
+    pub revision: String,
+}
+
+/// SHA-256 of every byte of one opened regular file; no bytes are retained.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileDigest {
+    /// Lowercase hexadecimal SHA-256.
+    pub sha256: String,
+    pub file_bytes: u64,
+    /// The same opaque opened-object revision as [`FileRangeRead::revision`].
+    pub revision: String,
+}
 const MAX_WALK_DEPTH: usize = 64;
 const MAX_WALK_DIRECTORIES: usize = 10_000;
 const MAX_WALK_ENTRIES: usize = 50_000;
@@ -110,6 +134,8 @@ pub enum WalkDirectoryEntry {
     },
     /// Exceptional locators are boxed so ordinary batches retain their size.
     NativeEntry(Box<NativeWalkDirectoryEntry>),
+    /// An enumeration failure with its exact operational child identity.
+    Error { path: PathUri, message: String },
     /// Display-only detail; it must never be joined or probed as a native path.
     UnrepresentableName { escaped_name: String },
 }
@@ -130,17 +156,29 @@ impl WalkDirectoryEntry {
         match self {
             Self::Entry { file_name, .. } => file_name,
             Self::NativeEntry(entry) => &entry.file_name,
+            Self::Error { path, .. } => path.as_str(),
             Self::UnrepresentableName { escaped_name } => escaped_name,
         }
     }
 }
 
-/// Only the classification bits a walk consumes. Retaining full metadata for
-/// every entry would increase the memory cost of large bounded batches.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Classification is always retained; optional details are boxed so ordinary
+/// walks do not allocate or retain full metadata for every entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WalkEntryMetadata {
     pub is_directory: bool,
     pub is_file: bool,
+    pub is_symlink: bool,
+    pub details: Option<Box<WalkFileMetadata>>,
+}
+
+/// Cheap enumeration metadata, never content/MIME detection or target probing.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct WalkFileMetadata {
+    pub size: u64,
+    pub created_at_ms: Option<i64>,
+    pub modified_at_ms: Option<i64>,
+    pub readonly: bool,
     pub is_symlink: bool,
 }
 
@@ -150,6 +188,7 @@ impl From<FileMetadata> for WalkEntryMetadata {
             is_directory: metadata.is_directory,
             is_file: metadata.is_file,
             is_symlink: metadata.is_symlink,
+            details: None,
         }
     }
 }
@@ -168,9 +207,19 @@ pub struct WalkOptions {
     pub max_entries: usize,
     /// Whether directory symlinks should be followed.
     pub follow_directory_symlinks: bool,
+    /// Aggregate during traversal instead of retaining individual entry paths.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub summary_only: bool,
+    /// Retain cheap entry metadata from enumeration; default false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_metadata: bool,
     /// Whether directories whose names start with `.` should be returned but not traversed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub prune_hidden_directories: bool,
+    /// Apply ancestor and nested `.gitignore` files inside Git repositories only,
+    /// independently of hidden traversal.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub apply_gitignore: bool,
     #[serde(default, skip_serializing_if = "WalkFilters::is_empty")]
     pub filters: WalkFilters,
 }
@@ -178,7 +227,12 @@ pub struct WalkOptions {
 /// Case-sensitive basename wildcards, independent of platform and gitignore.
 /// `*` matches zero or more Unicode characters; `?` matches one. Everything
 /// else is literal. File filters never prune directories needed for coverage;
-/// with include patterns, directories are traversed but not returned.
+/// with include patterns, directories are traversed but not returned. Explicit
+/// path patterns are anchored to the selected root, accept `/` or `\` separators,
+/// and match case-sensitively. `*` and `?` stay within a segment; a whole-segment
+/// `**` matches zero or more segments. Other characters are literal. Include
+/// groups are unioned; either exclusion group wins. Only directory exclusions
+/// prune traversal; the selected root is never excluded.
 #[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WalkFilters {
@@ -188,27 +242,63 @@ pub struct WalkFilters {
     pub exclude: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude_directories: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_directory_paths: Vec<String>,
 }
 
 impl WalkFilters {
     pub fn is_empty(&self) -> bool {
-        self.include.is_empty() && self.exclude.is_empty() && self.exclude_directories.is_empty()
+        !self.has_file_includes()
+            && self.exclude.is_empty()
+            && self.exclude_directories.is_empty()
+            && self.exclude_paths.is_empty()
+            && self.exclude_directory_paths.is_empty()
+    }
+
+    pub fn has_file_includes(&self) -> bool {
+        !self.include.is_empty() || !self.include_paths.is_empty()
+    }
+
+    fn has_path_patterns(&self) -> bool {
+        !self.include_paths.is_empty()
+            || !self.exclude_paths.is_empty()
+            || !self.exclude_directory_paths.is_empty()
     }
 
     pub fn validate(&self) -> io::Result<()> {
-        let patterns = self
+        let basename_patterns = self
             .include
             .iter()
             .chain(&self.exclude)
             .chain(&self.exclude_directories);
-        if self.include.len() + self.exclude.len() + self.exclude_directories.len() > 64
-            || patterns.into_iter().any(|pattern| {
+        let path_patterns = self
+            .include_paths
+            .iter()
+            .chain(&self.exclude_paths)
+            .chain(&self.exclude_directory_paths);
+        if basename_patterns.clone().count() + path_patterns.clone().count() > 64
+            || basename_patterns.into_iter().any(|pattern| {
                 pattern.is_empty() || pattern.len() > 256 || pattern.contains(['/', '\\', '\0'])
+            })
+            || path_patterns.into_iter().any(|pattern| {
+                pattern.is_empty()
+                    || pattern.len() > 256
+                    || pattern.contains(['\0', ':'])
+                    || pattern.split(['/', '\\']).any(|segment| {
+                        segment.is_empty()
+                            || segment == "."
+                            || segment == ".."
+                            || (segment.contains("**") && segment != "**")
+                    })
             })
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "walk filters require at most 64 nonempty basename patterns, each at most 256 UTF-8 bytes, without path separators or NUL",
+                "walk filters require at most 64 nonempty patterns, each at most 256 UTF-8 bytes; basename patterns forbid separators and NUL; path patterns must be root-relative with / or \\ separators, no empty/dot/parent segments, colon or NUL, and ** only as a whole segment",
             ));
         }
         Ok(())
@@ -219,6 +309,9 @@ struct PreparedWalkFilters {
     include: Vec<Vec<char>>,
     exclude: Vec<Vec<char>>,
     exclude_directories: Vec<Vec<char>>,
+    include_paths: Vec<Vec<Vec<char>>>,
+    exclude_paths: Vec<Vec<Vec<char>>>,
+    exclude_directory_paths: Vec<Vec<Vec<char>>>,
 }
 
 impl PreparedWalkFilters {
@@ -229,24 +322,72 @@ impl PreparedWalkFilters {
                 .map(|pattern| pattern.chars().collect())
                 .collect()
         };
+        let prepare_paths = |patterns: &[String]| -> Vec<Vec<Vec<char>>> {
+            patterns
+                .iter()
+                .map(|pattern| {
+                    pattern
+                        .split(['/', '\\'])
+                        .map(|segment| segment.chars().collect())
+                        .collect()
+                })
+                .collect()
+        };
         Self {
             include: prepare(&filters.include),
             exclude: prepare(&filters.exclude),
             exclude_directories: prepare(&filters.exclude_directories),
+            include_paths: prepare_paths(&filters.include_paths),
+            exclude_paths: prepare_paths(&filters.exclude_paths),
+            exclude_directory_paths: prepare_paths(&filters.exclude_directory_paths),
         }
     }
 
-    fn includes_file(&self, name: &[char]) -> bool {
-        (self.include.is_empty()
+    fn includes_file(&self, name: &[char], path: &[&[char]]) -> bool {
+        ((self.include.is_empty() && self.include_paths.is_empty())
             || self
                 .include
                 .iter()
-                .any(|pattern| basename_matches(pattern, name)))
+                .any(|pattern| basename_matches(pattern, name))
+            || self
+                .include_paths
+                .iter()
+                .any(|pattern| relative_path_matches(pattern, path)))
             && !self
                 .exclude
                 .iter()
                 .any(|pattern| basename_matches(pattern, name))
+            && !self
+                .exclude_paths
+                .iter()
+                .any(|pattern| relative_path_matches(pattern, path))
     }
+}
+
+fn relative_path_matches(pattern: &[Vec<char>], path: &[&[char]]) -> bool {
+    let (mut p, mut n) = (0, 0);
+    let mut globstar = None;
+    let mut retry = 0;
+    while n < path.len() {
+        if p < pattern.len() && pattern[p].as_slice() == ['*', '*'] {
+            globstar = Some(p);
+            p += 1;
+            retry = n;
+        } else if p < pattern.len() && basename_matches(&pattern[p], path[n]) {
+            p += 1;
+            n += 1;
+        } else if let Some(index) = globstar {
+            retry += 1;
+            n = retry;
+            p = index + 1;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p].as_slice() == ['*', '*'] {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 fn basename_matches(pattern: &[char], name: &[char]) -> bool {
@@ -289,6 +430,10 @@ pub enum WalkEntryKind {
 pub struct WalkEntry {
     pub path: PathUri,
     pub kind: WalkEntryKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Box<WalkFileMetadata>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_error: Option<String>,
 }
 
 /// A descendant that could not be inspected during a walk.
@@ -309,6 +454,22 @@ pub struct WalkStop {
     pub partially_examined: bool,
 }
 
+/// Totals for eligible descendants observed during the same bounded scan.
+/// The root is excluded. Bytes are logical file sizes counted per path,
+/// not unique objects or allocated storage. Errors/cutoffs make totals partial.
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WalkSummary {
+    pub files: usize,
+    pub directories: usize,
+    pub file_bytes: u64,
+    pub entries_examined: usize,
+    pub directories_read: usize,
+    /// Observed exclusions only, not unknown descendants of skipped directories.
+    /// Inaccessible/invalid entries retain their paths in WalkOutcome::errors.
+    pub skipped: BTreeMap<String, usize>,
+}
+
 /// Entries and recoverable errors collected by a bounded walk.
 #[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -317,6 +478,19 @@ pub struct WalkOutcome {
     /// Absence from older peers must never certify strict source scope.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_follow_enforced: bool,
+    /// Older peers omit this and cannot certify gitignore-filtered scope.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gitignore_applied: bool,
+    /// Observed entries omitted by gitignore rules; an ignored directory counts
+    /// once and its contents are not examined.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub gitignored_entries: usize,
+    /// Older peers cannot silently acknowledge requested metadata.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub metadata_included: bool,
+    /// Presence acknowledges summary-only execution, including on empty trees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<WalkSummary>,
     pub entries: Vec<WalkEntry>,
     pub errors: Vec<WalkError>,
     /// Whether a traversal budget prevented inspecting all eligible descendants.
@@ -458,8 +632,10 @@ impl FileSystemReadStream {
             };
             let result = chunk.and_then(|bytes| {
                 if bytes.len() as u64 > max_bytes.saturating_sub(*current) {
-                    Err(io::Error::new(io::ErrorKind::InvalidData,
-                        format!("file exceeds the {max_bytes}-byte read limit")))
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("file exceeds the {max_bytes}-byte read limit"),
+                    ))
                 } else {
                     *current += bytes.len() as u64;
                     Ok(bytes)
@@ -548,7 +724,104 @@ pub trait ExecutorFileSystem: Send + Sync {
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
         Box::pin(async move {
             let bytes = Bytes::from(self.read_file(path, sandbox).await?);
-            Ok(FileSystemReadStream::new(futures::stream::once(std::future::ready(Ok(bytes)))))
+            Ok(FileSystemReadStream::new(futures::stream::once(
+                std::future::ready(Ok(bytes)),
+            )))
+        })
+    }
+
+    /// Read at most FILE_RANGE_MAX_BYTES at an absolute byte offset. The backend
+    /// must detect opened-object changes during the read and reject a mismatched
+    /// expected revision before returning bytes. Never emulate this by collecting
+    /// the file or by returning an unversioned stream.
+    fn read_file_range<'a>(
+        &'a self,
+        path: &'a PathUri,
+        start: u64,
+        len: usize,
+        expected_revision: Option<&'a str>,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, FileRangeRead> {
+        Box::pin(async move {
+            let _ = (path, start, len, expected_revision, sandbox);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "revision-bound byte ranges are not supported by this filesystem",
+            ))
+        })
+    }
+
+    /// Hash every byte of one opened regular file with SHA-256 in a single
+    /// backend operation. `None` means the object changed during acquisition or
+    /// the path no longer names it afterwards. Never emulate this with per-page
+    /// reads or by collecting the file.
+    fn checksum_file<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<FileDigest>> {
+        Box::pin(async move {
+            let _ = (path, sandbox);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "streaming file checksums are not supported by this filesystem",
+            ))
+        })
+    }
+
+    /// The first candidate that is a regular file (following links), in order,
+    /// spelled with its stored file-name case when the backend reports it.
+    /// Missing candidates are skipped; any other probe error stops the search.
+    /// Backends with per-operation isolation costs must override this to probe
+    /// the whole list under one policy decision.
+    fn first_regular_file<'a>(
+        &'a self,
+        candidates: &'a [PathUri],
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<PathUri>> {
+        Box::pin(async move {
+            for candidate in candidates {
+                let metadata = match self.get_metadata(candidate, sandbox).await {
+                    Ok(metadata) => metadata,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(io::Error::new(
+                            error.kind(),
+                            format!(
+                                "unable to inspect candidate {}: {error}",
+                                candidate.inferred_native_path_string()
+                            ),
+                        ));
+                    }
+                };
+                if !metadata.is_file {
+                    continue;
+                }
+                // Report git.exe rather than a PATHEXT spelling such as git.EXE.
+                // A link keeps its own name; canonicalization names its target.
+                let stored = if metadata.is_symlink {
+                    None
+                } else {
+                    self.canonicalize(candidate, sandbox)
+                        .await
+                        .ok()
+                        .and_then(|canonical| canonical.basename())
+                        .zip(candidate.basename())
+                        .filter(|(stored, requested)| {
+                            stored != requested && stored.eq_ignore_ascii_case(requested)
+                        })
+                        .and_then(|(stored, _)| candidate.parent()?.join(&stored).ok())
+                };
+                return Ok(Some(stored.unwrap_or_else(|| candidate.clone())));
+            }
+            Ok(None)
         })
     }
 
@@ -721,6 +994,7 @@ pub trait ExecutorFileSystem: Send + Sync {
         &'a self,
         path: &'a PathUri,
         max_entries: usize,
+        _include_metadata: bool,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, ReadDirectoryOutcome<WalkDirectoryEntry>> {
         Box::pin(async move {
@@ -748,10 +1022,11 @@ pub trait ExecutorFileSystem: Send + Sync {
         &'a self,
         path: &'a PathUri,
         max_entries: usize,
+        include_metadata: bool,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, ReadDirectoryOutcome<WalkDirectoryEntry>> {
         Box::pin(async move {
-            let _ = (path, max_entries, sandbox);
+            let _ = (path, max_entries, include_metadata, sandbox);
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "no-follow directory enumeration is not supported by this filesystem",
@@ -824,40 +1099,46 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
         ));
     }
 
-    let root_metadata = file_system.get_metadata(root, sandbox).await?;
-    if root_metadata.is_symlink && !options.follow_directory_symlinks {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "walk root symlink skipped by policy; root was not traversed",
-        ));
-    }
-    if !root_metadata.is_directory {
-        return Err(io::Error::new(
-            io::ErrorKind::NotADirectory,
-            "walk root is not a directory",
-        ));
-    }
-
     let root_identity = if options.follow_directory_symlinks {
+        if !file_system.get_metadata(root, sandbox).await?.is_directory {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                "walk root is not a directory",
+            ));
+        }
         file_system.canonicalize(root, sandbox).await?
     } else {
+        // The first guarded enumeration validates the root without a
+        // target-following metadata query (including a root link's target).
         root.clone()
     };
     let mut outcome = WalkOutcome {
         no_follow_enforced: !options.follow_directory_symlinks,
+        gitignore_applied: options.apply_gitignore,
+        metadata_included: options.include_metadata,
+        summary: options.summary_only.then(WalkSummary::default),
         applied_filters: (!options.filters.is_empty()).then(|| options.filters.clone()),
         ..WalkOutcome::default()
     };
-    let mut queue = VecDeque::from([(root.clone(), 0usize)]);
+    let mut gitignore = None;
+    // Retain lexical root-relative names, not canonical paths or URI spellings.
+    // A non-Unicode ancestor leaves the path unknown instead of matching its
+    // replacement label. Basename-only walks do not allocate relative paths.
+    let mut queue = VecDeque::from([(
+        root.clone(),
+        0usize,
+        options.filters.has_path_patterns().then(String::new),
+    )]);
     let mut visited_directories = HashSet::from([root_identity]);
     let mut directory_count = 1usize;
     let mut entry_count = 0usize;
     let mut response_bytes = 0usize;
+    let mut returned_entries = 0usize;
     // Include patterns ask for matching files only: directories are traversed
     // for coverage but not returned, and max_entries bounds returned matches
     // rather than misses. The hard maximum still bounds raw examination, so a
     // sparse match set cannot make the walk unbounded on a huge tree.
-    let matching_files_only = !options.filters.include.is_empty();
+    let matching_files_only = options.filters.has_file_includes();
     let (examination_limit, examination_reason) = if matching_files_only {
         (MAX_WALK_ENTRIES, "examination_limit")
     } else {
@@ -865,8 +1146,9 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
     };
     let filters = PreparedWalkFilters::new(&options.filters);
     let mut name_chars = Vec::new();
+    let mut path_chars = Vec::new();
 
-    while let Some((directory, depth)) = queue.pop_front() {
+    while let Some((directory, depth, relative_directory)) = queue.pop_front() {
         if entry_count == examination_limit {
             return Ok(finish_stopped_walk(
                 outcome,
@@ -882,17 +1164,20 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
             file_system.read_directory_bounded_for_walk(
                 &directory,
                 examination_limit - entry_count,
+                options.include_metadata || options.summary_only,
                 sandbox,
             )
         } else {
             file_system.read_directory_bounded_no_follow_for_walk(
                 &directory,
                 examination_limit - entry_count,
+                options.include_metadata || options.summary_only,
                 sandbox,
             )
         };
         let batch = match read.await {
             Ok(batch) => batch,
+            Err(error) if &directory == root => return Err(error),
             Err(error) if error.kind() == io::ErrorKind::Unsupported => return Err(error),
             Err(error) => {
                 if !push_walk_error(
@@ -914,7 +1199,55 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
                 continue;
             }
         };
+        // Do not inspect ignore files beneath an unvalidated root link.
+        if options.apply_gitignore && gitignore.is_none() {
+            gitignore = Some(walk_gitignore::WalkGitignore::new(file_system, root, sandbox).await?);
+        }
+        let ignore_rules = match &mut gitignore {
+            Some(gitignore) => {
+                // A nested repository's own listing names its `.git` marker.
+                let repository_root = batch
+                    .entries
+                    .iter()
+                    .any(|entry| entry.sort_name().eq_ignore_ascii_case(".git"));
+                // A complete listing without `.gitignore` needs no read; an
+                // entry that failed enumeration may be that file.
+                let ignore_file_possible = batch.limit_reached
+                    || batch.entries.iter().any(|entry| {
+                        matches!(entry, WalkDirectoryEntry::Error { .. })
+                            || entry.sort_name().eq_ignore_ascii_case(".gitignore")
+                    });
+                let rules = gitignore
+                    .enter_directory(
+                        file_system,
+                        &directory,
+                        repository_root,
+                        ignore_file_possible,
+                        sandbox,
+                    )
+                    .await?;
+                for (path, message) in gitignore.take_problems() {
+                    if !push_walk_diagnostic(&mut outcome, &mut response_bytes, path, message) {
+                        return Ok(finish_stopped_walk(
+                            outcome,
+                            root,
+                            queue,
+                            directory,
+                            false,
+                            "response_bytes",
+                            MAX_WALK_RESPONSE_BYTES,
+                        ));
+                    }
+                }
+                rules
+            }
+            None => None,
+        };
         entry_count += batch.entries_examined;
+        if let Some(summary) = &mut outcome.summary {
+            summary.entries_examined = entry_count;
+            summary.directories_read += 1;
+        }
         if batch.limit_reached {
             record_walk_stop(
                 &mut outcome,
@@ -928,6 +1261,7 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
         let mut entries = batch.entries;
         entries.sort_by(|left, right| left.sort_name().cmp(right.sort_name()));
 
+        let no_follow = !options.follow_directory_symlinks;
         let mut probes = futures::stream::iter(entries)
             .map(|entry| {
                 let directory = &directory;
@@ -946,6 +1280,9 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
                                     metadata,
                                 } = *entry;
                                 (file_name, name_is_lossless, metadata, Some(path))
+                            }
+                            WalkDirectoryEntry::Error { path, message } => {
+                                return (String::new(), false, Ok((path, Err(io::Error::other(message)))));
                             }
                             WalkDirectoryEntry::UnrepresentableName { escaped_name } => {
                                 return (
@@ -970,6 +1307,7 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
                         Ok(path) => {
                             let metadata = match retained_metadata.take() {
                                 Some(metadata) => Ok(metadata),
+                                None if no_follow => Err(io::Error::other("entry classification unavailable from no-follow enumeration; no target probe performed")),
                                 None => file_system
                                     .get_metadata(&path, sandbox)
                                     .await
@@ -1024,6 +1362,7 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
                 }
             };
             if metadata.is_symlink && metadata.is_directory && !options.follow_directory_symlinks {
+                record_walk_skip(&mut outcome, "directory_symlink");
                 continue;
             }
 
@@ -1032,6 +1371,7 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
             } else if metadata.is_file {
                 WalkEntryKind::File
             } else {
+                record_walk_skip(&mut outcome, "non_file_or_directory");
                 continue;
             };
             // File filters cannot prune directories needed for coverage. Only
@@ -1039,11 +1379,34 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
             // match; never apply a Unicode pattern to its replacement label.
             let needs_text_match = match kind {
                 WalkEntryKind::File => {
-                    !options.filters.include.is_empty() || !options.filters.exclude.is_empty()
+                    options.filters.has_file_includes()
+                        || !options.filters.exclude.is_empty()
+                        || !options.filters.exclude_paths.is_empty()
                 }
-                WalkEntryKind::Directory => !options.filters.exclude_directories.is_empty(),
+                WalkEntryKind::Directory => {
+                    !options.filters.exclude_directories.is_empty()
+                        || !options.filters.exclude_directory_paths.is_empty()
+                }
             };
-            if !name_is_lossless && needs_text_match {
+            let relative_path = relative_directory.as_ref().and_then(|parent| {
+                name_is_lossless.then(|| {
+                    if parent.is_empty() {
+                        file_name.clone()
+                    } else {
+                        format!("{parent}/{file_name}")
+                    }
+                })
+            });
+            let needs_path_match = match kind {
+                WalkEntryKind::File => {
+                    !options.filters.include_paths.is_empty()
+                        || !options.filters.exclude_paths.is_empty()
+                }
+                WalkEntryKind::Directory => !options.filters.exclude_directory_paths.is_empty(),
+            };
+            if (!name_is_lossless && (needs_text_match || options.apply_gitignore))
+                || (needs_path_match && relative_path.is_none())
+            {
                 let message = format!("cannot apply text filters to native entry {path}");
                 if !push_walk_error(&mut outcome, &mut response_bytes, path, message) {
                     return Ok(finish_stopped_walk(
@@ -1058,16 +1421,40 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
                 }
                 continue;
             }
+            if ignore_rules
+                .as_ref()
+                .is_some_and(|rules| rules.is_ignored(&path, kind == WalkEntryKind::Directory))
+            {
+                outcome.gitignored_entries += 1;
+                record_walk_skip(&mut outcome, "gitignored");
+                continue;
+            }
             if needs_text_match {
                 name_chars.clear();
                 name_chars.extend(file_name.chars());
-                if (kind == WalkEntryKind::File && !filters.includes_file(&name_chars))
+                path_chars.clear();
+                if needs_path_match && let Some(relative_path) = &relative_path {
+                    path_chars.extend(relative_path.chars());
+                }
+                let path_segments = if needs_path_match {
+                    path_chars.split(|c| *c == '/').collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                if (kind == WalkEntryKind::File
+                    && !filters.includes_file(&name_chars, &path_segments))
                     || (kind == WalkEntryKind::Directory
                         && filters
                             .exclude_directories
                             .iter()
                             .any(|pattern| basename_matches(pattern, &name_chars)))
+                    || (kind == WalkEntryKind::Directory
+                        && filters
+                            .exclude_directory_paths
+                            .iter()
+                            .any(|pattern| relative_path_matches(pattern, &path_segments)))
                 {
+                    record_walk_skip(&mut outcome, "pattern_filter");
                     continue;
                 }
             }
@@ -1076,7 +1463,7 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
             if kind == WalkEntryKind::File || !matching_files_only {
                 // Misses never reach this budget. Stop at the first match it
                 // cannot hold, leaving this directory partially examined.
-                if matching_files_only && outcome.entries.len() == options.max_entries {
+                if matching_files_only && returned_entries == options.max_entries {
                     return Ok(finish_stopped_walk(
                         outcome,
                         root,
@@ -1087,11 +1474,58 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
                         options.max_entries,
                     ));
                 }
-                if !reserve_walk_response_bytes(
-                    &mut outcome,
-                    &mut response_bytes,
-                    path.as_str().len(),
-                ) {
+                if let Some(summary) = &mut outcome.summary
+                    && kind == WalkEntryKind::File
+                {
+                    summary.files += 1;
+                    if let Some(details) = &metadata.details {
+                        summary.file_bytes = summary
+                            .file_bytes
+                            .checked_add(details.size)
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "aggregate file byte total exceeds u64",
+                                )
+                            })?;
+                    } else if !push_walk_diagnostic(
+                        &mut outcome,
+                        &mut response_bytes,
+                        path.clone(),
+                        "file size unavailable from enumeration; byte total is partial".into(),
+                    ) {
+                        return Ok(finish_stopped_walk(
+                            outcome,
+                            root,
+                            queue,
+                            directory.clone(),
+                            true,
+                            "response_bytes",
+                            MAX_WALK_RESPONSE_BYTES,
+                        ));
+                    }
+                }
+                returned_entries += 1;
+                let details = if options.include_metadata {
+                    metadata.details
+                } else {
+                    None
+                };
+                let metadata_error = (options.include_metadata
+                    && !options.summary_only
+                    && details.is_none())
+                .then(|| {
+                    "entry metadata unavailable from enumeration; no additional probe performed"
+                        .to_string()
+                });
+                if let Some(message) = &metadata_error
+                    && !push_walk_diagnostic(
+                        &mut outcome,
+                        &mut response_bytes,
+                        path.clone(),
+                        message.clone(),
+                    )
+                {
                     return Ok(finish_stopped_walk(
                         outcome,
                         root,
@@ -1102,14 +1536,42 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
                         MAX_WALK_RESPONSE_BYTES,
                     ));
                 }
-                outcome.entries.push(WalkEntry {
-                    path: path.clone(),
-                    kind,
-                });
+                // Fixed numeric/bool fields and bounded diagnostic text. Include
+                // their maximum serialized extent in the existing response budget.
+                let metadata_bytes = if options.include_metadata { 320 } else { 0 };
+                if !options.summary_only
+                    && !reserve_walk_response_bytes(
+                        &mut outcome,
+                        &mut response_bytes,
+                        path.as_str().len().saturating_add(metadata_bytes),
+                    )
+                {
+                    return Ok(finish_stopped_walk(
+                        outcome,
+                        root,
+                        queue,
+                        directory.clone(),
+                        true,
+                        "response_bytes",
+                        MAX_WALK_RESPONSE_BYTES,
+                    ));
+                }
+                if !options.summary_only {
+                    outcome.entries.push(WalkEntry {
+                        path: path.clone(),
+                        kind,
+                        metadata: details,
+                        metadata_error,
+                    });
+                }
             }
 
             if kind == WalkEntryKind::Directory {
+                if let Some(summary) = &mut outcome.summary {
+                    summary.directories += 1;
+                }
                 if options.prune_hidden_directories && file_name.starts_with('.') {
+                    record_walk_skip(&mut outcome, "hidden_directory_subtree");
                     continue;
                 }
                 let directory_identity = if options.follow_directory_symlinks {
@@ -1139,6 +1601,7 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
                     path.clone()
                 };
                 if !visited_directories.insert(directory_identity) {
+                    record_walk_skip(&mut outcome, "duplicate_directory_subtree");
                     continue;
                 }
                 if depth == options.max_depth || directory_count == options.max_directories {
@@ -1150,13 +1613,24 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
                     record_walk_stop(&mut outcome, root, path, false, reason, limit);
                 } else {
                     directory_count += 1;
-                    queue.push_back((path, depth + 1));
+                    queue.push_back((path, depth + 1, relative_path));
                 }
             }
         }
     }
 
     Ok(outcome)
+}
+
+fn record_walk_skip(outcome: &mut WalkOutcome, reason: &str) {
+    if let Some(summary) = &mut outcome.summary {
+        *summary.skipped.entry(reason.into()).or_default() += 1;
+    }
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 fn record_walk_stop(
@@ -1191,7 +1665,7 @@ fn record_walk_stop(
 fn finish_stopped_walk(
     mut outcome: WalkOutcome,
     root: &PathUri,
-    queue: VecDeque<(PathUri, usize)>,
+    queue: VecDeque<(PathUri, usize, Option<String>)>,
     directory: PathUri,
     partially_examined: bool,
     reason: &str,
@@ -1205,13 +1679,26 @@ fn finish_stopped_walk(
         reason,
         limit,
     );
-    for (path, _) in queue {
+    for (path, _, _) in queue {
         record_walk_stop(&mut outcome, root, path, false, reason, limit);
     }
     outcome
 }
 
+/// An entry or subtree that was skipped because it could not be inspected.
 fn push_walk_error(
+    outcome: &mut WalkOutcome,
+    response_bytes: &mut usize,
+    path: PathUri,
+    message: String,
+) -> bool {
+    record_walk_skip(outcome, "inaccessible_or_invalid");
+    push_walk_diagnostic(outcome, response_bytes, path, message)
+}
+
+/// A per-path error that skips no entry (e.g. one still counted or returned,
+/// or an ignore file whose rules were not applied).
+fn push_walk_diagnostic(
     outcome: &mut WalkOutcome,
     response_bytes: &mut usize,
     path: PathUri,

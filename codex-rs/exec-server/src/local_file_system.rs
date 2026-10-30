@@ -278,6 +278,43 @@ impl LocalFileSystem {
 }
 
 impl ExecutorFileSystem for LocalFileSystem {
+    fn read_file_range<'a>(
+        &'a self,
+        path: &'a PathUri,
+        start: u64,
+        len: usize,
+        expected_revision: Option<&'a str>,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, codex_file_system::FileRangeRead> {
+        Box::pin(async move {
+            let (fs, sandbox) = self.file_system_for(sandbox)?;
+            fs.read_file_range(path, start, len, expected_revision, sandbox)
+                .await
+        })
+    }
+
+    fn checksum_file<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<codex_file_system::FileDigest>> {
+        Box::pin(async move {
+            let (fs, sandbox) = self.file_system_for(sandbox)?;
+            fs.checksum_file(path, sandbox).await
+        })
+    }
+
+    fn first_regular_file<'a>(
+        &'a self,
+        candidates: &'a [PathUri],
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<PathUri>> {
+        Box::pin(async move {
+            let (fs, sandbox) = self.file_system_for(sandbox)?;
+            fs.first_regular_file(candidates, sandbox).await
+        })
+    }
+
     fn mutate_file_if_matches<'a>(
         &'a self,
         path: &'a PathUri,
@@ -618,6 +655,33 @@ impl UnsandboxedFileSystem {
 }
 
 impl ExecutorFileSystem for UnsandboxedFileSystem {
+    fn read_file_range<'a>(
+        &'a self,
+        path: &'a PathUri,
+        start: u64,
+        len: usize,
+        expected_revision: Option<&'a str>,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, codex_file_system::FileRangeRead> {
+        Box::pin(async move {
+            reject_platform_sandbox_context(sandbox)?;
+            self.file_system
+                .read_file_range(path, start, len, expected_revision, None)
+                .await
+        })
+    }
+
+    fn checksum_file<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<codex_file_system::FileDigest>> {
+        Box::pin(async move {
+            reject_platform_sandbox_context(sandbox)?;
+            self.file_system.checksum_file(path, None).await
+        })
+    }
+
     fn mutate_file_if_matches<'a>(
         &'a self,
         path: &'a PathUri,
@@ -991,7 +1055,7 @@ impl DirectFileSystem {
         reject_sandbox_context(sandbox)?;
         let path = path.to_abs_path()?;
         run_cancellable_file_system_task(move |cancel| {
-            read_directory_sync(path.as_path(), None, &cancel, directory_entry)
+            read_directory_sync(path.as_path(), None, &cancel, true, directory_entry)
         })
         .await
         .map(|outcome| outcome.entries)
@@ -1012,7 +1076,13 @@ impl DirectFileSystem {
         }
         let path = path.to_abs_path()?;
         run_cancellable_file_system_task(move |cancel| {
-            read_directory_sync(path.as_path(), Some(max_entries), &cancel, directory_entry)
+            read_directory_sync(
+                path.as_path(),
+                Some(max_entries),
+                &cancel,
+                true,
+                directory_entry,
+            )
         })
         .await
     }
@@ -1083,6 +1153,48 @@ impl DirectFileSystem {
 }
 
 impl ExecutorFileSystem for DirectFileSystem {
+    fn read_file_range<'a>(
+        &'a self,
+        path: &'a PathUri,
+        start: u64,
+        len: usize,
+        expected_revision: Option<&'a str>,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, codex_file_system::FileRangeRead> {
+        Box::pin(async move {
+            reject_sandbox_context(sandbox)?;
+            if !(1..=codex_file_system::FILE_RANGE_MAX_BYTES).contains(&len)
+                || start.checked_add(len as u64).is_none()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid byte range length or offset",
+                ));
+            }
+            let path = path.to_abs_path()?;
+            let expected = expected_revision.map(str::to_owned);
+            run_cancellable_file_system_task(move |cancel| {
+                read_file_range_sync(path.as_path(), start, len, expected.as_deref(), &cancel)
+            })
+            .await
+        })
+    }
+
+    fn checksum_file<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<codex_file_system::FileDigest>> {
+        Box::pin(async move {
+            reject_sandbox_context(sandbox)?;
+            let path = path.to_abs_path()?;
+            run_cancellable_file_system_task(move |cancel| {
+                checksum_file_sync(path.as_path(), &cancel)
+            })
+            .await
+        })
+    }
+
     fn mutate_file_if_matches<'a>(
         &'a self,
         path: &'a PathUri,
@@ -1223,8 +1335,10 @@ impl ExecutorFileSystem for DirectFileSystem {
             if file.metadata().await?.len() > MAX_READ_FILE_BYTES {
                 return Err(file_too_large_error(MAX_READ_FILE_BYTES));
             }
-            Ok(FileSystemReadStream::new(ReaderStream::with_capacity(file, FILE_READ_CHUNK_SIZE))
-                .with_limit(MAX_READ_FILE_BYTES))
+            Ok(
+                FileSystemReadStream::new(ReaderStream::with_capacity(file, FILE_READ_CHUNK_SIZE))
+                    .with_limit(MAX_READ_FILE_BYTES),
+            )
         })
     }
 
@@ -1282,18 +1396,20 @@ impl ExecutorFileSystem for DirectFileSystem {
         &'a self,
         path: &'a PathUri,
         max_entries: usize,
+        include_metadata: bool,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, ReadDirectoryOutcome<WalkDirectoryEntry>> {
-        read_directory_for_walk(path, max_entries, sandbox, false)
+        read_directory_for_walk(path, max_entries, include_metadata, sandbox, false)
     }
 
     fn read_directory_bounded_no_follow_for_walk<'a>(
         &'a self,
         path: &'a PathUri,
         max_entries: usize,
+        include_metadata: bool,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, ReadDirectoryOutcome<WalkDirectoryEntry>> {
-        read_directory_for_walk(path, max_entries, sandbox, true)
+        read_directory_for_walk(path, max_entries, include_metadata, sandbox, true)
     }
 
     fn remove<'a>(
@@ -1320,6 +1436,164 @@ impl ExecutorFileSystem for DirectFileSystem {
             sandbox,
         ))
     }
+}
+
+/// No persistent handles or retained file bytes: each page reopens under its
+/// caller's policy, compares the revision, and reads only the bounded range.
+/// Default sharing never blocks other processes' writers or deleters, so a
+/// page counts only when two reads agree and the handle revision is unchanged:
+/// NTFS write/change times have clock-tick granularity, and a same-tick
+/// in-place write leaves size and times unchanged. A later page's reopen
+/// refuses a replacement.
+fn read_file_range_sync(
+    path: &Path,
+    start: u64,
+    len: usize,
+    expected: Option<&str>,
+    cancel: &CancellationToken,
+) -> io::Result<codex_file_system::FileRangeRead> {
+    check_file_system_cancelled(cancel)?;
+    let (file, metadata) = regular_file::open_sync(path)?;
+    let revision = file_range_revision(&file, &metadata)?;
+    if expected.is_some_and(|expected| expected != revision) {
+        return Err(io::Error::other(
+            "file revision changed between byte-range pages; discard the old continuation and start a new read",
+        ));
+    }
+    if start > metadata.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "byte range starts past end of file",
+        ));
+    }
+    let read_len = (metadata.len() - start).min(len as u64) as usize;
+    let mut bytes = vec![0u8; read_len];
+    let mut check = vec![0u8; read_len];
+    let read = read_full_at(&file, start, &mut bytes)?;
+    // A concurrent truncation can end either read early; that is a change.
+    let agreed =
+        read == read_len && read_full_at(&file, start, &mut check)? == read_len && bytes == check;
+    check_file_system_cancelled(cancel)?;
+    if !agreed || revision != file_range_revision(&file, &file.metadata()?)? {
+        return Err(io::Error::other(
+            "file changed during byte-range acquisition",
+        ));
+    }
+    Ok(codex_file_system::FileRangeRead {
+        bytes,
+        file_bytes: metadata.len(),
+        revision,
+    })
+}
+
+/// Fill `buffer` from `offset`, stopping early only at end of file.
+fn read_full_at(file: &std::fs::File, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+
+    let mut filled = 0;
+    while filled < buffer.len() {
+        let read = file.seek_read(&mut buffer[filled..], offset + filled as u64)?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    Ok(filled)
+}
+
+/// One open, one pass, no retained bytes. Each chunk is hashed only when two
+/// reads agree (as for range pages); the handle revision is compared before
+/// and after, then the path is reopened so a replacement or deletion during
+/// the pass is refused. `None` reports a change.
+fn checksum_file_sync(
+    path: &Path,
+    cancel: &CancellationToken,
+) -> io::Result<Option<codex_file_system::FileDigest>> {
+    use sha2::Digest as _;
+    use std::fmt::Write as _;
+
+    check_file_system_cancelled(cancel)?;
+    let (file, metadata) = regular_file::open_sync(path)?;
+    let revision = file_range_revision(&file, &metadata)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = vec![0u8; FILE_READ_CHUNK_SIZE];
+    let mut check = vec![0u8; FILE_READ_CHUNK_SIZE];
+    let mut file_bytes = 0u64;
+    loop {
+        check_file_system_cancelled(cancel)?;
+        let read = read_full_at(&file, file_bytes, &mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        if read_full_at(&file, file_bytes, &mut check[..read])? != read
+            || buffer[..read] != check[..read]
+        {
+            return Ok(None);
+        }
+        file_bytes += read as u64;
+        if file_bytes > metadata.len() {
+            return Ok(None);
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if file_bytes != metadata.len() || revision != file_range_revision(&file, &file.metadata()?)? {
+        return Ok(None);
+    }
+    match regular_file::open_sync(path) {
+        Ok((current, current_metadata)) => {
+            if revision != file_range_revision(&current, &current_metadata)? {
+                return Ok(None);
+            }
+        }
+        Err(error) if is_changed_file_race_error(error.kind()) => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let sha256 = hasher
+        .finalize()
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        });
+    Ok(Some(codex_file_system::FileDigest {
+        sha256,
+        file_bytes,
+        revision,
+    }))
+}
+
+fn file_range_revision(file: &std::fs::File, metadata: &std::fs::Metadata) -> io::Result<String> {
+    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
+    };
+    let identity = native_file_identity(file, metadata)?;
+    let mut basic = std::mem::MaybeUninit::<FILE_BASIC_INFO>::uninit();
+    // SAFETY: the live file handle and correctly sized output remain valid.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as _,
+            FileBasicInfo,
+            basic.as_mut_ptr().cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful call initialized the output.
+    let basic = unsafe { basic.assume_init() };
+    Ok(format!(
+        "v1:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
+        identity.volume_serial_number,
+        identity.file_index,
+        metadata.len(),
+        metadata.creation_time(),
+        metadata.last_write_time(),
+        basic.ChangeTime,
+        basic.FileAttributes
+    ))
 }
 
 struct NativeFileState {
@@ -1635,6 +1909,7 @@ fn directory_entry(
     name: std::ffi::OsString,
     metadata: Option<&std::fs::Metadata>,
     _is_symlink: Option<bool>,
+    _error: Option<&io::Error>,
 ) -> io::Result<Option<ReadDirectoryEntry>> {
     // A display approximation must never become another entry's identity.
     let file_name = name.into_string().map_err(|name| {
@@ -1656,6 +1931,7 @@ fn directory_entry(
 fn read_directory_for_walk<'a>(
     path: &'a PathUri,
     max_entries: usize,
+    include_metadata: bool,
     sandbox: Option<&'a FileSystemSandboxContext>,
     no_follow: bool,
 ) -> ExecutorFileSystemFuture<'a, ReadDirectoryOutcome<WalkDirectoryEntry>> {
@@ -1674,7 +1950,8 @@ fn read_directory_for_walk<'a>(
         let path = path.to_abs_path()?;
         run_cancellable_file_system_task(move |cancel| {
             let _directories = if no_follow {
-                codex_file_system::lock_directory_chain(path.as_path())?
+                codex_file_system::lock_directory_chain(path.as_path())
+                    .map_err(|error| refused_walk_directory_error(path.as_path(), error))?
             } else {
                 Vec::new()
             };
@@ -1682,15 +1959,58 @@ fn read_directory_for_walk<'a>(
                 path.as_path(),
                 Some(max_entries),
                 &cancel,
-                |name, metadata, is_symlink| {
-                    let file_name = name.to_str();
-                    let snapshot = metadata.and_then(|metadata| {
-                        is_symlink.map(|is_symlink| WalkEntryMetadata {
-                            is_directory: metadata.is_dir(),
-                            is_file: metadata.is_file(),
-                            is_symlink,
-                        })
+                !no_follow,
+                |name, metadata, is_symlink, error| {
+                    use std::os::windows::fs::FileTypeExt;
+                    // A followed link whose target is absent is neither a file
+                    // nor a directory, so the walker skips it as it always has;
+                    // other failures keep their exact path.
+                    let absent_target = !no_follow
+                        && is_symlink == Some(true)
+                        && error.is_some_and(|error| error.kind() == io::ErrorKind::NotFound);
+                    let snapshot = Some(match metadata {
+                        Some(metadata) => {
+                            let is_symlink = is_symlink.unwrap_or_else(|| metadata.is_symlink());
+                            WalkEntryMetadata {
+                                is_directory: metadata.is_dir()
+                                    || metadata.file_type().is_symlink_dir(),
+                                is_file: metadata.is_file()
+                                    || metadata.file_type().is_symlink_file(),
+                                is_symlink,
+                                details: include_metadata.then(|| {
+                                    Box::new(codex_file_system::WalkFileMetadata {
+                                        size: metadata.len(),
+                                        created_at_ms: metadata
+                                            .created()
+                                            .ok()
+                                            .map(system_time_to_unix_ms),
+                                        modified_at_ms: metadata
+                                            .modified()
+                                            .ok()
+                                            .map(system_time_to_unix_ms),
+                                        readonly: metadata.permissions().readonly(),
+                                        is_symlink,
+                                    })
+                                }),
+                            }
+                        }
+                        None if absent_target => WalkEntryMetadata {
+                            is_directory: false,
+                            is_file: false,
+                            is_symlink: true,
+                            details: None,
+                        },
+                        None => {
+                            return Ok(Some(WalkDirectoryEntry::Error {
+                                path: PathUri::from_host_native_path(path.as_path().join(&name))?,
+                                message: error.map_or_else(
+                                    || "entry metadata unavailable".into(),
+                                    ToString::to_string,
+                                ),
+                            }));
+                        }
                     });
+                    let file_name = name.to_str();
                     let Some(unicode_name) = file_name.filter(|_| !native_children) else {
                         let entry = codex_file_system::NativeWalkDirectoryEntry {
                             path: PathUri::from_host_native_path(path.as_path().join(&name))?,
@@ -1700,8 +2020,6 @@ fn read_directory_for_walk<'a>(
                         };
                         return Ok(Some(WalkDirectoryEntry::NativeEntry(Box::new(entry))));
                     };
-                    // Keep failed metadata observations addressable. The
-                    // walker's existing fallback reports their per-path error.
                     Ok(Some(WalkDirectoryEntry::Entry {
                         file_name: unicode_name.to_owned(),
                         metadata: snapshot,
@@ -1713,14 +2031,40 @@ fn read_directory_for_walk<'a>(
     })
 }
 
+/// The no-follow guard refuses links and non-directories as PermissionDenied,
+/// which reads like a sandbox denial. Classify a refused directory itself with
+/// a query that does not follow it; ancestor and access failures are unchanged.
+fn refused_walk_directory_error(path: &Path, error: io::Error) -> io::Error {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    if error.kind() != io::ErrorKind::PermissionDenied {
+        return error;
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 => {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path is a symlink or reparse point; links are not followed or listed",
+            )
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            io::Error::new(io::ErrorKind::NotADirectory, "path is not a directory")
+        }
+        _ => error,
+    }
+}
+
 fn read_directory_sync<T>(
     path: &Path,
     max_entries: Option<usize>,
     cancel: &CancellationToken,
+    follow_symlinks: bool,
     mut classify: impl FnMut(
         std::ffi::OsString,
         Option<&std::fs::Metadata>,
         Option<bool>,
+        Option<&io::Error>,
     ) -> io::Result<Option<T>>,
 ) -> io::Result<ReadDirectoryOutcome<T>> {
     check_file_system_cancelled(cancel)?;
@@ -1738,18 +2082,22 @@ fn read_directory_sync<T>(
         };
         let entry = entry?;
         entries_examined += 1;
-        // Enumeration already describes an entry that is not a link. Links
-        // follow their target. Legacy directory reads omit unavailable targets;
-        // walks retain their names so a failed metadata probe remains observable.
+        // Windows DirEntry metadata describes the link itself. Only legacy or
+        // explicitly following consumers may query a link's target.
         let is_symlink = entry
             .file_type()
             .ok()
             .map(|file_type| file_type.is_symlink());
-        let metadata = match is_symlink {
-            Some(false) => entry.metadata(),
-            _ => std::fs::metadata(entry.path()),
+        let metadata = match (follow_symlinks, is_symlink) {
+            (true, Some(true) | None) => std::fs::metadata(entry.path()),
+            _ => entry.metadata(),
         };
-        if let Some(entry) = classify(entry.file_name(), metadata.as_ref().ok(), is_symlink)? {
+        if let Some(entry) = classify(
+            entry.file_name(),
+            metadata.as_ref().ok(),
+            is_symlink,
+            metadata.as_ref().err(),
+        )? {
             entries.push(entry);
         }
     }
@@ -1897,8 +2245,3 @@ fn system_time_to_unix_ms(time: SystemTime) -> i64 {
     };
     millis.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
-
-
-
-
-

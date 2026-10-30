@@ -163,6 +163,15 @@ impl StepContext {
         self.mcp_tool_snapshot().await.tools.as_ref()
     }
 
+    pub(crate) fn mcp_discovery_complete(&self) -> bool {
+        self.mcp.manager().managed_auth_scope_is_current()
+            && self.mcp_tool_snapshot.get().is_some_and(|snapshot| {
+                !snapshot.temporarily_unavailable
+                    && snapshot.pending_servers.is_empty()
+                    && snapshot.failed_servers.is_empty()
+            })
+    }
+
     pub(crate) fn set_tool_router(
         &self,
         tool_router: Arc<ToolRouter>,

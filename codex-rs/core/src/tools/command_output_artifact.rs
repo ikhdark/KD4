@@ -1,6 +1,12 @@
 #[path = "raw_output_artifact_task.rs"]
 pub(crate) mod capture;
 
+#[path = "artifact_comparison.rs"]
+pub(crate) mod comparison;
+
+#[path = "structured_extraction.rs"]
+pub(crate) mod structured;
+
 #[cfg(windows)]
 #[path = "artifact_snapshot_cache.rs"]
 mod immutable_snapshot_cache;
@@ -80,6 +86,8 @@ pub(crate) const ARTIFACT_SEARCH_DEFAULT_MAX_RESULTS: usize = 20;
 pub(crate) const ARTIFACT_SEARCH_MAX_RESULTS: usize = 100;
 pub(crate) const ARTIFACT_SEARCH_MAX_CONTEXT_LINES: usize = 20;
 pub(crate) const ARTIFACT_SEARCH_MAX_QUERY_BYTES: usize = 1_024;
+pub(crate) const ARTIFACT_REGEX_MAX_SEARCH_BYTES: usize = 1024 * 1024;
+const ARTIFACT_REGEX_SIZE_LIMIT: usize = 1024 * 1024;
 const LOGICAL_ARTIFACT_METADATA_VERSION: u8 = 1;
 
 
@@ -105,8 +113,26 @@ pub(crate) enum ToolOutputSelector {
     JsonPointer {
         pointer: String,
     },
+    Structured {
+        format: structured::Format,
+        #[serde(default)]
+        fields: Vec<String>,
+        #[serde(default)]
+        filters: Vec<structured::Filter>,
+        #[serde(default = "structured::default_start_row")]
+        start_row: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end_row: Option<usize>,
+        #[serde(default = "structured::default_max_rows")]
+        max_rows: usize,
+        malformed_rows: structured::MalformedRows,
+        #[serde(default)]
+        pointer: String,
+    },
     Search {
         query: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        regex: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         enclosing: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -123,6 +149,10 @@ pub(crate) enum ToolOutputSelector {
 impl ToolOutputSelector {
     pub(crate) fn is_search(&self) -> bool {
         matches!(self, Self::Search { .. })
+    }
+
+    pub(crate) fn is_paged(&self) -> bool {
+        matches!(self, Self::Search { .. } | Self::Structured { .. })
     }
 }
 
@@ -317,6 +347,7 @@ impl ReadToolOutputResult {
                 // successful negative searches. JSON selections retain their location.
                 if let ToolOutputSelector::Search {
                     query,
+                    regex,
                     case_insensitive,
                     start_byte,
                     ..
@@ -328,7 +359,7 @@ impl ReadToolOutputResult {
                             .map(|(key, value)| (key.clone(), value.clone())).collect())
                     });
                     values.push(serde_json::json!({
-                        "matching": {"query": query, "case_insensitive": case_insensitive, "start_byte": start_byte},
+                        "matching": {"query": query, "regex": regex, "case_insensitive": case_insensitive, "start_byte": start_byte},
                         "value": proof,
                     }));
                 } else {
@@ -5735,7 +5766,7 @@ fn selector_range(
         ToolOutputSelector::Section { id } => metadata.sections.iter()
             .find(|section| section.id == *id).map(|section| section.canonical_range)
             .ok_or(ToolOutputSelectorStatus::NotFound),
-        ToolOutputSelector::Search { .. } => Err(ToolOutputSelectorStatus::Invalid),
+        ToolOutputSelector::Search { .. } | ToolOutputSelector::Structured { .. } => Err(ToolOutputSelectorStatus::Invalid),
     }
 }
 
@@ -5785,7 +5816,7 @@ fn normalized_selector_order_key(
                 ToolOutputSelector::Lines { .. } => 1,
                 ToolOutputSelector::Section { .. } => 2,
                 ToolOutputSelector::JsonPointer { .. } => 3,
-                ToolOutputSelector::Search { .. } => unreachable!(),
+                ToolOutputSelector::Search { .. } | ToolOutputSelector::Structured { .. } => unreachable!(),
             };
             (range.start, range.end, kind, serialized)
         }
@@ -5819,6 +5850,7 @@ fn merged_selector_still_completes(
         final_token_ceiling,
         &[],
         None,
+        usize::MAX,
     );
     match selected.status {
         ToolOutputSelectorStatus::Ok => true,
@@ -6148,6 +6180,27 @@ fn remember_search_count(key: AuthenticatedSearchCountKey, count: usize) {
     while cache.len() > 128 { cache.pop_front(); }
 }
 
+// Reuse the exact matcher, coordinates, hydration and pagination for plain logs.
+// The caller bounds and pins this one observation; its legacy status is not an
+// authenticated producer receipt, so it must not enter the count cache.
+pub(super) fn search_command_snapshot(
+    snapshot: &[u8],
+    selector: ToolOutputSelector,
+    capture_complete: bool,
+    max_bytes: usize,
+) -> ToolOutputSelectorResult {
+    let metadata = LogicalArtifactMetadata {
+        version: 0, artifact_id: String::new(),
+        canonical_kind: CanonicalToolResultKind::Bytes,
+        canonical_sha256: String::new(), retained_sha256: None,
+        canonical_bytes: snapshot.len() as u64, retained_bytes: snapshot.len() as u64,
+        capture_complete, complete: true, unavailable_ranges: Vec::new(),
+        json_pointers: BTreeMap::new(), sections: Vec::new(),
+        line_starts: canonical_line_starts(snapshot).unwrap_or_default(), segments: Vec::new(),
+    };
+    search_logical_artifact(&metadata, snapshot, selector, SearchBudget::SelectorBytes(max_bytes), &[], None)
+}
+
 fn search_logical_artifact(
     metadata: &LogicalArtifactMetadata,
     snapshot: &[u8],
@@ -6160,10 +6213,11 @@ fn search_logical_artifact(
         return invalid_selector_result(selector,
             "line/search indexing exceeds its bounded representation; exact byte selectors remain available");
     }
-    let (query, start_byte, max_results, context_lines, case_insensitive, enclosing) =
+    let (query, regex, start_byte, max_results, context_lines, case_insensitive, enclosing) =
         match &selector {
             ToolOutputSelector::Search {
                 query,
+                regex,
                 start_byte,
                 max_results,
                 context_lines,
@@ -6171,6 +6225,7 @@ fn search_logical_artifact(
                 enclosing,
             } => (
                 query.clone(),
+                *regex,
                 *start_byte,
                 *max_results,
                 *context_lines,
@@ -6205,6 +6260,27 @@ fn search_logical_artifact(
     let query_bytes = query.as_bytes();
     let search_offset = usize::try_from(start_byte).unwrap_or(usize::MAX);
     let search_bytes = snapshot.get(search_offset..).unwrap_or_default();
+    // Bound both compilation and repeated leftmost searches. Stop after one
+    // lookahead match rather than counting an arbitrarily dense regex subject.
+    // find_at uses the original bytes so anchors and boundaries survive paging.
+    let compiled = if regex {
+        if snapshot.len() > ARTIFACT_REGEX_MAX_SEARCH_BYTES {
+            return invalid_selector_result(selector, format!(
+                "regex search is limited to {ARTIFACT_REGEX_MAX_SEARCH_BYTES} retained bytes; use exact byte/line selections of this artifact, never rerun its producer"
+            ));
+        }
+        match regex::bytes::RegexBuilder::new(&query)
+            .unicode(false)
+            .case_insensitive(case_insensitive)
+            .size_limit(ARTIFACT_REGEX_SIZE_LIMIT)
+            .dfa_size_limit(ARTIFACT_REGEX_SIZE_LIMIT)
+            .nest_limit(64)
+            .build()
+        {
+            Ok(compiled) => Some(compiled),
+            Err(error) => return invalid_selector_result(selector, format!("invalid or oversized regex: {error}")),
+        }
+    } else { None };
     // Earlier results in this transaction counted the same immutable bytes.
     // Reuse only an identical scan origin or its exact non-overlapping cursor;
     // an arbitrary offset inside a previous match changes matching semantics.
@@ -6215,13 +6291,14 @@ fn search_logical_artifact(
         (metadata.capture_complete && metadata.retained_bytes == metadata.canonical_bytes)
             .then_some(&metadata.canonical_sha256)
     });
-    let cache_key = retained_digest.map(|digest| AuthenticatedSearchCountKey {
+    let cache_key = retained_digest.filter(|_| !regex && metadata.version != 0).map(|digest| AuthenticatedSearchCountKey {
         artifact_id: metadata.artifact_id.clone(), retained_sha256: digest.clone(),
         retained_bytes: metadata.retained_bytes, query: query.clone(), case_insensitive, start_byte,
     });
     let known_total = previous_results.iter().rev().find_map(|previous| {
         let ToolOutputSelector::Search {
             query: previous_query,
+            regex: previous_regex,
             case_insensitive: previous_case,
             start_byte: previous_start,
             ..
@@ -6229,6 +6306,7 @@ fn search_logical_artifact(
             return None;
         };
         if previous.status != ToolOutputSelectorStatus::Ok
+            || regex || *previous_regex
             || previous_query != &query
             || *previous_case != case_insensitive
         {
@@ -6249,19 +6327,25 @@ fn search_logical_artifact(
     let mut total_matches = known_total.unwrap_or(0);
     let mut indexed_matches = Vec::with_capacity(max_results);
     let mut cursor = 0;
+    let mut match_count_complete = true;
     while known_total != Some(0) {
-        let Some(offset) = (if case_insensitive {
-            crate::tools::shell_output_summary::find_ascii_case_bytes(
-                &search_bytes[cursor..],
-                query_bytes,
-            )
+        let found = if let Some(compiled) = &compiled {
+            compiled.find_at(snapshot, search_offset + cursor)
+                .map(|found| (found.start() - search_offset, found.end() - search_offset))
         } else {
-            memchr::memmem::find(&search_bytes[cursor..], query_bytes)
-        }) else {
-            break;
+            (if case_insensitive {
+                crate::tools::shell_output_summary::find_ascii_case_bytes(
+                    &search_bytes[cursor..],
+                    query_bytes,
+                )
+            } else {
+                memchr::memmem::find(&search_bytes[cursor..], query_bytes)
+            }).map(|offset| (cursor + offset, cursor + offset + query_bytes.len()))
         };
-        let relative_match_start = cursor + offset;
-        let relative_match_end = relative_match_start.saturating_add(query_bytes.len());
+        let Some((relative_match_start, relative_match_end)) = found else { break };
+        if relative_match_start == relative_match_end {
+            return invalid_selector_result(selector, "zero-width regex matches are unsupported; use a pattern that consumes bytes");
+        }
         cursor = relative_match_end;
         let match_start = search_offset.saturating_add(relative_match_start);
         let match_end = search_offset.saturating_add(relative_match_end);
@@ -6270,6 +6354,9 @@ fn search_logical_artifact(
         }
         if indexed_matches.len() < max_results {
             indexed_matches.push((match_start, match_end));
+        } else if regex {
+            match_count_complete = false;
+            break;
         }
         if known_total.is_some() && indexed_matches.len() == max_results {
             break;
@@ -6361,6 +6448,7 @@ fn search_logical_artifact(
         let remaining_match_count = total_matches.saturating_sub(matches_returned);
         let continuation = (remaining_match_count > 0).then(|| ToolOutputSelector::Search {
             query: query.clone(),
+            regex,
             enclosing,
             case_insensitive,
             start_byte: indexed_matches
@@ -6413,6 +6501,10 @@ fn search_logical_artifact(
             "matches": matches,
             "hydrated_ranges": hydrated_ranges,
         }));
+        if regex && let Some(value) = result.value.as_mut() {
+            value["regex"] = Value::Bool(true);
+            value["match_count_complete"] = Value::Bool(match_count_complete);
+        }
         if enclosing && let Some(value) = result.value.as_mut() {
             value["enclosing_complete"] = Value::Bool(enrichment_available);
         }
@@ -6680,7 +6772,7 @@ fn successful_exact_selector_result(
                 Err(_) => result.data_base64 = Some(BASE64_STANDARD.encode(bytes)),
             }
         }
-        ToolOutputSelector::Bytes { .. } | ToolOutputSelector::Search { .. } => unreachable!(),
+        ToolOutputSelector::Bytes { .. } | ToolOutputSelector::Search { .. } | ToolOutputSelector::Structured { .. } => unreachable!(),
     }
     result
 }
@@ -6770,6 +6862,7 @@ fn internally_drain_exact_subdivisions(
     Some(completed)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn select_logical_artifact(
     metadata: &LogicalArtifactMetadata,
     snapshot: &[u8],
@@ -6778,7 +6871,37 @@ fn select_logical_artifact(
     final_token_ceiling: usize,
     previous_results: &[ToolOutputSelectorResult],
     previous_cost: Option<&SelectorResponseCost>,
+    structured_source_bytes: usize,
 ) -> ToolOutputSelectorResult {
+    if matches!(selector, ToolOutputSelector::Structured { .. }) {
+        let owned_cost;
+        let previous_cost = match previous_cost {
+            Some(cost) => cost,
+            None => {
+                owned_cost = SelectorResponseCost::new(metadata, previous_results);
+                &owned_cost
+            }
+        };
+        // Like search, a page measures the whole response, including results
+        // already selected in this transaction. Its projected JSON is also
+        // charged against the caller's remaining source-byte budget, so that
+        // budget shortens the page instead of discarding it.
+        let coverage_complete = metadata.capture_complete
+            && metadata.complete
+            && metadata.unavailable_ranges.is_empty();
+        return structured::select(snapshot, selector, coverage_complete, |frame| {
+            let tokens = previous_cost
+                .with_next(selector_serialized_cost(frame), metadata.complete)
+                .tokens();
+            let projected = frame
+                .value
+                .as_ref()
+                .and_then(|value| serde_json::to_vec(value).ok())
+                .map_or(usize::MAX, |value| value.len());
+            codex_utils_string::approx_bytes_for_tokens(final_token_ceiling.saturating_sub(tokens))
+                .min(structured_source_bytes.saturating_sub(projected))
+        });
+    }
     if selector.is_search() {
         return search_logical_artifact(
             metadata,
@@ -6935,6 +7058,18 @@ impl ToolOutputSnapshot {
         selectors: Vec<ToolOutputSelector>,
         token_ceiling: usize,
     ) -> Result<ReadToolOutputResult, ReadToolOutputError> {
+        self.select_within_source_bytes(selectors, token_ceiling, usize::MAX)
+            .await
+    }
+
+    /// `source_bytes` is the caller's max_bytes budget. Structured pages are
+    /// shortened to its remainder after earlier results' in-order charges.
+    pub(crate) async fn select_within_source_bytes(
+        self: &Arc<Self>,
+        selectors: Vec<ToolOutputSelector>,
+        token_ceiling: usize,
+        source_bytes: usize,
+    ) -> Result<ReadToolOutputResult, ReadToolOutputError> {
         let snapshot = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
             // Derive missing lexical addresses once per authenticated recovery
@@ -6961,6 +7096,7 @@ impl ToolOutputSnapshot {
                 selectors,
                 token_ceiling,
                 pointers,
+                source_bytes,
             )
         })
         .await
@@ -7102,7 +7238,43 @@ fn select_tool_output_snapshot(
         selectors,
         token_ceiling,
         pointers.as_ref(),
+        usize::MAX,
     )
+}
+
+/// Source bytes a successful selection charges against a recovery's
+/// max_bytes, in the recovery owner's per-result terms: exact payload extents,
+/// delivered search context, or a structured page's projected JSON.
+fn recovery_source_charge(result: &ToolOutputSelectorResult) -> u64 {
+    if result.status != ToolOutputSelectorStatus::Ok {
+        return 0;
+    }
+    if matches!(result.selector, ToolOutputSelector::Structured { .. }) {
+        return result
+            .value
+            .as_ref()
+            .and_then(|value| serde_json::to_vec(value).ok())
+            .map_or(0, |value| value.len() as u64);
+    }
+    if result.selector.is_search() {
+        return result
+            .value
+            .as_ref()
+            .and_then(|value| value["hydrated_ranges"].as_array())
+            .into_iter()
+            .flatten()
+            .filter(|range| range["text"].is_string() || range["data_base64"].is_string())
+            .filter_map(|range| {
+                range["canonical_range"]["end"]
+                    .as_u64()?
+                    .checked_sub(range["canonical_range"]["start"].as_u64()?)
+            })
+            .sum();
+    }
+    result
+        .canonical_range
+        .filter(|_| result.text.is_some() || result.data_base64.is_some() || result.value.is_some())
+        .map_or(0, CanonicalByteRange::len)
 }
 
 fn select_tool_output_snapshot_indexed(
@@ -7111,6 +7283,7 @@ fn select_tool_output_snapshot_indexed(
     selectors: Vec<ToolOutputSelector>,
     token_ceiling: usize,
     pointers: Option<&ValidatedJsonPointers>,
+    source_bytes: usize,
 ) -> Result<ReadToolOutputResult, ReadToolOutputError> {
     let metadata = pointers.map_or(metadata, |pointers| &pointers.metadata);
     // Normalization decides merges against the same fragment ceiling selection
@@ -7135,16 +7308,37 @@ fn select_tool_output_snapshot_indexed(
     let mut cost = SelectorResponseCost::new(metadata, &[]);
     let retry_ceiling = token_ceiling.saturating_add(RECOVERY_RETRY_AVOIDANCE_TOKEN_MARGIN);
     for (index, selector) in selectors.iter().enumerate() {
-        // A search is a page, not an indivisible exact value. Share the remaining
-        // response capacity so the first query cannot starve every later query.
-        let selection_ceiling = if selector.is_search() {
+        // Search and structured pages are not indivisible exact values. Share
+        // the remaining response capacity so the first cannot starve later ones.
+        let selection_ceiling = if selector.is_paged() {
             let occupied = cost.size(response.complete).tokens();
-            // Search measures the entire response, including its existing envelope.
+            // A page measures the entire response, including its existing envelope.
             occupied
                 .saturating_add(token_ceiling.saturating_sub(occupied) / (selectors.len() - index))
                 .min(token_ceiling)
         } else {
             token_ceiling
+        };
+        // Mirror the recovery owner's in-order source-byte charges so a later
+        // structured page is shortened to what earlier selections leave.
+        let structured_source_bytes = if source_bytes != usize::MAX
+            && matches!(selector, ToolOutputSelector::Structured { .. })
+        {
+            let remaining =
+                response
+                    .results
+                    .iter()
+                    .fold(source_bytes as u64, |remaining, result| {
+                        let charge = recovery_source_charge(result);
+                        if charge <= remaining {
+                            remaining - charge
+                        } else {
+                            remaining
+                        }
+                    });
+            usize::try_from(remaining).unwrap_or(usize::MAX)
+        } else {
+            source_bytes
         };
         let mut selected =
             if let Some(message) = pointers.and_then(|pointers| pointers.error(selector)) {
@@ -7167,6 +7361,7 @@ fn select_tool_output_snapshot_indexed(
                     selection_ceiling,
                     &response.results,
                     Some(&cost),
+                    structured_source_bytes,
                 )
             };
         if selected.status == ToolOutputSelectorStatus::SelectorTooLarge
@@ -7400,6 +7595,12 @@ pub(crate) fn select_file_snapshot_for_script(
                 end: metadata.retained_bytes,
             }];
             result
+        } else if matches!(selector, ToolOutputSelector::Structured { .. }) {
+            let coverage_complete = metadata.capture_complete
+                && metadata.complete
+                && metadata.unavailable_ranges.is_empty();
+            structured::select(canonical.bytes.as_slice(), selector.clone(), coverage_complete,
+                |frame| serde_json::to_vec(frame).map_or(0, |bytes| remaining.saturating_sub(bytes.len())))
         } else if selector.is_search() {
             search_logical_artifact(
                 &metadata,

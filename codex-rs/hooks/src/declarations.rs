@@ -15,24 +15,22 @@ pub(crate) struct HookKeyBuilder {
 }
 
 impl HookKeyBuilder {
+    /// The identity stays TOML-based so persisted keys do not change. JSON
+    /// declarations can hold values TOML cannot represent (a `timeout` above
+    /// `i64::MAX`); those return an error and callers must skip the handler.
     pub(crate) fn next(
         &mut self,
         key_source: &str,
         event_name: HookEventName,
         matcher: Option<&str>,
         handler: &HookHandlerConfig,
-    ) -> String {
+    ) -> Result<String, String> {
         let identity = MatcherGroup {
             matcher: crate::events::common::matcher_pattern_for_event(event_name, matcher)
                 .map(str::to_owned),
             hooks: vec![handler.clone()],
         };
-        #[expect(
-            clippy::expect_used,
-            reason = "the hook identity is a concrete TOML-compatible config schema; changing it requires a persisted-key migration"
-        )]
-        let identity = TomlValue::try_from(identity)
-            .expect("hook declarations contain only TOML-serializable fields");
+        let identity = TomlValue::try_from(identity).map_err(|err| err.to_string())?;
         let base = format!(
             "{key_source}:{}:v2:{}",
             crate::hook_event_key_label(event_name),
@@ -41,7 +39,7 @@ impl HookKeyBuilder {
         let occurrence = self.occurrences.entry(base.clone()).or_default();
         let key = format!("{base}:{occurrence}");
         *occurrence += 1;
-        key
+        Ok(key)
     }
 }
 
@@ -65,10 +63,14 @@ pub fn plugin_hook_declarations(hook_sources: &[PluginHookSource]) -> Vec<Plugin
         for (event_name, groups) in source.hooks.clone().into_matcher_groups() {
             for group in &groups {
                 for handler in &group.hooks {
-                    declarations.push(PluginHookDeclaration {
-                        key: keys.next(&key_source, event_name, group.matcher.as_deref(), handler),
-                        event_name,
-                    });
+                    // Discovery skips the same unkeyable handlers, so both
+                    // enumerations keep identical occurrence counts.
+                    let Ok(key) =
+                        keys.next(&key_source, event_name, group.matcher.as_deref(), handler)
+                    else {
+                        continue;
+                    };
+                    declarations.push(PluginHookDeclaration { key, event_name });
                 }
             }
         }

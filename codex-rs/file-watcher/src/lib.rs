@@ -1,6 +1,11 @@
 //! Watches subscribed files or directories and routes coarse-grained change
 //! notifications to the subscribers that own matching watched paths.
 
+mod wait;
+
+pub use wait::WaitOutcome;
+pub use wait::wait_until;
+
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;

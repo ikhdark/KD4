@@ -8,14 +8,7 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandMutation {
     ReadOnly,
-    KnownMutation {
-        paths: Option<BTreeSet<PathBuf>>,
-    },
-    /// Observed tracked paths changed, without proof that this command wrote them.
-    ObservedChanges {
-        declared_paths: BTreeSet<PathBuf>,
-        unattributed_paths: BTreeSet<PathBuf>,
-    },
+    KnownMutation { paths: Option<BTreeSet<PathBuf>> },
     Uncertain,
 }
 
@@ -27,7 +20,7 @@ impl CommandMutation {
     pub fn paths(&self) -> Option<&BTreeSet<PathBuf>> {
         match self {
             Self::KnownMutation { paths } => paths.as_ref(),
-            Self::ReadOnly | Self::Uncertain | Self::ObservedChanges { .. } => None,
+            Self::ReadOnly | Self::Uncertain => None,
         }
     }
 }

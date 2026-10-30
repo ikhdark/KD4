@@ -58,11 +58,20 @@ fn patch_capture_lock_path(path: &Path) -> io::Result<PathBuf> {
     let identity = parent.join(name).to_string_lossy().to_lowercase();
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     identity.hash(&mut hash);
-    Ok(std::env::temp_dir()
-        .join("codex-patch-capture-v1")
-        // Bound the shared namespace without ever unlinking a live lock.
-        // Collisions conservatively return transient contention, not absence.
-        .join(format!("{:03x}.lock", hash.finish() & 0xfff)))
+    // Bound the shared namespace without ever unlinking a live lock.
+    // Collisions conservatively return transient contention, not absence.
+    Ok(patch_capture_directory()
+        .join(patch_capture_bucket(hash.finish() & (PATCH_CAPTURE_BUCKETS - 1))))
+}
+
+const PATCH_CAPTURE_BUCKETS: u64 = 0x1000;
+
+fn patch_capture_directory() -> PathBuf {
+    std::env::temp_dir().join("codex-patch-capture-v1")
+}
+
+fn patch_capture_bucket(bucket: u64) -> String {
+    format!("{bucket:03x}.lock")
 }
 
 fn open_patch_capture_file(path: &Path) -> io::Result<File> {
@@ -99,6 +108,52 @@ pub fn prepare_patch_capture(path: &Path) -> io::Result<PathBuf> {
     let lock_path = patch_capture_lock_path(&resolved.write_path)?;
     drop(open_patch_capture_lock(&lock_path)?);
     Ok(lock_path)
+}
+
+/// Initialize every admission bucket before a sandboxed helper guards paths
+/// unknown here, so it only opens existing locks read-only, and return the
+/// directory it may be granted read access to. Blocking. Buckets are created
+/// without truncation; one left missing fails only a probe that needs it. A
+/// complete listing is trusted until the directory's last-write time changes,
+/// as deleting any bucket (such as temp cleanup) does.
+pub fn prepare_patch_capture_namespace() -> io::Result<PathBuf> {
+    static PREPARED: std::sync::Mutex<Option<(PathBuf, std::time::SystemTime)>> =
+        std::sync::Mutex::new(None);
+    let directory = patch_capture_directory();
+    let modified = || std::fs::metadata(&directory)?.modified();
+    // Concurrent helper launches share one listing.
+    let mut prepared = PREPARED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Ok(current) = modified()
+        && prepared
+            .as_ref()
+            .is_some_and(|(path, at)| *path == directory && *at == current)
+    {
+        return Ok(directory);
+    }
+    std::fs::create_dir_all(&directory)?;
+    // Sampled before listing, so a deletion racing the listing changes it.
+    let listed_at = modified()?;
+    let existing = std::fs::read_dir(&directory)?
+        .flatten()
+        .map(|entry| entry.file_name())
+        .collect::<std::collections::HashSet<_>>();
+    let mut missing = false;
+    for bucket in (0..PATCH_CAPTURE_BUCKETS).map(patch_capture_bucket) {
+        if !existing.contains(std::ffi::OsStr::new(&bucket)) {
+            missing = true;
+            let _ = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(directory.join(bucket));
+        }
+    }
+    // Creating buckets changed the time; the next call records the settled listing.
+    *prepared = (!missing).then(|| (directory.clone(), listed_at));
+    Ok(directory)
 }
 
 /// Nonblocking capture admission for cooperating native writers. This is not

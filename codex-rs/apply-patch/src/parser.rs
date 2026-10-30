@@ -20,6 +20,8 @@ pub(crate) const ADD_FILE_MARKER: &str = "*** Add File: ";
 pub(crate) const DELETE_FILE_MARKER: &str = "*** Delete File: ";
 pub(crate) const UPDATE_FILE_MARKER: &str = "*** Update File: ";
 pub(crate) const MOVE_TO_MARKER: &str = "*** Move to: ";
+pub(crate) const GUARD_FILE_MARKER: &str = "*** Guard File: ";
+pub(crate) const EXPECT_MARKER: &str = "*** Expect: ";
 pub(crate) const EOF_MARKER: &str = "*** End of File";
 pub(crate) const CHANGE_CONTEXT_MARKER: &str = "@@ ";
 pub(crate) const EMPTY_CHANGE_CONTEXT_MARKER: &str = "@@";
@@ -35,6 +37,13 @@ pub enum ParseError {
     InvalidHunkError { message: String, line_number: usize },
 }
 use ParseError::*;
+
+/// A patch-wide precondition on raw file bytes, or on the path being absent.
+#[derive(Debug, PartialEq, Clone)]
+pub struct FileRevisionGuard {
+    pub path: PathBuf,
+    pub expected_sha256: Option<String>,
+}
 
 #[derive(Debug, PartialEq, Clone)]
 #[allow(clippy::enum_variant_names)]
@@ -194,9 +203,10 @@ fn parse_patch_text(patch: &str, mode: ParseMode) -> Result<ApplyPatchArgs, Pars
     }.to_owned();
     let mut parser = StreamingPatchParser::default();
     parser.push_delta_in_place(&patch)?;
-    let (hunks, environment_id) = parser.into_parts()?;
+    let (hunks, environment_id, revision_guards) = parser.into_parts()?;
     Ok(ApplyPatchArgs {
         hunks,
+        revision_guards,
         patch,
         workdir: None,
         environment_id,

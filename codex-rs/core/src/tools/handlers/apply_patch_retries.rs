@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 
 use codex_apply_patch::AppliedPatchDelta;
 use codex_apply_patch::ApplyPatchArgs;
+use codex_apply_patch::FileRevisionGuard;
 use codex_apply_patch::Hunk;
 use codex_apply_patch::UpdateFileChunk;
 use codex_apply_patch::UpdateLineKind;
@@ -152,6 +153,9 @@ fn parse_retry(input: &str) -> Result<(String, Vec<Amendment>), String> {
         let parsed =
             codex_apply_patch::parse_patch(&format!("*** Begin Patch\n{body}\n*** End Patch"))
                 .map_err(|error| error.to_string())?;
+        if !parsed.revision_guards.is_empty() {
+            return Err("retry amendments cannot change revision guards; submit a fresh reconciled patch".into());
+        }
         let mut hunks = parsed.hunks;
         if hunks.len() != 1 {
             return Err("each amendment must contain exactly one hunk".into());
@@ -261,7 +265,7 @@ impl RetainedPatches {
                 }
             }
         }
-        args.patch = render_patch(&args.hunks, args.environment_id.as_deref());
+        args.patch = render_patch(&args.hunks, args.environment_id.as_deref(), &args.revision_guards);
         Ok(PreparedRetry {
             id,
             args,
@@ -325,6 +329,11 @@ impl RetainedPatches {
         }
         let args = codex_apply_patch::parse_patch(patch).ok()?;
         let count = committed.changes().len();
+        // A committed prefix may have changed a guarded revision. Never drop
+        // its guard or silently replace the caller's baseline for a suffix.
+        if count > 0 && !args.revision_guards.is_empty() {
+            return None;
+        }
         if count >= args.hunks.len() {
             return None;
         }
@@ -338,7 +347,7 @@ impl RetainedPatches {
         }
         let origins = (0..args.hunks.len()).filter(|index| !excluded.contains(index)).collect::<Vec<_>>();
         let remaining = origins.iter().map(|index| args.hunks[*index].clone()).collect::<Vec<_>>();
-        let patch = render_patch(&remaining, args.environment_id.as_deref());
+        let patch = render_patch(&remaining, args.environment_id.as_deref(), &args.revision_guards);
         if patch.len() > MAX_RETAINED_BYTES {
             return None;
         }
@@ -383,10 +392,17 @@ impl RetainedPatches {
     }
 }
 
-fn render_patch(hunks: &[Hunk], environment_id: Option<&str>) -> String {
+fn render_patch(hunks: &[Hunk], environment_id: Option<&str>, guards: &[FileRevisionGuard]) -> String {
     let mut text = String::from("*** Begin Patch\n");
     if let Some(id) = environment_id {
         text.push_str(&format!("*** Environment ID: {id}\n"));
+    }
+    for guard in guards {
+        text.push_str(&format!("*** Guard File: {}\n*** Expect: ", guard.path.display()));
+        match &guard.expected_sha256 {
+            Some(hash) => text.push_str(&format!("sha256:{hash}\n")),
+            None => text.push_str("absent\n"),
+        }
     }
     for hunk in hunks {
         match hunk {

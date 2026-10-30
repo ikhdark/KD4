@@ -142,7 +142,13 @@ pub(crate) fn required_tool_error_terminal_cause(
     match error {
         // Refusal applies to this operation. Required-operation outcomes and
         // turn cancellation have their own explicit terminal paths.
-        FunctionCallError::DeniedToModel(_) | FunctionCallError::RespondToModel(_) => None,
+        FunctionCallError::Structured(failure)
+            if failure.code == codex_protocol::tool_failure::ToolFailureCode::RequiredOperationBlocked =>
+        {
+            Some(RequiredToolTerminalCause::Blocked)
+        }
+        FunctionCallError::Structured(_) | FunctionCallError::DeniedToModel(_)
+        | FunctionCallError::RespondToModel(_) => None,
         FunctionCallError::RequiredOperationBlocked(_) => Some(RequiredToolTerminalCause::Blocked),
         FunctionCallError::Fatal(_) => Some(RequiredToolTerminalCause::Failure),
     }
@@ -261,6 +267,12 @@ fn tool_dispatch_outcome_label(result: &Result<AnyToolResult, FunctionCallError>
         Err(
             FunctionCallError::DeniedToModel(_) | FunctionCallError::RequiredOperationBlocked(_),
         ) => "blocked",
+        Err(FunctionCallError::Structured(failure)) => match failure.code {
+            codex_protocol::tool_failure::ToolFailureCode::PermissionDenied
+            | codex_protocol::tool_failure::ToolFailureCode::RequiredOperationBlocked => "blocked",
+            codex_protocol::tool_failure::ToolFailureCode::Cancelled => "cancelled",
+            _ => "failure",
+        },
         Err(FunctionCallError::RespondToModel(_)) => "failure",
         Err(FunctionCallError::Fatal(_)) => "fatal",
     }
@@ -828,7 +840,9 @@ async fn acquire_read_cohort(
     };
     if cohort.admission.peek().is_none() {
         let _waiter = LifecycleCounterGuard::increment(timing, LifecycleCounter::ParallelGateWaiter);
-        cohort.admission.clone().await;
+        crate::tools::tool_dispatch_trace::observe_resource_wait(
+            "resource:workspace_global", cohort.admission.clone(),
+        ).await;
     }
     cohort
 }
@@ -879,7 +893,9 @@ async fn acquire_shared_workspace_gate(
                 turn_timing_state,
                 LifecycleCounter::ParallelGateWaiter,
             );
-            let guard = gate.read_owned().await;
+            let guard = crate::tools::tool_dispatch_trace::observe_resource_wait(
+                "resource:workspace_global", gate.read_owned(),
+            ).await;
             drop(waiter_guard);
             guard
         }
@@ -897,7 +913,9 @@ async fn acquire_exclusive_workspace_gate(
                 turn_timing_state,
                 LifecycleCounter::ParallelGateWaiter,
             );
-            let guard = gate.write_owned().await;
+            let guard = crate::tools::tool_dispatch_trace::observe_resource_wait(
+                "resource:workspace_global", gate.write_owned(),
+            ).await;
             drop(waiter_guard);
             guard
         }
@@ -1072,7 +1090,9 @@ async fn acquire_workspace_gate_with_additions(
             LifecycleCounter::ParallelGateWaiter,
         );
         WorkspaceResourceGateGuard::Scoped {
-            _guard: additions.acquire(resource_gate).await,
+            _guard: crate::tools::tool_dispatch_trace::observe_resource_wait(
+                "resource:workspace_scoped", additions.acquire(resource_gate),
+            ).await,
         }
     } else if shared_resource {
         WorkspaceResourceGateGuard::Shared {
@@ -1083,7 +1103,9 @@ async fn acquire_workspace_gate_with_additions(
                         turn_timing_state,
                         LifecycleCounter::ParallelGateWaiter,
                     );
-                    resource_gate.read_owned().await
+                    crate::tools::tool_dispatch_trace::observe_resource_wait(
+                        "resource:workspace_scoped", resource_gate.read_owned(),
+                    ).await
                 }
             },
         }
@@ -1096,7 +1118,9 @@ async fn acquire_workspace_gate_with_additions(
                         turn_timing_state,
                         LifecycleCounter::ParallelGateWaiter,
                     );
-                    resource_gate.write_owned().await
+                    crate::tools::tool_dispatch_trace::observe_resource_wait(
+                        "resource:workspace_scoped", resource_gate.write_owned(),
+                    ).await
                 }
             },
         }
@@ -2381,7 +2405,7 @@ impl ToolCallRuntime {
         let terminal_tasks = self.session.terminal_tasks.clone();
 
         let mut dispatch_handle: AbortOnDropHandle<Result<AnyToolResult, FunctionCallError>> =
-            AbortOnDropHandle::new(tokio::spawn(Box::pin(async move {
+            AbortOnDropHandle::new(tokio::spawn(crate::tools::tool_dispatch_trace::scope_tool_blocking_timing(Arc::clone(&timing), Box::pin(async move {
                 let admission_tool_name = router.semantic_tool_name(&dispatch_call.tool_name);
                 let (admission, mut read_only) = match workspace_admission_hint {
                     Some(classification) => classification,
@@ -2577,7 +2601,15 @@ impl ToolCallRuntime {
                         .is_empty();
                 if tracks_workspace {
                     timing.record_boundary(ToolLifecycleBoundary::DiffTrackerWaitStart);
-                    let mut guard = tracker.lock().await;
+                    // Like the gates: an uncontended acquisition is not
+                    // contention, even when Tokio's coop budget defers lock().
+                    let mut guard = if let Ok(guard) = tracker.try_lock() {
+                        guard
+                    } else {
+                        crate::tools::tool_dispatch_trace::observe_resource_wait(
+                            "resource:diff_tracker", tracker.lock(),
+                        ).await
+                    };
                     guard.activate_workspace_evidence_generation_batch(
                         &step_context.workspace_evidence_generation_batch,
                     );
@@ -2702,7 +2734,13 @@ impl ToolCallRuntime {
                             // observation made before its execution boundary.
                             timing.record_boundary(ToolLifecycleBoundary::EvidenceTrackerWaitStart);
                             let admitted_mutation_revision =
-                                evidence_tracker.lock().await.current_mutation_revision();
+                                if let Ok(guard) = evidence_tracker.try_lock() {
+                                    guard.current_mutation_revision()
+                                } else {
+                                    crate::tools::tool_dispatch_trace::observe_resource_wait(
+                                        "resource:evidence_tracker", evidence_tracker.lock(),
+                                    ).await.current_mutation_revision()
+                                };
                             if passive_poll
                                 && let Some(parent_call_id) = code_mode_parent_call_id.as_deref()
                             {
@@ -2964,7 +3002,7 @@ impl ToolCallRuntime {
                     drop(gate_guard);
                 }
                 result
-            })));
+            }))));
 
         let cancellation_owner = terminal_tasks.spawn(
             async move {
@@ -2981,10 +3019,15 @@ impl ToolCallRuntime {
                                 return Self::joined_tool_result(dispatch_handle.await, &dispatch_state).await;
                             }
                         };
-                        let mut cancellation_recovery = None;
+                        let mut cancellation_recovery: Option<serde_json::Value>;
                         let secs = started.elapsed().as_secs_f32();
                         abort_dispatch_span.record("aborted", true);
                         if cancelled_before_admission {
+                            cancellation_recovery = Some(serde_json::json!({
+                                "kind":"cancellation_recovery", "effects_state":"none",
+                                "retry_safe":false,
+                                "required_action":"This call did not reach admission; preserve effects of earlier calls and retry only if still authorized.",
+                            }));
                             dispatch_handle.abort();
                             match dispatch_handle.await {
                                 Ok(result) => return result,
@@ -3119,6 +3162,7 @@ async fn supervise_cancelled_dispatch_cleanup(
         ..
     } = invocation;
     let mut recovery = Vec::new();
+    let mut live_operations = Vec::new();
     let mut settlement = CancelledHandlerSettlement::Unresolved { call_id: call_id.clone() };
     let mut effects = crate::tools::context::ToolEffectRecovery::unknown(None, None);
     let recovery_for = |result: Option<&serde_json::Value>, error: Option<&str>| {
@@ -3230,6 +3274,16 @@ async fn supervise_cancelled_dispatch_cleanup(
                     .filter(|process| process.item_id == call_id)
                     .map(|process| process.process_id)
                     .collect::<Vec<_>>();
+                for process_id in &surviving {
+                    let Ok(process_id) = process_id.parse::<u32>() else { continue };
+                    if let Some(incarnation) = session.services.unified_exec_manager
+                        .process_incarnation(process_id).await
+                    {
+                        live_operations.push(serde_json::json!({"tool":"write_stdin", "arguments":{
+                            "session_id":process_id,"incarnation":incarnation,"chars":""
+                        }}));
+                    }
+                }
                 recovery.push(serde_json::json!({
                     "kind": "process_cleanup_failed",
                     "detail": error,
@@ -3269,6 +3323,7 @@ async fn supervise_cancelled_dispatch_cleanup(
         "effects_state": if effects_reported { "reported" } else { "unknown" },
         "retry_safe": false,
         "effects": effects,
+        "live_operations":live_operations,
         "handler_settlement": settlement,
         "required_action": if effects_reported {
             "The handler finished; its details state the committed effects. Retry only work those details show was not committed."
@@ -3327,6 +3382,7 @@ impl ToolCallRuntime {
         error: &FunctionCallError,
     ) -> ResponseItem {
         let (kind, message) = match error {
+            FunctionCallError::Structured(failure) => ("failed", failure.message.as_str()),
             FunctionCallError::RespondToModel(message) => ("failed", message.as_str()),
             FunctionCallError::DeniedToModel(message)
             | FunctionCallError::RequiredOperationBlocked(message) => ("denied", message.as_str()),
@@ -3336,20 +3392,24 @@ impl ToolCallRuntime {
             ),
         };
         let end = message.floor_char_boundary(1_024.min(message.len()));
+        let mut failure = error.failure();
+        // Preserve discovery's bounded diagnostic and internal-error redaction
+        // in the structured channel as well as in the legacy message field.
+        failure.message = message[..end].to_string();
         // Reuse the untrusted contextual envelope so discovery diagnostics do
         // not become a new user turn in history projection or compaction.
         crate::context::ContextualUserFragment::into(
             crate::context::AdditionalContextUserFragment::new(
                 "tool_search_failure".to_string(),
                 serde_json::json!({
-                "tool_search_failure": {"call_id":call_id,"kind":kind,"message":&message[..end],"truncated":end < message.len()}
+                "tool_search_failure": {"call_id":call_id,"kind":kind,"message":&message[..end],"truncated":end < message.len(),"tool_failure":failure}
                 }).to_string(),
             ),
         )
     }
 
     fn failure_response(call: ToolCall, err: FunctionCallError) -> ResponseInputItem {
-        Self::failure_response_for_message(&call, err.to_string())
+        Self::failure_response_for_message(&call, err.model_message())
     }
 
     pub(crate) fn failure_response_for_message(

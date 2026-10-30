@@ -215,7 +215,7 @@ pub struct SkillDiscoveryContinuation {
     pub cursor: Option<String>,
     pub resource_offset: usize,
     pub seen_cursors: HashSet<String>,
-    /// No further discovery is possible in this MCP resource generation.
+    /// This bounded attempt stopped on a repeated cursor; an explicit listing can retry.
     pub blocked: bool,
 }
 

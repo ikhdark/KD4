@@ -48,7 +48,6 @@ mod built_in {
                     description: Some("Default agent.".to_string()),
                     config_file: None,
                     nickname_candidates: None,
-                    config_snapshot: Default::default(),
                 },
             )])
         });

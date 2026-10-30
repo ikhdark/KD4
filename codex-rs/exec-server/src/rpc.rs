@@ -101,6 +101,10 @@ impl RpcNotificationSender {
         Self { outgoing_tx }
     }
 
+    pub(crate) fn same_channel(&self, other: &Self) -> bool {
+        self.outgoing_tx.same_channel(&other.outgoing_tx)
+    }
+
     pub(crate) async fn response(
         &self,
         request_id: RequestId,

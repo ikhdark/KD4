@@ -35,5 +35,6 @@ pub mod request_user_input;
 pub mod review_format;
 pub mod shell_environment;
 pub mod timing;
+pub mod tool_failure;
 pub mod user_input;
 pub mod validation;

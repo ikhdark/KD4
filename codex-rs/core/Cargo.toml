@@ -45,6 +45,7 @@ codex-extension-api = { workspace = true }
 codex-features = { workspace = true }
 codex-feedback = { workspace = true }
 codex-file-system = { workspace = true }
+codex-file-watcher = { workspace = true }
 codex-login = { workspace = true }
 codex-mcp = { workspace = true }
 codex-model-provider-info = { workspace = true }
@@ -90,6 +91,7 @@ jsonschema = { workspace = true }
 lru = { workspace = true }
 memchr = { workspace = true }
 rand = { workspace = true }
+regex = { workspace = true }
 regex-lite = { workspace = true }
 rmcp = { workspace = true, default-features = false, features = [
     "base64",

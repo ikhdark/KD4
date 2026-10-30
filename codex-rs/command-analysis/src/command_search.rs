@@ -525,7 +525,8 @@ impl<'a> RgArgumentRoles<'a> {
 
     fn option(&mut self, flag: &str, value: Option<&'a str>) {
         match flag {
-            "--hidden" => self.hidden = true,
+            // `-.` is rg's short spelling of --hidden.
+            "--hidden" | "-." => self.hidden = true,
             "--no-hidden" => self.hidden = false,
             "-u" | "--unrestricted" => {
                 self.unrestricted += 1;

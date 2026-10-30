@@ -203,11 +203,13 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
           keys(value).filter(key => !(array && key === 'length'));
       } catch { return '[error evidence unavailable]'; }
       if (controlsFirst) {
-        const controls = ['status', 'artifact_id', 'session_id', 'recovery', 'continuation',
+        const controls = ['tool_failure', 'code', 'effects', 'retry_safe', 'safe_next_actions', 'live_operations',
+          'status', 'artifact_id', 'session_id', 'recovery', 'continuation',
           'complete', 'execution_state', 'exit_code', 'process_exited', 'session_capabilities',
           'name', 'message', 'reason', 'step_id', 'terminal', 'value', 'initial', 'observations',
           'blocked_by', 'missing_capabilities', 'omitted_capabilities'];
-        names.sort((a, b) => Number(!controls.includes(a)) - Number(!controls.includes(b)));
+        names.sort((a, b) => (a === 'tool_failure' ? -1 : Number(!controls.includes(a))) -
+          (b === 'tool_failure' ? -1 : Number(!controls.includes(b))));
       }
       const selectedNames = names.slice(0, 64);
       for (const [index, key] of selectedNames.entries()) {
@@ -414,6 +416,8 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
         }
         return {...item, recovery: {tool: 'read_tool_output',
           source_sha256: source.source_sha256 || source.canonical_sha256,
+          canonical_sha256: source.canonical_sha256, source_encoding: source.source_encoding,
+          selector_encoding: source.selector_encoding, selector_coordinate_space: source.selector_coordinate_space,
           arguments: {artifact_id: source.artifact_id,
             selectors: [{kind: 'bytes', start: range.start, end: range.end}]}}};
       }
@@ -447,6 +451,8 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
       const envelope = unframed ? {source: {
         path: source.path, artifact_id: source.artifact_id,
         source_sha256: source.source_sha256 || source.canonical_sha256,
+        canonical_sha256: source.canonical_sha256, source_encoding: source.source_encoding,
+        selector_encoding: source.selector_encoding, selector_coordinate_space: source.selector_coordinate_space,
         environment_id: source.environment_id,
         canonical_uri: source.path === undefined ? source.canonical_uri : undefined,
       }, [fragment === 'rows' ? 'results' : 'result']: selected} : selected;
@@ -480,6 +486,8 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
         texts.push({text, source: {
           ...(source !== projected ? {path: source.path, artifact_id: source.artifact_id,
             source_sha256: source.source_sha256 || source.canonical_sha256,
+            canonical_sha256: source.canonical_sha256, source_encoding: source.source_encoding,
+            selector_encoding: source.selector_encoding, selector_coordinate_space: source.selector_coordinate_space,
             environment_id: source.environment_id, canonical_uri: source.canonical_uri} : {}),
           selector: item.selector, canonical_range: item.canonical_range,
           complete: item.complete === true ? undefined : item.complete, text_lines}});
@@ -646,6 +654,8 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
             sourceFragments: entry.sourceFragments,
             source: source && {path: source.path, artifact_id: source.artifact_id,
               source_sha256: source.source_sha256, canonical_sha256: source.canonical_sha256,
+              source_encoding: source.source_encoding, selector_encoding: source.selector_encoding,
+              selector_coordinate_space: source.selector_coordinate_space,
               environment_id: source.environment_id, canonical_uri: source.canonical_uri}});
           return;
         }

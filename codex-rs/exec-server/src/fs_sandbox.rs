@@ -200,8 +200,19 @@ fn prepare_capture_lock(
         FsHelperRequest::ReadFileCapped { path, .. } => path,
         FsHelperRequest::ReadFileBounded(params)
         | FsHelperRequest::ReadFileBoundedWithSource(params) => &params.path,
+        FsHelperRequest::ReadFileRange(params) => &params.path,
+        FsHelperRequest::ChecksumFile(params) => &params.path,
         FsHelperRequest::GetMetadata(params) => &params.path,
         FsHelperRequest::MutateFileIfMatches(params) => &params.path,
+        // Walks (.git/.gitignore probes, metadata fallbacks) and candidate lists
+        // guard paths that are unknown here or too many to prepare one by one.
+        // Best effort: without the namespace grant, those probes fail in the
+        // helper exactly as they would without preparation.
+        FsHelperRequest::Walk(_) | FsHelperRequest::FirstRegularFile { .. } => {
+            return Ok(codex_file_system::prepare_patch_capture_namespace()
+                .ok()
+                .and_then(|directory| AbsolutePathBuf::from_absolute_path(directory).ok()));
+        }
         _ => return Ok(None),
     };
     let path = path.to_abs_path().map_err(crate::fs_helper::map_fs_error)?;

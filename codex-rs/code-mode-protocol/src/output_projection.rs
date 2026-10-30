@@ -198,6 +198,7 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
         // Inline-only reads have no recovery handle. Keep failure diagnostics,
         // partial retention and every live artifact's controls explicit.
         if tool.name == "read_file"
+            && object.get("read_mode").and_then(Value::as_str) != Some("byte_ranges")
             && object.get("artifact_id").is_none_or(Value::is_null)
             && object.get("retained_bytes").and_then(Value::as_u64) == Some(0)
             && object.get("retained_artifact_complete") == Some(&Value::Bool(false))

@@ -203,15 +203,6 @@ impl NetworkRuleProtocol {
             ))),
         }
     }
-
-    pub fn as_policy_string(self) -> &'static str {
-        match self {
-            Self::Http => "http",
-            Self::Https => "https",
-            Self::Socks5Tcp => "socks5_tcp",
-            Self::Socks5Udp => "socks5_udp",
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

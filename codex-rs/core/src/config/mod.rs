@@ -1984,17 +1984,6 @@ pub struct AgentRoleConfig {
     pub config_file: Option<PathBuf>,
     /// Candidate nicknames for agents spawned with this role.
     pub nickname_candidates: Option<Vec<String>>,
-    /// One immutable file observation per configuration generation, shared by guidance and dispatch.
-    #[doc(hidden)]
-    pub config_snapshot: Arc<std::sync::OnceLock<(PathBuf, Result<String, String>)>>,
-}
-
-impl AgentRoleConfig {
-    pub(crate) fn capture_config_file_contents(&self, contents: String) {
-        if let Some(path) = self.config_file.as_ref() {
-            let _ = self.config_snapshot.set((path.clone(), Ok(contents)));
-        }
-    }
 }
 
 fn resolve_tool_suggest_config(

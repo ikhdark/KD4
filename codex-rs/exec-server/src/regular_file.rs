@@ -17,6 +17,7 @@ pub(crate) async fn open_with_metadata(
 }
 
 /// Validate the opened object, retaining metadata for the caller's initial check.
+/// Default sharing never denies other processes' writers or deleters.
 pub(crate) fn open_sync(path: &Path) -> io::Result<(std::fs::File, std::fs::Metadata)> {
     let _capture = codex_file_system::guard_patch_read(path)?;
     let mut options = std::fs::OpenOptions::new();

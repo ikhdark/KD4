@@ -71,7 +71,7 @@ pub(super) enum FileSelector {
 }
 
 const FILE_SELECTOR_KINDS: &str =
-    "bytes, lines, search, section, json_pointer, symbol or enclosing";
+    "bytes, lines, search, section, json_pointer, structured, symbol or enclosing";
 
 /// Decodes as `#[serde(untagged)]` did (structure, then exact), but a
 /// rejection names the selector's own problem. Untagged decoding said only
@@ -100,7 +100,7 @@ impl<'de> Deserialize<'de> for FileSelector {
         };
         Err(serde::de::Error::custom(match kind {
             Some("symbol" | "enclosing" | "search") => structure.to_string(),
-            Some("bytes" | "lines" | "section" | "json_pointer") => exact.to_string(),
+            Some("bytes" | "lines" | "section" | "json_pointer" | "structured") => exact.to_string(),
             Some(other) => format!(
                 "unsupported read_file selector kind `{}`; use one of {FILE_SELECTOR_KINDS} ({{\"kind\":\"section\",\"id\":\"outline\"}} lists Rust/Python items)",
                 other.chars().take(64).collect::<String>()
@@ -123,6 +123,8 @@ pub(super) enum StructureSelector {
     },
     Search {
         query: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        regex: bool,
         // Defaulted like every sibling field and like the identically named
         // field on `ToolOutputSelector::Search`. Without a default, a selector
         // that omitted only `enclosing` failed the untagged `oneOf` and the
@@ -392,6 +394,7 @@ pub(super) fn resolve_batch(
                 match &selector {
                     FileSelector::Structure(StructureSelector::Search {
                         query,
+                        regex,
                         case_insensitive,
                         start_byte,
                         max_results,
@@ -400,6 +403,7 @@ pub(super) fn resolve_batch(
                     }) => {
                         resolved.push(ToolOutputSelector::Search {
                             query: query.clone(),
+                            regex: *regex,
                             enclosing: false,
                             case_insensitive: *case_insensitive,
                             start_byte: *start_byte,
@@ -590,6 +594,7 @@ fn resolve_items(
             StructureSelector::Enclosing { line } => enclosing(items, line)?,
             StructureSelector::Search {
                 query,
+                regex,
                 enclosing,
                 case_insensitive,
                 start_byte,
@@ -600,6 +605,7 @@ fn resolve_items(
                 // snapshot owner, including subsequent immutable search pages.
                 resolved.push(ToolOutputSelector::Search {
                     query,
+                    regex,
                     enclosing,
                     case_insensitive,
                     start_byte,

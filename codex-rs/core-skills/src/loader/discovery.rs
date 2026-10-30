@@ -75,7 +75,10 @@ pub(super) async fn discover_skills(
                     options.hidden_directories,
                     HiddenDirectoryPolicy::Skip
                 ),
+                summary_only: false,
+                include_metadata: false,
                 filters: Default::default(),
+                apply_gitignore: false,
             },
             /*sandbox*/ None,
         )

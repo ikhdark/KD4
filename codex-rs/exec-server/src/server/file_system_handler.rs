@@ -165,6 +165,28 @@ impl FileSystemHandler {
         })
     }
 
+    pub(crate) async fn read_file_range(
+        &self, params: crate::protocol::FsReadFileRangeParams,
+    ) -> Result<crate::protocol::FsReadFileRangeResponse, JSONRPCErrorError> {
+        let read = self.file_system.read_file_range(&params.path, params.start, params.len,
+            params.expected_revision.as_deref(), params.sandbox.as_ref()).await.map_err(map_fs_error)?;
+        Ok(crate::protocol::FsReadFileRangeResponse {
+            data_base64: STANDARD.encode(read.bytes), file_bytes: read.file_bytes, revision: read.revision,
+        })
+    }
+
+    pub(crate) async fn checksum_file(
+        &self,
+        params: crate::protocol::FsChecksumFileParams,
+    ) -> Result<crate::protocol::FsChecksumFileResponse, JSONRPCErrorError> {
+        let digest = self
+            .file_system
+            .checksum_file(&params.path, params.sandbox.as_ref())
+            .await
+            .map_err(map_fs_error)?;
+        Ok(crate::protocol::FsChecksumFileResponse { digest })
+    }
+
     pub(crate) async fn write_file(
         &self,
         params: FsWriteFileParams,

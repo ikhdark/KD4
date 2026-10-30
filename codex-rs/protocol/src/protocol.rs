@@ -5207,9 +5207,12 @@ pub struct SamplingTimingCheckpoint {
     /// new or changed since the previous checkpoint of the same turn. Its
     /// activity timeline keeps its scalars but carries only the intervals from
     /// the previous checkpoint's last interval on, which may have been extended.
+    /// Its blocking evidence keeps cumulative drop counters but carries only
+    /// new or changed blocking intervals and the dependency edges added since.
     /// Readers rebuild those arrays by merging the turn's checkpoints in order,
-    /// replacing intervals that start at or after the first one carried. Older
-    /// rollouts hold full snapshots and omit this field.
+    /// replacing intervals that start at or after the first one carried,
+    /// upserting blocking intervals by ID and appending edges. Older rollouts
+    /// hold full snapshots and omit this field.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub incremental: bool,
 }

@@ -2461,6 +2461,13 @@ def _write_receipt(bundle_dir: Path, receipt: Mapping[str, object]) -> None:
         print(f"warning: could not index frozen bundle: {error}", file=sys.stderr)
 
 
+def _report_bundle_receipt(bundle_dir: Path, *, emit_json: bool = False) -> None:
+    receipt_path = bundle_dir / BUNDLE_RECEIPT_NAME
+    print(f"Build receipt: {receipt_path}", file=sys.stderr)
+    if emit_json:
+        sys.stdout.write(receipt_path.read_text(encoding="utf-8"))
+
+
 def _reuse_bundle(
     source: Path, receipt: Mapping[str, object], destination: Path | None
 ) -> tuple[Path, list[dict[str, object]]]:
@@ -2813,6 +2820,7 @@ def run_in_cargo_lane(
                     "no build (--rebuild builds anyway)",
                     file=sys.stderr,
                 )
+                _report_bundle_receipt(bundle_dir)
                 return 0
         source_identity = source_root_identity(repo_root)
         rank = None
@@ -2945,6 +2953,7 @@ def run_in_cargo_lane(
                             + (f"; use it, not the shared {target_dir}" if skipped is None else ""),
                             file=sys.stderr,
                         )
+                        _report_bundle_receipt(bundle_dir)
             except CleanupFailed:
                 (target_dir / ".lane-cleanup-unconfirmed").write_text(
                     "Process cleanup was not confirmed; inspect descendants before removing this quarantine.\n"
@@ -3710,10 +3719,18 @@ def main(argv: list[str] | None = None) -> int:
         help="Print a frozen bundle built from identical compiled inputs and settings.",
         description="Run from the source's codex-rs with the exact run-lane command. "
         "Candidates come from the local bundle index (written by every freeze). "
-        "Exit 0 prints the newest matching bundle directory; exit 1 means build it; "
+        "Exit 0 prints the newest matching bundle directory (or its existing JSON "
+        "receipt with --receipt); exit 1 means build it; "
         "exit 3 (--include-legacy only) prints a pre-receipt bundle candidate.",
     )
-    find_parser.add_argument(
+    find_output = find_parser.add_mutually_exclusive_group()
+    find_output.add_argument(
+        "--receipt",
+        action="store_true",
+        help=f"Print the existing {BUNDLE_RECEIPT_NAME} JSON instead of the bundle "
+        "directory; never build or synthesize a receipt for legacy bundles.",
+    )
+    find_output.add_argument(
         "--include-legacy",
         action="store_true",
         help="On a miss, also match pre-receipt *provenance*.json files below the "
@@ -3834,7 +3851,9 @@ def main(argv: list[str] | None = None) -> int:
             if bundle is None:
                 print(f"no matching bundle ({scanned} receipts scanned)", file=sys.stderr)
                 return 1
-            print(bundle)
+            _report_bundle_receipt(bundle, emit_json=args.receipt)
+            if not args.receipt:
+                print(bundle)
         else:
             parser.error(f"unknown command {args.command}")
     except (CargoLanesRootValidationError, OSError, RuntimeError, ValueError) as exc:

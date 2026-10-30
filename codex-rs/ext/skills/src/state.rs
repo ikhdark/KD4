@@ -214,9 +214,6 @@ impl SkillsThreadState {
         let Some(continuation) = catalog.continuation.clone() else {
             return catalog.clone();
         };
-        if continuation.blocked {
-            return catalog.clone();
-        }
         query.continuation = Some(continuation);
         match providers.list_orchestrator_for_turn(query).await {
             Ok(next) => {
@@ -240,7 +237,13 @@ impl SkillsThreadState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if cache
             .as_ref()
-            .is_some_and(|cache| matches!(cache.catalog.get(), Some(Err(_))))
+            .is_some_and(|cache| match cache.catalog.get() {
+                Some(Err(_)) => true,
+                Some(Ok(catalog)) => catalog.continuation.is_none() && !catalog.warnings.is_empty(),
+                None => cache.discovery_deadline.get().is_some_and(|deadline| {
+                    *deadline <= tokio::time::Instant::now()
+                }),
+            })
         {
             *cache = None;
         }

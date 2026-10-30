@@ -61,13 +61,16 @@ use crate::session::turn_context::TurnContext;
 use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot;
 
+mod blocking;
+
 const NANOS_PER_MILLISECOND: u128 = 1_000_000;
+// Schema 36 adds paired await suspensions and explicit dependency edges.
 // Schema 35 separates host assistant-text publication from reasoning/completion
 // and names continuation-after-truncation without a causal claim.
 // Schema 34 counts identity-bound transport attempts, including same-row auth retries.
 // Schema 33 records unique tool admission (not polling) and locally observed
 // nonempty model content for TTFT. Schemas <=32 aliased TTFT to visible output.
-pub(crate) const TIMING_SCHEMA_VERSION: u16 = 35;
+pub(crate) const TIMING_SCHEMA_VERSION: u16 = 36;
 const MAX_DETERMINISTIC_CONTINUATION_RECEIPTS: usize = 64;
 const MAX_TOOL_CALL_TIMINGS: usize = 1_024;
 // These records are diagnostic histories, not the source of truth for the
@@ -331,6 +334,8 @@ struct CheckpointedEntries {
     deterministic_continuation_receipts: Vec<Option<TurnTimingDeterministicContinuationReceipt>>,
     /// Interval count of the previous checkpoint's complete activity timeline.
     activity_intervals: usize,
+    blocking_intervals: Vec<Option<codex_protocol::timing::TurnTimingBlockingInterval>>,
+    dependency_edges: usize,
 }
 
 /// Activity intervals are only appended, except that the last interval written
@@ -1297,6 +1302,9 @@ struct TurnTimingStateInner {
     accounted_model_responses: u64,
     tool_calls: Vec<TurnTimingToolCall>,
     tool_call_timing_overflow: u32,
+    /// Model-visible direct results without a (capped) detail row. The next
+    /// dispatched request counts their consumes_tool_result edges as dropped.
+    unrecorded_tool_result_consumptions: u64,
     tool_closure: ToolClosureLedger,
     queued_durable_tool_result_execution_ids: BTreeSet<ToolExecutionId>,
     tool_result_persistence_barrier_failed: bool,
@@ -1430,6 +1438,7 @@ impl TurnTimingStateInner {
             accounted_model_responses: self.accounted_model_responses,
             tool_calls: Vec::new(),
             tool_call_timing_overflow: self.tool_call_timing_overflow,
+            unrecorded_tool_result_consumptions: self.unrecorded_tool_result_consumptions,
             tool_closure: ToolClosureLedger::default(),
             queued_durable_tool_result_execution_ids: BTreeSet::new(),
             tool_result_persistence_barrier_failed: self.tool_result_persistence_barrier_failed,
@@ -2228,9 +2237,10 @@ impl TurnTimingState {
     ///
     /// Scalar aggregates stay cumulative. Per-call details belong only to the
     /// final turn timing; aborted-turn recovery retains their counters instead.
-    /// Request and receipt entries already written unchanged by an earlier
-    /// checkpoint of this turn are omitted, as are activity intervals before
-    /// the previous checkpoint's last interval.
+    /// Request, receipt and blocking-interval entries already written unchanged
+    /// by an earlier checkpoint of this turn are omitted, as are activity
+    /// intervals before the previous checkpoint's last interval and dependency
+    /// edges already written.
     pub(crate) fn sampling_checkpoint(&self) -> codex_protocol::protocol::SamplingTimingCheckpoint {
         let (mut observation, tool_closure, sample) = {
             let state = self.state();
@@ -2257,6 +2267,8 @@ impl TurnTimingState {
                 model_requests,
                 deterministic_continuation_receipts,
                 activity_intervals,
+                blocking_intervals,
+                dependency_edges,
             } = &mut *checkpointed;
             retain_new_checkpoint_entries(&mut timing.model_requests, model_requests, digests);
             retain_new_checkpoint_entries(
@@ -2266,6 +2278,12 @@ impl TurnTimingState {
             );
             if let Some(timeline) = timing.activity_timeline.as_mut() {
                 retain_new_activity_intervals(&mut timeline.intervals, activity_intervals);
+                if let Some(evidence) = timeline.blocking.as_mut() {
+                    retain_new_checkpoint_entries(&mut evidence.intervals, blocking_intervals, digests);
+                    let total = evidence.dependencies.len();
+                    evidence.dependencies.drain(..(*dependency_edges).min(total));
+                    *dependency_edges = total;
+                }
             }
         }
         codex_protocol::protocol::SamplingTimingCheckpoint {
@@ -2759,6 +2777,16 @@ impl TurnTimingState {
             timing.outcome.is_some(),
         );
         self.signal_tool_closure_changed();
+        // Only a model-issued call is emitted by its sampling generation; a
+        // nested Code Mode call's generation is merely current at dispatch.
+        // The per-call detail cap below does not bound dependency evidence.
+        if source == TurnTimingToolCallSource::Direct
+            && timing.sampling_generation_id.0 != "generation-pending"
+            && let Some(evidence) = state.activity_timeline.blocking.as_mut()
+        {
+            blocking::record_dependency(evidence, timing.execution_id.0.clone(),
+                timing.sampling_generation_id.0.clone(), "emitted_by");
+        }
         if state.tool_calls.len() >= MAX_TOOL_CALL_TIMINGS {
             state.tool_call_timing_overflow = state.tool_call_timing_overflow.saturating_add(1);
             return;
@@ -2987,6 +3015,10 @@ impl TurnTimingState {
             .map(|(index, _)| index);
         if let Some(index) = index {
             state.tool_calls[index].output_model_visible_at_ms = model_visible_at_ms;
+        } else if state.tool_calls.len() >= MAX_TOOL_CALL_TIMINGS {
+            // The capped row cannot carry this result's consumption edge.
+            state.unrecorded_tool_result_consumptions =
+                state.unrecorded_tool_result_consumptions.saturating_add(1);
         }
     }
 
@@ -3817,17 +3849,24 @@ impl TurnTimingState {
         }
     }
 
-    pub(crate) fn record_tool_output_recovery(&self, retruncation_count: u32) {
+    pub(crate) fn record_tool_output_recovery(&self, in_cell: bool, retruncation_count: u32) {
         let mut state = self.state();
-        state.counters.tool_output_recovery_call_count = state
-            .counters
-            .tool_output_recovery_call_count
-            .saturating_add(1);
+        if in_cell {
+            state.counters.tool_output_in_cell_recovery_call_count = state
+                .counters
+                .tool_output_in_cell_recovery_call_count
+                .saturating_add(1);
+        } else {
+            state.counters.tool_output_recovery_call_count = state
+                .counters
+                .tool_output_recovery_call_count
+                .saturating_add(1);
+            state.tool_output_recovery_read_pending_continuation = true;
+        }
         state.counters.tool_output_recovery_retruncation_count = state
             .counters
             .tool_output_recovery_retruncation_count
             .saturating_add(retruncation_count);
-        state.tool_output_recovery_read_pending_continuation = true;
     }
 
     /// A cell delivery carrying recovered evidence exceeded its visible output
@@ -4373,12 +4412,14 @@ impl TurnTimingState {
                 request.attempt_kind
             };
         request.dispatched_attempt_count = request.dispatched_attempt_count.saturating_add(1);
+        let resumed_generation_id = format!("generation-{}", request.generation_index);
         let sample = self.clock.sample();
         state.advance(sample.time.monotonic_ns);
         state.activity.provider_request_dispatched = true;
         state.activity.provider_terminal_observed = false;
         let elapsed_ns = state.elapsed_since_start(sample.time.monotonic_ns);
         let lifecycle_context = self.lifecycle_context();
+        let mut consumed_tools = Vec::new();
         if let Some(model_resumed_at_ms) = state
             .elapsed_since_start(sample.time.monotonic_ns)
             .map(u128_to_u64_ms)
@@ -4390,6 +4431,11 @@ impl TurnTimingState {
                 if tool_call.output_model_visible_at_ms.is_some()
                     || tool_call.delivered_at_ms.is_some()
                 {
+                    // Relay delivery alone does not prove that a nested output
+                    // became an input to this model request.
+                    if tool_call.output_model_visible_at_ms.is_some() {
+                        consumed_tools.push(tool_call.execution_id.0.clone());
+                    }
                     tool_call.model_resumed_at_ms = Some(model_resumed_at_ms);
                     if !tool_call
                         .lifecycle_events
@@ -4409,6 +4455,14 @@ impl TurnTimingState {
                     tool_call.next_sample_block_reason = NextSampleBlockReason::ReadyToSample;
                 }
             }
+        }
+        let unrecorded_consumptions = std::mem::take(&mut state.unrecorded_tool_result_consumptions);
+        if let Some(evidence) = state.activity_timeline.blocking.as_mut() {
+            for execution_id in consumed_tools {
+                blocking::record_dependency(evidence, resumed_generation_id.clone(), execution_id, "consumes_tool_result");
+            }
+            evidence.dropped_dependencies =
+                evidence.dropped_dependencies.saturating_add(unrecorded_consumptions);
         }
         if state.dispatch_ready_snapshot.is_none()
             && let Some(elapsed_ns) = elapsed_ns
@@ -4638,6 +4692,10 @@ impl TurnTimingStateInner {
         *self = Self {
             activity_timeline: codex_protocol::timing::TurnTimingTimeline {
                 version: 1,
+                blocking: Some(codex_protocol::timing::TurnTimingBlockingEvidence {
+                    version: 1,
+                    ..Default::default()
+                }),
                 started_at_ns: u64::try_from(sample.time.monotonic_ns).unwrap_or(u64::MAX),
                 ..Default::default()
             },

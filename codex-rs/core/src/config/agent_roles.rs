@@ -216,9 +216,6 @@ async fn read_declared_role(
         let parsed_file = files
             .read(fs, &config_file, Some(declared_role_name))
             .await?;
-        if let Some(Ok(contents)) = files.contents.get(&config_file) {
-            role.capture_config_file_contents(contents.clone());
-        }
         role_name = parsed_file.role_name;
         role.description = parsed_file.description.or(role.description);
         role.nickname_candidates = parsed_file.nickname_candidates.or(role.nickname_candidates);
@@ -231,7 +228,6 @@ fn merge_missing_role_fields(role: &mut AgentRoleConfig, fallback: &AgentRoleCon
     role.description = role.description.clone().or(fallback.description.clone());
     if role.config_file.is_none() {
         role.config_file = fallback.config_file.clone();
-        role.config_snapshot = fallback.config_snapshot.clone();
     }
     role.nickname_candidates = role
         .nickname_candidates
@@ -280,7 +276,6 @@ async fn agent_role_config_from_toml(
         description,
         config_file: config_file.map(AbsolutePathBuf::into_path_buf),
         nickname_candidates,
-        config_snapshot: Default::default(),
     })
 }
 
@@ -616,11 +611,7 @@ async fn discover_agent_roles_in_dir(
             description: parsed_file.description,
             config_file: Some(agent_file.to_path_buf()),
             nickname_candidates: parsed_file.nickname_candidates,
-            config_snapshot: Default::default(),
         };
-        if let Some(Ok(contents)) = files.contents.get(agent_file) {
-            role.capture_config_file_contents(contents.clone());
-        }
         roles.insert(role_name, role);
     }
 
@@ -640,7 +631,10 @@ async fn collect_agent_role_files(
                 max_directories: MAX_AGENT_ROLE_DIRECTORIES,
                 max_entries: MAX_AGENT_ROLE_ENTRIES,
                 follow_directory_symlinks: true,
+                summary_only: false,
+                include_metadata: false,
                 prune_hidden_directories: false,
+                apply_gitignore: false,
                 filters: Default::default(),
             },
             /*sandbox*/ None,

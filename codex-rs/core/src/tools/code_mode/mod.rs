@@ -3244,7 +3244,7 @@ async fn call_nested_tool(
     let mut result = match result {
         Ok(result) => result,
         Err(error) => {
-            let message = error.to_string();
+            let message = error.model_message();
             let (retained_output, output_truncated, _) = bounded_failed_nested_text(&message);
             let terminal_cause = required_tool_error_terminal_cause(&error);
             tool_runtime
@@ -3648,7 +3648,17 @@ async fn call_nested_tool(
             ToolOutputOutcome::Failure | ToolOutputOutcome::TimedOut
         )
     {
-        return Err(FunctionCallError::RespondToModel(script_result.to_string()));
+        let failure = result_value.get("tool_failure")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_else(|| {
+                let mut failure = codex_protocol::tool_failure::ToolFailure::new(
+                    codex_protocol::tool_failure::ToolFailureCode::Failed,
+                    format!("tool `{tool_name}` returned a failed result"),
+                );
+                failure.details = Some(script_result);
+                failure
+            });
+        return Err(FunctionCallError::structured(failure));
     }
     // This value is consumed by JavaScript, not rendered directly to the model.
     // Preserve the owning tool's structured contract so a cell can inspect

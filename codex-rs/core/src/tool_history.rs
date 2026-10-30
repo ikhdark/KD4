@@ -475,6 +475,11 @@ impl ToolHistoryCandidate {
             "path",
             "environment_id",
             "source_sha256",
+            "canonical_sha256",
+            "source_encoding",
+            "source_bytes",
+            "selector_encoding",
+            "selector_coordinate_space",
             "scope",
             "cwd",
             "workdir",
@@ -1280,6 +1285,11 @@ pub(crate) fn compact_read_evidence(value: &serde_json::Value) -> serde_json::Va
         "environment_id",
         "canonical_uri",
         "source_sha256",
+        "canonical_sha256",
+        "source_encoding",
+        "source_bytes",
+        "selector_encoding",
+        "selector_coordinate_space",
         "canonical_bytes",
         "artifact_id",
         "retained_artifact_complete",
@@ -1390,6 +1400,9 @@ struct FailureResolutionIndex<'a> {
 pub(crate) struct ReadStatusQuery {
     pub(crate) source_sha256: Option<String>,
     pub(crate) snapshot_id: Option<String>,
+    /// Internal: select by retained-representation hash (decoded for UTF-16).
+    #[serde(skip)]
+    pub(crate) canonical_sha256: Option<String>,
     #[serde(default)]
     pub(crate) snapshot_offset: usize,
     #[serde(default)]
@@ -1511,7 +1524,7 @@ impl ToolHistoryState {
             .collect::<Vec<_>>();
         let rows = paths.iter().map(|path| {
             let key = SourceDependencyV1::new(path, false).path;
-            let mut snapshots = BTreeMap::<(Option<String>, Option<String>, String, u64, Option<String>), (Vec<(u64, u64)>, BTreeSet<String>, bool, bool, Option<usize>)>::new();
+            let mut snapshots = BTreeMap::<(Option<String>, Option<String>, String, u64, Option<String>, Option<(String, Option<String>, Option<u64>)>), (Vec<(u64, u64)>, BTreeSet<String>, bool, bool, Option<usize>)>::new();
             for (call, value, current) in &parsed {
                 let Some(source) = value["path"].as_str() else { continue };
                 if source_locator_key(&SourceDependencyV1::new(Path::new(source), false).path) != source_locator_key(&key) { continue; }
@@ -1519,16 +1532,26 @@ impl ToolHistoryState {
                 let uri = value["canonical_uri"].as_str();
                 if environment_id.is_some() && environment.is_some() && environment_id != environment { continue; }
                 let (Some(hash), Some(size)) = (value["source_sha256"].as_str(), value["canonical_bytes"].as_u64()) else { continue };
+                // Recovery ranges belong to the retained representation, not
+                // the original UTF-16 byte hash. Keep re-encodings distinct.
+                let canonical_hash = value["canonical_sha256"].as_str().unwrap_or(hash);
+                // UTF-8 is the default representation; older records spell it out.
+                let encoding = value["source_encoding"].as_str().filter(|encoding| *encoding != "utf-8");
+                // Only a non-default representation joins the identity, so
+                // UTF-8 snapshot IDs from earlier builds and sessions still match.
+                let representation = (canonical_hash != hash || encoding.is_some()).then(|| {
+                    (canonical_hash.to_string(), encoding.map(str::to_string), value["source_bytes"].as_u64())
+                });
                 // Legacy records have unknown attribution. Keep each separate;
                 // matching bytes/path do not establish a shared source environment.
                 let legacy = (environment.is_none() || uri.is_none()).then(|| call.clone());
-                let snapshot = snapshots.entry((environment.map(str::to_string), uri.map(str::to_string), hash.to_string(), size, legacy)).or_default();
+                let snapshot = snapshots.entry((environment.map(str::to_string), uri.map(str::to_string), hash.to_string(), size, legacy, representation)).or_default();
                 snapshot.2 |= *current;
                 snapshot.4 = snapshot.4.max(order.get(call.as_str()).copied());
                 snapshot.3 |= value["coverage_history_complete"] == false;
                 snapshot.3 |= self.recovered_ranges.contains_key(call);
                 let recovered = value["artifact_id"].as_str()
-                    .filter(|id| self.artifact_identity(id) == Some((size, hash)))
+                    .filter(|id| self.artifact_identity(id) == Some((size, canonical_hash)))
                     .and_then(|id| self.recovered_artifact_selectors(id));
                 snapshot.3 |= recovered.is_some_and(|ranges| ranges.len() >= 64);
                 collect_obtained_read_ranges(value, size, &mut snapshot.0);
@@ -1547,14 +1570,19 @@ impl ToolHistoryState {
                 }
             }
             let mut snapshots = snapshots.into_iter().filter_map(|(identity, coverage)| {
-                let id = sha256(serde_json::to_string(&identity).ok()?.as_bytes());
+                let id = sha256(match &identity.5 {
+                    Some(_) => serde_json::to_string(&identity),
+                    None => serde_json::to_string(&(&identity.0, &identity.1, &identity.2, identity.3, &identity.4)),
+                }.ok()?.as_bytes());
+                let canonical_hash = identity.5.as_ref().map_or(&identity.2, |representation| &representation.0);
                 (query.source_sha256.as_ref().is_none_or(|hash| hash == &identity.2)
+                    && query.canonical_sha256.as_ref().is_none_or(|hash| hash == canonical_hash)
                     && query.snapshot_id.as_ref().is_none_or(|selected| selected == &id))
                     .then_some((id, identity, coverage))
             }).collect::<Vec<_>>();
             snapshots.sort_by(|left, right| right.2.4.cmp(&left.2.4).then_with(|| left.1.cmp(&right.1)));
             let total = snapshots.len();
-            let snapshots = snapshots.into_iter().skip(query.snapshot_offset).take(8).map(|(id, (environment, uri, hash, size, legacy), (mut ranges, artifacts, current, forgotten, observed))| {
+            let snapshots = snapshots.into_iter().skip(query.snapshot_offset).take(8).map(|(id, (environment, uri, hash, size, legacy, representation), (mut ranges, artifacts, current, forgotten, observed))| {
                 ranges.sort_unstable();
                 let mut merged: Vec<(u64, u64)> = Vec::new();
                 for (start, end) in ranges {
@@ -1570,7 +1598,7 @@ impl ToolHistoryState {
                     end = next;
                 }
                 if end < size { missing.push((end, size)); }
-                serde_json::json!({"snapshot_id":id, "source_sha256":hash, "canonical_bytes":size,
+                let mut snapshot = serde_json::json!({"snapshot_id":id, "source_sha256":hash, "canonical_bytes":size,
                     "environment_id":environment, "canonical_uri":uri,
                     "source_attribution":if legacy.is_some() {"unknown"} else {"recorded"},
                     "observation_recency":if observed.is_some() {"recorded"} else {"unknown"},
@@ -1586,7 +1614,20 @@ impl ToolHistoryState {
                     "artifact_ids":artifacts.iter().skip(query.artifact_offset).take(8).collect::<Vec<_>>(),
                     "omitted_artifact_ids":artifacts.len().saturating_sub(query.artifact_offset.saturating_add(8)),
                     "next_artifact_offset":(artifacts.len() > query.artifact_offset.saturating_add(8)).then(|| query.artifact_offset.saturating_add(8)),
-                    "freshness":if current {"unverified"} else {"invalidated"}})
+                    "freshness":if current {"unverified"} else {"invalidated"}});
+                // Like read_file, UTF-8 snapshots omit identities and labels
+                // that only a decoded snapshot distinguishes.
+                if let Some((canonical_hash, source_encoding, source_bytes)) = representation {
+                    if canonical_hash != hash {
+                        snapshot["canonical_sha256"] = serde_json::json!(canonical_hash);
+                    }
+                    if let Some(encoding) = source_encoding {
+                        snapshot["source_encoding"] = serde_json::json!(encoding);
+                        snapshot["source_bytes"] = serde_json::json!(source_bytes);
+                        snapshot["selector_coordinate_space"] = serde_json::json!("decoded_utf8");
+                    }
+                }
+                snapshot
             }).collect::<Vec<_>>();
             serde_json::json!({"path":path, "status":if total == 0 {"unknown"} else {"observed"},
                 "snapshots":snapshots, "omitted_snapshots":total.saturating_sub(query.snapshot_offset.saturating_add(8)),

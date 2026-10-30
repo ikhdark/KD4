@@ -214,6 +214,18 @@ pub(crate) fn create_write_stdin_tool_with_max_timeout(max_timeout_ms: u64) -> T
         crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS.min(max_timeout_ms);
     let properties = BTreeMap::from([
         (
+            "event_filter".to_string(),
+            JsonSchema { description: Some("Conditional process wait for readiness/error literals or exit. Observation-only: omit other controls/output budgets. Replays retained producer bytes unless after is supplied, then waits through irrelevant output until a match or terminal event. Each call closes on return or cancellation; no persistent watcher. Exit/failure are always included, even without a literal match.".into()), ..JsonSchema::object(BTreeMap::from([
+                ("contains".into(), JsonSchema::array(JsonSchema::string(Some("Nonempty literal, at most 256 UTF-8 bytes. At most 16 literals; duplicates match once per call across selected streams. Empty array waits only for exit/failure.".into())), None)),
+                ("stream".into(), JsonSchema::string_enum(vec!["any".into(), "stdout".into(), "stderr".into()], Some("Default any. PTY output is stdout.".into()))),
+                ("timeout_ms".into(), bounded_integer("Required subscription lifetime; nested Code Mode deadlines may shorten it. The first match, exit/failure, output gap, timeout or cancellation closes this call's subscription. Cancellation never terminates the process.".into(), 1, max_timeout_ms)),
+                ("after".into(), JsonSchema { description: Some("Reuse output_cursor from this same session/incarnation to skip previously examined bytes. Omit to include output emitted before subscription. Matches must end after the cursor; split literals still match. Unselected streams and exit-only waits keep the previous position. Cursor is runtime-only; it does not consume ordinary output.".into()), ..JsonSchema::object(BTreeMap::from([
+                    ("stdout".into(), bounded_integer("Previously examined stdout byte position.".into(), 0, usize::MAX as u64)),
+                    ("stderr".into(), bounded_integer("Previously examined stderr byte position.".into(), 0, usize::MAX as u64)),
+                ]), Some(vec!["stdout".into(), "stderr".into()]), Some(false.into())) }),
+            ]), Some(vec!["contains".into(), "timeout_ms".into()]), Some(false.into())) },
+        ),
+        (
             "terminate".to_string(),
             JsonSchema::boolean(Some("True confirms process termination before collecting final output. Requires empty chars. Use only with session_capabilities.cancellation=true.".to_string())),
         ),
@@ -278,7 +290,34 @@ pub(crate) fn create_write_stdin_tool_with_max_timeout(max_timeout_ms: u64) -> T
             Some(vec!["session_id".to_string(), "incarnation".to_string()]),
             Some(false.into()),
         ),
-        output_schema: Some(unified_exec_output_schema().into()),
+        output_schema: Some(json!({"anyOf":[unified_exec_output_schema(), process_event_output_schema()]}).into()),
+    })
+}
+
+fn process_event_output_schema() -> Value {
+    json!({
+        "type":"object",
+        "description":"Read-only conditional observation, not command completion collection. Retained stdout/stderr are replayed unless event_filter.after is supplied, then only new bytes are examined. Reuse output_cursor as after to avoid old matches across waits; a split literal ending after the cursor still matches. No normal output is consumed. Exit/failure always end the wait, even without a match; a literal wait first drains output still open at exit, up to the timeout. history_complete=false means bytes a literal wait would examine were lost, or output was still open. At most 20 events and 16 literals (256 UTF-8 bytes each); failure messages cap at 1024 Unicode characters. Collect final output with ordinary write_stdin.",
+        "properties":{
+            "session_id":{"type":"integer"}, "incarnation":{"type":"string"},
+            "subscription_closed":{"const":true},
+            "subscription_end":{"enum":["events","timeout"]},
+            "history_complete":{"type":"boolean"},
+            "output_cursor":{"type":"object","properties":{
+                "stdout":{"type":"integer","minimum":0},
+                "stderr":{"type":"integer","minimum":0}
+            },"required":["stdout","stderr"],"additionalProperties":false},
+            "events":{"type":"array","maxItems":20,"items":{
+                "type":"object","properties":{
+                    "kind":{"enum":["output_match","output_gap","exited","failed"]},
+                    "stream":{"enum":["stdout","stderr","unknown"]},
+                    "contains":{"type":"string"}, "exit_code":{"type":["integer","null"]},
+                    "message":{"type":"string"}, "message_truncated":{"type":"boolean"}
+                },"required":["kind"],"additionalProperties":false
+            }}
+        },
+        "required":["session_id","incarnation","subscription_closed","subscription_end","history_complete","output_cursor","events"],
+        "additionalProperties":false
     })
 }
 
@@ -794,6 +833,8 @@ fn windows_shell_guidance() -> &'static str {
 Windows safety rules (apply when executing in a Windows environment, regardless of the host OS):
 - PowerShell and cmd do not expand wildcard paths for native `rg`. Search a literal parent directory with `--glob` instead, for example `rg -n "default_prompt:" skills --glob "**/agents/openai.yaml"`.
 - PowerShell `foreach` statements cannot feed a pipeline directly. Collect first: `$rows = foreach ($item in $items) { $item }; $rows | Out-String`.
+- Required PowerShell cmdlets must use `-ErrorAction Stop` (or a script-scoped stop policy); capture and check `$LASTEXITCODE` immediately after each required native command, before dependent work or success output. A final zero exit does not prove earlier steps succeeded. Guard genuinely optional paths explicitly rather than ignoring required failures.
+- For multiline Python or other interpreter code, prefer a literal PowerShell here-string piped to the selected interpreter's stdin over nested `-c` quoting. Keep diagnostic projections in named steps rather than deeply nested expressions.
 - For deletes and moves prefer `Remove-Item` / `Move-Item` with `-LiteralPath`; do not hand PowerShell-enumerated paths to `cmd /c` or another shell.
 - When using `Start-Process` to launch a background helper or service, pass `-WindowStyle Hidden` unless the user explicitly asked for a visible interactive window."#
 }

@@ -264,6 +264,7 @@ async fn run_connection_with_shutdown(
                                 method,
                                 crate::protocol::EXEC_TERMINATE_METHOD
                                     | crate::protocol::HTTP_REQUEST_CANCEL_METHOD
+                                    | crate::protocol::FS_CHECKSUM_FILE_CANCEL_METHOD
                             );
                         let filesystem_read = initialized && matches!(method,
                             crate::protocol::FS_READ_FILE_METHOD
@@ -272,7 +273,10 @@ async fn run_connection_with_shutdown(
                                 | crate::protocol::FS_GET_METADATA_METHOD
                                 | crate::protocol::FS_CANONICALIZE_METHOD
                                 | crate::protocol::FS_READ_DIRECTORY_METHOD
-                                | crate::protocol::FS_WALK_METHOD);
+                                | crate::protocol::FS_WALK_METHOD
+                                | crate::protocol::FS_READ_FILE_RANGE_METHOD
+                                | crate::protocol::FS_CHECKSUM_FILE_METHOD
+                                | crate::protocol::LOOKUP_EXECUTABLE_METHOD);
                         let independent_read = initialized
                             && (filesystem_read || matches!(
                                 method,
@@ -282,6 +286,7 @@ async fn run_connection_with_shutdown(
                                     | crate::protocol::ENVIRONMENT_INFO_METHOD
                                     | crate::protocol::HTTP_REQUEST_METHOD
                                     | crate::protocol::HTTP_REQUEST_CANCEL_METHOD
+                                    | crate::protocol::FS_CHECKSUM_FILE_CANCEL_METHOD
                             ));
                         if initialized
                             && (if control {
@@ -448,19 +453,33 @@ async fn run_connection_with_shutdown(
                         } else {
                             None
                         };
-                        // Act on the exact stream present at admission, never a
-                        // same-named replacement reached by a deferred lookup.
-                        let admitted_http_cancel = if initialized && method == crate::protocol::HTTP_REQUEST_CANCEL_METHOD {
+                        // Act on the exact stream or checksum present at admission,
+                        // never a same-named replacement reached by a deferred lookup.
+                        let admitted_cancel = if !initialized {
+                            None
+                        } else if method == crate::protocol::HTTP_REQUEST_CANCEL_METHOD {
                             Some(match serde_json::from_value::<crate::protocol::HttpRequestCancelParams>(request.params.clone().unwrap_or_default()) {
                                 Ok(params) => handler.cancel_http_body_stream(&params.request_id).await,
                                 Err(error) => Err(crate::rpc::invalid_params(error.to_string())),
                             })
+                        } else if method == crate::protocol::FS_CHECKSUM_FILE_CANCEL_METHOD {
+                            Some(match serde_json::from_value::<crate::protocol::FsChecksumFileCancelParams>(request.params.clone().unwrap_or_default()) {
+                                Ok(params) => handler.cancel_checksum_file(&params.cancel_id),
+                                Err(error) => Err(crate::rpc::invalid_params(error.to_string())),
+                            })
                         } else { None };
+                        // A checksum keeps its place in the read cohort that later
+                        // writes and starts await. Register its cancel id before it
+                        // queues: the cancel bypasses ordering and may arrive first.
+                        let admitted_checksum = (initialized && method == crate::protocol::FS_CHECKSUM_FILE_METHOD)
+                            .then(|| request.params.as_ref()?.get("cancelId")?.as_str().map(str::to_string))
+                            .flatten()
+                            .map(|cancel_id| handler.reserve_checksum_cancel(cancel_id));
                         filesystem_handle_reads.retain(|_, completion| completion.clone().now_or_never().is_none());
                         let read_handle = (method == crate::protocol::FS_READ_BLOCK_METHOD)
                             .then(|| request.params.as_ref()?.get("handleId")?.as_str().map(str::to_string))
                             .flatten();
-                        let mut predecessor = if admitted_terminate.is_some() || admitted_http_cancel.is_some() {
+                        let mut predecessor = if admitted_terminate.is_some() || admitted_cancel.is_some() {
                             None
                         } else if initialized && method == crate::protocol::EXEC_WRITE_METHOD {
                             // A blocked terminal owns only its own FIFO. Starts
@@ -568,8 +587,31 @@ async fn run_connection_with_shutdown(
                                 };
                                 Some(process_response(request.id, result))
                             })
-                        } else if let Some(result) = admitted_http_cancel {
+                        } else if let Some(result) = admitted_cancel {
                             Box::pin(async move { Some(process_response(request.id, result)) })
+                        } else if let Some(admitted) = admitted_checksum {
+                            match admitted {
+                                Ok(cancellation) => {
+                                    let request_id = request.id.clone();
+                                    let response = route(Arc::clone(&handler), request);
+                                    // Dropping the route stops local hashing at its next
+                                    // chunk or terminates the sandbox helper; dropping
+                                    // `cancellation` afterwards releases the id.
+                                    Box::pin(async move {
+                                        tokio::select! {
+                                            biased;
+                                            _ = cancellation.cancelled() => Some(RpcServerOutboundMessage::Error {
+                                                request_id,
+                                                error: invalid_request("fs/checksumFile cancelled".into()),
+                                            }),
+                                            message = response => message,
+                                        }
+                                    })
+                                }
+                                Err(error) => Box::pin(async move {
+                                    Some(RpcServerOutboundMessage::Error { request_id: request.id, error })
+                                }),
+                            }
                         } else if let Some(admitted) = admitted_http {
                             let handler = Arc::clone(&handler);
                             Box::pin(async move {

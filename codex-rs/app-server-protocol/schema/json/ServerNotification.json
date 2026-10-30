@@ -840,7 +840,11 @@
               "type": "string"
             },
             "path": {
-              "$ref": "#/definitions/LegacyAppPathString",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/LegacyAppPathString"
+                }
+              ],
               "description": "Absolute path in the executor's native path convention, not the host's."
             },
             "type": {
@@ -6511,6 +6515,97 @@
       ],
       "type": "object"
     },
+    "TurnTimingBlockingCategory": {
+      "enum": [
+        "resource_contention",
+        "dependency_wait"
+      ],
+      "type": "string"
+    },
+    "TurnTimingBlockingEvidence": {
+      "description": "Bounded evidence for instrumented awaits only. Checkpoints upsert intervals by ID and append edges; terminal records contain the complete retained lists. Resource prerequisites name a resource class, not a holder or CPU scheduler.",
+      "properties": {
+        "dependencies": {
+          "items": {
+            "$ref": "#/definitions/TurnTimingDependencyEdge"
+          },
+          "type": "array"
+        },
+        "droppedDependencies": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "droppedIntervals": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "intervals": {
+          "items": {
+            "$ref": "#/definitions/TurnTimingBlockingInterval"
+          },
+          "type": "array"
+        },
+        "version": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "dependencies",
+        "droppedDependencies",
+        "droppedIntervals",
+        "intervals",
+        "version"
+      ],
+      "type": "object"
+    },
+    "TurnTimingBlockingInterval": {
+      "description": "First Pending through Ready (or cancellation) of an awaited prerequisite. Includes wake/re-poll latency, not synchronous work before the first Pending. An absent end is right-censored at the enclosing timeline's frozen endpoint.",
+      "properties": {
+        "cancelled": {
+          "type": "boolean"
+        },
+        "category": {
+          "$ref": "#/definitions/TurnTimingBlockingCategory"
+        },
+        "dependent": {
+          "type": "string"
+        },
+        "endNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "id": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "prerequisite": {
+          "type": "string"
+        },
+        "startNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "cancelled",
+        "category",
+        "dependent",
+        "id",
+        "prerequisite",
+        "startNs"
+      ],
+      "type": "object"
+    },
     "TurnTimingCounters": {
       "properties": {
         "approvalWaitCount": {
@@ -6938,6 +7033,26 @@
         "saturationCount",
         "toolCallCount",
         "userInputWaitCount"
+      ],
+      "type": "object"
+    },
+    "TurnTimingDependencyEdge": {
+      "description": "Direction is dependent -> prerequisite. Generation and execution IDs are scoped to this turn and clock domain; chronology alone never adds an edge.",
+      "properties": {
+        "dependent": {
+          "type": "string"
+        },
+        "prerequisite": {
+          "type": "string"
+        },
+        "relation": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "dependent",
+        "prerequisite",
+        "relation"
       ],
       "type": "object"
     },
@@ -8453,6 +8568,17 @@
     },
     "TurnTimingTimeline": {
       "properties": {
+        "blocking": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TurnTimingBlockingEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Observed await suspensions and explicit dependency edges, not a complete task DAG. Absence is legacy unknown; idle time is never a blocking wait."
+        },
         "clockDomainId": {
           "description": "Absent for clocks without proven alignment (including legacy records).",
           "type": [

@@ -594,6 +594,7 @@ impl McpToolOutput {
 
 #[derive(Clone)]
 pub struct ToolSearchOutput {
+    pub search_complete: bool,
     pub tools: Vec<JsonValue>,
     pub omitted_result_count: usize,
     pub activated_omitted_tools: Vec<String>,
@@ -615,7 +616,7 @@ impl ToolOutput for ToolSearchOutput {
     fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInputItem {
         ResponseInputItem::ToolSearchOutput {
             call_id: call_id.to_string(),
-            status: if self.omitted_result_count == 0 {
+            status: if self.search_complete {
                 "completed".to_string()
             } else {
                 "incomplete".to_string()
@@ -627,7 +628,7 @@ impl ToolOutput for ToolSearchOutput {
     }
 
     fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
-        let status = if self.omitted_result_count == 0 {
+        let status = if self.search_complete {
             CodeModeToolSearchStatus::Completed
         } else {
             CodeModeToolSearchStatus::Incomplete
@@ -637,6 +638,7 @@ impl ToolOutput for ToolSearchOutput {
             self.tools.clone(),
             Some(self.omitted_result_count),
         );
+        result["search_complete"] = serde_json::json!(self.search_complete);
         if !self.activated_omitted_tools.is_empty() {
             result["activated_omitted_tools"] = serde_json::json!(self.activated_omitted_tools);
             result["resolution"] = serde_json::json!({"helper":"resolve_tool", "argument":"exact activated_omitted_tools name"});
@@ -928,6 +930,10 @@ impl ApplyPatchToolOutput {
     ) -> Self {
         use codex_apply_patch::AppliedPatchFileChange;
         let mut diagnostics = Vec::new();
+        let mut syntax_changes = std::collections::BTreeMap::<
+            std::path::PathBuf,
+            (&std::path::Path, &str, &str),
+        >::new();
         let mut remaining_diff_bytes = 32 * 1024usize;
         let changes = delta
             .changes()
@@ -956,6 +962,12 @@ impl ApplyPatchToolOutput {
                         (content.as_str(), "", &applied.path)
                     }
                 };
+                let baseline = syntax_changes.remove(applied.path.as_path());
+                if !matches!(&applied.change, AppliedPatchFileChange::Delete { .. }) {
+                    let (before_path, before, _) =
+                        baseline.unwrap_or((applied.path.as_path(), old, new));
+                    syntax_changes.insert(diagnostic_path.to_path_buf(), (before_path, before, new));
+                }
                 let diff = similar::TextDiff::from_lines(old, new);
                 for change in diff.iter_all_changes() {
                     if change.tag() != similar::ChangeTag::Insert {
@@ -1053,6 +1065,22 @@ impl ApplyPatchToolOutput {
                 change
             })
             .collect();
+        // Repeated sections can break and then repair one file. Compare its
+        // original preimage to its final committed bytes, not intermediate writes.
+        let syntax_deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        let mut syntax_budget_reported = false;
+        for (path, (before_path, before, after)) in syntax_changes {
+            if let Some(warning) = crate::tools::handlers::syntax_regression(
+                &before_path.to_string_lossy(),
+                &path.to_string_lossy(),
+                before,
+                after,
+                syntax_deadline,
+                &mut syntax_budget_reported,
+            ) {
+                diagnostics.push(warning);
+            }
+        }
         Self {
             text,
             success,
@@ -1089,7 +1117,10 @@ impl ApplyPatchToolOutput {
         let mut essential = Vec::new();
         for diagnostic in &self.diagnostics {
             match diagnostic["kind"].as_str() {
-                Some(kind @ ("trailing_whitespace" | "space_before_tab" | "conflict_marker")) => {
+                Some(
+                    kind @ ("trailing_whitespace" | "space_before_tab" | "conflict_marker"
+                    | "syntax_regression" | "syntax_check_skipped"),
+                ) => {
                     *counts.entry(kind).or_default() += 1;
                     let bytes = diagnostic.to_string().len();
                     if sample.len() < 8 && sample_bytes + bytes <= 2048 {
@@ -1119,13 +1150,24 @@ impl ApplyPatchToolOutput {
                 "Success. Updated the files.".to_string()
             } else {
                 format!(
-                    "Success. Updated the files. Added-line diagnostics: {}",
+                    "Success. Updated the files. Advisory patch diagnostics: {}",
                     self.diagnostic_display()
                 )
             }
         } else {
             failed_patch_text(&self.text, self.retry.as_ref())
         };
+        // Failure text already renders typed mismatch evidence; add only
+        // advisories about changes that remain committed.
+        if !self.success && include_diagnostics {
+            let mut display = self.diagnostic_display();
+            if display["advisory_count"].as_u64().is_some_and(|count| count > 0)
+                && let Some(fields) = display.as_object_mut()
+            {
+                fields.remove("diagnostics");
+                text.push_str(&format!("\nAdvisory patch diagnostics: {display}"));
+            }
+        }
         if !self.changes_exact {
             text.push_str(
                 "\nchanges_exact=false: the committed change inventory is incomplete or uncertain.",
@@ -1254,11 +1296,32 @@ pub struct AbortedToolOutput {
 }
 
 impl AbortedToolOutput {
-    fn rendered(&self) -> String {
-        match &self.recovery {
-            Some(recovery) => format!("{}\n{recovery}", self.message),
-            None => self.message.clone(),
+    fn failure(&self) -> codex_protocol::tool_failure::ToolFailure {
+        use codex_protocol::tool_failure::ToolEffectsState;
+        use codex_protocol::tool_failure::ToolFailure;
+        use codex_protocol::tool_failure::ToolFailureCode;
+        let mut failure = ToolFailure::new(ToolFailureCode::Cancelled, &self.message);
+        if let Some(recovery) = &self.recovery {
+            failure.effects = match recovery["effects_state"].as_str() {
+                Some("none") => ToolEffectsState::None,
+                Some("reported") => ToolEffectsState::Reported,
+                _ => ToolEffectsState::Unknown,
+            };
+            // Live operations belong to the typed field that callers inspect;
+            // keep the remaining recovery in its original key order.
+            let mut details = recovery.clone();
+            failure.live_operations = details
+                .as_object_mut()
+                .and_then(|object| object.shift_remove("live_operations"))
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_default();
+            failure.details = Some(details);
         }
+        failure
+    }
+
+    fn rendered(&self) -> String {
+        self.failure().model_message()
     }
 }
 
@@ -1282,13 +1345,8 @@ impl ToolOutput for AbortedToolOutput {
                 self.message.clone(),
             )],
             spillable_text: vec![self.rendered()],
-            essential_inline: {
-                let mut essential = serde_json::json!({ "state": "aborted" });
-                if let Some(recovery) = &self.recovery {
-                    essential["cancellation_recovery"] = recovery.clone();
-                }
-                essential
-            },
+            // tool_failure.details carries the recovery; do not repeat it.
+            essential_inline: serde_json::json!({ "state": "aborted", "tool_failure": self.failure() }),
             requested_limit: None,
             predetermined_ranges: Vec::new(),
             predetermined_json_pointers: Vec::new(),
@@ -1324,13 +1382,7 @@ impl ToolOutput for AbortedToolOutput {
             ToolPayload::ToolSearch { .. } => {
                 code_mode_tool_search_result(CodeModeToolSearchStatus::Aborted, Vec::new(), None)
             }
-            _ => {
-                let mut result = serde_json::json!({ "status": "aborted", "message": self.message });
-                if let Some(recovery) = &self.recovery {
-                    result["cancellation_recovery"] = recovery.clone();
-                }
-                result
-            }
+            _ => serde_json::json!({ "status": "aborted", "message": self.message, "tool_failure": self.failure() }),
         }
     }
 }

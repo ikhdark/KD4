@@ -77,7 +77,7 @@ impl ToolExecutor<ToolCall> for ListTool {
     fn spec(&self) -> ToolSpec {
         skill_function_tool::<ListArgs, ListResponse>(
             TOOL_NAME,
-            "List a page of enabled skills owned by the requested authority. Only orchestrator-owned skills are currently supported. Use name for an exact name or query for a substring search (not both, at most 256 bytes). search_complete=false means no-match is not definitive. discovery_blocked=true means discovery cannot advance until the MCP resource generation changes; known skills remain readable. Returns opaque package and main-resource handles for skills.read. Pass next_cursor back as cursor with the same filters to continue; restart from the first page if stale. An explicit first-page request retries failed discovery, but not blocked pagination.",
+            "List a page of enabled skills owned by the requested authority. Only orchestrator-owned skills are currently supported. Use name for an exact name or query for a substring search (not both, at most 256 bytes). search_complete=false means no-match is not definitive. discovery_blocked=true means this bounded attempt encountered repeated pagination, not a permanent block; known skills remain readable. Returns opaque package and main-resource handles for skills.read. Pass next_cursor back as cursor with the same filters to continue or retry incomplete discovery; restart from the first page if stale. An explicit first-page request retries failed discovery. Reuse a completed enumeration only with the same catalog generation, filters, authority, and access scope.",
         )
     }
 
@@ -129,7 +129,6 @@ impl ToolExecutor<ToolCall> for ListTool {
                 }
             };
             if catalog.continuation.is_some()
-                && !catalog.discovery_blocked()
                 && (start == skills.len() || (!search && args.cursor.is_none()))
             {
                 drop(skills);
@@ -204,7 +203,7 @@ fn page_response<'a>(
     search_complete: Option<bool>,
 ) -> Result<ListResponse<'a>, FunctionCallError> {
     let count = skills.len();
-    let incomplete = continuation.is_some_and(|progress| !progress.blocked);
+    let incomplete = continuation.is_some();
     let mut response = ListResponse {
         skills: Vec::new(),
         warnings,

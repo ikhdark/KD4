@@ -122,9 +122,13 @@ fn check(
             .and_then(|(_, script)| {
                 codex_shell_command::powershell::standalone_powershell_inspection_argv(script)
             }),
-            ShellType::Bash | ShellType::Sh | ShellType::Zsh => command
-                .last()
-                .and_then(|script| codex_shell_command::validation::standalone_argv(script)),
+            // Only the exact `shell -c script` shape names the script. A later
+            // positional parameter is $0/$1 data, not the command that runs.
+            ShellType::Bash | ShellType::Sh | ShellType::Zsh => {
+                codex_shell_command::bash::extract_bash_command(command).and_then(|(_, script)| {
+                    codex_shell_command::validation::standalone_argv(script)
+                })
+            }
             ShellType::Cmd => parsed()
                 .as_ref()
                 .filter(|stages| stages.len() == 1)
@@ -136,17 +140,7 @@ fn check(
         }
         // Flattening cannot prove the effective cwd/environment of a build.
         // A failed precise lowering must not turn a visible build into admission.
-        // CMD owns the complete tail after /c or /k, not each launch argument
-        // separately. Cargo's program and subcommand can span those arguments.
-        let possible_build = if shell == ShellType::Cmd {
-            super::extract_cmd_command(command).map_or_else(
-                || args.iter().any(|script| visibly_builds_cmd(script)),
-                |script| visibly_builds_cmd(script.as_ref()),
-            )
-        } else {
-            args.iter().any(|script| visibly_builds(script))
-        };
-        if possible_build
+        if shell_visibly_builds(command, shell, 0)
             || parsed().as_ref().is_some_and(|stages| {
                 stages.iter().any(|stage| visibly_builds_argv(stage, 0))
             })
@@ -1042,9 +1036,40 @@ fn potential_build(argv: &[String]) -> bool {
             && cargo_subcommand(&argv[1..]).is_some_and(|(_, name)| !cargo_builtin(name))
 }
 
-fn visibly_builds_cmd(script: &str) -> bool {
+/// Possible-build recognition for a shell envelope whose effective state is not
+/// proved, in that shell's own dialect. CMD owns the complete tail after /c or
+/// /k, not each launch argument separately; Cargo's program and subcommand can
+/// span those arguments. POSIX source uses its AST owner, which sees through
+/// prefix assignments and command substitutions; the established word scan
+/// still applies, so source the AST cannot recover keeps its rejection.
+fn shell_visibly_builds(command: &[String], shell: ShellType, depth: usize) -> bool {
+    let args = command.get(1..).unwrap_or(&[]);
+    match shell {
+        ShellType::Cmd => super::extract_cmd_command(command).map_or_else(
+            || args.iter().any(|script| visibly_builds_cmd(script, depth)),
+            |script| visibly_builds_cmd(script.as_ref(), depth),
+        ),
+        ShellType::Bash | ShellType::Sh | ShellType::Zsh => {
+            let builds = |script: &str| {
+                codex_shell_command::bash::possible_command_argvs(script)
+                    .iter()
+                    .any(|argv| visibly_builds_argv(argv, depth))
+                    || visibly_builds_at_depth(script, depth)
+            };
+            codex_shell_command::bash::extract_bash_command(command).map_or_else(
+                || args.iter().any(|script| builds(script)),
+                |(_, script)| builds(script),
+            )
+        }
+        ShellType::PowerShell => args
+            .iter()
+            .any(|script| visibly_builds_at_depth(script, depth)),
+    }
+}
+
+fn visibly_builds_cmd(script: &str, depth: usize) -> bool {
     super::possible_cmd_commands(script).is_none_or(|commands| {
-        commands.iter().any(|argv| visibly_builds_argv(argv, 0))
+        commands.iter().any(|argv| visibly_builds_argv(argv, depth))
     })
 }
 
@@ -1067,6 +1092,11 @@ fn visibly_builds_argv(argv: &[String], depth: usize) -> bool {
     }
     if potential_build(argv) {
         return true;
+    }
+    // A nested shell hides its own assignments and cd from the outer
+    // flattening, so a build inside it is as visible as one outside it.
+    if let Some(shell) = infer_direct_shell_type(argv) {
+        return shell_visibly_builds(argv, shell, depth + 1);
     }
     let Some((program, args)) = argv.split_first() else {
         return false;

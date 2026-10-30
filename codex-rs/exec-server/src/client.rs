@@ -779,6 +779,13 @@ impl ExecServerClient {
         })?
     }
 
+    pub async fn lookup_executable(
+        &self,
+        params: crate::LookupExecutableParams,
+    ) -> Result<crate::LookupExecutableResponse, ExecServerError> {
+        self.call(crate::protocol::LOOKUP_EXECUTABLE_METHOD, &params).await
+    }
+
     pub async fn exec(&self, params: ExecParams) -> Result<ExecResponse, ExecServerError> {
         self.call(EXEC_METHOD, &params).await
     }
@@ -903,6 +910,12 @@ impl ExecServerClient {
         params: FsReadFileBoundedParams,
     ) -> Result<FsReadFileBoundedResponse, ExecServerError> {
         self.call_optional_fs(FS_READ_FILE_BOUNDED_METHOD, &params).await
+    }
+
+    pub async fn fs_read_file_range(
+        &self, params: crate::protocol::FsReadFileRangeParams,
+    ) -> Result<crate::protocol::FsReadFileRangeResponse, ExecServerError> {
+        self.call_optional_fs(crate::protocol::FS_READ_FILE_RANGE_METHOD, &params).await
     }
 
     async fn call_optional_fs<P, T>(

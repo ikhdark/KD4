@@ -45,6 +45,11 @@ pub struct TurnTimingTimeline {
     pub started_at_ns: u64,
     pub duration_ns: u64,
     pub intervals: Vec<TurnTimingActivityInterval>,
+    /// Observed await suspensions and explicit dependency edges, not a complete
+    /// task DAG. Absence is legacy unknown; idle time is never a blocking wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub blocking: Option<TurnTimingBlockingEvidence>,
     /// Complete, bounded suffix summaries after exact interval retention fills.
     /// Order inside a summary is unknown. Checkpoints carry the entire current
     /// suffix, replacing (not appending to) the preceding coarse snapshot.
@@ -145,6 +150,55 @@ fn merge_durations(target: &mut BTreeMap<String, u64>, source: BTreeMap<String, 
         let duration = target.entry(name).or_default();
         *duration = duration.saturating_add(elapsed);
     }
+}
+
+/// Bounded evidence for instrumented awaits only. Checkpoints upsert intervals
+/// by ID and append edges; terminal records contain the complete retained lists.
+/// Resource prerequisites name a resource class, not a holder or CPU scheduler.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnTimingBlockingEvidence {
+    pub version: u16,
+    pub intervals: Vec<TurnTimingBlockingInterval>,
+    pub dependencies: Vec<TurnTimingDependencyEdge>,
+    pub dropped_intervals: u64,
+    pub dropped_dependencies: u64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export_to = "v2/")]
+pub enum TurnTimingBlockingCategory {
+    ResourceContention,
+    DependencyWait,
+}
+
+/// First Pending through Ready (or cancellation) of an awaited prerequisite.
+/// Includes wake/re-poll latency, not synchronous work before the first Pending.
+/// An absent end is right-censored at the enclosing timeline's frozen endpoint.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnTimingBlockingInterval {
+    pub id: u64,
+    pub dependent: String,
+    pub prerequisite: String,
+    pub category: TurnTimingBlockingCategory,
+    pub start_ns: u64,
+    pub end_ns: Option<u64>,
+    pub cancelled: bool,
+}
+
+/// Direction is dependent -> prerequisite. Generation and execution IDs are
+/// scoped to this turn and clock domain; chronology alone never adds an edge.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnTimingDependencyEdge {
+    pub dependent: String,
+    pub prerequisite: String,
+    pub relation: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]

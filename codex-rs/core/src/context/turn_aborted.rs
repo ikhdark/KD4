@@ -225,6 +225,31 @@ fn merge_checkpoint_entries(timing: &mut TurnTiming, previous: TurnTiming) {
         }
         intervals.append(&mut timeline.intervals);
         timeline.intervals = intervals;
+        // A blocking interval is written again when it changes (an open wait
+        // later ends), so upsert by ID. Edges are append-only and written
+        // exactly once, so concatenation keeps legitimate repeats. Drop
+        // counters are cumulative.
+        if let Some(earlier_blocking) = earlier.blocking {
+            match timeline.blocking.as_mut() {
+                Some(evidence) => {
+                    evidence.intervals = merge_by_identity(
+                        earlier_blocking.intervals,
+                        std::mem::take(&mut evidence.intervals),
+                        |interval| interval.id,
+                    );
+                    let mut dependencies = earlier_blocking.dependencies;
+                    dependencies.append(&mut evidence.dependencies);
+                    evidence.dependencies = dependencies;
+                    evidence.dropped_intervals = evidence
+                        .dropped_intervals
+                        .max(earlier_blocking.dropped_intervals);
+                    evidence.dropped_dependencies = evidence
+                        .dropped_dependencies
+                        .max(earlier_blocking.dropped_dependencies);
+                }
+                None => timeline.blocking = Some(earlier_blocking),
+            }
+        }
     }
 }
 

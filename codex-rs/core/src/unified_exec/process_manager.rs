@@ -900,8 +900,9 @@ impl UnifiedExecProcessManager {
                     .get(&process_id)
                     .is_some_and(|entry| Arc::ptr_eq(&entry.process, process));
                 if is_same_process {
+                    let removed = store.remove(process_id);
                     store.remember_finished(process_id, &output);
-                    store.remove(process_id)
+                    removed
                 } else {
                     None
                 }
@@ -2319,16 +2320,13 @@ impl UnifiedExecProcessManager {
         )
         .await
         .map_err(|err| match err {
-            error @ UnifiedExecError::RemoteStart { .. } => {
-                ToolError::Codex(CodexErr::Io(std::io::Error::other(error)))
-            }
             UnifiedExecError::SandboxDenied { output, .. } => {
                 ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
                     output,
                     network_policy_decision: None,
                 }))
             }
-            other => ToolError::Rejected(other.to_string()),
+            other => ToolError::Codex(CodexErr::Io(std::io::Error::other(other))),
         })
     }
 
@@ -2645,12 +2643,13 @@ impl UnifiedExecProcessManager {
             .await
             .map(|result| result.output)
             .map_err(|err| match err {
+                ToolError::Denied(message) => UnifiedExecError::PermissionDenied { message },
                 ToolError::Codex(CodexErr::Io(error))
                     if error.get_ref().is_some_and(<dyn std::error::Error + std::marker::Send + std::marker::Sync + 'static>::is::<UnifiedExecError>) =>
                 {
                     match error.into_inner().and_then(|source| source.downcast::<UnifiedExecError>().ok()) {
                         Some(error) => *error,
-                        None => UnifiedExecError::create_process("remote start evidence became unavailable".into()),
+                        None => UnifiedExecError::process_failed("remote start evidence became unavailable".into()),
                     }
                 }
                 ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied { output, .. })) => {

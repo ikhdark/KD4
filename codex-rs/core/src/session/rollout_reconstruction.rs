@@ -218,6 +218,16 @@ pub(super) fn historical_process_ids(items: &[RolloutItem]) -> HashSet<u32> {
         }
     }
     fn response_ids(item: &ResponseItem, ids: &mut HashSet<u32>) {
+        if let Some(inventory) = crate::unified_exec::process_inventory::recorded_inventory(item) {
+            for entry in inventory["entries"].as_array().into_iter().flatten() {
+                if let Some(id) = entry["session_id"]
+                    .as_u64()
+                    .and_then(|id| u32::try_from(id).ok())
+                {
+                    ids.insert(id);
+                }
+            }
+        }
         match item {
             ResponseItem::FunctionCallOutput { output, .. }
             | ResponseItem::CustomToolCallOutput { output, .. } => {
@@ -319,6 +329,24 @@ pub(super) fn append_unified_exec_resume_invalidation_with_rollout(
         })
         .collect::<HashSet<_>>();
     let mut handles = ResumeHandles::new();
+    // Inventory is an observation of the previous owner, never live authority
+    // in this owner. Preserve its identities in the existing invalidation notice.
+    for (position, item) in history.iter().enumerate() {
+        if let Some(inventory) = crate::unified_exec::process_inventory::recorded_inventory(item) {
+            for entry in inventory["entries"].as_array().into_iter().flatten() {
+                if let Some(id) = entry["session_id"]
+                    .as_u64()
+                    .and_then(|id| u32::try_from(id).ok())
+                {
+                    let artifact = entry["raw_output_artifact_id"]
+                        .as_str()
+                        .filter(|id| id.len() <= 160)
+                        .map(str::to_string);
+                    record_resume_handle(&mut handles, id, artifact, (false, position));
+                }
+            }
+        }
+    }
     // Canonical lifecycle items are host-produced and persisted independently
     // of script text. Never infer nested handles/artifacts from printed JSON.
     for (position, item) in rollout.iter().enumerate() {
@@ -376,7 +404,7 @@ pub(super) fn append_unified_exec_resume_invalidation_with_rollout(
     history.retain(|item| {
         let is_notice = is_unified_exec_resume_invalidation(item);
         had_notice |= is_notice;
-        !is_notice
+        !is_notice && !crate::unified_exec::process_inventory::is_process_inventory(item)
     });
     if !has_old_sessions && !had_notice && handles.is_empty() {
         return;
@@ -395,15 +423,16 @@ pub(super) fn append_unified_exec_resume_invalidation_with_rollout(
         "omitted_handle_count": omitted});
     let text = format!(
         "{UNIFIED_EXEC_RESUME_INVALIDATION_START}\n\
-Process session IDs in the pre-resume history are no longer live. Do not poll those old sessions. \
+Process session IDs recorded before this thread was resumed or forked are not live in this process owner. \
+Do not poll those old sessions. \
 Newly returned session IDs are valid and do not reuse recorded process IDs. \
-This includes sessions in nested code-mode command receipts. Pre-resume live cell execution \
-cannot be resumed. Only durably retained terminal receipts may be recoverable through wait; \
+This includes sessions in nested code-mode command receipts. Live cell execution from before \
+that boundary cannot be resumed. Only durably retained terminal receipts may be recoverable through wait; \
 do not restart work to recreate evidence. Invalidation does not establish \
 whether a command completed or was terminated; retain its recorded output and recovery references, \
 and re-establish uncertain effects before repeating it. \
 Start another process only when the current task still requires execution; \
-do not rerun completed commands merely because this conversation resumed.\n\
+do not rerun completed commands merely because this thread was resumed or forked.\n\
 Recorded process handles and saved output references (historical evidence, not a crash-time inventory):\n\
 {evidence}\n\
 </unified_exec_resume_invalidated>"

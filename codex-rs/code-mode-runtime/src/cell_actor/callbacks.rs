@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use codex_code_mode_protocol::CancellationCause;
 use codex_code_mode_protocol::NestedCancellation;
+use codex_protocol::tool_failure::ToolFailure;
+use codex_protocol::tool_failure::ToolFailureCode;
 use futures::FutureExt;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -135,11 +137,12 @@ pub(super) fn spawn_tool<H: CellHost>(
                     // Record before signalling: an observer woken by the
                     // cancellation must already be able to read why.
                     timeout_cancellation.cancel_with(CancellationCause::NestedDeadline);
-                    Err(if timeout_cancellation.cause() == Some(CancellationCause::NestedDeadline) {
+                    let message = if timeout_cancellation.cause() == Some(CancellationCause::NestedDeadline) {
                         format!("nested tool `{timeout_tool_name}` exceeded its {}ms timeout", timeout.as_millis())
                     } else {
                         timeout_cancellation.cause().map(|cause| cause.describe()).unwrap_or_else(|| "nested tool cancelled".into())
-                    })
+                    };
+                    Err(ToolFailure::new(ToolFailureCode::Cancelled, message).model_message())
                 }
             }
         })
@@ -169,11 +172,11 @@ pub(super) fn spawn_tool<H: CellHost>(
                 RuntimeCommand::ToolResponseAfterDeadline {
                     id: id.clone(),
                     result,
-                    error_text: if receipt_cancellation.cause() == Some(CancellationCause::NestedDeadline) {
+                    error_text: ToolFailure::new(ToolFailureCode::Cancelled, if receipt_cancellation.cause() == Some(CancellationCause::NestedDeadline) {
                         format!("nested tool `{tool_name}` exceeded its {}ms timeout; completed evidence is in error.results.completed.value; do not replay its effects", timeout.as_millis())
                     } else {
                         receipt_cancellation.cause().map(|cause| cause.describe()).unwrap_or_else(|| "nested tool cancelled".into())
-                    },
+                    }).model_message(),
                 },
                 None,
             ),
@@ -187,7 +190,14 @@ pub(super) fn spawn_tool<H: CellHost>(
             Ok(Err(error_text)) => (
                 RuntimeCommand::ToolError {
                     id: id.clone(),
-                    error_text,
+                    error_text: if serde_json::from_str::<serde_json::Value>(&error_text).ok()
+                        .and_then(|value| value.get("tool_failure").cloned())
+                        .and_then(|value| serde_json::from_value::<ToolFailure>(value).ok()).is_some()
+                    {
+                        error_text
+                    } else {
+                        ToolFailure::new(ToolFailureCode::Failed, error_text).model_message()
+                    },
                 },
                 None,
             ),
@@ -196,7 +206,7 @@ pub(super) fn spawn_tool<H: CellHost>(
                 (
                     RuntimeCommand::ToolError {
                         id: id.clone(),
-                        error_text: failure_reason.clone(),
+                        error_text: ToolFailure::new(ToolFailureCode::UncertainEffects, &failure_reason).model_message(),
                     },
                     Some(failure_reason),
                 )

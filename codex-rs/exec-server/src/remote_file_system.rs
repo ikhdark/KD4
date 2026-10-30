@@ -1,6 +1,7 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use codex_utils_path_uri::PathUri;
+use std::sync::Arc;
 use tokio::io;
 use tracing::trace;
 
@@ -29,11 +30,55 @@ use crate::protocol::FsReadFileParams;
 use crate::protocol::FsRemoveParams;
 use crate::protocol::FsWalkParams;
 use crate::protocol::FsWriteFileParams;
+use crate::rpc::RpcClient;
 
 const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
 const INVALID_PARAMS_ERROR_CODE: i64 = -32602;
 const METHOD_NOT_FOUND_ERROR_CODE: i64 = -32601;
 const NOT_FOUND_ERROR_CODE: i64 = -32004;
+
+/// Validate the bounded, revision-aware wire result for remote and helper reads.
+pub(crate) fn decode_file_range(
+    response: crate::protocol::FsReadFileRangeResponse, start: u64, len: usize,
+    expected: Option<&str>,
+) -> io::Result<codex_file_system::FileRangeRead> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid revision-bound byte-range response");
+    if !(1..=codex_file_system::FILE_RANGE_MAX_BYTES).contains(&len)
+        || start.checked_add(len as u64).is_none()
+        || start > response.file_bytes
+        || response.revision.is_empty() || response.revision.len() > 512
+        || expected.is_some_and(|expected| expected != response.revision)
+        || response.data_base64.len() > len.div_ceil(3) * 4
+    {
+        return Err(invalid());
+    }
+    let bytes = STANDARD.decode(response.data_base64).map_err(|_| invalid())?;
+    if bytes.len() as u64 != (response.file_bytes - start).min(len as u64) {
+        return Err(invalid());
+    }
+    Ok(codex_file_system::FileRangeRead { bytes, file_bytes: response.file_bytes, revision: response.revision })
+}
+
+/// Validate a remote or helper digest before it can certify any bytes.
+pub(crate) fn validate_file_digest(
+    digest: Option<codex_file_system::FileDigest>,
+) -> io::Result<Option<codex_file_system::FileDigest>> {
+    if let Some(digest) = &digest
+        && (digest.sha256.len() != 64
+            || !digest
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || digest.revision.is_empty()
+            || digest.revision.len() > 512)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid file checksum response",
+        ));
+    }
+    Ok(digest)
+}
 
 #[path = "remote_file_stream.rs"]
 mod file_stream;
@@ -337,6 +382,22 @@ impl RemoteFileSystem {
                 "remote filesystem did not apply requested walk filters; update the execution server or use an unfiltered audit",
             ));
         }
+        if options.apply_gitignore && !response.gitignore_applied {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "remote filesystem did not apply gitignore rules; update it or set include_ignored=true",
+            ));
+        }
+        if options.summary_only && response.summary.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "remote filesystem did not aggregate the walk; update the execution server",
+            ));
+        }
+        if options.include_metadata && !response.metadata_included {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,
+                "remote filesystem did not include requested entry metadata; update the execution server"));
+        }
         Ok(response)
     }
 
@@ -383,6 +444,51 @@ impl RemoteFileSystem {
 }
 
 impl ExecutorFileSystem for RemoteFileSystem {
+    fn read_file_range<'a>(
+        &'a self, path: &'a PathUri, start: u64, len: usize,
+        expected_revision: Option<&'a str>, sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, codex_file_system::FileRangeRead> {
+        Box::pin(async move {
+            let client = self.client.get().await.map_err(map_remote_error)?;
+            // No old-peer stream fallback: it cannot bind a page to a revision.
+            let response = client.fs_read_file_range(crate::protocol::FsReadFileRangeParams {
+                path: path.clone(), start, len, expected_revision: expected_revision.map(str::to_owned),
+                sandbox: remote_sandbox_context(sandbox),
+            }).await.map_err(map_remote_error)?;
+            decode_file_range(response, start, len, expected_revision)
+        })
+    }
+
+    fn checksum_file<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<codex_file_system::FileDigest>> {
+        Box::pin(async move {
+            let client = self.client.get().await.map_err(map_remote_error)?;
+            // Bind the call to one transport so an abandoned pass is cancelled
+            // where it runs; later writes and starts there queue behind it.
+            let rpc_client = client.rpc_client().await.map_err(map_remote_error)?;
+            let cancel_id = uuid::Uuid::new_v4().simple().to_string();
+            let mut cancel_on_drop =
+                CancelChecksumOnDrop(Some((Arc::clone(&rpc_client), cancel_id.clone())));
+            // Older peers refuse with Unsupported; no per-page or host fallback.
+            let response: Result<crate::protocol::FsChecksumFileResponse, _> = client
+                .call_rpc(
+                    &rpc_client,
+                    crate::protocol::FS_CHECKSUM_FILE_METHOD,
+                    &crate::protocol::FsChecksumFileParams {
+                        path: path.clone(),
+                        sandbox: remote_sandbox_context(sandbox),
+                        cancel_id: Some(cancel_id),
+                    },
+                )
+                .await;
+            cancel_on_drop.0 = None;
+            validate_file_digest(response.map_err(map_remote_error)?.digest)
+        })
+    }
+
     fn mutate_file_if_matches<'a>(
         &'a self,
         path: &'a PathUri,
@@ -554,6 +660,29 @@ impl ExecutorFileSystem for RemoteFileSystem {
             options,
             sandbox,
         ))
+    }
+}
+
+/// Abandons an executor checksum whose call was dropped before its response.
+/// Best effort: an unknown or finished id is a no-op on the executor, and an
+/// older peer's method-not-found just leaves its pass to finish as before.
+struct CancelChecksumOnDrop(Option<(Arc<RpcClient>, String)>);
+
+impl Drop for CancelChecksumOnDrop {
+    fn drop(&mut self) {
+        let Some((rpc_client, cancel_id)) = self.0.take() else {
+            return;
+        };
+        // Never recover or replay a connection just to cancel obsolete work.
+        rpc_client.cleanup_runtime().spawn(async move {
+            let _: Result<(), _> = rpc_client
+                .call_for_cleanup(
+                    crate::protocol::FS_CHECKSUM_FILE_CANCEL_METHOD,
+                    &crate::protocol::FsChecksumFileCancelParams { cancel_id },
+                    std::time::Duration::from_secs(5),
+                )
+                .await;
+        });
     }
 }
 

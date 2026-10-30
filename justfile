@@ -205,6 +205,12 @@ cargo-lane lane *args:
 [windows]
 cargo-lane-isolated-home lane *args:
     @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\build\cargo-lane.ps1" -Lane "{{ lane }}" -IsolateCargoHome -WarmWaitSeconds "{{ rust_validation_wait_seconds }}" @($args | Select-Object -Skip 2); exit $LASTEXITCODE
+
+# Print the existing frozen build receipt for an exact Cargo command; never build.
+[windows]
+cargo-artifacts *args:
+    @python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" find-bundle --repo-root "{{ justfile_directory() }}" --receipt -- @($args | Select-Object -Skip 1); exit $LASTEXITCODE
+
 [no-cd]
 target-disk:
     @{python-recipe}{{ python }}

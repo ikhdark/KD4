@@ -11,6 +11,8 @@ use codex_code_mode::NotificationFuture;
 use codex_code_mode::ToolInvocationFuture;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::tool_failure::ToolFailure;
+use codex_protocol::tool_failure::ToolFailureCode;
 use serde_json::Value as JsonValue;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
@@ -325,8 +327,12 @@ impl CodeModeDispatchBroker {
                             .await;
                             if !ready {
                                 observation.outcome = "gate_cancelled";
-                                let _ = response_tx
-                                    .send(Err("code mode nested tool call cancelled".to_string()));
+                                let _ = response_tx.send(Err(nested_tool_failure(
+                                    &cell_id,
+                                    ToolFailureCode::Cancelled,
+                                    "code mode nested tool call cancelled",
+                                    /*admitted*/ false,
+                                )));
                                 return;
                             }
                             let scope_matches = cells
@@ -338,9 +344,12 @@ impl CodeModeDispatchBroker {
                             if !scope_matches {
                                 observation.phase = "environment_gate";
                                 observation.outcome = "scope_refused";
-                                let _ = response_tx.send(Err(
-                                    "code mode cell environment selection changed; start a new cell for the current scope".to_string(),
-                                ));
+                                let _ = response_tx.send(Err(nested_tool_failure(
+                                    &cell_id,
+                                    ToolFailureCode::StaleInput,
+                                    "code mode cell environment selection changed; start a new cell for the current scope",
+                                    /*admitted*/ false,
+                                )));
                                 return;
                             }
                             let child_started_at = Instant::now();
@@ -378,7 +387,12 @@ impl CodeModeDispatchBroker {
                                     // process/runtime cleanup before this
                                     // dispatch task releases its handles.
                                     let _ = invocation.await;
-                                    Err("code mode nested tool call cancelled".to_string())
+                                    Err(nested_tool_failure(
+                                        &cell_id,
+                                        ToolFailureCode::Cancelled,
+                                        "code mode nested tool call cancelled",
+                                        /*admitted*/ true,
+                                    ))
                                 }
                             };
                             let child_completed_at = Instant::now();
@@ -500,6 +514,24 @@ fn duration_ms(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Typed failure for a nested call stopped by this dispatcher, so the cell
+/// receives the same code whichever side observes cancellation first.
+/// `admitted` means the call may have started and its effects are unknown.
+fn nested_tool_failure(
+    cell_id: &CellId,
+    code: ToolFailureCode,
+    message: &str,
+    admitted: bool,
+) -> String {
+    let mut failure = if admitted {
+        ToolFailure::new(code, message)
+    } else {
+        ToolFailure::no_effects(code, message)
+    };
+    failure.details = Some(serde_json::json!({"cell_id": cell_id.as_str()}));
+    failure.model_message()
+}
+
 async fn invoke_with_user_intent(
     input_queue: &crate::session::InputQueue,
     cell_id: &CellId,
@@ -517,12 +549,18 @@ async fn invoke_with_user_intent(
             std::future::Future::poll(invocation.as_mut(), cx)
         }) {
             Ok(result) => result,
-            Err(current_epoch) => std::task::Poll::Ready(Err(serde_json::json!({
-                "type": "plan_invalidated", "started": false,
-                "cell_id": cell_id.to_string(), "authoring_epoch": authoring_epoch,
-                "current_epoch": current_epoch,
-                "message": "User intent changed; author a new cell after incorporating the accepted input."
-            }).to_string())),
+            Err(current_epoch) => {
+                // Refused before admission: the call never started.
+                let mut failure = ToolFailure::no_effects(
+                    ToolFailureCode::StaleInput,
+                    "User intent changed; author a new cell after incorporating the accepted input.",
+                );
+                failure.details = Some(serde_json::json!({
+                    "cell_id": cell_id.as_str(), "authoring_epoch": authoring_epoch,
+                    "current_epoch": current_epoch,
+                }));
+                std::task::Poll::Ready(Err(failure.model_message()))
+            }
         }
     }).await
 }
@@ -562,27 +600,36 @@ impl CodeModeSessionDelegate for CodeModeDispatchBroker {
         cancellation: NestedCancellation,
     ) -> ToolInvocationFuture<'a> {
         Box::pin(async move {
+            let cell_id = invocation.cell_id.clone();
+            let failure = |code, message: &str, admitted: bool| {
+                nested_tool_failure(&cell_id, code, message, admitted)
+            };
             if cancellation.is_cancelled() {
-                return Err("code mode nested tool call cancelled".to_string());
+                return Err(failure(ToolFailureCode::Cancelled, "code mode nested tool call cancelled", false));
             }
             let cancellation_token = cancellation.token().clone();
             let (response_tx, response_rx) = oneshot::channel();
             tokio::select! {
                 biased;
-                _ = cancellation_token.cancelled() => return Err("code mode nested tool call cancelled".to_string()),
+                _ = cancellation_token.cancelled() => return Err(failure(ToolFailureCode::Cancelled, "code mode nested tool call cancelled", false)),
                 sent = self.dispatch_tx
                 .send(DispatchMessage::InvokeTool {
                     invocation,
                     cancellation: cancellation.clone(),
                     enqueued_at: Instant::now(),
                     response_tx,
-                }) => sent.map_err(|_| "code mode nested tool dispatcher is unavailable".to_string())?,
+                }) => sent.map_err(|_| failure(ToolFailureCode::RetryableFailure, "code mode nested tool dispatcher is unavailable", false))?,
             }
             tokio::select! {
-                response = response_rx => response
-                    .map_err(|_| "code mode nested tool dispatcher stopped".to_string())?,
+                // The worker drops a cancelled message, so its receive error
+                // can be ready together with the cancellation branch.
+                response = response_rx => response.map_err(|_| if cancellation_token.is_cancelled() {
+                    failure(ToolFailureCode::Cancelled, "code mode nested tool call cancelled", true)
+                } else {
+                    failure(ToolFailureCode::UncertainEffects, "code mode nested tool dispatcher stopped", true)
+                })?,
                 _ = cancellation_token.cancelled() => {
-                    Err("code mode nested tool call cancelled".to_string())
+                    Err(failure(ToolFailureCode::Cancelled, "code mode nested tool call cancelled", true))
                 }
             }
         })
@@ -703,7 +750,7 @@ impl CoreTurnHost {
             .with_code_mode_user_intent(invocation.cell_id.as_str(), authoring_epoch);
         call_nested_tool(self.exec.clone(), tool_runtime, invocation, cancellation)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.model_message())
     }
 
     async fn notify(&self, call_id: String, cell_id: CellId, text: String) -> Result<(), String> {

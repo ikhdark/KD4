@@ -6,12 +6,17 @@ pub(crate) mod apply_patch_spec;
 pub(crate) use codex_command_analysis::command_preflight;
 pub(crate) use codex_command_analysis::command_search;
 pub(crate) use codex_command_analysis::command_shape;
+mod checksum_file;
+mod compare_artifacts;
 mod current_time;
 mod dynamic;
 pub(crate) mod extension_tools;
+mod git_blame;
+mod git_inspection;
 mod list_available_plugins_to_install;
 pub(crate) mod list_available_plugins_to_install_spec;
 mod list_files;
+mod lookup_executable;
 pub(crate) mod mcp;
 mod mcp_resource;
 pub(crate) mod mcp_resource_spec;
@@ -21,6 +26,7 @@ pub(crate) mod multi_agents_v2;
 mod plan;
 pub(crate) mod plan_spec;
 mod read_file;
+pub(crate) use read_file::syntax_regression;
 mod read_tool_output;
 pub(crate) mod read_tool_output_spec;
 mod request_permissions;
@@ -33,12 +39,14 @@ mod shell;
 pub(crate) use shell::validation_diagnostic_range;
 pub(crate) mod shell_spec;
 mod sleep;
+mod snapshot_freshness;
 mod tool_search;
 pub(crate) mod tool_search_spec;
 pub(crate) mod unified_exec;
 mod view_image;
 pub(crate) mod view_image_spec;
 mod wait_for_environment;
+mod wait_for_file;
 
 use codex_protocol::request_permissions::UriAdditionalPermissionProfile;
 use codex_sandboxing::policy_transforms::intersect_uri_permission_profiles;
@@ -65,10 +73,15 @@ use crate::tools::handlers::command_shape::CommandInvocation;
 pub use apply_patch::ApplyPatchHandler;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::AskForApproval;
+pub(crate) use checksum_file::ChecksumFileHandler;
+pub(crate) use compare_artifacts::CompareArtifactsHandler;
 pub use current_time::CurrentTimeHandler;
 pub use dynamic::DynamicToolHandler;
+pub(crate) use git_blame::GitBlameHandler;
+pub(crate) use git_inspection::GitInspectionHandler;
 pub use list_available_plugins_to_install::ListAvailablePluginsToInstallHandler;
 pub(crate) use list_files::ListFilesHandler;
+pub(crate) use lookup_executable::LookupExecutableHandler;
 pub use mcp::McpHandler;
 pub use mcp_resource::ListMcpResourceTemplatesHandler;
 pub use mcp_resource::ListMcpResourcesHandler;
@@ -91,6 +104,7 @@ pub use shell::ShellCommandHandler;
 pub(crate) use shell::ShellCommandHandlerOptions;
 pub(crate) use shell::VALIDATION_COMMAND_TIMEOUT_MS;
 pub use sleep::SleepHandler;
+pub(crate) use snapshot_freshness::CheckSnapshotFreshnessHandler;
 pub(crate) use tool_search::ToolSearchHandler;
 pub(crate) use tool_search::ToolSearchHandlerCache;
 pub use unified_exec::ExecCommandHandler;
@@ -99,6 +113,7 @@ pub use unified_exec::WriteStdinHandler;
 pub(crate) use unified_exec::validate_exec_command_arguments;
 pub use view_image::ViewImageHandler;
 pub(crate) use wait_for_environment::WaitForEnvironmentHandler;
+pub(crate) use wait_for_file::WaitForFileHandler;
 
 tokio::task_local! {
     static PARSED_FUNCTION_ARGUMENTS: ParsedFunctionArguments;
@@ -150,11 +165,11 @@ impl ParsedFunctionArguments {
         }
         Some(match &self.value {
             Ok(value) => T::deserialize(value.as_ref()).map_err(|err| {
-                FunctionCallError::RespondToModel(format!(
+                invalid_arguments(format!(
                     "failed to parse function arguments: {err}"
                 ))
             }),
-            Err(message) => Err(FunctionCallError::RespondToModel(format!(
+            Err(message) => Err(invalid_arguments(format!(
                 "failed to parse function arguments: {message}"
             ))),
         })
@@ -202,8 +217,15 @@ where
         return parsed;
     }
     serde_json::from_str(arguments).map_err(|err| {
-        FunctionCallError::RespondToModel(format!("failed to parse function arguments: {err}"))
+        invalid_arguments(format!("failed to parse function arguments: {err}"))
     })
+}
+
+fn invalid_arguments(message: String) -> FunctionCallError {
+    FunctionCallError::structured(codex_protocol::tool_failure::ToolFailure::no_effects(
+        codex_protocol::tool_failure::ToolFailureCode::InvalidInput,
+        message,
+    ))
 }
 
 fn updated_hook_command(updated_input: &Value) -> Result<&str, FunctionCallError> {

@@ -15,6 +15,9 @@ use crate::unified_exec::WriteStdinRequest;
 use codex_async_utils::OrCancelExt;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TerminalInteractionEvent;
+use codex_protocol::tool_failure::ToolFailure;
+use codex_protocol::tool_failure::ToolFailureCode;
+use codex_protocol::tool_failure::ToolOperationHandle;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use serde::Deserialize;
@@ -39,6 +42,8 @@ struct WriteStdinArgs {
     wait_for_output: Option<bool>,
     #[serde(default)]
     terminate: bool,
+    #[serde(default)]
+    event_filter: Option<crate::unified_exec::ProcessEventFilter>,
 }
 
 impl WriteStdinArgs {
@@ -136,6 +141,34 @@ impl WriteStdinHandler {
         };
 
         let args: WriteStdinArgs = parse_arguments(&arguments)?;
+        if let Some(filter) = &args.event_filter {
+            if !args.chars.is_empty() || args.terminate || args.wait_for_output.is_some()
+                || args.yield_time_ms.is_some() || args.max_output_tokens.is_some()
+            {
+                return Err(FunctionCallError::RespondToModel(
+                    "event_filter is observation-only; omit chars, terminate, wait_for_output, yield_time_ms and max_output_tokens".into(),
+                ));
+            }
+            filter.validate(self.max_timeout_ms).map_err(FunctionCallError::RespondToModel)?;
+            let incarnation = args.incarnation.ok_or_else(|| FunctionCallError::RespondToModel(
+                "event_filter requires the originating process incarnation".into(),
+            ))?;
+            let result = session.services.unified_exec_manager
+                .filtered_process_events(
+                    args.session_id,
+                    incarnation,
+                    filter,
+                    // Return a timeout result with its cursor before a nested
+                    // wrapper deadline drops the call.
+                    crate::unified_exec::nested_poll_bound(source.nested_deadline()),
+                )
+                .or_cancel(&cancellation_token).await
+                .map_err(|_| FunctionCallError::RespondToModel(
+                    "process event subscription cancelled and closed; process and normal output are unchanged".into(),
+                ))?
+                .map_err(FunctionCallError::RespondToModel)?;
+            return Ok(boxed_tool_output(codex_tools::JsonToolOutput::with_success(result, Some(true))));
+        }
         let live_incarnation = session
             .services
             .unified_exec_manager
@@ -158,9 +191,10 @@ impl WriteStdinHandler {
         // prevents persisted values from controlling another runtime's process.
         let incarnation = match args.incarnation {
             Some(incarnation) if live_incarnation == Some(incarnation) => incarnation,
-            _ => return Err(FunctionCallError::RespondToModel(
-                "process handle is stale or lacks its creation identity; supply incarnation from the originating session_capabilities. No process was polled, written, or terminated.".into(),
-            )),
+            _ => return Err(FunctionCallError::structured(ToolFailure::no_effects(
+                ToolFailureCode::StaleInput,
+                "process handle is stale or lacks its creation identity; supply incarnation from the originating session_capabilities. No process was polled, written, or terminated.",
+            ))),
         };
         let wait_for_output = args.waits_for_output();
         if args.terminate && !args.chars.is_empty() {
@@ -174,7 +208,9 @@ impl WriteStdinHandler {
             ));
         }
         validate_independent_review_stdin(&turn.session_source, &args.chars, args.terminate)
-            .map_err(|message| FunctionCallError::RespondToModel(message.to_string()))?;
+            .map_err(|message| FunctionCallError::structured(ToolFailure::no_effects(
+                ToolFailureCode::PermissionDenied, message,
+            )))?;
         if args.terminate
             && !session
                 .services
@@ -182,9 +218,11 @@ impl WriteStdinHandler {
                 .terminate_process_for_poll(args.session_id)
                 .await
         {
-            return Err(FunctionCallError::RespondToModel(
+            return Err(stdin_failure(
+                ToolFailureCode::UncertainEffects,
                 "termination could not be confirmed; inspect the session before retrying"
                     .to_string(),
+                args.session_id, incarnation,
             ));
         }
         let yield_time_ms = owner_wait_yield_time_ms(
@@ -212,8 +250,10 @@ impl WriteStdinHandler {
                     .or_cancel(&cancellation_token)
                     .await
                     .map_err(|_| {
-                        FunctionCallError::RespondToModel(
+                        stdin_failure(
+                            ToolFailureCode::Cancelled,
                             "command wait cancelled; process state remains inspectable".to_string(),
+                            args.session_id, incarnation,
                         )
                     })?
             } else {
@@ -296,9 +336,11 @@ impl WriteStdinHandler {
                 ));
             }
             Err(err) => {
-                return Err(FunctionCallError::RespondToModel(format!(
-                    "write_stdin failed: {err}"
-                )));
+                return Err(stdin_failure(
+                    ToolFailureCode::UncertainEffects,
+                    format!("write_stdin failed: {err}"),
+                    args.session_id, incarnation,
+                ));
             }
         };
 
@@ -379,6 +421,23 @@ impl WriteStdinHandler {
             .await;
         Ok(boxed_tool_output(response))
     }
+}
+
+fn stdin_failure(
+    code: ToolFailureCode,
+    message: String,
+    session_id: u32,
+    incarnation: uuid::Uuid,
+) -> FunctionCallError {
+    let mut failure = ToolFailure::new(code, message);
+    failure.live_operations.push(ToolOperationHandle {
+        tool: "write_stdin".to_string(),
+        arguments: serde_json::json!({"session_id":session_id,"incarnation":incarnation,"chars":""}),
+    });
+    failure.safe_next_actions.push(
+        "Use the originating handle with empty chars to inspect/collect the existing operation; do not resend input or launch a replacement command. A retired handle is not proof of rollback.".into(),
+    );
+    FunctionCallError::structured(failure)
 }
 
 fn nested_return_margin_reached(

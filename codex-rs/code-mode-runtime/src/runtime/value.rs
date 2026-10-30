@@ -608,10 +608,23 @@ pub(super) fn error_value<'s>(
     if scope.is_execution_terminating() {
         return v8::undefined(scope).into();
     }
-    match v8::String::new(scope, message) {
+    let error = match v8::String::new(scope, message) {
         Some(message) => v8::Exception::error(scope, message),
         None => v8::undefined(scope).into(),
+    };
+    // The bridge keeps its existing string transport, but a native failure
+    // envelope remains machine-readable on caught JavaScript exceptions.
+    if let Ok(envelope) = serde_json::from_str::<JsonValue>(message)
+        && let Some(failure) = envelope.get("tool_failure")
+        && serde_json::from_value::<codex_protocol::tool_failure::ToolFailure>(failure.clone()).is_ok()
+        && let Ok(object) = v8::Local::<v8::Object>::try_from(error)
+        && let Some(json) = v8::String::new(scope, &failure.to_string())
+        && let Some(value) = v8::json::parse(scope, json)
+        && let Some(key) = v8::String::new(scope, "tool_failure")
+    {
+        object.set(scope, key.into(), value);
     }
+    error
 }
 
 fn valid_image_data_uri(uri: &str) -> bool {

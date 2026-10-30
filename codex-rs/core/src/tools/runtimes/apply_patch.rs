@@ -67,6 +67,7 @@ pub struct ApplyPatchRequest {
 pub struct ApplyPatchRuntime {
     committed_delta: AppliedPatchDelta,
     patch_mismatch: Option<codex_apply_patch::PatchContextMismatch>,
+    revision_guard_mismatch: bool,
     workspace_tracking_started: bool,
     workspace_tracking_finished: bool,
     mutation_repo_root: Option<PathBuf>,
@@ -106,6 +107,10 @@ impl ApplyPatchRuntime {
 
     pub(crate) fn patch_mismatch(&self) -> Option<&codex_apply_patch::PatchContextMismatch> {
         self.patch_mismatch.as_ref()
+    }
+
+    pub(crate) fn revision_guard_mismatch(&self) -> bool {
+        self.revision_guard_mismatch
     }
 
     pub async fn finish_pending_workspace_tracking(&mut self, ctx: &ToolCtx) {
@@ -487,6 +492,9 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
                         } => {
                             self.patch_mismatch = mismatches.first().cloned();
                         }
+                        codex_apply_patch::ApplyPatchError::RevisionGuardMismatch(_) => {
+                            self.revision_guard_mismatch = true;
+                        }
                         _ => {}
                     }
                     let kind = patch_failure_kind(&error);
@@ -554,6 +562,7 @@ pub(crate) fn patch_failure_kind(error: &codex_apply_patch::ApplyPatchError) -> 
         ApplyPatchError::ParseError(_) => "parse",
         ApplyPatchError::IoError(_) => "io",
         ApplyPatchError::ComputeReplacements(_) => "replacement",
+        ApplyPatchError::RevisionGuardMismatch(_) => "revision_guard_mismatch",
         ApplyPatchError::MultiplePatchConflicts { .. } => "multiple_conflicts",
         ApplyPatchError::PathUri(_) => "path",
         ApplyPatchError::ImplicitInvocation => "implicit_invocation",

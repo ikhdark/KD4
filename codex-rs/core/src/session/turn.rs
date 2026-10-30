@@ -7337,7 +7337,11 @@ async fn drain_in_flight_with_buffer(
         let completion = if let Some(completion) = completed.pop_front() {
             completion
         } else {
-            let Some(completion) = in_flight.next().await else {
+            let Some(completion) = turn_context.turn_timing_state.observe_wait(
+                "sampling", "tool-relay:ordered-results",
+                codex_protocol::timing::TurnTimingBlockingCategory::DependencyWait,
+                in_flight.next(),
+            ).await else {
                 break;
             };
             completion
@@ -7792,9 +7796,11 @@ fn try_run_sampling_request<'a>(
             let expected_generation = terminal.wake_generation_id();
             let _sampling_waiter =
                 SamplingGateWaiterGuard::new(Arc::clone(&turn_context.turn_timing_state));
-            let wake = terminal
-                .wait_for_interrupt_resolution(&expected_generation)
-                .await;
+            let wake = turn_context.turn_timing_state.observe_wait(
+                "sampling", "sampling:interrupt-resolution",
+                codex_protocol::timing::TurnTimingBlockingCategory::DependencyWait,
+                terminal.wait_for_interrupt_resolution(&expected_generation),
+            ).await;
             let wait_finished_at_ms = turn_context.turn_timing_state.monotonic_offset_ms();
             turn_context
                 .turn_timing_state
@@ -7959,11 +7965,17 @@ fn try_run_sampling_request<'a>(
                     let wait_started_at_ms = turn_timing_state.monotonic_offset_ms();
                     let sampling_waiter =
                         SamplingGateWaiterGuard::new(Arc::clone(&turn_timing_state));
-                    let Some(admission) = terminal.acquire_sampling_admission().await else {
+                    let Some(admission) = turn_timing_state.observe_wait(
+                        "sampling", "resource:sampling-admission",
+                        codex_protocol::timing::TurnTimingBlockingCategory::ResourceContention,
+                        terminal.acquire_sampling_admission(),
+                    ).await else {
                         let expected_generation = terminal.wake_generation_id();
-                        let wake = terminal
-                            .wait_for_interrupt_resolution(&expected_generation)
-                            .await;
+                        let wake = turn_timing_state.observe_wait(
+                            "sampling", "sampling:interrupt-resolution",
+                            codex_protocol::timing::TurnTimingBlockingCategory::DependencyWait,
+                            terminal.wait_for_interrupt_resolution(&expected_generation),
+                        ).await;
                         let wait_finished_at_ms = turn_timing_state.monotonic_offset_ms();
                         turn_timing_state.record_pending_tool_timer_wait(ToolLifecycleTimerWait {
                             wait_kind: "sampling_gate_acquisition_and_resolution".to_string(),

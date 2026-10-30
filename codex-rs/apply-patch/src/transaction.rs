@@ -1,6 +1,6 @@
 //! Advisory endpoint ownership for cooperating local patch processes. This does
 //! not exclude editors/commands that do not participate, or provide remote CAS.
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
@@ -13,6 +13,7 @@ use sha2::Digest;
 use sha2::Sha256;
 
 use crate::Hunk;
+use crate::FileRevisionGuard;
 use crate::invocation::mutation_endpoint_identity;
 
 pub(crate) struct PatchTransaction {
@@ -21,28 +22,39 @@ pub(crate) struct PatchTransaction {
     _locks: Vec<File>,
 }
 
+/// Lease keys, each mapped to whether this patch mutates that endpoint.
 async fn identities(
     hunks: &[Hunk],
+    guards: &[FileRevisionGuard],
     cwd: &PathUri,
     fs: &dyn ExecutorFileSystem,
     sandbox: Option<&FileSystemSandboxContext>,
-) -> anyhow::Result<BTreeSet<String>> {
-    let mut endpoints = BTreeSet::new();
+) -> anyhow::Result<BTreeMap<String, bool>> {
+    let mut endpoints = BTreeMap::new();
     for hunk in hunks {
         let source = hunk.resolve_path(cwd)?;
-        endpoints.insert(lease_key(
-            mutation_endpoint_identity(fs, &source, sandbox).await?,
-        ));
+        endpoints.insert(
+            lease_key(mutation_endpoint_identity(fs, &source, sandbox).await?),
+            true,
+        );
         if let Hunk::UpdateFile {
             move_path: Some(destination),
             ..
         } = hunk
         {
             let destination = cwd.join(&destination.to_string_lossy())?;
-            endpoints.insert(lease_key(
-                mutation_endpoint_identity(fs, &destination, sandbox).await?,
-            ));
+            endpoints.insert(
+                lease_key(mutation_endpoint_identity(fs, &destination, sandbox).await?),
+                true,
+            );
         }
+    }
+    // A guard only reads its endpoint unless a hunk also mutates it.
+    for guard in guards {
+        let path = cwd.join(&guard.path.to_string_lossy())?;
+        endpoints
+            .entry(lease_key(mutation_endpoint_identity(fs, &path, sandbox).await?))
+            .or_insert(false);
     }
     Ok(endpoints)
 }
@@ -60,6 +72,7 @@ fn lease_key(identity: String) -> String {
 
 pub(crate) async fn acquire(
     hunks: &[Hunk],
+    guards: &[FileRevisionGuard],
     cwd: &PathUri,
     fs: &dyn ExecutorFileSystem,
     sandbox: Option<&FileSystemSandboxContext>,
@@ -69,7 +82,7 @@ pub(crate) async fn acquire(
         // ownership remains in force; no cross-process guarantee is inferred.
         return Ok(None);
     }
-    let endpoints = identities(hunks, cwd, fs, sandbox).await?;
+    let endpoints = identities(hunks, guards, cwd, fs, sandbox).await?;
     let keys = endpoints.clone();
     let transaction = tokio::task::spawn_blocking(move || -> io::Result<PatchTransaction> {
         // Stable across CODEX_HOME/checkouts. The account-private directory
@@ -77,7 +90,7 @@ pub(crate) async fn acquire(
         // target or missing target parent is created during admission.
         let directory = lease_directory()?;
         let mut locks = Vec::with_capacity(keys.len());
-        for key in keys {
+        for (key, mutated) in keys {
             let digest = hex::encode(Sha256::digest(key.as_bytes()));
             let mut options = OpenOptions::new();
             options.read(true).write(true).create(true).truncate(false);
@@ -97,7 +110,9 @@ pub(crate) async fn acquire(
                     return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unsafe patch lease file"));
                 }
             }
-            file.try_lock().map_err(|error| match error {
+            // Patches that only guard an endpoint share it; mutation excludes all.
+            let locked = if mutated { file.try_lock() } else { file.try_lock_shared() };
+            locked.map_err(|error| match error {
                 std::fs::TryLockError::WouldBlock => io::Error::new(io::ErrorKind::WouldBlock,
                     "apply_patch: an endpoint is busy in another patch process. No files were changed by this attempt; retry after its owner finishes."),
                 std::fs::TryLockError::Error(error) => error,
@@ -107,7 +122,7 @@ pub(crate) async fn acquire(
         Ok(PatchTransaction { _locks: locks })
     }).await.context("patch endpoint admission worker failed")??;
     anyhow::ensure!(
-        identities(hunks, cwd, fs, sandbox).await? == endpoints,
+        identities(hunks, guards, cwd, fs, sandbox).await? == endpoints,
         "patch endpoint aliases changed during admission; no files were changed"
     );
     Ok(Some(transaction))

@@ -104,6 +104,10 @@ impl StartingTurnEnvironment {
         self.resolution.peek().is_some_and(Result::is_err)
     }
 
+    pub(crate) fn is_remote(&self) -> bool {
+        self.environment.is_remote()
+    }
+
     pub(crate) async fn wait_until_ready(&self) -> TurnEnvironmentResult {
         let _readiness = crate::tools::tool_dispatch_trace::active_tool_dispatch_timing()
             .and_then(|timing| timing.turn_timing_state())

@@ -6,9 +6,6 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
-use crate::decision::Decision;
-use crate::rule::NetworkRuleProtocol;
-use crate::rule::normalize_network_rule_host;
 use thiserror::Error;
 
 // Bound memory used while checking existing rules before an append.
@@ -20,8 +17,6 @@ pub enum AmendError {
     EmptyPrefix,
     #[error("prefix rule tokens cannot be empty or whitespace-only")]
     EmptyPrefixToken,
-    #[error("invalid network rule: {0}")]
-    InvalidNetworkRule(String),
     #[error("policy path has no parent: {path}")]
     MissingParent { path: PathBuf },
     #[error("failed to create policy directory {dir}: {source}")]
@@ -31,8 +26,6 @@ pub enum AmendError {
     },
     #[error("failed to format prefix tokens: {source}")]
     SerializePrefix { source: serde_json::Error },
-    #[error("failed to serialize network rule field: {source}")]
-    SerializeNetworkRule { source: serde_json::Error },
     #[error("failed to open policy file {path}: {source}")]
     OpenPolicyFile {
         path: PathBuf,
@@ -80,55 +73,10 @@ pub fn blocking_append_allow_prefix_rule(
         .map_err(|source| AmendError::SerializePrefix { source })?;
     let pattern = format!("[{}]", tokens.join(", "));
     let rule = format!(r#"prefix_rule(pattern={pattern}, decision="allow")"#);
-    append_rule_line(policy_path, &rule, true)
+    append_rule_line(policy_path, &rule)
 }
 
-/// Note this function uses advisory file locking and performs blocking I/O, so it should be used
-/// with [`tokio::task::spawn_blocking`] when called from an async context.
-pub fn blocking_append_network_rule(
-    policy_path: &Path,
-    host: &str,
-    protocol: NetworkRuleProtocol,
-    decision: Decision,
-    justification: Option<&str>,
-) -> Result<(), AmendError> {
-    let host = normalize_network_rule_host(host)
-        .map_err(|err| AmendError::InvalidNetworkRule(err.to_string()))?;
-    if let Some(raw) = justification
-        && raw.trim().is_empty()
-    {
-        return Err(AmendError::InvalidNetworkRule(
-            "justification cannot be empty".to_string(),
-        ));
-    }
-
-    let host = serde_json::to_string(&host)
-        .map_err(|source| AmendError::SerializeNetworkRule { source })?;
-    let protocol = serde_json::to_string(protocol.as_policy_string())
-        .map_err(|source| AmendError::SerializeNetworkRule { source })?;
-    let decision = serde_json::to_string(match decision {
-        Decision::Allow => "allow",
-        Decision::Prompt => "prompt",
-        Decision::Forbidden => "deny",
-    })
-    .map_err(|source| AmendError::SerializeNetworkRule { source })?;
-
-    let mut args = vec![
-        format!("host={host}"),
-        format!("protocol={protocol}"),
-        format!("decision={decision}"),
-    ];
-    if let Some(justification) = justification {
-        let justification = serde_json::to_string(justification)
-            .map_err(|source| AmendError::SerializeNetworkRule { source })?;
-        args.push(format!("justification={justification}"));
-    }
-    let rule = format!("network_rule({})", args.join(", "));
-    // Network rules are ordered: an earlier identical rule may have been overridden.
-    append_rule_line(policy_path, &rule, false)
-}
-
-fn append_rule_line(policy_path: &Path, rule: &str, deduplicate: bool) -> Result<(), AmendError> {
+fn append_rule_line(policy_path: &Path, rule: &str) -> Result<(), AmendError> {
     let dir = policy_path
         .parent()
         .ok_or_else(|| AmendError::MissingParent {
@@ -150,10 +98,10 @@ fn append_rule_line(policy_path: &Path, rule: &str, deduplicate: bool) -> Result
         }
     }
 
-    append_locked_line(policy_path, rule, deduplicate)
+    append_locked_line(policy_path, rule)
 }
 
-fn append_locked_line(policy_path: &Path, line: &str, deduplicate: bool) -> Result<(), AmendError> {
+fn append_locked_line(policy_path: &Path, line: &str) -> Result<(), AmendError> {
     // Create through any symlink before resolving the destination. Never replace
     // the symlink itself, including when it initially has a missing target.
     let file = OpenOptions::new()
@@ -229,7 +177,7 @@ fn append_locked_line(policy_path: &Path, line: &str, deduplicate: bool) -> Resu
         });
     }
 
-    if deduplicate && contains_literal_rule(&contents, line) {
+    if contains_literal_rule(&contents, line) {
         return Ok(());
     }
 

@@ -43,6 +43,7 @@ use tokio_util::sync::CancellationToken;
 
 const DEFAULT_LINE_COUNT: usize = 200;
 const MAX_AGGREGATE_LINES: usize = 2_000;
+const MAX_AUTOMATIC_CONTINUATION_PAGES: u32 = 64;
 // A nested result is serialized into a code-mode cell and then into the outer
 // exec result. Reserve enough space for that outer envelope so a fitting exact
 // recovery cannot be recursively truncated into another artifact.
@@ -140,6 +141,7 @@ struct ReconstructedSelection {
 #[serde(rename_all = "snake_case")]
 enum ContinuationStopReason {
     Budget,
+    PageLimit,
     Cancelled,
     IdentityDrift,
     IncompleteOwnerResult,
@@ -225,7 +227,9 @@ impl RecoveryContinuationState {
     ) {
         let resumable = matches!(
             reason,
-            ContinuationStopReason::Budget | ContinuationStopReason::Cancelled
+            ContinuationStopReason::Budget
+                | ContinuationStopReason::PageLimit
+                | ContinuationStopReason::Cancelled
         );
         let selector = selector.map(|selector| {
             if resumable {
@@ -242,6 +246,7 @@ impl RecoveryContinuationState {
             resumable,
             message: Some(match reason {
                 ContinuationStopReason::Budget => "Recovery reached its output budget. Continue with the unconsumed selector in a new call.",
+                ContinuationStopReason::PageLimit => "Recovery reached its automatic page limit. Continue with the unconsumed selector in a new call.",
                 ContinuationStopReason::Cancelled => "Recovery was cancelled. Already recovered pages are retained; the unconsumed selector can be retried.",
                 ContinuationStopReason::IdentityDrift => "The artifact identity or continuation changed. Re-identify the artifact and start a new recovery; do not combine pages from different identities.",
                 ContinuationStopReason::IncompleteOwnerResult => "The artifact has unavailable ranges or returned an incomplete continuation result. Inspect the retained evidence and obtain the missing source before claiming complete recovery.",
@@ -329,9 +334,9 @@ impl RecoveryContinuationState {
             let Some(selector) = result.continuation.as_ref() else {
                 continue;
             };
-            // A search continuation is another requested page, not an unfinished
-            // fragment of the requested page. Preserve the caller's max_results.
-            if result.status == ToolOutputSelectorStatus::Ok && selector.is_search() {
+            // Search/structured cursors request another page, not an unfinished
+            // fragment. Preserve the caller's max_results/max_rows.
+            if result.status == ToolOutputSelectorStatus::Ok && selector.is_paged() {
                 continue;
             }
             if let ToolOutputSelector::Bytes { start, end } = selector
@@ -410,7 +415,7 @@ impl RecoveryContinuationState {
         self.output.complete = self.output.results.iter().all(|result| {
             result.status == ToolOutputSelectorStatus::Ok
                 && result.complete
-                && (result.selector.is_search() || result.continuation.is_none())
+                && (result.selector.is_paged() || result.continuation.is_none())
         });
         self.refresh_reconstruction();
         if self.projected_size(None).tokens() > self.token_ceiling {
@@ -534,12 +539,16 @@ impl RecoveryContinuationState {
         merge_adjacent_recovery_pages(&mut self.output.results);
         if self.output.complete
             && self.continuation_stop.as_ref().is_some_and(|stop| {
-                stop.reason == ContinuationStopReason::Budget
+                matches!(
+                    stop.reason,
+                    ContinuationStopReason::Budget | ContinuationStopReason::PageLimit
+                )
             })
             && recovery_envelope_fits(&self.output, None, self.token_ceiling)
         {
             // Reconstruction can satisfy overlapping owners from bytes already
-            // delivered. Do not advertise those bytes as pending work.
+            // delivered, including cached pages counted toward the page limit.
+            // Do not advertise those bytes as pending work.
             self.continuation_stop = None;
         }
         DrainedRecoveryTransaction {
@@ -646,7 +655,7 @@ impl RecoveryContinuationState {
                 result.status == ToolOutputSelectorStatus::Ok && result.complete;
             complete &= result.status == ToolOutputSelectorStatus::Ok
                 && result.complete
-                && (result.selector.is_search() || result.continuation.is_none());
+                && (result.selector.is_paged() || result.continuation.is_none());
         }
         if !self.reconstructed.iter().any(Option::is_some) {
             complete = self.output.complete;
@@ -693,7 +702,7 @@ impl RecoveryContinuationState {
         self.output.complete = self.output.results.iter().all(|result| {
             result.status == ToolOutputSelectorStatus::Ok
                 && result.complete
-                && (result.selector.is_search() || result.continuation.is_none())
+                && (result.selector.is_paged() || result.continuation.is_none())
         });
     }
 }
@@ -1057,16 +1066,12 @@ async fn handle_read_tool_output(
     let args = parse_read_tool_output_args(arguments)?;
     let selectors = resolved_selectors(&args)?;
     let code_mode_recovery = matches!(&invocation.source, ToolCallSource::CodeMode { .. });
-    let max_bytes = if code_mode_recovery
-        && args
-            .max_bytes
-            .is_some_and(|bytes| bytes > READ_TOOL_OUTPUT_MAX_BYTES)
-    {
-        args.max_bytes
-            .unwrap_or_default()
-            .min(READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES)
-    } else {
-        resolved_max_bytes(args.max_bytes)?
+    let max_bytes = match (code_mode_recovery, args.max_bytes) {
+        (true, None) => READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES,
+        (true, Some(bytes)) if bytes > READ_TOOL_OUTPUT_MAX_BYTES => {
+            bytes.min(READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES)
+        }
+        _ => resolved_max_bytes(args.max_bytes)?,
     };
     // Fit the actual escaped response, rather than charging every source byte
     // the worst-case expansion. ASCII logs can use the requested script budget.
@@ -1079,6 +1084,10 @@ async fn handle_read_tool_output(
     };
     let mut command_limit = max_bytes;
     let mut command_identity = None;
+    // Oversized envelope of the previous attempt, and whether that attempt was
+    // already the halving retry after a cut that did not shrink the envelope.
+    let mut previous_envelope = usize::MAX;
+    let mut halved_after_stall = false;
     loop {
         let Some(output) = crate::tools::command_output_artifact::capture::read_command_log(
             invocation.step_context.turn.config.codex_home.as_path(),
@@ -1111,15 +1120,30 @@ async fn handle_read_tool_output(
         if envelope_bytes > command_delivery_limit {
             let has_source = output["results"].as_array().is_some_and(|results|
                 results.iter().any(|result| ["text", "data_base64"].iter().any(|key|
-                    result[*key].as_str().is_some_and(|text| !text.is_empty()))));
-            let smaller = command_limit.saturating_mul(command_delivery_limit)
-                / envelope_bytes.max(1);
+                    result[*key].as_str().is_some_and(|text| !text.is_empty()))
+                    || matches!(result["selector"]["kind"].as_str(), Some("structured" | "search")) && result["value"].is_object()));
+            // Every retry rereads the log and reruns its searches/extraction.
+            // A proportional cut can miss a whole row/line boundary, so halve
+            // once when the envelope did not shrink; if that also fails, the
+            // excess is metadata or an already minimal search/structured page.
+            let shrunk = envelope_bytes < previous_envelope;
+            let smaller = if shrunk {
+                command_limit.saturating_mul(command_delivery_limit) / envelope_bytes.max(1)
+            } else {
+                command_limit / 2
+            };
             let smaller = smaller.min(command_limit.saturating_sub(1));
-            if !has_source || smaller == 0 || invocation.cancellation_token.is_cancelled() {
+            if !has_source
+                || (!shrunk && halved_after_stall)
+                || smaller == 0
+                || invocation.cancellation_token.is_cancelled()
+            {
                 return Err(FunctionCallError::RespondToModel(
                     "Command recovery cannot fit this delivery budget; request fewer selectors or use bounded byte reads of the saved log.".into(),
                 ));
             }
+            halved_after_stall = !shrunk;
+            previous_envelope = envelope_bytes;
             command_limit = smaller;
             continue;
         }
@@ -1157,6 +1181,7 @@ async fn handle_read_tool_output(
             result = result.with_model_value(model_value);
         }
         crate::tools::context::ensure_exact_model_delivery(&result, &invocation)?;
+        record_recovery_metrics(&invocation);
         attempt.completed = true;
         return Ok(boxed_tool_output(result));
     }
@@ -1167,8 +1192,8 @@ async fn handle_read_tool_output(
     let action_bounds_hash = hex::encode(action_bounds_digest.finalize());
     // JavaScript consumes exact data before choosing what to print. Coupling
     // this selection to its display budget makes a small summary require extra
-    // recovery calls. Larger exact script selections are explicit opt-ins;
-    // direct reads and the default retain their existing display-sized caps.
+    // recovery calls. Scripts automatically drain within the fixed payload cap;
+    // direct reads and explicit smaller budgets retain display-sized caps.
     let token_ceiling = if code_mode_recovery && max_bytes > READ_TOOL_OUTPUT_MAX_BYTES {
         // Approximate token costs use UTF-8 bytes / 4. Leave ample space for
         // escaping, continuation metadata and the retry-avoidance margin.
@@ -1226,21 +1251,10 @@ async fn handle_read_tool_output(
     // exempt from generic re-projection, so this delivery is never truncated
     // again. An in-cell recovery reaches the model only through its cell's
     // output budget; that delivery attributes any re-truncation.
-    // This is an explicit tool invocation, even when wrapped in model-authored
-    // JS. Nesting alone does not prove recovery avoided a model handoff.
+    // Direct reads and in-cell transactions have separate timing contracts.
+    // Only direct recovery marks a following provider tool-result generation.
     // Automatic continuation pages are tracked separately by the transaction.
-    invocation
-        .step_context
-        .turn
-        .turn_timing_state
-        .record_tool_output_recovery(/*retruncation_count*/ 0);
-    if let ToolCallSource::CodeMode { cell_id, .. } = &invocation.source {
-        invocation
-            .session
-            .services
-            .code_mode_service
-            .record_packet_tool_output_recovery(cell_id);
-    }
+    record_recovery_metrics(&invocation);
 
     let exact_recovery_receipt = exact_code_mode_recovery_receipt(
         code_mode_recovery,
@@ -1313,6 +1327,22 @@ async fn handle_read_tool_output(
     }))
 }
 
+fn record_recovery_metrics(invocation: &ToolInvocation) {
+    let in_cell = matches!(&invocation.source, ToolCallSource::CodeMode { .. });
+    invocation
+        .step_context
+        .turn
+        .turn_timing_state
+        .record_tool_output_recovery(in_cell, /*retruncation_count*/ 0);
+    if let ToolCallSource::CodeMode { cell_id, .. } = &invocation.source {
+        invocation
+            .session
+            .services
+            .code_mode_service
+            .record_packet_tool_output_recovery(cell_id);
+    }
+}
+
 // Ownership diagnosis must not turn a failed lookup into a long wait.
 const ARTIFACT_OWNER_RELATION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -1360,7 +1390,10 @@ fn recovery_call_succeeded(
     output: &ReadToolOutputResult,
     stop: Option<&RecoveryContinuationStopV1>,
 ) -> bool {
-    if stop.is_some_and(|stop| stop.reason != ContinuationStopReason::Budget) {
+    let bounded_stop = stop.is_some_and(|stop| matches!(
+        stop.reason, ContinuationStopReason::Budget | ContinuationStopReason::PageLimit
+    ));
+    if stop.is_some() && !bounded_stop {
         return false;
     }
     if output.selection_status() == "complete" {
@@ -1369,7 +1402,7 @@ fn recovery_call_succeeded(
     output.unavailable_ranges.is_empty()
         && !output.results.is_empty()
         && stop.is_some_and(|stop| {
-            stop.reason == ContinuationStopReason::Budget
+            bounded_stop
                 && stop.resumable
                 && (stop.selector.is_some() || !stop.page_selectors.is_empty())
         })
@@ -1437,14 +1470,16 @@ fn recovery_tool_output(
 
 fn parse_read_tool_output_args(arguments: &str) -> Result<ReadToolOutputArgs, FunctionCallError> {
     parse_arguments(arguments).map_err(|err| match err {
-        FunctionCallError::RespondToModel(message) => {
-            let detail = message
+        FunctionCallError::Structured(mut failure) => {
+            let detail = failure
+                .message
                 .strip_prefix("failed to parse function arguments: ")
-                .unwrap_or(&message);
+                .unwrap_or(&failure.message);
             let detail = file_only_selector_hint(arguments).unwrap_or_else(|| detail.to_string());
-            FunctionCallError::RespondToModel(format!(
+            failure.message = format!(
                 "failed to parse read_tool_output arguments: {detail}. Consult the advertised read_tool_output schema."
-            ))
+            );
+            FunctionCallError::Structured(failure)
         }
         err => err,
     })
@@ -1454,7 +1489,7 @@ fn parse_read_tool_output_args(arguments: &str) -> Result<ReadToolOutputArgs, Fu
 /// reports only the schema's accepted selector kinds.
 pub(crate) fn file_only_selector_hint(arguments: &str) -> Option<String> {
     file_only_selector_kind(arguments).map(|kind| format!(
-        "`{kind}` selectors are read_file-only; snapshots take bytes, lines, section, json_pointer or search selectors. On a Rust/Python snapshot saved with an outline, select {{\"kind\":\"section\",\"id\":\"outline\"}} for item IDs, then {{\"kind\":\"section\",\"id\":\"<item id>\"}}; otherwise search or select lines here, or use read_file on the current file"
+        "`{kind}` selectors are read_file-only; snapshots take bytes, lines, section, json_pointer, structured or search selectors. On a Rust/Python snapshot saved with an outline, select {{\"kind\":\"section\",\"id\":\"outline\"}} for item IDs, then {{\"kind\":\"section\",\"id\":\"<item id>\"}}; otherwise search or select lines here, or use read_file on the current file"
     ))
 }
 
@@ -1577,6 +1612,25 @@ fn bound_recovery_source_bytes(output: &mut ReadToolOutputResult, max_bytes: usi
         if result.status != ToolOutputSelectorStatus::Ok {
             continue;
         }
+        if matches!(result.selector, ToolOutputSelector::Structured { .. }) {
+            // Projections carry no canonical range: charge delivered JSON, not
+            // invented exact-source coverage, against an explicit byte limit.
+            let bytes = result.value.as_ref().and_then(|value| serde_json::to_vec(value).ok())
+                .map_or(0, |value| value.len() as u64);
+            if bytes <= remaining {
+                remaining -= bytes;
+            } else {
+                // Selection already fit rows to this same remainder, so only a
+                // page whose empty frame cannot fit lands here.
+                result.status = ToolOutputSelectorStatus::SelectorTooLarge;
+                result.complete = false;
+                result.value = None;
+                result.continuation = None;
+                result.message = Some("Structured page exceeds the max_bytes left by earlier selections; request this selector without siblings or with a larger max_bytes.".into());
+                output.complete = false;
+            }
+            continue;
+        }
         if result.selector.is_search()
             && let Some(value) = result.value.as_mut()
         {
@@ -1679,7 +1733,9 @@ async fn drain_recovery_snapshot_with_source_budget(
     let token_ceiling = token_ceiling.saturating_add(
         crate::tools::command_output_artifact::RECOVERY_RETRY_AVOIDANCE_TOKEN_MARGIN,
     );
-    let mut complete_output = snapshot.select(selectors.clone(), token_ceiling).await?;
+    let mut complete_output = snapshot
+        .select_within_source_bytes(selectors.clone(), token_ceiling, max_bytes)
+        .await?;
     bound_recovery_source_bytes(&mut complete_output, max_bytes);
     if complete_output.complete && !cancellation_token.is_cancelled()
         && recovery_envelope_fits(&complete_output, None, token_ceiling) {
@@ -1704,7 +1760,7 @@ async fn drain_recovery_snapshot_with_source_budget(
     } else {
         drop(complete_output);
         let mut output = snapshot
-            .select(selectors, token_ceiling.saturating_sub(reserve))
+            .select_within_source_bytes(selectors, token_ceiling.saturating_sub(reserve), max_bytes)
             .await?;
         bound_recovery_source_bytes(&mut output, max_bytes);
         output
@@ -1712,6 +1768,20 @@ async fn drain_recovery_snapshot_with_source_budget(
     // Loading this transaction did perform an artifact read. Following its
     // pages reuses that same identity-checked observation, without more I/O.
     let mut state = RecoveryContinuationState::new(output, token_ceiling);
+    // Charge delivered structured pages like bound_recovery_source_bytes. The
+    // loop only appends accepted pages, so serialize each page's value once.
+    let structured_bytes = |results: &[ToolOutputSelectorResult]| {
+        results
+            .iter()
+            .filter(|result| {
+                result.status == ToolOutputSelectorStatus::Ok
+                    && matches!(result.selector, ToolOutputSelector::Structured { .. })
+            })
+            .filter_map(|result| serde_json::to_vec(result.value.as_ref()?).ok())
+            .map(|value| value.len() as u64)
+            .sum::<u64>()
+    };
+    let mut projected_bytes = structured_bytes(&state.output.results);
     loop {
         let (result_index, mut selector) = match state.next_step() {
             ContinuationStep::Complete => break,
@@ -1729,7 +1799,11 @@ async fn drain_recovery_snapshot_with_source_budget(
             state.record_stop(ContinuationStopReason::Cancelled, Some(selector));
             break;
         }
-        let delivered = state.output.represented_source_bytes();
+        if state.drained_continuation_pages >= MAX_AUTOMATIC_CONTINUATION_PAGES {
+            state.record_stop(ContinuationStopReason::PageLimit, Some(selector));
+            break;
+        }
+        let delivered = state.output.represented_source_bytes().saturating_add(projected_bytes);
         let remaining = (max_bytes as u64).saturating_sub(delivered);
         if remaining == 0 {
             state.record_stop(ContinuationStopReason::Budget, Some(selector));
@@ -1751,7 +1825,13 @@ async fn drain_recovery_snapshot_with_source_budget(
                 state.record_stop(ContinuationStopReason::Budget, Some(selector));
                 break;
             }
-            snapshot.select(vec![selector.clone()], ceiling).await
+            snapshot
+                .select_within_source_bytes(
+                    vec![selector.clone()],
+                    ceiling,
+                    usize::try_from(remaining).unwrap_or(usize::MAX),
+                )
+                .await
         };
         if cancellation_token.is_cancelled() {
             state.record_stop(ContinuationStopReason::Cancelled, Some(selector));
@@ -1774,10 +1854,12 @@ async fn drain_recovery_snapshot_with_source_budget(
             state.record_stop(ContinuationStopReason::Budget, Some(selector));
             break;
         }
+        let page_projected_bytes = structured_bytes(&page.results);
         if let Err(reason) = state.accept_page(result_index, &selector, page) {
             state.record_stop(reason, Some(selector));
             break;
         }
+        projected_bytes = projected_bytes.saturating_add(page_projected_bytes);
     }
     // Only incomplete reads need a page directory. Reserving it before draining
     // would consume the retry-avoidance margin on nearly complete selections.

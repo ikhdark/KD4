@@ -67,12 +67,35 @@ pub(crate) struct ExecServerHandler {
     notifications: RpcNotificationSender,
     session: StdMutex<Option<SessionHandle>>,
     active_body_stream_ids: Mutex<HashMap<String, (RequestId, CancellationToken)>>,
+    active_checksums: Arc<StdMutex<HashMap<String, CancellationToken>>>,
     background_task_shutdown: CancellationToken,
     background_tasks: TaskTracker,
     file_system: FileSystemHandler,
     runtime_paths: ExecServerRuntimePaths,
     initialize_requested: AtomicBool,
     initialized: AtomicBool,
+}
+
+/// One admitted cancellable checksum; dropping it releases its `cancelId`.
+pub(crate) struct ChecksumCancellation {
+    active: Arc<StdMutex<HashMap<String, CancellationToken>>>,
+    cancel_id: String,
+    token: CancellationToken,
+}
+
+impl ChecksumCancellation {
+    pub(crate) async fn cancelled(&self) {
+        self.token.cancelled().await;
+    }
+}
+
+impl Drop for ChecksumCancellation {
+    fn drop(&mut self) {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.cancel_id);
+    }
 }
 
 impl ExecServerHandler {
@@ -86,6 +109,7 @@ impl ExecServerHandler {
             notifications,
             session: StdMutex::new(None),
             active_body_stream_ids: Mutex::new(HashMap::new()),
+            active_checksums: Arc::default(),
             background_task_shutdown: CancellationToken::new(),
             background_tasks: TaskTracker::new(),
             file_system: FileSystemHandler::new(runtime_paths.clone()),
@@ -266,6 +290,17 @@ impl ExecServerHandler {
             .await)
     }
 
+    pub(crate) async fn lookup_executable(
+        &self,
+        params: crate::LookupExecutableParams,
+    ) -> Result<crate::LookupExecutableResponse, JSONRPCErrorError> {
+        self.require_initialized_for("executable lookup")?;
+        let filesystem = crate::LocalFileSystem::with_runtime_paths(self.runtime_paths.clone());
+        crate::executable_lookup::lookup_executable(&filesystem, &params)
+            .await
+            .map_err(|error| invalid_params(error.to_string()))
+    }
+
     pub(crate) fn environment_info(&self) -> Result<EnvironmentInfo, JSONRPCErrorError> {
         self.require_initialized_for("environment info")?;
         Ok(EnvironmentInfo::local())
@@ -346,6 +381,58 @@ impl ExecServerHandler {
     ) -> Result<FsReadFileBoundedResponse, JSONRPCErrorError> {
         self.require_initialized_for("filesystem")?;
         self.file_system.read_file_bounded(params).await
+    }
+
+    pub(crate) async fn fs_read_file_range(
+        &self, params: crate::protocol::FsReadFileRangeParams,
+    ) -> Result<crate::protocol::FsReadFileRangeResponse, JSONRPCErrorError> {
+        self.require_initialized_for("filesystem")?;
+        self.file_system.read_file_range(params).await
+    }
+
+    pub(crate) async fn fs_checksum_file(
+        &self,
+        params: crate::protocol::FsChecksumFileParams,
+    ) -> Result<crate::protocol::FsChecksumFileResponse, JSONRPCErrorError> {
+        self.require_initialized_for("filesystem")?;
+        self.file_system.checksum_file(params).await
+    }
+
+    /// Registers a checksum's `cancelId` before the request is queued, so a
+    /// cancel that overtakes queued work still reaches it.
+    pub(crate) fn reserve_checksum_cancel(
+        &self,
+        cancel_id: String,
+    ) -> Result<ChecksumCancellation, JSONRPCErrorError> {
+        let mut active = self
+            .active_checksums
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active.contains_key(&cancel_id) {
+            return Err(invalid_params(format!(
+                "fs/checksumFile cancelId `{cancel_id}` is already active"
+            )));
+        }
+        let token = CancellationToken::new();
+        active.insert(cancel_id.clone(), token.clone());
+        Ok(ChecksumCancellation {
+            active: Arc::clone(&self.active_checksums),
+            cancel_id,
+            token,
+        })
+    }
+
+    pub(crate) fn cancel_checksum_file(&self, cancel_id: &str) -> Result<(), JSONRPCErrorError> {
+        self.require_initialized_for("filesystem")?;
+        if let Some(token) = self
+            .active_checksums
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(cancel_id)
+        {
+            token.cancel();
+        }
+        Ok(())
     }
 
     pub(crate) async fn fs_open(

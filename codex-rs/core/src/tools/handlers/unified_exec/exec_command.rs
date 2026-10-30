@@ -694,9 +694,11 @@ impl ExecCommandHandler {
             && !allows_inline_sandbox_approval(context.turn.approval_policy.value())
         {
             let approval_policy = context.turn.approval_policy.value();
-            return Err(FunctionCallError::RespondToModel(format!(
+            return Err(FunctionCallError::structured(codex_protocol::tool_failure::ToolFailure::no_effects(
+                codex_protocol::tool_failure::ToolFailureCode::PermissionDenied,
+                format!(
                 "approval policy is {approval_policy:?}; reject command — you cannot ask for escalated permissions if the approval policy is {approval_policy:?}"
-            )));
+            ))));
         }
 
         let implicit_grant = !sandbox_permissions.uses_additional_permissions()
@@ -1209,7 +1211,7 @@ impl ExecCommandHandler {
                 let repair = repair_notice
                     .as_deref()
                     .map_or(String::new(), |notice| format!("\n{notice}"));
-                exec_command_error_output(&command_for_display, &err, &repair)
+                exec_command_error_output(&command_for_display, &err, &repair, tracked_execution.is_none())
             }
         };
         let running_process_after_cleanup = session
@@ -1320,6 +1322,7 @@ fn exec_command_error_output(
     command_for_display: &str,
     error: &UnifiedExecError,
     repair: &str,
+    no_process_registered: bool,
 ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
     // Lead with the reason and bound the echoed command: a long script echoed
     // first pushed the reason past the nested-result bound, so the model saw
@@ -1335,5 +1338,19 @@ fn exec_command_error_output(
         format!("`{command_for_display}`")
     };
     let message = format!("exec_command failed: {error}{repair}\ncommand: {command}");
-    Err(FunctionCallError::RespondToModel(message))
+    use codex_protocol::tool_failure::ToolFailure;
+    use codex_protocol::tool_failure::ToolFailureCode;
+    let failure = match error {
+        UnifiedExecError::CreateProcess { .. } if no_process_registered => {
+            ToolFailure::no_effects(ToolFailureCode::RetryableFailure, message)
+        }
+        UnifiedExecError::MissingCommandLine | UnifiedExecError::ForeignPath { .. } => {
+            ToolFailure::no_effects(ToolFailureCode::InvalidInput, message)
+        }
+        UnifiedExecError::SandboxDenied { .. } | UnifiedExecError::PermissionDenied { .. } => {
+            ToolFailure::new(ToolFailureCode::PermissionDenied, message)
+        }
+        _ => ToolFailure::new(ToolFailureCode::UncertainEffects, message),
+    };
+    Err(FunctionCallError::structured(failure))
 }

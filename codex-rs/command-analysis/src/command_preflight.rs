@@ -305,11 +305,17 @@ pub async fn preflight_invocation_for_kd4_runtime(
             }
         }
         // The parser's cached literal stages are advice only. Validation keeps
-        // the complete invocation; neither path adds filesystem probes.
-        if let Some(notice) = source_paging_advisory(
-            command,
-            shell_type.or_else(|| infer_direct_shell_type(command)),
-        ) {
+        // the complete invocation; neither path adds filesystem probes. Without
+        // an active syntax scope the lowering is a blocking parser round trip,
+        // so it runs on the analysis worker like every other parse here.
+        let advisory_shell = shell_type.or_else(|| infer_direct_shell_type(command));
+        let advisory_command = command.to_vec();
+        if advisory_shell == Some(ShellType::PowerShell)
+            && let Ok(Some(notice)) = crate::run_blocking_command_analysis(move || {
+                source_paging_advisory(&advisory_command, advisory_shell)
+            })
+            .await
+        {
             outcome.advisory = Some(match outcome.advisory {
                 Some(existing) => format!("{existing}\n{notice}"),
                 None => notice.to_string(),

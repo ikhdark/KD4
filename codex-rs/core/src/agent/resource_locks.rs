@@ -5,18 +5,108 @@ use crate::session::session::Session;
 use codex_protocol::ThreadId;
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::Weak;
 use std::sync::atomic::Ordering;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[derive(Default)]
 pub(crate) struct AgentResourceLocks {
     // Never held across an await, I/O, or another mutex acquisition.
-    locks: Mutex<BTreeMap<String, HeldLock>>,
+    state: Mutex<LockState>,
+}
+
+#[derive(Default)]
+struct LockState {
+    locks: BTreeMap<String, HeldLock>,
+    waiters: BTreeMap<String, WaitQueue>,
+    // Live wait:true calls and their resources, including notified retries. A
+    // pending wait holds no tool-call gate, so this owner refuses its runtime's
+    // acquisitions of other resources; with ordered acquisition, lock waits
+    // stay acyclic. Same-resource calls join it and are idempotent.
+    pending_waits: BTreeMap<Uuid, (Weak<Session>, String)>,
+}
+
+#[derive(Default)]
+struct WaitQueue {
+    queued: VecDeque<LockWaiter>,
+    // One retry in flight, not an ownership reservation. A nonwaiting acquire
+    // can still win; the notified caller must recheck under the owner mutex.
+    notified: Option<Uuid>,
+}
+
+struct LockWaiter {
+    id: Uuid,
+    runtime: Weak<Session>,
+    cancellation: CancellationToken,
+    sender: oneshot::Sender<()>,
+}
+
+impl LockState {
+    fn wake_runtime(&mut self, resource: &str, runtime: &Weak<Session>) {
+        if let Some(queue) = self.waiters.get_mut(resource) {
+            // Concurrent same-runtime acquires are idempotent too. Closing
+            // these senders lets them observe the committed acquisition.
+            queue
+                .queued
+                .retain(|waiter| !waiter.runtime.ptr_eq(runtime));
+            if queue.queued.is_empty() && queue.notified.is_none() {
+                self.waiters.remove(resource);
+            }
+        }
+    }
+
+    fn notify_next(&mut self, resource: &str) {
+        if self.locks.contains_key(resource) {
+            return;
+        }
+        let Some(queue) = self.waiters.get_mut(resource) else {
+            return;
+        };
+        if queue.notified.is_some() {
+            return;
+        }
+        while let Some(waiter) = queue.queued.pop_front() {
+            // Never upgrade/drop a Session while holding this mutex.
+            if !waiter.cancellation.is_cancelled()
+                && waiter.runtime.strong_count() != 0
+                && waiter.sender.send(()).is_ok()
+            {
+                queue.notified = Some(waiter.id);
+                return;
+            }
+        }
+        self.waiters.remove(resource);
+    }
+}
+
+struct WaitRegistration<'a> {
+    owner: &'a AgentResourceLocks,
+    resource: String,
+    id: Uuid,
+}
+
+impl Drop for WaitRegistration<'_> {
+    fn drop(&mut self) {
+        let mut state = self.owner.lock();
+        state.pending_waits.remove(&self.id);
+        if let Some(queue) = state.waiters.get_mut(&self.resource) {
+            queue.queued.retain(|waiter| waiter.id != self.id);
+            if queue.notified == Some(self.id) {
+                queue.notified = None;
+            }
+            if queue.queued.is_empty() && queue.notified.is_none() {
+                state.waiters.remove(&self.resource);
+            }
+        }
+        // Cancellation or a dropped future must not consume the only wakeup.
+        state.notify_next(&self.resource);
+    }
 }
 
 #[derive(Clone)]
@@ -61,8 +151,8 @@ impl AgentLockResult {
 }
 
 impl AgentResourceLocks {
-    fn lock(&self) -> MutexGuard<'_, BTreeMap<String, HeldLock>> {
-        self.locks
+    fn lock(&self) -> MutexGuard<'_, LockState> {
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -73,9 +163,107 @@ impl AgentResourceLocks {
         resource: String,
         cancellation: &CancellationToken,
     ) -> AgentLockResult {
-        let mut locks = self.lock();
-        // Check after entering the critical section: there is no queued async
-        // acquisition that can later commit after its caller was cancelled.
+        Self::acquire_locked(&mut self.lock(), session, resource, cancellation, None)
+    }
+
+    /// `deadline` bounds only the wait. Expiry removes the waiter and returns
+    /// `timed_out` as data, never a thrown error or a later acquisition.
+    pub(crate) async fn acquire_wait(
+        &self,
+        session: &Arc<Session>,
+        resource: String,
+        cancellation: &CancellationToken,
+        deadline: Option<tokio::time::Instant>,
+    ) -> AgentLockResult {
+        let mut registration: Option<WaitRegistration<'_>> = None;
+        loop {
+            let (result, next) = {
+                let mut state = self.lock();
+                let result = Self::acquire_locked(
+                    &mut state,
+                    session,
+                    resource.clone(),
+                    cancellation,
+                    registration.as_ref().map(|current| current.id),
+                );
+                let next = if result.status == "busy" {
+                    let id = Uuid::now_v7();
+                    let (sender, receiver) = oneshot::channel();
+                    state
+                        .waiters
+                        .entry(resource.clone())
+                        .or_default()
+                        .queued
+                        .push_back(LockWaiter {
+                            id,
+                            runtime: Arc::downgrade(session),
+                            cancellation: cancellation.clone(),
+                            sender,
+                        });
+                    state
+                        .pending_waits
+                        .insert(id, (Arc::downgrade(session), resource.clone()));
+                    Some((
+                        WaitRegistration {
+                            owner: self,
+                            resource: resource.clone(),
+                            id,
+                        },
+                        receiver,
+                    ))
+                } else {
+                    None
+                };
+                // Busy observation and subscription share release's mutex, so
+                // release-before-subscription cannot strand this caller.
+                (result, next)
+            };
+            // Keep the prior notification in flight through the atomic retry;
+            // dropping it earlier could wake every waiter on the same release.
+            drop(registration.take());
+            let Some((guard, receiver)) = next else {
+                return result;
+            };
+            registration = Some(guard);
+            tracing::debug!(thread_id = %session.thread_id, resource = %resource, "agent_lock waiter registered");
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    return AgentLockResult::new("cancelled", None, Some("acquisition was cancelled"));
+                }
+                signal = receiver => {
+                    tracing::debug!(thread_id = %session.thread_id, resource = %resource, notified = signal.is_ok(), "agent_lock waiter retry");
+                }
+                _ = async {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    // Deregister first: its Drop retakes the owner mutex and
+                    // passes on any in-flight wakeup.
+                    drop(registration.take());
+                    let holder = self.lock().locks.get(&resource).map(|held| held.info.clone());
+                    return AgentLockResult::new(
+                        "timed_out",
+                        holder,
+                        Some("the enclosing call deadline elapsed first; the waiter was removed and no ownership was granted. Retry in a later call; do not busy-loop"),
+                    );
+                }
+            }
+        }
+    }
+
+    fn acquire_locked(
+        state: &mut LockState,
+        session: &Arc<Session>,
+        resource: String,
+        cancellation: &CancellationToken,
+        own_wait: Option<Uuid>,
+    ) -> AgentLockResult {
+        let locks = &mut state.locks;
+        // Check inside the critical section, including every notified retry:
+        // cancelled callers must never commit a queued acquisition later.
         if cancellation.is_cancelled() {
             return AgentLockResult::new("cancelled", None, Some("acquisition was cancelled"));
         }
@@ -91,7 +279,24 @@ impl AgentResourceLocks {
             && held.runtime.ptr_eq(&runtime)
         {
             // Idempotent, not reference-counted: one matching release suffices.
-            return AgentLockResult::new("acquired", Some(held.info.clone()), None);
+            let info = held.info.clone();
+            state.wake_runtime(&resource, &runtime);
+            return AgentLockResult::new("acquired", Some(info), None);
+        }
+        // A pending wait is this runtime's next ordered acquisition. Until it
+        // returns, only the same resource (its retry or an idempotent duplicate)
+        // may proceed; holding another resource could close a wait cycle.
+        if state.pending_waits.iter().any(|(id, (waiter, pending))| {
+            Some(*id) != own_wait && waiter.ptr_eq(&runtime) && *pending != resource
+        })
+        {
+            return AgentLockResult::new(
+                "order_violation",
+                None,
+                Some(
+                    "this runtime has a pending wait:true acquisition; no other acquisition can commit until it returns",
+                ),
+            );
         }
         if locks
             .values()
@@ -110,7 +315,7 @@ impl AgentResourceLocks {
                 "busy",
                 Some(held.info.clone()),
                 Some(
-                    "no acquisition was queued; do not busy-loop or hold resources needed by the owner. Use the agreed release/grant route and wait_agent with mailbox_only:true; finish blocked only if no viable release route exists",
+                    "no acquisition was queued; retry acquire with wait:true for a targeted release wakeup. Do not busy-loop or hold resources needed by the owner; finish blocked only if no viable release route exists",
                 ),
             );
         }
@@ -120,12 +325,13 @@ impl AgentResourceLocks {
             token: Uuid::now_v7(),
         };
         locks.insert(
-            resource,
+            resource.clone(),
             HeldLock {
                 info: info.clone(),
-                runtime,
+                runtime: runtime.clone(),
             },
         );
+        state.wake_runtime(&resource, &runtime);
         AgentLockResult::new("acquired", Some(info), None)
     }
 
@@ -135,8 +341,8 @@ impl AgentResourceLocks {
         resource: &str,
         token: Uuid,
     ) -> AgentLockResult {
-        let mut locks = self.lock();
-        let Some(held) = locks.get(resource) else {
+        let mut state = self.lock();
+        let Some(held) = state.locks.get(resource) else {
             return AgentLockResult::new("not_found", None, None);
         };
         if held.info.owner != session.thread_id || !held.runtime.ptr_eq(&Arc::downgrade(session)) {
@@ -155,7 +361,8 @@ impl AgentResourceLocks {
         }
         let info = held.info.clone();
         // Owner, runtime, token and deletion share the same critical section.
-        locks.remove(resource);
+        state.locks.remove(resource);
+        state.notify_next(resource);
         AgentLockResult::new("released", Some(info), None)
     }
 
@@ -163,15 +370,20 @@ impl AgentResourceLocks {
         AgentLockResult {
             status: "listed",
             lock: None,
-            locks: self.lock().values().map(|held| held.info.clone()).collect(),
+            locks: self
+                .lock()
+                .locks
+                .values()
+                .map(|held| held.info.clone())
+                .collect(),
             reason: None,
         }
     }
 
     pub(crate) fn recover(&self, resource: &str, token: Uuid) -> AgentLockResult {
         let held = {
-            let locks = self.lock();
-            let Some(held) = locks.get(resource) else {
+            let state = self.lock();
+            let Some(held) = state.locks.get(resource) else {
                 return AgentLockResult::new("not_found", None, None);
             };
             if held.info.token != token {
@@ -217,13 +429,14 @@ impl AgentResourceLocks {
                 ),
             );
         }
-        let mut locks = self.lock();
-        match locks.get(resource) {
+        let mut state = self.lock();
+        match state.locks.get(resource) {
             None => AgentLockResult::new("not_found", None, None),
             Some(current)
                 if current.info.token == token && current.runtime.ptr_eq(&held.runtime) =>
             {
-                locks.remove(resource);
+                state.locks.remove(resource);
+                state.notify_next(resource);
                 AgentLockResult::new("recovered", Some(held.info), None)
             }
             Some(current) => AgentLockResult::new(
@@ -234,17 +447,36 @@ impl AgentResourceLocks {
         }
     }
 
-    /// Linearizes the shutdown fence with acquisitions, without a new waiter.
+    /// Linearizes the shutdown fence with acquisitions and retires its waiters.
     pub(crate) fn fence_session(&self, session: &Session) {
-        let _locks = self.lock();
+        let mut state = self.lock();
         session.shutting_down.store(true, Ordering::Release);
+        for queue in state.waiters.values_mut() {
+            // Closing the sender wakes the pending acquisition to observe the
+            // fence. An already-notified retry will observe the same fence.
+            queue
+                .queued
+                .retain(|waiter| !std::ptr::eq(waiter.runtime.as_ptr(), session));
+        }
+        state
+            .waiters
+            .retain(|_, queue| !queue.queued.is_empty() || queue.notified.is_some());
     }
 
     /// Called only by the existing owner after terminal/history/writer drain.
     /// Pointer identity prevents an old runtime's late cleanup deleting locks
     /// acquired by a resumed runtime with the same ThreadId.
     pub(crate) fn release_session(&self, session: &Session) {
-        self.lock()
-            .retain(|_, held| !std::ptr::eq(held.runtime.as_ptr(), session));
+        let mut state = self.lock();
+        let released: Vec<_> = state
+            .locks
+            .iter()
+            .filter(|(_, held)| std::ptr::eq(held.runtime.as_ptr(), session))
+            .map(|(resource, _)| resource.clone())
+            .collect();
+        for resource in released {
+            state.locks.remove(&resource);
+            state.notify_next(&resource);
+        }
     }
 }

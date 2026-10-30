@@ -776,11 +776,19 @@ impl ApplyPatchHandler {
                             "kind": mismatch.kind,
                         })).collect::<Vec<_>>(),
                     }));
-                    let retry = session.services.retained_patches.lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .retain(&retained_input, &turn_environment.environment_id,
-                            &turn_environment.owner_id(),
-                            turn_environment.cwd(), &Default::default(), observed_source);
+                    // A receipt replays the submitted revision guards, so only a
+                    // fresh reconciled patch can recover from a stale guard.
+                    let guard_mismatch = matches!(
+                        parse_error,
+                        codex_apply_patch::ApplyPatchError::RevisionGuardMismatch(_)
+                    );
+                    let retry = (!guard_mismatch).then(|| {
+                        session.services.retained_patches.lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .retain(&retained_input, &turn_environment.environment_id,
+                                &turn_environment.owner_id(),
+                                turn_environment.cwd(), &Default::default(), observed_source)
+                    }).flatten();
 
                     let read_note =
                         read_snapshot_note(&session, turn_environment, mismatches).await;
@@ -1153,7 +1161,10 @@ async fn run_owned_patch(
                 // Shell interception can verify relative paths after `cd`.
                 // The dedicated tool cannot select that working directory, so
                 // never offer a receipt that would replay those paths elsewhere.
-                let retry = (req.action.cwd == *req.turn_environment.cwd())
+                // A receipt also replays the submitted revision guards, so a
+                // stale guard needs a fresh reconciled patch instead.
+                let retry = (req.action.cwd == *req.turn_environment.cwd()
+                    && !runtime.revision_guard_mismatch())
                     .then(|| {
                         tool_ctx
                             .session

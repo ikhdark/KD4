@@ -143,6 +143,12 @@ where
     let discovery_deadline = tokio::time::Instant::now() + ORCHESTRATOR_SKILL_DISCOVERY_TIMEOUT;
     let mut catalog = SkillCatalog::default();
     let mut progress = continuation.unwrap_or_default();
+    // Detect loops within one bounded attempt, not across explicit retries.
+    // A provider can recover without changing its resource generation.
+    if progress.blocked {
+        progress.blocked = false;
+        progress.seen_cursors.clear();
+    }
     let mut skill_resources_seen = 0usize;
     let mut skipped_resources = 0usize;
     for page_index in 0..MAX_RESOURCE_PAGES {
@@ -209,7 +215,7 @@ where
         }
     }
     if catalog.discovery_blocked() {
-        catalog.warnings.push("Orchestrator skill discovery is incomplete and blocked. Known skills remain available; discovery can retry after the MCP resource generation changes.".to_string());
+        catalog.warnings.push("Orchestrator skill discovery stopped on repeated pagination. Known skills remain available; follow skills.list next_cursor to retry.".to_string());
     } else if catalog.continuation.is_some() {
         catalog.warnings.push("Orchestrator skill discovery is incomplete. Follow skills.list next_cursor to continue discovery.".to_string());
     }

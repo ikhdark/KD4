@@ -68,7 +68,14 @@ pub(crate) struct HeadTailBuffer {
     unreported_omitted_bytes: usize,
     lagged_chunks: u64,
     unreported_lagged_chunks: u64,
+    /// Ascending producer positions (retained plus omitted bytes) of lag
+    /// seams, excluding seams inside the omitted middle. Once full, later
+    /// seams share `lag_overflow`, whose inner positions are unknown.
+    lag_seams: Vec<usize>,
+    lag_overflow: Option<(usize, usize)>,
 }
+
+const MAX_LAG_SEAMS: usize = 1024;
 
 impl Default for HeadTailBuffer {
     fn default() -> Self {
@@ -97,6 +104,8 @@ impl HeadTailBuffer {
             unreported_omitted_bytes: 0,
             lagged_chunks: 0,
             unreported_lagged_chunks: 0,
+            lag_seams: Vec::new(),
+            lag_overflow: None,
         }
     }
 
@@ -123,6 +132,25 @@ impl HeadTailBuffer {
         if skipped > 0 {
             // A chunk count does not establish the missing byte count.
             self.start_offset = None;
+            let at = self.retained_bytes().saturating_add(self.omitted_bytes);
+            // An omission already reports loss inside the omitted middle.
+            let (head, tail_start) = (self.head.len(), self.tail_start());
+            self.lag_seams.retain(|&seam| seam < head || seam >= tail_start);
+            if self
+                .lag_overflow
+                .is_some_and(|(first, last)| first >= head && last < tail_start)
+            {
+                self.lag_overflow = None;
+            }
+            if let Some((_, last)) = self.lag_overflow.as_mut() {
+                *last = at;
+            } else if self.lag_seams.last() != Some(&at) {
+                if self.lag_seams.len() < MAX_LAG_SEAMS {
+                    self.lag_seams.push(at);
+                } else {
+                    self.lag_overflow = Some((at, at));
+                }
+            }
         }
         self.lagged_chunks = self.lagged_chunks.saturating_add(skipped);
         self.unreported_lagged_chunks = self.unreported_lagged_chunks.saturating_add(skipped);
@@ -273,6 +301,31 @@ impl HeadTailBuffer {
         })
     }
 
+    fn tail_start(&self) -> usize {
+        self.head.len().saturating_add(self.omitted_bytes)
+    }
+
+    pub(crate) fn stream_layout(&self) -> StreamLayout {
+        StreamLayout {
+            head: self.head.len(),
+            omitted: self.omitted_bytes,
+            lag_seams: self.lag_seams.clone(),
+            lag_overflow: self.lag_overflow,
+        }
+    }
+
+    /// Retained bytes of an undrained cumulative stream buffer.
+    pub(super) fn retained_stream(&self) -> RetainedStream<'_> {
+        let (front, back) = self.tail.as_slices();
+        RetainedStream {
+            head: &self.head,
+            tail: [front, back],
+            omitted: self.omitted_bytes,
+            lag_seams: &self.lag_seams,
+            lag_overflow: self.lag_overflow,
+        }
+    }
+
     /// Drain into another bounded buffer without turning omission notices into
     /// output bytes. Returns whether this batch contains meaningful progress.
     pub(crate) fn drain_into(&mut self, target: &mut Self) -> bool {
@@ -382,6 +435,117 @@ impl HeadTailBuffer {
     fn record_omitted_bytes(&mut self, omitted: usize) {
         self.omitted_bytes = self.omitted_bytes.saturating_add(omitted);
         self.unreported_omitted_bytes = self.unreported_omitted_bytes.saturating_add(omitted);
+    }
+}
+
+/// Producer coordinates of a stream snapshot taken with
+/// `to_bytes_with_loss_notice(&[])`, so a retired process rescans it exactly.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct StreamLayout {
+    head: usize,
+    omitted: usize,
+    lag_seams: Vec<usize>,
+    lag_overflow: Option<(usize, usize)>,
+}
+
+/// Retained bytes of a cumulative stream in producer coordinates.
+pub(super) struct RetainedStream<'a> {
+    head: &'a [u8],
+    tail: [&'a [u8]; 2],
+    omitted: usize,
+    lag_seams: &'a [usize],
+    lag_overflow: Option<(usize, usize)>,
+}
+
+impl<'a> RetainedStream<'a> {
+    pub(super) fn frozen(snapshot: &'a [u8], layout: &'a StreamLayout) -> Self {
+        let marker = if layout.omitted > 0 {
+            omitted_output_marker(layout.omitted).len()
+        } else {
+            0
+        };
+        let head = layout.head.min(snapshot.len());
+        RetainedStream {
+            head: &snapshot[..head],
+            tail: [snapshot.get(head.saturating_add(marker)..).unwrap_or_default(), &[]],
+            omitted: layout.omitted,
+            lag_seams: &layout.lag_seams,
+            lag_overflow: layout.lag_overflow,
+        }
+    }
+
+    fn tail_start(&self) -> usize {
+        self.head.len().saturating_add(self.omitted)
+    }
+
+    pub(super) fn total(&self) -> usize {
+        self.tail_start()
+            .saturating_add(self.tail[0].len())
+            .saturating_add(self.tail[1].len())
+    }
+
+    /// Whether a scan from producer position `after` examines lost bytes: an
+    /// omission ending after it, or a lag seam at or after it. A seam belongs
+    /// to the scan that examines the byte following it, so a cursor chain
+    /// reports it once; at the end of closed output it stays visible, as exit
+    /// does. Overflowed seams are reported conservatively.
+    pub(super) fn lost_since(&self, after: usize, closed: bool) -> bool {
+        let total = self.total();
+        let examined = |seam: usize| seam < total || closed;
+        (self.omitted > 0 && self.tail_start() > after)
+            || self
+                .lag_seams
+                .get(self.lag_seams.partition_point(|&seam| seam < after))
+                .is_some_and(|&seam| examined(seam))
+            || self
+                .lag_overflow
+                .is_some_and(|(first, last)| last >= after && examined(first.max(after)))
+    }
+
+    /// Visit retained producer bytes from position `from` in contiguous pieces.
+    /// A piece is not `joined` to the bytes before it across an omission or a
+    /// lag seam; bytes between overflowed seams are skipped. The caller owns
+    /// its cursor; this never acknowledges normal polling output. Returns the
+    /// producer position after the last byte.
+    pub(super) fn visit_since(&self, from: usize, mut visit: impl FnMut(usize, &[u8], bool)) -> usize {
+        let tail_start = self.tail_start();
+        let unknown = self.lag_overflow.map_or(0..0, |(first, last)| first..last);
+        let mut seams = self.lag_seams[self.lag_seams.partition_point(|&seam| seam < from)..]
+            .iter()
+            .copied()
+            .chain(self.lag_overflow.map(|(first, _)| first))
+            .peekable();
+        let mut position = from;
+        let mut joined = true;
+        for (start, bytes) in [
+            (0, self.head),
+            (tail_start, self.tail[0]),
+            (tail_start.saturating_add(self.tail[0].len()), self.tail[1]),
+        ] {
+            let end = start.saturating_add(bytes.len());
+            if end <= position {
+                continue;
+            }
+            if start > position {
+                position = start;
+                joined = false;
+            }
+            while position < end {
+                if unknown.contains(&position) {
+                    position = unknown.end;
+                    joined = false;
+                    continue;
+                }
+                while let Some(seam) = seams.next_if(|&seam| seam <= position) {
+                    joined &= seam != position;
+                }
+                let stop = seams.peek().map_or(end, |&seam| seam.min(end));
+                visit(position, &bytes[position - start..stop - start], joined);
+                position = stop;
+                joined = true;
+            }
+        }
+        self.total()
     }
 }
 

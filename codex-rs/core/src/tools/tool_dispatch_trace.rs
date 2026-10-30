@@ -46,6 +46,7 @@ pub(crate) fn push_timer_wait(
 
 tokio::task_local! {
     static ACTIVE_TOOL_DISPATCH_TIMING: Arc<ToolDispatchTiming>;
+    static ACTIVE_TOOL_BLOCKING_TIMING: Arc<ToolDispatchTiming>;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -690,6 +691,31 @@ pub(crate) fn record_exec_cleanup_state(
 
 pub(crate) fn active_tool_dispatch_timing() -> Option<Arc<ToolDispatchTiming>> {
     ACTIVE_TOOL_DISPATCH_TIMING.try_with(Arc::clone).ok()
+}
+
+/// Instrument the existing await without changing admission or lock ordering.
+pub(crate) async fn observe_resource_wait<F: Future>(resource: &str, future: F) -> F::Output {
+    if let Some(timing) = ACTIVE_TOOL_BLOCKING_TIMING.try_with(Arc::clone).ok()
+        .or_else(active_tool_dispatch_timing)
+        && let Some(turn) = timing.turn_timing_state()
+    {
+        turn.observe_wait(
+            &timing.execution_id().0,
+            resource,
+            codex_protocol::timing::TurnTimingBlockingCategory::ResourceContention,
+            future,
+        ).await
+    } else {
+        future.await
+    }
+}
+
+/// Admission runs before handler/process observation. Scope only blocking
+/// attribution here so baseline/Git processes do not become tool execution.
+pub(crate) async fn scope_tool_blocking_timing<F: Future>(
+    timing: Arc<ToolDispatchTiming>, future: F,
+) -> F::Output {
+    ACTIVE_TOOL_BLOCKING_TIMING.scope(timing, future).await
 }
 
 /// Separates startup stages in structured logs without changing the rollout wire

@@ -4,7 +4,7 @@ use crate::ToolSpec;
 use codex_code_mode::CodeModeToolKind;
 use codex_code_mode::ToolDefinition as CodeModeToolDefinition;
 
-const CODE_MODE_TOOL_SEARCH_RESULT_GUIDANCE: &str = "In code mode, this returns a structured result. Inspect `status` before using `tools`: `completed` is complete, `incomplete` reports an exact `omitted_result_count` when known, and `aborted` has `omitted_result_count: null`. A null count means the lower layer did not provide an exact count. `direct_only_tools` overrides local resolution: these excluded names are activated for the next direct model interface, not this cell. For other returned or `activated_omitted_tools` names, use `resolve_tool(name)` rather than repeating the search. A returned namespace tool outside `direct_only_tools` is callable as `resolve_tool(\"<namespace>.<name>\")`.";
+const CODE_MODE_TOOL_SEARCH_RESULT_GUIDANCE: &str = "In code mode, inspect `status` and `search_complete` before reusing a discovery result. `completed` is complete; `incomplete` remains retryable, including bounded matches or an unavailable catalog even with zero omitted contracts. `omitted_result_count` counts omitted contracts when known; `aborted` has a null count. Reuse complete results only for the same catalog version, query, limit, scope, and permissions. `direct_only_tools` overrides local resolution: these excluded names are activated for the next direct model interface, not this cell. Resolve returned or `activated_omitted_tools` names with `resolve_tool(name)`; repeat or refine discovery when enumeration is incomplete. A returned namespace tool outside `direct_only_tools` is callable as `resolve_tool(\"<namespace>.<name>\")`.";
 
 pub fn code_mode_tool_search_output_schema() -> serde_json::Value {
     serde_json::json!({
@@ -15,6 +15,7 @@ pub fn code_mode_tool_search_output_schema() -> serde_json::Value {
                 "enum": ["completed", "incomplete", "aborted"]
             },
             "execution": { "const": "client" },
+            "search_complete": { "type": "boolean" },
             "tools": { "type": "array" },
             "direct_only_tools": { "type": "array", "items": { "type": "string" } },
             "direct_only_guidance": { "type": "string" },

@@ -40,11 +40,14 @@ fn is_dangerous_powershell(command: &[String]) -> bool {
     if !is_powershell_executable(exe) {
         return false;
     }
-    // These forms have PowerShell semantics that POSIX shlex cannot preserve.
+    // Escapes, comments, here-strings and subexpressions do not preserve POSIX quoting.
     // An unavailable bounded parse cannot establish harmlessness.
     match parse_powershell_invocation(rest) {
         PowershellInvocation::InlineCommand { script, .. }
-            if script.contains(['`', '\\']) || script.contains("<#") => {
+            if script.contains(['`', '\\', '#'])
+                || script.contains("@'")
+                || script.contains("@\"")
+                || script.contains("$(") => {
             try_parse_powershell_ast_commands(exe, script)
                 .map(|commands| {
                     commands
@@ -53,7 +56,7 @@ fn is_dangerous_powershell(command: &[String]) -> bool {
                 })
                 .unwrap_or(true)
         }
-        // Preserve the established best-effort scan for unescaped scripts,
+        // Preserve the established best-effort scan outside these lexical forms,
         // including nested commands that the restricted AST parser does not lower.
         PowershellInvocation::InlineCommand { script, .. } => shlex_split(script)
             .map(|tokens| is_dangerous_powershell_script_tokens(&tokens))
@@ -267,7 +270,11 @@ fn is_direct_gui_launch(command: &[String]) -> bool {
 
 fn split_cmd_script(script: &str) -> Option<Vec<Vec<String>>> {
     // CMD groups with double quotes. Apostrophes and backslashes are literal;
-    // only an unquoted caret escapes the next character.
+    // only an unquoted caret escapes the next character. Besides whitespace,
+    // CMD also treats unquoted comma, semicolon and equals as argument
+    // delimiters, so `rd,/s,/q`, `rd;/s;/q` and `rd=/s=/q` run recursive quiet
+    // removal just like the spaced form; split on them so the switches are not
+    // hidden inside a single joined token.
     let mut commands = Vec::new();
     let mut words = Vec::new();
     let mut word = String::new();
@@ -296,7 +303,7 @@ fn split_cmd_script(script: &str) -> Option<Vec<Vec<String>>> {
                     chars.next();
                 }
             }
-            ch if ch.is_whitespace() && !quoted => {
+            ch if (ch.is_whitespace() || matches!(ch, ',' | ';' | '=')) && !quoted => {
                 if started {
                     words.push(std::mem::take(&mut word));
                     started = false;

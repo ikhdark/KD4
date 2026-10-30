@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use crate::tools::command_output_artifact::ARTIFACT_SEARCH_MAX_CONTEXT_LINES;
 use crate::tools::command_output_artifact::ARTIFACT_SEARCH_MAX_QUERY_BYTES;
 use crate::tools::command_output_artifact::ARTIFACT_SEARCH_MAX_RESULTS;
+use crate::tools::command_output_artifact::ARTIFACT_REGEX_MAX_SEARCH_BYTES;
 
 pub(crate) const READ_TOOL_OUTPUT_TOOL_NAME: &str = "read_tool_output";
 pub(crate) const READ_TOOL_OUTPUT_MAX_BYTES: usize = 16_384;
@@ -108,6 +109,24 @@ fn selector_schema(include_sections: bool) -> JsonSchema {
         )]),
         vec!["pointer"],
     ));
+    variants.push(selector_variant(
+        "structured",
+        BTreeMap::from([
+            ("format".into(), JsonSchema::string_enum(["json", "jsonl", "csv", "tsv"].map(serde_json::Value::from).to_vec(), Some("Input format. JSON selects an array or one object; JSONL uses physical lines (blank lines are malformed); CSV/TSV require unique nonempty headers and return strings. JSON/CSV/TSV are limited to 16 MiB; JSONL streams with an 8 MiB per-line limit.".into()))),
+            ("fields".into(), bounded_array(JsonSchema::string(None), 0, 64, "RFC 6901 pointers to project; omitted/empty returns whole rows. Projected objects use pointer strings as keys and omit missing fields (explicit null is preserved).".into())),
+            ("filters".into(), bounded_array(JsonSchema::object(BTreeMap::from([
+                ("pointer".into(), JsonSchema::string(Some("RFC 6901 pointer within each row; empty selects the row.".into()))),
+                ("op".into(), JsonSchema::string_enum(["eq", "ne", "lt", "le", "gt", "ge", "contains", "exists", "missing"].map(serde_json::Value::from).to_vec(), None)),
+                ("value".into(), JsonSchema { description: Some("Required JSON operand except for exists/missing, where it must be omitted. eq/ne use typed JSON equality; ordering compares strings or numbers without coercion; contains accepts string substrings or array members. Missing fields fail every comparison, including ne. Unsafe integer/float ordering does not match.".into()), ..Default::default() }),
+            ]), Some(vec!["pointer".into(), "op".into()]), Some(false.into())), 0, 64, "All predicates must match; applied before projection, after row-range selection.".into())),
+            ("start_row".into(), bounded_integer(1, u64::MAX, "One-based input row before filtering; default 1. CSV/TSV exclude the header and count parsed records (quoted newlines stay in one record).".into())),
+            ("end_row".into(), bounded_integer(1, u64::MAX, "Inclusive input row; omitted reads to EOF.".into())),
+            ("max_rows".into(), bounded_integer(1, 1000, "Maximum returned rows plus reported malformed rows; default 100. Response budgets may shorten a page. complete means this page was delivered; follow continuation until value.rows_exhausted. Counts describe only scanned rows in this page, not the whole source.".into())),
+            ("malformed_rows".into(), JsonSchema::string_enum(["error", "skip", "report"].map(serde_json::Value::from).to_vec(), Some("Required policy: error rejects the current selection with its row number; skip counts malformed rows; report also returns row/error entries. Applies to selected input rows, before filters. Invalid documents/headers and I/O failures always reject; successful sibling selectors survive.".into()))),
+            ("pointer".into(), JsonSchema::string(Some("JSON-only RFC 6901 pointer selecting the input array/object; default root. Must be omitted/empty for JSONL/CSV/TSV.".into()))),
+        ]),
+        vec!["format", "malformed_rows"],
+    ));
     variants.push(
             selector_variant(
                 "search",
@@ -115,12 +134,16 @@ fn selector_schema(include_sections: bool) -> JsonSchema {
                     (
                         "query".to_string(),
                         JsonSchema::string(Some(format!(
-                            "Fixed string to find, case-sensitive unless case_insensitive is true; at most {ARTIFACT_SEARCH_MAX_QUERY_BYTES} UTF-8 bytes."
+                            "Fixed string by default, or byte-regex pattern with regex:true; at most {ARTIFACT_SEARCH_MAX_QUERY_BYTES} UTF-8 bytes."
                         ))),
                     ),
                     (
+                        "regex".to_string(),
+                        JsonSchema::boolean(Some(format!("Defaults to false. Uses Rust's non-backtracking byte-regex engine: no lookaround/backreferences, ASCII classes/case folding by default (inline Unicode flags allowed). At most {ARTIFACT_REGEX_MAX_SEARCH_BYTES} retained subject bytes, 1 MiB compiled/DFA limits and nesting limit 64. Non-overlapping matches; encountering a zero-width match rejects the selector. Anchors/boundaries refer to the original subject, not start_byte. Examines at most max_results+1 matches per page; match_count_complete:false makes total_matches/remaining_match_count lower bounds. Follow continuation, not the producer."))),
+                    ),
+                    (
                         "case_insensitive".to_string(),
-                        JsonSchema::boolean(Some("Match ASCII letters without regard to case; defaults to false. Non-ASCII bytes remain exact.".to_string())),
+                        JsonSchema::boolean(Some("Match ASCII letters without regard to case; defaults to false. Non-ASCII bytes remain exact unless a regex explicitly enables Unicode.".to_string())),
                     ),
                     (
                         "enclosing".to_string(),
@@ -178,7 +201,7 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: READ_TOOL_OUTPUT_TOOL_NAME.to_string(),
-        description: "Read a saved tool-output snapshot without rerunning the tool. Artifacts are thread-private: passing an ID to another agent does not grant access. Have the owning agent recover and share the needed evidence instead. Batch known searches or selections in one call to share authenticated snapshot validation. Search results include matching text in results[].value.hydrated_ranges; a complete search page can still have more matches. Returns exact text or data_base64 for arbitrary bytes up to max_bytes plus continuation metadata; complete indicates requested-selection delivery, not full capture or current workspace freshness. Command-log artifacts accept only bytes and lines, not search, section or json_pointer: use their advertised recovery.arguments and filter recovered text in-script. A running command's artifact is not readable until it exits; resume its live handle first. A line that cannot fit returns an exact byte continuation for the remaining selection in this same artifact; use that continuation rather than read_file, which requires a whole UTF-8 file within its size limit. Source snapshots retain advanced selectors. Capture gaps and disk failures remain explicitly incomplete. Check retained_artifact_complete and continuation_stop.reason/resumable; preserve successful siblings and recover only required missing selections. In an exec cell, call advertised recovery.arguments before returning; follow resumable budget continuations while ranges advance, and report non-resumable failures or gaps instead of looping. For a required full 753-line diff with lines 1-24 delivered, recover lines 25-753 from the saved artifact in that same cell. Consume pages in-script and print only needed evidence to avoid another enclosing display truncation; do not raise default limits or dump huge results. Never rerun the producer merely to recover output.".to_string(),
+        description: "Read a saved tool-output snapshot without rerunning the tool. Artifacts are thread-private: passing an ID to another agent does not grant access. Have the owning agent recover and share the needed evidence instead. Batch known searches or selections in one call to share authenticated snapshot validation. Search results include matching text in results[].value.hydrated_ranges; a complete search page can still have more matches. Returns exact text or data_base64 for arbitrary bytes up to max_bytes plus continuation metadata; complete indicates requested-selection delivery, not full capture or current workspace freshness. Command logs and indexed snapshots share bounded fixed-string/regex search, match coordinates, context and continuations. Command-log search is limited to 16 MiB retained bytes (regex: 1 MiB); larger logs retain streaming bytes, lines and structured extraction. Command logs do not support section or json_pointer. A running command's artifact is not readable until it exits; resume its live handle first. A line that cannot fit returns an exact byte continuation for the remaining selection in this same artifact; use that continuation rather than read_file, which requires a bounded whole-file text snapshot. Source snapshots retain advanced selectors. UTF-16 read_file snapshots retain decoded UTF-8 without the BOM: every recovery selector and canonical_sha256/canonical_bytes addresses that decoded snapshot, not original UTF-16 bytes, code units or the original-byte source_sha256. Capture gaps and disk failures remain explicitly incomplete. Check retained_artifact_complete and continuation_stop.reason/resumable; preserve successful siblings and recover only required missing selections. In an exec cell, call advertised recovery.arguments before returning; follow resumable budget/page_limit continuations while ranges advance, and report non-resumable failures or gaps instead of looping. For a required full 753-line diff with lines 1-24 delivered, recover lines 25-753 from the saved artifact in that same cell. Consume pages in-script and print only needed evidence to avoid another enclosing display truncation; do not raise default limits or dump huge results. Never rerun the producer merely to recover output.".to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(
@@ -186,7 +209,7 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
                 ("artifact_id".to_string(), artifact_id),
                 ("selectors".to_string(), selectors),
                 ("max_bytes".to_string(), bounded_integer(1, u64::MAX,
-                    format!("Maximum delivered source bytes, default {READ_TOOL_OUTPUT_MAX_BYTES}. Direct calls are capped at that default. Code-mode scripts may explicitly request up to {READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES} bytes under a separate 1 MiB serialized payload cap; print only the needed evidence. Metadata/escaping can produce a smaller page with continuation."))),
+                    format!("Maximum delivered source bytes. Direct calls default to and are capped at {READ_TOOL_OUTPUT_MAX_BYTES}. Code-mode scripts default to {READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES} bytes and automatically drain selected continuations within that source budget, a 1 MiB serialized payload cap, and 64 continuation pages; an explicit smaller limit is preserved. Print only needed evidence. Metadata/escaping can produce a smaller page with a structured resumable stop."))),
                 ("cell_recovery".to_string(), JsonSchema::boolean(Some(
                     "Set by a truncated exec cell's recovery.arguments: the read gets room in its cell beyond the output budget, up to the exec ceiling.".to_string(),
                 ))),
@@ -223,7 +246,7 @@ pub(crate) fn read_tool_output_output_schema(mut selector_schema: JsonSchema) ->
             "retained_bytes": {"type": "integer", "minimum": 0},
             "complete": {"type": "boolean"},
             "selection_status": {"type": "string", "enum": ["complete", "partial", "failed"], "description": "Requested-page delivery, not transport success or whole-file coverage. Partial and failed batches retain all successful siblings."},
-            "retained_artifact_complete": {"type": "boolean", "description": "All original bytes are retained. This does not imply the requested selection was delivered."},
+            "retained_artifact_complete": {"type": "boolean", "description": "All canonical snapshot bytes are retained (decoded UTF-8 for UTF-16 read_file sources). This does not imply original encoded bytes are retained or the requested selection was delivered."},
             "delivered_selection_complete": {"type": "boolean", "description": "All requested selectors were delivered completely; legacy complete has the same meaning."},
             "criterion_evidence": {
                 "type": "object",
@@ -244,7 +267,7 @@ pub(crate) fn read_tool_output_output_schema(mut selector_schema: JsonSchema) ->
                 "properties": {
                     "version": {"type": "integer", "enum": [1]},
                     "reason": {"type": "string", "enum": [
-                        "budget", "cancelled", "identity_drift", "incomplete_owner_result",
+                        "budget", "page_limit", "cancelled", "identity_drift", "incomplete_owner_result",
                         "invalid_selector", "selector_not_found", "page_read_error", "repeated_selector"
                     ]},
                     "selector": {"anyOf": [{"$ref": "#/$defs/selector"}, {"type": "null"}]},
@@ -275,7 +298,7 @@ pub(crate) fn read_tool_output_output_schema(mut selector_schema: JsonSchema) ->
                     "exact_bytes": {"type": "integer", "minimum": 0},
                     "canonical_range": {"$ref": "#/$defs/range"},
                     "text": {"type": "string"},
-                    "value": {"description": "Exact selected JSON value. Search selectors return the search_result shape."},
+                    "value": {"description": "Exact selected JSON value, search_result, or a structured page: rows [{row,value}], errors [{row,message}], malformed_rows and rows_scanned counts, rows_exhausted, coverage_complete. Structured values are projections, not exact source-byte acquisition; continuation resumes the same selection at the next unconsumed input row."},
                     "data_base64": {"type": "string"},
                     "subdivision_plan": {
                         "type": "object",
@@ -299,6 +322,8 @@ pub(crate) fn read_tool_output_output_schema(mut selector_schema: JsonSchema) ->
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
+                    "regex": {"type": "boolean"},
+                    "match_count_complete": {"type": "boolean", "description": "For regex pages, false means total_matches and remaining_match_count are lower bounds from bounded lookahead, not full-source counts. Absent for fixed strings, whose counts remain exact. Independent of source coverage and page delivery."},
                     "start_byte": {"type": "integer", "minimum": 0},
                     "coverage_complete": {"type": "boolean", "description": "The original source is fully retained. False means zero matches cannot establish absence; counts describe only retained bytes from start_byte."},
                     "total_matches": {"type": "integer", "minimum": 0},

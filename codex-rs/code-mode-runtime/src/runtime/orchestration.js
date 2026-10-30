@@ -213,7 +213,9 @@
           // Duplicate paths share this reservation; uneven files share the budget.
           remainingBytes -= size;
           if (evidence.file_complete) return evidence;
-          const hash = initial.source_sha256;
+          // Recovery addresses the retained UTF-8 snapshot, not the original
+          // file bytes (which differ for decoded UTF-16 sources).
+          const hash = initial.canonical_sha256 ?? initial.source_sha256;
           if (
             typeof hash !== "string" ||
             !hash ||
@@ -306,8 +308,10 @@
             consume(page);
             if (offset < size) {
               const stop = page.continuation_stop;
+              // Budget and automatic page-limit stops are both bounded,
+              // resumable pages of this same snapshot.
               if (
-                stop?.reason !== "budget" ||
+                (stop?.reason !== "budget" && stop?.reason !== "page_limit") ||
                 stop.resumable !== true ||
                 stop.selector?.kind !== "bytes" ||
                 stop.selector.start !== offset ||
@@ -345,6 +349,10 @@
         lines = false,
         max_per_file = 10,
         force_fresh = false,
+        hydrate = false,
+        enclosing = false,
+        context_lines = 3,
+        max_hydrated_files = 8,
       } = {},
     ) {
       // ripgrep through the argv command shape: patterns and paths are never
@@ -379,11 +387,21 @@
         no_ignore,
         lines,
         force_fresh,
+        hydrate,
+        enclosing,
       })) {
         if (typeof value !== "boolean")
           throw new TypeError(`${name} must be boolean`);
       }
       integer(max_per_file, 1, 1000, "max_per_file");
+      integer(context_lines, 0, 20, "context_lines");
+      integer(max_hydrated_files, 1, 32, "max_hydrated_files");
+      hydrate ||= enclosing;
+      lines ||= hydrate;
+      // Extend the existing authorized snapshot/structure owner, not rg's
+      // previews: one bounded read per file, normalized/deduplicated selectors,
+      // whole-source hashes and immutable recovery for oversized selections.
+      const read = hydrate ? capability("read_file") : undefined;
       const run = capability("exec_command");
       // Fixed flags keep the record format independent of user configuration:
       // Counts are NUL-framed; JSON line events preserve arbitrary path spelling
@@ -506,6 +524,7 @@
         );
       const files = new Map();
       const occurrences = new Map();
+      const hydrationHits = new Map();
       const normalizePath = (file) => file.replace(/^(\.\/)+/, "");
       let unparsed = false;
       let binary = false;
@@ -600,6 +619,14 @@
               continue;
             }
             seen.set(data.line_number, identity);
+            if (hydrate) {
+              const hits = hydrationHits.get(entry) ?? [];
+              hydrationHits.set(entry, hits);
+              // Context plus enclosing uses at most the owner's 64 selectors.
+              if (hits.length < 32)
+                hits.push({ line: data.line_number, start: data.absolute_offset,
+                  text: data.lines.text });
+            }
             let start = 0;
             let end = Math.min(text.length, text.length > 240 ? 239 : 240);
             if (text.length > 240 && Array.isArray(data.submatches)) {
@@ -656,12 +683,84 @@
       for (const entry of sorted) {
         if (lines && entry.count >= max_per_file) capped = entry.capped = true;
       }
+      const searchComplete = code !== 2 && !capped && !unparsed && !binary;
+      let hydration;
+      if (hydrate) {
+        hydration = { complete: true, truncated: false, files_read: 0,
+          max_files: max_hydrated_files, max_matches_per_file: 32,
+          max_bytes_per_file: 1024 * 1024 };
+        const encoder = new TextEncoder();
+        // Serial reads add no detached tasks or new scheduler/lock lifetime.
+        // A failed file never discards successful search/read siblings.
+        for (const entry of sorted) {
+          const hits = hydrationHits.get(entry) ?? [];
+          const reasons = [];
+          let truncated = false;
+          if (entry.binary || !entry.path || !hits.length) {
+            reasons.push("source_unavailable");
+          } else if (hydration.files_read >= max_hydrated_files) {
+            reasons.push("file_limit");
+            truncated = true;
+          } else {
+            ++hydration.files_read;
+            const structural = enclosing && /\.(rs|py)$/i.test(entry.path);
+            if (enclosing && !structural) reasons.push("enclosing_unsupported");
+            if (entry.count > hits.length) {
+              reasons.push("match_limit");
+              truncated = true;
+            }
+            const selectors = hits.flatMap(hit => [
+              { kind: "lines", start: Math.max(1, hit.line - context_lines),
+                end: hit.line + context_lines },
+              ...(structural ? [{ kind: "enclosing", line: hit.line }] : []),
+            ]);
+            try {
+              const source = entry.source = await read({ path: entry.path, selectors });
+              if (source.complete !== true) reasons.push("selection_incomplete");
+              truncated ||= source.continuation != null || source.results?.some(row =>
+                ["selector_too_large", "aggregate_omitted"].includes(row.status) ||
+                row.continuation != null) === true;
+              // rg and read_file observe mutable files at different instants.
+              // Bind only exact hit bytes at their original UTF-8 offsets to
+              // this hash; never stamp the rg previews with an unverified hash.
+              const ranges = (source.results ?? []).filter(row =>
+                row.status === "ok" && typeof row.text === "string" && row.canonical_range
+              ).map(row => ({ ...row.canonical_range, bytes: encoder.encode(row.text) }));
+              let verified = 0;
+              for (const hit of hits) {
+                if (!Number.isSafeInteger(hit.start) || hit.start < 0) continue;
+                const expected = encoder.encode(hit.text);
+                const range = ranges.find(range => range.start <= hit.start &&
+                  range.end >= hit.start + expected.length);
+                if (!range) continue;
+                const offset = hit.start - range.start;
+                if (expected.every((byte, i) => byte === range.bytes[offset + i])) ++verified;
+                else if (!reasons.includes("source_changed")) reasons.push("source_changed");
+              }
+              entry.matches_verified = verified;
+              if (verified !== hits.length && !reasons.includes("source_changed"))
+                reasons.push("match_unavailable");
+            } catch (cause) {
+              reasons.push("read_error");
+              entry.hydration_error = { message: cause?.message ?? String(cause),
+                ...(cause?.tool_failure ? { tool_failure: cause.tool_failure } : {}) };
+            }
+          }
+          entry.hydration = { complete: reasons.length === 0, truncated, reasons,
+            matches_selected: entry.source ? hits.length : 0,
+            matches_omitted: entry.count - (entry.source ? hits.length : 0) };
+          hydration.complete &&= entry.hydration.complete;
+          hydration.truncated ||= truncated;
+        }
+      }
       return {
         pattern,
         files: sorted,
         file_count: sorted.length,
         match_count: sorted.reduce((sum, entry) => sum + entry.count, 0),
-        complete: code !== 2 && !capped && !unparsed && !binary,
+        complete: searchComplete && (!hydration || hydration.complete),
+        ...(hydration ? { search_complete: searchComplete, hydration,
+          truncated: capped || hydration.truncated } : {}),
         ...(errors.length ? { errors: errors.slice(0, 20) } : {}),
         // The host's advisory for this search, such as existing paths near a
         // guessed one that rg could not open. Dropping it cost another search.

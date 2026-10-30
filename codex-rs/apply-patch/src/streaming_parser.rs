@@ -7,6 +7,9 @@ use crate::parser::DELETE_FILE_MARKER;
 use crate::parser::EMPTY_CHANGE_CONTEXT_MARKER;
 use crate::parser::END_PATCH_MARKER;
 use crate::parser::EOF_MARKER;
+use crate::parser::EXPECT_MARKER;
+use crate::parser::FileRevisionGuard;
+use crate::parser::GUARD_FILE_MARKER;
 use crate::parser::Hunk;
 use crate::parser::MOVE_TO_MARKER;
 use crate::parser::ParseError;
@@ -17,6 +20,9 @@ use Hunk::*;
 use ParseError::*;
 
 const ENVIRONMENT_ID_MARKER: &str = "*** Environment ID:";
+
+/// A finished patch's hunks, environment id and revision guards.
+pub(crate) type PatchParts = (Vec<Hunk>, Option<String>, Vec<FileRevisionGuard>);
 
 #[derive(Debug, Default, Clone)]
 pub struct StreamingPatchParser {
@@ -30,6 +36,8 @@ struct StreamingParserState {
     mode: StreamingParserMode,
     hunks: Vec<Hunk>,
     environment_id: Option<String>,
+    revision_guards: Vec<FileRevisionGuard>,
+    pending_guard: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -37,6 +45,7 @@ enum StreamingParserMode {
     #[default]
     NotStarted,
     StartedPatch,
+    GuardFile,
     AddFile,
     DeleteFile,
     UpdateFile {
@@ -92,9 +101,20 @@ impl StreamingPatchParser {
     }
 
     fn handle_hunk_headers_and_end_patch(&mut self, trimmed: &str) -> Result<bool, ParseError> {
+        if let Some(path) = trimmed.strip_prefix(GUARD_FILE_MARKER) {
+            if !matches!(self.state.mode, StreamingParserMode::StartedPatch) || path.is_empty() {
+                return Err(InvalidPatchError("Revision guards must name a file before any file hunks".into()));
+            }
+            self.state.pending_guard = Some(PathBuf::from(path));
+            self.state.mode = StreamingParserMode::GuardFile;
+            return Ok(true);
+        }
         if matches!(self.state.mode, StreamingParserMode::StartedPatch)
             && let Some(environment_id) = trimmed.strip_prefix(ENVIRONMENT_ID_MARKER)
         {
+            if !self.state.revision_guards.is_empty() {
+                return Err(InvalidPatchError("Environment ID must precede revision guards".into()));
+            }
             if self.state.environment_id.is_some() {
                 return Err(InvalidPatchError(
                     "apply_patch environment_id cannot be specified more than once".to_string(),
@@ -175,10 +195,7 @@ impl StreamingPatchParser {
             let line = std::mem::take(&mut self.line_buffer);
             self.line_number += 1;
             if line.trim() == END_PATCH_MARKER
-                && !matches!(
-                    self.state.mode,
-                    StreamingParserMode::NotStarted | StreamingParserMode::EndedPatch
-                )
+                && matches!(self.state.mode, StreamingParserMode::StartedPatch | StreamingParserMode::AddFile | StreamingParserMode::DeleteFile | StreamingParserMode::UpdateFile { .. })
             {
                 self.ensure_update_hunk_is_not_empty(line.trim())?;
                 self.state.mode = StreamingParserMode::EndedPatch;
@@ -202,9 +219,9 @@ impl StreamingPatchParser {
     }
 
     /// Finalize a batch parse without cloning the completed patch payload.
-    pub(crate) fn into_parts(mut self) -> Result<(Vec<Hunk>, Option<String>), ParseError> {
+    pub(crate) fn into_parts(mut self) -> Result<PatchParts, ParseError> {
         self.finish_in_place()?;
-        Ok((self.state.hunks, self.state.environment_id))
+        Ok((self.state.hunks, self.state.environment_id, self.state.revision_guards))
     }
 
     fn process_line(&mut self, line: &str) -> Result<(), ParseError> {
@@ -218,6 +235,24 @@ impl StreamingPatchParser {
                 Err(InvalidPatchError(
                     "The first line of the patch must be '*** Begin Patch'".to_string(),
                 ))
+            }
+            StreamingParserMode::GuardFile => {
+                let expected = trimmed.strip_prefix(EXPECT_MARKER).ok_or_else(||
+                    InvalidPatchError("Guard File must be followed by *** Expect: sha256:<64 hex characters> or *** Expect: absent".into()))?;
+                let expected_sha256 = if expected == "absent" {
+                    None
+                } else if let Some(hash) = expected.strip_prefix("sha256:")
+                    && hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    Some(hash.to_ascii_lowercase())
+                } else {
+                    return Err(InvalidPatchError("Revision guard requires sha256:<64 hex characters> or absent".into()));
+                };
+                let path = self.state.pending_guard.take().ok_or_else(||
+                    InvalidPatchError("Revision guard is missing its path".into()))?;
+                self.state.revision_guards.push(FileRevisionGuard { path, expected_sha256 });
+                self.state.mode = StreamingParserMode::StartedPatch;
+                Ok(())
             }
             StreamingParserMode::StartedPatch => {
                 if self.handle_hunk_headers_and_end_patch(trimmed)? {

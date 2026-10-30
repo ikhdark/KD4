@@ -51,6 +51,7 @@ use crate::rpc::not_found;
 
 pub const CODEX_FS_HELPER_ARG1: &str = "--codex-run-as-fs-helper";
 const FS_READ_DIRECTORY_BOUNDED_OPERATION: &str = "fs/readDirectoryBounded";
+const FS_FIRST_REGULAR_FILE_OPERATION: &str = "fs/firstRegularFile";
 pub(crate) const FS_PERMISSION_DENIED_ERROR_CODE: i64 = -32003;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +81,13 @@ pub(crate) enum FsHelperRequest {
     ReadFileBounded(FsReadFileBoundedParams),
     #[serde(rename = "fs/readFileBoundedWithSource")]
     ReadFileBoundedWithSource(FsReadFileBoundedParams),
+    #[serde(rename = "fs/readFileRange")]
+    ReadFileRange(crate::protocol::FsReadFileRangeParams),
+    #[serde(rename = "fs/checksumFile")]
+    ChecksumFile(crate::protocol::FsChecksumFileParams),
+    // Helper-only: one launch probes every executable lookup candidate.
+    #[serde(rename = "fs/firstRegularFile")]
+    FirstRegularFile { candidates: Vec<PathUri> },
     #[serde(rename = "fs/writeFile")]
     WriteFile(FsWriteFileParams),
     #[serde(rename = "fs/createDirectory")]
@@ -112,6 +120,12 @@ pub(crate) enum FsHelperResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "response")]
 pub(crate) enum FsHelperPayload {
+    #[serde(rename = "fs/readFileRange")]
+    ReadFileRange(crate::protocol::FsReadFileRangeResponse),
+    #[serde(rename = "fs/checksumFile")]
+    ChecksumFile(crate::protocol::FsChecksumFileResponse),
+    #[serde(rename = "fs/firstRegularFile")]
+    FirstRegularFile { path: Option<PathUri> },
     #[serde(rename = "fs/readFile")]
     ReadFile(FsReadFileResponse),
     #[serde(rename = "fs/readFileBounded")]
@@ -133,8 +147,9 @@ pub(crate) enum FsHelperPayload {
     ReadDirectory(FsReadDirectoryResponse),
     #[serde(rename = "fs/readDirectoryBounded")]
     ReadDirectoryBounded(FsHelperReadDirectoryBoundedResponse),
+    // Boxed: a walk outcome dwarfs every other payload.
     #[serde(rename = "fs/walk")]
-    Walk(FsWalkResponse),
+    Walk(Box<FsWalkResponse>),
     #[serde(rename = "fs/remove")]
     Remove(FsRemoveResponse),
     #[serde(rename = "fs/copy")]
@@ -144,8 +159,40 @@ pub(crate) enum FsHelperPayload {
 }
 
 impl FsHelperPayload {
+    pub(crate) fn expect_read_file_range(self) -> Result<crate::protocol::FsReadFileRangeResponse, JSONRPCErrorError> {
+        match self {
+            Self::ReadFileRange(response) => Ok(response),
+            other => Err(unexpected_response(crate::protocol::FS_READ_FILE_RANGE_METHOD, other.operation())),
+        }
+    }
+
+    pub(crate) fn expect_checksum_file(
+        self,
+    ) -> Result<crate::protocol::FsChecksumFileResponse, JSONRPCErrorError> {
+        match self {
+            Self::ChecksumFile(response) => Ok(response),
+            other => Err(unexpected_response(
+                crate::protocol::FS_CHECKSUM_FILE_METHOD,
+                other.operation(),
+            )),
+        }
+    }
+
+    pub(crate) fn expect_first_regular_file(self) -> Result<Option<PathUri>, JSONRPCErrorError> {
+        match self {
+            Self::FirstRegularFile { path } => Ok(path),
+            other => Err(unexpected_response(
+                FS_FIRST_REGULAR_FILE_OPERATION,
+                other.operation(),
+            )),
+        }
+    }
+
     fn operation(&self) -> &'static str {
         match self {
+            Self::ReadFileRange(_) => crate::protocol::FS_READ_FILE_RANGE_METHOD,
+            Self::ChecksumFile(_) => crate::protocol::FS_CHECKSUM_FILE_METHOD,
+            Self::FirstRegularFile { .. } => FS_FIRST_REGULAR_FILE_OPERATION,
             Self::ReadFile(_) => FS_READ_FILE_METHOD,
             Self::ReadFileBounded(_) => FS_READ_FILE_BOUNDED_METHOD,
             Self::ReadFileBoundedWithSource { .. } => "fs/readFileBoundedWithSource",
@@ -261,7 +308,7 @@ impl FsHelperPayload {
 
     pub(crate) fn expect_walk(self) -> Result<FsWalkResponse, JSONRPCErrorError> {
         match self {
-            Self::Walk(response) => Ok(response),
+            Self::Walk(response) => Ok(*response),
             other => Err(unexpected_response(FS_WALK_METHOD, other.operation())),
         }
     }
@@ -327,6 +374,29 @@ pub(crate) async fn run_direct_request(
 ) -> Result<FsHelperPayload, JSONRPCErrorError> {
     let file_system = DirectFileSystem;
     match request {
+        FsHelperRequest::ReadFileRange(params) => {
+            let read = file_system.read_file_range(&params.path, params.start, params.len,
+                params.expected_revision.as_deref(), None).await.map_err(map_fs_error)?;
+            Ok(FsHelperPayload::ReadFileRange(crate::protocol::FsReadFileRangeResponse {
+                data_base64: STANDARD.encode(read.bytes), file_bytes: read.file_bytes, revision: read.revision,
+            }))
+        }
+        FsHelperRequest::ChecksumFile(params) => {
+            let digest = file_system
+                .checksum_file(&params.path, /*sandbox*/ None)
+                .await
+                .map_err(map_fs_error)?;
+            Ok(FsHelperPayload::ChecksumFile(
+                crate::protocol::FsChecksumFileResponse { digest },
+            ))
+        }
+        FsHelperRequest::FirstRegularFile { candidates } => {
+            let path = file_system
+                .first_regular_file(&candidates, /*sandbox*/ None)
+                .await
+                .map_err(map_fs_error)?;
+            Ok(FsHelperPayload::FirstRegularFile { path })
+        }
         FsHelperRequest::ReadFileCapped { path, max_bytes } => {
             let data = file_system
                 .read_file_capped(&path, max_bytes, None)
@@ -487,7 +557,7 @@ pub(crate) async fn run_direct_request(
                 .walk(&params.path, params.options, /*sandbox*/ None)
                 .await
                 .map_err(map_fs_error)?;
-            Ok(FsHelperPayload::Walk(outcome))
+            Ok(FsHelperPayload::Walk(Box::new(outcome)))
         }
         FsHelperRequest::Remove(params) => {
             file_system

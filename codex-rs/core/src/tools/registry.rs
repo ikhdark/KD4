@@ -1781,7 +1781,12 @@ impl ToolRegistry {
                         &base_tool_result_tags,
                         /*extra_trace_fields*/ &[],
                     );
-                    let err = FunctionCallError::RespondToModel(message);
+                    let err = FunctionCallError::structured(
+                        codex_protocol::tool_failure::ToolFailure::no_effects(
+                            codex_protocol::tool_failure::ToolFailureCode::InvalidInput,
+                            message,
+                        ),
+                    );
                     dispatch_state.try_complete();
                     return Err(err);
                 }
@@ -1823,7 +1828,12 @@ impl ToolRegistry {
                 &tool_result_tags,
                 &extra_trace_fields,
             );
-            let err = FunctionCallError::RespondToModel(message);
+            let err = FunctionCallError::structured(
+                codex_protocol::tool_failure::ToolFailure::no_effects(
+                    codex_protocol::tool_failure::ToolFailureCode::InvalidInput,
+                    message,
+                ),
+            );
             dispatch_state.try_complete();
             return Err(err);
         }
@@ -1841,7 +1851,7 @@ impl ToolRegistry {
         {
             // A sub-agent's misaddressed progress report gets the ancestor
             // policy rather than a schema error it would retry around.
-            let message = (!external_tool
+            let refusal = (!external_tool
                 && matches!(tool_name.name.as_str(), "send_message" | "followup_task"))
             .then(|| parsed_function_arguments.as_ref()?.value().ok())
             .flatten()
@@ -1850,8 +1860,13 @@ impl ToolRegistry {
                     &invocation.step_context.turn,
                     arguments,
                 )
-            })
-            .unwrap_or(message);
+            });
+            let code = if refusal.is_some() {
+                codex_protocol::tool_failure::ToolFailureCode::PermissionDenied
+            } else {
+                codex_protocol::tool_failure::ToolFailureCode::InvalidInput
+            };
+            let message = refusal.unwrap_or(message);
             let log_payload = invocation.payload.log_payload();
             otel.tool_result_with_tags(
                 tool_name_flat.as_ref(),
@@ -1863,7 +1878,9 @@ impl ToolRegistry {
                 &tool_result_tags,
                 &extra_trace_fields,
             );
-            let err = FunctionCallError::RespondToModel(message);
+            let err = FunctionCallError::structured(
+                codex_protocol::tool_failure::ToolFailure::no_effects(code, message),
+            );
             dispatch_state.try_complete();
             return Err(err);
         }
@@ -1949,7 +1966,12 @@ impl ToolRegistry {
                 &tool_result_tags,
                 &extra_trace_fields,
             );
-            let err = FunctionCallError::RespondToModel(message);
+            let err = FunctionCallError::structured(
+                codex_protocol::tool_failure::ToolFailure::no_effects(
+                    codex_protocol::tool_failure::ToolFailureCode::InvalidInput,
+                    message,
+                ),
+            );
             notify_tool_finish_if_unclaimed(
                 &invocation,
                 dispatch_state.as_ref(),

@@ -40,6 +40,24 @@ pub const EXEC_OUTPUT_GAP_METHOD: &str = "process/outputGap";
 /// Process observation failed; this is not evidence of an OS exit.
 pub const EXEC_FAILED_METHOD: &str = "process/failed";
 pub const ENVIRONMENT_INFO_METHOD: &str = "environment/info";
+/// Read-only lookup on the selected executor; old peers must refuse, not use host PATH.
+pub const LOOKUP_EXECUTABLE_METHOD: &str = "environment/lookupExecutable";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LookupExecutableParams {
+    pub name: String,
+    pub cwd: PathUri,
+    pub sandbox: Option<FileSystemSandboxContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LookupExecutableResponse {
+    /// Availability at lookup time only, never trust, launch permission or execution proof.
+    pub path: Option<PathUri>,
+}
+
 pub const FS_READ_FILE_METHOD: &str = "fs/readFile";
 /// Stable, size-bounded read that honors the same sandbox context as `fs/readFile`.
 /// Older peers return method-not-found.
@@ -326,6 +344,57 @@ pub struct FsReadFileBoundedParams {
 pub struct FsReadFileBoundedResponse {
     /// `null` when the file exceeds `maxBytes` or changed while it was read.
     pub data_base64: Option<String>,
+}
+
+pub const FS_READ_FILE_RANGE_METHOD: &str = "fs/readFileRange";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FsReadFileRangeParams {
+    pub path: PathUri,
+    pub start: u64,
+    pub len: usize,
+    pub expected_revision: Option<String>,
+    pub sandbox: Option<FileSystemSandboxContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsReadFileRangeResponse {
+    pub data_base64: String,
+    pub file_bytes: u64,
+    pub revision: String,
+}
+
+/// Hashes one opened regular file on the executor. Older peers return
+/// method-not-found; never fall back to per-page or host-side reads.
+pub const FS_CHECKSUM_FILE_METHOD: &str = "fs/checksumFile";
+/// Idempotently abandon a checksum by `cancelId`, bypassing request ordering.
+/// Unknown or finished ids are no-ops; older peers return method-not-found.
+pub const FS_CHECKSUM_FILE_CANCEL_METHOD: &str = "fs/checksumFileCancel";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FsChecksumFileParams {
+    pub path: PathUri,
+    pub sandbox: Option<FileSystemSandboxContext>,
+    /// Client-chosen id for `fs/checksumFileCancel`; one still active on this
+    /// connection is refused. Absent: the pass cannot be cancelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsChecksumFileCancelParams {
+    pub cancel_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsChecksumFileResponse {
+    /// `None` when the source changed or was replaced during acquisition.
+    pub digest: Option<codex_file_system::FileDigest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

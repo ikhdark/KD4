@@ -20,6 +20,11 @@ import type { SandboxMode } from "./SandboxMode";
  * treats a non-empty path as a consistency check against the active rollout path.
  * Empty string path values are treated as absent.
  *
+ * Rejoining a subscribed or busy thread ignores stale legacy `approvalPolicy`
+ * and `sandbox` hints and returns its active permissions without changing them.
+ * Conflicting exact `permissionProfile` and other typed overrides are rejected.
+ * Cold resume still applies configuration overrides.
+ *
  * Prefer using thread_id whenever possible.
  */
 export type ThreadResumeParams = {threadId: string, /**

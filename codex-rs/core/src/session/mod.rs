@@ -2147,7 +2147,9 @@ impl Session {
                 self.apply_rollout_reconstruction_with_provider(
                     &turn_context,
                     &rollout_items,
-                    /*invalidate_unified_exec_sessions*/ false,
+                    // A fork has a new process manager, not the parent's
+                    // process/control ownership. Reuse cold-resume invalidation.
+                    /*invalidate_unified_exec_sessions*/ true,
                     reconstructed_provider_id.as_deref(),
                 )
                 .await;
@@ -2257,6 +2259,23 @@ impl Session {
                 rollout_items,
             );
             rollout_reconstruction::append_unsettled_tool_recovery(&mut history, rollout_items);
+        } else if let Some(position) = history
+            .iter()
+            .position(crate::unified_exec::process_inventory::is_process_inventory)
+        {
+            // Rollback reloads persisted checkpoints, which can predate a cold
+            // resume or fork. Only this owner's current snapshot may stand there.
+            history.retain(|item| {
+                !crate::unified_exec::process_inventory::is_process_inventory(item)
+            });
+            if let Some(inventory) = self
+                .services
+                .unified_exec_manager
+                .compaction_process_inventory()
+                .await
+            {
+                history.insert(position, inventory);
+            }
         }
         // Keep the recorded rollout unchanged. Prepare its reconstructed history before
         // installing it, so legacy images are processed once for this resume or fork and

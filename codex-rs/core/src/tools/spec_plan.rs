@@ -10,16 +10,20 @@ use crate::tools::effective_tool_mode;
 use crate::tools::exposure::AgentSurfaceStage;
 use crate::tools::exposure::ToolExposureIdentity;
 use crate::tools::handlers::ApplyPatchHandler;
+use crate::tools::handlers::ChecksumFileHandler;
 use crate::tools::handlers::CodeModeExecuteHandler;
 use crate::tools::handlers::CodeModeWaitHandler;
+use crate::tools::handlers::CompareArtifactsHandler;
 use crate::tools::handlers::CurrentTimeHandler;
 use crate::tools::handlers::DynamicToolHandler;
 use crate::tools::handlers::ExecCommandHandler;
 use crate::tools::handlers::ExecCommandHandlerOptions;
+use crate::tools::handlers::GitBlameHandler;
 use crate::tools::handlers::ListAvailablePluginsToInstallHandler;
 use crate::tools::handlers::ListFilesHandler;
 use crate::tools::handlers::ListMcpResourceTemplatesHandler;
 use crate::tools::handlers::ListMcpResourcesHandler;
+use crate::tools::handlers::LookupExecutableHandler;
 use crate::tools::handlers::McpHandler;
 use crate::tools::handlers::PlanHandler;
 use crate::tools::handlers::ReadFileHandler;
@@ -884,7 +888,7 @@ fn build_code_mode_executors(
                 if definition.name == "apply_patch" {
                     definition.description = format!("{}\nNested apply_patch is available: await tools.apply_patch(patchText). Result: {{success, text, changes, changes_exact, environment_id, diagnostics, retry?}}; check success before continuing.", definition.description).into();
                 } else if definition.name == "read_file" {
-                    definition.description = format!("{}\nResult fields: path, total_lines, source_sha256, canonical_bytes, retained_bytes, complete, file_complete, retained_artifact_complete, results; optional artifact_id, continuation, page_selectors, snapshot_error. Each results[] item has selector, status, complete and text or value (search hydrated_ranges), with recovery fields when incomplete.", definition.description).into();
+                    definition.description = format!("{}\nResult fields: path, retained_bytes, complete, file_complete, retained_artifact_complete, results. Snapshot reads add total_lines, source_sha256, canonical_bytes and optional artifact_id, continuation, page_selectors, snapshot_error, canonical_sha256 (decoded UTF-16 snapshot identity; join recovery pages on it when present), unchanged; live byte pages instead add read_mode:byte_ranges, file_bytes, file_revision and, when incomplete, range_recovery. Each results[] item has selector, status, complete and text, value or data_hex/data_base64 (search hydrated_ranges), with recovery fields when incomplete.", definition.description).into();
                 }
                 eager_nested_tool_definitions.push(definition);
             } else if tool_mode == ToolMode::CodeModeOnly
@@ -911,7 +915,7 @@ fn build_code_mode_executors(
         eager_nested_tool_descriptions.push("Nested apply_patch is unavailable in this session; use its direct interface only if advertised.".to_string());
     }
     if has_nested_list_files {
-        eager_nested_tool_descriptions.push("- `await tools.list_files({path, include?, exclude?, exclude_directories?, max_depth?, max_entries?})`: include/exclude/exclude_directories are arrays of basename-pattern strings, never booleans. max_depth:0 lists only the selected directory; default depth 8 and 2000 entries. No gitignore. Returns `{entries:[{path,kind}], truncated, complete}`. With include patterns only matching files are listed, but subdirectories are still traversed unless pruned by exclude_directories. Combine known patterns for the same root/options; check completeness under the combined limits. Resolve the full contract for other options.".to_string());
+        eager_nested_tool_descriptions.push("- `await tools.list_files({path, include?, exclude?, exclude_directories?, include_paths?, exclude_paths?, exclude_directory_paths?, include_hidden?, include_ignored?, include_metadata?, summary_only?, max_depth?, max_entries?})`: include/exclude/exclude_directories are arrays of case-sensitive basename patterns, never booleans. Explicit include_paths/exclude_paths/exclude_directory_paths are case-sensitive root-relative patterns with / or \\ separators, segment-local * and ?, and whole-segment ** for zero or more segments. Inclusion groups are unioned; exclusions win. max_depth:0 lists only the selected directory; default depth 8 and 2000 entries. By default respects .gitignore only inside Git repositories (from each entry's nearest repository root down; never outside one); include_ignored:true bypasses it. Hidden directories are not traversed unless include_hidden:true, independently of ignored-file filtering. For unfiltered coverage set both true and omit filters. Returns `{entries:[{path,kind}], truncated, complete}`. With include patterns only matching files are listed, but subdirectories are still traversed unless pruned by exclude_directories or exclude_directory_paths. Combine known patterns for the same root/options; check completeness under the combined limits. summary_only:true aggregates file/directory counts and logical file bytes in the same scan instead of returning entry paths; check summary.skipped and summary.totals_complete along with errors/cutoffs. Traversal and metadata costs still apply. include_metadata:true adds cheap entry size/timestamps/link/readonly metadata; omitted by default, no content detection or link-target probes. Check per-path errors and metadata_error. Resolve the full contract for other options.".to_string());
     }
     if !lazy_builtin_tool_names.is_empty() {
         // Names only: built-ins keep this line stable when external inventories change.
@@ -1256,6 +1260,11 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     let features = turn_context.config.features.get();
     let environment_mode = tool_environment_mode(context.step_context);
     planned_tools.add_with_authorization_class(ReadToolOutputHandler, TypedToolClass::ReadSearch);
+    planned_tools.add_with_exposure_and_authorization_class(
+        CompareArtifactsHandler,
+        if search_tool_enabled(turn_context) { ToolExposure::Deferred } else { ToolExposure::Direct },
+        TypedToolClass::ReadSearch,
+    );
     // Host skill locators remain readable even when no execution environment exists.
     // The handler still requires an environment for ordinary filesystem paths.
     planned_tools.add_with_authorization_class(ReadFileHandler, TypedToolClass::ReadSearch);
@@ -1266,10 +1275,43 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
         .is_empty()
         || !context.step_context.environments.starting.is_empty()
     {
+        planned_tools.add_with_exposure_and_authorization_class(
+            LookupExecutableHandler,
+            if search_tool_enabled(turn_context) { ToolExposure::Deferred } else { ToolExposure::Direct },
+            TypedToolClass::ReadSearch,
+        );
+        planned_tools.add_with_exposure_and_authorization_class(
+            ChecksumFileHandler,
+            if search_tool_enabled(turn_context) { ToolExposure::Deferred } else { ToolExposure::Direct },
+            TypedToolClass::ReadSearch,
+        );
+        planned_tools.add_with_exposure_and_authorization_class(
+            crate::tools::handlers::CheckSnapshotFreshnessHandler,
+            if search_tool_enabled(turn_context) { ToolExposure::Deferred } else { ToolExposure::Direct },
+            TypedToolClass::ReadSearch,
+        );
         planned_tools.add_with_authorization_class(
             crate::tools::handlers::ReadStatusHandler,
             TypedToolClass::ReadSearch,
         );
+        // The handler refuses remote filesystems; do not advertise a tool
+        // that every call in this session would reject.
+        let environments = &context.step_context.environments;
+        if environments
+            .turn_environments
+            .iter()
+            .any(|environment| !environment.environment.is_remote())
+            || environments
+                .starting
+                .iter()
+                .any(|environment| !environment.is_remote())
+        {
+            planned_tools.add_with_exposure_and_authorization_class(
+                crate::tools::handlers::WaitForFileHandler,
+                if search_tool_enabled(turn_context) { ToolExposure::Deferred } else { ToolExposure::Direct },
+                TypedToolClass::ReadSearch,
+            );
+        }
     }
     if !context
         .step_context
@@ -1278,6 +1320,30 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
         .is_empty()
     {
         planned_tools.add_with_authorization_class(ListFilesHandler, TypedToolClass::ReadSearch);
+        // Native Git tools refuse remote and restricted-read environments.
+        if turn_context
+            .file_system_sandbox_policy()
+            .has_full_disk_read_access()
+            && context
+                .step_context
+                .environments
+                .turn_environments
+                .iter()
+                .any(|environment| !environment.environment.is_remote())
+        {
+            for range in [false, true] {
+                planned_tools.add_with_exposure_and_authorization_class(
+                    crate::tools::handlers::GitInspectionHandler { range },
+                    if search_tool_enabled(turn_context) { ToolExposure::Deferred } else { ToolExposure::Direct },
+                    TypedToolClass::ReadSearch,
+                );
+            }
+            planned_tools.add_with_exposure_and_authorization_class(
+                GitBlameHandler,
+                if search_tool_enabled(turn_context) { ToolExposure::Deferred } else { ToolExposure::Direct },
+                TypedToolClass::ReadSearch,
+            );
+        }
         planned_tools.add_with_authorization_class(
             crate::tools::handlers::SaveTurnDiffHandler,
             TypedToolClass::StructuredEdit,
@@ -1684,7 +1750,22 @@ fn append_tool_search_executor(
         return None;
     }
 
-    let handler = context.tool_search_handler_cache.get_or_build(search_infos);
+    // Inventory equality alone does not identify a catalog generation or access scope.
+    let cache_context = serde_json::json!({
+        "enumeration_complete": context.step_context.mcp_discovery_complete(),
+        "mcp_generation": context.step_context.mcp.generation(),
+        "exposure": context.exposure_identity,
+        "permissions": turn_context.permission_profile,
+        "approval": turn_context.approval_policy.value(),
+        "environment_generation": context.step_context.environments.generation,
+        "environments": context.step_context.environments.to_selections(),
+        "roots": context.step_context.selected_capability_roots.iter()
+            .map(codex_exec_server::ResolvedSelectedCapabilityRoot::selected_root)
+            .collect::<Vec<_>>(),
+    });
+    let handler = context
+        .tool_search_handler_cache
+        .get_or_build(search_infos, cache_context);
     planned_tools.runtimes.insert(
         0,
         RegisteredTool::new(handler.clone(), TypedToolClass::ReadSearch),
@@ -1845,6 +1926,10 @@ impl CoreToolRuntime for MultiAgentV2NamespaceOverride {
             tool_name: self.handler.tool_name(),
             ..invocation.clone()
         })
+    }
+
+    fn delegates_workspace_admission(&self) -> bool {
+        self.handler.delegates_workspace_admission()
     }
 
     fn waits_for_runtime_cancellation(&self) -> bool {

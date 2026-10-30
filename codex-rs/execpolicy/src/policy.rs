@@ -3,13 +3,11 @@ use crate::error::Error;
 use crate::error::Result;
 use crate::executable_name::executable_lookup_key;
 use crate::rule::NetworkRule;
-use crate::rule::NetworkRuleProtocol;
 use crate::rule::PatternToken;
 use crate::rule::PrefixPattern;
 use crate::rule::PrefixRule;
 use crate::rule::RuleMatch;
 use crate::rule::RuleRef;
-use crate::rule::normalize_network_rule_host;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use multimap::MultiMap;
 use serde::Deserialize;
@@ -136,30 +134,6 @@ impl Policy {
                 .insert(executable_lookup_key(&first_token), Arc::clone(&rule));
         }
         self.rules_by_program.insert(first_token, rule);
-        Ok(())
-    }
-
-    pub fn add_network_rule(
-        &mut self,
-        host: &str,
-        protocol: NetworkRuleProtocol,
-        decision: Decision,
-        justification: Option<String>,
-    ) -> Result<()> {
-        let host = normalize_network_rule_host(host)?;
-        if let Some(raw) = justification.as_deref()
-            && raw.trim().is_empty()
-        {
-            return Err(Error::InvalidRule(
-                "justification cannot be empty".to_string(),
-            ));
-        }
-        self.network_rules.push(NetworkRule {
-            host,
-            protocol,
-            decision,
-            justification,
-        });
         Ok(())
     }
 

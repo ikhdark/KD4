@@ -48,10 +48,17 @@ const MIN_FILE_READ_PREVIEW_TOKENS: usize = 2_000;
 pub(super) mod code_sections;
 pub(crate) use code_sections::existing_tests_changed;
 pub(crate) use code_sections::compilation_module_paths;
+pub(crate) use code_sections::syntax_regression;
 
 #[path = "read_file_structure.rs"]
 mod structure;
 use structure::FileSelector;
+
+#[path = "read_file_ranges.rs"]
+mod ranges;
+
+#[path = "read_file_encoding.rs"]
+mod encoding;
 
 pub(crate) struct ReadFileHandler;
 pub(crate) struct ReadStatusHandler;
@@ -154,6 +161,10 @@ impl CoreToolRuntime for ReadStatusHandler {}
 struct ReadFileArgs {
     path: String,
     environment_id: Option<String>,
+    revision: Option<String>,
+    if_source_hash: Option<String>,
+    if_file_revision: Option<String>,
+    encoding: Option<ranges::ByteEncoding>,
     selectors: Option<Vec<FileSelector>>,
 }
 
@@ -163,6 +174,10 @@ struct RawReadFileArgs {
     #[serde(alias = "file_path")]
     path: String,
     environment_id: Option<String>,
+    revision: Option<String>,
+    if_source_hash: Option<String>,
+    if_file_revision: Option<String>,
+    encoding: Option<ranges::ByteEncoding>,
     selectors: Option<Vec<FileSelector>>,
     offset: Option<usize>,
     limit: Option<usize>,
@@ -177,6 +192,20 @@ impl TryFrom<RawReadFileArgs> for ReadFileArgs {
         // Dispatch consumes this flag before replay lookup/storage; the handler
         // always reads the selected filesystem when it is actually invoked.
         let _ = raw.force_fresh;
+        if let Some(revision) = &raw.revision {
+            if revision.trim().is_empty() || revision.contains(['\0', '\n', '\r']) {
+                return Err("revision must be a nonempty Git commit revision".into());
+            }
+            if raw.path.starts_with("skill:") || raw.path.starts_with("context:") {
+                return Err("revision is only supported for repository files".into());
+            }
+        }
+        let if_source_hash = raw.if_source_hash.map(|hash| {
+            if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err("if_source_hash must be a 64-character hexadecimal SHA-256".to_string());
+            }
+            Ok(hash.to_ascii_lowercase())
+        }).transpose()?;
         let legacy_range = raw.offset.is_some() || raw.limit.is_some();
         if legacy_range && raw.selectors.is_some() {
             return Err("use selectors or offset/limit, not both".into());
@@ -197,9 +226,33 @@ impl TryFrom<RawReadFileArgs> for ReadFileArgs {
         } else {
             raw.selectors
         };
+        if raw.encoding.is_some()
+            && (raw.revision.is_some() || if_source_hash.is_some()
+                || raw.path.starts_with("skill:") || raw.path.starts_with("context:")
+                || !selectors.as_ref().is_some_and(|selectors| !selectors.is_empty()
+                    && selectors.iter().all(|selector| matches!(selector,
+                        FileSelector::Exact(ToolOutputSelector::Bytes { .. })))))
+        {
+            return Err("encoding requires filesystem bytes-only selectors and cannot be combined with revision or if_source_hash".into());
+        }
+        if let Some(revision) = &raw.if_file_revision {
+            if revision.is_empty() || revision.len() > 512 || !revision.is_ascii() {
+                return Err("if_file_revision must be an opaque ASCII revision of 1-512 bytes".into());
+            }
+            if raw.revision.is_some() || if_source_hash.is_some() || raw.path.starts_with("skill:") || raw.path.starts_with("context:")
+                || !selectors.as_ref().is_some_and(|selectors| !selectors.is_empty() && selectors.iter()
+                    .all(|selector| matches!(selector, FileSelector::Exact(ToolOutputSelector::Bytes { .. }))))
+            {
+                return Err("if_file_revision requires filesystem byte selectors and cannot be combined with revision or if_source_hash".into());
+            }
+        }
         Ok(Self {
             path: raw.path,
             environment_id: raw.environment_id,
+            revision: raw.revision,
+            if_source_hash,
+            if_file_revision: raw.if_file_revision,
+            encoding: raw.encoding,
             selectors,
         })
     }
@@ -215,11 +268,11 @@ pub(crate) fn validate_read_file_arguments(arguments: &str) -> Result<(), String
 /// also names the accepted forms; a bare serde mismatch was retried blind.
 fn parse_read_file_arguments(arguments: &str) -> Result<ReadFileArgs, FunctionCallError> {
     parse_arguments(arguments).map_err(|error| match error {
-        FunctionCallError::RespondToModel(message) => {
-            FunctionCallError::RespondToModel(match accepted_selector_forms(arguments) {
-                Some(forms) => format!("{message}. {forms}"),
-                None => message,
-            })
+        FunctionCallError::Structured(mut failure) => {
+            if let Some(forms) = accepted_selector_forms(arguments) {
+                failure.message = format!("{}. {forms}", failure.message);
+            }
+            FunctionCallError::Structured(failure)
         }
         error => error,
     })
@@ -287,15 +340,20 @@ fn accepted_selector_forms(arguments: &str) -> Option<String> {
 /// filesystem identity and authorization still belong to the replay guard.
 pub(crate) fn canonical_read_file_arguments(arguments: &str) -> Option<serde_json::Value> {
     let args = parse_arguments::<ReadFileArgs>(arguments).ok()?;
-    // A live turn snapshot is never replayable under a filesystem identity.
-    if args.path == crate::turn_diff_tracker::TURN_DIFF_LOCATOR {
+    // Mutable revisions must resolve again; workspace replay guards cannot
+    // establish Git ref/object identity (nor may they credit current source).
+    if args.path == crate::turn_diff_tracker::TURN_DIFF_LOCATOR || args.revision.is_some() || args.if_file_revision.is_some() || args.encoding.is_some() {
         return None;
     }
-    Some(json!({
+    let mut identity = json!({
         "path": args.path,
         "environment_id": args.environment_id,
         "selectors": args.selectors,
-    }))
+    });
+    if let Some(hash) = args.if_source_hash {
+        identity["if_source_hash"] = json!(hash);
+    }
+    Some(identity)
 }
 
 
@@ -305,18 +363,41 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
     }
 
     fn spec(&self) -> ToolSpec {
-        let mut selectors = JsonSchema::array(file_selector_schema(), Some("Omit to read the first page immediately. Batch known ranges here. Search results include text in results[].value.hydrated_ranges; enclosing:true also returns enclosing Rust/Python items as line selections. json_pointer selects a complete JSON value. {\"kind\":\"section\",\"id\":\"outline\"} lists items; symbol and enclosing share its parser; qualified names (Type::method or Class.method) disambiguate items. Oversized selections return child_selectors.".to_string()));
+        let mut selectors = JsonSchema::array(file_selector_schema(), Some("Omit to read the first page immediately. Batch known ranges here. Search results include text in results[].value.hydrated_ranges; enclosing:true also returns enclosing Rust/Python items as line selections. json_pointer selects a complete JSON value; structured projects/filters JSON, JSONL, CSV or TSV rows with explicit malformed_rows policy. {\"kind\":\"section\",\"id\":\"outline\"} lists items; symbol and enclosing share its parser; qualified names (Type::method or Class.method) disambiguate items. Oversized selections return child_selectors.".to_string()));
         selectors.min_items = Some(1);
         selectors.max_items = Some(READ_TOOL_OUTPUT_MAX_SELECTORS as u64);
         let mut output = read_tool_output_output_schema(file_selector_schema());
         output["properties"]["path"] = json!({"type": "string"});
         output["properties"]["environment_id"] = json!({"type":"string", "description":"Actual resolved execution environment, or host-skills/host-context for host-owned sources."});
         output["properties"]["canonical_uri"] = json!({"type":"string", "description":"Canonical path URI in the resolved environment, or the host-owned locator."});
+        output["properties"]["git_source"] = json!({"type":"object", "properties":{
+            "repository_root":{"type":"string"}, "path":{"type":"string"},
+            "commit_oid":{"type":"string"}, "blob_oid":{"type":"string"}},
+            "required":["repository_root","path","commit_oid","blob_oid"], "additionalProperties":false});
         output["properties"]["total_lines"] = json!({"type": "integer", "minimum": 0});
-        output["properties"]["source_sha256"] = json!({"type": "string", "description": "SHA-256 of the complete selected source representation, including bytes outside this page. Default attached HTML can be rendered text: use explicit selectors to obtain the original file hash and exact bytes before a revision-bound codex-range patch."});
+        output["properties"]["source_encoding"] = json!({"type":"string", "enum":["utf-16le","utf-16be"], "description":"Original encoding of a decoded snapshot; omitted for UTF-8. UTF-16 requires a BOM, which is omitted from the decoded snapshot; decoding is strict, not lossy."});
+        output["properties"]["source_bytes"] = json!({"type":"integer", "minimum":0, "description":"Original file byte count, including the UTF-16 BOM; canonical_bytes counts the decoded UTF-8 snapshot instead."});
+        output["properties"]["selector_encoding"] = json!({"const":"utf-8"});
+        output["properties"]["selector_coordinate_space"] = json!({"type":"string", "enum":["decoded_utf8","source_bytes"], "description":"Omitted for UTF-8 snapshots, whose selectors address canonical bytes. Decoded snapshot selectors, byte/search offsets, canonical_range and recovery address retained UTF-8 bytes, never original UTF-16 bytes or code units. Lines/structure refer to this decoded text. Live byte_ranges use source_bytes: original bytes, including with encoding:hex|base64."});
+        output["properties"]["read_mode"] = json!({"const":"byte_ranges"});
+        output["properties"]["encoding"] = json!({"type":"string", "enum":["hex","base64"]});
+        output["$defs"]["result"]["properties"]["data_hex"] = json!({"type":"string", "description":"Lowercase hexadecimal of exactly canonical_range, two digits per source byte. Present only for encoding:hex; no text decoding."});
+        output["properties"]["file_bytes"] = json!({"type":"integer", "minimum":0});
+        output["properties"]["file_revision"] = json!({"type":"string", "description":"Opaque opened-file identity/size/timestamps/change-time revision, not a content hash or retained snapshot. Pass as if_file_revision on later byte pages."});
+        output["properties"]["range_recovery"] = json!({"type":"object", "properties":{
+            "tool":{"const":"read_file"}, "arguments":{"type":"object", "properties":{
+                "path":{"type":"string"}, "environment_id":{"type":"string"}, "if_file_revision":{"type":"string"},
+                "encoding":{"type":"string", "enum":["hex","base64"]},
+                "selectors":{"type":"array", "minItems":1, "maxItems":64, "items":file_selector_schema()}},
+                "required":["path","environment_id","if_file_revision","selectors"], "additionalProperties":false}},
+            "required":["tool","arguments"], "additionalProperties":false,
+            "description":"Read current, revision-guarded byte pages via read_file, NOT read_tool_output; a change refuses the page. No snapshot was retained."});
+        output["properties"]["source_sha256"] = json!({"type": "string", "description": "SHA-256 of the complete original file bytes, including the UTF-16 BOM and bytes outside this page. For decoded UTF-16, canonical_sha256 hashes the distinct retained UTF-8 snapshot. Default attached UTF-8 HTML can still be rendered text: use explicit selectors for the original hash/bytes. A UTF-16 raw hash does not make decoded ranges suitable for codex-range patches."});
+        output["properties"]["unchanged"] = json!({"const":true, "description":"The freshly read source representation matches if_source_hash and the requested selection resolved completely. No content, snapshot, recovery handle or acquisition evidence is delivered; complete and file_complete are false. This compares source identity, not prior selection coverage."});
+        output["properties"]["selection_status"]["enum"] = json!(["complete", "partial", "failed", "unchanged"]);
         output["properties"]["artifact_id"] = json!({"type": ["string", "null"], "description": "Immutable snapshot identity when retained; omitted or null for ordinary complete inline reads or unavailable storage. An active typed inspect:path obligation retains its acquisition identity even for a complete inline selection."});
         output["properties"]["canonical_sha256"]["description"] = json!(
-            "Compatibility alias for source_sha256; omitted from model presentation when identical."
+            "SHA-256 of the retained selector snapshot. UTF-16 snapshots contain decoded UTF-8 without the BOM, so this differs from the original-byte source_sha256; omitted from presentation only when identical."
         );
         output["properties"]["delivered_selection_complete"]["description"] = json!(
             "Compatibility alias for complete; omitted from model presentation when identical."
@@ -327,6 +408,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     key.as_str(),
                     Some(
                         "artifact_id"
+                            | "canonical_bytes"
                             | "canonical_sha256"
                             | "delivered_selection_complete"
                             | "retained_bytes"
@@ -334,7 +416,6 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     )
                 )
             });
-            required.push(json!("source_sha256"));
         }
         output["properties"]["retained_bytes"]["description"] = json!(
             "Retained source bytes; omitted in presentation only for inline-only reads with no artifact, zero retained bytes and no snapshot error."
@@ -344,7 +425,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
         );
         output["properties"]["file_complete"] = json!({"type": "boolean", "description": "The returned exact bytes and hydrated ranges cover the whole selected source representation in this tool result. This is acquisition coverage, not proof that enclosing script output displayed every byte or that the model semantically reviewed it. Retention, match coordinates, and recovery selectors alone do not establish coverage."});
         output["properties"]["selector_bindings"] = json!({"type":"array", "maxItems":64,
-            "description":"Successful symbol/enclosing requests bound by their original zero-based selector index to exact snapshot ranges, before result sorting/merging. Resolution is not delivery: check results and completeness separately. Bound to source_sha256; no source is duplicated. qualified_name and kind are the bound item's parser-derived identity (owner included), not type resolution.",
+            "description":"Successful symbol/enclosing requests bound by their original zero-based selector index to exact snapshot ranges, before result sorting/merging. Resolution is not delivery: check results and completeness separately. Bound to canonical_sha256 (decoded UTF-8 for UTF-16); no source is duplicated. qualified_name and kind are the bound item's parser-derived identity (owner included), not type resolution.",
             "items":{"type":"object", "properties":{
                 "selector_index":{"type":"integer","minimum":0},
                 "qualified_name":{"type":"string"},
@@ -357,7 +438,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             "items":{"type":"object", "properties":{
                 "selector_index":{"type":"integer","minimum":0}, "selector":file_selector_schema(),
                 "status":{"const":"invalid_selector"}, "complete":{"const":false}, "message":{"type":"string"},
-                "source_sha256":{"type":"string"}, "omitted_candidates":{"type":"integer","minimum":0},
+                "source_sha256":{"type":"string", "description":"Compatibility field for this diagnostic's canonical snapshot hash, not the original UTF-16 byte hash."}, "omitted_candidates":{"type":"integer","minimum":0},
                 "candidates":{"type":"array","maxItems":8,"items":{"type":"object","properties":{
                     "qualified_name":{"type":"string"}, "selector":file_selector_schema()},
                     "required":["qualified_name","selector"],"additionalProperties":false}}},
@@ -396,6 +477,11 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             "description": "First up to eight independent pages of continuation, in source order. Fetch in parallel; continuation retains the full remaining extent."
         });
         output["properties"]["snapshot_error"] = json!({"type": "string", "description": "Snapshot storage failed; inline evidence is still valid, but no recovery handle or continuation is available."});
+        output["allOf"] = json!([{
+            "if":{"required":["read_mode"], "properties":{"read_mode":{"const":"byte_ranges"}}},
+            "then":{"required":["file_bytes","file_revision","retained_bytes","retained_artifact_complete"]},
+            "else":{"required":["source_sha256","canonical_bytes","total_lines"]}
+        }]);
         #[expect(
             clippy::expect_used,
             reason = "read_tool_output_output_schema constructs an object with a required array"
@@ -403,11 +489,11 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
         output["required"]
             .as_array_mut()
             .expect("object schema")
-            .extend([json!("path"), json!("total_lines"), json!("file_complete")]);
+            .extend([json!("path"), json!("file_complete")]);
         ToolSpec::Function(ResponsesApiTool {
             name: "read_file".to_string(),
             description: format!(
-                "Read a UTF-8 file without shell quoting. The entire file must be UTF-8 and at most {MAX_FILE_MIB} MiB, even for a small byte selector. Structural selectors (symbol, enclosing, section outline/item IDs, and search with enclosing:true) support only Rust (.rs) and Python (.py). For PowerShell (.ps1) and other languages, use fixed-string search without enclosing or explicit line ranges; unsupported structural requests are rejected. Prefer explicit line ranges or supported symbols for known code; do not dump whole files to locate one function. Path alone returns a first page capped at about {DEFAULT_FILE_READ_TOKEN_CEILING} tokens plus continuation; small files fit inline. Host-owned skill/context guidance keeps its existing delivery budget. Default HTML outside the workspace may be rendered as text: hashes, ranges and recovery then describe that text; use explicit selectors for exact original markup. Use read_tool_output with the artifact_id and continuation only for needed remaining ranges of the immutable snapshot. complete describes the requested page or selectors; file_complete describes acquired source coverage, not final script display or semantic review. A complete inline read may have no retained artifact; that is not a read failure. Explicit lines, bytes and fixed-string search selectors remain exact. In code mode explicit selections return up to 1 MiB to the script independently of its display budget: consume it there and print only needed evidence, not the entire recovered result. Each call reads current contents; retained snapshots are historical. Pass a skill: locator to read its SKILL.md; omit environment_id for host-owned skills.\n\n{}",
+                "Read a file without shell quoting. UTF-8 and BOM-marked UTF-16LE/BE text snapshots are limited to {MAX_FILE_MIB} MiB for both original and decoded bytes. UTF-16 is strictly decoded to UTF-8 without the BOM; source_encoding names the original encoding, source_sha256 hashes original bytes including the BOM, and canonical_sha256/canonical_bytes identify the retained decoded UTF-8 snapshot. All snapshot selectors (including bytes, search offsets, lines and structure), canonical_range and read_tool_output recovery address that decoded UTF-8 snapshot, not UTF-16 bytes or code units. Use encoding:hex|base64 for original-byte offsets. UTF-16 decoded acquisition does not grant original-byte source_inspection evidence or authorize codex-range edits. Git revision reads remain UTF-8 only. Larger current filesystem files support bytes-only selectors via bounded seek reads (up to 64 KiB per script page), including binary or split UTF-8 via data_base64. These return read_mode:byte_ranges, file_bytes and file_revision, never a whole-file source_sha256, line count or retained snapshot; file_complete and retained_artifact_complete stay false. Use range_recovery.arguments with read_file, or pass if_file_revision plus byte selectors for other pages. Changed identity/metadata refuses the page; this is not an immutable snapshot. Line/search/structural selectors, host locators and Git revision reads retain the snapshot limit. Structural selectors (symbol, enclosing, section outline/item IDs, and search with enclosing:true) support only Rust (.rs) and Python (.py). For PowerShell (.ps1) and other languages, use fixed-string search without enclosing or explicit line ranges; unsupported structural requests are rejected. Prefer explicit line ranges or supported symbols for known code; do not dump whole files to locate one function. Path alone returns a first page capped at about {DEFAULT_FILE_READ_TOKEN_CEILING} tokens plus continuation; small files fit inline. Host-owned skill/context guidance keeps its existing delivery budget. Default HTML outside the workspace may be rendered as text: hashes, ranges and recovery then describe that text; use explicit selectors for exact original markup. Use read_tool_output with the artifact_id and continuation only for needed remaining ranges of the immutable snapshot. complete describes the requested page or selectors; file_complete describes acquired source coverage, not final script display or semantic review. A complete inline read may have no retained artifact; that is not a read failure. Explicit lines, bytes and fixed-string search selectors remain exact. In code mode explicit selections return up to 1 MiB to the script independently of its display budget: consume it there and print only needed evidence, not the entire recovered result. Omit revision for current contents; revision reads resolve immutable Git objects and reuse the same selectors and snapshots. Pass a skill: locator to read its SKILL.md; omit environment_id for host-owned skills.\n\nFor raw binary inspection of any current file size, set encoding:hex or encoding:base64 with explicit zero-based half-open bytes selectors. This always uses the same bounded revision-guarded range backend, returning data_hex or data_base64 and exact canonical_range offsets, never decoded text. At most 64 KiB of raw bytes per script call; direct pages may be smaller to fit delivery. No execution, decompression, format detection or implicit decoding. range_recovery preserves encoding; use it with read_file, not read_tool_output.\n\n{}",
                 include_str!("../../../templates/result_binding_checkpoint.md").trim(),
             ),
             strict: false,
@@ -423,6 +509,10 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 ("offset".to_string(), JsonSchema { minimum: Some(1.into()), maximum: Some(usize::MAX.into()), ..JsonSchema::integer(Some("Legacy 1-based starting line; use instead of selectors, defaults to 1.".to_string())) }),
                 ("limit".to_string(), JsonSchema { minimum: Some(1.into()), maximum: Some(usize::MAX.into()), ..JsonSchema::integer(Some("Legacy positive line count; defaults to 2000 when offset is supplied.".to_string())) }),
                 ("environment_id".to_string(), JsonSchema::string(Some("Environment id; omit to use the primary environment.".to_string()))),
+                ("encoding".to_string(), JsonSchema { enum_values: Some(vec!["hex".into(), "base64".into()]), ..JsonSchema::string(Some("Explicit raw-byte output for filesystem bytes-only selectors at any file size. hex returns lowercase data_hex; base64 returns standard padded data_base64. No text decoding or execution. Uses bounded live ranges, not whole-file snapshots; cannot combine with revision or if_source_hash.".into())) }),
+                ("revision".to_string(), JsonSchema::string(Some("Read an exact Git blob at this commit revision instead of the workspace. Path is repository-root-relative (repository selected by environment cwd). Resolves once to immutable commit_oid/blob_oid in git_source; reuse returned commit_oid as revision to pin later selectors, or recover the retained snapshot. All source selectors and the 8 MiB UTF-8 limit apply. Local environments with full disk read access only; no fetching, filters, text conversion or replacement objects. Historical path/URI are distinct from workspace evidence. Omit for current contents.".into()))),
+                ("if_file_revision".to_string(), JsonSchema::string(Some("Opaque file_revision from a large-file byte read. Requires filesystem bytes-only selectors; refuses a changed object/metadata revision, even if the file shrank below 8 MiB. Not a hash, snapshot, or if_source_hash freshness shortcut. Cannot combine with revision or if_source_hash.".into()))),
+                ("if_source_hash".to_string(), JsonSchema::string(Some("Optional 64-hex source_sha256 from a previous read. Reacquire current contents through the same authorized owner and compare the whole selected representation, not just requested ranges. On a match and complete selector resolution, return unchanged:true without content or retention; invalid, missing or partial selections keep their normal results. Omit when you need content (including a new selection); a match is not evidence that you previously acquired these selectors. Default rendered HTML and explicit exact markup have different identities.".to_string()))),
                 ("force_fresh".to_string(), JsonSchema::boolean(Some("Legacy compatibility option; every call reads current contents.".to_string()))),
                 ("selectors".to_string(), selectors),
                 ]), None, Some(false.into()))
@@ -460,11 +550,12 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                                 | ToolOutputSelector::Search { .. }
                                 | ToolOutputSelector::Section { .. }
                                 | ToolOutputSelector::JsonPointer { .. }
+                                | ToolOutputSelector::Structured { .. }
                         )
                 )
             }) {
                 return Err(FunctionCallError::RespondToModel(
-                    "read_file supports bytes, lines, search, section, json_pointer, symbol, and enclosing selectors".to_string(),
+                    "read_file supports bytes, lines, search, section, json_pointer, structured, symbol, and enclosing selectors".to_string(),
                 ));
             }
             if invocation.cancellation_token.is_cancelled() {
@@ -475,10 +566,37 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             let turn = &invocation.step_context.turn;
             let mut source_inspection = None;
             let mut inspection_proof_error = None;
+            let mut git_source = None;
+            let mut decoded_source = None;
             // The catalog advertises `skill:<id>` locators, so this tool has to
             // resolve them. Without it the model can see every skill listed and
             // load none of them.
-            let (contents, resolved_path, environment_id, canonical_uri) = if args.path
+            let (contents, resolved_path, environment_id, canonical_uri) = if let Some(revision) = &args.revision {
+                let environment = wait_for_tool_environment(
+                    &invocation.step_context.environments, args.environment_id.as_deref(),
+                    &invocation.cancellation_token,
+                ).await?.ok_or_else(|| FunctionCallError::RespondToModel(
+                    "historical reads require a selected local environment".into(),
+                ))?;
+                if environment.environment.is_remote() || !turn.file_system_sandbox_policy().has_full_disk_read_access() {
+                    return Err(FunctionCallError::RespondToModel(
+                        "historical reads require a local environment with full disk read access; remote/restricted Git reads are not supported".into(),
+                    ));
+                }
+                crate::tools::parallel::wait_for_workspace_baseline().await;
+                let cwd = environment.cwd().to_abs_path().map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+                let source = tokio::select! {
+                    _ = invocation.cancellation_token.cancelled() => return Err(FunctionCallError::RespondToModel("read_file cancelled".into())),
+                    source = codex_git_utils::read_historical_file(cwd.to_path_buf(), args.path.clone(), revision.clone(), MAX_FILE_BYTES) => source.map_err(FunctionCallError::RespondToModel)?,
+                };
+                let root = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(&source.repository_root)
+                    .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+                let uri = format!("{}?git_commit={}&git_blob={}", codex_utils_path_uri::PathUri::from_abs_path(&root), source.commit_oid, source.blob_oid);
+                let locator = format!("git:{}:{}:{}", source.repository_root.display(), source.commit_oid, source.path);
+                git_source = Some(json!({"repository_root":source.repository_root, "path":source.path,
+                    "commit_oid":source.commit_oid, "blob_oid":source.blob_oid}));
+                (source.contents, locator, environment.environment_id.clone(), uri)
+            } else if args.path
                 == crate::turn_diff_tracker::TURN_DIFF_LOCATOR
             {
                 return Err(FunctionCallError::RespondToModel(
@@ -589,7 +707,10 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     .unwrap_or_else(|| args.path.clone());
                 (contents, path, "host-skills".to_string(), uri)
             } else {
-                read_environment_file(&invocation, &args, &mut source_inspection, &mut inspection_proof_error).await?
+                match read_environment_file(&invocation, &args, &mut source_inspection, &mut inspection_proof_error, &mut decoded_source).await? {
+                    EnvironmentFileRead::Snapshot(snapshot) => snapshot,
+                    EnvironmentFileRead::Ranges(output) => return Ok(boxed_tool_output(output)),
+                }
             };
             if invocation.cancellation_token.is_cancelled() {
                 return Err(FunctionCallError::RespondToModel(
@@ -603,6 +724,8 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             // later request, and single-line documents leave no lines to page
             // by. Workspace files and explicit selections keep exact bytes.
             let render_html = !explicit_selection
+                && decoded_source.is_none()
+                && git_source.is_none()
                 && source_inspection.is_none()
                 && html_outside_workspace(&invocation, &environment_id, &resolved_path);
             let script_consumer = matches!(&invocation.source, ToolCallSource::CodeMode { .. });
@@ -642,6 +765,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 token_ceiling
             };
             let structure_path = args.path.clone();
+            let if_source_hash = args.if_source_hash;
             let (
                 canonical,
                 mut result,
@@ -727,6 +851,39 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 });
             }
             let mut successful = result.selection_status() == "complete";
+            // Validate/resolve the original selectors before suppressing content:
+            // matching bytes must not hide an invalid symbol, missing pointer,
+            // mixed failure or budget-limited selection. No retained snapshot or
+            // delivered-evidence signal is created by this freshness-only reply.
+            let source_hash = decoded_source.as_ref().map_or(canonical.sha256.as_str(), |source| source.sha256.as_str());
+            if successful && if_source_hash.as_deref() == Some(source_hash) {
+                let mut output = json!({
+                    "path": resolved_path,
+                    "environment_id": environment_id,
+                    "canonical_uri": canonical_uri,
+                    "source_sha256": canonical.sha256,
+                    "canonical_sha256": canonical.sha256,
+                    "canonical_bytes": canonical.exact_bytes,
+                    "total_lines": total_lines,
+                    "unchanged": true,
+                    "selection_status": "unchanged",
+                    "complete": false,
+                    "delivered_selection_complete": false,
+                    "file_complete": false,
+                    "retained_bytes": 0,
+                    "retained_artifact_complete": false,
+                    "results": [],
+                });
+                encoding::annotate(&mut output, decoded_source.as_ref());
+                if let Some(source) = &git_source { output["git_source"] = source.clone(); }
+                let projected = codex_code_mode::model_visible_tool_result(
+                    &ToolName::plain("read_file"), &output,
+                ).unwrap_or_else(|| output.clone());
+                let output = JsonToolOutput::with_success(output, Some(true))
+                    .with_model_value(projected);
+                crate::tools::context::ensure_exact_model_delivery(&output, &invocation)?;
+                return Ok(boxed_tool_output(output));
+            }
             let file_complete = selector_errors.is_empty() && file_selection_complete(&result);
             // Explicit selections retain the existing immutable-snapshot contract.
             // Complete default reads stay inline; omitted bytes need one durable
@@ -837,7 +994,9 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             output["canonical_uri"] = json!(canonical_uri);
             output["total_lines"] = json!(total_lines);
             output["source_sha256"] = json!(canonical.sha256);
+            encoding::annotate(&mut output, decoded_source.as_ref());
             output["file_complete"] = json!(file_complete);
+            if let Some(source) = &git_source { output["git_source"] = source.clone(); }
             if let Some(error) = inspection_proof_error {
                 output["inspection_proof_error"] = json!(error);
             }
@@ -1278,6 +1437,7 @@ pub(crate) async fn current_file_fingerprint(
     };
     if args.path.starts_with("skill:")
         || args.path.starts_with("context:")
+        || args.encoding.is_some()
     {
         return None;
     }
@@ -1349,21 +1509,19 @@ fn html_outside_workspace(invocation: &ToolInvocation, environment_id: &str, pat
             .any(|root| within(root.as_path()))
 }
 
+enum EnvironmentFileRead {
+    Snapshot((String, String, String, String)),
+    Ranges(JsonToolOutput),
+}
+
 /// Reads an ordinary path through the selected environment's filesystem.
 async fn read_environment_file(
     invocation: &ToolInvocation,
     args: &ReadFileArgs,
     source_inspection: &mut Option<crate::tool_history::SourceInspectionOrigin>,
     inspection_proof_error: &mut Option<String>,
-) -> Result<
-    (
-        String,
-        String,
-        String,
-        String,
-    ),
-    FunctionCallError,
-> {
+    decoded_source: &mut Option<encoding::DecodedSource>,
+) -> Result<EnvironmentFileRead, FunctionCallError> {
     let environment = wait_for_tool_environment(
         &invocation.step_context.environments,
         args.environment_id.as_deref(),
@@ -1383,6 +1541,10 @@ async fn read_environment_file(
     let sandbox = turn.file_system_sandbox_context(None, environment.cwd());
     let fs = environment.environment.get_filesystem();
     crate::tools::parallel::wait_for_workspace_baseline().await;
+    if args.if_file_revision.is_some() || args.encoding.is_some() {
+        return ranges::read_ranges(invocation, args, fs.as_ref(), &path, &sandbox,
+            &environment.environment_id).await.map(EnvironmentFileRead::Ranges);
+    }
     let coordinator = invocation.session.services.agent_control.task_coordinator();
     if !environment.environment.is_remote()
         && let Some(binding) = coordinator.binding_for_turn(turn)
@@ -1509,7 +1671,10 @@ async fn read_environment_file(
                             max_directories: 1,
                             max_entries: 32,
                             follow_directory_symlinks: false,
+                            summary_only: false,
+                            include_metadata: false,
                             prune_hidden_directories: true,
+                            apply_gitignore: false,
                             filters: Default::default(),
                         },
                         Some(&sandbox),
@@ -1537,9 +1702,12 @@ async fn read_environment_file(
                 ));
             }
             if metadata.size > MAX_FILE_BYTES as u64 {
-                return Err(diagnostic_error(format!(
-                    "file exceeds the {MAX_FILE_MIB} MiB read limit"
-                )));
+                // Never turn permission/I/O failures into another read route.
+                if failure.is_ok() {
+                    return ranges::read_ranges(invocation, args, fs.as_ref(), &path, &sandbox,
+                        &environment.environment_id).await.map(EnvironmentFileRead::Ranges);
+                }
+                return Err(diagnostic_error(format!("file exceeds the {MAX_FILE_MIB} MiB snapshot limit; use bounded byte selectors")));
             }
             return Err(FunctionCallError::RespondToModel(match failure {
                 Err(err) => format!(
@@ -1552,15 +1720,17 @@ async fn read_environment_file(
             }));
         }
     };
-    let contents = String::from_utf8(contents).map_err(|_| {
-        FunctionCallError::RespondToModel("read_file requires UTF-8 text".to_string())
-    })?;
-    Ok((
+    let (contents, decoded) = encoding::decode(contents, MAX_FILE_BYTES).await?;
+    if decoded.is_some() && source_inspection.take().is_some() {
+        *inspection_proof_error = Some("Decoded UTF-16 acquisition is not original-byte source_inspection evidence; no receipt was recorded.".into());
+    }
+    *decoded_source = decoded;
+    Ok(EnvironmentFileRead::Snapshot((
         contents,
         path.inferred_native_path_string(),
         environment.environment_id.clone(),
         path.to_string(),
-    ))
+    )))
 }
 
 /// Reads a `skill:<catalog-id>` locator through the provider that discovered

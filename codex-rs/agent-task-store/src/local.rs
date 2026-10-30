@@ -196,7 +196,7 @@ impl DeferredHostCompletionWake {
         host_legacy_outcome: bool,
     ) -> StoreResult<AgentReceipt> {
         let receipt = self.store.submit_agent_receipt_impl(
-            self.attempt_id, receipt, None, host_legacy_outcome, self.pending.clone(),
+            self.attempt_id, receipt, host_legacy_outcome, self.pending.clone(),
         ).await?;
         self.pending = None;
         self.store.notify_wake_waiters();
@@ -1597,7 +1597,6 @@ LIMIT 1
         &self,
         attempt_id: AttemptId,
         mut draft: ReceiptDraft,
-        _review_reason: Option<String>,
         host_legacy_outcome: bool,
         host_completion: Option<(String, String)>,
     ) -> StoreResult<AgentReceipt> {
@@ -3536,7 +3535,7 @@ impl LocalAgentTaskStore {
     ) -> TaskStoreFuture<'_, AgentReceipt> {
         Box::pin(async move {
             let result = self
-                .submit_agent_receipt_impl(attempt_id, receipt, None, false, None)
+                .submit_agent_receipt_impl(attempt_id, receipt, false, None)
                 .await;
             if result.is_ok() {
                 self.notify_wake_waiters();
@@ -3566,24 +3565,7 @@ impl LocalAgentTaskStore {
                 architecture_contract: None,
             };
             let result = self
-                .submit_agent_receipt_impl(attempt_id, receipt, None, true, None)
-                .await;
-            if result.is_ok() {
-                self.notify_wake_waiters();
-            }
-            result
-        })
-    }
-
-    pub fn submit_agent_receipt_with_review(
-        &self,
-        attempt_id: AttemptId,
-        receipt: ReceiptDraft,
-        review_reason: String,
-    ) -> TaskStoreFuture<'_, AgentReceipt> {
-        Box::pin(async move {
-            let result = self
-                .submit_agent_receipt_impl(attempt_id, receipt, Some(review_reason), false, None)
+                .submit_agent_receipt_impl(attempt_id, receipt, true, None)
                 .await;
             if result.is_ok() {
                 self.notify_wake_waiters();

@@ -793,10 +793,19 @@ fn tool_timeout_ms(
     let default_timeout_ms = scope
         .get_slot::<RuntimeState>()
         .map(|state| {
-            if state.enabled_tools.get(tool_index).is_some_and(|tool| {
+            let is_write_stdin = state.enabled_tools.get(tool_index).is_some_and(|tool| {
                 tool.tool_name.namespace.is_none() && tool.tool_name.name == "write_stdin"
-            }) && input.is_some_and(|input| {
-                input["wait_for_output"].as_bool().unwrap_or_else(|| {
+            });
+            if is_write_stdin
+                && let Some(timeout_ms) = input.and_then(|input| input["event_filter"]["timeout_ms"].as_u64())
+            {
+                // A filtered subscription owns a finite lifetime, unlike an
+                // open-ended passive output wait. Preserve wrapper headroom
+                // and bounded workspace admission rather than dropping it.
+                return codex_code_mode_protocol::tool_owned_timeout_with_grace(timeout_ms);
+            }
+            if is_write_stdin && input.is_some_and(|input| {
+                input["event_filter"].is_null() && input["wait_for_output"].as_bool().unwrap_or_else(|| {
                     input["chars"].as_str().unwrap_or_default().is_empty()
                         && input["yield_time_ms"].is_null()
                         && input["terminate"] != true

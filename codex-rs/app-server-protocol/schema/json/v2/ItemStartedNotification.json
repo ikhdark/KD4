@@ -109,7 +109,11 @@
               "type": "string"
             },
             "path": {
-              "$ref": "#/definitions/LegacyAppPathString",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/LegacyAppPathString"
+                }
+              ],
               "description": "Absolute path in the executor's native path convention, not the host's."
             },
             "type": {

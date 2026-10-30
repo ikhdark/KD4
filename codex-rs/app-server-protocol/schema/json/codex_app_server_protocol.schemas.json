@@ -2303,6 +2303,77 @@
             },
             "method": {
               "enum": [
+                "externalAgentConfig/detect"
+              ],
+              "title": "ExternalAgentConfig/detectRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ExternalAgentConfigDetectParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "ExternalAgentConfig/detectRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "externalAgentConfig/import"
+              ],
+              "title": "ExternalAgentConfig/importRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ExternalAgentConfigImportParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "ExternalAgentConfig/importRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "externalAgentConfig/import/readHistories"
+              ],
+              "title": "ExternalAgentConfig/import/readHistoriesRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "id",
+            "method"
+          ],
+          "title": "ExternalAgentConfig/import/readHistoriesRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
                 "config/value/write"
               ],
               "title": "Config/value/writeRequestMethod",
@@ -5359,6 +5430,46 @@
           "properties": {
             "method": {
               "enum": [
+                "externalAgentConfig/import/progress"
+              ],
+              "title": "ExternalAgentConfig/import/progressNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ExternalAgentConfigImportProgressNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "ExternalAgentConfig/import/progressNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "externalAgentConfig/import/completed"
+              ],
+              "title": "ExternalAgentConfig/import/completedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ExternalAgentConfigImportCompletedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "ExternalAgentConfig/import/completedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
                 "fs/changed"
               ],
               "title": "Fs/changedNotificationMethod",
@@ -8042,7 +8153,11 @@
                 "type": "string"
               },
               "path": {
-                "$ref": "#/definitions/v2/LegacyAppPathString",
+                "allOf": [
+                  {
+                    "$ref": "#/definitions/v2/LegacyAppPathString"
+                  }
+                ],
                 "description": "Absolute path in the executor's native path convention, not the host's."
               },
               "type": {
@@ -8554,6 +8669,17 @@
           "declined"
         ],
         "type": "string"
+      },
+      "CommandMigration": {
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
       },
       "ComputerUseRequirements": {
         "properties": {
@@ -10091,6 +10217,302 @@
           }
         ]
       },
+      "ExternalAgentConfigDetectParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "cwds": {
+            "description": "Zero or more working directories to include for repo-scoped detection.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "includeHome": {
+            "description": "If true, include detection under the user's home directory.",
+            "type": "boolean"
+          }
+        },
+        "title": "ExternalAgentConfigDetectParams",
+        "type": "object"
+      },
+      "ExternalAgentConfigDetectResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/definitions/v2/ExternalAgentConfigMigrationItem"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "ExternalAgentConfigDetectResponse",
+        "type": "object"
+      },
+      "ExternalAgentConfigImportCompletedNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "importId": {
+            "type": "string"
+          },
+          "itemTypeResults": {
+            "items": {
+              "$ref": "#/definitions/v2/ExternalAgentConfigImportTypeResult"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "importId",
+          "itemTypeResults"
+        ],
+        "title": "ExternalAgentConfigImportCompletedNotification",
+        "type": "object"
+      },
+      "ExternalAgentConfigImportHistoriesReadResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/definitions/v2/ExternalAgentConfigImportHistory"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "ExternalAgentConfigImportHistoriesReadResponse",
+        "type": "object"
+      },
+      "ExternalAgentConfigImportHistory": {
+        "properties": {
+          "completedAtMs": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "failures": {
+            "items": {
+              "$ref": "#/definitions/v2/ExternalAgentConfigImportItemTypeFailure"
+            },
+            "type": "array"
+          },
+          "importId": {
+            "type": "string"
+          },
+          "successes": {
+            "items": {
+              "$ref": "#/definitions/v2/ExternalAgentConfigImportItemTypeSuccess"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "completedAtMs",
+          "failures",
+          "importId",
+          "successes"
+        ],
+        "type": "object"
+      },
+      "ExternalAgentConfigImportItemTypeFailure": {
+        "properties": {
+          "cwd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "errorType": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "failureStage": {
+            "type": "string"
+          },
+          "itemType": {
+            "$ref": "#/definitions/v2/ExternalAgentConfigMigrationItemType"
+          },
+          "message": {
+            "type": "string"
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "failureStage",
+          "itemType",
+          "message"
+        ],
+        "type": "object"
+      },
+      "ExternalAgentConfigImportItemTypeSuccess": {
+        "properties": {
+          "cwd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "itemType": {
+            "$ref": "#/definitions/v2/ExternalAgentConfigMigrationItemType"
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "itemType"
+        ],
+        "type": "object"
+      },
+      "ExternalAgentConfigImportParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "migrationItems": {
+            "items": {
+              "$ref": "#/definitions/v2/ExternalAgentConfigMigrationItem"
+            },
+            "type": "array"
+          },
+          "source": {
+            "description": "Source product that produced the migration items. Missing means unspecified.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "migrationItems"
+        ],
+        "title": "ExternalAgentConfigImportParams",
+        "type": "object"
+      },
+      "ExternalAgentConfigImportProgressNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "importId": {
+            "type": "string"
+          },
+          "itemTypeResults": {
+            "items": {
+              "$ref": "#/definitions/v2/ExternalAgentConfigImportTypeResult"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "importId",
+          "itemTypeResults"
+        ],
+        "title": "ExternalAgentConfigImportProgressNotification",
+        "type": "object"
+      },
+      "ExternalAgentConfigImportResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "importId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "importId"
+        ],
+        "title": "ExternalAgentConfigImportResponse",
+        "type": "object"
+      },
+      "ExternalAgentConfigImportTypeResult": {
+        "properties": {
+          "failures": {
+            "items": {
+              "$ref": "#/definitions/v2/ExternalAgentConfigImportItemTypeFailure"
+            },
+            "type": "array"
+          },
+          "itemType": {
+            "$ref": "#/definitions/v2/ExternalAgentConfigMigrationItemType"
+          },
+          "successes": {
+            "items": {
+              "$ref": "#/definitions/v2/ExternalAgentConfigImportItemTypeSuccess"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "failures",
+          "itemType",
+          "successes"
+        ],
+        "type": "object"
+      },
+      "ExternalAgentConfigMigrationItem": {
+        "properties": {
+          "cwd": {
+            "description": "Null or empty means home-scoped migration; non-empty means repo-scoped migration.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "type": "string"
+          },
+          "details": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/MigrationDetails"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "itemType": {
+            "$ref": "#/definitions/v2/ExternalAgentConfigMigrationItemType"
+          }
+        },
+        "required": [
+          "description",
+          "itemType"
+        ],
+        "type": "object"
+      },
+      "ExternalAgentConfigMigrationItemType": {
+        "enum": [
+          "AGENTS_MD",
+          "CONFIG",
+          "SKILLS",
+          "PLUGINS",
+          "MCP_SERVER_CONFIG",
+          "SUBAGENTS",
+          "HOOKS",
+          "COMMANDS",
+          "SESSIONS"
+        ],
+        "type": "string"
+      },
       "FeedbackUploadParams": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
@@ -11283,6 +11705,17 @@
           "sourcePath",
           "timeoutSec",
           "trustStatus"
+        ],
+        "type": "object"
+      },
+      "HookMigration": {
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
         ],
         "type": "object"
       },
@@ -12491,6 +12924,17 @@
         ],
         "type": "object"
       },
+      "McpServerMigration": {
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
       "McpServerOauthLoginCompletedNotification": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
@@ -12929,6 +13373,60 @@
             "type": "string"
           }
         ]
+      },
+      "MigrationDetails": {
+        "properties": {
+          "commands": {
+            "default": [],
+            "items": {
+              "$ref": "#/definitions/v2/CommandMigration"
+            },
+            "type": "array"
+          },
+          "hooks": {
+            "default": [],
+            "items": {
+              "$ref": "#/definitions/v2/HookMigration"
+            },
+            "type": "array"
+          },
+          "mcpServers": {
+            "default": [],
+            "items": {
+              "$ref": "#/definitions/v2/McpServerMigration"
+            },
+            "type": "array"
+          },
+          "plugins": {
+            "default": [],
+            "items": {
+              "$ref": "#/definitions/v2/PluginsMigration"
+            },
+            "type": "array"
+          },
+          "sessions": {
+            "default": [],
+            "items": {
+              "$ref": "#/definitions/v2/SessionMigration"
+            },
+            "type": "array"
+          },
+          "skills": {
+            "default": [],
+            "items": {
+              "$ref": "#/definitions/v2/SkillMigration"
+            },
+            "type": "array"
+          },
+          "subagents": {
+            "default": [],
+            "items": {
+              "$ref": "#/definitions/v2/SubagentMigration"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
       },
       "ModeKind": {
         "description": "Initial collaboration mode to use when the TUI starts.",
@@ -14941,6 +15439,24 @@
         "title": "PluginUninstallResponse",
         "type": "object"
       },
+      "PluginsMigration": {
+        "properties": {
+          "marketplaceName": {
+            "type": "string"
+          },
+          "pluginNames": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "marketplaceName",
+          "pluginNames"
+        ],
+        "type": "object"
+      },
       "ProcessExitedNotification": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Final process exit notification for `process/spawn`.",
@@ -16914,6 +17430,27 @@
         "title": "ServerRequestResolvedNotification",
         "type": "object"
       },
+      "SessionMigration": {
+        "properties": {
+          "cwd": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "cwd",
+          "path"
+        ],
+        "type": "object"
+      },
       "SessionSource": {
         "oneOf": [
           {
@@ -17111,6 +17648,17 @@
           "name",
           "path",
           "scope"
+        ],
+        "type": "object"
+      },
+      "SkillMigration": {
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
         ],
         "type": "object"
       },
@@ -17452,6 +18000,17 @@
             "type": "object"
           }
         ]
+      },
+      "SubagentMigration": {
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
       },
       "SurfacedToolResult": {
         "description": "Authoritative typed tool result surfaced as the terminal result of a turn. `canonical_message`, when present, is owner-authored and may be copied unchanged into legacy last-message consumers. `value` is never rendered into synthetic assistant prose by the host.",
@@ -19619,7 +20178,7 @@
       },
       "ThreadResumeParams": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "There are three ways to resume a thread: 1. By thread_id: load the thread from disk by thread_id and resume it. 2. By history: instantiate the thread from memory and resume it. 3. By path: load the thread from disk by path and resume it.\n\nFor non-running threads, the precedence is: history > non-empty path > thread_id. If using history or a non-empty path for a non-running thread, the thread_id param will be ignored.\n\nIf thread_id identifies a running thread, app-server rejoins that thread and treats a non-empty path as a consistency check against the active rollout path. Empty string path values are treated as absent.\n\nPrefer using thread_id whenever possible.",
+        "description": "There are three ways to resume a thread: 1. By thread_id: load the thread from disk by thread_id and resume it. 2. By history: instantiate the thread from memory and resume it. 3. By path: load the thread from disk by path and resume it.\n\nFor non-running threads, the precedence is: history > non-empty path > thread_id. If using history or a non-empty path for a non-running thread, the thread_id param will be ignored.\n\nIf thread_id identifies a running thread, app-server rejoins that thread and treats a non-empty path as a consistency check against the active rollout path. Empty string path values are treated as absent.\n\nRejoining a subscribed or busy thread ignores stale legacy `approvalPolicy` and `sandbox` hints and returns its active permissions without changing them. Conflicting exact `permissionProfile` and other typed overrides are rejected. Cold resume still applies configuration overrides.\n\nPrefer using thread_id whenever possible.",
         "properties": {
           "approvalPolicy": {
             "anyOf": [
@@ -21913,6 +22472,97 @@
         ],
         "type": "object"
       },
+      "TurnTimingBlockingCategory": {
+        "enum": [
+          "resource_contention",
+          "dependency_wait"
+        ],
+        "type": "string"
+      },
+      "TurnTimingBlockingEvidence": {
+        "description": "Bounded evidence for instrumented awaits only. Checkpoints upsert intervals by ID and append edges; terminal records contain the complete retained lists. Resource prerequisites name a resource class, not a holder or CPU scheduler.",
+        "properties": {
+          "dependencies": {
+            "items": {
+              "$ref": "#/definitions/v2/TurnTimingDependencyEdge"
+            },
+            "type": "array"
+          },
+          "droppedDependencies": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "droppedIntervals": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "intervals": {
+            "items": {
+              "$ref": "#/definitions/v2/TurnTimingBlockingInterval"
+            },
+            "type": "array"
+          },
+          "version": {
+            "format": "uint16",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "dependencies",
+          "droppedDependencies",
+          "droppedIntervals",
+          "intervals",
+          "version"
+        ],
+        "type": "object"
+      },
+      "TurnTimingBlockingInterval": {
+        "description": "First Pending through Ready (or cancellation) of an awaited prerequisite. Includes wake/re-poll latency, not synchronous work before the first Pending. An absent end is right-censored at the enclosing timeline's frozen endpoint.",
+        "properties": {
+          "cancelled": {
+            "type": "boolean"
+          },
+          "category": {
+            "$ref": "#/definitions/v2/TurnTimingBlockingCategory"
+          },
+          "dependent": {
+            "type": "string"
+          },
+          "endNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "prerequisite": {
+            "type": "string"
+          },
+          "startNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cancelled",
+          "category",
+          "dependent",
+          "id",
+          "prerequisite",
+          "startNs"
+        ],
+        "type": "object"
+      },
       "TurnTimingCounters": {
         "properties": {
           "approvalWaitCount": {
@@ -22340,6 +22990,26 @@
           "saturationCount",
           "toolCallCount",
           "userInputWaitCount"
+        ],
+        "type": "object"
+      },
+      "TurnTimingDependencyEdge": {
+        "description": "Direction is dependent -> prerequisite. Generation and execution IDs are scoped to this turn and clock domain; chronology alone never adds an edge.",
+        "properties": {
+          "dependent": {
+            "type": "string"
+          },
+          "prerequisite": {
+            "type": "string"
+          },
+          "relation": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "dependent",
+          "prerequisite",
+          "relation"
         ],
         "type": "object"
       },
@@ -23855,6 +24525,17 @@
       },
       "TurnTimingTimeline": {
         "properties": {
+          "blocking": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/TurnTimingBlockingEvidence"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Observed await suspensions and explicit dependency edges, not a complete task DAG. Absence is legacy unknown; idle time is never a blocking wait."
+          },
           "clockDomainId": {
             "description": "Absent for clocks without proven alignment (including legacy records).",
             "type": [

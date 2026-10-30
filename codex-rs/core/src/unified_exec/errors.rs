@@ -11,6 +11,8 @@ pub(crate) enum UnifiedExecError {
     },
     #[error("Failed to create unified exec process: {message}")]
     CreateProcess { message: String },
+    #[error("Command denied: {message}")]
+    PermissionDenied { message: String },
     #[error("Unified exec process failed: {message}")]
     ProcessFailed { message: String },
     #[error("Unified exec process failed: {message}")]
