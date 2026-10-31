@@ -13,10 +13,10 @@ const MAX_CANDIDATES: usize = 4096;
 
 /// Resolve files only: never start a shell, inspect shell profiles or launch the result.
 /// Called on the executor so host PATH/PATHEXT cannot leak into remote lookups.
-pub(crate) async fn lookup_executable(
-    filesystem: &dyn ExecutorFileSystem,
+fn prepare_lookup(
     params: &LookupExecutableParams,
-) -> io::Result<LookupExecutableResponse> {
+    max_candidates: usize,
+) -> io::Result<LookupPlan> {
     let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidInput, message.to_owned());
     let name = &params.name;
     if name.is_empty() || name.len() > 4096 || name.contains(['\0', '*', '?', '"']) {
@@ -95,7 +95,7 @@ pub(crate) async fn lookup_executable(
     'directories: for directory in directories {
         let base = cwd.as_path().join(&directory).join(program);
         for suffix in &suffixes {
-            if candidates.len() == MAX_CANDIDATES {
+            if candidates.len() == max_candidates {
                 truncated = true;
                 break 'directories;
             }
@@ -116,23 +116,86 @@ pub(crate) async fn lookup_executable(
             }
         }
     }
-    // One backend operation: a sandboxed filesystem probes every candidate in a
-    // single helper launch rather than one launch per candidate.
+    let incomplete = unresolved.or_else(|| truncated.then(|| format!(
+        "executable lookup exceeded {max_candidates} candidate probes"
+    )));
+    Ok(LookupPlan { candidates, incomplete })
+}
+
+struct LookupPlan {
+    candidates: Vec<PathUri>,
+    incomplete: Option<String>,
+}
+
+pub(crate) async fn lookup_executable(
+    filesystem: &dyn ExecutorFileSystem,
+    params: &LookupExecutableParams,
+) -> io::Result<LookupExecutableResponse> {
+    let plan = prepare_lookup(params, MAX_CANDIDATES)?;
     let path = filesystem
-        .first_regular_file(&candidates, params.sandbox.as_ref())
+        .first_regular_file(&plan.candidates, params.sandbox.as_ref())
         .await
         .map_err(|error| {
             io::Error::new(error.kind(), format!("{error}; availability is unknown"))
         })?;
     if path.is_none()
-        && let Some(unresolved) = unresolved
+        && let Some(unresolved) = plan.incomplete
     {
         return Err(io::Error::other(format!("{unresolved}; availability is unknown")));
     }
-    if path.is_none() && truncated {
-        return Err(io::Error::other(format!(
-            "executable lookup exceeded {MAX_CANDIDATES} candidate probes; availability is unknown"
-        )));
-    }
     Ok(LookupExecutableResponse { path })
+}
+
+pub(crate) async fn lookup_executables(
+    filesystem: &dyn ExecutorFileSystem,
+    params: &crate::protocol::LookupExecutablesParams,
+) -> io::Result<Vec<codex_file_system::FileSystemLookupResult>> {
+    use codex_file_system::FileSystemLookup;
+    use codex_file_system::FileSystemLookupResult;
+    if params.names.is_empty() || params.names.len() > 32 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "expected 1-32 executable names"));
+    }
+    let mut results = Vec::with_capacity(params.names.len());
+    let mut requests = Vec::new();
+    let mut pending = Vec::new();
+    let mut probes_left = 16_384usize;
+    let mut bytes_left = 4 * 1024 * 1024usize;
+    for name in &params.names {
+        let lookup = LookupExecutableParams { name: name.clone(), cwd: params.cwd.clone(), sandbox: None };
+        match prepare_lookup(&lookup, MAX_CANDIDATES.min(probes_left)) {
+            Err(error) => results.push(FileSystemLookupResult::from_result(Err(error))),
+            Ok(mut plan) => {
+                let mut retained = 0;
+                for path in &plan.candidates {
+                    if path.as_str().len() > bytes_left {
+                        plan.incomplete = Some("executable batch exceeded 4 MiB of candidate path text".into());
+                        break;
+                    }
+                    bytes_left -= path.as_str().len();
+                    retained += 1;
+                }
+                plan.candidates.truncate(retained);
+                probes_left -= retained;
+                pending.push((results.len(), plan.incomplete));
+                requests.push(FileSystemLookup::FirstRegularFile { candidates: plan.candidates });
+                results.push(FileSystemLookupResult::Unknown { error: "lookup not completed".into() });
+            }
+        }
+    }
+    if !requests.is_empty() {
+        let observed = match filesystem.lookup_batch(&requests, params.sandbox.as_ref()).await {
+            Ok(observed) if observed.len() == requests.len() => observed,
+            Ok(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, "lookup batch result count mismatch")),
+            // A helper/transport failure (even NotFound) says nothing about
+            // any target's existence. Only per-probe outcomes classify paths.
+            Err(error) => vec![FileSystemLookupResult::Unknown { error: error.to_string() }; requests.len()],
+        };
+        for ((index, incomplete), outcome) in pending.into_iter().zip(observed) {
+            results[index] = match (outcome, incomplete) {
+                (FileSystemLookupResult::Missing, Some(error)) => FileSystemLookupResult::Unknown { error },
+                (outcome, _) => outcome,
+            };
+        }
+    }
+    Ok(results)
 }

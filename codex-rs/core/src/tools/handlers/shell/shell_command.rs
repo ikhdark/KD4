@@ -98,7 +98,7 @@ impl ShellCommandHandler {
             "environment_id".to_string(),
             serde_json::Value::String(environment_id.to_string()),
         );
-        if !allow_login_shell && !object.contains_key("login") {
+        if !allow_login_shell && !object.contains_key("login") && !object.contains_key("program") {
             object.insert("login".to_string(), serde_json::Value::Bool(false));
         }
         serde_json::to_string(&value).map_err(|err| {
@@ -131,7 +131,6 @@ impl ShellCommandHandler {
 
         Ok(login.unwrap_or(allow_login_shell))
     }
-
 
     pub(super) fn to_exec_params_with_shell(
         params: &ShellCommandToolCallParams,
@@ -219,7 +218,10 @@ impl ToolExecutor<ToolInvocation> for ShellCommandHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(self.handle_call(invocation))
+        Box::pin(
+            codex_shell_command::PowershellAnalysisScope::default()
+                .scope(self.handle_call(invocation)),
+        )
     }
 }
 
@@ -320,8 +322,25 @@ impl ShellCommandHandler {
             &original_invocation,
             &turn_environment,
             session_shell.as_ref(),
+            params.shell.as_deref(),
         )
         .await?;
+        if original_invocation.is_argv() && params.login.is_some() {
+            return Err(FunctionCallError::RespondToModel(
+                "`login` is only valid for shell scripts, not program/args.".into(),
+            ));
+        }
+        if original_safety_shell.shell_type == ShellType::Cmd && params.login == Some(true) {
+            return Err(FunctionCallError::RespondToModel(
+                "cmd.exe does not support login/profile loading; omit `login` or set it to false."
+                    .into(),
+            ));
+        }
+        if original_safety_shell.shell_type == ShellType::PowerShell && !original_invocation.is_argv() {
+            codex_shell_command::PowershellAnalysisScope::select_executable(
+                original_safety_shell.shell_path.to_string_lossy().into_owned(),
+            );
+        }
         let original_safety_command =
             original_invocation.to_safety_args(&original_safety_shell, use_login_shell)?;
         let original_shell_type = if original_invocation.is_argv() {
@@ -390,6 +409,7 @@ impl ShellCommandHandler {
                 &command_invocation,
                 &turn_environment,
                 session_shell.as_ref(),
+                params.shell.as_deref(),
             )
             .await?
         } else {
@@ -482,17 +502,21 @@ impl ShellCommandHandler {
             &session, &turn, &call_id, policy_classification,
             validation_launch,
             policy_selection,
-            &format!("{validation_cwd}:{environment_hash}"),
+            &serde_json::json!([turn_environment.owner_id(), validation_cwd, environment_hash,
+                sandbox_context, runtime_context, prefix_rule]).to_string(),
             workspace_identity.as_deref(),
             &turn_environment.environment_id,
             &PathUri::from_abs_path(&exec_params.cwd),
             &exec_params.command,
+            &exec_params.env,
+            turn_environment.environment.get_filesystem().as_ref(),
         ).await {
             Ok(permit) => permit,
             Err(refusal) => return Ok(refusal),
         };
         let run_args = RunExecLikeArgs {
             max_output_tokens: params.max_output_tokens,
+            quiet_on_success: params.quiet_on_success.unwrap_or(false),
             validation,
             tool_name,
             exec_params,
@@ -526,19 +550,26 @@ async fn resolve_command_shell_async(
     invocation: &CommandInvocation,
     turn_environment: &TurnEnvironment,
     session_shell: &Shell,
+    requested_shell: Option<&str>,
 ) -> Result<Shell, FunctionCallError> {
     let environment_shell = turn_environment.shell.as_ref().unwrap_or(session_shell);
-    if !invocation.is_powershell_script()
+    if requested_shell.is_none() && (!invocation.is_powershell_script()
         || environment_shell.shell_type == ShellType::PowerShell
-        || turn_environment.environment.is_remote()
+        || turn_environment.environment.is_remote())
     {
-        return resolve_command_shell(invocation, turn_environment, session_shell);
+        return resolve_command_shell(invocation, turn_environment, session_shell, requested_shell);
     }
     let invocation = invocation.clone();
     let turn_environment = turn_environment.clone();
     let session_shell = session_shell.clone();
+    let requested_shell = requested_shell.map(str::to_owned);
     crate::tools::run_blocking_command_analysis(move || {
-        resolve_command_shell(&invocation, &turn_environment, &session_shell)
+        resolve_command_shell(
+            &invocation,
+            &turn_environment,
+            &session_shell,
+            requested_shell.as_deref(),
+        )
     })
     .await
     .map_err(|error| {
@@ -550,8 +581,31 @@ pub(super) fn resolve_command_shell(
     invocation: &CommandInvocation,
     turn_environment: &TurnEnvironment,
     session_shell: &Shell,
+    requested_shell: Option<&str>,
 ) -> Result<Shell, FunctionCallError> {
     let environment_shell = turn_environment.shell.as_ref().unwrap_or(session_shell);
+    if let Some(requested) = requested_shell {
+        if invocation.is_argv() {
+            return Err(FunctionCallError::RespondToModel(
+                "`shell` is only valid for shell scripts, not program/args.".into(),
+            ));
+        }
+        let selected = if turn_environment.environment.is_remote() {
+            if requested != environment_shell.shell_path.to_string_lossy() {
+                return Err(FunctionCallError::RespondToModel("Remote shell overrides must exactly match the reported executable; alternate executables are not supported.".into()));
+            }
+            environment_shell.clone()
+        } else {
+            crate::shell::get_shell_by_model_provided_path(&std::path::PathBuf::from(requested))
+                .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
+        };
+        if invocation.is_powershell_script() && selected.shell_type != ShellType::PowerShell {
+            return Err(FunctionCallError::RespondToModel(
+                "`script_body` requires a PowerShell executable.".into(),
+            ));
+        }
+        return Ok(selected);
+    }
     if !invocation.is_powershell_script() {
         return Ok(environment_shell.clone());
     }
@@ -658,4 +712,3 @@ impl CoreToolRuntime for ShellCommandHandler {
         })
     }
 }
-

@@ -1,5 +1,6 @@
 use crate::models::ResponseItem;
 use crate::protocol::CompactedItem;
+use crate::protocol::CompactionProvenance;
 use serde::Deserialize;
 
 // Before `window_number` was introduced, the numeric window number was serialized as
@@ -22,6 +23,7 @@ impl<'de> Deserialize<'de> for CompactedItem {
         Ok(Self {
             message: serialized.message,
             replacement_history: serialized.replacement_history,
+            provenance: serialized.provenance,
             window_number,
             first_window_id: serialized.first_window_id,
             previous_window_id: serialized.previous_window_id,
@@ -35,6 +37,8 @@ struct SerializedCompactedItem {
     message: String,
     #[serde(default)]
     replacement_history: Option<Vec<ResponseItem>>,
+    #[serde(default)]
+    provenance: Option<CompactionProvenance>,
     #[serde(default)]
     window_number: Option<u64>,
     #[serde(default)]

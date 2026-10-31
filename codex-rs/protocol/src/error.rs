@@ -121,6 +121,10 @@ pub enum CodexErr {
     /// Invalid request.
     #[error("{0}")]
     InvalidRequest(String),
+    /// A rejected final is recoverable by a later turn, not a fatal session
+    /// error or permission for automatic transport retries after repair ends.
+    #[error("Final response validation failed: {0}")]
+    FinalResponseValidation(serde_json::Value),
     /// Invalid image.
     #[error("The provided image data is invalid. Remove or replace the image and try again.")]
     InvalidImageRequest(),
@@ -259,6 +263,7 @@ impl CodexErr {
             | CodexErr::QuotaExceeded
             | CodexErr::InvalidImageRequest()
             | CodexErr::InvalidRequest(_)
+            | CodexErr::FinalResponseValidation(_)
             | CodexErr::IncompleteResponse(_)
             | CodexErr::ProviderFailure { .. }
             | CodexErr::RefreshTokenFailed(_)

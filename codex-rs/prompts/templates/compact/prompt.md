@@ -23,6 +23,12 @@ Separate independent obligations with blank lines. Keep each obligation's
 conditions, prohibitions, and evidence in the same paragraph; never separate a
 qualification from the action it limits.
 
+Reuse the existing update_plan requirement IDs and owner when supplied; render
+identified obligations as `[ID] <original requirement text>`, retaining their
+qualifications. Do not invent another ledger. A summary rewrite is not a
+completion or supersession transition; keep requirements unresolved until the
+owner explicitly records completion or accepted user-authorized supersession.
+
 Every section must contain an explicit value. Write `None` when there is no
 task-relevant content for a required section; never leave a section empty.
 

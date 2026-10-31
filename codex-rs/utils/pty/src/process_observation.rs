@@ -1,4 +1,4 @@
-//! Payload-free observations at successful creation boundaries, not a launcher.
+//! Root observations at successful creation boundaries, not a launcher.
 //! Counts cover only instrumented roots; opaque descendants remain unknown.
 use std::cell::RefCell;
 use std::future::Future;
@@ -26,6 +26,10 @@ pub enum ProcessRole {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProcessStart {
+    /// Local image observation; absent for remote/opaque or inaccessible roots.
+    pub resolved_executable: Option<String>,
+    pub executable_identity: crate::environment_receipt::ExecutableIdentity,
+    pub environment: Option<crate::environment_receipt::LaunchEnvironment>,
     pub instance_id: String,
     pub execution_id: Option<String>,
     pub producer: String,
@@ -41,6 +45,8 @@ pub struct ProcessStart {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProcessStartSnapshot {
     pub schema_version: u16,
+    /// Preserves requested provenance when an opaque backend has no native observer.
+    pub unobserved_launch_environment: Option<crate::environment_receipt::LaunchEnvironment>,
     pub requested_root_starts_observed: u64,
     pub auxiliary_root_starts_observed: u64,
     pub dropped_details: u64,
@@ -64,7 +70,8 @@ impl ProcessStartRecorder {
     pub fn snapshot(&self) -> ProcessStartSnapshot {
         let details = self.details.try_lock().ok();
         ProcessStartSnapshot {
-            schema_version: 1,
+            schema_version: 2,
+            unobserved_launch_environment: None,
             requested_root_starts_observed: self.requested.load(Ordering::Acquire),
             auxiliary_root_starts_observed: self.auxiliary.load(Ordering::Acquire),
             dropped_details: self.dropped.load(Ordering::Acquire) + u64::from(details.is_none()),
@@ -83,6 +90,7 @@ impl ProcessStartRecorder {
 pub struct ProcessObservationContext {
     recorder: Arc<ProcessStartRecorder>,
     execution_id: String,
+    environment: Option<crate::environment_receipt::LaunchEnvironment>,
 }
 
 tokio::task_local! { static ACTIVE: ProcessObservationContext; }
@@ -93,6 +101,7 @@ impl ProcessObservationContext {
         Self {
             recorder,
             execution_id,
+            environment: None,
         }
     }
     pub fn current() -> Option<Self> {
@@ -103,6 +112,25 @@ impl ProcessObservationContext {
     }
     pub async fn scope<F: Future>(self, future: F) -> F::Output {
         ACTIVE.scope(self, future).await
+    }
+    pub fn snapshot(&self) -> ProcessStartSnapshot {
+        let mut snapshot = self.recorder.snapshot();
+        if snapshot.roots.iter().all(|root| root.environment.is_none()) {
+            snapshot.unobserved_launch_environment = self.environment.clone();
+        }
+        snapshot
+    }
+    pub async fn scope_environment<F: Future>(
+        environment: crate::environment_receipt::LaunchEnvironment,
+        future: F,
+    ) -> F::Output {
+        match Self::current() {
+            Some(mut context) => {
+                context.environment = Some(environment);
+                context.scope(future).await
+            }
+            None => future.await,
+        }
     }
     pub fn scope_sync<T>(context: Option<Self>, operation: impl FnOnce() -> T) -> T {
         struct Restore(Option<ProcessObservationContext>);
@@ -180,7 +208,16 @@ pub fn observe_process_start(
         *RECORDER_ID,
         NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed)
     );
+    let environment = context.as_ref().filter(|_| role == ProcessRole::RequestedRoot)
+        .and_then(|context| context.environment.clone());
+    let resolved_executable = context.as_ref().filter(|context| context.environment.is_some())
+        .and_then(|_| os_pid.and_then(crate::environment_receipt::executable_for_pid));
     let start = ProcessStart {
+        executable_identity: crate::environment_receipt::ExecutableIdentity::observed(
+            resolved_executable.as_deref(), environment.as_ref(),
+        ),
+        resolved_executable,
+        environment,
         instance_id: instance_id.clone(),
         execution_id: context.as_ref().map(|c| c.execution_id.clone()),
         producer: producer.into(),

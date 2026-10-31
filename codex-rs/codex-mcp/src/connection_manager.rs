@@ -935,6 +935,16 @@ impl McpConnectionManager {
             .fetch_add(1, Ordering::AcqRel);
     }
 
+    /// Refreshes discovery through each connection's existing catalog owner,
+    /// including connections retained by a runtime configuration refresh.
+    pub fn invalidate_caches(&self) {
+        self.invalidate_resource_caches();
+        for client in self.clients.values() {
+            client.invalidate_tool_catalog();
+        }
+        self.tool_catalog_revision.fetch_add(1, Ordering::AcqRel);
+    }
+
     pub(crate) fn resource_cache_key(
         &self,
         server: &str,

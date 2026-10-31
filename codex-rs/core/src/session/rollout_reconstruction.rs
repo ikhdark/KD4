@@ -54,6 +54,18 @@ pub(super) fn unsettled_tool_recovery_page(
     items: &[RolloutItem],
     offset: usize,
 ) -> serde_json::Value {
+    let operations = unsettled_tool_recovery_entries(items);
+    let count = operations.len();
+    let operations = operations.skip(offset).take(8).collect::<Vec<_>>();
+    let next = offset.saturating_add(operations.len());
+    serde_json::json!({"operations": operations, "unresolved_count": count,
+        "offset": offset, "omitted_count": count.saturating_sub(next),
+        "recovery_path": (next < count).then(|| format!("context:unsettled-tools/{next}"))})
+}
+
+pub(super) fn unsettled_tool_recovery_entries(
+    items: &[RolloutItem],
+) -> impl ExactSizeIterator<Item = serde_json::Value> + '_ {
     use sha2::Digest;
     use std::collections::BTreeMap;
     let mut pending = BTreeMap::new();
@@ -61,7 +73,7 @@ pub(super) fn unsettled_tool_recovery_page(
     let mut turn = "";
     let mut cwd = None;
     let bounded = |value: &str| value.chars().take(240).collect::<String>();
-    let redacted_path = |value: &str| {
+    let redacted_path = move |value: &str| {
         if value.contains("://") {
             url::Url::parse(value)
                 .ok()
@@ -125,10 +137,9 @@ pub(super) fn unsettled_tool_recovery_page(
             _ => {}
         }
     }
-    let count = pending.len();
     let mut pending = pending.into_iter().collect::<Vec<_>>();
     pending.sort_unstable_by_key(|(index, _)| std::cmp::Reverse(*index));
-    let operations = pending.into_iter().skip(offset).take(8).map(|(index, (turn, call_id, cwd, response))| {
+    pending.into_iter().map(move |(index, (turn, call_id, cwd, response))| {
         let (name, namespace, arguments) = match response {
             ResponseItem::FunctionCall { name, namespace, arguments, .. }
             | ResponseItem::CustomToolCall { name, namespace, input: arguments, .. } => (name, namespace, arguments),
@@ -148,11 +159,7 @@ pub(super) fn unsettled_tool_recovery_page(
             "invocation_sha256": hex::encode(sha2::Sha256::digest(arguments.as_bytes())),
             "status": "result_not_durably_available_effects_unknown",
         })
-    }).collect::<Vec<_>>();
-    let next = offset.saturating_add(operations.len());
-    serde_json::json!({"operations": operations, "unresolved_count": count,
-        "offset": offset, "omitted_count": count.saturating_sub(next),
-        "recovery_path": (next < count).then(|| format!("context:unsettled-tools/{next}"))})
+    })
 }
 
 impl Session {

@@ -58,10 +58,25 @@ pub fn conpty_supported() -> bool {
 #[cfg(not(unix))]
 struct PtyChildTerminator {
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    #[cfg(windows)]
+    job: Option<Arc<crate::win::JobObject>>,
 }
 
 #[cfg(not(unix))]
 impl ChildTerminator for PtyChildTerminator {
+    #[cfg(windows)]
+    fn replay_control(&self) -> Option<Box<dyn ChildTerminator>> {
+        self.job.as_ref().map(|job| Box::new(Arc::clone(job)) as Box<dyn ChildTerminator>)
+    }
+
+    #[cfg(windows)]
+    fn tree_is_empty(&self) -> std::io::Result<bool> {
+        match &self.job {
+            Some(job) => job.active_process_count().map(|count| count == 0),
+            None => Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "tree accounting unavailable")),
+        }
+    }
+
     fn signal(&mut self, signal: ProcessSignal) -> std::io::Result<()> {
         Err(crate::process::unsupported_signal(signal))
     }
@@ -297,6 +312,10 @@ async fn spawn_process_portable(
     #[cfg(not(windows))]
     let mut child = slave.spawn_command(command_builder)?;
 
+    #[cfg(windows)]
+    let job = (child.as_mut() as &mut dyn portable_pty::Child)
+        .downcast_mut::<crate::win::WinChild>()
+        .map(|child| child.job());
     let killer = child.clone_killer();
 
     let (writer_tx, writer_rx) = crate::stdin_channel(128);
@@ -376,7 +395,11 @@ async fn spawn_process_portable(
 
     let handle = ProcessHandle::new(
         writer_tx,
-        Box::new(PtyChildTerminator { killer }),
+        Box::new(PtyChildTerminator {
+            killer,
+            #[cfg(windows)]
+            job,
+        }),
         reader_handle,
         Vec::new(),
         writer_handle,

@@ -234,6 +234,7 @@ impl CodeModeExecuteHandler {
         direct_nested_tool_specs: Vec<ToolSpec>,
         deferred_nested_tool_specs: Vec<ToolSpec>,
         canonical_input_schemas: &HashMap<codex_tools::ToolName, serde_json::Value>,
+        effective_contract_revisions: &HashMap<codex_tools::ToolName, String>,
     ) -> Result<Self, String> {
         let mut nested_tool_specs = direct_nested_tool_specs;
         // Deferred tools stay out of the model-visible `exec` description, but
@@ -253,6 +254,15 @@ impl CodeModeExecuteHandler {
         // declarations. The isolate consumes only callable metadata, so do not
         // clone and transport the original JSON schema trees for every cell.
         for definition in &mut enabled_tools {
+            // Keep the immutable runtime catalog revision-bound even when a
+            // changed constraint has the same TypeScript projection.
+            if let Some(revision) = effective_contract_revisions.get(&definition.tool_name) {
+                definition.description = format!(
+                    "{}\nEffective contract revision: {revision}.",
+                    definition.description,
+                )
+                .into();
+            }
             definition.input_schema = None;
             definition.output_schema = None;
         }
@@ -327,6 +337,10 @@ impl CodeModeExecuteHandler {
         }
         // Apply the public ceiling before crossing either session transport.
         // The remote wire uses i32, while the pragma accepts safe integers.
+        let context_token_limit = step_context.model_output_token_limit(
+            &session,
+            codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
+        ).await;
         let max_output_tokens = args
             .max_output_tokens
             .map(|limit| limit.min(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL));
@@ -623,12 +637,8 @@ impl CodeModeExecuteHandler {
             )
             .await;
         let (mut output, delivered_call_ids, delivery) =
-            handle_runtime_response(&exec, response, max_output_tokens, started_at)
+            handle_runtime_response(&exec, response, max_output_tokens, context_token_limit, started_at)
                 .map_err(FunctionCallError::RespondToModel)?;
-        exec.session
-            .services
-            .code_mode_service
-            .elide_bodies_already_in_context(&mut output);
         if !retention_settled {
             super::attach_pending_retention(&mut output, &cell_id, &call_id);
         }

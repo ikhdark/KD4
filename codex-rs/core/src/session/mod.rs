@@ -225,6 +225,7 @@ mod mcp;
 mod mcp_runtime;
 pub(crate) mod multi_agents;
 mod review;
+pub(crate) mod resume_inventory;
 mod rollout_reconstruction;
 #[allow(clippy::module_inception)]
 pub(crate) mod session;
@@ -1508,6 +1509,7 @@ fn response_item_needs_turn_id(item: &ResponseItem) -> bool {
 struct StartupRolloutFacts {
     initial_messages: Option<Vec<EventMsg>>,
     mailbox_communication_ids: Vec<codex_protocol::ResponseItemId>,
+    mailbox_progress: Vec<InterAgentCommunication>,
     has_prior_user_turns: bool,
     last_token_info: Option<TokenUsageInfo>,
     reconstructed_provider_id: Option<String>,
@@ -1519,6 +1521,7 @@ impl StartupRolloutFacts {
         let mut initial_messages =
             (!matches!(history, InitialHistory::New | InitialHistory::Cleared)).then(Vec::new);
         let mut mailbox_communication_ids = Vec::new();
+        let mut mailbox_progress = Vec::new();
         let mut prior_user_turns = PriorUserTurnTracker::default();
         let mut last_token_info = None;
         let mut persisted_settings =
@@ -1539,12 +1542,26 @@ impl StartupRolloutFacts {
                     }
                 }
                 RolloutItem::InterAgentCommunication(communication) => {
+                    if communication.progress.is_some() {
+                        mailbox_progress.push(communication.clone());
+                    }
                     if let Some(id) = communication.id.as_ref() {
                         mailbox_communication_ids.push(id.clone());
                     }
                 }
                 RolloutItem::ResponseItem(ResponseItem::AgentMessage { id: Some(id), .. }) => {
                     mailbox_communication_ids.push(id.clone());
+                }
+                RolloutItem::InterAgentCommunicationMetadata { trigger_turn, progress: Some((author, recipient, progress)) }
+                    if matches!(items.get(idx + 1), Some(RolloutItem::ResponseItem(ResponseItem::AgentMessage {
+                        id: Some(_), author: recorded_author, recipient: recorded_recipient, ..
+                    })) if recorded_author == author.as_str() && recorded_recipient == recipient.as_str()) =>
+                {
+                    // A trailing marker without its committed payload is not an
+                    // acknowledgment and must not suppress a sender's retry.
+                    let mut communication = InterAgentCommunication::new(author.clone(), recipient.clone(), Vec::new(), String::new(), *trigger_turn);
+                    communication.progress = Some(progress.clone());
+                    mailbox_progress.push(communication);
                 }
                 _ => {}
             }
@@ -1553,6 +1570,7 @@ impl StartupRolloutFacts {
         Self {
             initial_messages,
             mailbox_communication_ids,
+            mailbox_progress,
             has_prior_user_turns: prior_user_turns.has_prior_user_turns(),
             last_token_info: last_token_info.cloned(),
             reconstructed_provider_id: persisted_settings.into_settings().model_provider_id,
@@ -2609,10 +2627,12 @@ impl Session {
             // Cancellation during hook discovery leaves both accepted values intact.
             // Preserve ordinary session updates accepted while the build was pending.
             state.session_configuration.original_config_do_not_use = config;
-            self.services
-                .latest_mcp_runtime()
-                .manager()
-                .invalidate_resource_caches();
+            let runtime = self.services.latest_mcp_runtime();
+            if invalidate_discovery {
+                runtime.manager().invalidate_caches();
+            } else {
+                runtime.manager().invalidate_resource_caches();
+            }
             let hooks = hooks.with_run_history_from(&self.services.hooks.load());
             self.services.hooks.store(Arc::new(hooks));
             let new_config = notify_config_contributors
@@ -3188,17 +3208,30 @@ impl Session {
                     binding.assignment_id, binding.attempt_id,
                 )
             });
-        let Some(mut communication) =
+        let communication =
             crate::session_prefix::inter_agent_completion_communication_with_diagnostics(
+                &turn_context.config.codex_home,
+                parent_thread_id,
                 parent_agent_path,
                 child_agent_path.clone(),
                 self.thread_id,
                 &status,
                 receipt.as_deref(),
                 protected_host_summary,
-            )
-        else {
-            return true;
+            ).await;
+        let mut communication = match communication {
+            Ok(Some(communication)) => communication,
+            Ok(None) => return true,
+            Err(error) => {
+                warn!(%error, "child result remains pending; complete report retention/delivery failed");
+                if let Some(binding) = turn_context.agent_task_binding.get().and_then(Option::as_ref) {
+                    let _ = self.services.agent_control.task_coordinator().record_host_completion_observation(
+                        binding, self.thread_id, &format!("{}:result-retention", turn_context.sub_id),
+                        error, None,
+                    ).await;
+                }
+                return false;
+            }
         };
         // Reuse mailbox identity deduplication for repeated terminal dispatch
         // of this turn. Preserve the existing stronger error identity, which
@@ -5013,6 +5046,8 @@ impl Session {
                 .persist_rollout_items_ordered(&[
                     RolloutItem::InterAgentCommunicationMetadata {
                         trigger_turn: communication.trigger_turn,
+                        progress: communication.progress.clone().map(|progress|
+                            (communication.author.clone(), communication.recipient.clone(), progress)),
                     },
                     RolloutItem::ResponseItem(items[0].clone()),
                 ])
@@ -5026,6 +5061,7 @@ impl Session {
                 );
             }
             drop(_permit);
+            session.input_queue.acknowledge_mailbox_communication(&communication).await;
             session.send_raw_response_items(&turn_context, &items).await;
             Ok::<_, std::io::Error>(())
         });
@@ -5153,6 +5189,7 @@ impl Session {
         world_state_baseline: Option<WorldStateSnapshot>,
         fragment_digests: Vec<ContextFragmentDigest>,
         compacted_item: CompactedItem,
+        operation: codex_protocol::protocol::CompactionOperation,
     ) -> CodexResult<()> {
         let session = Arc::clone(self);
         let turn_context = Arc::clone(turn_context);
@@ -5180,7 +5217,11 @@ impl Session {
             };
             // Reserve the next window under the ordered commit gate, but leave
             // live metadata unchanged until its rollout record is durable.
-            let (window_number, window_ids) = session.state.lock().await.next_auto_compact_window();
+            let (window_number, window_ids, source_history) = {
+                let state = session.state.lock().await;
+                let (number, ids) = state.next_auto_compact_window();
+                (number, ids, state.history.clone())
+            };
             let mut items = items;
             let application_context = session
                 .state
@@ -5192,9 +5233,19 @@ impl Session {
             // must contain the same policy before delivery is reconciled.
             let insertion_index = items.len().saturating_sub(1);
             items.splice(insertion_index..insertion_index, application_context);
-            let items = Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned();
+            let mut items = Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned();
+            let provenance = crate::compact_provenance::install(
+                source_history.raw_items(),
+                &mut items,
+                operation,
+                window_ids.window_id.to_string(),
+                window_ids.previous_window_id.map(|id| id.to_string()),
+                session.thread_id.to_string(),
+                turn_context.sub_id.clone(),
+            )?;
             let compacted_item = CompactedItem {
                 replacement_history: Some(items.clone()),
+                provenance: Some(provenance),
                 window_number: Some(window_number),
                 first_window_id: Some(window_ids.first_window_id.to_string()),
                 previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
@@ -6244,7 +6295,7 @@ impl Session {
         self.state.lock().await.clone_history()
     }
 
-    /// Scope retirement alone needs input provenance. Hold the existing history
+    /// Pinning and scope retirement need input provenance. Hold the existing history
     /// gate through the plan commit so steering/rollback cannot replace the
     /// authorization boundary between checking it and publishing the revision.
     pub(crate) async fn plan_scope_inputs(
@@ -6568,6 +6619,45 @@ impl Session {
         }))
     }
 
+    async fn check_compaction_artifact_pin(
+        &self,
+        pin: &mut serde_json::Value,
+        checks: &mut BTreeMap<String, serde_json::Value>,
+    ) {
+        let Some(id) = pin["artifact_id"].as_str() else { return };
+        let id = id.to_string();
+        let mut check = if let Some(check) = checks.get(&id) {
+            check.clone()
+        } else {
+            let (check, _) = crate::tools::command_output_artifact::audit_tool_output_reference(
+                self.codex_home().await.as_path(), &self.thread_id.to_string(), &id,
+                crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_MAX_BYTES,
+            ).await;
+            checks.insert(id, check.clone());
+            check
+        };
+        let expected_bytes = pin["bytes"].as_u64();
+        let expected_hash = pin["sha256"].as_str();
+        let observed = &check["identity"];
+        let mismatch = check["access"] == "readable"
+            && (expected_bytes.is_some_and(|bytes| observed["canonical_bytes"].as_u64() != Some(bytes))
+                || expected_hash.is_some_and(|hash| observed["canonical_sha256"].as_str() != Some(hash)));
+        check["identity_match"] = if mismatch {
+            check["reason"] = "recorded_identity_mismatch".into();
+            check["recovery"] = serde_json::json!({
+                "instruction": "Do not use this handle as the recorded artifact. Preserve both identities and original selectors; use already delivered evidence or resolve the mismatch with the storage owner. Do not replay the producer.",
+            });
+            "mismatched"
+        } else if check["access"] != "readable" || expected_bytes.is_none() || expected_hash.is_none() {
+            "unknown"
+        } else if check["identity"]["historical_authenticity"] != "authenticated" {
+            "unverified"
+        } else {
+            "matched"
+        }.into();
+        pin["reference_check"] = check;
+    }
+
     pub(crate) async fn compaction_artifact_pins(
         &self,
         state: &crate::tool_history::ToolHistoryState,
@@ -6578,13 +6668,27 @@ impl Session {
         };
         let mut payload = prepared.payload;
         let mut rendered_candidates = prepared.rendered_candidates;
+        let mut checks = BTreeMap::new();
+        if let Some(pins) = payload["artifacts"].as_array_mut() {
+            for pin in pins {
+                self.check_compaction_artifact_pin(pin, &mut checks).await;
+            }
+        }
         if payload["omitted_artifact_count"].as_u64().unwrap_or(0) != 0
             || payload["omitted_detail_count"].as_u64().unwrap_or(0) != 0
+            || codex_utils_string::approx_token_count(&payload.to_string())
+                > crate::tool_history::COMPACTION_ARTIFACT_PIN_TOKEN_BUDGET
         {
             let mut retained = state.clone();
             retained.retain_for_history(items);
-            let pins = retained.artifact_recovery_directory_reusing(&mut rendered_candidates);
+            let mut pins = retained.artifact_recovery_directory_reusing(&mut rendered_candidates);
             drop(rendered_candidates);
+            if let Some(pins) = pins.as_array_mut() {
+                pins.extend(prepared.additional_references);
+                for pin in pins {
+                    self.check_compaction_artifact_pin(pin, &mut checks).await;
+                }
+            }
             let members = pins
                 .as_array()
                 .into_iter()
@@ -6620,7 +6724,7 @@ impl Session {
                 .await
                 .apply_tool_history_mutation(&mutation);
             payload["directory"] = directory;
-            payload["instruction"] = "Inline pins list the newest retained artifacts. Older artifacts, exact identities and recovered selectors are retained in directory; read its /items with read_tool_output only when a needed artifact is not listed here. Saved outputs and their provenance remain retained.".into();
+            payload["instruction"] = format!("{} Older references and check results are in directory; read its /items only when needed. Retaining this directory does not retain or deliver its referenced content.", payload["instruction"].as_str().unwrap_or_default()).into();
             while codex_utils_string::approx_token_count(&payload.to_string())
                 > crate::tool_history::COMPACTION_ARTIFACT_PIN_TOKEN_BUDGET
             {
@@ -6730,6 +6834,41 @@ impl Session {
             .await
             .tool_history_state_ref()
             .completed_source_inspection(artifact_id, bytes, sha256, attempt_id)
+    }
+
+    pub(crate) async fn operation_attempt_advisory(
+        &self,
+        attempt: &crate::tools::operation_history::OperationAttempt,
+    ) -> serde_json::Value {
+        self.state.lock().await.tool_history_state_ref().operation_attempt_advisory(attempt)
+    }
+
+    pub(crate) async fn record_operation_attempt(
+        &self,
+        attempt: crate::tools::operation_history::OperationAttempt,
+    ) -> serde_json::Value {
+        let Ok(_permit) = self.tool_history_reconciliation_gate.acquire().await else {
+            unreachable!("session-owned tool-history reconciliation semaphore is never closed");
+        };
+        let mut writer = self.tool_history_persistence.writer().await;
+        let mut state = self.state.lock().await;
+        let mut advisory = state.tool_history_state_ref().operation_attempt_advisory(&attempt);
+        let mutation = crate::tool_history::ToolHistoryMutation::RecordOperationAttempt {
+            attempt: Box::new(attempt),
+        };
+        // Match the existing journal owner: enqueue before applying in memory.
+        // This receipt says queued, not that asynchronous disk I/O has finished.
+        match writer.enqueue_mutation(mutation.clone(), "operation retry memory") {
+            Ok(_) => {
+                state.apply_tool_history_mutation(&mutation);
+                advisory["persistence"] = serde_json::json!("queued");
+            }
+            Err(error) => {
+                advisory["persistence"] = serde_json::json!("unavailable");
+                tracing::warn!(%error, "operation retry memory could not be queued");
+            }
+        }
+        advisory
     }
 
     pub(crate) async fn register_tool_history_candidate(
@@ -7705,7 +7844,9 @@ impl Session {
             "Selected model is temporarily at capacity. Retrying automatically; your turn is still active."
                 .to_string()
         } else {
-            codex_error.to_string()
+            // Provider/transport Display values can contain URLs, echoed headers
+            // or credentials. Retry diagnostics retain only the typed cause.
+            format!("Retry trigger: {:?}. Provider details redacted.", crate::responses_retry::retry_trigger(&codex_error))
         };
         let codex_error_info = CodexErrorInfo::ResponseStreamDisconnected {
             http_status_code: codex_error.http_status_code_value(),

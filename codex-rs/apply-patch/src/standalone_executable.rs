@@ -124,14 +124,20 @@ fn run_apply_patch(patch: &str) -> i32 {
     };
     // TODO(anp): Discover the standalone executable cwd as PathUri directly.
     let cwd = codex_utils_path_uri::PathUri::from_abs_path(&cwd);
-    match runtime.block_on(crate::apply_patch(
+    let result = runtime.block_on(crate::apply_patch(
         patch,
         &cwd,
         &mut stdout,
         &mut stderr,
         codex_exec_server::LOCAL_FS.as_ref(),
         /*sandbox*/ None,
-    )) {
+    ));
+    let delta = match &result { Ok(delta) => delta, Err(failure) => failure.delta() };
+    if let Err(error) = writeln!(stdout, "Change manifest: {}", serde_json::json!(delta.manifest())) {
+        eprintln!("Error: Failed to write patch manifest: {error}");
+        return 1;
+    }
+    match result {
         Ok(_) => {
             // Flush to ensure output ordering when used in pipelines.
             match stdout.flush() {

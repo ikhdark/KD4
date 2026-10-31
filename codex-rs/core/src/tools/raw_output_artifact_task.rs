@@ -459,6 +459,34 @@ pub(crate) async fn read_command_log(
         let mut byte_ranges = Vec::new();
         let mut search_snapshot = None;
         for selector in &selectors {
+            if matches!(selector, ToolOutputSelector::Tail { .. }) {
+                let selected = match super::tail_window_limit(selector, remaining) {
+                    Err(message) => super::invalid_selector_result(selector.clone(), message),
+                    Ok(_) if remaining == 0 => super::ToolOutputSelectorResult::state(
+                        selector.clone(), super::ToolOutputSelectorStatus::AggregateOmitted,
+                    ),
+                    Ok(limit) => {
+                        let (mut file, _identity) = open_command_log(&path)
+                            .map_err(|error| super::ReadToolOutputError::Io(error.to_string()))?;
+                        let length = file.metadata()
+                            .map_err(|error| super::ReadToolOutputError::Io(error.to_string()))?.len();
+                        if length != metadata.len() {
+                            return Err(super::ReadToolOutputError::Io("command log changed during tail read".into()));
+                        }
+                        let count = length.min(limit as u64) as usize;
+                        file.seek(SeekFrom::Start(length - count as u64))
+                            .map_err(|error| super::ReadToolOutputError::Io(error.to_string()))?;
+                        let mut window = vec![0; count];
+                        file.read_exact(&mut window)
+                            .map_err(|error| super::ReadToolOutputError::Io(error.to_string()))?;
+                        super::tail_selector_result(selector.clone(), &window, length, remaining)
+                    }
+                };
+                remaining = remaining.saturating_sub(super::recovery_source_charge(&selected) as usize);
+                results.push(serde_json::to_value(selected)
+                    .map_err(|error| super::ReadToolOutputError::Io(error.to_string()))?);
+                continue;
+            }
             if selector.is_search() {
                 let limit = if matches!(selector, ToolOutputSelector::Search { regex: true, .. }) {
                     super::ARTIFACT_REGEX_MAX_SEARCH_BYTES
@@ -520,7 +548,7 @@ pub(crate) async fn read_command_log(
             }
             let ToolOutputSelector::Lines { start, end } = selector else {
                 return Err(super::ReadToolOutputError::InvalidRange(
-                    "Command logs support bytes, lines, search and structured selectors; source snapshots retain sections and JSON pointers. Preserve this artifact_id and do not rerun its producer.".into()));
+                    "Command logs support bytes, lines, tail, search and structured selectors; source snapshots retain sections and JSON pointers. Preserve this artifact_id and do not rerun its producer.".into()));
             };
             if *start == 0 || end < start {
                 return Err(super::ReadToolOutputError::InvalidRange("expected 1-based start <= end".into()));

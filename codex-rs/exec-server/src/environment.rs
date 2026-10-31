@@ -508,6 +508,54 @@ impl Environment {
             .map_err(|error| ExecServerError::Protocol(error.to_string()))
     }
 
+    /// Independent availability observations on this executor, never host fallbacks.
+    pub async fn lookup_executables(
+        &self,
+        mut params: crate::protocol::LookupExecutablesParams,
+    ) -> Result<Vec<codex_file_system::FileSystemLookupResult>, ExecServerError> {
+        if let Some(client) = &self.remote_client {
+            params.sandbox = params.sandbox.map(crate::FileSystemSandboxContext::drop_cwd_if_unused);
+            return client.get().await?.lookup_executables(params).await;
+        }
+        crate::executable_lookup::lookup_executables(self.filesystem.as_ref(), &params)
+            .await
+            .map_err(|error| ExecServerError::Protocol(error.to_string()))
+    }
+
+    /// Fresh advisory support from the selected backend, never an admission decision.
+    /// Legacy peers cannot establish either support or lack of support.
+    pub async fn capability_report(
+        &self,
+        query: crate::CapabilityQuery,
+    ) -> Result<crate::CapabilityReport, ExecServerError> {
+        query.validate().map_err(|error| ExecServerError::Protocol(error.into()))?;
+        let manifest = if let Some(client) = &self.remote_client {
+            match client.get().await?.capability_manifest().await {
+                Ok(manifest) => Some(manifest),
+                Err(ExecServerError::Server { code: -32601, .. }) => None,
+                Err(error) => return Err(error),
+            }
+        } else if let Some(paths) = &self.local_runtime_paths {
+            // Native equivalents supplied by LocalProcess/LocalFileSystem and
+            // Environment. RPC-only handle/lifecycle methods are not inferred.
+            use crate::protocol::*;
+            let methods = [
+                EXEC_METHOD, EXEC_OWNED_METHOD, EXEC_READ_METHOD, EXEC_WRITE_METHOD,
+                EXEC_CLOSE_STDIN_METHOD, EXEC_SIGNAL_METHOD, EXEC_TERMINATE_METHOD,
+                ENVIRONMENT_INFO_METHOD, CAPABILITY_MANIFEST_METHOD, LOOKUP_EXECUTABLE_METHOD,
+                FS_READ_FILE_METHOD, FS_READ_FILE_BOUNDED_METHOD, FS_READ_FILE_RANGE_METHOD,
+                FS_CHECKSUM_FILE_METHOD, FS_WRITE_FILE_METHOD, FS_CREATE_DIRECTORY_METHOD,
+                FS_GET_METADATA_METHOD, FS_CANONICALIZE_METHOD, FS_READ_DIRECTORY_METHOD,
+                FS_WALK_METHOD, FS_REMOVE_METHOD, FS_COPY_METHOD, FS_MUTATE_FILE_IF_MATCHES_METHOD,
+                HTTP_REQUEST_METHOD,
+            ].into_iter().map(str::to_string).collect();
+            Some(crate::capabilities::manifest(paths, "codex-native", methods, false)?)
+        } else {
+            None
+        };
+        Ok(crate::CapabilityReport::new(manifest, query))
+    }
+
     pub async fn current_runtime(&self) -> Result<Option<EnvironmentRuntime>, ExecServerError> {
         match &self.remote_client {
             Some(client) => {

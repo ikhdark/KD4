@@ -30,6 +30,12 @@ struct CompilationInputs {
     fingerprints: BTreeMap<PathBuf, String>,
     #[serde(default)]
     closed_inputs: bool,
+    /// Set only by the validation owner after proving dependency closure and
+    /// binding the exact command, toolchain, configuration and environment.
+    #[serde(default)]
+    reuse_context: Option<String>,
+    #[serde(default)]
+    command: Vec<String>,
 }
 
 fn compilation_inputs_changed(previous: &str, current: &str) -> bool {
@@ -59,6 +65,7 @@ struct SuiteReservation {
     started: bool,
     policy: Option<(String, String)>,
     compilation_only: bool,
+    success: Option<serde_json::Value>,
 }
 
 /// Compilation kind travels inside the opaque selection, preserving the
@@ -80,6 +87,69 @@ pub struct FullSuitePermit {
 const DUPLICATE_CALL: &str = "Full-suite launch blocked: this tool call already reserved or crossed the possible-start boundary; resume its live run instead of launching it twice.";
 
 impl FullSuiteBudget {
+    /// Binding is separate from repair/change evidence: a named source graph
+    /// alone is never dependency closure. Missing/unreadable inputs stay unknown.
+    pub fn bind_compilation_reuse(revision: &str, context: &str, command: &[String]) -> Option<String> {
+        let mut inputs: CompilationInputs = serde_json::from_str(revision).ok()?;
+        if context.is_empty() || command.first().is_none_or(|program| program.is_empty())
+            || !inputs.closed_inputs || inputs.fingerprints.is_empty()
+            || inputs.fingerprints.values().any(|hash|
+                hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return None;
+        }
+        inputs.reuse_context = Some(context.to_owned());
+        inputs.command = command.to_vec();
+        serde_json::to_string(&inputs).ok()
+    }
+
+    pub fn compilation_evidence_inputs(&self, owner: &str) -> Option<Vec<PathBuf>> {
+        let state = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = state.get(owner).filter(|entry| entry.started && entry.compilation_only)?;
+        let inputs: CompilationInputs = serde_json::from_str(&entry.policy.as_ref()?.1).ok()?;
+        (inputs.closed_inputs && inputs.reuse_context.is_some())
+            .then(|| inputs.fingerprints.into_keys().collect())
+    }
+
+    /// Called only by the settled execution owner, with a fresh reobservation of
+    /// every consumed input. Success is session-local and never checkpointed.
+    pub fn record_compilation_success(
+        &self, owner: &str, current: BTreeMap<PathBuf, String>, mut evidence: serde_json::Value,
+    ) {
+        let mut state = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(entry) = state.get_mut(owner).filter(|entry| entry.started && entry.compilation_only) else { return; };
+        let Some(inputs) = entry.policy.as_ref().and_then(|(_, revision)|
+            serde_json::from_str::<CompilationInputs>(revision).ok()) else { return; };
+        if inputs.closed_inputs && inputs.reuse_context.is_some()
+            && !current.is_empty() && !inputs.command.is_empty() && inputs.fingerprints == current
+            && let Some(receipt) = evidence.as_object_mut()
+        {
+            // Optional validation attribution is not the command owner. Keep
+            // argv from admission even when no such attribution was requested.
+            receipt.insert("argv".into(), serde_json::json!(inputs.command));
+            entry.success = Some(evidence);
+        }
+    }
+
+    /// Return the original command/artifact receipt, not a fresh execution.
+    pub fn reusable_compilation_evidence(&self, revision: &str) -> Option<serde_json::Value> {
+        let current: CompilationInputs = serde_json::from_str(revision).ok()?;
+        if !current.closed_inputs || current.reuse_context.is_none()
+            || current.command.is_empty() || current.fingerprints.is_empty() {
+            return None;
+        }
+        let state = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.values().find_map(|entry| {
+            if !entry.started || !entry.compilation_only { return None; }
+            let prior: CompilationInputs = serde_json::from_str(&entry.policy.as_ref()?.1).ok()?;
+            (prior.closed_inputs && prior.reuse_context == current.reuse_context
+                && prior.command == current.command
+                && prior.compilation_inputs_v1 == current.compilation_inputs_v1
+                && prior.fingerprints == current.fingerprints)
+                .then(|| entry.success.clone()).flatten()
+        })
+    }
+
     /// Exact patch effects only; unknown writers and command completion are
     /// not evidence that a compilation input changed. No child work holds this
     /// lock, and no input-evidence lock is nested with the reservation lock.
@@ -105,6 +175,8 @@ impl FullSuiteBudget {
             compilation_inputs_v1: scope.to_owned(), edit_revision,
             closed_inputs: closed_inputs && relevant_inputs.len() == fingerprints.len(),
             fingerprints,
+            reuse_context: None,
+            command: Vec::new(),
         }).unwrap_or_default()
     }
 
@@ -136,6 +208,7 @@ impl FullSuiteBudget {
                 started: false,
                 policy: None,
                 compilation_only: false,
+                success: None,
             },
         );
         Ok(Some(FullSuitePermit {
@@ -172,7 +245,7 @@ impl FullSuiteBudget {
         state.insert(owner.clone(), SuiteReservation {
             generation: Arc::clone(&generation), started: false,
             policy: Some((selection, source_revision)),
-            compilation_only,
+            compilation_only, success: None,
         });
         Ok(FullSuitePermit { budget: Arc::clone(self), owner, generation })
     }
@@ -217,7 +290,7 @@ impl FullSuiteBudget {
             ) { continue; }
             state.insert(format!("recovered-policy:{}", serde_json::json!(attempt)), SuiteReservation {
                 generation: Arc::new(()), started: true,
-                policy: Some(policy), compilation_only,
+                policy: Some(policy), compilation_only, success: None,
             });
         }
     }

@@ -181,7 +181,7 @@ impl FileSystemHandler {
     ) -> Result<crate::protocol::FsChecksumFileResponse, JSONRPCErrorError> {
         let digest = self
             .file_system
-            .checksum_file(&params.path, params.sandbox.as_ref())
+            .checksum_file(&params.path, params.include_text_diagnostics, params.sandbox.as_ref())
             .await
             .map_err(map_fs_error)?;
         Ok(crate::protocol::FsChecksumFileResponse { digest })

@@ -124,6 +124,10 @@ impl CodeModeWaitHandler {
                 if tool_name.namespace.is_none() && tool_name.name.as_str() == WAIT_TOOL_NAME =>
             {
                 let args: ExecWaitArgs = parse_arguments(&arguments)?;
+                let context_token_limit = step_context.model_output_token_limit(
+                    &session,
+                    codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
+                ).await;
                 let exec = ExecContext { session, turn };
                 let started_at = Instant::now();
                 let cell_id = codex_code_mode::CellId::new(args.cell_id);
@@ -281,12 +285,8 @@ impl CodeModeWaitHandler {
                     .observe_packet_retention(&cell_id, args.terminate || super::observation_failed(&response), &cancellation_token)
                     .await;
                 let (mut output, delivered_call_ids, delivery) =
-                    handle_runtime_response(&exec, response, effective_max_tokens, started_at)
+                    handle_runtime_response(&exec, response, effective_max_tokens, context_token_limit, started_at)
                         .map_err(FunctionCallError::RespondToModel)?;
-                exec.session
-                    .services
-                    .code_mode_service
-                    .elide_bodies_already_in_context(&mut output);
                 if !retention_settled {
                     super::attach_pending_retention(&mut output, &cell_id, &call_id);
                 }

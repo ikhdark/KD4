@@ -1,11 +1,15 @@
 use crate::digest_writer::DigestWriter;
 use crate::stable_context::StableContextKind;
 use crate::stable_context::StableContextManifest;
+use codex_otel::ModelToolResultTelemetry;
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
 use codex_utils_output_truncation::approx_token_count;
+use codex_utils_output_truncation::model_token_count;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::value::RawValue;
@@ -534,6 +538,8 @@ pub(crate) struct PromptContextBreakdown {
     /// Length of the leading run of input items whose contributions are all
     /// fixed-prefix categories: the provider-cacheable fixed prefix.
     pub(crate) fixed_prefix_item_count: usize,
+    /// One record per inclusion, without deduplication across items or requests.
+    pub(crate) tool_result_attribution: Vec<ModelToolResultTelemetry>,
     fixed_contribution_count: usize,
     /// Every recorded contribution, fixed or not. Compared with the fixed
     /// count, it shows whether one item contributed only fixed categories.
@@ -546,14 +552,35 @@ pub(crate) struct PromptContextBreakdown {
 }
 
 impl PromptContextBreakdown {
+    fn tool_origins(items: &[ResponseItem]) -> HashMap<&str, Option<(&str, Option<&str>)>> {
+        let mut origins = HashMap::new();
+        for item in items {
+            let (call_id, name, namespace) = match item {
+                ResponseItem::FunctionCall { call_id, name, namespace, .. }
+                | ResponseItem::CustomToolCall { call_id, name, namespace, .. } =>
+                    (call_id.as_str(), name.as_str(), namespace.as_deref()),
+                _ => continue,
+            };
+            let origin = Some((name, namespace));
+            origins.entry(call_id).and_modify(|previous| {
+                if *previous != origin {
+                    *previous = None;
+                }
+            }).or_insert(origin);
+        }
+        origins
+    }
+
     pub(crate) fn from_response_items(
         items: &[ResponseItem],
         sidecar: &PromptProvenanceSidecar,
     ) -> serde_json::Result<Self> {
         let mut breakdown = Self::default();
+        let origins = Self::tool_origins(items);
         let aligned_offset = items.len().saturating_sub(sidecar.aligned_items.len());
         for (index, item) in items.iter().enumerate() {
             let serialized_item = serde_json::to_vec(item)?;
+            breakdown.record_tool_result(index, item, &serialized_item, &origins);
             let aligned = index
                 .checked_sub(aligned_offset)
                 .and_then(|index| sidecar.aligned_item(index));
@@ -590,8 +617,10 @@ impl PromptContextBreakdown {
         }
         let aligned_offset = items.len().saturating_sub(sidecar.aligned_items.len());
         let mut breakdown = Self::default();
+        let origins = Self::tool_origins(items);
         for (index, (item, raw_item)) in items.iter().zip(serialized_items.iter()).enumerate() {
             let serialized_item = raw_item.get().as_bytes();
+            breakdown.record_tool_result(index, item, serialized_item, &origins);
             let before = breakdown.contribution_counts();
             if embedded_base_index == Some(index) {
                 breakdown.record_serialized(PromptContextCategory::BaseSystem, serialized_item);
@@ -609,6 +638,43 @@ impl PromptContextBreakdown {
             sequence_envelope_bytes(items.len()),
         );
         Ok(breakdown)
+    }
+
+    fn record_tool_result(
+        &mut self,
+        input_index: usize,
+        item: &ResponseItem,
+        serialized: &[u8],
+        origins: &HashMap<&str, Option<(&str, Option<&str>)>>,
+    ) {
+        let (kind, call_id, output) = match item {
+            ResponseItem::FunctionCallOutput { call_id, output, .. } =>
+                ("function_call_output", call_id, output),
+            ResponseItem::CustomToolCallOutput { call_id, output, .. } =>
+                ("custom_tool_call_output", call_id, output),
+            _ => return,
+        };
+        let text_only = match &output.body {
+            FunctionCallOutputBody::Text(_) => true,
+            FunctionCallOutputBody::ContentItems(items) => items.iter().all(|item|
+                matches!(item, FunctionCallOutputContentItem::InputText { .. })),
+        };
+        // Hashes identify the actual projected representation, not its original
+        // artifact. Retries and later history inclusions each retain a record.
+        let representation_hash = Sha256::digest(serialized).into();
+        self.tool_result_attribution.push(ModelToolResultTelemetry {
+            input_index,
+            kind,
+            tool_name: origins.get(call_id.as_str()).copied().flatten()
+                .map(|(name, _)| name.to_owned()),
+            tool_namespace: origins.get(call_id.as_str()).copied().flatten()
+                .and_then(|(_, namespace)| namespace.map(str::to_owned)),
+            call_id_sha256: hex_hash(&Sha256::digest(call_id.as_bytes()).into()),
+            representation_sha256: hex_hash(&representation_hash),
+            serialized_bytes: u64::try_from(serialized.len()).unwrap_or(u64::MAX),
+            estimated_tokens: content_aware_serialized_tokens(serialized),
+            tokenizer_estimate: text_only.then(|| cached_tool_result_tokens(serialized, representation_hash)),
+        });
     }
 
     fn contribution_counts(&self) -> (usize, usize) {
@@ -999,6 +1065,42 @@ fn category_for_stable_kind(kind: StableContextKind) -> PromptContextCategory {
         | StableContextKind::Personality
         | StableContextKind::DeveloperInstructions => PromptContextCategory::OtherInjected,
     }
+}
+
+/// Repeated history inclusions still emit distinct attribution records, but an
+/// unchanged final representation need not run BPE again. Custody is bounded;
+/// exact bytes, not the hash alone, decide reuse. Never hold the cache lock
+/// while tokenizing or acquire another owner lock under it.
+fn cached_tool_result_tokens(serialized: &[u8], hash: [u8; 32]) -> u64 {
+    const MAX_BYTES: usize = 1024 * 1024;
+    const MAX_ENTRY_BYTES: usize = 64 * 1024;
+    const MAX_ENTRIES: usize = 128;
+    type Entry = ([u8; 32], Box<[u8]>, u64);
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::VecDeque<Entry>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if serialized.len() <= MAX_ENTRY_BYTES {
+        let entries = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, _, tokens)) = entries.iter()
+            .find(|(key, bytes, _)| *key == hash && bytes.as_ref() == serialized)
+        {
+            return *tokens;
+        }
+    }
+    let tokens = u64::try_from(model_token_count(std::str::from_utf8(serialized).unwrap_or_default()))
+        .unwrap_or(u64::MAX);
+    if serialized.len() <= MAX_ENTRY_BYTES {
+        let mut entries = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Another request may have finished the same count while this one ran.
+        if !entries.iter().any(|(key, bytes, _)| *key == hash && bytes.as_ref() == serialized) {
+            let mut bytes: usize = entries.iter().map(|(_, bytes, _)| bytes.len()).sum();
+            while entries.len() >= MAX_ENTRIES || bytes + serialized.len() > MAX_BYTES {
+                if let Some((_, removed, _)) = entries.pop_front() { bytes -= removed.len(); }
+            }
+            entries.push_back((hash, serialized.into(), tokens));
+        }
+    }
+    tokens
 }
 
 fn hex_hash(hash: &[u8; 32]) -> String {

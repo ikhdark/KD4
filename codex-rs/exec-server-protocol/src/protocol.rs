@@ -30,6 +30,8 @@ pub struct OwnedProcessParams<T> {
 }
 pub const EXEC_READ_METHOD: &str = "process/read";
 pub const EXEC_WRITE_METHOD: &str = "process/write";
+/// Separate method so older peers reject close rather than silently ignore it.
+pub const EXEC_CLOSE_STDIN_METHOD: &str = "process/closeStdin";
 pub const EXEC_SIGNAL_METHOD: &str = "process/signal";
 pub const EXEC_TERMINATE_METHOD: &str = "process/terminate";
 pub const EXEC_OUTPUT_DELTA_METHOD: &str = "process/output";
@@ -40,8 +42,30 @@ pub const EXEC_OUTPUT_GAP_METHOD: &str = "process/outputGap";
 /// Process observation failed; this is not evidence of an OS exit.
 pub const EXEC_FAILED_METHOD: &str = "process/failed";
 pub const ENVIRONMENT_INFO_METHOD: &str = "environment/info";
+pub const CAPABILITY_MANIFEST_METHOD: &str = "environment/capabilities";
+pub const CAPABILITY_QUERY_METHOD: &str = "environment/capabilities/query";
+pub const CAPABILITY_MANIFEST_VERSION: u32 = 1;
+/// The request was rejected before its operation ran; refresh discovery, not the operation.
+pub const STALE_CAPABILITY_MANIFEST_ERROR_CODE: i64 = -32012;
 /// Read-only lookup on the selected executor; old peers must refuse, not use host PATH.
 pub const LOOKUP_EXECUTABLE_METHOD: &str = "environment/lookupExecutable";
+pub const LOOKUP_EXECUTABLES_METHOD: &str = "environment/lookupExecutables";
+pub const FS_LOOKUP_BATCH_METHOD: &str = "fs/lookupBatch";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LookupExecutablesParams {
+    pub names: Vec<String>,
+    pub cwd: PathUri,
+    pub sandbox: Option<FileSystemSandboxContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FsLookupBatchParams {
+    pub requests: Vec<codex_file_system::FileSystemLookup>,
+    pub sandbox: Option<FileSystemSandboxContext>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -110,6 +134,121 @@ pub struct InitializeParams {
 #[serde(rename_all = "camelCase")]
 pub struct InitializeResponse {
     pub session_id: String,
+    /// Absent on legacy peers. Support metadata never grants permission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_manifest: Option<CapabilityManifest>,
+}
+
+/// A backend-scoped support snapshot, not an authorization or an execution receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilityManifest {
+    pub schema_version: u32,
+    pub backend: String,
+    /// Process incarnation, shared across connections to the same backend.
+    pub backend_id: String,
+    pub backend_version: String,
+    /// Opaque fingerprint of the backend's effective runtime configuration.
+    pub configuration_revision: String,
+    /// Binds the version, backend identity, configuration and supported methods.
+    pub revision: String,
+    /// Registered request methods only; per-call constraints still apply.
+    pub methods: Vec<String>,
+    /// False for a partial inventory: omitted operations are unknown, not unsupported.
+    #[serde(default = "complete_method_inventory")]
+    pub methods_complete: bool,
+}
+
+fn complete_method_inventory() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilitySupport {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+impl CapabilityManifest {
+    /// Method-level support only. Execution must still validate parameters and permissions.
+    pub fn method_support(&self, method: &str) -> CapabilitySupport {
+        if self.schema_version != CAPABILITY_MANIFEST_VERSION {
+            CapabilitySupport::Unknown
+        } else if self.methods.iter().any(|registered| registered == method) {
+            CapabilitySupport::Supported
+        } else if self.methods_complete {
+            CapabilitySupport::Unsupported
+        } else {
+            CapabilitySupport::Unknown
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CapabilityQuery {
+    /// Empty enumerates known methods. Names are exact, case-sensitive operation IDs.
+    #[serde(default)]
+    pub methods: Vec<String>,
+}
+
+impl CapabilityQuery {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.methods.len() > 64
+            || self.methods.iter().any(|method| {
+                method.is_empty() || method.len() > 128 || method.chars().any(char::is_control)
+            })
+        {
+            return Err(
+                "capability queries accept at most 64 operation IDs, each 1-128 bytes without control characters",
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Advisory, point-in-time evidence. Missing legacy metadata is explicitly unknown.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilityReport {
+    pub schema_version: u32,
+    pub manifest: Option<CapabilityManifest>,
+    pub inventory_complete: bool,
+    pub operations: std::collections::BTreeMap<String, CapabilitySupport>,
+}
+
+impl CapabilityReport {
+    pub fn new(manifest: Option<CapabilityManifest>, query: CapabilityQuery) -> Self {
+        let methods = if query.methods.is_empty() {
+            manifest
+                .as_ref()
+                .map(|manifest| manifest.methods.clone())
+                .unwrap_or_default()
+        } else {
+            query.methods
+        };
+        let operations = methods
+            .into_iter()
+            .map(|method| {
+                let support = manifest
+                    .as_ref()
+                    .map_or(CapabilitySupport::Unknown, |manifest| {
+                        manifest.method_support(&method)
+                    });
+                (method, support)
+            })
+            .collect();
+        Self {
+            schema_version: CAPABILITY_MANIFEST_VERSION,
+            inventory_complete: manifest.as_ref().is_some_and(|manifest| {
+                manifest.schema_version == CAPABILITY_MANIFEST_VERSION && manifest.methods_complete
+            }),
+            manifest,
+            operations,
+        }
+    }
 }
 
 /// Information about an execution/filesystem environment.
@@ -130,12 +269,17 @@ pub struct EnvironmentInfo {
 }
 
 impl EnvironmentInfo {
-    /// Returns information about the current local exec-server process.
-    pub fn local() -> Self {
+    /// Shared process incarnation without probing shell or filesystem availability.
+    pub fn local_resource_id() -> String {
         static RESOURCE_ID: std::sync::LazyLock<String> =
             std::sync::LazyLock::new(|| codex_protocol::ThreadId::new().to_string());
+        RESOURCE_ID.clone()
+    }
+
+    /// Returns information about the current local exec-server process.
+    pub fn local() -> Self {
         Self {
-            resource_id: Some(RESOURCE_ID.clone()),
+            resource_id: Some(Self::local_resource_id()),
             operating_system: Some("windows".to_string()),
             shell: codex_shell_command::shell_detect::default_user_shell().into(),
             cwd: std::env::current_dir()
@@ -284,6 +428,13 @@ pub struct WriteResponse {
     pub status: WriteStatus,
 }
 
+/// Idempotently close pipe input after accepted writes; never synthesize terminal EOF.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloseStdinParams {
+    pub process_id: ProcessId,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ProcessSignal {
@@ -378,6 +529,9 @@ pub const FS_CHECKSUM_FILE_CANCEL_METHOD: &str = "fs/checksumFileCancel";
 pub struct FsChecksumFileParams {
     pub path: PathUri,
     pub sandbox: Option<FileSystemSandboxContext>,
+    /// Opt-in, constant-space encoding and newline diagnostics in the same pass.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_text_diagnostics: bool,
     /// Client-chosen id for `fs/checksumFileCancel`; one still active on this
     /// connection is refused. Absent: the pass cannot be cancelled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -469,6 +623,7 @@ pub struct FsMutateFileIfMatchesResponse {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum FsFileMutationOutcome {
     Committed,
+    Unchanged,
     Conflict,
     #[serde(rename_all = "camelCase")]
     RecoveryRequired {
@@ -481,6 +636,7 @@ impl From<codex_file_system::FileMutationOutcome> for FsFileMutationOutcome {
     fn from(outcome: codex_file_system::FileMutationOutcome) -> Self {
         match outcome {
             codex_file_system::FileMutationOutcome::Committed => Self::Committed,
+            codex_file_system::FileMutationOutcome::Unchanged => Self::Unchanged,
             codex_file_system::FileMutationOutcome::Conflict => Self::Conflict,
             codex_file_system::FileMutationOutcome::RecoveryRequired {
                 retained_path,
@@ -497,6 +653,7 @@ impl From<FsFileMutationOutcome> for codex_file_system::FileMutationOutcome {
     fn from(outcome: FsFileMutationOutcome) -> Self {
         match outcome {
             FsFileMutationOutcome::Committed => Self::Committed,
+            FsFileMutationOutcome::Unchanged => Self::Unchanged,
             FsFileMutationOutcome::Conflict => Self::Conflict,
             FsFileMutationOutcome::RecoveryRequired {
                 retained_path,

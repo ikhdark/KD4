@@ -38,9 +38,11 @@ pub(crate) enum UnifiedExecError {
     #[error("failed to write to stdin")]
     WriteToStdin,
     #[error(
-        "stdin is closed for this session. Commands requiring interactive input must be started with tty=true; rerunning this command may repeat its effects."
+        "stdin is closed for this session; input was not delivered. Start commands needing input with pipe_stdin=true or tty=true. A closed pipe cannot be reopened; rerunning may repeat effects."
     )]
     StdinClosed,
+    #[error("stdin close was not confirmed: {message}; closing again is safe, but do not resend input")]
+    CloseStdin { message: String },
     #[error("missing command line for unified exec request")]
     MissingCommandLine,
     #[error("Command denied by sandbox: {message}")]

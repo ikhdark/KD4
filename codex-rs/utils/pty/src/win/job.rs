@@ -132,8 +132,8 @@ impl JobObject {
     ///
     /// This disables both explicit job termination and kill-on-close for this
     /// object. Calls race safely with [`Self::terminate`]: whichever operation
-    /// acquires the state lock first determines whether the process tree is
-    /// preserved or terminated.
+    /// acquires the state lock first determines normal-exit preservation. An
+    /// explicit later cancellation still owns and terminates the retained job.
     pub fn preserve_descendants(&self) -> io::Result<()> {
         let mut state = self
             .state
@@ -152,14 +152,45 @@ impl JobObject {
         Ok(())
     }
 
-    /// Terminates every process currently assigned to the job.
+    pub fn termination_was_requested(&self) -> bool {
+        matches!(*self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            JobState::TerminationRequested | JobState::Terminated)
+    }
+
+    pub(crate) fn active_process_count(&self) -> io::Result<u32> {
+        // SAFETY: the owned job and initialized accounting storage remain live
+        // for the exact structure size supplied to Windows.
+        let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        let queried = unsafe {
+            QueryInformationJobObject(
+                self.handle.as_raw_handle().cast(),
+                JobObjectBasicAccountingInformation,
+                std::ptr::addr_of_mut!(accounting).cast(),
+                std::mem::size_of_val(&accounting) as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if queried == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(accounting.ActiveProcesses)
+        }
+    }
+
+    /// Terminates the tree and confirms that the job has no active processes.
+    /// A failed query or deadline is uncertainty, not a termination receipt;
+    /// retain this owner for reconciliation.
     pub fn terminate(&self) -> io::Result<()> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| io::Error::other("job state lock poisoned"))?;
         match *state {
-            JobState::PreserveDescendants | JobState::Terminated => return Ok(()),
+            JobState::Terminated => return Ok(()),
+            JobState::PreserveDescendants => {
+                Self::set_limit_flags(&self.handle, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)?;
+                *state = JobState::TerminationRequested;
+            }
             JobState::Active => *state = JobState::TerminationRequested,
             JobState::TerminationRequested => {}
         }
@@ -171,11 +202,42 @@ impl JobObject {
             TerminateJobObject(self.handle.as_raw_handle().cast(), /*uExitCode*/ 1)
         };
         if terminated == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            *state = JobState::Terminated;
-            Ok(())
+            return Err(io::Error::last_os_error());
         }
+        // The root waiter may concurrently preserve descendants. Let it see
+        // TerminationRequested without blocking an async worker on this wait.
+        drop(state);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let active = self.active_process_count()?;
+            if active == 0 {
+                *self.state.lock().map_err(|_| io::Error::other("job state lock poisoned"))? = JobState::Terminated;
+                self.custody_diagnostic("shutdown_confirmed", 0);
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, format!(
+                    "shutdown uncertain: owned job still has {active} active processes"
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
+// A reaped root needs only its job for later tree cancellation. In particular,
+// this does not retain ManagedRootProcess's execution-admission lease.
+impl crate::process::ChildTerminator for std::sync::Arc<JobObject> {
+    fn signal(&mut self, signal: crate::process::ProcessSignal) -> io::Result<()> {
+        Err(crate::process::unsupported_signal(signal))
+    }
+
+    fn kill(&mut self) -> io::Result<()> {
+        self.terminate()
+    }
+
+    fn tree_is_empty(&self) -> io::Result<bool> {
+        self.active_process_count().map(|count| count == 0)
     }
 }
 

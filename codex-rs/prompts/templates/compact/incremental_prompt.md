@@ -45,3 +45,8 @@ rather than filling their budgets. Post-hoc truncation remains a safety net.
 Separate independent obligations with blank lines. Keep each obligation's
 conditions, prohibitions, and evidence in the same paragraph; never separate a
 qualification from the action it limits.
+
+Reuse supplied update_plan requirement IDs and their owner, not another ledger.
+Keep `[ID] <original requirement text>` and its qualifications until that owner
+explicitly records completion or accepted user-authorized supersession; summary
+rewrites and accounting claims cannot perform those transitions.

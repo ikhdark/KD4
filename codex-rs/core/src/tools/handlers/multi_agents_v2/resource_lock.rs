@@ -55,7 +55,7 @@ impl ToolExecutor<ToolInvocation> for Handler {
                 required.push("token".into());
             }
             if operation == "acquire" {
-                properties.insert("wait".into(), JsonSchema::boolean(Some("Default false (nonblocking). If true, register with the resource owner and wait for a targeted release wakeup, then retry atomic acquisition. A wakeup does not grant ownership. Until it returns, this agent's acquisitions of other resources return order_violation; same-resource calls join it. Cancellation or the enclosing call deadline removes the waiter and returns cancelled/timed_out without ownership; never wait while holding a resource the owner needs.".into())));
+                properties.insert("wait".into(), JsonSchema::boolean(Some("Default false (nonblocking). If true, register with the resource owner and wait for a targeted release wakeup, then retry atomic acquisition. A wakeup does not grant ownership. Until it returns, this agent's acquisitions of other resources return order_violation; same-resource calls join it. Cancellation or the enclosing call deadline removes the waiter and returns cancelled/timed_out without ownership. With no enclosing deadline, the wait expires after 30 seconds; never wait while holding a resource the owner needs.".into())));
             }
             variants.push(JsonSchema::object(
                 properties,
@@ -66,7 +66,7 @@ impl ToolExecutor<ToolInvocation> for Handler {
         ToolSpec::Function(ResponsesApiTool {
             name: "agent_lock".into(),
             description: format!(
-                "{}\n\n{}",
+                "{}\n\n{}\nWaited acquisitions return wait.admission_wait_ms and wait.last_observed_holder (resource, owner, acquisition token). This is a historical owner-verified snapshot, not current ownership, execution time or queue rank; terminal status and lock remain authoritative.",
                 "Cooperative named locks within this live root-agent tree, not filesystem isolation: ordinary write tools remain unrestricted by these locks. Acquire is atomic and defaults to nonblocking (busy queues nothing). Set wait:true to register for targeted release wakeups and retry acquisition without polling; wakeups are not ownership grants. Acquire multiple resources in strictly increasing case-sensitive UTF-8 order, or release held locks first. Same-runtime reacquire is idempotent, not counted. Release requires both the runtime-verified acquiring identity and current token. Shutdown fences acquisition; confirmed drained termination automatically cleans that runtime's locks and wakes waiters. Recover is root-only, token-fenced and never forces shutdown: active holders are refused, uncertain/stalled shutdown returns recovery_blocked and retains ownership. A completed/error/interrupted turn alone is not termination. List recovers lock/token state after a lost response. Process-local only; no cross-process or restart isolation.",
                 include_str!("../../../../templates/agents/resource_contention.md").trim()
             ),

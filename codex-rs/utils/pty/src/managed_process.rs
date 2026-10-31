@@ -80,7 +80,7 @@ fn admission_reclaimers() -> &'static Mutex<Vec<(u64, AdmissionReclaimer)>> {
 pub struct ManagedRootProcess {
     id: u64,
     #[cfg(windows)]
-    job: crate::win::JobObject,
+    job: Arc<crate::win::JobObject>,
 }
 
 #[derive(Debug)]
@@ -157,7 +157,7 @@ impl ManagedRootProcess {
         Ok(Self {
             id: NEXT_MANAGED_ROOT_ID.fetch_add(1, Ordering::Relaxed),
             #[cfg(windows)]
-            job,
+            job: Arc::new(job),
         })
     }
 
@@ -302,6 +302,16 @@ impl ManagedRootProcess {
         self.job.terminate()
     }
 
+    #[cfg(windows)]
+    pub(crate) fn tree_is_empty(&self) -> io::Result<bool> {
+        self.job.active_process_count().map(|count| count == 0)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn replay_job(&self) -> Arc<crate::JobObject> {
+        Arc::clone(&self.job)
+    }
+
     /// Terminate and reap a child whose containment setup failed.
     ///
     /// The caller waits at most five seconds. The cleanup task continues owning
@@ -390,11 +400,15 @@ impl ManagedRootProcess {
                         }
                     }
                 }
-                drop(self);
-                match kill_error {
-                    Some(error) => Err(error),
-                    None => Ok(()),
+                // Reaping the root cannot settle a failed tree termination.
+                // Reuse the runtime-independent reconciler: an indefinitely
+                // failing job must not pin Tokio's blocking pool at shutdown.
+                if let Some(error) = job_error {
+                    crate::process::retain_terminator(Box::new(self));
+                    return Err(error);
                 }
+                drop(self);
+                Ok(())
             })
         });
         async move {
@@ -413,6 +427,21 @@ impl ManagedRootProcess {
     #[cfg(windows)]
     pub fn preserve_descendants(&self) -> io::Result<()> {
         self.job.preserve_descendants()
+    }
+}
+
+#[cfg(windows)]
+impl crate::process::ChildTerminator for ManagedRootProcess {
+    fn signal(&mut self, signal: crate::process::ProcessSignal) -> io::Result<()> {
+        Err(crate::process::unsupported_signal(signal))
+    }
+
+    fn kill(&mut self) -> io::Result<()> {
+        self.terminate()
+    }
+
+    fn tree_is_empty(&self) -> io::Result<bool> {
+        ManagedRootProcess::tree_is_empty(self)
     }
 }
 

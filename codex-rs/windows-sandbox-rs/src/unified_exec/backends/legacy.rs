@@ -87,6 +87,7 @@ fn spawn_legacy_process(
     stdout_tx: mpsc::Sender<Vec<u8>>,
     stderr_tx: Option<mpsc::Sender<Vec<u8>>>,
     writer_rx: mpsc::Receiver<codex_utils_pty::StdinPayload>,
+    stdin_close_tx: tokio::sync::watch::Sender<Option<codex_utils_pty::StdinCloseResult>>,
     logs_base_dir: Option<&Path>,
 ) -> Result<LegacyProcessHandles> {
     let (pi, job, output_join, writer_handle, hpc, conpty_owner, desktop) = if tty {
@@ -110,6 +111,7 @@ fn spawn_legacy_process(
             Some(conpty.take_input_write()),
             writer_rx,
             /*normalize_newlines*/ true,
+            stdin_close_tx,
         );
         (pi, job, output_join, writer_handle, hpc, Some(conpty), None)
     } else {
@@ -147,6 +149,7 @@ fn spawn_legacy_process(
             pipe_handles.stdin_write,
             writer_rx,
             /*normalize_newlines*/ false,
+            stdin_close_tx,
         );
         (
             pipe_handles.process,
@@ -183,11 +186,13 @@ fn spawn_input_writer(
     input_write: Option<HANDLE>,
     mut writer_rx: mpsc::Receiver<codex_utils_pty::StdinPayload>,
     normalize_newlines: bool,
+    stdin_close_tx: tokio::sync::watch::Sender<Option<codex_utils_pty::StdinCloseResult>>,
 ) -> tokio::task::JoinHandle<()> {
     let input_write = input_write.map(|handle| handle as usize);
     let (finished, completion) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
         let mut windows_input = WindowsTtyInputNormalizer::default();
+        let mut result = Ok(());
         while let Some(bytes) = writer_rx.blocking_recv() {
             let Some(handle_addr) = input_write else {
                 continue;
@@ -195,7 +200,8 @@ fn spawn_input_writer(
             let handle = handle_addr as HANDLE;
             let normalized = normalize_newlines.then(|| windows_input.normalize(&bytes));
             let input = normalized.as_deref().unwrap_or(&bytes);
-            if write_all_handle(handle, input).is_err() {
+            if let Err(error) = write_all_handle(handle, input) {
+                result = Err((std::io::ErrorKind::BrokenPipe, error.to_string()));
                 break;
             }
         }
@@ -206,6 +212,7 @@ fn spawn_input_writer(
                 CloseHandle(handle as HANDLE);
             }
         }
+        stdin_close_tx.send_replace(Some(result));
         let _ = finished.send(());
     });
     tokio::spawn(async move { let _ = completion.await; })
@@ -557,6 +564,7 @@ fn spawn_windows_sandbox_session_legacy_blocking(
     }
 
     let (writer_tx, writer_rx) = codex_utils_pty::stdin_channel(128);
+    let (stdin_close_tx, stdin_close_receipt) = tokio::sync::watch::channel(None);
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(256);
     let stderr_rx = if tty {
         None
@@ -585,6 +593,7 @@ fn spawn_windows_sandbox_session_legacy_blocking(
         stdout_tx,
         stderr_rx.as_ref().map(|(tx, _rx)| tx.clone()),
         writer_rx,
+        stdin_close_tx,
         common.logs_base_dir.as_deref(),
     )?;
     // Successful native spawn transfers this same handle to its waiter below.
@@ -706,6 +715,7 @@ fn spawn_windows_sandbox_session_legacy_blocking(
         exit_rx,
         terminator,
         writer_handle: Some(writer_handle),
+        stdin_close_receipt: Some(stdin_close_receipt),
         resizer: hpc_handle.map(|hpc| {
             Box::new(move |size| resize_conpty_handle(&hpc, size))
                 as Box<dyn FnMut(TerminalSize) -> Result<()> + Send>

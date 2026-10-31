@@ -22,7 +22,9 @@ pub fn parse_mcp_tool(tool: &rmcp::model::Tool) -> Result<ToolDefinition, serde_
     }
 
     let lossy = parse_owned_tool_input_schema(serialized_input_schema.clone()).is_err();
-    let original_schema = lossy.then(|| serialized_input_schema.to_string());
+    let original_schema = lossy.then(|| {
+        crate::json_schema::canonical_schema(serialized_input_schema.clone()).to_string()
+    });
     let input_schema = parse_mcp_input_schema(serialized_input_schema)?;
     let mut description: String = tool.description.clone().map(Into::into).unwrap_or_default();
     if let Some(original_schema) = original_schema {

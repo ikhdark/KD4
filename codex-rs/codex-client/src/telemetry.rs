@@ -40,8 +40,28 @@ pub struct TransportPhaseObservation {
     pub unavailable_reason: Option<&'static str>,
 }
 
+/// A snapshot from the transport retry-loop owner, not a physical dispatch count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryBudget {
+    pub max_attempts: u128,
+    pub attempts_started: u128,
+    pub attempts_remaining: u128,
+}
+
 /// API-specific request telemetry.
 pub trait RequestTelemetry: Send + Sync {
+    /// The transport retry-loop owner's budget, including its initial attempt.
+    /// No elapsed deadline is configured here; an outer deadline is unknown.
+    /// Started invocations are not proof of physical dispatch or agent attempts.
+    fn on_retry_budget(&self, _budget: RetryBudget) {}
+
+    /// A retry policy decision, not proof another request was sent. Observers
+    /// must not persist raw errors: bodies, headers and URLs may contain secrets.
+    fn on_retry_scheduled(&self, _attempt: u64, _error: &TransportError, _delay: Duration) {}
+
+    /// Actual wait, including an interrupted wait. `completed` does not imply dispatch.
+    fn on_retry_wait_finished(&self, _attempt: u64, _duration: Duration, _completed: bool) {}
+
     /// Authentication/preparation finished; the client is handing the request
     /// to its transport. This is not proof of network or provider receipt.
     fn on_request_dispatched(&self) {}

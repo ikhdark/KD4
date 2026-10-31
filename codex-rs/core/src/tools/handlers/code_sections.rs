@@ -773,6 +773,24 @@ pub(crate) fn sections(items: &[CodeItem]) -> Vec<ToolProjectionSection> {
         .iter()
         .filter(|item| item.kind != "use")
         .collect::<Vec<_>>();
+    let mut outline = outline_sections(&items);
+    if let Some(value) = outline.first_mut().and_then(|section| section.value.as_mut())
+        && !import_ranges.is_empty()
+    {
+        value["import_ranges"] = import_ranges.iter().take(16)
+            .map(|(start_line, end_line, count)| json!({"start_line": start_line, "end_line": end_line, "count": count}))
+            .collect();
+        if import_ranges.len() > 16 {
+            value["omitted_import_ranges"] = (import_ranges.len() - 16).into();
+        }
+    }
+    sections.extend(outline);
+    sections
+}
+
+/// Shared bounded directory pages; exact source ranges remain with their owner.
+pub(super) fn outline_sections(items: &[impl Serialize]) -> Vec<ToolProjectionSection> {
+    let mut sections = Vec::new();
     // Fit ordinary outlines in one response instead of forcing a round trip
     // per handful of items. Larger outlines retain bounded directory pages.
     let mut start = 0;
@@ -790,14 +808,7 @@ pub(crate) fn sections(items: &[CodeItem]) -> Vec<ToolProjectionSection> {
         let next = (end < items.len()).then(|| format!("outline:{end}"));
         let mut value =
             json!({"items": &items[start..end], "total_items": items.len(), "next": next});
-        if start == 0 && !import_ranges.is_empty() {
-            value["import_ranges"] = import_ranges.iter().take(16)
-                .map(|(start_line, end_line, count)| json!({"start_line": start_line, "end_line": end_line, "count": count}))
-                .collect();
-            if import_ranges.len() > 16 {
-                value["omitted_import_ranges"] = (import_ranges.len() - 16).into();
-            }
-        }
+        value["parse_complete"] = true.into();
         sections.push(ToolProjectionSection {
             id: if start == 0 {
                 "outline".into()

@@ -62,6 +62,14 @@ impl ProcessHandler {
             .await
     }
 
+    pub(crate) async fn close_stdin_owned(
+        &self,
+        params: crate::protocol::OwnedProcessParams<crate::protocol::CloseStdinParams>,
+    ) -> Result<WriteResponse, JSONRPCErrorError> {
+        let identity = self.owned_identity(&params.params.process_id, params.incarnation.as_deref()).await?;
+        self.process.close_stdin_bound(params.params, identity.as_ref()).await
+    }
+
     pub(crate) async fn signal_owned(
         &self,
         params: crate::protocol::OwnedProcessParams<SignalParams>,

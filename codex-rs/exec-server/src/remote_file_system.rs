@@ -80,6 +80,19 @@ pub(crate) fn validate_file_digest(
     Ok(digest)
 }
 
+pub(crate) fn require_text_diagnostics(
+    digest: Option<codex_file_system::FileDigest>,
+    requested: bool,
+) -> io::Result<Option<codex_file_system::FileDigest>> {
+    if requested && digest.as_ref().is_some_and(|digest| digest.text_diagnostics.is_none()) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "executor did not provide requested text diagnostics",
+        ));
+    }
+    Ok(digest)
+}
+
 #[path = "remote_file_stream.rs"]
 mod file_stream;
 
@@ -462,6 +475,7 @@ impl ExecutorFileSystem for RemoteFileSystem {
     fn checksum_file<'a>(
         &'a self,
         path: &'a PathUri,
+        include_text_diagnostics: bool,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, Option<codex_file_system::FileDigest>> {
         Box::pin(async move {
@@ -480,12 +494,14 @@ impl ExecutorFileSystem for RemoteFileSystem {
                     &crate::protocol::FsChecksumFileParams {
                         path: path.clone(),
                         sandbox: remote_sandbox_context(sandbox),
+                        include_text_diagnostics,
                         cancel_id: Some(cancel_id),
                     },
                 )
                 .await;
             cancel_on_drop.0 = None;
-            validate_file_digest(response.map_err(map_remote_error)?.digest)
+            let digest = validate_file_digest(response.map_err(map_remote_error)?.digest)?;
+            require_text_diagnostics(digest, include_text_diagnostics)
         })
     }
 
@@ -521,6 +537,24 @@ impl ExecutorFileSystem for RemoteFileSystem {
                 .await
                 .map_err(map_remote_error)?;
             Ok(response.directory_case_sensitive)
+        })
+    }
+
+    fn lookup_batch<'a>(
+        &'a self,
+        requests: &'a [codex_file_system::FileSystemLookup],
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Vec<codex_file_system::FileSystemLookupResult>> {
+        Box::pin(async move {
+            codex_file_system::validate_lookup_batch(requests)?;
+            let client = self.client.get().await.map_err(map_remote_error)?;
+            let results = client.fs_lookup_batch(crate::protocol::FsLookupBatchParams {
+                requests: requests.to_vec(), sandbox: remote_sandbox_context(sandbox),
+            }).await.map_err(map_remote_error)?;
+            if results.len() != requests.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "lookup batch result count mismatch"));
+            }
+            Ok(results)
         })
     }
 

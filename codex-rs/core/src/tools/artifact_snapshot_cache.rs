@@ -95,7 +95,17 @@ impl SnapshotCache {
         if let Some(entry) = cached {
             // No payload read/hash is needed: the actual objects and namespace
             // cannot be changed or expired while this enforced lease is held.
-            return Ok(Arc::clone(&entry.snapshot));
+            // A lease preserves bytes, not current read authority: Windows can
+            // revoke an ACL while previously granted handles remain usable.
+            // Reopen every content-bearing member under current access checks.
+            if protected_file(path).is_some()
+                && protected_file(&logical_metadata_path(path)).is_some()
+                && entry.snapshot.metadata.segments.iter().filter(|segment| segment.index != 0)
+                    .all(|segment| protected_file(&logical_segment_path(path, segment.index)).is_some())
+            {
+                return Ok(Arc::clone(&entry.snapshot));
+            }
+            return loader(None);
         }
         // Acquire exclusion BEFORE authentication. Acquiring it afterward could
         // bless a same-size replacement using bytes read before the lease.

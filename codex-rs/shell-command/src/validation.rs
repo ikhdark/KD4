@@ -244,7 +244,9 @@ pub fn standalone_argv(script: &str) -> Option<Vec<String>> {
 /// Reuse the syntax owner's single-command proof: pipelines, redirections,
 /// expressions and compound scripts cannot authenticate a runner receipt.
 pub fn standalone_powershell_argv(script: &str) -> Option<Vec<String>> {
-    crate::command_safety::try_parse_powershell_ast_analysis("pwsh", script)?
+    crate::command_safety::try_parse_powershell_ast_analysis(
+        &crate::PowershellAnalysisScope::selected_executable(), script,
+    )?
         .direct_argv
         .map(|candidate| candidate.argv)
 }
@@ -306,7 +308,8 @@ fn combine_policy_classifications(
             return Policy::Restricted;
         }
         // Never lose a recognized prohibited command behind an opaque sibling.
-        for candidate in [Policy::Restricted, Policy::Benchmark, Policy::Tooling, Policy::TargetedCompilation, Policy::Opaque, Policy::ReadOnly] {
+        for candidate in [Policy::Restricted, Policy::Benchmark, Policy::Tooling, Policy::TargetedCompilation, Policy::Opaque, Policy::ReadOnly,
+            ] {
             if left == candidate || right == candidate {
                 return candidate;
             }
@@ -336,7 +339,7 @@ pub fn classify_powershell_script_with_runners(
         return simple;
     }
     let command = vec![
-        "pwsh".to_string(),
+        crate::PowershellAnalysisScope::selected_executable(),
         "-Command".to_string(),
         script.to_string(),
     ];
@@ -529,8 +532,7 @@ fn classify_literal_script(
                         } else {
                             classify_literal_script(part, depth + 1, runners, powershell)
                         }
-                    },
-                ));
+                    }));
                 if powershell && let ValidationClassification::Validation { exit_code_is_authoritative, .. } = &mut classification {
                     *exit_code_is_authoritative = false;
                 }
@@ -908,8 +910,10 @@ fn classification_from_operations(
     }
 }
 
-const LIBTEST_VALUE_OPTIONS: &[&str] = &["--skip", "--logfile", "--format", "--color", "--test-threads", "--shuffle-seed"];
-const CARGO_VALUE_OPTIONS: &[&str] = &["-p", "--package", "--exclude", "--test", "--bin", "--bench", "--example", "--target", "--target-dir", "--manifest-path", "--features", "-F", "--profile", "--config", "--color", "--message-format", "-j", "--jobs", "-E", "--filterset", "--skip", "--run-ignored", "--retries", "--test-threads", "--partition", "--status-level", "--final-status-level", "--success-output", "--failure-output", "--no-tests", "--binaries-metadata", "--cargo-metadata"];
+const LIBTEST_VALUE_OPTIONS: &[&str] = &["--skip", "--logfile", "--format", "--color", "--test-threads", "--shuffle-seed",
+];
+const CARGO_VALUE_OPTIONS: &[&str] = &["-p", "--package", "--exclude", "--test", "--bin", "--bench", "--example", "--target", "--target-dir", "--manifest-path", "--features", "-F", "--profile", "--config", "--color", "--message-format", "-j", "--jobs", "-E", "--filterset", "--skip", "--run-ignored", "--retries", "--test-threads", "--partition", "--status-level", "--final-status-level", "--success-output", "--failure-output", "--no-tests", "--binaries-metadata", "--cargo-metadata",
+];
 
 fn runner_flags<'a>(binary: &str, args: &'a [String]) -> Vec<&'a str> {
     let mut flags = Vec::new();
@@ -968,10 +972,12 @@ fn decode_python_invocation(args: &[String]) -> Option<PythonInvocation<'_>> {
     let mut interactive = false;
     while let Some(arg) = args.get(index) {
         let operand = if arg == "--" {
-            args.get(index + 1).map(|value| if value == "-" {
+            args.get(index + 1).map(|value| {
+                if value == "-" {
                 PythonOperand::Stdin
             } else {
                 PythonOperand::Script(index + 1)
+            }
             })
         } else if arg == "-" {
             Some(PythonOperand::Stdin)
@@ -981,13 +987,15 @@ fn decode_python_invocation(args: &[String]) -> Option<PythonInvocation<'_>> {
             None
         };
         if operand.is_some() || arg == "--" {
-            return Some(PythonInvocation { operand, interactive });
+            return Some(PythonInvocation { operand, interactive,
+            });
         }
         // Windows py selectors precede the interpreter's options. Recognizing
         // these conservatively cannot grant an opaque child compilation proof.
-        if arg.strip_prefix('-').is_some_and(|value|
+        if arg.strip_prefix('-').is_some_and(|value| {
             value.starts_with(|ch: char| ch.is_ascii_digit())
-                && value.chars().all(|ch| ch.is_ascii_digit() || matches!(ch, '.' | '-')))
+                && value.chars().all(|ch| ch.is_ascii_digit() || matches!(ch, '.' | '-'))
+        })
             || arg.strip_prefix("-V:").is_some_and(|value| !value.is_empty())
         {
             index += 1;
@@ -1015,7 +1023,8 @@ fn decode_python_invocation(args: &[String]) -> Option<PythonInvocation<'_>> {
                 if matches!(flag, 'c' | 'm') {
                     let operand = if flag == 'c' { PythonOperand::Code(value) }
                         else { PythonOperand::Module(value, &args[tail..]) };
-                    return Some(PythonInvocation { operand: Some(operand), interactive });
+                    return Some(PythonInvocation { operand: Some(operand), interactive,
+                    });
                 }
                 index = tail;
                 consumed_value = true;
@@ -1026,7 +1035,8 @@ fn decode_python_invocation(args: &[String]) -> Option<PythonInvocation<'_>> {
         }
         if !consumed_value { index += 1; }
     }
-    Some(PythonInvocation { operand: None, interactive })
+    Some(PythonInvocation { operand: None, interactive,
+    })
 }
 
 /// Public KD4 lane recipes own exactly a recipe and lane before the child argv.
@@ -1048,7 +1058,9 @@ fn execution_mode(
         }
     }
     if binary == "dotnet" {
-        let flags = option_flags(args, &["--settings", "-s", "--filter", "--logger", "-l", "--results-directory", "--test-adapter-path", "--framework", "-f", "--configuration", "--runtime", "-r", "--collect", "--diag"]);
+        let flags = option_flags(args, &["--settings", "-s", "--filter", "--logger", "-l", "--results-directory", "--test-adapter-path", "--framework", "-f", "--configuration", "--runtime", "-r", "--collect", "--diag",
+            ],
+        );
         if flags.iter().any(|flag| matches!(*flag, "-t" | "--list-tests" | "--help" | "-h" | "--version")) {
             return Mode::Listing;
         }
@@ -1078,14 +1090,18 @@ fn execution_mode(
     if binary == "pytest" || is_python_launcher(binary)
         && args.windows(2).any(|pair| pair[0] == "-m" && pair[1] == "pytest")
     {
-        let flags = option_flags(args, &["-k", "-m", "--override-ini", "-o", "--confcutdir", "--rootdir", "--basetemp", "--ignore", "--ignore-glob", "--deselect", "--import-mode", "--tb", "--capture"]);
+        let flags = option_flags(args, &["-k", "-m", "--override-ini", "-o", "--confcutdir", "--rootdir", "--basetemp", "--ignore", "--ignore-glob", "--deselect", "--import-mode", "--tb", "--capture",
+            ],
+        );
         if flags.contains(&"--setup-only") {
             // Fixture setup is side-effectful runtime work, not compilation.
             return Mode::Unknown;
         }
-        if flags.iter().any(|flag| matches!(*flag,
+        if flags.iter().any(|flag| {
+            matches!(*flag,
             "--collect-only" | "--collectonly" | "--co" | "--setup-plan"
-            | "--fixtures" | "--funcargs" | "--fixtures-per-test" | "--help" | "-h" | "--version"))
+            | "--fixtures" | "--funcargs" | "--fixtures-per-test" | "--help" | "-h" | "--version")
+        })
         {
             return Mode::Listing;
         }
@@ -1140,8 +1156,12 @@ fn execution_mode(
         return Mode::Listing;
     }
     if binary == "go" {
-        let flags = option_flags(args, &["-run", "-test.run", "-bench", "-test.bench", "-count", "-test.count", "-timeout", "-test.timeout", "-cpu", "-test.cpu", "-o", "-coverprofile", "-benchtime", "-test.benchtime"]);
-        if flags.iter().any(|flag| matches!(*flag, "-list" | "-test.list" | "-h" | "--help" | "-help" | "-test.help"))
+        let flags = option_flags(args, &["-run", "-test.run", "-bench", "-test.bench", "-count", "-test.count", "-timeout", "-test.timeout", "-cpu", "-test.cpu", "-o", "-coverprofile", "-benchtime", "-test.benchtime",
+            ],
+        );
+        if flags.iter().any(|flag| {
+            matches!(*flag, "-list" | "-test.list" | "-h" | "--help" | "-help" | "-test.help")
+        })
         {
             return Mode::Listing;
         }
@@ -1948,12 +1968,15 @@ pub fn validation_resource_cwd_is_unambiguous(program: &str, args: &[String]) ->
     fn script(body: &str, powershell: bool, depth: usize) -> bool {
         if depth > MAX_WRAPPER_DEPTH { return false; }
         let commands = if powershell {
-            let wrapper = ["pwsh".to_owned(), "-Command".to_owned(), body.to_owned()];
+            let wrapper = [
+                crate::PowershellAnalysisScope::selected_executable(), "-Command".to_owned(), body.to_owned(),
+            ];
             crate::powershell::parse_powershell_command_into_plain_commands(&wrapper)
         } else {
-            crate::bash::try_parse_shell(body).and_then(|tree|
+            crate::bash::try_parse_shell(body).and_then(|tree| {
                 crate::bash::try_parse_word_only_commands_with_operators(&tree, body)
-                    .map(|(commands, _)| commands))
+                    .map(|(commands, _)| commands)
+            })
         };
         let Some(commands) = commands else {
             return !powershell && grouped_command_body(body.trim())
@@ -1969,10 +1992,11 @@ pub fn validation_resource_cwd_is_unambiguous(program: &str, args: &[String]) ->
         if matches!(binary.as_str(), "env" | "command" | "time" | "exec" | "rustup") {
             return match decode_execution_wrapper(&binary, args) {
                 ExecutionWrapper::Child(index) => {
-                    let changes_cwd = binary == "env" && args[..index].iter().any(|arg|
-                        matches!(arg.as_str(), "-C" | "--chdir")
+                    let changes_cwd = binary == "env" && args[..index].iter().any(|arg| {
+                            matches!(arg.as_str(), "-C" | "--chdir")
                             || arg.starts_with("--chdir=")
-                            || (arg.starts_with("-C") && arg.len() > 2));
+                            || (arg.starts_with("-C") && arg.len() > 2)
+                        });
                     !changes_cwd && argv(&args[index], &args[index + 1..], depth + 1)
                 }
                 ExecutionWrapper::NonExecution => true,
@@ -2030,12 +2054,18 @@ pub fn analyze_validation_policy_script_with_runners(
     // opaque sibling. Reuse the resource owner's exact cwd boundary.
     let wrapper = ["-Command".to_owned(), script.to_owned()];
     let posix_wrapper = ["-c".to_owned(), script.to_owned()];
+    let executable = if powershell {
+        crate::PowershellAnalysisScope::selected_executable()
+    } else { "sh".to_owned()
+    };
     let runners = if validation_resource_cwd_is_unambiguous(
-        if powershell { "pwsh" } else { "sh" },
+        &executable,
         if powershell { &wrapper } else { &posix_wrapper },
     ) { runners } else { &[] };
     let policy = policy_script(script, runners, powershell, 0, &mut leaves);
-    (policy, policy_selection(leaves, if powershell { "powershell-script" } else { "script" }, &[script.to_owned()]))
+    (policy, policy_selection(leaves, if powershell { "powershell-script" } else { "script" }, &[script.to_owned()],
+        ),
+    )
 }
 
 pub fn classify_validation_policy_script_with_runners(
@@ -2054,7 +2084,8 @@ pub fn classify_validation_policy_powershell_script_with_runners(
 
 fn policy_selection(mut leaves: Vec<Vec<String>>, program: &str, args: &[String]) -> String {
     if leaves.is_empty() {
-        leaves.push(std::iter::once(program.to_owned()).chain(args.iter().cloned()).collect());
+        leaves.push(std::iter::once(program.to_owned()).chain(args.iter().cloned()).collect(),
+        );
     }
     serde_json::to_string(&leaves).unwrap_or_default()
 }
@@ -2074,7 +2105,9 @@ fn policy_script(
         if let Some(argv) = crate::powershell::standalone_powershell_inspection_argv(script) {
             vec![argv]
         } else {
-            let command = ["pwsh".to_owned(), "-Command".to_owned(), script.to_owned()];
+            let command = [
+                crate::PowershellAnalysisScope::selected_executable(), "-Command".to_owned(), script.to_owned(),
+            ];
             let Some(commands) = crate::powershell::parse_powershell_command_into_plain_commands(&command) else {
                 return Policy::Opaque;
             };
@@ -2131,7 +2164,9 @@ fn policy_argv_inner(
     let binary = normalized_program_name(program);
     if matches!(binary.as_str(), "env" | "command" | "time" | "exec" | "rustup") {
         return match decode_execution_wrapper(&binary, args) {
-            ExecutionWrapper::Child(index) => policy_argv(&args[index], &args[index + 1..], runners, depth + 1, leaves),
+            ExecutionWrapper::Child(index) => {
+                policy_argv(&args[index], &args[index + 1..], runners, depth + 1, leaves)
+            }
             ExecutionWrapper::NonExecution => Policy::ReadOnly,
             ExecutionWrapper::Opaque => Policy::Opaque,
         };
@@ -2153,7 +2188,8 @@ fn policy_argv_inner(
             if arg.eq_ignore_ascii_case("/c") || arg.eq_ignore_ascii_case("/k") {
                 return policy_cmd_script(&args[index + 1..].join(" "), runners, depth + 1, leaves);
             }
-            if !["/d", "/s", "/q", "/a", "/u", "/e:on", "/e:off", "/v:on", "/v:off"].iter().any(|flag| arg.eq_ignore_ascii_case(flag)) {
+            if !["/d", "/s", "/q", "/a", "/u", "/e:on", "/e:off", "/v:on", "/v:off",
+            ].iter().any(|flag| arg.eq_ignore_ascii_case(flag)) {
                 return Policy::Opaque;
             }
             index += 1;
@@ -2168,7 +2204,9 @@ fn policy_argv_inner(
         while let Some(arg) = args.get(index) {
             if matches!(arg.as_str(), "--package" | "-p") { index += 2; }
             else if matches!(arg.as_str(), "--call" | "-c") {
-                return args.get(index + 1).map_or(Policy::Opaque, |script| policy_script(script, runners, false, depth + 1, leaves));
+                return args.get(index + 1).map_or(Policy::Opaque, |script| {
+                    policy_script(script, runners, false, depth + 1, leaves)
+                });
             } else if arg.starts_with('-') { index += 1; }
             else {
                 let program = arg.split_once('@').filter(|(name, _)| !name.is_empty()).map_or(arg.as_str(), |(name, _)| name);
@@ -2227,7 +2265,8 @@ fn policy_argv_inner(
             "c" => "check", "t" => "test", "b" => "build", "r" => "run", other => other,
         }.to_owned();
     }
-    leaves.push(std::iter::once(binary.clone()).chain(canonical_args).collect());
+    leaves.push(std::iter::once(binary.clone()).chain(canonical_args).collect(),
+    );
     if binary == "cargo" {
         return policy_cargo(args);
     }
@@ -2235,7 +2274,8 @@ fn policy_argv_inner(
         .filter(|subcommand| matches!(*subcommand, "nextest" | "llvm-cov" | "miri"))
     {
         let tail = if args.first().is_some_and(|arg| arg == subcommand) { &args[1..] } else { args };
-        return policy_cargo(&std::iter::once(subcommand.to_owned()).chain(tail.iter().cloned()).collect::<Vec<_>>());
+        return policy_cargo(&std::iter::once(subcommand.to_owned()).chain(tail.iter().cloned()).collect::<Vec<_>>(),
+        );
     }
     if matches!(binary.as_str(), "cargo-kda" | "kda") {
         return policy_kda(args);
@@ -2255,7 +2295,9 @@ fn policy_argv_inner(
         return policy;
     }
     let help_options = if is_python_launcher(&binary) || binary == "pytest" {
-        option_flags(args, &["-m", "-W", "-X", "-k", "--override-ini", "-o", "--rootdir", "--basetemp", "--ignore", "--deselect"])
+        option_flags(args, &["-m", "-W", "-X", "-k", "--override-ini", "-o", "--rootdir", "--basetemp", "--ignore", "--deselect",
+            ],
+        )
     } else {
         runner_flags(&binary, args)
     };
@@ -2286,14 +2328,19 @@ fn policy_argv_inner(
     if is_python_launcher(&binary) { Policy::Opaque } else { Policy::Unrelated }
 }
 
-fn policy_test_or_check(classification: &ValidationClassification) -> Option<ValidationPolicyClassification> {
+fn policy_test_or_check(classification: &ValidationClassification,
+) -> Option<ValidationPolicyClassification> {
     let ValidationClassification::Validation { leaves, .. } = classification else { return None; };
-    if leaves.iter().any(|leaf| matches!(leaf.operation, ValidationOperation::Test | ValidationOperation::Fuzz)
-        && matches!(leaf.mode, ValidationExecutionMode::Execution | ValidationExecutionMode::Unknown))
+    if leaves.iter().any(|leaf| {
+        matches!(leaf.operation, ValidationOperation::Test | ValidationOperation::Fuzz)
+        && matches!(leaf.mode, ValidationExecutionMode::Execution | ValidationExecutionMode::Unknown)
+    })
     {
         Some(ValidationPolicyClassification::Tests)
-    } else if leaves.iter().any(|leaf| matches!(leaf.operation, ValidationOperation::Check | ValidationOperation::Lint)
-        && matches!(leaf.mode, ValidationExecutionMode::Checking | ValidationExecutionMode::Unknown))
+    } else if leaves.iter().any(|leaf| {
+        matches!(leaf.operation, ValidationOperation::Check | ValidationOperation::Lint)
+        && matches!(leaf.mode, ValidationExecutionMode::Checking | ValidationExecutionMode::Unknown)
+    })
     {
         Some(ValidationPolicyClassification::Checks)
     } else { None }
@@ -2316,12 +2363,16 @@ fn policy_language_tool(binary: &str, args: &[String]) -> Option<ValidationPolic
         return Some(Policy::Benchmark);
     }
     if binary == "go" && args.first().is_some_and(|arg| arg == "test") {
-        let value = |flag: &str| args.iter().enumerate().filter_map(|(index, arg)| {
+        let value = |flag: &str| {
+            args.iter().enumerate().filter_map(|(index, arg)| {
             if arg == flag { args.get(index + 1).map(String::as_str) }
             else { arg.split_once('=').filter(|(key, _)| *key == flag).map(|(_, value)| value) }
-        }).next_back();
+        }).next_back()
+        };
         if value("-run") == Some("^$") && value("-bench").is_some_and(|value| !value.is_empty()) && value("-fuzz").is_none()
-            && !args.iter().any(|arg| matches!(arg.as_str(), "--" | "-args" | "-test.run") || arg.starts_with("-test.run="))
+            && !args.iter().any(|arg| {
+                matches!(arg.as_str(), "--" | "-args" | "-test.run") || arg.starts_with("-test.run=")
+            })
         {
             return Some(Policy::Benchmark);
         }
@@ -2331,14 +2382,17 @@ fn policy_language_tool(binary: &str, args: &[String]) -> Option<ValidationPolic
     {
         return match module {
             "py_compile" | "compileall" => Some(Policy::TargetedCompilation),
-            "json.tool" => Some(if tail.iter().any(|arg| matches!(arg.as_str(), "--help" | "-h")) { Policy::ReadOnly } else { Policy::Checks }),
+            "json.tool" => Some(if tail.iter().any(|arg| matches!(arg.as_str(), "--help" | "-h")) { Policy::ReadOnly } else { Policy::Checks },
+            ),
             _ => None,
         };
     }
     if matches!(binary, "ctest" | "mocha" | "ava" | "tap")
         || binary == "node" && has(&["--test"])
         || binary == "dotnet" && args.first().is_some_and(|arg| arg == "vstest")
-        || binary == "java" && args.iter().any(|arg| matches!(arg.as_str(), "org.junit.runner.JUnitCore" | "org.junit.platform.console.ConsoleLauncher" | "org.testng.TestNG" | "junit.textui.TestRunner"))
+        || binary == "java" && args.iter().any(|arg| {
+                matches!(arg.as_str(), "org.junit.runner.JUnitCore" | "org.junit.platform.console.ConsoleLauncher" | "org.testng.TestNG" | "junit.textui.TestRunner")
+            })
     { return Some(Policy::Tests); }
     if matches!(binary, "mvn" | "mvnw" | "gradle" | "gradlew")
         && args.iter().any(|arg| {
@@ -2358,7 +2412,8 @@ fn policy_language_tool(binary: &str, args: &[String]) -> Option<ValidationPolic
     if binary == "ruff" {
         return Some(if has(&["--check"]) || args.first().is_some_and(|arg| arg == "check") && !has(&["--fix", "--fix-only"]) {
             Policy::Checks
-        } else { Policy::Tooling });
+        } else { Policy::Tooling },
+        );
     }
     if binary == "go" && args.first().is_some_and(|arg| arg == "vet") { return Some(Policy::Checks); }
     None
@@ -2388,8 +2443,9 @@ fn policy_cargo(args: &[String]) -> ValidationPolicyClassification {
     }
     // Coverage and Miri can execute Rust tests without a `cargo test` leaf.
     if (args[index] == "miri" && args.get(index + 1).is_some_and(|arg| arg == "test")
-        || args[index] == "llvm-cov" && !args.get(index + 1).is_some_and(|arg|
-            matches!(arg.as_str(), "show-env" | "report" | "clean" | "export" | "demangle")))
+        || args[index] == "llvm-cov" && !args.get(index + 1).is_some_and(|arg| {
+                matches!(arg.as_str(), "show-env" | "report" | "clean" | "export" | "demangle")
+            }))
         && matches!(execution_mode("cargo", args, ValidationOperation::Test), ValidationExecutionMode::Execution | ValidationExecutionMode::Unknown)
         && !args.iter().any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version"))
     {
@@ -2444,7 +2500,9 @@ fn policy_cargo(args: &[String]) -> ValidationPolicyClassification {
         "clippy" | "shear" => policy_lint(&args[index + 1..]),
         "fmt" if args[index + 1..].iter().any(|arg| arg == "--check") => Policy::Checks,
         "kda" => policy_kda(&args[index + 1..]),
-        "help" | "version" | "metadata" | "tree" | "locate-project" | "pkgid" | "search" => Policy::ReadOnly,
+        "help" | "version" | "metadata" | "tree" | "locate-project" | "pkgid" | "search" => {
+            Policy::ReadOnly
+        }
         "test" | "t" | "build" | "b" | "run" | "r" | "fmt" | "doc" | "fix" | "nextest" | "fuzz" | "llvm-cov" | "miri" => Policy::Restricted,
         _ => Policy::Opaque,
     }
@@ -2478,7 +2536,8 @@ fn policy_kdr_python(args: &[String]) -> Option<ValidationPolicyClassification> 
         let index = python_script_index(args)?;
         let script = args[index].replace('\\', "/");
         ["tools/kdr_session_suite.py", "tools/benchmark_frozen_analysis.py",
-            "tools/rollout_analysis/benchmark_scan.py"].iter().any(|path| {
+            "tools/rollout_analysis/benchmark_scan.py",
+        ].iter().any(|path| {
                 script == *path || script.strip_suffix(*path).is_some_and(|prefix| prefix.ends_with('/'))
             }).then_some(&args[index + 1..])?
     };
@@ -2510,7 +2569,8 @@ fn policy_kda(mut args: &[String]) -> ValidationPolicyClassification {
 
 /// Composite KDA requests execute their nested operations, so classify those
 /// too; a plan-only batch lists its steps without running them.
-fn policy_kda_request(request: &serde_json::Value, depth: usize) -> Option<ValidationPolicyClassification> {
+fn policy_kda_request(request: &serde_json::Value, depth: usize,
+) -> Option<ValidationPolicyClassification> {
     use ValidationPolicyClassification as Policy;
     let op = request.get("op")?.as_str()?;
     let own = match op {
@@ -2533,10 +2593,12 @@ fn policy_kda_request(request: &serde_json::Value, depth: usize) -> Option<Valid
             return Policy::Restricted;
         }
         policy_kda_request(step, depth + 1).unwrap_or(Policy::Restricted)
-    }))))
+    }),
+    )))
 }
 
-fn policy_just(args: &[String], runners: &[RepositoryRunner], depth: usize, leaves: &mut Vec<Vec<String>>) -> ValidationPolicyClassification {
+fn policy_just(args: &[String], runners: &[RepositoryRunner], depth: usize, leaves: &mut Vec<Vec<String>>,
+) -> ValidationPolicyClassification {
     use ValidationPolicyClassification as Policy;
     if depth > MAX_WRAPPER_DEPTH { return Policy::Opaque; }
     // Reuse the manifest's constrained numeric --set grammar; arbitrary
@@ -2547,10 +2609,13 @@ fn policy_just(args: &[String], runners: &[RepositoryRunner], depth: usize, leav
     let mut changed_owner = false;
     while let Some(arg) = args.get(index) {
         if arg == "--command" || arg == "-c" {
-            return args[index + 1..].split_first().map_or(Policy::Opaque, |(program, args)| policy_argv(program, args, runners, depth + 1, leaves));
+            return args[index + 1..].split_first().map_or(Policy::Opaque, |(program, args)| {
+                    policy_argv(program, args, runners, depth + 1, leaves)
+                });
         }
         if arg == "--shell-command" {
-            return policy_script(&args[index + 1..].join(" "), runners, false, depth + 1, leaves);
+            return policy_script(&args[index + 1..].join(" "), runners, false, depth + 1, leaves,
+            );
         }
         if matches!(arg.as_str(), "--help" | "-h" | "--version" | "-V" | "--list" | "-l" | "--summary" | "--show" | "-s" | "--dump" | "--usage" | "--groups" | "--variables" | "--dry-run" | "-n") {
             return Policy::ReadOnly;
@@ -2567,9 +2632,10 @@ fn policy_just(args: &[String], runners: &[RepositoryRunner], depth: usize, leav
     // visible child: its tests and checks still propagate.
     if let Some(child) = just_lane_child(tail) && let Some((program, args)) = child.split_first() {
         let policy = policy_argv(program, args, runners, depth + 1, leaves);
-        let owned_lane = !changed_owner && owner.is_some_and(|runner|
-            runner.admission_runner.as_deref() == Some("rust_build_status")
-                && runner.passthrough_args == Some(2));
+        let owned_lane = !changed_owner && owner.is_some_and(|runner| {
+                runner.admission_runner.as_deref() == Some("rust_build_status")
+                && runner.passthrough_args == Some(2)
+            });
         if policy == Policy::Checks && owned_lane {
             return Policy::Tooling;
         }
@@ -2580,26 +2646,33 @@ fn policy_just(args: &[String], runners: &[RepositoryRunner], depth: usize, leav
         } else { policy };
     }
     if !changed_owner && recipe == "check-lane"
-        && owner.is_some_and(|runner| runner.admission_runner.as_deref() == Some("rust_build_status")
-            && runner.operations.contains(&ValidationOperation::Check))
+        && owner.is_some_and(|runner| {
+            runner.admission_runner.as_deref() == Some("rust_build_status")
+            && runner.operations.contains(&ValidationOperation::Check)
+        })
         && tail.get(1).is_some_and(|package| literal_package_selector(package)) {
-        let child = [vec!["check".to_owned(), "-p".to_owned(), tail[1].clone()], tail[2..].to_vec()].concat();
+        let child = [vec!["check".to_owned(), "-p".to_owned(), tail[1].clone()], tail[2..].to_vec(),
+        ].concat();
         return policy_argv("cargo", &child, runners, depth + 1, leaves);
     }
     if !changed_owner && matches!(recipe.as_str(), "clippy" | "clippy-lane" | "cargo-shear" | "lint-rust") {
-        leaves.push(std::iter::once("just".to_owned()).chain(tail.iter().cloned()).collect());
+        leaves.push(std::iter::once("just".to_owned()).chain(tail.iter().cloned()).collect(),
+        );
         let policy = policy_lint(&tail[1..]);
         // Only these recipes delegate the whole check to the permitted lane
         // script; cargo-shear and the mixed lint-rust recipe are not exempt.
         return if policy == Policy::Checks && matches!(recipe.as_str(), "clippy" | "clippy-lane")
-            && owner.is_some_and(|runner| runner.admission_runner.as_deref() == Some("rust_build_status")
-                && runner.operations.contains(&ValidationOperation::Lint)) {
+            && owner.is_some_and(|runner| {
+                runner.admission_runner.as_deref() == Some("rust_build_status")
+                && runner.operations.contains(&ValidationOperation::Lint)
+            }) {
             Policy::Tooling
         } else { policy };
     }
     if !changed_owner && matches!(recipe.as_str(), "fmt-check" | "fmt-check-fast") {
         // These repository recipes invoke scripts/maintenance/format.py.
-        leaves.push(std::iter::once("just".to_owned()).chain(tail.iter().cloned()).collect());
+        leaves.push(std::iter::once("just".to_owned()).chain(tail.iter().cloned()).collect(),
+        );
         return if owner.is_some_and(|runner| runner.operations.contains(&ValidationOperation::Lint)) {
             Policy::Tooling
         } else { Policy::Checks };
@@ -2618,7 +2691,8 @@ fn policy_just(args: &[String], runners: &[RepositoryRunner], depth: usize, leav
     }
     let classification = classify_argv_with_runners("just", args, runners);
     if let Some(policy) = policy_test_or_check(&classification) {
-        leaves.push(std::iter::once("just".to_owned()).chain(tail.iter().cloned()).collect());
+        leaves.push(std::iter::once("just".to_owned()).chain(tail.iter().cloned()).collect(),
+        );
         return policy;
     }
     if !changed_owner && matches!(recipe.as_str(),
@@ -2628,19 +2702,22 @@ fn policy_just(args: &[String], runners: &[RepositoryRunner], depth: usize, leav
         | "core-test" | "core-test-fast" | "core-gate" | "hooks-schema-check")
         && matches!(execution_mode("just", &tail[1..], ValidationOperation::Test), ValidationExecutionMode::Execution | ValidationExecutionMode::Unknown)
     {
-        leaves.push(std::iter::once("just".to_owned()).chain(tail.iter().cloned()).collect());
+        leaves.push(std::iter::once("just".to_owned()).chain(tail.iter().cloned()).collect(),
+        );
         return Policy::Tests;
     }
     if matches!(recipe.as_str(), "core-gate" | "check-lane" | "release-lane" | "build" | "test-compile")
         || matches!(&classification, ValidationClassification::Validation { .. })
     {
-        leaves.push(std::iter::once("just".to_owned()).chain(tail.iter().cloned()).collect());
+        leaves.push(std::iter::once("just".to_owned()).chain(tail.iter().cloned()).collect(),
+        );
         return if !changed_owner && benchmark_only(&classification) { Policy::Benchmark } else { Policy::Restricted };
     }
     Policy::Opaque
 }
 
-fn policy_repository_script(script: &str, args: &[String], runners: &[RepositoryRunner], depth: usize, leaves: &mut Vec<Vec<String>>) -> Option<ValidationPolicyClassification> {
+fn policy_repository_script(script: &str, args: &[String], runners: &[RepositoryRunner], depth: usize, leaves: &mut Vec<Vec<String>>,
+) -> Option<ValidationPolicyClassification> {
     use ValidationPolicyClassification as Policy;
     let script = script.replace('\\', "/");
     let kind = if script.ends_with("scripts/build/rust_test_runner.py") { 0 }
@@ -2659,7 +2736,9 @@ fn policy_repository_script(script: &str, args: &[String], runners: &[Repository
     if kind == 1 && command == "run-lane" {
         let policy = args.iter().position(|arg| arg == "--")
             .and_then(|index| args[index + 1..].split_first())
-            .map_or(Policy::Opaque, |(program, args)| policy_argv(program, args, runners, depth + 1, leaves));
+            .map_or(Policy::Opaque, |(program, args)| {
+                policy_argv(program, args, runners, depth + 1, leaves)
+            });
         let invocation = std::iter::once(script).chain(args.iter().cloned()).collect::<Vec<_>>();
         let owned_lane = runners.iter().any(|runner| {
                 runner.admission_runner.as_deref() == Some("rust_build_status")
@@ -2672,7 +2751,8 @@ fn policy_repository_script(script: &str, args: &[String], runners: &[Repository
         // A script wrapper must never erase a test or full-test-suite child.
         return Some(if !owned_lane && matches!(policy, Policy::TargetedCompilation | Policy::Tooling | Policy::Benchmark | Policy::ReadOnly) {
             Policy::Restricted
-        } else { policy });
+        } else { policy },
+        );
     }
     let script = match kind {
         0 => "scripts/build/rust_test_runner.py",
@@ -2682,10 +2762,13 @@ fn policy_repository_script(script: &str, args: &[String], runners: &[Repository
     if args.get(index + 1).is_some_and(|arg| matches!(arg.as_str(), "--help" | "-h")) {
         return Some(Policy::ReadOnly);
     }
-    leaves.push(std::iter::once(script.to_owned()).chain(args.iter().cloned()).collect());
+    leaves.push(std::iter::once(script.to_owned()).chain(args.iter().cloned()).collect(),
+    );
     Some(match (kind, command) {
         (0, "plan" | "plan-batch" | "list-targets" | "gates-for" | "required-for") | (1, "lanes" | "doctor" | "disk") => Policy::ReadOnly,
-        (0, "run-target" | "run-gate" | "rerun-inventory" | "check-gates") | (2, "test-python") => Policy::Tests,
+        (0, "run-target" | "run-gate" | "rerun-inventory" | "check-gates") | (2, "test-python") => {
+            Policy::Tests
+        }
         (0, "check-manifest") | (2, "lint-python" | "audit-scripts") => Policy::Checks,
         _ => Policy::Opaque,
     })
@@ -2693,7 +2776,8 @@ fn policy_repository_script(script: &str, args: &[String], runners: &[Repository
 
 /// CMD's literal subset uses double quotes, not POSIX single-quote escaping.
 /// Expansion, FOR/IF blocks and redirection intentionally remain opaque.
-fn policy_cmd_script(script: &str, runners: &[RepositoryRunner], depth: usize, leaves: &mut Vec<Vec<String>>) -> ValidationPolicyClassification {
+fn policy_cmd_script(script: &str, runners: &[RepositoryRunner], depth: usize, leaves: &mut Vec<Vec<String>>,
+) -> ValidationPolicyClassification {
     use ValidationPolicyClassification as Policy;
     if script.contains(['%', '!', '^', '(', ')', '<', '>']) { return Policy::Opaque; }
     let script = script.trim();
@@ -2721,7 +2805,8 @@ fn policy_cmd_script(script: &str, runners: &[RepositoryRunner], depth: usize, l
         if program.eq_ignore_ascii_case("call") {
             return Some(args.split_first().map_or(Policy::Opaque, |(program, args)| {
                 policy_argv(program, args, runners, depth + 1, leaves)
-            }));
+            }),
+            );
         }
         Some(policy_argv(program, args, runners, depth + 1, leaves))
     }))
@@ -2865,7 +2950,8 @@ fn policy_python_code(
             Policy::Restricted
         } else {
             Policy::Opaque
-        });
+        },
+        );
     }
     combine_policy_classifications(policies)
 }
@@ -2892,7 +2978,8 @@ fn python_literal_string(input: &str) -> Option<(String, &str)> {
         if character == quote { return Some((value, &input[index + character.len_utf8()..])); }
         if character == '\\' {
             let (_, escaped) = chars.next()?;
-            value.push(match escaped { '\\' | '\'' | '"' => escaped, 'n' => '\n', 'r' => '\r', 't' => '\t', _ => return None });
+            value.push(match escaped { '\\' | '\'' | '"' => escaped, 'n' => '\n', 'r' => '\r', 't' => '\t', _ => return None,
+            });
         } else { value.push(character); }
     }
     None

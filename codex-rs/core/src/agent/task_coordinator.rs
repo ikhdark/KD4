@@ -1317,6 +1317,7 @@ const fn observation_metric_label(kind: ObservationKind) -> &'static str {
         ObservationKind::ReceiptSealed => "receipt_sealed",
         ObservationKind::HostCompletion => "host_completion",
         ObservationKind::Completed => "completed",
+        ObservationKind::PartialResult => "partial_result",
         ObservationKind::NeedsMain => "needs_main",
         ObservationKind::Violated => "violated",
         ObservationKind::Abandoned => "abandoned",

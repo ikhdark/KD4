@@ -55,6 +55,14 @@ pub(crate) trait ChildTerminator: Send + Sync {
     fn signal(&mut self, signal: ProcessSignal) -> io::Result<()>;
 
     fn kill(&mut self) -> io::Result<()>;
+
+    fn tree_is_empty(&self) -> io::Result<bool> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "tree accounting unavailable"))
+    }
+
+    fn replay_control(&self) -> Option<Box<dyn ChildTerminator>> {
+        None
+    }
 }
 
 // Numeric group control is valid only while the owned root cannot be reaped.
@@ -243,8 +251,8 @@ fn drain_released_pty_reader(reader: JoinHandle<()>) {
 /// there is no local `PtyHandles` instance to resize directly.
 type ResizeFn = Box<dyn FnMut(TerminalSize) -> anyhow::Result<()> + Send>;
 
-pub(crate) type StdinCloseReceipt =
-    tokio::sync::watch::Receiver<Option<Result<(), (io::ErrorKind, String)>>>;
+pub type StdinCloseResult = Result<(), (io::ErrorKind, String)>;
+pub type StdinCloseReceipt = tokio::sync::watch::Receiver<Option<StdinCloseResult>>;
 
 /// Producer EOF receipts. Channel closure alone is not proof of capture: a
 /// failed or aborted reader leaves its receipt false. Only the producer sets it.
@@ -268,6 +276,11 @@ impl OutputCapture {
 
 /// Handle for driving an interactive process (PTY or pipe).
 pub struct ProcessHandle {
+    // 0: no cancellation, 1: requested, 2: tree confirmed, 3: uncertain.
+    // Root exit is independently observed by the native waiter.
+    termination: std::sync::atomic::AtomicU8,
+    finished_for_replay: AtomicBool,
+    stdin_close_request: Option<tokio::sync::watch::Sender<bool>>,
     stdin_close_receipt: Option<StdinCloseReceipt>,
     output_capture: OutputCapture,
     writer_tx: StdMutex<Option<crate::StdinSender>>,
@@ -313,6 +326,9 @@ impl ProcessHandle {
         // identity must survive that release so finish still drains the final ConPTY frame.
         let has_pty = pty_handles.is_some();
         Self {
+            termination: std::sync::atomic::AtomicU8::new(0),
+            finished_for_replay: AtomicBool::new(false),
+            stdin_close_request: None,
             stdin_close_receipt: None,
             output_capture: OutputCapture::default(),
             writer_tx: StdMutex::new(Some(writer_tx)),
@@ -334,11 +350,17 @@ impl ProcessHandle {
         self
     }
 
-    /// The Unix PTY writer reports ordered input-drain/close errors;
-    /// pipe and ConPTY sessions keep sender-drop close semantics.
-    #[cfg(unix)]
+    /// The writer reports when accepted input has drained and its handle closed.
     pub(crate) fn with_stdin_close_receipt(mut self, receipt: StdinCloseReceipt) -> Self {
         self.stdin_close_receipt = Some(receipt);
+        self
+    }
+
+    pub(crate) fn with_stdin_close_request(
+        mut self,
+        request: tokio::sync::watch::Sender<bool>,
+    ) -> Self {
+        self.stdin_close_request = Some(request);
         self
     }
 
@@ -417,20 +439,26 @@ impl ProcessHandle {
         }
     }
 
-    /// Drop this handle's stdin sender. All sender clones must also be dropped.
+    /// Close pipe admission, including outstanding sender clones, and drop this sender.
     /// This alone is not evidence of terminal EOF; use `close_stdin_ordered`
     /// when the caller needs an ordered close result.
     pub fn close_stdin(&self) {
+        if let Some(request) = &self.stdin_close_request {
+            request.send_replace(true);
+        }
         if let Ok(mut writer_tx) = self.writer_tx.lock() {
             writer_tx.take();
         }
     }
 
-    /// Close pipe input after queued bytes. Unix PTYs drain accepted input then
-    /// return Unsupported: terminal input cannot be half-closed reliably, and
-    /// no terminal-control bytes are synthesized.
-    /// External writer clones must be dropped before this operation can finish.
+    /// Close pipe input after queued bytes. PTYs return Unsupported without
+    /// closing or synthesizing terminal-control bytes. Driver-backed callers
+    /// must release their sender clones before awaiting this receipt.
     pub async fn close_stdin_ordered(&self) -> io::Result<()> {
+        if self.has_pty || self.resizer.lock().map_or(true, |resizer| resizer.is_some()) {
+            return Err(io::Error::new(io::ErrorKind::Unsupported,
+                "terminal input cannot be half-closed; pipe EOF is not Ctrl-D"));
+        }
         self.close_stdin();
         if let Some(mut receipt) = self.stdin_close_receipt.clone() {
             let result = receipt.wait_for(Option::is_some).await.map_err(|_| {
@@ -448,7 +476,7 @@ impl ProcessHandle {
         Ok(())
     }
 
-    /// Closes stdin, drops the terminator, and releases the pseudoconsole after
+    /// Closes stdin and releases the pseudoconsole after
     /// the root process exits.
     ///
     /// ConPTY keeps its output pipe open until the pseudoconsole handles are
@@ -457,9 +485,8 @@ impl ProcessHandle {
     /// reader drain buffered output and then observe EOF without aborting it.
     pub fn release_pty_after_exit(&self) {
         self.close_stdin();
-        if let Ok(mut killer_opt) = self.killer.lock() {
-            killer_opt.take();
-        }
+        // Root exit is not tree cleanup. Keep the job control handle available
+        // for cancellation/reconciliation until the owner explicitly finishes.
         release_pty_handles(&self.pty_handles);
     }
 
@@ -471,12 +498,25 @@ impl ProcessHandle {
             .lock()
             .map_err(|_| io::Error::other("failed to lock process terminator"))?;
         let Some(killer) = killer_opt.as_mut() else {
-            return Ok(());
+            return if self.termination_is_confirmed() {
+                Ok(())
+            } else {
+                self.termination.store(3, Ordering::Release);
+                Err(io::Error::other("shutdown uncertain: native control was already released without tree confirmation"))
+            };
         };
 
-        killer.kill()?;
-        killer_opt.take();
+        self.termination.store(1, Ordering::Release);
+        if let Err(error) = killer.kill() {
+            self.termination.store(3, Ordering::Release);
+            return Err(error);
+        }
+        self.termination.store(2, Ordering::Release);
         Ok(())
+    }
+
+    pub fn termination_is_confirmed(&self) -> bool {
+        self.termination.load(Ordering::Acquire) == 2
     }
 
     pub fn signal(&self, signal: ProcessSignal) -> io::Result<()> {
@@ -504,11 +544,44 @@ impl ProcessHandle {
     /// inherited output handle. Native PTY readers drain to EOF with a bounded
     /// cutoff, rather than discarding kernel-buffered bytes at root exit.
     pub fn finish(&self) {
-        self.close_stdin();
+        self.finish_inner(false);
+    }
 
-        if let Ok(mut killer_opt) = self.killer.lock() {
+    /// Release drained I/O, but retain cancellation custody while a completed
+    /// root still has descendants. Empty native jobs release admission promptly.
+    /// Nonempty jobs retain only cleanup control, not completed-root admission.
+    pub fn finish_for_replay(&self) {
+        if self.has_exited() {
+            self.finish_inner(true);
+        }
+    }
+
+    fn finish_inner(&self, for_replay: bool) {
+        // Never wait on an in-flight native termination from an async reader.
+        // Checking under this gate also closes the check/drop race with kill.
+        let Ok(mut killer_opt) = self.killer.try_lock() else {
+            return;
+        };
+        if matches!(self.termination.load(Ordering::Acquire), 1 | 3) {
+            // Do not discard the job/control handle or diagnostic readers while
+            // tree cleanup is pending or uncertain, even after root exit.
+            return;
+        }
+        if for_replay && !self.termination_is_confirmed() {
+            self.finished_for_replay.store(true, Ordering::Release);
+            if killer_opt.as_ref().is_some_and(|killer| killer.tree_is_empty().unwrap_or(false)) {
+                self.termination.store(2, Ordering::Release);
+                killer_opt.take();
+            } else if let Some(control) = killer_opt.as_ref().and_then(|killer| killer.replay_control()) {
+                // The root has exited. Keep its job, not its execution permit,
+                // so unrelated launches do not queue behind replay retention.
+                *killer_opt = Some(control);
+            }
+        } else {
             killer_opt.take();
         }
+        drop(killer_opt);
+        self.close_stdin();
 
         if let Ok(mut h) = self.reader_handle.lock()
             && let Some(handle) = h.take()
@@ -543,10 +616,60 @@ impl ProcessHandle {
 
 impl Drop for ProcessHandle {
     fn drop(&mut self) {
-        if let Err(error) = self.terminate() {
-            log::warn!("failed to terminate process while dropping its handle: {error}");
+        if self.finished_for_replay.load(Ordering::Acquire)
+            && self.termination.load(Ordering::Acquire) == 0
+        {
+            // Replay expiry is not an explicit cancellation. Preserve legitimate
+            // background descendants, just as normal completion did before.
             self.finish();
         }
+        // Ordinary finished sessions deliberately released their native control.
+        // There is no remaining terminator to transfer or cancellation to claim.
+        if self.killer.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner).is_none() {
+            return;
+        }
+        if let Err(error) = self.terminate() {
+            log::warn!("failed to terminate process while dropping its handle: {error}");
+            // The native waiter owns root reaping, but cannot certify tree
+            // cleanup. Transfer the failed terminator rather than closing its
+            // last job handle and releasing admission on an uncertain result.
+            if let Some(killer) = self.killer.get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner).take()
+            {
+                retain_terminator(killer);
+            }
+        }
+    }
+}
+
+type RetainedTerminator = Arc<StdMutex<Option<Box<dyn ChildTerminator>>>>;
+
+fn retained_terminators() -> &'static StdMutex<Vec<RetainedTerminator>> {
+    static OWNERS: std::sync::OnceLock<StdMutex<Vec<RetainedTerminator>>> = std::sync::OnceLock::new();
+    OWNERS.get_or_init(|| StdMutex::new(Vec::new()))
+}
+
+pub(crate) fn retain_terminator(killer: Box<dyn ChildTerminator>) {
+    let owner = Arc::new(StdMutex::new(Some(killer)));
+    retained_terminators().lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(Arc::clone(&owner));
+    // Independent of Tokio shutdown: cancelling the caller/runtime must not
+    // discard custody. Store before spawning, including thread-start failures.
+    if let Err(error) = std::thread::Builder::new().name("codex-tree-cleanup".into()).spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let mut killer = owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if killer.as_mut().is_some_and(|killer| killer.kill().is_err()) {
+                continue;
+            }
+            killer.take();
+            drop(killer);
+            retained_terminators().lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|entry| !Arc::ptr_eq(entry, &owner));
+            break;
+        }
+    }) {
+        log::error!("could not start tree cleanup reconciliation; shutdown uncertain, terminator retained: {error}");
     }
 }
 
@@ -622,6 +745,7 @@ pub struct ProcessDriver {
     pub exit_rx: oneshot::Receiver<i32>,
     pub terminator: Option<Box<dyn FnMut() -> io::Result<()> + Send + Sync>>,
     pub writer_handle: Option<JoinHandle<()>>,
+    pub stdin_close_receipt: Option<StdinCloseReceipt>,
     pub resizer: Option<ResizeFn>,
 }
 
@@ -670,6 +794,7 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
         exit_rx,
         terminator,
         writer_handle,
+        stdin_close_receipt,
         resizer,
     } = driver;
 
@@ -725,7 +850,7 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
         }
     });
 
-    let handle = ProcessHandle::new(
+    let mut handle = ProcessHandle::new(
         writer_tx,
         Box::new(ClosureTerminator { inner: terminator }),
         reader_handle,
@@ -741,6 +866,8 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
         resizer,
     )
     .with_output_capture(capture);
+
+    handle.stdin_close_receipt = stdin_close_receipt;
 
     SpawnedProcess {
         session: handle,

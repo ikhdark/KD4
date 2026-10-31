@@ -208,7 +208,8 @@ fn prepare_capture_lock(
         // guard paths that are unknown here or too many to prepare one by one.
         // Best effort: without the namespace grant, those probes fail in the
         // helper exactly as they would without preparation.
-        FsHelperRequest::Walk(_) | FsHelperRequest::FirstRegularFile { .. } => {
+        FsHelperRequest::Walk(_) | FsHelperRequest::FirstRegularFile { .. }
+        | FsHelperRequest::LookupBatch { .. } => {
             return Ok(codex_file_system::prepare_patch_capture_namespace()
                 .ok()
                 .and_then(|directory| AbsolutePathBuf::from_absolute_path(directory).ok()));

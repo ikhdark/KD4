@@ -34,6 +34,8 @@ use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CompactedItem;
+use codex_protocol::protocol::CompactionMode;
+use codex_protocol::protocol::CompactionOperation;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnStartedEvent;
@@ -403,6 +405,12 @@ async fn run_remote_compact_task_inner_impl(
         world_state_baseline,
         fragment_digests,
         compacted_item,
+        CompactionOperation {
+            mode: CompactionMode::Remote,
+            request: serde_json::to_value(compaction_metadata).map_err(|error| {
+                CodexErr::Fatal(format!("failed to encode compaction operation: {error}"))
+            })?,
+        },
     )
     .await?;
     if let Some(client_session) = client_session {
@@ -443,10 +451,11 @@ async fn run_remote_compaction_request_v2(
         .info()
         .stream_max_retries()
         .min(MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES);
-    let mut retry_state = ResponsesStreamRetryState::default();
+    let mut retry_state = ResponsesStreamRetryState::new(max_retries);
     turn_context.turn_timing_state.begin_compaction_generation();
     loop {
         retry_state.check_retry_budget(cancellation_token)?;
+        retry_state.begin_attempt(turn_context, ResponsesStreamRequest::RemoteCompactionV2);
         let attempt_started = tokio::time::Instant::now();
         let model_request_timing_guard = turn_context.turn_timing_state.begin_model_request_wait();
         let service_tier =
@@ -670,6 +679,7 @@ fn persisted_v2_compacted_item(replacement_history: Vec<ResponseItem>) -> Compac
         // Resume and fork reconstruction must install the same opaque checkpoint and bounded
         // unresolved user tail that became live above. `None` is reserved for legacy records.
         replacement_history: Some(replacement_history),
+        provenance: None,
         // The ordered history commit assigns and publishes the next window.
         window_number: None,
         first_window_id: None,

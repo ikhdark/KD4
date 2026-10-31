@@ -27,6 +27,7 @@ pub use crate::events::session_telemetry::ModelAttemptTelemetry;
 pub use crate::events::session_telemetry::ModelAttemptTransport;
 pub use crate::events::session_telemetry::ModelContextComponentTelemetry;
 pub use crate::events::session_telemetry::ModelPromptContextCategoryTelemetry;
+pub use crate::events::session_telemetry::ModelToolResultTelemetry;
 pub use crate::events::session_telemetry::ModelToolSchemaTelemetry;
 pub use crate::events::session_telemetry::ResponseStartTelemetry;
 pub use crate::events::session_telemetry::SessionTelemetry;

@@ -22,6 +22,7 @@ Object.defineProperty(globalThis, "run_graph", {
     const resultsSucceeded = (value) =>
       (Array.isArray(value) ? value : [value]).every(
         (item) => item?.success !== false &&
+          (item?.completion_recovered !== true || item.success === true) &&
           (!isCommand(item) || (item.error == null && item.exit_code === 0)),
       );
     // Capture definitions before running callbacks. Reject the entire graph

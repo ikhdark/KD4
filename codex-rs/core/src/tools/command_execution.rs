@@ -287,12 +287,15 @@ pub(crate) struct RunningCommand {
     pub(crate) key: CommandAttemptKey,
     pub(crate) artifact: RawOutputArtifact,
     completed_exit_code: Option<i32>,
+    exit_observed: bool,
     terminal_facts: Option<CommandTerminalFacts>,
 }
 
 #[derive(Debug, Clone)]
 struct CommandTerminalFacts {
-    success: bool,
+    process_exited: bool,
+    output_drained: bool,
+    success: Option<bool>,
     search_no_match: bool,
     failure_cause: Option<String>,
     sampling_signal: Option<serde_json::Value>,
@@ -310,6 +313,7 @@ struct CommandCompletionReceipt {
     process_id: u32,
     incarnation: uuid::Uuid,
     exit_code: Option<i32>,
+    exit_observed: bool,
     local_cwd: Option<PathBuf>,
     artifact: RawOutputArtifact,
     terminal_facts: Option<CommandTerminalFacts>,
@@ -651,9 +655,14 @@ impl CommandExecutionLedger {
         exit_code: Option<i32>,
         failure_cause: Option<&str>,
         search_no_match: bool,
+        process_exited: bool,
+        output_drained: bool,
     ) {
         let mut facts = CommandTerminalFacts {
-            success: failure_cause.is_none() && (exit_code == Some(0) || search_no_match),
+            process_exited,
+            output_drained,
+            success: (process_exited && (exit_code.is_some() || failure_cause.is_some()))
+                .then_some(failure_cause.is_none() && (exit_code == Some(0) || search_no_match)),
             search_no_match,
             failure_cause: failure_cause.map(|cause| cause.chars().take(2048).collect()),
             sampling_signal: None,
@@ -687,21 +696,23 @@ impl CommandExecutionLedger {
         };
         if let Some(slot) = slot {
             if let Some(previous) = slot.as_ref() {
+                facts.process_exited |= previous.process_exited;
+                facts.output_drained |= previous.output_drained;
                 facts.sampling_signal = previous.sampling_signal.clone();
                 // Exit-only and duplicate observers must not erase a known
                 // late failure merely because they have no diagnostic of their own.
                 facts.failure_cause = facts
                     .failure_cause
                     .or_else(|| previous.failure_cause.clone());
-                facts.success &= previous.success;
-                facts.search_no_match &= facts.success;
+                facts.success = if previous.success == Some(false) {
+                    Some(false)
+                } else {
+                    facts.success.or(previous.success)
+                };
+                facts.search_no_match |= previous.search_no_match;
+                facts.search_no_match &= facts.success == Some(true);
             }
-            if slot
-                .as_ref()
-                .is_none_or(|previous| previous.success || !facts.success)
-            {
-                *slot = Some(facts);
-            }
+            *slot = Some(facts);
         }
     }
 
@@ -775,6 +786,7 @@ impl CommandExecutionLedger {
                 key,
                 artifact,
                 completed_exit_code: None,
+                exit_observed: false,
                 terminal_facts: None,
             },
         );
@@ -815,6 +827,26 @@ impl CommandExecutionLedger {
             .and_then(|receipt| receipt.local_cwd.clone())
     }
 
+    /// Candidate handles only, never evidence that results or consumed inputs
+    /// are interchangeable. The process owner must still confirm live identity.
+    pub(crate) async fn matching_running_commands(
+        &self,
+        key: &CommandAttemptKey,
+    ) -> Vec<(u32, uuid::Uuid)> {
+        let Some(environment) = key.execution_context.get("environment") else {
+            return Vec::new();
+        };
+        let state = self.state.lock().await;
+        state.process.running.iter().filter_map(|(id, running)| {
+            let other = &running.key;
+            (key.environment_id == other.environment_id
+                && key.cwd == other.cwd
+                && key.command == other.command
+                && other.execution_context.get("environment") == Some(environment))
+                .then_some((*id, running.incarnation))
+        }).collect()
+    }
+
     pub(crate) async fn identical_running_process(
         &self,
         _key: &CommandAttemptKey,
@@ -832,20 +864,20 @@ impl CommandExecutionLedger {
         incarnation: uuid::Uuid,
     ) -> Option<serde_json::Value> {
         let state = self.state.lock().await;
-        if state.process.running.contains_key(&process_id) {
+        if state.process.running.get(&process_id).is_some_and(|command| command.incarnation == incarnation) {
             return None;
         }
-        let (exit_code, artifact, facts) = if let Some(pending) = state
+        let (execution_id, parent, exit_code, exit_observed, artifact, facts) = if let Some(pending) = state
             .process
             .pending_by_execution_id
             .values()
-            .find(|pending| pending.process_id == process_id)
+            .find(|pending| pending.process_id == process_id && pending.command.incarnation == incarnation)
         {
-            if pending.command.incarnation != incarnation {
-                return None;
-            }
             (
+                pending.command.execution_id,
+                &pending.command.parent_tool_execution_id,
                 pending.command.completed_exit_code,
+                pending.command.exit_observed,
                 &pending.command.artifact,
                 pending.command.terminal_facts.as_ref(),
             )
@@ -855,31 +887,43 @@ impl CommandExecutionLedger {
                 .completion_receipt_order
                 .iter()
                 .rev()
-                .filter_map(|id| state.process.completion_receipts.get(id))
-                .find(|receipt| receipt.process_id == process_id)?;
-            if receipt.incarnation != incarnation {
-                return None;
-            }
+                .filter_map(|id| state.process.completion_receipts.get(id).map(|receipt| (*id, receipt)))
+                .find(|(_, receipt)| receipt.process_id == process_id && receipt.incarnation == incarnation)?;
+            let (execution_id, receipt) = receipt;
             (
+                execution_id,
+                &receipt.parent_tool_execution_id,
                 receipt.exit_code,
+                receipt.exit_observed,
                 &receipt.artifact,
                 receipt.terminal_facts.as_ref(),
             )
         };
+        let process_exited = exit_observed || facts.is_some_and(|facts| facts.process_exited);
         let (artifact_id, bytes, error) = artifact.model_projection();
         let mut result = serde_json::json!({
-            "execution_state": "exited", "process_exited": true,
+            "output_reference": RawOutputArtifact::output_reference(Some(artifact)),
+            "polled_session_id": process_id, "incarnation": incarnation,
+            "completion_provenance": {
+                "source": "command_execution_ledger",
+                "execution_id": execution_id.0,
+                "parent_tool_execution_id": parent,
+            },
+            "execution_state": if process_exited { "exited" } else { "unknown" },
+            "process_exited": process_exited,
+            "output_drained": facts.map(|facts| facts.output_drained),
             "exit_code": exit_code,
             "output": "", "output_complete": false, "output_reduced": true,
             "raw_output_artifact_retention_limit_hit": artifact.retention_limit_hit(),
             "completion_recovered": true,
-            "success": facts.is_some_and(|facts| facts.success),
+            "success": facts.and_then(|facts| facts.success),
             "search_no_match": facts.is_some_and(|facts| facts.search_no_match),
             "error": facts.and_then(|facts| facts.failure_cause.as_deref()).or_else(|| {
                 facts.is_none().then_some("Terminal outcome details were not retained; do not infer successful execution from the exit code or replay the command.")
             }),
             "terminal_facts_available": facts.is_some(),
-            "notice": "Process already completed and was cleaned up. Output is not replayed; recover the retained artifact when needed. Do not restart the command.",
+            "retained_artifact_complete": RawOutputArtifact::output_reference(Some(artifact))["capture_complete"],
+            "notice": "Retained process receipt, not a live control handle. Retirement alone does not establish exit or complete output capture. Output is not replayed; use the retained output reference. Do not restart the command.",
         });
         if let Some(signal) = facts.and_then(|facts| facts.sampling_signal.as_ref()) {
             result["_sampling_request_signal"] = signal.clone();
@@ -1119,6 +1163,7 @@ impl CommandExecutionLedger {
                 return CompletionApplyResult::Missing;
             };
             running.completed_exit_code = exit_code;
+            running.exit_observed = true;
             if let Some(exit_code) = exit_code {
                 record_running_exit_locked(&mut state, &running, exit_code);
             }
@@ -1203,6 +1248,7 @@ impl CommandExecutionLedger {
                 && let Some(exit_code) = exit_code
             {
                 running.completed_exit_code = Some(exit_code);
+                running.exit_observed = true;
                 record_running_exit_locked(&mut state, &running, exit_code);
             }
             insert_completion_receipt(&mut state, execution_id, process_id, running);
@@ -1256,6 +1302,7 @@ fn insert_completion_receipt(
             process_id,
             incarnation: command.incarnation,
             exit_code: command.completed_exit_code,
+            exit_observed: command.exit_observed,
             artifact: command.artifact,
             terminal_facts: command.terminal_facts,
         },

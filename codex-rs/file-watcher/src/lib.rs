@@ -4,6 +4,7 @@
 mod wait;
 
 pub use wait::WaitOutcome;
+pub use wait::Subscription;
 pub use wait::wait_until;
 
 use std::collections::BTreeMap;

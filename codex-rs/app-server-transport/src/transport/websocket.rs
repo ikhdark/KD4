@@ -421,6 +421,7 @@ async fn run_websocket_outbound_loop<M, SinkError>(
                 let mut batch_bytes = 0;
                 let mut write_complete_tx = None;
                 for index in 0..MAX_WEBSOCKET_BATCH_MESSAGES {
+                    let flush_boundary = !queued_message.message.can_batch();
                     if let Some(json) = serialize_outgoing_message(queued_message.message) {
                         batch_bytes += json.len();
                         if websocket_writer.feed(M::text(json)).await.is_err() {
@@ -431,9 +432,10 @@ async fn run_websocket_outbound_loop<M, SinkError>(
                     if disconnect_token.is_cancelled() {
                         break 'writer;
                     }
-                    // Coalesce only already queued frames, without a timer. Receipts
-                    // and control traffic end a batch so later output cannot delay them.
-                    if write_complete_tx.is_some()
+                    // Coalesce only already queued deltas, without a timer. Lifecycle,
+                    // readiness and error events flush before any later output.
+                    if flush_boundary
+                        || write_complete_tx.is_some()
                         || batch_bytes >= WEBSOCKET_BATCH_TARGET_BYTES
                         || index + 1 == MAX_WEBSOCKET_BATCH_MESSAGES
                         || !writer_control_rx.is_empty()

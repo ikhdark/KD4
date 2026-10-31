@@ -85,6 +85,30 @@ impl Handler {
         let turn = Arc::clone(&step_context.turn);
         let arguments = function_arguments(payload)?;
         let args: WaitArgs = parse_arguments(&arguments)?;
+        if (args.acceptance.is_some() && (args.dependencies_only || args.mailbox_only
+            || args.targets.is_some() || args.cursor.is_some() || args.completion_mode.is_some()
+            || args.dependency_cursor.is_some()))
+            || (args.acceptance_cursor.is_some() && args.acceptance.is_none())
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "acceptance selects a separate wait mode; only acceptance_cursor and timeout_ms may accompany it".into(),
+            ));
+        }
+        if (args.dependencies_only && (args.mailbox_only || args.targets.is_some() || args.cursor.is_some() || args.completion_mode.is_some()))
+            || (args.dependency_cursor.is_some() && !args.dependencies_only)
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "dependencies_only cannot combine with mailbox_only, targets, completion_mode or cursor; dependency_cursor requires dependencies_only".into(),
+            ));
+        }
+        if (args.targets.is_some() && (args.mailbox_only || args.cursor.is_some()))
+            || (args.completion_mode.is_some() && args.targets.is_none())
+            || args.targets.as_ref().is_some_and(Vec::is_empty)
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "wait_agent: nonempty targets selects completion waiting; do not combine it with mailbox_only or cursor. completion_mode requires targets".into(),
+            ));
+        }
         let min_timeout_ms = turn.config.multi_agent_v2.min_wait_timeout_ms;
         let max_timeout_ms = turn.config.multi_agent_v2.max_wait_timeout_ms;
         let default_timeout_ms = turn.config.multi_agent_v2.default_wait_timeout_ms;
@@ -151,6 +175,35 @@ impl Handler {
                     .map(|timeout_ms| wait_started + Duration::from_millis(timeout_ms as u64)),
                 crate::unified_exec::nested_poll_bound(source.nested_deadline()),
             );
+            if let Some(targets) = &args.targets {
+                let resolve = async {
+                    let mut children = Vec::new();
+                    for target in targets {
+                        children.push(resolve_agent_target(&session, &turn, target).await?);
+                    }
+                    Ok::<_, FunctionCallError>(children)
+                };
+                let resolved = tokio::select! {
+                    biased;
+                    _ = cancellation_token.cancelled() => Err("cancelled"),
+                    _ = async { match deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => Err("timed_out"),
+                    result = resolve => Ok(result?),
+                };
+                let completion = match resolved {
+                    Ok(children) => serde_json::to_value(session.services.agent_control.wait_for_child_completions(
+                        &turn.session_source.get_agent_path().unwrap_or_else(AgentPath::root),
+                        &children, args.completion_mode.unwrap_or_default(), &cancellation_token, deadline,
+                    ).await.map_err(|error| task_store_context_error("wait_agent", "selected completion wait failed", error))?)
+                        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?,
+                    Err(reason) => json!({"reason": reason, "mode": args.completion_mode.unwrap_or_default(), "outcomes": [], "unresolved_targets": targets, "acceptance": "not_evaluated"}),
+                };
+                return Ok(WaitAgentResult {
+                    message: "Selected-child wait ended; terminal outcomes are not deliverable acceptance.".into(),
+                    timed_out: completion["reason"] == "timed_out",
+                    completion: Some(completion),
+                    ..Default::default()
+                });
+            }
             macro_rules! before_delivery {
                 ($future:expr, $cursor:expr) => {
                     tokio::select! {
@@ -206,6 +259,84 @@ impl Handler {
                     })?;
             }
             let store = coordinator.store();
+            if let Some(targets) = &args.acceptance {
+                let root = coordinator.root_session_id().ok_or_else(||
+                    FunctionCallError::RespondToModel("acceptance wait requires durable coordination".into()))?;
+                let caller = turn.session_source.get_agent_path().unwrap_or_else(AgentPath::root).to_string();
+                let prefix = format!("{caller}/");
+                let bindings = coordinator.bindings_for_recovery();
+                let caller_binding = coordinator.binding_for_turn(&turn).filter(|binding|
+                    binding.thread_id.as_deref() == Some(session.thread_id.to_string().as_str()));
+                if turn.session_source.is_non_root_agent() && caller_binding.is_none() {
+                    return Err(FunctionCallError::RespondToModel("acceptance wait requires the worker's bound attempt".into()));
+                }
+                let dependencies = match caller_binding.as_ref() {
+                    Some(binding) => before_delivery!(coordinator.get_agent_task(
+                        binding.assignment_id, Some(0)), parsed_cursor)
+                        .map_err(|error| task_store_context_error("wait_agent", "caller dependency lookup failed", error))?
+                        .assignment.dependencies,
+                    None => Vec::new(),
+                };
+                for target in targets {
+                    if !bindings.iter().any(|binding| binding.assignment_id == target.assignment_id
+                        && binding.attempt_id == target.attempt_id && binding.root_session_id == root
+                        && (binding.agent_path == caller || binding.agent_path.starts_with(&prefix)
+                            || dependencies.contains(&binding.assignment_id)))
+                    {
+                        return Err(FunctionCallError::RespondToModel(
+                            "acceptance targets must name current caller, descendant or declared dependency attempts".into()));
+                    }
+                }
+                let store = store.as_ref().ok_or_else(||
+                    FunctionCallError::RespondToModel("acceptance store unavailable".into()))?;
+                let mut subscription = before_delivery!(store.subscribe_acceptance(
+                    root, caller_binding.map(|binding| (binding.assignment_id, binding.attempt_id)),
+                    targets.clone()), parsed_cursor)
+                    .map_err(|error| task_store_context_error("wait_agent", "acceptance subscription failed", error))?;
+                let readiness = tokio::select! {
+                    biased;
+                    _ = cancellation_token.cancelled() => return Err(FunctionCallError::RespondToModel("wait_agent cancelled".into())),
+                    outcome = input.next() => return Ok(input_only_result(&turn, outcome, parsed_cursor, wait_started)),
+                    _ = async { match deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => {
+                        return Ok(input_only_result(&turn, WaitOutcome::TimedOut, parsed_cursor, wait_started));
+                    }
+                    result = subscription.next(args.acceptance_cursor.as_deref()) => result
+                        .map_err(|error| task_store_context_error("wait_agent", "acceptance observation failed", error))?,
+                };
+                return Ok(WaitAgentResult {
+                    message: "Selected criteria observed; this neither completes the whole task nor cancels any required work. Revalidate evidence before consumption.".into(),
+                    typed_deltas: vec![json!({"acceptance_readiness": readiness})],
+                    ..Default::default()
+                });
+            }
+            if args.dependencies_only {
+                let binding = coordinator.binding_for_turn(&turn).filter(|binding|
+                    binding.thread_id.as_deref() == Some(session.thread_id.to_string().as_str()))
+                    .ok_or_else(|| FunctionCallError::RespondToModel("dependency readiness requires the caller's bound task attempt".into()))?;
+                let store = store.as_ref().ok_or_else(|| FunctionCallError::RespondToModel("dependency readiness store unavailable".into()))?;
+                let mut subscription = before_delivery!(store.subscribe_dependency_readiness(
+                    binding.assignment_id, binding.attempt_id), parsed_cursor)
+                    .map_err(|error| task_store_context_error("wait_agent", "dependency subscription failed", error))?;
+                let readiness = tokio::select! {
+                    biased;
+                    _ = cancellation_token.cancelled() => return Err(FunctionCallError::RespondToModel("wait_agent cancelled".into())),
+                    outcome = input.next() => return Ok(input_only_result(&turn, outcome, parsed_cursor, wait_started)),
+                    _ = async { match deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => {
+                        return Ok(input_only_result(&turn, WaitOutcome::TimedOut, parsed_cursor, wait_started));
+                    }
+                    result = subscription.next(args.dependency_cursor.as_deref()) => result
+                        .map_err(|error| task_store_context_error("wait_agent", "dependency authority observation failed", error))?,
+                };
+                return Ok(WaitAgentResult {
+                    message: if readiness.ready {
+                        "Declared prerequisites are authoritatively accepted at this observation; revalidate authority before consuming them."
+                    } else {
+                        "Dependency readiness is invalid: recover the returned blockers before consuming prerequisites."
+                    }.into(),
+                    typed_deltas: vec![json!({"dependency_readiness": readiness})],
+                    ..Default::default()
+                });
+            }
             let root_session_id = coordinator.root_session_id();
             let consuming_agent_path = turn
                 .session_source
@@ -1327,8 +1458,15 @@ impl CoreToolRuntime for Handler {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WaitArgs {
+    acceptance: Option<Vec<codex_agent_task_store::AcceptanceTarget>>,
+    acceptance_cursor: Option<String>,
+    targets: Option<Vec<String>>,
+    completion_mode: Option<crate::agent::control::completion::CompletionMode>,
     #[serde(default)]
     mailbox_only: bool,
+    #[serde(default)]
+    dependencies_only: bool,
+    dependency_cursor: Option<String>,
     timeout_ms: Option<i64>,
     cursor: Option<String>,
 }
@@ -1337,6 +1475,8 @@ struct WaitArgs {
 pub(crate) struct WaitAgentResult {
     pub(crate) message: String,
     pub(crate) timed_out: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) completion: Option<JsonValue>,
     pub(crate) cursor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) previous_delivery: Option<JsonValue>,
@@ -1554,6 +1694,7 @@ impl WaitAgentResult {
         Self {
             message,
             timed_out: outcome == WaitOutcome::TimedOut,
+            completion: None,
             cursor,
             previous_delivery: None,
             typed_deltas,

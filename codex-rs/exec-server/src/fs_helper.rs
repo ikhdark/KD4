@@ -72,6 +72,8 @@ pub(crate) struct FsHelperReadDirectoryBoundedResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "params")]
 pub(crate) enum FsHelperRequest {
+    #[serde(rename = "fs/lookupBatch")]
+    LookupBatch { requests: Vec<codex_file_system::FileSystemLookup> },
     #[serde(rename = "fs/readFile")]
     ReadFile(FsReadFileParams),
     // A distinct operation makes older helpers refuse rather than ignore the cap.
@@ -120,6 +122,8 @@ pub(crate) enum FsHelperResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "response")]
 pub(crate) enum FsHelperPayload {
+    #[serde(rename = "fs/lookupBatch")]
+    LookupBatch { results: Vec<codex_file_system::FileSystemLookupResult> },
     #[serde(rename = "fs/readFileRange")]
     ReadFileRange(crate::protocol::FsReadFileRangeResponse),
     #[serde(rename = "fs/checksumFile")]
@@ -159,6 +163,13 @@ pub(crate) enum FsHelperPayload {
 }
 
 impl FsHelperPayload {
+    pub(crate) fn expect_lookup_batch(self) -> Result<Vec<codex_file_system::FileSystemLookupResult>, JSONRPCErrorError> {
+        match self {
+            Self::LookupBatch { results } => Ok(results),
+            other => Err(unexpected_response(crate::protocol::FS_LOOKUP_BATCH_METHOD, other.operation())),
+        }
+    }
+
     pub(crate) fn expect_read_file_range(self) -> Result<crate::protocol::FsReadFileRangeResponse, JSONRPCErrorError> {
         match self {
             Self::ReadFileRange(response) => Ok(response),
@@ -190,6 +201,7 @@ impl FsHelperPayload {
 
     fn operation(&self) -> &'static str {
         match self {
+            Self::LookupBatch { .. } => crate::protocol::FS_LOOKUP_BATCH_METHOD,
             Self::ReadFileRange(_) => crate::protocol::FS_READ_FILE_RANGE_METHOD,
             Self::ChecksumFile(_) => crate::protocol::FS_CHECKSUM_FILE_METHOD,
             Self::FirstRegularFile { .. } => FS_FIRST_REGULAR_FILE_OPERATION,
@@ -374,6 +386,10 @@ pub(crate) async fn run_direct_request(
 ) -> Result<FsHelperPayload, JSONRPCErrorError> {
     let file_system = DirectFileSystem;
     match request {
+        FsHelperRequest::LookupBatch { requests } => {
+            let results = file_system.lookup_batch(&requests, None).await.map_err(map_fs_error)?;
+            Ok(FsHelperPayload::LookupBatch { results })
+        }
         FsHelperRequest::ReadFileRange(params) => {
             let read = file_system.read_file_range(&params.path, params.start, params.len,
                 params.expected_revision.as_deref(), None).await.map_err(map_fs_error)?;
@@ -383,7 +399,7 @@ pub(crate) async fn run_direct_request(
         }
         FsHelperRequest::ChecksumFile(params) => {
             let digest = file_system
-                .checksum_file(&params.path, /*sandbox*/ None)
+                .checksum_file(&params.path, params.include_text_diagnostics, /*sandbox*/ None)
                 .await
                 .map_err(map_fs_error)?;
             Ok(FsHelperPayload::ChecksumFile(

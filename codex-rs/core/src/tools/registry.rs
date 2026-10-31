@@ -265,6 +265,14 @@ pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
         false
     }
 
+    /// A trusted read-only notification waiter must allow the producers it
+    /// waits for to mutate the workspace. It captures non-atomic state itself;
+    /// authorization and independently admitted pre/post hooks still apply.
+    /// Payload-sensitive so ordinary observations retain existing admission.
+    fn waits_for_workspace_changes(&self, _payload: &ToolPayload) -> bool {
+        false
+    }
+
     /// Process control is effectful, not a read-only observation. It must be
     /// able to stop a process that holds the workspace lease, so admission is
     /// owned by the process manager rather than the repository gate. This does
@@ -430,6 +438,7 @@ pub(crate) struct AnyToolResult {
     pub(crate) source_dependencies:
         Option<std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>>,
     pub(crate) code_mode_feedback: Vec<FunctionCallOutputContentItem>,
+    pub(crate) operation_history: Option<Value>,
 }
 
 pub(crate) struct ModelToolProjection {
@@ -512,13 +521,17 @@ impl AnyToolResult {
     }
 
     pub(crate) fn response(&self) -> ResponseInputItem {
-        if let Some(projection) = self.model_projection.as_ref() {
-            return with_model_delivery_notice(
+        let response = if let Some(projection) = self.model_projection.as_ref() {
+            with_model_delivery_notice(
                 projection.response(),
                 self.result.model_delivery_notice(),
-            );
-        }
-        self.result.to_response_item(&self.call_id, &self.payload)
+            )
+        } else {
+            self.result.to_response_item(&self.call_id, &self.payload)
+        };
+        let notice = self.operation_history.as_ref()
+            .map(|history| serde_json::json!({"operation_history": history}).to_string());
+        with_operation_history_notice(response, notice.as_deref())
     }
 
     pub(crate) fn success_for_logging(&self) -> bool {
@@ -547,7 +560,17 @@ impl AnyToolResult {
     }
 
     pub(crate) fn sampling_request_signal(&self) -> Option<serde_json::Value> {
-        let mut signal = self.result.sampling_request_signal()?;
+        let mut signal = self.result.sampling_request_signal();
+        if matches!(self.outcome_for_logging(), ToolOutputOutcome::Failure | ToolOutputOutcome::TimedOut) {
+            let signal = signal.get_or_insert_with(|| serde_json::json!({}));
+            let fingerprint = self.operation_history.as_ref()
+                .and_then(|history| history.pointer("/instance/fingerprint"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("tool_failure.unclassified_instance.{}", self.call_id));
+            signal["failure_signature"] = serde_json::json!(fingerprint);
+        }
+        let mut signal = signal?;
         if signal.get("command_evidence") != Some(&Value::Bool(true))
             || self.outcome_for_logging() != ToolOutputOutcome::Success
         {
@@ -694,10 +717,12 @@ impl AnyToolResult {
     }
 
     pub(crate) fn into_response(self) -> ResponseInputItem {
+        let notice = self.operation_history.as_ref()
+            .map(|history| serde_json::json!({"operation_history": history}).to_string());
         if let Some(projection) = self.model_projection {
-            return with_model_delivery_notice(
-                projection.into_response(),
-                self.result.model_delivery_notice(),
+            return with_operation_history_notice(
+                with_model_delivery_notice(projection.into_response(), self.result.model_delivery_notice()),
+                notice.as_deref(),
             );
         }
         let Self {
@@ -706,13 +731,18 @@ impl AnyToolResult {
             result,
             ..
         } = self;
-        result.to_response_item(&call_id, &payload)
+        with_operation_history_notice(result.to_response_item(&call_id, &payload), notice.as_deref())
     }
 
 
     pub(crate) fn code_mode_result_with_budget(self, budget: usize) -> serde_json::Value {
-        self.result
-            .code_mode_result_with_budget(&self.payload, budget)
+        let mut result = self.result.code_mode_result_with_budget(&self.payload, budget);
+        if let Some(history) = self.operation_history {
+            if let Some(fields) = result.as_object_mut() {
+                fields.entry("operation_history").or_insert(history);
+            }
+        }
+        result
     }
 
     pub(crate) fn code_mode_failure_is_error(&self) -> bool {
@@ -728,6 +758,16 @@ pub(crate) async fn install_synthetic_terminal_projection(
     invocation: &ToolInvocation,
     result: &mut AnyToolResult,
 ) {
+    if result.operation_history.is_none() && result.result.tool_failure().is_some_and(|failure|
+        matches!(failure.code, codex_protocol::tool_failure::ToolFailureCode::Cancelled
+            | codex_protocol::tool_failure::ToolFailureCode::TimedOut)) {
+        let mut attempt = crate::tools::operation_history::OperationAttempt::capture(invocation, None, None).await;
+        // Cancellation may have interrupted a rewriting hook. Preserve the
+        // requested parameters, but never certify them as the executed input.
+        attempt.mark_requested_input();
+        attempt.settle_output(result);
+        result.operation_history = Some(invocation.session.record_operation_attempt(attempt).await);
+    }
     let parsed_function_arguments = ParsedFunctionArguments::from_payload(&invocation.payload);
     let provider_visible = projection_is_provider_visible(&invocation.source);
     let phase_started = Instant::now();
@@ -991,6 +1031,14 @@ fn apply_post_tool_use_outcome(
 }
 
 impl ToolOutput for PostToolUseFeedbackOutput {
+    fn tool_failure(&self) -> Option<codex_protocol::tool_failure::ToolFailure> {
+        if self.accounting_error.is_some() || self.context_error.is_some() {
+            None
+        } else {
+            self.original.tool_failure()
+        }
+    }
+
     fn allows_generic_artifact_retention(&self) -> bool {
         self.original.allows_generic_artifact_retention()
     }
@@ -1157,6 +1205,10 @@ pub(crate) fn is_model_delivery_unavailable_receipt(item: &ResponseItem, call_id
 }
 
 impl ToolOutput for UnavailableModelProjectionOutput {
+    fn tool_failure(&self) -> Option<codex_protocol::tool_failure::ToolFailure> {
+        self.original.tool_failure()
+    }
+
     fn allows_generic_artifact_retention(&self) -> bool {
         self.original.allows_generic_artifact_retention()
     }
@@ -1269,6 +1321,8 @@ pub(crate) struct RegisteredTool {
     external_mutation_intent: crate::agent::task_capabilities::ExternalMutationIntent,
     spec: ToolSpec,
     canonical_spec_sha256: OnceLock<String>,
+    effective_input_schema: OnceLock<Option<Value>>,
+    effective_contract_revision: OnceLock<String>,
     search_info: OnceLock<Option<codex_tools::ToolSearchInfo>>,
     code_mode_argument_preflight: Arc<CodeModeArgumentPreflight>,
 }
@@ -1306,6 +1360,8 @@ impl RegisteredTool {
                 crate::agent::task_capabilities::ExternalMutationIntent::MayMutate,
             spec,
             canonical_spec_sha256: OnceLock::new(),
+            effective_input_schema: OnceLock::new(),
+            effective_contract_revision: OnceLock::new(),
             search_info: OnceLock::new(),
             code_mode_argument_preflight: Arc::new(CodeModeArgumentPreflight::default()),
         }
@@ -1324,6 +1380,7 @@ impl RegisteredTool {
     }
 
     pub(crate) fn with_provider_authority(mut self, authority: String) -> Self {
+        self.effective_contract_revision.take();
         self.provider_authority = Some(authority);
         self
     }
@@ -1356,6 +1413,8 @@ impl RegisteredTool {
 
     pub(crate) fn spec_mut(&mut self) -> &mut ToolSpec {
         self.canonical_spec_sha256.take();
+        self.effective_input_schema.take();
+        self.effective_contract_revision.take();
         self.search_info.take();
         self.code_mode_argument_preflight = Arc::new(CodeModeArgumentPreflight::default());
         &mut self.spec
@@ -1367,6 +1426,34 @@ impl RegisteredTool {
             hex::encode(Sha256::digest(
                 serde_json::to_vec(&canonical_spec).unwrap_or_default(),
             ))
+        })
+    }
+
+    /// Capture the executable schema once, shared by validation and declarations.
+    pub(crate) fn effective_input_schema(&self) -> Option<&Value> {
+        self.effective_input_schema
+            .get_or_init(|| {
+                self.runtime
+                    .code_mode_input_schema()
+                    .or_else(|| self.spec.input_schema_for(&self.tool_name))
+            })
+            .as_ref()
+    }
+
+    pub(crate) fn effective_contract_revision(&self) -> &str {
+        self.effective_contract_revision.get_or_init(|| {
+            let contract = serde_json::json!({
+                "version": 1,
+                "identity": self.tool_name,
+                "provider_authority": self.provider_authority(),
+                "contract": self.spec.effective_callable_contract(
+                    &self.tool_name, self.effective_input_schema(),
+                ),
+            });
+            format!(
+                "v1:{}",
+                hex::encode(Sha256::digest(contract.to_string().as_bytes()))
+            )
         })
     }
 
@@ -1578,6 +1665,7 @@ impl ToolRegistry {
     ) -> bool {
         self.tool(name).is_some_and(|tool| {
             tool.delegates_workspace_admission() || tool.controls_process(payload)
+                || tool.waits_for_workspace_changes(payload)
         })
     }
 
@@ -1705,14 +1793,61 @@ impl ToolRegistry {
         }
     }
 
+    pub(crate) async fn dispatch_any_with_terminal_outcome(
+        &self,
+        invocation: ToolInvocation,
+        dispatch_state: Arc<ToolDispatchState>,
+    ) -> Result<AnyToolResult, FunctionCallError> {
+        let session = Arc::clone(&invocation.session);
+        let mut attempt = self.capture_operation_attempt(&invocation).await;
+        let mut result = self.dispatch_with_operation_attempt(invocation, dispatch_state, &mut attempt).await;
+        // This is a reused recovery receipt, not a new execution/failure. Do
+        // not overwrite the unresolved owner attempt with the preflight refusal.
+        if attempt.recovery_deferred {
+            return result;
+        }
+        attempt.settle(&result);
+        let advisory = session.record_operation_attempt(attempt).await;
+        match &mut result {
+            Ok(output) => {
+                if output.outcome_for_logging() != ToolOutputOutcome::Success
+                    || advisory["previous_unsuccessful_attempt_count"].as_u64().is_some_and(|count| count > 0) {
+                    output.operation_history = Some(advisory);
+                }
+            }
+            Err(FunctionCallError::Structured(failure)) => {
+                crate::tools::operation_history::annotate_failure(failure, advisory);
+            }
+            Err(error @ FunctionCallError::RespondToModel(_)) => {
+                let mut failure = error.failure();
+                crate::tools::operation_history::annotate_failure(&mut failure, advisory);
+                *error = FunctionCallError::structured(failure);
+            }
+            // Preserve terminal/refusal variants and their existing control flow.
+            Err(_) => {}
+        }
+        result
+    }
+
+    async fn capture_operation_attempt(
+        &self, invocation: &ToolInvocation,
+    ) -> crate::tools::operation_history::OperationAttempt {
+        let registered = self.tools.get(&invocation.tool_name);
+        crate::tools::operation_history::OperationAttempt::capture(
+            invocation, registered.map(RegisteredTool::effective_contract_revision),
+            registered.and_then(RegisteredTool::provider_authority),
+        ).await
+    }
+
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "tool dispatch must keep active-turn accounting atomic"
     )]
-    pub(crate) async fn dispatch_any_with_terminal_outcome(
+    async fn dispatch_with_operation_attempt(
         &self,
         mut invocation: ToolInvocation,
         dispatch_state: Arc<ToolDispatchState>,
+        attempt: &mut crate::tools::operation_history::OperationAttempt,
     ) -> Result<AnyToolResult, FunctionCallError> {
         // Direct registry callers do not pass through ToolCallRuntime's prepare
         // phase. Resolve their executable before selecting its handler/schema.
@@ -1721,6 +1856,7 @@ impl ToolRegistry {
             && let Some(registered) = self.tools.get(&invocation.tool_name)
         {
             invocation = registered.runtime().prepare_invocation(invocation).await?;
+            *attempt = self.capture_operation_attempt(&invocation).await;
         }
         let expansion_notice = (original_name != invocation.tool_name).then(|| {
             format!(
@@ -1760,16 +1896,17 @@ impl ToolRegistry {
                 turn_state.tool_calls = turn_state.tool_calls.saturating_add(1);
             }
         }
-        let (tool, tool_spec, code_mode_argument_preflight, external_tool) =
+        let (tool, tool_spec, input_schema, code_mode_argument_preflight, external_tool) =
             match self.tools.get(&tool_name) {
                 Some(registered) => (
                     Arc::clone(registered.runtime()),
                     registered.spec(),
+                    registered.effective_input_schema(),
                     Arc::clone(&registered.code_mode_argument_preflight),
                     registered.authorization_class() == TypedToolClass::DynamicExternal,
                 ),
                 None => {
-                    let message = unsupported_tool_call_message(&invocation.payload, &tool_name);
+                    let message = unsupported_tool_call_message(&invocation.payload, &tool_name, &self.tools);
                     let log_payload = invocation.payload.log_payload();
                     otel.tool_result_with_tags(
                         tool_name_flat.as_ref(),
@@ -1841,9 +1978,9 @@ impl ToolRegistry {
         let validate_arguments =
             external_tool || matches!(invocation.source, ToolCallSource::CodeMode { .. });
         if validate_arguments
-            && let Err(message) = code_mode_argument_preflight.validate(
+            && let Err(mut failure) = code_mode_argument_preflight.validate(
                 &tool_name,
-                tool_spec,
+                input_schema,
                 &invocation.payload,
                 parsed_function_arguments.as_ref(),
                 !external_tool,
@@ -1861,12 +1998,12 @@ impl ToolRegistry {
                     arguments,
                 )
             });
-            let code = if refusal.is_some() {
-                codex_protocol::tool_failure::ToolFailureCode::PermissionDenied
-            } else {
-                codex_protocol::tool_failure::ToolFailureCode::InvalidInput
-            };
-            let message = refusal.unwrap_or(message);
+            if let Some(message) = refusal {
+                failure = codex_protocol::tool_failure::ToolFailure::no_effects(
+                    codex_protocol::tool_failure::ToolFailureCode::PermissionDenied, message,
+                );
+            }
+            let message = failure.to_string();
             let log_payload = invocation.payload.log_payload();
             otel.tool_result_with_tags(
                 tool_name_flat.as_ref(),
@@ -1878,9 +2015,7 @@ impl ToolRegistry {
                 &tool_result_tags,
                 &extra_trace_fields,
             );
-            let err = FunctionCallError::structured(
-                codex_protocol::tool_failure::ToolFailure::no_effects(code, message),
-            );
+            let err = FunctionCallError::structured(failure);
             dispatch_state.try_complete();
             return Err(err);
         }
@@ -1922,6 +2057,9 @@ impl ToolRegistry {
         let hook_input_notice = hook_input_notice.or(expansion_notice);
         let hook_rewrote_input = hook_input_notice.is_some();
         if hook_rewrote_input {
+            *attempt = self.capture_operation_attempt(&invocation).await;
+        }
+        if hook_rewrote_input {
             parsed_function_arguments = ParsedFunctionArguments::from_payload(&invocation.payload);
             let name = flat_tool_name(&invocation.tool_name);
             rewritten_source_dependencies =
@@ -1947,14 +2085,15 @@ impl ToolRegistry {
         // handler so a hook cannot turn a schema-valid call into an invalid one.
         if hook_rewrote_input
             && validate_arguments
-            && let Err(message) = code_mode_argument_preflight.validate(
+            && let Err(failure) = code_mode_argument_preflight.validate(
                 &tool_name,
-                tool_spec,
+                input_schema,
                 &invocation.payload,
                 parsed_function_arguments.as_ref(),
                 !external_tool,
             )
         {
+            let message = failure.to_string();
             let log_payload = invocation.payload.log_payload();
             otel.tool_result_with_tags(
                 tool_name_flat.as_ref(),
@@ -1966,12 +2105,7 @@ impl ToolRegistry {
                 &tool_result_tags,
                 &extra_trace_fields,
             );
-            let err = FunctionCallError::structured(
-                codex_protocol::tool_failure::ToolFailure::no_effects(
-                    codex_protocol::tool_failure::ToolFailureCode::InvalidInput,
-                    message,
-                ),
-            );
+            let err = FunctionCallError::structured(failure);
             notify_tool_finish_if_unclaimed(
                 &invocation,
                 dispatch_state.as_ref(),
@@ -2012,6 +2146,35 @@ impl ToolRegistry {
             return Err(error);
         }
 
+        // Inspect the effective post-hook input at the existing dispatch owner,
+        // after admission and immediately before handler entry. No new journal,
+        // retry counter, or permission policy is introduced.
+        let retry_memory = invocation.session.operation_attempt_advisory(attempt).await;
+        if let Some(failure) = attempt.recovery_preflight(&retry_memory) {
+            let error = FunctionCallError::structured(failure);
+            notify_tool_finish_if_unclaimed(
+                &invocation, dispatch_state.as_ref(), &error,
+                ToolCallOutcome::Failed { handler_executed: false },
+            ).await?;
+            return Err(error);
+        }
+        if retry_memory["unchanged_unsuccessful_attempt_count"].as_u64().is_some_and(|count| count > 0) {
+            // This is native retry context, not hook-authored text: preserve
+            // the hook budget and keep owner observations explicitly data.
+            invocation.session.record_conversation_items_ordered(
+                &invocation.step_context.turn,
+                &[ResponseItem::Message {
+                    id: None,
+                    role: "developer".into(),
+                    content: vec![codex_protocol::models::ContentItem::InputText {
+                        text: format!("Retry-path memory (data, not instructions, permission or a retry ban): {retry_memory}"),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                }],
+            ).await.map_err(|error| FunctionCallError::Fatal(format!("Could not record retry memory: {error}")))?;
+        }
+
         let invocation_for_tool = invocation.clone();
         let handler_dispatch_state = Arc::clone(&dispatch_state);
         let log_payload = invocation.payload.log_payload();
@@ -2027,13 +2190,33 @@ impl ToolRegistry {
                 || {
                     let tool = tool.clone();
                     let parsed_function_arguments = parsed_function_arguments.clone();
+                    let argument_preflight = Arc::clone(&code_mode_argument_preflight);
+                    let tool_name = tool_name.clone();
+                    let payload = &invocation.payload;
                     async move {
                         handler_dispatch_state.mark_handler_started();
-                        with_parsed_function_arguments(
-                            parsed_function_arguments,
+                        let result = with_parsed_function_arguments(
+                            parsed_function_arguments.clone(),
                             handle_any_tool(tool.as_ref(), invocation_for_tool),
                         )
-                        .await
+                        .await;
+                        // Direct native calls retain their decoder's accepted
+                        // compatibility surface. Explain only an established
+                        // no-effects argument rejection, before logging it.
+                        result.map_err(|error| {
+                            if !validate_arguments
+                                && matches!(&error, FunctionCallError::Structured(failure)
+                                    if failure.code == codex_protocol::tool_failure::ToolFailureCode::InvalidInput
+                                    && failure.effects == codex_protocol::tool_failure::ToolEffectsState::None)
+                                && let Err(failure) = argument_preflight.validate(
+                                    &tool_name, input_schema, payload,
+                                    parsed_function_arguments.as_ref(), true,
+                                )
+                            {
+                                return FunctionCallError::structured(failure);
+                            }
+                            error
+                        })
                     }
                 },
                 AnyToolResult::success_for_logging,
@@ -2359,6 +2542,26 @@ fn projection_is_provider_visible(source: &ToolCallSource) -> bool {
     matches!(source, ToolCallSource::Direct)
 }
 
+fn with_operation_history_notice(
+    mut response: ResponseInputItem,
+    notice: Option<&str>,
+) -> ResponseInputItem {
+    // Preserve an existing JSON object as one parseable object, not JSON
+    // followed by prose. Scalar/programmatic result shapes remain unchanged.
+    if let (Some(notice), ResponseInputItem::FunctionCallOutput { output, .. }
+        | ResponseInputItem::CustomToolCallOutput { output, .. }) = (notice, &mut response)
+        && let FunctionCallOutputBody::Text(text) = &mut output.body
+        && let Ok(mut value) = serde_json::from_str::<Value>(text)
+        && let Some(fields) = value.as_object_mut()
+        && let Ok(history) = serde_json::from_str::<Value>(notice)
+    {
+        fields.entry("operation_history").or_insert_with(|| history["operation_history"].clone());
+        *text = value.to_string();
+        return response;
+    }
+    with_model_delivery_notice(response, notice)
+}
+
 fn with_model_delivery_notice(
     mut response: ResponseInputItem,
     notice: Option<&str>,
@@ -2464,6 +2667,7 @@ async fn handle_any_tool(
         model_projection: None,
         source_dependencies: None,
         code_mode_feedback: Vec::new(),
+        operation_history: None,
     };
     Ok(result)
 }
@@ -2676,19 +2880,22 @@ async fn prepare_model_projection(
         ToolOutputDiagnosticClass::HighSignal => OutputDiagnosticClass::HighSignal,
     };
     let requested_limit = metadata.requested_limit;
-    let limits = resolve_projected_output_limits(
-        requested_limit,
-        outcome,
-        diagnostic_class,
-        if matches!(
-            invocation.tool_name.name.as_str(),
-            "exec_command" | "write_stdin" | "read_file"
-        ) {
-            10_000
-        } else {
-            8_000
-        },
-    );
+    let hard_limit = invocation
+        .step_context
+        .model_output_token_limit(
+            &invocation.session,
+            if matches!(
+                invocation.tool_name.name.as_str(),
+                "exec_command" | "write_stdin" | "read_file"
+            ) {
+                10_000
+            } else {
+                8_000
+            },
+        )
+        .await;
+    let limits =
+        resolve_projected_output_limits(requested_limit, outcome, diagnostic_class, hard_limit);
     // This pass only decides whether canonical recovery is needed. The actual
     // projection is rendered below; constructing and discarding a truncated
     // copy here repeats the most expensive work on oversized results.
@@ -3031,10 +3238,18 @@ pub(crate) fn authorized_tool_invocation_sha256(
     .map(|bytes| crate::tool_history::sha256(&bytes))
 }
 
-fn canonical_tool_invocation_sha256(
+pub(crate) fn canonical_tool_invocation_sha256(
     payload: &ToolPayload,
     parsed_function_arguments: Option<&ParsedFunctionArguments>,
 ) -> Option<String> {
+    let value = canonical_tool_invocation_value(payload, parsed_function_arguments)?;
+    Some(crate::tool_history::sha256(&serde_json::to_vec(&value).ok()?))
+}
+
+pub(crate) fn canonical_tool_invocation_value(
+    payload: &ToolPayload,
+    parsed_function_arguments: Option<&ParsedFunctionArguments>,
+) -> Option<Value> {
     let value = match payload {
         ToolPayload::Function { arguments } => serde_json::json!({
             "kind": "function",
@@ -3058,8 +3273,7 @@ fn canonical_tool_invocation_sha256(
             "input": input,
         }),
     };
-    let bytes = serde_json::to_vec(&canonicalize_json(&value)).ok()?;
-    Some(crate::tool_history::sha256(&bytes))
+    Some(canonicalize_json(&value))
 }
 
 fn canonical_json_argument(value: &str) -> Value {
@@ -4725,6 +4939,31 @@ fn render_projection_with_exact_metrics(envelope: &mut ToolProjectionV1) -> Opti
             "artifact_id".to_string(),
             Value::String(artifact_id.clone()),
         );
+        if !fields.contains_key("recovery") && envelope.canonical_bytes > 0 {
+            // Section ranges are authoritative canonical addresses. A partial
+            // section may include already shown bytes; do not present its full
+            // range as an exact gap or infer coordinates from rendered markers.
+            let mut selectors = envelope
+                .sections
+                .iter()
+                .filter(|section| section.inclusion == ToolProjectionInclusion::Omitted)
+                .filter_map(|section| section.canonical_range)
+                .filter(|range| range.start < range.end && range.end <= envelope.canonical_bytes)
+                .map(|range| serde_json::json!({"kind":"bytes", "start":range.start, "end":range.end}))
+                .collect::<Vec<_>>();
+            let scope = if selectors.is_empty() || selectors.len() > 64 {
+                selectors = vec![serde_json::json!({"kind":"bytes", "start":0, "end":envelope.canonical_bytes})];
+                "canonical_result"
+            } else {
+                "omitted_sections"
+            };
+            fields.insert("recovery_scope".into(), scope.into());
+            fields.insert("recovery".into(), serde_json::json!({
+                "tool":"read_tool_output", "arguments": {
+                    "artifact_id":artifact_id, "selectors":selectors
+                }
+            }));
+        }
         if !envelope.omitted_sections.is_empty() {
             fields.insert(
                 "omitted_sections".to_string(),
@@ -4845,29 +5084,18 @@ struct CompiledArgumentValidator {
 
 fn compile_code_mode_argument_validator(
     tool_name: &ToolName,
-    spec: &ToolSpec,
+    schema: Option<&Value>,
 ) -> Result<Option<CompiledArgumentValidator>, String> {
-    let parameters = match spec {
-        ToolSpec::Function(tool) => Some(&tool.parameters),
-        ToolSpec::Namespace(namespace) => namespace.tools.iter().find_map(|nested| match nested {
-            codex_tools::ResponsesApiNamespaceTool::Function(tool)
-                if tool.name == tool_name.name =>
-            {
-                Some(&tool.parameters)
-            }
-            codex_tools::ResponsesApiNamespaceTool::Function(_) => None,
-        }),
-        ToolSpec::ToolSearch { .. } | ToolSpec::WebSearch { .. } | ToolSpec::Freeform(_) => None,
-    };
-    let Some(parameters) = parameters else {
+    let Some(schema) = schema else {
         return Ok(None);
     };
-    let schema = serde_json::to_value(parameters)
-        .map_err(|err| format!("tool `{tool_name}` argument schema is invalid: {err}"))?;
-    let validator = jsonschema::validator_for(&schema).map_err(|err| {
-        format!("tool `{tool_name}` argument schema could not be compiled: {err}")
+    let validator = jsonschema::validator_for(schema).map_err(|err| {
+        format!("tool `{tool_name}` rejected before execution: argument schema could not be compiled: {}", bounded_preflight_diagnostic(err.masked()))
     })?;
-    Ok(Some(CompiledArgumentValidator { validator, schema }))
+    Ok(Some(CompiledArgumentValidator {
+        validator,
+        schema: schema.clone(),
+    }))
 }
 
 /// Property names an object schema accepts.
@@ -4883,9 +5111,8 @@ fn schema_property_names(schema: &Value) -> Vec<&str> {
         .unwrap_or_default()
 }
 
-/// Resolve a JSON pointer against the schema, following `oneOf`/`anyOf` only
-/// where the pointer itself selects a branch. Returns `None` when the pointer
-/// does not address a schema node, so no guidance is invented.
+/// Conservative instance-path fallback. Composition branches are selected by
+/// the validator's schema path below, never guessed from an instance pointer.
 fn schema_at<'a>(schema: &'a Value, pointer: &str) -> Option<&'a Value> {
     fn dereference<'a>(
         root: &'a Value,
@@ -4946,14 +5173,23 @@ fn schema_at<'a>(schema: &'a Value, pointer: &str) -> Option<&'a Value> {
     dereference(schema, node, &mut budget)
 }
 
-/// Describe the accepted shape at one rejected pointer.
+/// The validator identifies the actual failing branch, including nested
+/// oneOf/anyOf and referenced definitions. Instance paths alone lose that fact.
+fn validation_schema<'a>(
+    error: &jsonschema::ValidationError<'_>,
+    schema: &'a Value,
+) -> Option<&'a Value> {
+    error.schema_path().as_str().rsplit_once('/')
+        .and_then(|(parent, _)| schema.pointer(parent))
+        .or_else(|| schema_at(schema, error.instance_path().as_str()))
+}
+
+/// Describe the accepted shape at the validator-selected schema node.
 ///
 /// Only facts already present in the tool's own schema are reported: the
 /// accepted property names, or the named `oneOf`/`anyOf` branches with the
 /// required keys of each. Nothing is inferred about intent.
-fn accepted_shape(schema: &Value, pointer: &str) -> Option<String> {
-    let node = schema_at(schema, pointer)?;
-
+fn accepted_shape(node: &Value) -> Option<String> {
     for keyword in ["oneOf", "anyOf"] {
         if let Some(branches) = node.get(keyword).and_then(Value::as_array) {
             let described = branches
@@ -4966,21 +5202,30 @@ fn accepted_shape(schema: &Value, pointer: &str) -> Option<String> {
                         .and_then(Value::as_object)
                         .and_then(|properties| {
                             properties.iter().find_map(|(key, value)| {
-                                value
-                                    .get("const")
-                                    .and_then(Value::as_str)
-                                    .map(|constant| format!("{key}={constant}"))
+                                value.get("const")
+                                    .or_else(|| {
+                                        let values = value.get("enum")?.as_array()?;
+                                        (values.len() == 1).then(|| &values[0])
+                                    })
+                                    .map(|constant| format!("{key}={}", bounded_preflight_diagnostic(constant)))
                             })
                         });
                     let keys = schema_property_names(branch);
-                    if tag.is_none() && keys.is_empty() {
-                        return None;
-                    }
-                    let keys = if keys.is_empty() {
-                        String::new()
+                    let mut keys = if keys.is_empty() {
+                        branch.get("enum").or_else(|| branch.get("const"))
+                            .or_else(|| branch.get("type"))
+                            .map(bounded_preflight_diagnostic).unwrap_or_default()
                     } else {
                         format!("{{{}}}", keys.join(", "))
                     };
+                    if let Some(required) = branch.get("required")
+                        && required.as_array().is_some_and(|items| !items.is_empty())
+                    {
+                        keys.push_str(&format!("; required: {}", bounded_preflight_diagnostic(required)));
+                    }
+                    if tag.is_none() && keys.is_empty() {
+                        return None;
+                    }
                     // Join only when both parts exist, so an undiscriminated
                     // branch does not render with a leading space.
                     Some(match tag {
@@ -5053,25 +5298,32 @@ impl CodeModeArgumentPreflight {
     fn validate(
         &self,
         tool_name: &ToolName,
-        spec: &ToolSpec,
+        schema: Option<&Value>,
         payload: &ToolPayload,
         parsed_function_arguments: Option<&ParsedFunctionArguments>,
         native_compatibility: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), codex_protocol::tool_failure::ToolFailure> {
+        use codex_protocol::tool_failure::{ToolFailure, ToolFailureCode, ToolFieldError};
+        let reject = |message| ToolFailure::no_effects(ToolFailureCode::InvalidInput, message);
         let ToolPayload::Function { arguments } = payload else {
             return Ok(());
         };
-        if native_compatibility && tool_name.namespace.is_none() && tool_name.name == "exec_command"
-        {
-            return crate::tools::handlers::validate_exec_command_arguments(arguments).map_err(
-                |message| format!("tool `{tool_name}` argument preflight failed: {message}"),
-            );
-        }
-        if native_compatibility && tool_name.namespace.is_none() && tool_name.name == "read_file" {
-            return crate::tools::handlers::validate_read_file_arguments(arguments).map_err(
-                |message| format!("tool `{tool_name}` argument preflight failed: {message}"),
-            );
-        }
+        // Preserve the native decoders' compatibility rules. Consult the
+        // advertised validator only to explain an already rejected payload.
+        let native_rejection = if native_compatibility && tool_name.namespace.is_none() {
+            match tool_name.name.as_str() {
+                "exec_command" => Some(crate::tools::handlers::validate_exec_command_arguments(arguments)),
+                "read_file" => Some(crate::tools::handlers::validate_read_file_arguments(arguments)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let native_rejection = match native_rejection {
+            Some(Ok(())) => return Ok(()),
+            Some(Err(message)) => Some(message),
+            None => None,
+        };
         // The schema can only list snapshot selector kinds; name the section
         // selector that replaces a read_file-only one.
         if native_compatibility
@@ -5080,78 +5332,185 @@ impl CodeModeArgumentPreflight {
             && let Some(hint) =
                 crate::tools::handlers::read_tool_output_file_only_selector_hint(arguments)
         {
-            return Err(format!("tool `{tool_name}` argument preflight failed: {hint}"));
+            return Err(reject(format!("tool `{tool_name}` rejected before execution: {hint}")));
         }
         let value = parsed_function_arguments
             .and_then(|parsed| parsed.value().ok())
             .cloned()
             .ok_or_else(|| {
-                let message = parsed_function_arguments
-                    .and_then(|parsed| parsed.value().err())
-                    .unwrap_or("unknown JSON parse error");
-                format!("tool `{tool_name}` arguments are not valid JSON: {message}")
+                match serde_json::from_str::<Value>(arguments) {
+                    Err(error) => ToolFailure::invalid_json(error.line(), error.column()),
+                    Ok(_) => ToolFailure::no_effects(ToolFailureCode::Failed,
+                        "Parsed argument representation is unavailable; inspect the original call receipt."),
+                }
             })?;
         if !value.is_object() {
-            return Err(format!(
-                "tool `{tool_name}` expects a JSON object for arguments"
+            let mut failure = reject(format!(
+                "tool `{tool_name}` rejected before execution: $: expected a JSON object for arguments"
             ));
+            failure.field_errors.push(ToolFieldError {
+                path: String::new(), expected: "a JSON object".into(),
+                correction: "Supply named arguments as a JSON object, not an array or scalar.".into(),
+            });
+            return Err(failure);
         }
 
-        let validator = self.validator.get_or_init(|| {
-            compile_code_mode_argument_validator(tool_name, spec)
+        let validator = self
+            .validator
+            .get_or_init(|| compile_code_mode_argument_validator(tool_name, schema));
+        let validator = validator.as_ref().map_err(|message| {
+            ToolFailure::no_effects(ToolFailureCode::Failed, message.clone())
+        })?;
+        let diagnostic = validator.as_ref().and_then(|compiled| {
+            argument_schema_diagnostic(&compiled.validator, &compiled.schema, &value)
         });
-        let validator = validator.as_ref().map_err(Clone::clone)?;
-        let Some(compiled) = validator else {
-            return Ok(());
-        };
-        let mut errors = compiled.validator.iter_errors(&value);
-        let messages = errors
-            .by_ref()
-            .take(4)
-            .map(|error| {
-                let pointer = error.instance_path().as_str();
-                let path = if pointer.is_empty() {
-                    "$".to_string()
-                } else {
-                    format!("${}", bounded_preflight_diagnostic(pointer))
-                };
-                // Append the accepted shape from the tool's own schema. Without
-                // it the model only learns which key was wrong, not which keys
-                // exist, and a retry can repeat the same rejected call.
-                let message = bounded_preflight_diagnostic(&error);
-                let message = if message.ends_with("[diagnostic truncated]") {
-                    let constraint = bounded_preflight_diagnostic(error.schema_path());
-                    let expected = compiled
-                        .schema
-                        .pointer(error.schema_path().as_str())
-                        .map(bounded_preflight_diagnostic)
-                        .unwrap_or_default();
-                    format!("{message} (constraint {constraint}: {expected})")
-                } else {
-                    message
-                };
-                match accepted_shape(&compiled.schema, pointer) {
-                    Some(shape) => format!(
-                        "{path}: {message} ({})",
-                        bounded_preflight_diagnostic(shape)
-                    ),
-                    None => format!("{path}: {message}"),
-                }
-            })
-            .collect::<Vec<_>>();
-        if messages.is_empty() {
-            return Ok(());
+        match diagnostic.or_else(|| native_rejection.map(reject)) {
+            Some(mut failure) => {
+                failure.message = format!("tool `{tool_name}` rejected before execution: {}", failure.message);
+                Err(failure)
+            }
+            None => Ok(()),
         }
-        let suffix = errors
-            .next()
-            .is_some()
-            .then_some("; additional errors omitted");
-        Err(format!(
-            "tool `{tool_name}` argument preflight failed: {}{}",
-            messages.join("; "),
-            suffix.unwrap_or_default()
-        ))
     }
+}
+
+/// Reuse validator facts, never rejected values. Shared by registry preflight
+/// and MCP's canonical-schema check after hooks; neither path repairs arguments.
+pub(crate) fn argument_schema_diagnostic(
+    validator: &jsonschema::Validator,
+    schema: &Value,
+    value: &Value,
+) -> Option<codex_protocol::tool_failure::ToolFailure> {
+    use codex_protocol::tool_failure::{ToolFailure, ToolFailureCode, ToolFieldError};
+
+    fn member_path(parent: &str, name: &str) -> String {
+        format!("{parent}/{}", name.replace('~', "~0").replace('/', "~1"))
+    }
+
+    fn field_errors(error: &jsonschema::ValidationError<'_>, schema: &Value) -> Vec<ToolFieldError> {
+        use jsonschema::error::ValidationErrorKind;
+        let pointer = error.instance_path().as_str();
+        let node = validation_schema(error, schema);
+        let (paths, expected, correction) = match error.kind() {
+            ValidationErrorKind::Required { property } => {
+                let path = property.as_str().map(|name| member_path(pointer, name))
+                    .unwrap_or_else(|| pointer.to_string());
+                let property_schema = node.and_then(|node| node.get("properties"))
+                    .and_then(|properties| properties.get(property.as_str()?))
+                    .or_else(|| schema_at(schema, &path));
+                let expected = property_schema.and_then(|node| node.get("enum").or_else(|| node.get("const")).or_else(|| node.get("type")))
+                    .map(bounded_preflight_diagnostic)
+                    .unwrap_or_else(|| "a value for this required property".into());
+                (vec![path], expected, "Supply this required field using the advertised contract.")
+            }
+            ValidationErrorKind::AdditionalProperties { unexpected }
+            | ValidationErrorKind::UnevaluatedProperties { unexpected } => (
+                unexpected.iter().take(13).map(|name| member_path(pointer, name)).collect(),
+                node.and_then(accepted_shape).unwrap_or_else(|| "only properties accepted by the advertised schema".into()),
+                "Remove this unsupported field; use an advertised property instead.",
+            ),
+            // Do not display the rejected key or the nested unmasked instance.
+            ValidationErrorKind::PropertyNames { error } => (
+                vec![pointer.to_string()], bounded_preflight_diagnostic(error.masked()),
+                "Use property names satisfying the advertised propertyNames constraint.",
+            ),
+            ValidationErrorKind::AnyOf { .. } | ValidationErrorKind::OneOfNotValid { .. }
+            | ValidationErrorKind::OneOfMultipleValid { .. } => (
+                vec![pointer.to_string()], node.and_then(accepted_shape)
+                    .unwrap_or_else(|| "the advertised schema alternatives".into()),
+                "Choose an advertised form and satisfy its fields; branch diagnostics are alternatives, not cumulative requirements.",
+            ),
+            ValidationErrorKind::Custom { .. } => (
+                vec![pointer.to_string()], "the advertised custom constraint".into(),
+                "Correct this field using the advertised contract.",
+            ),
+            ValidationErrorKind::Enum { options } => (
+                vec![pointer.to_string()], format!("allowed values: {}", bounded_preflight_diagnostic(options)),
+                "Choose one of the allowed values without changing other arguments.",
+            ),
+            _ => (vec![pointer.to_string()], bounded_preflight_diagnostic(error.masked()),
+                "Set this field to a value satisfying the stated constraint."),
+        };
+        paths.into_iter().map(|path| ToolFieldError {
+            path, expected: expected.clone(), correction: correction.into(),
+        }).collect()
+    }
+
+    fn describe(error: &jsonschema::ValidationError<'_>, schema: &Value) -> String {
+        use jsonschema::error::ValidationErrorKind;
+
+        let message = match error.kind() {
+            // jsonschema's masked PropertyNames display delegates to the
+            // unmasked nested error, whose instance is the rejected key.
+            ValidationErrorKind::PropertyNames { error } => return describe(error, schema),
+            ValidationErrorKind::Custom { .. } => "custom schema constraint failed".to_string(),
+            ValidationErrorKind::Enum { options } => {
+                format!("allowed values: {}", bounded_preflight_diagnostic(options))
+            }
+            _ => bounded_preflight_diagnostic(error.masked()),
+        };
+        let pointer = error.instance_path().as_str();
+        let path = bounded_preflight_diagnostic(format_args!("${pointer}"));
+        let constraint = bounded_preflight_diagnostic(error.schema_path());
+        let mut description = format!("{path}: {message} (schema {constraint})");
+        if let Some(shape) = validation_schema(error, schema).and_then(accepted_shape) {
+            description.push_str(&format!(" ({})", bounded_preflight_diagnostic(shape)));
+        }
+        description
+    }
+
+    fn append(
+        error: &jsonschema::ValidationError<'_>,
+        schema: &Value,
+        messages: &mut Vec<String>,
+        fields: &mut Vec<ToolFieldError>,
+        remaining: &mut usize,
+    ) -> bool {
+        use jsonschema::error::ValidationErrorKind;
+
+        if *remaining == 0 {
+            return true;
+        }
+        *remaining -= 1;
+        messages.push(describe(error, schema));
+        let rejected_fields = field_errors(error, schema);
+        let omitted = fields.len() + rejected_fields.len() > 12;
+        fields.extend(rejected_fields.into_iter().take(12_usize.saturating_sub(fields.len())));
+        if let ValidationErrorKind::AnyOf { context }
+        | ValidationErrorKind::OneOfNotValid { context } = error.kind()
+        {
+            // Branch errors are supplied by this validation, not another pass
+            // or a guessed choice of the caller's intended branch.
+            for branch in context {
+                for error in branch {
+                    if append(error, schema, messages, fields, remaining) {
+                        return true;
+                    }
+                }
+            }
+        }
+        omitted
+    }
+
+    let mut errors = validator.iter_errors(value);
+    let mut messages = Vec::new();
+    let mut fields = Vec::new();
+    let mut remaining = 12;
+    let mut omitted = false;
+    for error in errors.by_ref().take(4) {
+        omitted |= append(&error, schema, &mut messages, &mut fields, &mut remaining);
+    }
+    omitted |= errors.next().is_some();
+    if messages.is_empty() {
+        return None;
+    }
+    if omitted {
+        messages.push("additional errors omitted".to_string());
+    }
+    let mut failure = ToolFailure::no_effects(ToolFailureCode::InvalidInput, messages.join("; "));
+    failure.field_errors = fields;
+    failure.details = Some(serde_json::json!({"field_errors_complete": !omitted}));
+    Some(failure)
 }
 
 fn function_hook_tool_input(arguments: &str) -> Value {
@@ -5168,14 +5527,29 @@ fn function_hook_tool_input(arguments: &str) -> Value {
     }
 }
 
-fn unsupported_tool_call_message(payload: &ToolPayload, tool_name: &ToolName) -> String {
+fn unsupported_tool_call_message(
+    payload: &ToolPayload,
+    tool_name: &ToolName,
+    tools: &HashMap<ToolName, RegisteredTool>,
+) -> String {
     let message = match payload {
         ToolPayload::Custom { .. } => format!("unsupported custom tool call: {tool_name}"),
         _ => format!("unsupported call: {tool_name}"),
     };
-    format!(
-        "{message}. No tool was run. Use an exact name from the current tool declarations; if tool_search is available, use it to discover and activate a missing tool. In code mode, inspect ALL_TOOL_NAMES and resolve_tool(name) before retrying."
-    )
+    let leaf = tool_name.name.rsplit('.').next().unwrap_or(&tool_name.name);
+    let mut alternatives = tools.keys()
+        .filter(|name| name.name == tool_name.name || name.name == leaf)
+        .map(ToString::to_string).collect::<Vec<_>>();
+    alternatives.sort();
+    let mut message = format!("{message}. Rejected before execution; no tool was run. Use an exact name and call form from the current tool declarations.");
+    if !alternatives.is_empty() {
+        message.push_str(&format!(" Current catalog names with this leaf: {}. These are name corrections, not proof of equivalent behavior or permission.", alternatives.join(", ")));
+    }
+    if tools.keys().any(|name| name.namespace.is_none() && name.name == "tool_search") {
+        message.push_str(" The registered tool_search can discover and activate tools; inspect its current contract.");
+    }
+    message.push_str(" Preserve earlier results and effects; this rejection does not authorize replaying other operations.");
+    message
 }
 
 

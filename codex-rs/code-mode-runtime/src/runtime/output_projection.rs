@@ -37,6 +37,13 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
   const objectPrototype = Object.prototype;
   const arrayPrototype = Array.prototype;
   const projections = new WeakMap();
+  // Native response identity is independent of display eligibility. A clone or
+  // caller-selected formatter must never manufacture extraction provenance.
+  const sources = new WeakMap();
+  const sourceOf = sources.get.bind(sources);
+  const setSource = sources.set.bind(sources);
+  const sourceSnapshot = source => source.baseline?.original ??
+    parseExact(source.baseline?.serialized ?? source.serialized);
   const lookup = projections.get.bind(projections);
   const set = projections.set.bind(projections);
   const get = value => {
@@ -47,7 +54,7 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
     if (root.lazy) {
       root.projected = projectTool(root.serialized, root.namespace, root.toolName);
       root.disabled = root.projected === undefined;
-      if (!root.disabled) root.original = parseExact(root.serialized);
+      if (!root.disabled || root.extractionSource) root.original = parseExact(root.serialized);
       root.lazy = false;
       delete root.serialized;
     }
@@ -203,7 +210,7 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
           keys(value).filter(key => !(array && key === 'length'));
       } catch { return '[error evidence unavailable]'; }
       if (controlsFirst) {
-        const controls = ['tool_failure', 'code', 'effects', 'retry_safe', 'safe_next_actions', 'live_operations',
+        const controls = ['tool_failure', 'code', 'effects', 'retry_safe', 'safe_next_actions', 'live_operations', 'field_errors',
           'status', 'artifact_id', 'session_id', 'recovery', 'continuation',
           'complete', 'execution_state', 'exit_code', 'process_exited', 'session_capabilities',
           'name', 'message', 'reason', 'step_id', 'terminal', 'value', 'initial', 'observations',
@@ -605,12 +612,146 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
       return item;
     };
   }
+  function extractResult(value, options) {
+    const fail = message => { throw new TypeError('extract_result: ' + message); };
+    const source = value && typeof value === 'object' && !isProxy(value) ? sourceOf(value) : undefined;
+    if (!source || !inert(value, new Set())) fail('requires an unmodified native tool result');
+    const snapshot = sourceSnapshot(source);
+    if (!same(value, snapshot)) fail('native tool result was modified');
+    if (!inert(options, new Set())) fail('options must contain inert data');
+    const encode = item => {
+      try { return stringify(item, canonicalReplacer(1024 * 1024)); }
+      catch (error) { if (error === budgetExceeded) fail('formatted result exceeds 1 MiB'); throw error; }
+    };
+    encode(options);
+    const shape = (object, required, optional = []) => {
+      if (!object || typeof object !== 'object' || isArray(object) ||
+          keys(object).some(key => !descriptor(object, key).enumerable ||
+            (!required.includes(key) && !optional.includes(key))) ||
+          required.some(key => !descriptor(object, key))) fail('invalid declaration fields');
+    };
+    // JSON object equality is independent of member order and whether the
+    // caller used a null prototype; mutation guards intentionally are not.
+    const equal = (left, right, depth = 0) => {
+      if (left === right) return true;
+      if (depth >= 128 || left === null || right === null ||
+          typeof left !== 'object' || typeof right !== 'object' || isArray(left) !== isArray(right)) return false;
+      const names = keys(left);
+      return names.length === keys(right).length && names.every(key => {
+        const field = descriptor(right, key);
+        return field && equal(descriptor(left, key).value, field.value, depth + 1);
+      });
+    };
+    const pointer = path => {
+      if (typeof path !== 'string' || (path !== '' && !path.startsWith('/')) ||
+          /~(?:[^01]|$)/.test(path)) fail('requires exact RFC 6901 pointers');
+      return path === '' ? [] : path.slice(1).split('/').map(key => key.replace(/~1/g, '/').replace(/~0/g, '~'));
+    };
+    const at = (object, path) => {
+      for (const key of pointer(path)) {
+        if (object === null || typeof object !== 'object' ||
+            (isArray(object) && !/^(0|[1-9][0-9]*)$/.test(key))) fail('missing value at ' + path);
+        const field = descriptor(object, key);
+        if (!field || !('value' in field)) fail('missing value at ' + path);
+        object = field.value;
+      }
+      return object;
+    };
+    shape(options, ['fields', 'format'], ['row']);
+    const {fields, format} = options;
+    if (!isArray(fields) || fields.length < 1 || fields.length > 64 ||
+        !['json', 'text', 'csv', 'tsv'].includes(format)) fail('requires 1..64 fields and an explicit json/text/csv/tsv format');
+    let selected = snapshot, prefix = '';
+    const rowField = descriptor(options, 'row');
+    if (rowField) {
+      const row = rowField.value;
+      shape(row, ['pointer', 'where']);
+      const rows = at(snapshot, row.pointer);
+      if (!isArray(rows) || !isArray(row.where) || row.where.length < 1 || row.where.length > 64)
+        fail('row requires an array pointer and 1..64 equality predicates');
+      for (const filter of row.where) {
+        shape(filter, ['pointer', 'value']);
+        pointer(filter.pointer);
+      }
+      let found = -1;
+      for (let index = 0; index < rows.length; ++index) {
+        // A missing predicate field is not an equal value, even for null.
+        const matches = row.where.every(filter => {
+          let field = rows[index];
+          for (const key of pointer(filter.pointer)) {
+            if (!field || typeof field !== 'object' ||
+                (isArray(field) && !/^(0|[1-9][0-9]*)$/.test(key))) return false;
+            const member = descriptor(field, key);
+            if (!member || !('value' in member)) return false;
+            field = member.value;
+          }
+          return equal(field, filter.value);
+        });
+        if (!matches) continue;
+        if (found !== -1) fail('ambiguous row: more than one match');
+        found = index;
+      }
+      if (found === -1) fail('missing row: no match');
+      selected = rows[found];
+      prefix = row.pointer + '/' + found;
+    }
+    const values = Object.create(null), pointers = Object.create(null), seen = new Set();
+    for (const field of fields) {
+      shape(field, ['name', 'pointer']);
+      if (typeof field.name !== 'string' || field.name.length === 0 || seen.has(field.name))
+        fail('field names must be nonempty and unique');
+      seen.add(field.name);
+      values[field.name] = at(selected, field.pointer);
+      pointers[field.name] = prefix + field.pointer;
+    }
+    // Bound selected data before allocating delimited or textual copies.
+    const json = encode(values);
+    const scalar = item => {
+      if (item === null || !['string', 'number', 'boolean', 'bigint'].includes(typeof item))
+        fail('text/csv/tsv require non-null scalar values');
+      return NativeString(item);
+    };
+    let text;
+    if (format === 'json') text = json;
+    else if (format === 'text') {
+      if (fields.length !== 1) fail('text requires exactly one field');
+      text = scalar(values[fields[0].name]);
+    } else {
+      const delimiter = format === 'csv' ? ',' : '\t';
+      const quote = item => {
+        const text = scalar(item);
+        return text.includes(delimiter) || /["\r\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+      };
+      text = fields.map(field => quote(field.name)).join(delimiter) + '\r\n' +
+        fields.map(field => quote(values[field.name])).join(delimiter) + '\r\n';
+    }
+    const identity = Object.create(null);
+    for (const key of ['path', 'artifact_id', 'source_thread_id', 'source_sha256', 'canonical_sha256',
+      'source_encoding', 'selector_encoding', 'selector_coordinate_space', 'environment_id', 'canonical_uri',
+      'git_source', '_meta', 'session_id', 'session_capabilities', 'raw_output_artifact_id',
+      'complete', 'file_complete', 'retained_artifact_complete', 'coverage_complete']) {
+      const field = descriptor(snapshot, key);
+      if (field) identity[key] = field.value;
+    }
+    // Clone through the captured exact codec. Scripts may edit the return
+    // value without changing native source identity or the selection recipe.
+    return parseExact(encode({text, values, provenance: {tool: source.tool, runtime_tool_call_id: source.callId,
+      source: identity, selection: options, pointers}}));
+  }
   return function project(value, original, projected, sourceFragments) {
-    if (arguments.length === 5) {
+    if (arguments.length === 5 || arguments.length === 6) {
+      const native = arguments[5];
+      setSource(value, {serialized: original, tool: {namespace: projected, name: sourceFragments}, callId: native?.callId});
+      if (native && !native.presentation) return;
       // Retain the transport string as an immutable mutation baseline. The
       // extra object graphs and display projection exist only when observed.
       const root = {lazy: true, serialized: original, namespace: projected,
-        toolName: sourceFragments, sourceFragments: arguments[4]};
+        toolName: sourceFragments, sourceFragments: arguments[4], extractionSource: true};
+      // Share the existing mutation baseline instead of retaining a second
+      // transport body or reparsing it during extraction and storage capture.
+      const source = sourceOf(value);
+      source.baseline = root;
+      delete source.serialized;
       set(value, root);
       if (root.sourceFragments && Array.isArray(value.results)) {
         const rows = (values, path) => {
@@ -646,6 +787,9 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
       };
       const visit = (item, path, depth) => {
         if (!item || typeof item !== 'object' || depth >= 128) return;
+        const source = sourceOf(item);
+        if (source && same(item, sourceSnapshot(source)))
+          records.push({path, extractionTool: source.tool, extractionCallId: source.callId});
         const entry = get(item);
         if (entry && same(item, entry.original) && (!entry.root || same(entry.root, entry.rootOriginal))) {
           const display = entry.fragment ? standaloneFragment(entry.projected, entry.rootOriginal) : entry.projected;
@@ -673,6 +817,11 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
         let target = value;
         for (const key of record.path) target = descriptor(target, key)?.value;
         if (!target || typeof target !== 'object') continue;
+        if (record.extractionTool) {
+          setSource(target, {serialized: project(target, 'serialize'), tool: record.extractionTool,
+            callId: record.extractionCallId});
+          continue;
+        }
         let display = clone(target);
         for (const edit of record.edits) {
           if (!edit.path.length) { display = edit.value; continue; }
@@ -692,6 +841,7 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
       }
       return;
     }
+    if (arguments.length === 3 && original === 'extract_result') return extractResult(value, projected);
     // The transport codec shares this cell-owned, captured serializer, not
     // script-overridable JSON methods. BigInt never silently becomes Number.
     if (arguments.length === 3 && original === 'graph_evidence') {
@@ -939,6 +1089,29 @@ fn project_tool_callback(
     }
 }
 
+pub(super) fn extract_result_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue<v8::Value>,
+) {
+    let function = scope
+        .get_slot::<RuntimeState>()
+        .and_then(|state| state.output_projector.as_ref())
+        .map(|function| v8::Local::new(scope, function));
+    let Some(function) = function else {
+        super::value::throw_type_error(scope, "result extractor unavailable");
+        return;
+    };
+    let Some(mode) = v8::String::new(scope, "extract_result") else {
+        super::value::throw_type_error(scope, "failed to allocate result extraction mode");
+        return;
+    };
+    let receiver = v8::undefined(scope).into();
+    if let Some(value) = function.call(scope, receiver, &[args.get(0), mode.into(), args.get(1)]) {
+        retval.set(value);
+    }
+}
+
 fn is_proxy_callback(
     _scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -1006,20 +1179,26 @@ pub(super) fn tool_result_to_v8<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     raw: &Value,
     tool: &codex_protocol::ToolName,
+    runtime_tool_call_id: &str,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
     let serialized = serde_json::to_string(raw).map_err(|error| error.to_string())?;
     let json = v8::String::new(scope, &serialized)
         .ok_or_else(|| "failed to allocate tool response".to_string())?;
     let value = json_codec(scope, json.into(), "parse")
         .ok_or_else(|| "failed to parse tool response".to_string())?;
-    // Keep this eligibility list aligned with model_visible_tool_result. Other
-    // tools need no display recipe or retained transport snapshot at all.
-    if !raw.is_object() || (tool.namespace.is_none() && !tool.name.starts_with("mcp__")
-        && !matches!(tool.name.as_str(), "update_plan" | "apply_patch" | "read_file"
-            | "read_tool_output" | "exec_command" | "write_stdin"))
-    {
+    if !raw.is_object() && !raw.is_array() {
         return Ok(value);
     }
+    // All structured native results retain extraction identity; only the
+    // existing eligible envelopes acquire lazy display recipes.
+    let presentation = raw.is_object()
+        && (tool.namespace.is_some() || tool.name.starts_with("mcp__")
+            || matches!(tool.name.as_str(), "update_plan" | "apply_patch" | "read_file"
+                | "read_tool_output" | "exec_command" | "write_stdin"));
+    let native = json_to_v8(scope, &serde_json::json!({
+        "presentation": presentation,
+        "callId": runtime_tool_call_id,
+    })).ok_or_else(|| "failed to allocate native result identity".to_string())?;
     let namespace: v8::Local<v8::Value> = match tool.namespace.as_deref() {
         Some(namespace) => v8::String::new(scope, namespace)
             .ok_or_else(|| "failed to allocate projection namespace".to_string())?.into(),
@@ -1034,7 +1213,7 @@ pub(super) fn tool_result_to_v8<'s>(
         .map(|function| v8::Local::new(scope, function))
         .ok_or_else(|| "output projector unavailable".to_string())?;
     let receiver = v8::undefined(scope).into();
-    function.call(scope, receiver, &[value, json.into(), namespace, name.into(), fragments.into()])
+    function.call(scope, receiver, &[value, json.into(), namespace, name.into(), fragments.into(), native])
         .ok_or_else(|| "failed to register lazy output projection".to_string())?;
     Ok(value)
 }

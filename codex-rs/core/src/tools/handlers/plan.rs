@@ -34,9 +34,6 @@ const PLAN_UNCHANGED_MESSAGE: &str = "Plan unchanged";
 impl PlanToolOutput {
     fn response_result(&self) -> JsonValue {
         let mut response = self.response_with_lineage(false);
-        if let Some(fields) = response.as_object_mut() {
-            fields.remove("obligations");
-        }
         if let Some(lineage) = response.get_mut("lineage").and_then(JsonValue::as_object_mut) {
             lineage.remove("requirements");
             lineage.remove("step_requirements");
@@ -45,6 +42,7 @@ impl PlanToolOutput {
             fields.remove("lineage");
             // This is a display projection, not a full replay authority.
             fields.insert("lineage_complete".into(), JsonValue::Bool(false));
+            fields.insert("pinned_requirements".into(), serde_json::json!(self.lineage.pinned_requirements()));
             let remaining = self.lineage.remaining_requirements(&self.current_plan);
             if !remaining.is_empty() {
                 fields.insert("remaining_requirements".into(), serde_json::json!(remaining));
@@ -194,9 +192,10 @@ impl PlanHandler {
                 ))
             })?;
         requested_args.sampling_revision = step_context.plan_sampling_revision.clone();
-        if requested_args.plan.is_some() == requested_args.set.is_some() {
+        if usize::from(requested_args.plan.is_some()) + usize::from(requested_args.set.is_some())
+            + usize::from(!requested_args.pin.is_empty()) != 1 {
             return Err(FunctionCallError::RespondToModel(
-                "provide exactly one of plan or set".to_string(),
+                "provide exactly one of plan, set or a nonempty pin".to_string(),
             ));
         }
         let active = requested_args
@@ -241,7 +240,7 @@ impl PlanHandler {
             };
             // Lazy provenance lookup: no input journal, prompt projection, or
             // history scan on ordinary requests or status-only plan updates.
-            let scope_guard = if (!requested_args.superseded.is_empty()
+            let scope_guard = if (!requested_args.pin.is_empty() || !requested_args.superseded.is_empty()
                 || !requested_args.scope_change_instructions.is_empty()
                 || !requested_args.scope_change_refs.is_empty()) && requested_args.needs_scope_inputs(
                 session.services.plan_store.snapshot().await.as_ref(),

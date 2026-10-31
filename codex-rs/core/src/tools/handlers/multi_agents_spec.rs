@@ -127,6 +127,12 @@ pub fn create_send_message_tool() -> ToolSpec {
         // vocabulary. Accepting it avoids failing the whole cell, along with any
         // unrelated work batched before the call, over a spelling.
         ("task_name".to_string(), task_name_alias_schema()),
+        ("message_id".into(), JsonSchema::string(Some("Optional retry identity (1..256 bytes), scoped to sender and recipient. Reuse only for the identical message. The returned acknowledgment confirms queue admission or prior acceptance, not consumption or task completion.".into()))),
+        ("progress".into(), JsonSchema { description: Some("Opt-in replaceable progress snapshot only. Never set on results, errors, blockers, control messages or meaningful transitions. Coalesces queued snapshots by sender/recipient/task/attempt and increasing revision, without crossing ordinary-message barriers. Does not authorize progress reporting or ancestor messages.".into()), ..JsonSchema::object(BTreeMap::from([
+            ("task_id".into(), JsonSchema::string(Some("Nonempty task identity, at most 256 bytes.".into()))),
+            ("attempt_id".into(), JsonSchema::string(Some("Nonempty attempt identity, at most 256 bytes; use a new identity for a retry.".into()))),
+            ("revision".into(), JsonSchema { minimum: Some(0.into()), maximum: Some(9_007_199_254_740_991_u64.into()), ..JsonSchema::integer(Some("Monotonically increasing revision within this task and attempt. Older/equal revisions are acknowledged without redelivery.".into())) }),
+        ]), Some(vec!["task_id".into(), "attempt_id".into(), "revision".into()]), Some(false.into())) }),
         (
             "message".to_string(),
             JsonSchema::string(Some(
@@ -194,7 +200,7 @@ pub fn create_followup_task_tool() -> ToolSpec {
 pub fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "wait_agent".to_string(),
-        description: "Wait for input or durable task progress without ending the caller's turn. For a quiet-window release or slot grant, set mailbox_only:true and omit timeout_ms: this waits for mailbox, deferred-result or new user input even when the caller's descendants have all settled. The default also observes durable task progress and returns immediately when owned assignments have settled. Returns at the first event, not when agents finish. On an input wake, return from the exec cell and process that input; empty typed_deltas alone is not a reason to wait again. If the required release/grant has not arrived, keep waiting in-turn, not a final Paused response. Default-mode admission bookkeeping and already-delivered completion events are folded internally. Omit cursor to use the retained position; supply one only to replay. Does not return message content: it arrives on your next request."
+        description: "Wait in-turn. Supply nonempty targets (child task names or thread IDs) for selected-child completion subscriptions; completion_mode is any (default) or all. Pins current producer attempts, returns durable terminal outcomes and exact result_recovery references, not deliverable acceptance. No status polling, mailbox consumption, cursor advancement or worker cancellation; cancellation/deadline returns partial outcomes and pending obligations. Independent of unrelated mail; omit targets for the existing progress/input wait. For a quiet-window release or slot grant, set mailbox_only:true and omit timeout_ms: waits for mailbox, deferred-result or new user input even when descendants settled. Default progress mode returns at the first event, not necessarily completion, or immediately when owned assignments settled. On input wake return from the exec cell and process input. Empty typed_deltas alone is not a reason to wait again. If a required release/grant has not arrived, keep waiting in-turn. Default-mode admission bookkeeping and delivered completion events are folded internally. Omit cursor to retain position; supply one only to replay. Message content arrives on your next request."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -339,14 +345,36 @@ pub(super) fn spawn_agent_output_schema_v2(hide_agent_metadata: bool) -> Value {
         "properties": {
             "task_name": {"type": "string"},
             "assignment_id": {"type": "string"},
-            "integration_plan": integration_plan
+            "integration_plan": integration_plan,
+            "effective_capabilities": {"type": "object", "description": "Launch-time backend/model/workspace and inherited restriction snapshot; configuration_revision binds its identity. Advisory only, never a permission grant."},
+            "overlap_warnings": {
+                "type": "array",
+                "description": "Admission-time advisories, never rejection or reuse. Potential duplicates differ from declared independent verification and scope-only overlap.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "assignment_id": {"type": "string"},
+                        "attempt_id": {"type": "string"},
+                        "task_name": {"type": ["string", "null"]},
+                        "agent_path": {"type": ["string", "null"]},
+                        "thread_id": {"type": ["string", "null"]},
+                        "kind": {"enum": ["potential_duplicate", "independent_verification", "related_work"]},
+                        "objective_matches": {"type": "boolean"},
+                        "deliverable_overlap": {"type": "boolean"},
+                        "contract_overlap": {"type": "boolean"},
+                        "scope_overlap": {"type": "boolean"}
+                    },
+                    "required": ["assignment_id", "attempt_id", "task_name", "agent_path", "thread_id", "kind", "objective_matches", "deliverable_overlap", "contract_overlap", "scope_overlap"],
+                    "additionalProperties": false
+                }
+            }
         },
-        "required": ["task_name", "assignment_id", "integration_plan"],
+        "required": ["task_name", "assignment_id", "integration_plan", "overlap_warnings"],
         "additionalProperties": false
     });
     if !hide_agent_metadata {
         spawned["properties"]["nickname"] = json!({"type": ["string", "null"]});
-        spawned["required"] = json!(["task_name", "nickname", "assignment_id", "integration_plan"]);
+        spawned["required"] = json!(["task_name", "nickname", "assignment_id", "integration_plan", "overlap_warnings"]);
     }
     let reused = json!({
         "type": "object",
@@ -468,7 +496,21 @@ fn wait_output_schema_v2() -> Value {
             },
             "timed_out": {
                 "type": "boolean",
-                "description": "Whether the wait call returned because no mailbox update arrived before the timeout."
+                "description": "Whether the wait ended at its explicit or enclosing deadline."
+            },
+            "completion": {
+                "type": "object",
+                "description": "Selected-child result: reason completed/cancelled/timed_out, mode any/all, terminal outcomes with exact attempt recovery, pending bindings (or unresolved_targets during setup), acceptance:not_evaluated. Completed is lifecycle only.",
+                "properties": {
+                    "reason": {"enum": ["completed", "cancelled", "timed_out"]},
+                    "mode": {"enum": ["any", "all"]},
+                    "outcomes": {"type": "array", "items": {"type": "object", "additionalProperties": true}},
+                    "pending": {"type": "array", "items": {"type": "object", "additionalProperties": true}},
+                    "unresolved_targets": {"type": "array", "items": {"type": "string"}},
+                    "acceptance": {"const": "not_evaluated"}
+                },
+                "required": ["reason", "mode", "outcomes", "acceptance"],
+                "additionalProperties": false
             },
             "cursor": {
                 "type": ["string", "null"],
@@ -532,6 +574,10 @@ fn spawn_agent_common_properties_v2(
         .map(|guidance| format!(" {guidance}"))
         .unwrap_or_default();
     BTreeMap::from([
+        (
+            "independent_verification".to_string(),
+            JsonSchema::boolean(Some("Default false. Declare intentionally independent verification rather than redundant implementation. Changes advisory overlap classification only, not permissions, runtime profile or acceptance.".into())),
+        ),
         (
             "message".to_string(),
             JsonSchema::string(Some(
@@ -610,7 +656,7 @@ The `message` must include the task type, intended read/write scope, category in
 Launch authorized independent assignments in the same batch, not a serial spawn loop. In exec, use bounded Promise.allSettled and retain every success and failure; failed siblings do not justify respawning successes.
 Sequence only real dependencies or shared-resource conflicts. Integrate completions with the next substantive step/final, not an acknowledgment-only model round.
 It can message its children and peers, but cannot message ancestors. Its final answer and terminal outcome are delivered to its parent automatically when it finishes.
-Supply `message` (or its `prompt`/`instructions` alias). Each task is durably tracked with a repository-wide diagnostic claim and returns an `assignment_id`; overlap is recorded without rejecting it. The host records the final outcome automatically, without a role-specific receipt workflow.
+Supply `message` (or its `prompt`/`instructions` alias). Each task is durably tracked with a repository-wide diagnostic claim and returns an `assignment_id` and `overlap_warnings` identifying active task/attempt/worker IDs. These compare effective contracts, declared scopes and deliverables before launch and are advisory, not proof of redundancy or grounds to reject/reuse work. Set independent_verification:true for intentional independent checking; resemblance alone never blocks assignment. The host records the final outcome automatically, without a role-specific receipt workflow.
 
     {full_history_override_guidance}
 Omitted `fork_turns` and `fork_turns="none"` create a lineage-preserving TaskCapsule fork: the capsule is the sole structured bootstrap and no parent conversation or conversation-derived capability selection is inherited. Integers from 1 through 5 retain bounded history. `fork_turns="all"` is disabled by default and is only available with the configuration escape hatch."#
@@ -631,6 +677,38 @@ Omitted `fork_turns` and `fork_turns="none"` create a lineage-preserving TaskCap
 
 fn wait_agent_tool_parameters_v2(options: WaitAgentTimeoutOptions) -> JsonSchema {
     let properties = BTreeMap::from([
+        (
+            "acceptance".into(),
+            JsonSchema::array(JsonSchema::object(BTreeMap::from([
+                ("assignment_id".into(), JsonSchema::string(None)),
+                ("attempt_id".into(), JsonSchema::string(None)),
+                ("criterion_ids".into(), JsonSchema::array(JsonSchema::string(None), None)),
+            ]), Some(vec!["assignment_id".into(), "attempt_id".into(), "criterion_ids".into()]), Some(false.into())),
+            Some("Nonempty explicit criterion selections for current caller, descendant or declared dependency attempts. Each criterion must have an explicit evidence policy. Initial call observes status; pass acceptance_readiness.cursor as acceptance_cursor to wait for distinct satisfaction. Reuses lifecycle subscriptions, rejects stale attempts, and never cancels other work or implies whole-task completion. Only timeout_ms and acceptance_cursor may accompany this mode.".into())),
+        ),
+        (
+            "acceptance_cursor".into(),
+            JsonSchema::string(Some("Last delivered acceptance_readiness.cursor; requires acceptance. Duplicate or unrelated updates do not redeliver satisfaction.".into())),
+        ),
+        (
+            "dependencies_only".to_string(),
+            JsonSchema::boolean(Some("Observe this worker's declared prerequisite authority, not child completion. Initial call returns ready/blockers; pass its dependency_readiness.cursor as dependency_cursor to wait for a change. Cannot combine with targets, completion_mode, mailbox_only or cursor. Stale worker attempts are rejected; input, cancellation and deadlines still wake the wait.".into())),
+        ),
+        (
+            "dependency_cursor".to_string(),
+            JsonSchema::string(Some("Last delivered dependency_readiness.cursor. Requires dependencies_only:true; duplicate/irrelevant notifications are folded internally. Omit for an immediate authoritative observation.".into())),
+        ),
+        (
+            "targets".to_string(),
+            JsonSchema {
+                min_items: Some(1),
+                ..JsonSchema::array(JsonSchema::string(None), Some("Optional nonempty selected descendant task names or thread IDs. Duplicates are coalesced. Pins producer attempts at subscription; cannot combine with mailbox_only or cursor.".into()))
+            },
+        ),
+        (
+            "completion_mode".to_string(),
+            JsonSchema::string_enum(vec![json!("any"), json!("all")], Some("Requires targets. Default any returns the first terminal producer; all waits for every selected producer. Neither accepts deliverables.".into())),
+        ),
         (
             "mailbox_only".to_string(),
             JsonSchema::boolean(Some(

@@ -1,4 +1,5 @@
 mod managed_process;
+pub mod environment_receipt;
 pub mod pipe;
 mod process;
 mod stdin;
@@ -43,6 +44,8 @@ pub use process::ProcessOutputReceiver;
 pub use process::ProcessSignal;
 /// Bundle of process handles plus split output and exit receivers returned by spawn helpers.
 pub use process::SpawnedProcess;
+pub use process::StdinCloseReceipt;
+pub use process::StdinCloseResult;
 /// Terminal size in character cells used for PTY spawn and resize operations.
 pub use process::TerminalSize;
 /// Combine stdout/stderr into lossy broadcast output; use split receivers for exact delivery.

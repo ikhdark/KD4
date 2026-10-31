@@ -52,6 +52,7 @@ type ScopedSyntaxEntries = HashMap<(String, String), Arc<ScopedSyntax>>;
 #[derive(Clone, Default)]
 pub struct PowershellAnalysisScope {
     entries: Arc<Mutex<ScopedSyntaxEntries>>,
+    executable: Arc<std::sync::OnceLock<String>>,
 }
 
 struct ScopedSyntax {
@@ -68,6 +69,20 @@ thread_local! {
 }
 
 impl PowershellAnalysisScope {
+    /// Bind workload-only classification to this invocation's selected host.
+    /// Explicit nested shell wrappers continue to carry their own executable.
+    pub fn select_executable(executable: String) {
+        if let Some(scope) = Self::current() {
+            let _ = scope.executable.set(executable);
+        }
+    }
+
+    pub fn selected_executable() -> String {
+        Self::current()
+            .and_then(|scope| scope.executable.get().cloned())
+            .unwrap_or_else(|| "pwsh".into())
+    }
+
     pub fn current() -> Option<Self> {
         ACTIVE_ANALYSIS.try_with(Clone::clone).ok()
             .or_else(|| BLOCKING_ANALYSIS.with(|slot| slot.borrow().clone()))
@@ -98,11 +113,13 @@ impl PowershellAnalysisScope {
             if !entries.contains_key(&key) && entries.len() >= MAX_CACHED_SYNTAX_ENTRIES {
                 return None; // Fail closed instead of evicting a failure and retrying it.
             }
-            Arc::clone(entries.entry(key).or_insert_with(|| Arc::new(ScopedSyntax {
-                deadline: Instant::now() + POWERSHELL_PARSER_RESPONSE_TIMEOUT,
-                outcome: std::sync::OnceLock::new(),
-                unavailable: std::sync::atomic::AtomicBool::new(false),
-            })))
+            Arc::clone(entries.entry(key).or_insert_with(|| {
+                Arc::new(ScopedSyntax {
+                    deadline: Instant::now() + POWERSHELL_PARSER_RESPONSE_TIMEOUT,
+                    outcome: std::sync::OnceLock::new(),
+                    unavailable: std::sync::atomic::AtomicBool::new(false),
+                })
+            }))
         };
         // No map lock is held while the one parser owner runs. Other workers
         // wait for that bounded request rather than starting spare hosts.
@@ -324,6 +341,11 @@ fn parse_with_powershell_ast_before(
     let Some(flavor) = PowershellFlavor::from_requested_executable(executable) else {
         return PowershellParseOutcome::Failed;
     };
+    // Never certify a custom/shadow executable using a different installed host.
+    // Trust restrictions remain unchanged: unavailable matching syntax is not proof.
+    if trusted_powershell_host_path(executable).is_none() {
+        return PowershellParseOutcome::Failed;
+    }
     let parser = {
         let mut parser_processes = PARSER_PROCESSES
             .lock()
@@ -1058,4 +1080,3 @@ fn kill_child(child: &mut Option<Child>) {
             let _ = child.wait();
         });
 }
-

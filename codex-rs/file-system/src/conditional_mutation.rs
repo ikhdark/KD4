@@ -35,6 +35,7 @@ use windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle;
 #[derive(Debug)]
 pub enum FileMutationOutcome {
     Committed,
+    Unchanged,
     Conflict,
     RecoveryRequired {
         retained_path: std::path::PathBuf,
@@ -234,6 +235,11 @@ pub fn mutate_file_if_matches(
         (None, None) => None,
         _ => return Ok(FileMutationOutcome::Conflict),
     };
+    // Compare only after validating the opened preimage. Do not stage, rename,
+    // rewrite or touch timestamps for an identical replacement (or absent delete).
+    if preimage == replacement {
+        return Ok(FileMutationOutcome::Unchanged);
+    }
     let Some(replacement) = replacement else {
         if let Some(file) = &old {
             delete_handle(file)?;

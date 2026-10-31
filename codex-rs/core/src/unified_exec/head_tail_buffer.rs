@@ -59,6 +59,9 @@ pub(crate) struct HeadTailBuffer {
     /// observations. Raw producer artifacts are independent of this projection.
     utf8_tail: Vec<u8>,
     start_offset: Option<u64>,
+    // Independent producer coordinates, carried with the pending report. They
+    // count bytes, never text equality; cumulative stream buffers are untouched.
+    stream_ranges: Option<[std::ops::Range<u64>; 2]>,
     max_bytes: usize,
     head_budget: usize,
     tail_budget: usize,
@@ -95,6 +98,7 @@ impl HeadTailBuffer {
             pending_report: None,
             utf8_tail: Vec::new(),
             start_offset: Some(0),
+            stream_ranges: None,
             max_bytes,
             head_budget,
             tail_budget,
@@ -130,6 +134,7 @@ impl HeadTailBuffer {
 
     pub(crate) fn record_lagged_chunks(&mut self, skipped: u64) {
         if skipped > 0 {
+            self.stream_ranges = None;
             // A chunk count does not establish the missing byte count.
             self.start_offset = None;
             let at = self.retained_bytes().saturating_add(self.omitted_bytes);
@@ -191,6 +196,37 @@ impl HeadTailBuffer {
         self.push_to_tail(&chunk[head_len..]);
     }
 
+    pub(crate) fn streamed() -> Self {
+        Self { stream_ranges: Some([0..0, 0..0]), ..Self::default() }
+    }
+
+    pub(crate) fn push_stream_chunk(&mut self, index: usize, chunk: &[u8]) {
+        if let Some(ranges) = &mut self.stream_ranges {
+            ranges[index].end += chunk.len() as u64;
+        }
+        self.push_chunk(chunk);
+    }
+
+    pub(crate) fn pending_stream_ranges(&self) -> Option<[std::ops::Range<u64>; 2]> {
+        self.pending_report.as_ref()?.stream_ranges.clone()
+    }
+
+    pub(crate) fn stream_text(&self, range: &std::ops::Range<u64>) -> Option<String> {
+        let start = usize::try_from(range.start).ok()?;
+        let end = usize::try_from(range.end).ok()?;
+        if end.checked_sub(start)? > UNIFIED_EXEC_OUTPUT_MAX_BYTES || end > self.retained_stream().total() {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        let mut contiguous = true;
+        self.retained_stream().visit_since(start, |at, part, joined| {
+            if at >= end { return; }
+            contiguous &= at == start + bytes.len() && (joined || at == start);
+            bytes.extend_from_slice(&part[..part.len().min(end - at)]);
+        });
+        (contiguous && bytes.len() == end - start).then(|| String::from_utf8(bytes).ok()).flatten()
+    }
+
     pub(crate) fn push_display_notice(&mut self, notice: &[u8]) {
         // These bytes are not present in the cumulative producer artifact.
         self.start_offset = None;
@@ -220,6 +256,9 @@ impl HeadTailBuffer {
     pub(crate) fn begin_output_report(&mut self) {
         if self.pending_report.is_none() {
             let mut report = Self {
+                stream_ranges: self.stream_ranges.as_ref().map(|ranges| {
+                    [ranges[0].start..ranges[0].start, ranges[1].start..ranges[1].start]
+                }),
                 start_offset: self
                     .start_offset
                     .and_then(|start| start.checked_sub(self.utf8_tail.len() as u64)),
@@ -329,6 +368,15 @@ impl HeadTailBuffer {
     /// Drain into another bounded buffer without turning omission notices into
     /// output bytes. Returns whether this batch contains meaningful progress.
     pub(crate) fn drain_into(&mut self, target: &mut Self) -> bool {
+        match (&mut self.stream_ranges, &mut target.stream_ranges) {
+            (Some(source), Some(target)) => {
+                for (source, target) in source.iter_mut().zip(target) {
+                    target.end = source.end;
+                    source.start = source.end;
+                }
+            }
+            _ => target.stream_ranges = None,
+        }
         let omitted = self.take_unreported_omitted_bytes();
         let lagged = self.take_unreported_lagged_chunks();
         let consumed = (self.retained_bytes() as u64).checked_add(omitted as u64);

@@ -805,6 +805,14 @@ impl OutgoingMessageSender {
         }
     }
 
+    pub(crate) async fn connection_is_remote_control(&self, connection_id: ConnectionId) -> bool {
+        self.active_connections
+            .lock()
+            .await
+            .get(&connection_id)
+            .is_some_and(|connection| connection.remote_control)
+    }
+
     async fn response_delivery_error(
         &self,
         connection_id: ConnectionId,

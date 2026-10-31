@@ -62,15 +62,17 @@ use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot;
 
 mod blocking;
+pub(crate) mod retries;
 
 const NANOS_PER_MILLISECOND: u128 = 1_000_000;
+// Schema 37 counts retries/fallbacks only at unique physical transport entry.
 // Schema 36 adds paired await suspensions and explicit dependency edges.
 // Schema 35 separates host assistant-text publication from reasoning/completion
 // and names continuation-after-truncation without a causal claim.
 // Schema 34 counts identity-bound transport attempts, including same-row auth retries.
 // Schema 33 records unique tool admission (not polling) and locally observed
 // nonempty model content for TTFT. Schemas <=32 aliased TTFT to visible output.
-pub(crate) const TIMING_SCHEMA_VERSION: u16 = 36;
+pub(crate) const TIMING_SCHEMA_VERSION: u16 = 37;
 const MAX_DETERMINISTIC_CONTINUATION_RECEIPTS: usize = 64;
 const MAX_TOOL_CALL_TIMINGS: usize = 1_024;
 // These records are diagnostic histories, not the source of truth for the
@@ -1282,6 +1284,7 @@ pub(crate) struct TimingCounters {
 
 #[derive(Clone, Debug, Default)]
 struct TurnTimingStateInner {
+    retry_decisions: retries::RetryDecisionLedger,
     activity_timeline: codex_protocol::timing::TurnTimingTimeline,
     final_content: FinalContentObservations,
     starting_credit_balance: Option<f64>,
@@ -1420,6 +1423,7 @@ impl TurnTimingStateInner {
             return self.clone();
         }
         Self {
+            retry_decisions: self.retry_decisions.clone(),
             final_content: self.final_content.clone(),
             activity_timeline: self.activity_timeline.clone(),
             starting_credit_balance: self.starting_credit_balance,
@@ -2230,6 +2234,7 @@ impl TurnTimingState {
     pub(crate) fn complete_snapshot(&self) -> TurnTimingSnapshot {
         let mut state = self.state();
         let sample = self.clock.sample();
+        state.retry_decisions.finish(sample.time.monotonic_ns, None);
         state.complete(sample)
     }
 
@@ -2406,7 +2411,6 @@ impl TurnTimingState {
 
     pub(crate) fn record_model_fallback(&self) {
         let mut state = self.state();
-        state.counters.model_fallback_count = state.counters.model_fallback_count.saturating_add(1);
         state.next_attempt_kind = TurnTimingAttemptKind::Fallback;
     }
 
@@ -3994,6 +3998,58 @@ impl TurnTimingState {
         self.begin_guard(GuardKind::RetryBackoff)
     }
 
+    /// Records a policy choice, not an attempt. Only the deduplicated transport
+    /// entry below can turn this plan into an executed retry.
+    pub(crate) fn adopt_startup_retry_decision(&self, mut decision: retries::RetryDecisionLedger) {
+        let mut state = self.state();
+        if state.completed_snapshot.is_some() || state.retry_decisions.has_pending() {
+            decision.finish(self.clock.sample().time.monotonic_ns, None);
+            return;
+        }
+        state.retry_decisions = decision;
+        if let Some(request) = state.model_requests.last_mut()
+            && request.dispatched_attempt_count == 0
+        {
+            request.attempt_kind = TurnTimingAttemptKind::Fallback;
+        }
+    }
+
+    /// A policy choice is resolved only by a physical transport-entry callback.
+    pub(crate) fn record_retry_decision(
+        &self,
+        trigger: retries::RetryTrigger,
+        http_status: Option<u16>,
+        action: retries::RetryAction,
+        backoff: Option<Duration>,
+    ) {
+        let mut state = self.state();
+        if state.completed_snapshot.is_some() {
+            return;
+        }
+        let source = state.model_requests.last().and_then(|request| {
+            if matches!(trigger, retries::RetryTrigger::MissingCredentials) {
+                return None;
+            }
+            let attempt = request.physical_attempt_ids.iter().rev()
+                .find(|id| request.dispatched_attempt_ids.contains(*id))?;
+            Some((request.sampling_request_id.clone()?, attempt.clone()))
+        });
+        let now_ns = self.clock.sample().time.monotonic_ns;
+        let generation_index = state.current_generation_index;
+        state.retry_decisions.plan(now_ns, retries::RetryPlan {
+            generation_index,
+            clock_id: codex_protocol::timing::process_clock_domain_id(),
+            trigger,
+            http_status,
+            action,
+            source: source.as_ref().map(|(request, attempt)| (request.as_str(), attempt.as_str())),
+            backoff_ns: backoff.map(|duration| duration.as_nanos()),
+        });
+        if state.activity.retry > 0 {
+            state.retry_decisions.begin_wait(now_ns);
+        }
+    }
+
     pub(crate) fn begin_standalone_work(self: &Arc<Self>) -> TurnTimingGuard {
         self.begin_guard(GuardKind::StandaloneWork)
     }
@@ -4368,15 +4424,20 @@ impl TurnTimingState {
         sampling_request_id: &str,
         physical_attempt_id: &str,
         internal_retry: bool,
+        route: retries::RetryRoute,
     ) {
         self.mark_model_request_dispatched_inner(Some((
             sampling_request_id,
             physical_attempt_id,
             internal_retry,
+            route,
         )));
     }
 
-    fn mark_model_request_dispatched_inner(&self, identity: Option<(&str, &str, bool)>) {
+    fn mark_model_request_dispatched_inner(
+        &self,
+        identity: Option<(&str, &str, bool, retries::RetryRoute)>,
+    ) {
         self.set_live_sampling_phase(None);
         let mut state = self.state();
         let Some(request) = state.model_requests.last_mut() else {
@@ -4384,7 +4445,7 @@ impl TurnTimingState {
             return;
         };
         let attempt_kind =
-            if let Some((sampling_request_id, physical_attempt_id, internal_retry)) = identity {
+            if let Some((sampling_request_id, physical_attempt_id, internal_retry, _)) = identity {
                 if request.sampling_request_id.as_deref() != Some(sampling_request_id)
                     || !request
                         .physical_attempt_ids
@@ -4412,8 +4473,17 @@ impl TurnTimingState {
                 request.attempt_kind
             };
         request.dispatched_attempt_count = request.dispatched_attempt_count.saturating_add(1);
+        let generation_index = request.generation_index;
         let resumed_generation_id = format!("generation-{}", request.generation_index);
         let sample = self.clock.sample();
+        if let Some((sampling_request_id, physical_attempt_id, _, route)) = identity {
+            state.retry_decisions.finish(sample.time.monotonic_ns, Some(retries::RetryExecution {
+                generation_index: Some(generation_index),
+                sampling_request_id,
+                physical_attempt_id,
+                route,
+            }));
+        }
         state.advance(sample.time.monotonic_ns);
         state.activity.provider_request_dispatched = true;
         state.activity.provider_terminal_observed = false;
@@ -4506,10 +4576,13 @@ impl TurnTimingState {
                     state.counters.attempts_by_kind.primary.saturating_add(1);
             }
             TurnTimingAttemptKind::Retry => {
+                state.counters.model_retry_count = state.counters.model_retry_count.saturating_add(1);
                 state.counters.attempts_by_kind.retry =
                     state.counters.attempts_by_kind.retry.saturating_add(1);
             }
             TurnTimingAttemptKind::Fallback => {
+                state.counters.model_retry_count = state.counters.model_retry_count.saturating_add(1);
+                state.counters.model_fallback_count = state.counters.model_fallback_count.saturating_add(1);
                 state.counters.attempts_by_kind.fallback =
                     state.counters.attempts_by_kind.fallback.saturating_add(1);
             }
@@ -4569,7 +4642,6 @@ impl Drop for TurnTimingGuard {
 
 impl TurnTimingStateInner {
     fn record_model_retry(&mut self) {
-        self.counters.model_retry_count = self.counters.model_retry_count.saturating_add(1);
         if self.next_attempt_kind != TurnTimingAttemptKind::Fallback {
             self.next_attempt_kind = TurnTimingAttemptKind::Retry;
         }
@@ -4673,7 +4745,11 @@ impl TurnTimingStateInner {
         self.current_generation_disposition = disposition;
         self.current_relevant_state_fingerprint = relevant_state_fingerprint;
         self.current_failure_fingerprint = None;
-        self.next_attempt_kind = TurnTimingAttemptKind::Primary;
+        self.next_attempt_kind = if self.retry_decisions.is_fallback_for(Some(generation_index)) {
+            TurnTimingAttemptKind::Fallback
+        } else {
+            TurnTimingAttemptKind::Primary
+        };
     }
 
     fn start(&mut self, sample: ClockSample) -> i64 {
@@ -4762,6 +4838,9 @@ impl TurnTimingStateInner {
                 self.increment_wait_count(kind);
             }
             GuardKind::RetryBackoff => {
+                if self.activity.retry == 0 {
+                    self.retry_decisions.begin_wait(now_ns);
+                }
                 self.activity.retry = self.activity.retry.saturating_add(1);
             }
             GuardKind::StandaloneWork => {
@@ -4819,7 +4898,13 @@ impl TurnTimingStateInner {
                 decrement(&mut self.activity.tool)
             }
             GuardKind::InteractiveWait(_) => decrement(&mut self.activity.interactive),
-            GuardKind::RetryBackoff => decrement(&mut self.activity.retry),
+            GuardKind::RetryBackoff => {
+                let valid = decrement(&mut self.activity.retry);
+                if self.activity.retry == 0 {
+                    self.retry_decisions.end_wait(now_ns);
+                }
+                valid
+            }
             GuardKind::StandaloneWork => decrement(&mut self.activity.standalone),
             GuardKind::Local(phase) => self.decrement_local_activity(phase),
         };

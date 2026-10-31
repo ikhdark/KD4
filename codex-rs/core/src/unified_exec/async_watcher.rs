@@ -907,6 +907,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
         None => None,
     };
     let mut metadata = codex_protocol::items::CommandExecutionOutputMetadata {
+        incarnation: process.map(|process| process.incarnation().to_string()),
         process_exited,
         output_drained,
         aggregated_output_is_exact: snapshot
@@ -944,6 +945,8 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
                 exit_code,
                 metadata.failure_cause.as_deref(),
                 search_no_match,
+                process_exited,
+                output_drained,
             )
             .await;
         if process_exited && output_drained {

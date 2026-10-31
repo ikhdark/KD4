@@ -30,10 +30,17 @@ pub fn create_update_plan_tool() -> ToolSpec {
         ("input_id".into(), JsonSchema::string(None)),
         ("sha256".into(), JsonSchema::string(None)),
     ]), Some(vec!["input_id".into(), "sha256".into()]), Some(false.into()));
+    let mut pins = JsonSchema::array(JsonSchema::object(BTreeMap::from([
+        ("text".into(), JsonSchema::string(Some("Original requirement text; preserved independently of checklist rows.".into()))),
+        ("source".into(), reference.clone()),
+    ]), Some(vec!["text".into()]), Some(false.into())), Some(
+        "Add requirements without replacing any checklist or outstanding scope. Source defaults to the latest accepted user text; explicit input_id/sha256 must authenticate against accepted input. Repeating the same text/source preserves its stable ID and state.".into()));
+    pins.min_items = Some(1);
     let properties = BTreeMap::from([
         ("plan".into(), JsonSchema::array(item,
             Some("Replace the checklist. Rows may be renamed or removed, but unfinished requirements must be retained via continues or retired with accepted user authorization.".into()))),
         ("set".into(), updates),
+        ("pin".into(), pins),
         ("explanation".into(), JsonSchema::string(None)),
         ("expected_revision".into(), JsonSchema::string(Some(
             "Revision returned by the last update. Required after the plan changed since this sampling step; rejects stale updates without mutation.".into()))),
@@ -53,15 +60,15 @@ pub fn create_update_plan_tool() -> ToolSpec {
         ("scope_change_reviewed_revision".into(), JsonSchema::string(Some(
             "When citing earlier input, reconcile all later user instructions and supply the input revision returned on reconciliation.".into()))),
         ("resolve".into(), JsonSchema::array(JsonSchema::string(None), Some(
-            "Original requirement IDs explicitly completed by finished renamed/split/merged descendants. Not validation receipts; every descendant must be completed.".into()))),
+            "Explicitly complete original or pinned requirement IDs; every mapped descendant must be completed. For an unmapped pin, submit the unchanged plan plus resolve. Not validation receipts; summary/checklist rewrites alone never complete pins.".into()))),
     ]);
     ToolSpec::Function(ResponsesApiTool {
         name: "update_plan".into(),
-        description: format!("{}\n\n{}", "Update a progress checklist for multi-step work. Unavailable in Plan mode. Use plan or set, not both; at most one step may be in_progress. Checklist statuses are model reports, not proof of task correctness.", include_str!("../../../templates/plan_progress.md").trim()),
+        description: format!("{}\n\n{}", "Update a progress checklist or pin task requirements through its existing owner. Unavailable in Plan mode. Use exactly one of plan, set or pin; at most one checklist step may be in_progress. Pins survive compaction with stable IDs, authentic input provenance and explicit states; they do not discard other requirements. Checklist statuses are model reports, not proof of task correctness.", include_str!("../../../templates/plan_progress.md").trim()),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema {
-            one_of: Some(["plan", "set"].into_iter().map(|key| JsonSchema {
+            one_of: Some(["plan", "set", "pin"].into_iter().map(|key| JsonSchema {
                 required: Some(vec![key.into()]),
                 ..JsonSchema::object(BTreeMap::new(), None, None)
             }).collect()),
@@ -85,9 +92,23 @@ pub fn create_update_plan_tool() -> ToolSpec {
                 "completion_authority":{"const":"checklist_only"},
                 "lineage_complete":{"const":false,"description":"This compact model result omits durable requirement lineage and is not a complete replay snapshot."},
                 "remaining_requirements":{"type":"object","additionalProperties":{"type":"string"}},
+                "pinned_requirements":{"type":"object","additionalProperties":{
+                    "type":"object","properties":{
+                        "text":{"type":"string"},
+                        "state":{"enum":["pending","in_progress","completed","superseded"]},
+                        "source":{"type":"object","properties":{
+                            "input_id":{"type":"string"},"sha256":{"type":"string"}
+                        },"required":["input_id","sha256"],"additionalProperties":false}
+                    },"required":["text","state","source"],"additionalProperties":false
+                }},
+                "obligations":{"type":"object","description":"Derived from the existing requirement owner. Summary rewrites cannot close these IDs; use an explicit checklist completion/resolve or authorized supersession.","properties":{
+                    "completed":{"type":"integer","minimum":0},
+                    "superseded":{"type":"integer","minimum":0},
+                    "unresolved":{"type":"array","items":{"type":"string"}}
+                },"required":["completed","superseded","unresolved"],"additionalProperties":false},
 
             },
-            "required":["current_plan","revision","step_ids","message","effect","no_progress","completion_authority","lineage_complete"],
+            "required":["current_plan","revision","step_ids","message","effect","no_progress","completion_authority","lineage_complete","obligations"],
             "additionalProperties":false
         }).into()),
     })

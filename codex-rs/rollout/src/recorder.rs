@@ -1163,6 +1163,9 @@ impl RolloutRecorder {
         resumed: Option<(JsonlWriter, crate::ToolManifestDictionary)>,
         writer_lease: Option<Arc<std::fs::File>>,
     ) -> std::io::Result<Self> {
+        // Session metadata and turn identity both record the executable hash;
+        // start it now rather than on the first turn.
+        codex_utils_build_info::prehash_executable();
         let (writer, deferred_log_file_info, rollout_path, meta, tool_manifests) = match params {
             RolloutRecorderParams::Create {
                 session_id,
@@ -1201,7 +1204,8 @@ impl RolloutRecorder {
                     cwd: config.cwd().to_path_buf(),
                     originator,
                     cli_version: env!("CARGO_PKG_VERSION").to_string(),
-                    // Hash lazily when metadata is first written.
+                    // The first metadata write fills in the executable hash,
+                    // which recorder creation started computing.
                     harness_build: Some(initial_harness_build_info()),
                     agent_nickname: source.get_nickname(),
                     agent_role: source.get_agent_role(),

@@ -518,6 +518,7 @@ impl ExecutorFileSystem for SandboxedFileSystem {
     fn checksum_file<'a>(
         &'a self,
         path: &'a PathUri,
+        include_text_diagnostics: bool,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, Option<codex_file_system::FileDigest>> {
         Box::pin(async move {
@@ -529,13 +530,34 @@ impl ExecutorFileSystem for SandboxedFileSystem {
                     FsHelperRequest::ChecksumFile(crate::protocol::FsChecksumFileParams {
                         path: path.clone(),
                         sandbox: None,
+                        include_text_diagnostics,
                         cancel_id: None,
                     }),
                 )
                 .await?
                 .expect_checksum_file()
                 .map_err(map_sandbox_error)?;
-            crate::remote_file_system::validate_file_digest(response.digest)
+            let digest = crate::remote_file_system::validate_file_digest(response.digest)?;
+            crate::remote_file_system::require_text_diagnostics(digest, include_text_diagnostics)
+        })
+    }
+
+    /// One helper launch probes every candidate instead of one per candidate.
+    fn lookup_batch<'a>(
+        &'a self,
+        requests: &'a [codex_file_system::FileSystemLookup],
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Vec<codex_file_system::FileSystemLookupResult>> {
+        Box::pin(async move {
+            codex_file_system::validate_lookup_batch(requests)?;
+            let sandbox = require_platform_sandbox(sandbox)?;
+            let results = self.run_sandboxed(sandbox, FsHelperRequest::LookupBatch {
+                requests: requests.to_vec(),
+            }).await?.expect_lookup_batch().map_err(map_sandbox_error)?;
+            if results.len() != requests.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "lookup batch result count mismatch"));
+            }
+            Ok(results)
         })
     }
 

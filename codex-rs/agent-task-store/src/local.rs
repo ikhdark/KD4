@@ -2,6 +2,24 @@
 mod wake_subscriptions;
 #[path = "source_inspection.rs"]
 mod source_inspection;
+#[path = "dependency_readiness.rs"]
+mod dependency_readiness;
+#[path = "edit_intents.rs"]
+mod edit_intents;
+pub use edit_intents::{EditIntent, EditIntentRegion, EditIntentWarning};
+#[path = "partial_results.rs"]
+mod partial_results;
+pub use partial_results::AgentPartialResult;
+pub use partial_results::PartialResultDraft;
+pub use partial_results::PartialResultSource;
+pub use partial_results::PartialResultStatus;
+pub use dependency_readiness::AcceptanceObservation;
+pub use dependency_readiness::AcceptanceReadiness;
+pub use dependency_readiness::AcceptanceSubscription;
+pub use dependency_readiness::AcceptanceTarget;
+pub use dependency_readiness::DependencyReadiness;
+pub use dependency_readiness::DependencySubscription;
+pub use partial_results::WorkerFinding;
 
 use chrono::Utc;
 use codex_state::StateRuntime;
@@ -320,8 +338,8 @@ impl DurableWakePoller {
         })
     }
 
-    fn register(self: &Arc<Self>, root: &str) -> DurableWakeWaiter {
-        let wake_rx = self.subscriptions.register(root);
+    fn register(self: &Arc<Self>, root: &str, state: bool) -> DurableWakeWaiter {
+        let wake_rx = self.subscriptions.register(root, state);
         if self.waiter_count.fetch_add(1, Ordering::AcqRel) == 0 {
             self.active.send_replace(true);
         }
@@ -446,7 +464,7 @@ impl LocalAgentTaskStore {
         root_session_id: String,
         after_event_id: Option<WakeEventId>,
     ) -> StoreResult<WakeRead> {
-        let waiter = self.durable_wake_poller.register(&root_session_id);
+        let waiter = self.durable_wake_poller.register(&root_session_id, false);
         let mut wake_rx = waiter.wake_rx.clone();
         let mut shutdown_rx = self.durable_wake_poller.shutdown.subscribe();
         loop {
@@ -3252,6 +3270,23 @@ impl LocalAgentTaskStore {
         Box::pin(async move { self.get_agent_task_authorization_impl(assignment_id).await })
     }
 
+    /// Read an exact attempt, including after a follow-up or correction. The
+    /// existing relational seal validator remains the receipt authority.
+    pub async fn get_agent_attempt(
+        &self,
+        assignment_id: AssignmentId,
+        attempt_id: AttemptId,
+    ) -> StoreResult<(Attempt, Option<AgentReceipt>)> {
+        let mut tx = self.pool.begin().await?;
+        let attempt = load_attempt_tx(&mut tx, attempt_id).await?;
+        if attempt.assignment_id != assignment_id {
+            return Err(StoreError::InvalidAssignment("attempt belongs to a different assignment".into()));
+        }
+        let receipt = load_receipt_tx(&mut tx, &attempt).await?.map(|(receipt, _)| receipt);
+        tx.commit().await?;
+        Ok((attempt, receipt))
+    }
+
     pub fn bind_agent_task(
         &self,
         binding: AgentTaskBindingDraft,
@@ -3702,6 +3737,16 @@ impl LocalAgentTaskStore {
             self.read_wake_events_impl(root_session_id, after_event_id)
                 .await
         })
+    }
+
+    /// Capture the authoritative stream tail without replaying old progress.
+    /// Call before inspecting selected state; the existing wait then closes the
+    /// read/subscribe race. Do not use the derived stream cache as evidence.
+    pub async fn current_wake_cursor(&self, root_session_id: &str) -> StoreResult<Option<WakeEventId>> {
+        let cursor = sqlx::query_scalar::<_, String>(
+            "SELECT wake_event_id FROM observations WHERE root_session_id = ? ORDER BY wake_sequence DESC LIMIT 1",
+        ).bind(root_session_id).fetch_optional(&self.pool).await?;
+        cursor.as_deref().map(WakeEventId::parse).transpose()
     }
 
     pub fn wait_for_wake_events(
@@ -5251,10 +5296,12 @@ async fn selective_admission_tx(
         .then(std::time::Instant::now);
     let rows = sqlx::query(
         "SELECT assignments.body_json, repositories.workspace_id, attempts.state,
-                attempts.sealed_at
+                attempts.sealed_at, attempts.attempt_id, attempts.amendment_json,
+                bindings.task_name, bindings.agent_path, bindings.thread_id
          FROM assignments
          JOIN assignment_repositories repositories USING (assignment_id)
          JOIN attempts ON attempts.assignment_id = assignments.assignment_id
+         LEFT JOIN agent_task_bindings bindings ON bindings.assignment_id = assignments.assignment_id
          WHERE repositories.repository_id = ?
            AND assignments.root_session_id = ?
            AND attempts.state = ? AND attempts.sealed_at IS NULL
@@ -5307,6 +5354,41 @@ async fn selective_admission_tx(
         if read_overlaps {
             overlaps.benign_read_overlap_count =
                 overlaps.benign_read_overlap_count.saturating_add(1);
+        }
+        let scope_overlap = existing.read_scope.iter().chain(&existing.write_scope).any(|existing_scope| {
+            assignment.read_scope.iter().enumerate().any(|(index, scope)|
+                scopes_overlap_observed(existing_scope, scope, scope_case.read(index)))
+                || assignment.write_scope.iter().enumerate().any(|(index, scope)|
+                    scopes_overlap_observed(existing_scope, scope, scope_case.write(index)))
+        });
+        let amendment: Option<crate::AttemptAmendment> = row
+            .get::<Option<String>, _>("amendment_json")
+            .map(|value| decode(&value)).transpose()?.flatten();
+        let contract = existing.effective_contract(amendment.as_ref());
+        let candidate = assignment.effective_contract(None);
+        let normalized = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+        let objective_matches = normalized(&contract.objective) == normalized(&candidate.objective);
+        let deliverable_overlap = contract.acceptance_criteria.iter().any(|left|
+            candidate.acceptance_criteria.iter().any(|right| normalized(&left.text) == normalized(&right.text)))
+            || existing.required_evidence.iter().any(|left|
+                assignment.required_evidence.iter().any(|right| normalized(left) == normalized(right)));
+        let contract_overlap = existing.contract_claims.iter().any(|claim| assignment.contract_claims.contains(claim));
+        if objective_matches || deliverable_overlap || contract_overlap || scope_overlap {
+            let independent = assignment.independent_verification || existing.independent_verification
+                || [assignment.relation.as_ref(), existing.relation.as_ref()].into_iter().flatten()
+                    .any(|relation| matches!(relation.kind, crate::RelationKind::Review | crate::RelationKind::Verification));
+            overlaps.warnings.push(crate::TaskOverlapWarning {
+                assignment_id: existing.assignment_id,
+                attempt_id: AttemptId::parse(&row.get::<String, _>("attempt_id"))?,
+                task_name: row.get("task_name"),
+                agent_path: row.get("agent_path"),
+                thread_id: row.get("thread_id"),
+                kind: if independent { crate::TaskOverlapKind::IndependentVerification }
+                    else if objective_matches && deliverable_overlap || contract_overlap {
+                        crate::TaskOverlapKind::PotentialDuplicate
+                    } else { crate::TaskOverlapKind::RelatedWork },
+                objective_matches, deliverable_overlap, contract_overlap, scope_overlap,
+            });
         }
         // Only a candidate that writes can conflict with a writer. A read-only
         // candidate's contract claims stay advisory, like its read overlap.

@@ -232,6 +232,13 @@ pub trait ExecProcess: Send + Sync {
 
     fn write(&self, chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse>;
 
+    /// Close piped input after accepted writes. Repeated closes are harmless.
+    fn close_stdin(&self) -> ExecProcessFuture<'_, WriteResponse> {
+        Box::pin(async {
+            Err(ExecServerError::Protocol("explicit stdin close is unsupported by this backend".into()))
+        })
+    }
+
     /// Whether dropping an unfinished `write` future guarantees that none of its
     /// bytes were queued for the process, then or later. Only then may a caller
     /// report the abandoned input as safely retryable; the default makes no claim.

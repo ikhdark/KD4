@@ -368,6 +368,7 @@ where
             let Some(mut queued_message) = queued_message else {
                 break;
             };
+            let flush_boundary = !queued_message.message.can_batch();
             if let Some(streamed_len) = queued_message
                 .encoded_json
                 .as_ref()
@@ -389,7 +390,7 @@ where
                     error!("Failed to stream outgoing message to stdout: {err}");
                     break;
                 }
-                if queued_message.write_complete_tx.is_some() {
+                if flush_boundary || queued_message.write_complete_tx.is_some() {
                     let flush_result = tokio::select! {
                         _ = cancellation_for_writer.cancelled() => break 'writer,
                         result = stdout.flush() => result,
@@ -408,7 +409,9 @@ where
             batch.clear();
             let mut byte_credits = Vec::new();
             let mut write_complete_tx = None;
+            let mut flush_boundary = false;
             for index in 0..MAX_STDOUT_BATCH_MESSAGES {
+                flush_boundary = !queued_message.message.can_batch();
                 let frame_start = batch.len();
                 let encoded = if let Some(mut encoded) = queued_message.encoded_json.take() {
                     batch.extend_from_slice(&encoded.bytes);
@@ -427,9 +430,10 @@ where
                         error!("Failed to serialize OutgoingMessage: {err}");
                     }
                 }
-                // Only coalesce messages already admitted. A receipt is a flush
-                // boundary: later traffic must not delay its acknowledgement.
-                if write_complete_tx.is_some()
+                // Never wait to fill a batch. Lifecycle/control events and receipts
+                // end it before later output can delay their delivery.
+                if flush_boundary
+                    || write_complete_tx.is_some()
                     || batch.len() >= STDOUT_BATCH_TARGET_BYTES
                     || index + 1 == MAX_STDOUT_BATCH_MESSAGES
                 {
@@ -460,7 +464,7 @@ where
                 error!("Failed to write to stdout: {err}");
                 break;
             }
-            if write_complete_tx.is_some() {
+            if flush_boundary || write_complete_tx.is_some() {
                 let flush_result = tokio::select! {
                     _ = cancellation_for_writer.cancelled() => break 'writer,
                     result = stdout.flush() => result,

@@ -276,8 +276,14 @@ impl PartialEq for PreparedOutputSchema {
 impl PreparedOutputSchema {
     pub(crate) fn prepare(original: Value) -> Result<Arc<Self>, String> {
         // Retrieval features are disabled: external refs cannot fetch data.
-        let validator = jsonschema::validator_for(&original)
-            .map_err(|error| format!("Invalid output schema: {error}"))?;
+        let validator = jsonschema::validator_for(&original).map_err(|error| {
+            format!(
+                "Invalid output schema at {} ({} at {}): {error}",
+                error.instance_path(),
+                error.kind().keyword(),
+                error.schema_path(),
+            )
+        })?;
         Ok(Arc::new(Self {
             original,
             validator,
@@ -289,15 +295,68 @@ impl PreparedOutputSchema {
     }
 
     pub(crate) fn validate_text(&self, text: Option<&str>) -> Result<(), Value> {
-        let text = text.ok_or_else(|| serde_json::json!({"category":"missing_output"}))?;
-        let value: Value = serde_json::from_str(text).map_err(|error|
-            serde_json::json!({"category":"invalid_json", "line":error.line(), "column":error.column()}))?;
-        self.validator.validate(&value).map_err(|error| {
-            serde_json::json!({"category":"schema_mismatch", "instance_pointer":
-                error.instance_path().as_str().chars().take(512).collect::<String>()})
-        })
+        let text = text.ok_or_else(|| {
+            serde_json::json!({
+                "category": "missing_output",
+                "instance_pointer": "",
+                "message": "A completed final JSON response is required.",
+            })
+        })?;
+        // Parse exactly the proposed JSON: no fence stripping, defaults, type
+        // conversion or mutation of the response that will be accepted.
+        let value: Value = serde_json::from_str(text).map_err(|error| {
+            serde_json::json!({
+                "category": "invalid_json",
+                "instance_pointer": "",
+                "line": error.line(),
+                "column": error.column(),
+                "message": error.to_string(),
+            })
+        })?;
+        let errors: Vec<Value> = self
+            .validator
+            .iter_errors(&value)
+            .map(|error| {
+                let pointer = error.instance_path().as_str();
+                let child_pointer = |name: &str| {
+                    format!("{pointer}/{}", name.replace('~', "~0").replace('/', "~1"))
+                };
+                let field_pointers = match error.kind() {
+                    jsonschema::error::ValidationErrorKind::Required { property } => property
+                        .as_str()
+                        .map(child_pointer)
+                        .into_iter()
+                        .collect::<Vec<_>>(),
+                    jsonschema::error::ValidationErrorKind::AdditionalProperties { unexpected } => {
+                        unexpected.iter().map(|name| child_pointer(name)).collect()
+                    }
+                    _ => vec![pointer.to_string()],
+                };
+                serde_json::json!({
+                    "instance_pointer": pointer,
+                    "field_pointers": field_pointers,
+                    "schema_pointer": error.schema_path().as_str(),
+                    "constraint": error.kind().keyword(),
+                    "message": error.to_string(),
+                })
+            })
+            .collect();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(serde_json::json!({
+                "category": "schema_mismatch",
+                "instance_pointer": errors[0]["instance_pointer"],
+                "errors": errors,
+            }))
+        }
     }
 }
+
+/// One final-schema repair per turn, including regular-task reentry. Context
+/// refreshes, hooks and compaction cannot replenish this delivery-only budget.
+#[derive(Default)]
+struct FinalResponseRepair(std::sync::atomic::AtomicBool);
 
 /// The context needed for a single turn of the thread.
 #[derive(Debug)]
@@ -313,6 +372,28 @@ impl Default for CurrentTurnTokenUsage {
 }
 
 impl TurnContext {
+    pub(crate) fn claim_final_response_repair(&self) -> bool {
+        !self
+            .extension_data
+            .get_or_init(FinalResponseRepair::default)
+            .0
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn final_response_validation_error(&self, validation: Value) -> CodexErr {
+        let attempted = self
+            .extension_data
+            .get::<FinalResponseRepair>()
+            .is_some_and(|state| state.0.load(std::sync::atomic::Ordering::Relaxed));
+        CodexErr::FinalResponseValidation(serde_json::json!({
+            "category": if attempted { "repair_exhausted" } else { "repair_unavailable" },
+            "repair_policy": { "max_attempts": 1, "attempts": u8::from(attempted) },
+            "validation": validation,
+            "recoverable": true,
+            "recovery": "Continue the conversation with corrected output or a revised explicit schema; completed tool effects were not replayed.",
+        }))
+    }
+
     pub(crate) fn record_current_turn_usage(&self, usage: &codex_protocol::protocol::TokenUsage) {
         let ledger = self.extension_data.get_or_init(CurrentTurnTokenUsage::default);
         ledger.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).add_assign(usage);

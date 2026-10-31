@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use codex_git_utils::DiffComparison;
 use codex_git_utils::DiffRequest;
+use codex_git_utils::DiffSourceRequest;
 use codex_git_utils::RangeTraversal;
 use codex_tools::JsonSchema;
 use codex_tools::JsonToolOutput;
@@ -45,6 +46,7 @@ struct Arguments {
     paths: Vec<String>,
     max_patch_bytes: Option<usize>,
     max_files: Option<usize>,
+    source_ranges: Option<DiffSourceRequest>,
     traversal: Option<RangeTraversal>,
     max_commits: Option<usize>,
     environment_id: Option<String>,
@@ -87,17 +89,30 @@ impl ToolExecutor<ToolInvocation> for GitInspectionHandler {
             vec!["base".to_string(), "head".to_string()]
         } else {
             properties.insert("comparison".to_string(), JsonSchema::string_enum(vec![json!("staged"), json!("unstaged"), json!("revisions")], Some("Required. staged: captured HEAD (or unborn empty tree) to live index; unstaged: live index to working tree; revisions: explicit base/head commit trees. Never combines staged and unstaged.".into())));
+            properties.insert("source_ranges".to_string(), JsonSchema::object(BTreeMap::from([
+                ("context_lines".into(), bounded(0, 100, "Surrounding lines per hunk side; default 3. Both source and patch use this context.".into())),
+                ("max_bytes".into(), bounded(0, 131_072, "Maximum combined old/new source text bytes; default 16384. Whole hunks only, at most 1000 returned; omitted ranges remain explicitly incomplete. Independent of max_patch_bytes.".into())),
+                ("if_diff_sha256".into(), JsonSchema::string(Some("Optional diff_sha256 from a previous git_diff with identical paths/context. Refuse stale coordinates if any captured content, endpoint commit or metadata differs. Omit only when requesting newly resolved hunks rather than reusing prior coordinates.".into()))),
+            ]), None, Some(false.into())));
             vec!["comparison".to_string()]
         };
         let purpose = if self.range {
             "Summarize base..head commits separately from the base-tree to head-tree endpoint diff. Reversions can produce commits with zero endpoint changes. Ancestry booleans, all merge bases, shallow-history uncertainty and all-parent/first-parent traversal are explicit. Non-ancestor ranges are allowed; paths never filter commits. No per-commit statistics are summed."
         } else {
-            "Inspect one explicit Git comparison: staged, unstaged, or two immutable revisions. Returns comparison endpoint identities, file status/modes/raw OIDs, rename similarity, binary flags and Git-generated exact unified patch hunks. Does not reconstruct diffs from turn patch tracking."
+            "Inspect one explicit Git comparison: staged, unstaged, or two immutable revisions. Optional source_ranges resolves hunks into exact old/new source text and line ranges with configurable context from the SAME Git capture, binding each side to its path/mode/blob OID, including deletions and renames. Zero line_count denotes an anchor, not a source line. Working-tree blob IDs identify captured normalized content, not stored/recoverable objects or current raw bytes. diff_sha256 binds the full capture even when patch/files are truncated; use source_ranges.if_diff_sha256 with matching paths/context to reject stale coordinates. Binary/non-UTF-8/non-regular source ranges remain explicitly unavailable; pure renames/mode changes have no source hunks. Coverage is only changed lines with context, never complete behavioral review or read_file history/retention credit. Returns comparison endpoints, status/modes/raw OIDs, rename similarity, binary flags and exact Git patch hunks; never reconstructs diffs from turn patch tracking."
         };
         ToolSpec::Function(ResponsesApiTool {
-            name: if self.range { "git_commit_range" } else { "git_diff" }.into(),
-            description: format!("{purpose} Untracked files are excluded. Mutable index/working-tree endpoints are observations, not coherent snapshots or content identities; raw all-zero OIDs mean unavailable. Unstaged comparisons cover checked-out submodule commits, not dirty submodule work trees. Patch encoding is utf8, or hex for non-UTF-8 bytes. Full selected totals remain separate from explicit file/patch/commit truncation; bounded stderr warnings keep their start and end, including Git's rename-limit diagnostics, and mark omitted bytes. Rename detection uses 50% similarity and a 1000-candidate limit. Git's built-in EOL/encoding normalization is preserved, but configured clean/process filters, external diff and textconv are disabled. Local full-disk-read environments only. No fetches or repository writes. Unsupported/missing history, conflicts, non-UTF-8 paths, timeout or capture above 8 MiB fail explicitly, never as no changes. Default limits fit the default direct-response budget; larger limits suit Code Mode, and a direct response that cannot fit fails undelivered. Use narrower paths for oversized diffs; there is no retained patch recovery handle."),
-            strict: false, defer_loading: None,
+            name: if self.range {
+                "git_commit_range"
+            } else {
+                "git_diff"
+            }
+            .into(),
+            description: format!(
+                "{purpose} Untracked files are excluded. Mutable index/working-tree endpoints are observations, not coherent snapshots or content identities; raw all-zero OIDs mean unavailable. Unstaged comparisons cover checked-out submodule commits, not dirty submodule work trees. Patch encoding is utf8, or hex for non-UTF-8 bytes. Full selected totals remain separate from explicit file/patch/commit truncation; bounded stderr warnings keep their start and end, including Git's rename-limit diagnostics, and mark omitted bytes. Rename detection uses 50% similarity and a 1000-candidate limit. Git's built-in EOL/encoding normalization is preserved, but configured clean/process filters, external diff and textconv are disabled. Local full-disk-read environments only. No fetches or repository writes. Unsupported/missing history, conflicts, non-UTF-8 paths, timeout or capture above 8 MiB fail explicitly, never as no changes. Default limits fit the default direct-response budget; larger limits suit Code Mode, and a direct response that cannot fit fails undelivered. Use narrower paths for oversized diffs; there is no retained patch recovery handle."
+            ),
+            strict: false,
+            defer_loading: None,
             parameters: JsonSchema::object(properties, Some(required), Some(false.into())),
             output_schema: Some(output_schema(self.range).into()),
         })
@@ -111,7 +126,7 @@ impl ToolExecutor<ToolInvocation> for GitInspectionHandler {
                 ));
             };
             let args: Arguments = parse_arguments(arguments)?;
-            if self.range && args.comparison.is_some()
+            if self.range && (args.comparison.is_some() || args.source_ranges.is_some())
                 || !self.range && (args.traversal.is_some() || args.max_commits.is_some())
             {
                 return Err(FunctionCallError::RespondToModel(
@@ -159,6 +174,7 @@ impl ToolExecutor<ToolInvocation> for GitInspectionHandler {
                 paths: args.paths,
                 max_patch_bytes: args.max_patch_bytes.unwrap_or(default_patch),
                 max_files: args.max_files.unwrap_or(default_files),
+                source_ranges: args.source_ranges,
             };
             let operation = async {
                 if self.range {
@@ -226,8 +242,26 @@ fn output_schema(range: bool) -> serde_json::Value {
         "total_files":integer,"files":{"type":"array","items":file},"files_truncated":boolean,
         "additions":integer,"deletions":integer,"binary_files":integer,"patch":string,
         "patch_encoding":{"type":"string","enum":["utf8","hex"]},"total_patch_bytes":integer,
-        "returned_patch_bytes":integer,"patch_truncated":boolean,"warnings":string},
-        "required":["repository_root","comparison","from","to","paths","unmatched_paths","git_args","filter_policy","untracked_included","coherent_snapshot_verified","total_files","files","files_truncated","additions","deletions","binary_files","patch","patch_encoding","total_patch_bytes","returned_patch_bytes","patch_truncated","warnings"]});
+        "returned_patch_bytes":integer,"patch_truncated":boolean,"warnings":string,
+        "diff_sha256":string},
+        "required":["repository_root","comparison","from","to","paths","unmatched_paths","git_args","filter_policy","untracked_included","coherent_snapshot_verified","total_files","files","files_truncated","additions","deletions","binary_files","patch","patch_encoding","total_patch_bytes","returned_patch_bytes","patch_truncated","warnings","diff_sha256"]});
+    let side = json!({"type":"object","additionalProperties":false,"properties":{
+        "path":string,"mode":string,"blob_oid":nullable_string,"present":boolean},
+        "required":["path","mode","blob_oid","present"]});
+    let source_range = json!({"type":"object","additionalProperties":false,"properties":{
+        "start_line":integer,"line_count":integer,"text":string},
+        "required":["start_line","line_count","text"]});
+    diff["properties"]["source_ranges"] = json!({"type":"object","additionalProperties":false,"properties":{
+        "coverage":{"const":"changed_lines_with_context"},"behavioral_review_complete":{"const":false},
+        "coordinate_space":{"const":"git_blob_lines_after_builtin_normalization"},
+        "context_lines":integer,"files_truncated":boolean,"ranges_complete":boolean,"returned_source_bytes":integer,
+        "files":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{
+            "old":side,"new":side,"total_hunks":integer,"ranges_complete":boolean,
+            "unavailable_reason":nullable_string,
+            "hunks":{"type":"array","items":{"type":"object","additionalProperties":false,
+                "properties":{"old":source_range,"new":source_range},"required":["old","new"]}}},
+            "required":["old","new","hunks","total_hunks","ranges_complete","unavailable_reason"]}}},
+        "required":["coverage","behavioral_review_complete","coordinate_space","context_lines","files","files_truncated","ranges_complete","returned_source_bytes"]});
     if !range {
         diff["properties"]["environment_id"] = string;
         if let Some(required) = diff["required"].as_array_mut() {

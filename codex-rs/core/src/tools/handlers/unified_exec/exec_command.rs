@@ -23,8 +23,8 @@ use crate::tools::handlers::allows_inline_sandbox_approval;
 use crate::tools::handlers::apply_granted_turn_permissions_uri;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
 use crate::tools::handlers::command_preflight::preflight_invocation_for_kd4_runtime;
-use crate::tools::handlers::command_search::rg_search_no_match_eligible;
 use crate::tools::handlers::command_search::missing_rg_path_advisory_with_cancellation;
+use crate::tools::handlers::command_search::rg_search_no_match_eligible;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::command_shape::powershell_script_failure_advisory;
 use crate::tools::handlers::normalize_and_validate_additional_permissions_uri;
@@ -52,7 +52,6 @@ use codex_sandboxing::SandboxablePreference;
 use codex_sandboxing::select_initial;
 use codex_shell_command::is_safe_command::is_known_safe_command_in_state;
 use codex_shell_command::is_safe_command::is_known_safe_direct_argv_in_state;
-use codex_shell_command::shell_detect::detect_shell_type;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use codex_utils_output_truncation::approx_token_count;
@@ -169,10 +168,10 @@ pub(super) fn validate_and_consume_remote_shell(
             "environment `{environment_id}` does not report a shell"
         ));
     };
-    if detect_shell_type(Path::new(&requested_shell)) != Some(remote_shell.shell_type) {
+    if requested_shell != remote_shell.shell_path.to_string_lossy() {
         return Err(format!(
-            "environment `{environment_id}` only supports `{}`",
-            remote_shell.name()
+            "environment `{environment_id}` only supports its reported shell executable `{}`; alternate remote executables are not supported",
+            remote_shell.shell_path.display()
         ));
     }
     Ok(())
@@ -279,18 +278,20 @@ pub(super) async fn attach_hidden_rg_directory_advisory(
         })
         .await
         .ok()?;
-        if candidates.is_empty() {
-            return None;
-        }
-        let root = workspace.resolve_workspace_root(cwd).await.ok()??;
-        let ignored = crate::git_workspace::git_ignored_paths(&root, &candidates).await;
-        Some(candidates
-            .into_iter()
-            .filter(|path| !ignored.contains(path))
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>())
-    })
-    .await
+            if candidates.is_empty() {
+                return None;
+            }
+            let root = workspace.resolve_workspace_root(cwd).await.ok()??;
+            let ignored = crate::git_workspace::git_ignored_paths(&root, &candidates).await;
+            Some(
+                candidates
+                    .into_iter()
+                    .filter(|path| !ignored.contains(path))
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .await
     else {
         return;
     };
@@ -454,6 +455,7 @@ impl ExecCommandHandler {
         };
         context.env_overrides.clone_from(&args.env);
         let environment_is_remote = environment.is_remote();
+        let quiet_on_success = args.quiet_on_success;
         if environment_is_remote && !args.command_invocation().is_argv() {
             if turn_environment.shell.is_none() {
                 return Err(FunctionCallError::RespondToModel(format!(
@@ -489,8 +491,19 @@ impl ExecCommandHandler {
         )
         .await?;
         let original_invocation = args.command_invocation();
-        let policy_cwd = if environment_is_remote { None } else {
-            native_cwd.as_ref().map(codex_utils_absolute_path::AbsolutePathBuf::as_path)
+        if original_resolved_command.preflight_shell_type == Some(ShellType::PowerShell)
+            && !environment_is_remote
+        {
+            codex_shell_command::PowershellAnalysisScope::select_executable(
+                original_resolved_command.command[0].clone(),
+            );
+        }
+        let policy_cwd = if environment_is_remote {
+            None
+        } else {
+            native_cwd
+                .as_ref()
+                .map(codex_utils_absolute_path::AbsolutePathBuf::as_path)
         };
         let (mut policy_classification, mut policy_selection) =
             crate::validation::analyze_validation_policy_with_shell(
@@ -523,7 +536,7 @@ impl ExecCommandHandler {
             ))
         })?;
         let repaired = preflight.repaired();
-        let repair_notice = {
+        let mut repair_notice = {
             let mut notices = args.argument_notices.clone();
             notices.extend(preflight.model_notice());
             (!notices.is_empty()).then(|| notices.join("\n"))
@@ -576,9 +589,11 @@ impl ExecCommandHandler {
             let shell_type = resolved_command.preflight_shell_type;
             crate::tools::run_blocking_command_analysis(move || {
                 rg_search_no_match_eligible(&command, shell_type)
-            }).await.map_err(|error| FunctionCallError::RespondToModel(format!(
-                "command search worker failed: {error}"
-            )))
+            })
+            .await
+            .map_err(|error| {
+                FunctionCallError::RespondToModel(format!("command search worker failed: {error}"))
+            })
         };
         let safety_command = resolved_command.safety_command.clone();
         let direct_argv = command_invocation.is_argv();
@@ -653,6 +668,7 @@ impl ExecCommandHandler {
         let yield_time_ms = args.observation_yield_time_ms(nested);
         let ExecCommandArgs {
             tty,
+            pipe_stdin,
             stall_timeout_ms,
             max_output_tokens,
             sandbox_permissions,
@@ -694,11 +710,14 @@ impl ExecCommandHandler {
             && !allows_inline_sandbox_approval(context.turn.approval_policy.value())
         {
             let approval_policy = context.turn.approval_policy.value();
-            return Err(FunctionCallError::structured(codex_protocol::tool_failure::ToolFailure::no_effects(
-                codex_protocol::tool_failure::ToolFailureCode::PermissionDenied,
-                format!(
-                "approval policy is {approval_policy:?}; reject command — you cannot ask for escalated permissions if the approval policy is {approval_policy:?}"
-            ))));
+            return Err(FunctionCallError::structured(
+                codex_protocol::tool_failure::ToolFailure::no_effects(
+                    codex_protocol::tool_failure::ToolFailureCode::PermissionDenied,
+                    format!(
+                        "approval policy is {approval_policy:?}; reject command — you cannot ask for escalated permissions if the approval policy is {approval_policy:?}"
+                    ),
+                ),
+            ));
         }
 
         let implicit_grant = !sandbox_permissions.uses_additional_permissions()
@@ -740,7 +759,7 @@ impl ExecCommandHandler {
             context.turn.windows_sandbox_level,
         );
         let runtime_context = format!(
-            "shell={shell_type:?};login={use_login_shell};tty={tty};stall_timeout_ms={stall_timeout_ms:?};network={:?}",
+            "shell={shell_type:?};login={use_login_shell};tty={tty};pipe_stdin={pipe_stdin};stall_timeout_ms={stall_timeout_ms:?};network={:?}",
             context.turn.network_sandbox_policy(),
         );
         let input_context = format!("prefix={prefix_rule:?}");
@@ -838,11 +857,14 @@ impl ExecCommandHandler {
             &session, &turn, &call_id, policy_classification,
             validation_launch,
             policy_selection,
-            &format!("{validation_cwd}:{environment_hash}"),
+            &serde_json::json!([turn_environment.owner_id(), validation_cwd, environment_hash,
+                sandbox_context, runtime_context, input_context]).to_string(),
             workspace_identity.as_deref(),
             &turn_environment.environment_id,
             &cwd,
             &command,
+            &effective_environment,
+            fs.as_ref(),
         ).await {
             Ok(permit) => permit,
             Err(refusal) => return Ok(refusal),
@@ -855,7 +877,9 @@ impl ExecCommandHandler {
             .begin_attempt_with_freshness(&attempt_key, repaired, force_fresh)
             .await
         {
-            return Err(FunctionCallError::RespondToModel(blocked.render_for_model()));
+            return Err(FunctionCallError::RespondToModel(
+                blocked.render_for_model(),
+            ));
         }
         drop(attempt_phase);
 
@@ -899,11 +923,14 @@ impl ExecCommandHandler {
                     .record_exit(&attempt_key, 0)
                     .await;
                 let mut response = ExecCommandToolOutput {
+                    stream_chunks: None,
+                    stream_ranges: None,
                     output_ranges: Some(crate::unified_exec::head_tail_buffer::OutputChunkRanges {
                         range: 0..raw_output.len() as u64,
                         gap: None,
                     }),
                     process_output: None,
+                    environment_receipt: None,
                     error: None,
                     validation: validation.clone(),
                     event_call_id: String::new(),
@@ -913,6 +940,7 @@ impl ExecCommandHandler {
                     truncation_policy: turn.model_info.truncation_policy.into(),
                     max_output_tokens,
                     process_id: None,
+                    quiet_on_success: false,
                     session_capabilities: None,
                     exit_code: Some(0),
                     process_exited: true,
@@ -948,6 +976,15 @@ impl ExecCommandHandler {
             &session.thread_id.to_string(),
         );
         emit_unified_exec_tty_metric(&turn.session_telemetry, tty);
+        if let Some(notice) = manager
+            .duplicate_running_command_notice(&session.services.command_execution, &attempt_key)
+            .await
+        {
+            repair_notice = Some(match repair_notice.take() {
+                Some(existing) => format!("{existing}\n{notice}"),
+                None => notice,
+            });
+        }
         let process_id_reservation = manager.reserve_process_id().await;
         let process_id = process_id_reservation.process_id();
         let exec_result = manager
@@ -975,6 +1012,7 @@ impl ExecCommandHandler {
                     sandbox_cwd: native_environment_cwd,
                     turn_environment: turn_environment.clone(),
                     tty,
+                    pipe_stdin,
                     sandbox_permissions: effective_additional_permissions.sandbox_permissions,
                     additional_permissions: normalized_additional_permissions,
                     additional_permissions_uri: normalized_additional_permissions_uri,
@@ -1011,6 +1049,7 @@ impl ExecCommandHandler {
         };
         let result = match exec_result {
             Ok(mut response) => {
+                response.quiet_on_success = quiet_on_success;
                 background_process_expected = response.process_id.is_some();
                 let finalized_artifact = response
                     .raw_output_artifact
@@ -1074,6 +1113,9 @@ impl ExecCommandHandler {
                         &session.thread_id.to_string(),
                     )
                     .await;
+                crate::validation_task::retain_exec_compilation(
+                    &session, &turn, &call_id, &mut response, &turn_environment,
+                ).await;
                 Ok(boxed_tool_output(response))
             }
             Err(UnifiedExecError::SandboxDenied {
@@ -1116,6 +1158,10 @@ impl ExecCommandHandler {
                 }
                 let original_token_count = approx_token_count(&output_text);
                 let mut response = ExecCommandToolOutput {
+                    stream_chunks: None,
+                    stream_ranges: None,
+                    environment_receipt: codex_utils_pty::process_observation::ProcessObservationContext::current()
+                        .map(|context| context.snapshot()),
                     output_ranges: Some(crate::unified_exec::head_tail_buffer::OutputChunkRanges {
                         range: 0..output_text.len() as u64,
                         gap: None,
@@ -1130,6 +1176,7 @@ impl ExecCommandHandler {
                     truncation_policy: turn.model_info.truncation_policy.into(),
                     max_output_tokens,
                     // Sandbox denial is terminal, so there is no live
+                    quiet_on_success: false,
                     // process for write_stdin to resume.
                     process_id: None,
                     session_capabilities: None,
@@ -1211,7 +1258,12 @@ impl ExecCommandHandler {
                 let repair = repair_notice
                     .as_deref()
                     .map_or(String::new(), |notice| format!("\n{notice}"));
-                exec_command_error_output(&command_for_display, &err, &repair, tracked_execution.is_none())
+                exec_command_error_output(
+                    &command_for_display,
+                    &err,
+                    &repair,
+                    tracked_execution.is_none(),
+                )
             }
         };
         let running_process_after_cleanup = session

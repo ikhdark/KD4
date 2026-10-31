@@ -39,9 +39,15 @@ struct WriteStdinArgs {
     #[serde(default)]
     max_output_tokens: Option<usize>,
     #[serde(default)]
+    quiet_on_success: bool,
+    #[serde(default)]
     wait_for_output: Option<bool>,
     #[serde(default)]
     terminate: bool,
+    #[serde(default)]
+    close_stdin: bool,
+    #[serde(default)]
+    status_only: bool,
     #[serde(default)]
     event_filter: Option<crate::unified_exec::ProcessEventFilter>,
 }
@@ -49,7 +55,7 @@ struct WriteStdinArgs {
 impl WriteStdinArgs {
     fn waits_for_output(&self) -> bool {
         self.wait_for_output.unwrap_or_else(|| {
-            self.chars.is_empty() && self.yield_time_ms.is_none() && !self.terminate
+            self.chars.is_empty() && self.yield_time_ms.is_none() && !self.terminate && !self.close_stdin
         })
     }
 }
@@ -100,12 +106,12 @@ fn completed_process_output(
     mut result: serde_json::Value,
 ) -> Box<dyn crate::tools::context::ToolOutput> {
     let retained_signal = result.as_object_mut().and_then(|result| result.remove("_sampling_request_signal"));
-    let success = result["success"].as_bool().unwrap_or(false);
-    let output = codex_tools::JsonToolOutput::with_success(result, Some(success));
+    let success = result["success"].as_bool();
+    let output = codex_tools::JsonToolOutput::with_success(result, success);
     if let Some(signal) = retained_signal {
         return boxed_tool_output(output.with_sampling_request_signal(signal));
     }
-    if success {
+    if success != Some(false) {
         boxed_tool_output(output)
     } else {
         boxed_tool_output(output.with_sampling_request_signal(serde_json::json!({
@@ -141,18 +147,71 @@ impl WriteStdinHandler {
         };
 
         let args: WriteStdinArgs = parse_arguments(&arguments)?;
+        if args.close_stdin && (!args.chars.is_empty() || args.terminate || args.wait_for_output == Some(true)) {
+            return Err(FunctionCallError::RespondToModel(
+                "close_stdin requires empty chars and cannot be combined with terminate or wait_for_output=true; send input separately".into(),
+            ));
+        }
+        if args.status_only {
+            if !args.chars.is_empty()
+                || args.terminate
+                || args.close_stdin
+                || args.wait_for_output.is_some()
+                || args.yield_time_ms.is_some()
+                || args.max_output_tokens.is_some()
+                || args.event_filter.is_some()
+            {
+                return Err(FunctionCallError::RespondToModel(
+                    "status_only is observation-only; omit chars, terminate, close_stdin, wait_for_output, yield_time_ms, max_output_tokens and event_filter".into(),
+                ));
+            }
+            let incarnation = args.incarnation.ok_or_else(|| {
+                FunctionCallError::structured(ToolFailure::no_effects(
+                    ToolFailureCode::StaleInput,
+                    "status_only requires incarnation from the originating session_capabilities",
+                ))
+            })?;
+            let observed = session.services.unified_exec_manager
+                .process_status(args.session_id, incarnation)
+                .await;
+            let observed = if observed.as_ref().map_or(true, |value| value["status"] == "unavailable") {
+                if let Some(receipt) = session.retained_process_result(args.session_id, incarnation).await {
+                    Ok(serde_json::json!({
+                        "status_only": true, "session_id": args.session_id, "incarnation": incarnation,
+                        "status": if receipt["process_exited"] == true { "exited" } else { "uncertain" },
+                        "exit_code": receipt["exit_code"],
+                        "error": receipt["error"].as_str().map(|error| error.chars().take(1024).collect::<String>()),
+                        "completion_provenance": receipt["completion_provenance"],
+                        "output_drained": receipt["output_drained"],
+                        "output_reference": receipt["output_reference"],
+                    }))
+                } else { observed }
+            } else { observed };
+            let result = observed
+                .map_err(|message| FunctionCallError::structured(ToolFailure::no_effects(
+                    ToolFailureCode::StaleInput, message,
+                )))?;
+            return Ok(boxed_tool_output(codex_tools::JsonToolOutput::with_success(result, Some(true))));
+        }
         if let Some(filter) = &args.event_filter {
-            if !args.chars.is_empty() || args.terminate || args.wait_for_output.is_some()
+            if !args.chars.is_empty() || args.terminate || args.close_stdin || args.wait_for_output.is_some()
                 || args.yield_time_ms.is_some() || args.max_output_tokens.is_some()
             {
                 return Err(FunctionCallError::RespondToModel(
-                    "event_filter is observation-only; omit chars, terminate, wait_for_output, yield_time_ms and max_output_tokens".into(),
+                    "event_filter is observation-only; omit chars, terminate, close_stdin, wait_for_output, yield_time_ms and max_output_tokens".into(),
                 ));
             }
             filter.validate(self.max_timeout_ms).map_err(FunctionCallError::RespondToModel)?;
             let incarnation = args.incarnation.ok_or_else(|| FunctionCallError::RespondToModel(
                 "event_filter requires the originating process incarnation".into(),
             ))?;
+            if session.services.unified_exec_manager.process_incarnation(args.session_id).await.is_none()
+                && let Some(receipt) = session.retained_process_result(args.session_id, incarnation).await
+            {
+                let result = filter.retained_observation(args.session_id, incarnation, &receipt)
+                    .map_err(FunctionCallError::RespondToModel)?;
+                return Ok(boxed_tool_output(codex_tools::JsonToolOutput::with_success(result, Some(true))));
+            }
             let result = session.services.unified_exec_manager
                 .filtered_process_events(
                     args.session_id,
@@ -163,9 +222,15 @@ impl WriteStdinHandler {
                     crate::unified_exec::nested_poll_bound(source.nested_deadline()),
                 )
                 .or_cancel(&cancellation_token).await
-                .map_err(|_| FunctionCallError::RespondToModel(
+                ;
+            let result = match result {
+                Ok(result) => result,
+                Err(_) => return Err(stdin_failure(
+                    &session, ToolFailureCode::Cancelled,
                     "process event subscription cancelled and closed; process and normal output are unchanged".into(),
-                ))?
+                    args.session_id, incarnation,
+                ).await),
+            }
                 .map_err(FunctionCallError::RespondToModel)?;
             return Ok(boxed_tool_output(codex_tools::JsonToolOutput::with_success(result, Some(true))));
         }
@@ -177,12 +242,9 @@ impl WriteStdinHandler {
         if live_incarnation.is_none()
             && args.chars.is_empty()
             && !args.terminate
+            && !args.close_stdin
             && let Some(incarnation) = args.incarnation
-            && let Some(result) = session
-                .services
-                .command_execution
-                .completed_process_result(args.session_id, incarnation)
-                .await
+            && let Some(result) = session.retained_process_result(args.session_id, incarnation).await
         {
             return Ok(completed_process_output(result));
         }
@@ -207,7 +269,7 @@ impl WriteStdinHandler {
                 "wait_for_output requires empty chars; send input separately".to_string(),
             ));
         }
-        validate_independent_review_stdin(&turn.session_source, &args.chars, args.terminate)
+        validate_independent_review_stdin(&turn.session_source, &args.chars, args.terminate || args.close_stdin)
             .map_err(|message| FunctionCallError::structured(ToolFailure::no_effects(
                 ToolFailureCode::PermissionDenied, message,
             )))?;
@@ -218,12 +280,16 @@ impl WriteStdinHandler {
                 .terminate_process_for_poll(args.session_id)
                 .await
         {
+            let status = session.services.unified_exec_manager
+                .process_status(args.session_id, incarnation).await.ok();
+            let detail = status.as_ref().and_then(|status| status["shutdown_error"].as_str())
+                .unwrap_or("process owner did not provide confirmation");
             return Err(stdin_failure(
+                &session,
                 ToolFailureCode::UncertainEffects,
-                "termination could not be confirmed; inspect the session before retrying"
-                    .to_string(),
+                format!("shutdown uncertain: {detail}; owner and recovery handles retained; inspect the session before retrying"),
                 args.session_id, incarnation,
-            ));
+            ).await);
         }
         let yield_time_ms = owner_wait_yield_time_ms(
             &args.chars,
@@ -236,6 +302,7 @@ impl WriteStdinHandler {
             let request = WriteStdinRequest {
                 process_id: args.session_id,
                 input: &args.chars,
+                close_stdin: args.close_stdin,
                 yield_time_ms,
                 max_output_tokens: args.max_output_tokens,
                 truncation_policy: turn.model_info.truncation_policy.into(),
@@ -245,17 +312,19 @@ impl WriteStdinHandler {
             };
             let manager = &session.services.unified_exec_manager;
             let mut response = if wait_for_output {
-                manager
+                match manager
                     .write_stdin_until_output(request)
                     .or_cancel(&cancellation_token)
                     .await
-                    .map_err(|_| {
-                        stdin_failure(
+                {
+                    Ok(response) => response,
+                    Err(_) => return Err(stdin_failure(
+                            &session,
                             ToolFailureCode::Cancelled,
                             "command wait cancelled; process state remains inspectable".to_string(),
                             args.session_id, incarnation,
-                        )
-                    })?
+                        ).await),
+                }
             } else {
                 manager.write_stdin(request).await
             };
@@ -296,13 +365,9 @@ impl WriteStdinHandler {
         }
         let response = match response {
             Err(crate::unified_exec::UnifiedExecError::UnknownProcessId { process_id })
-                if args.chars.is_empty() && !args.terminate =>
+                if args.chars.is_empty() && !args.terminate && !args.close_stdin =>
             {
-                if let Some(result) = session
-                    .services
-                    .command_execution
-                    .completed_process_result(process_id, incarnation)
-                    .await
+                if let Some(result) = session.retained_process_result(process_id, incarnation).await
                 {
                     return Ok(completed_process_output(result));
                 }
@@ -335,12 +400,21 @@ impl WriteStdinHandler {
                     .await,
                 ));
             }
+            Err(err @ crate::unified_exec::UnifiedExecError::StdinClosed) => {
+                return Err(stdin_failure(
+                    &session,
+                    ToolFailureCode::InvalidInput,
+                    format!("write_stdin failed: {err}"),
+                    args.session_id, incarnation,
+                ).await);
+            }
             Err(err) => {
                 return Err(stdin_failure(
+                    &session,
                     ToolFailureCode::UncertainEffects,
                     format!("write_stdin failed: {err}"),
                     args.session_id, incarnation,
-                ));
+                ).await);
             }
         };
 
@@ -413,6 +487,9 @@ impl WriteStdinHandler {
                 .await;
         }
 
+        // Presentation is per receipt, not a change to the process or its streams.
+        response.quiet_on_success =
+            args.quiet_on_success && args.chars.is_empty() && !args.terminate;
         response
             .prepare_recovery_artifact(
                 turn.config.codex_home.as_path(),
@@ -423,13 +500,22 @@ impl WriteStdinHandler {
     }
 }
 
-fn stdin_failure(
+async fn stdin_failure(
+    session: &crate::session::Session,
     code: ToolFailureCode,
     message: String,
     session_id: u32,
     incarnation: uuid::Uuid,
 ) -> FunctionCallError {
     let mut failure = ToolFailure::new(code, message);
+    if code == ToolFailureCode::InvalidInput {
+        failure.effects = codex_protocol::tool_failure::ToolEffectsState::None;
+    }
+    let mut reference = session.services.unified_exec_manager
+        .process_output_reference(session_id, incarnation).await
+        .unwrap_or_else(|| crate::tools::command_output_artifact::RawOutputArtifact::output_reference(None));
+    reference["owner_thread_id"] = session.thread_id.to_string().into();
+    failure.details = Some(serde_json::json!({"output_reference": reference}));
     failure.live_operations.push(ToolOperationHandle {
         tool: "write_stdin".to_string(),
         arguments: serde_json::json!({"session_id":session_id,"incarnation":incarnation,"chars":""}),
@@ -473,6 +559,12 @@ fn owner_wait_yield_time_ms(
 }
 
 impl CoreToolRuntime for WriteStdinHandler {
+    fn waits_for_runtime_cancellation(&self) -> bool {
+        // Preserve bounded observation cleanup and its recovery receipt. This
+        // does not terminate the existing process or resend an interaction.
+        true
+    }
+
     fn controls_process(&self, payload: &ToolPayload) -> bool {
         let ToolPayload::Function { arguments } = payload else {
             return false;
@@ -486,7 +578,7 @@ impl CoreToolRuntime for WriteStdinHandler {
             return false;
         };
         serde_json::from_str::<WriteStdinArgs>(arguments)
-            .is_ok_and(|args| args.chars.is_empty() && !args.terminate)
+            .is_ok_and(|args| args.chars.is_empty() && !args.terminate && !args.close_stdin)
     }
 
     fn matches_kind(&self, payload: &ToolPayload) -> bool {

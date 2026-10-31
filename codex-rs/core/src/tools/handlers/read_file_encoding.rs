@@ -10,28 +10,55 @@ pub(super) struct DecodedSource {
 pub(super) async fn decode(
     bytes: Vec<u8>,
     max_bytes: usize,
-) -> Result<(String, Option<DecodedSource>), FunctionCallError> {
-    let error = |message: &str| FunctionCallError::RespondToModel(message.into());
-    // FF FE 00 00 is the UTF-32LE BOM; reading it as UTF-16LE would invent NULs.
-    let little_endian = if bytes.starts_with(&[0xff, 0xfe, 0x00, 0x00]) {
-        return Err(error("read_file does not decode UTF-32; use encoding:hex or encoding:base64 for original bytes"));
-    } else if bytes.starts_with(&[0xff, 0xfe]) {
-        true
-    } else if bytes.starts_with(&[0xfe, 0xff]) {
-        false
-    } else {
-        return String::from_utf8(bytes)
-            .map(|text| (text, None))
-            .map_err(|_| error("read_file requires UTF-8 or BOM-marked UTF-16LE/BE text; use encoding:hex or encoding:base64 for original bytes"));
+) -> Result<DecodedFile, FunctionCallError> {
+    // Recognized encodings precede byte heuristics: UTF-16 zero bytes are
+    // code units, not binary evidence.
+    let source_encoding = bom_encoding(&bytes);
+    if matches!(source_encoding, Some("utf-32le" | "utf-32be")) {
+        return Ok(DecodedFile::Unsupported(Classification::unsupported(
+            decoding_error("read_file does not decode UTF-32; use encoding:hex or encoding:base64 for original bytes", &bytes).to_string(),
+            source_encoding,
+        )));
+    }
+    let little_endian = match source_encoding {
+        Some("utf-16le") => true,
+        Some("utf-16be") => false,
+        _ => {
+            return Ok(match String::from_utf8(bytes) {
+                Ok(text) => decoded_text(text, None),
+                Err(error) => {
+                    let mut classification =
+                        classify_page(error.as_bytes(), false).unwrap_or_else(|| {
+                            Classification::unsupported("unknown text encoding".into(), None)
+                        });
+                    classification.reason.push_str("; ");
+                    classification.reason.push_str(
+                        &decoding_error(
+                            "invalid UTF-8 is not proof of binary content",
+                            error.as_bytes(),
+                        )
+                        .to_string(),
+                    );
+                    DecodedFile::Unsupported(classification)
+                }
+            });
+        }
     };
     // Decoding and hashing up to 8 MiB stays off async workers, like selection.
-    tokio::task::spawn_blocking(move || decode_utf16(&bytes, little_endian, max_bytes))
-        .await
-        .map_err(|err| {
-            FunctionCallError::RespondToModel(format!("UTF-16 decoding worker failed: {err}"))
-        })?
+    let result =
+        tokio::task::spawn_blocking(move || decode_utf16(&bytes, little_endian, max_bytes))
+            .await
+            .map_err(|err| {
+                FunctionCallError::RespondToModel(format!("UTF-16 decoding worker failed: {err}"))
+            })?;
+    Ok(match result {
+        Ok((text, source)) => decoded_text(text, source),
+        Err(error) => DecodedFile::Unsupported(Classification::unsupported(
+            error.to_string(),
+            source_encoding,
+        )),
+    })
 }
-
 fn decode_utf16(
     bytes: &[u8],
     little_endian: bool,
@@ -41,7 +68,10 @@ fn decode_utf16(
     let payload = &bytes[2..];
     let (units, remainder) = payload.as_chunks::<2>();
     if !remainder.is_empty() {
-        return Err(error("read_file found an incomplete UTF-16 code unit"));
+        return Err(decoding_error(
+            "read_file found an incomplete UTF-16 code unit",
+            bytes,
+        ));
     }
     let units = units.iter().map(|&pair| {
         if little_endian {
@@ -52,8 +82,8 @@ fn decode_utf16(
     });
     let mut text = String::with_capacity(payload.len().min(max_bytes));
     for character in char::decode_utf16(units) {
-        let character =
-            character.map_err(|_| error("read_file found an unpaired UTF-16 surrogate"))?;
+        let character = character
+            .map_err(|_| decoding_error("read_file found an unpaired UTF-16 surrogate", bytes))?;
         if text.len().saturating_add(character.len_utf8()) > max_bytes {
             return Err(error(
                 "decoded UTF-16 text exceeds the 8 MiB snapshot limit; use encoding:hex or encoding:base64 for original byte pages",
@@ -73,6 +103,89 @@ fn decode_utf16(
             bytes: bytes.len(),
         }),
     ))
+}
+
+fn decoding_error(message: &str, bytes: &[u8]) -> FunctionCallError {
+    let mut scanner = codex_file_system::TextDiagnosticsScanner::default();
+    scanner.push(bytes);
+    FunctionCallError::RespondToModel(format!(
+        "{message}; text_diagnostics: {}",
+        serde_json::json!(scanner.finish())
+    ))
+}
+
+#[derive(serde::Serialize)]
+pub(super) struct Classification {
+    kind: &'static str,
+    confidence: &'static str,
+    reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoding: Option<&'static str>,
+}
+
+impl Classification {
+    pub(super) fn unsupported(reason: String, encoding: Option<&'static str>) -> Self {
+        Self {
+            kind: "unsupported_text",
+            confidence: if encoding.is_some() { "high" } else { "low" },
+            reason,
+            encoding,
+        }
+    }
+}
+
+pub(super) enum DecodedFile {
+    Text(String, Option<DecodedSource>),
+    Unsupported(Classification),
+}
+
+fn bom_encoding(bytes: &[u8]) -> Option<&'static str> {
+    [
+        (&[0xff, 0xfe, 0x00, 0x00][..], "utf-32le"),
+        (&[0x00, 0x00, 0xfe, 0xff][..], "utf-32be"),
+        (&[0xff, 0xfe][..], "utf-16le"),
+        (&[0xfe, 0xff][..], "utf-16be"),
+    ]
+    .into_iter()
+    .find_map(|(bom, encoding)| bytes.starts_with(bom).then_some(encoding))
+}
+
+fn decoded_text(text: String, source: Option<DecodedSource>) -> DecodedFile {
+    if let Some(mut classification) = classify_page(text.as_bytes(), false) {
+        classification.encoding = Some(source.as_ref().map_or("utf-8", |source| source.encoding));
+        DecodedFile::Unsupported(classification)
+    } else {
+        DecodedFile::Text(text, source)
+    }
+}
+
+/// A local byte-range observation, not a whole-file verdict. Original-byte
+/// ranges never implicitly decode recognized encodings or split UTF-8.
+pub(super) fn classify_page(bytes: &[u8], at_file_start: bool) -> Option<Classification> {
+    if at_file_start && let Some(encoding) = bom_encoding(bytes) {
+        return Some(Classification::unsupported(
+            "recognized encoded text in an original-byte range; no implicit decoding".into(),
+            Some(encoding),
+        ));
+    }
+    if bytes
+        .iter()
+        .any(|byte| matches!(byte, 0..=8 | 11 | 14..=31 | 127))
+    {
+        return Some(Classification {
+            kind: "likely_binary",
+            confidence: "medium",
+            reason: "non-display control bytes; binary content is likely, not proven".into(),
+            encoding: None,
+        });
+    }
+    std::str::from_utf8(bytes).err().map(|_| {
+        Classification::unsupported(
+            "invalid or split UTF-8; unknown text encoding or binary content, not proven binary"
+                .into(),
+            None,
+        )
+    })
 }
 
 /// UTF-8 is the default: its canonical bytes are the source bytes, so only a

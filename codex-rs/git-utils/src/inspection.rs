@@ -4,6 +4,11 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
+
+use crate::diff_source::DiffSourceRanges;
+use crate::diff_source::DiffSourceRequest;
 
 use crate::historical::ReadCancellation;
 use crate::historical::disabled_filter_config;
@@ -78,6 +83,9 @@ pub struct DiffInspection {
     pub returned_patch_bytes: usize,
     pub patch_truncated: bool,
     pub warnings: String,
+    pub diff_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_ranges: Option<DiffSourceRanges>,
 }
 
 pub struct DiffRequest {
@@ -87,6 +95,7 @@ pub struct DiffRequest {
     pub paths: Vec<String>,
     pub max_patch_bytes: usize,
     pub max_files: usize,
+    pub source_ranges: Option<DiffSourceRequest>,
 }
 
 pub async fn inspect_diff(cwd: PathBuf, request: DiffRequest) -> Result<DiffInspection, String> {
@@ -100,7 +109,7 @@ pub async fn inspect_diff(cwd: PathBuf, request: DiffRequest) -> Result<DiffInsp
     .map_err(|error| error.to_string())?
 }
 
-fn repository_root(cwd: &Path, control: &GitCommandControl) -> Result<PathBuf, String> {
+pub(crate) fn repository_root(cwd: &Path, control: &GitCommandControl) -> Result<PathBuf, String> {
     let root = read_git(cwd, &["rev-parse", "--show-toplevel"], 32 * 1024, control)?;
     Ok(PathBuf::from(root.trim_end_matches(['\r', '\n'])))
 }
@@ -151,7 +160,11 @@ fn capture_diff(
         paths,
         max_patch_bytes,
         max_files,
+        source_ranges,
     } = request;
+    if let Some(source) = &source_ranges {
+        source.validate()?;
+    }
     if max_patch_bytes > MAX_PATCH_BYTES
         || !(1..=MAX_INSPECTION_ENTRIES).contains(&max_files)
         || paths.len() > 64
@@ -266,7 +279,6 @@ fn capture_diff(
             "-l1000",
             "--diff-algorithm=myers",
             "--no-indent-heuristic",
-            "--unified=3",
             "--inter-hunk-context=0",
             "--src-prefix=a/",
             "--dst-prefix=b/",
@@ -276,6 +288,12 @@ fn capture_diff(
         ]
         .map(str::to_string),
     );
+    args.push(format!(
+        "--unified={}",
+        source_ranges
+            .as_ref()
+            .map_or(3, |source| source.context_lines)
+    ));
     // Dirty-submodule checks run status inside each submodule, where its own
     // clean filters would execute; unstaged reads compare submodule commits only.
     args.push(
@@ -325,6 +343,36 @@ fn capture_diff(
         ));
     }
     let (mut files, patch) = parse_diff(&output.stdout)?;
+    // Bind coordinates to the complete captured diff, not a truncated patch,
+    // mutable ref name, file length or mtime. A later guarded call must use the
+    // same context/path selection. Source text is projected from this very
+    // capture, so no second worktree read can attach stale hunk coordinates.
+    let mut identity = Sha256::new();
+    for part in [
+        root.to_string_lossy().as_bytes(),
+        from.commit_oid.as_deref().unwrap_or("").as_bytes(),
+        to.commit_oid.as_deref().unwrap_or("").as_bytes(),
+        &output.stdout,
+    ] {
+        identity.update((part.len() as u64).to_le_bytes());
+        identity.update(part);
+    }
+    let diff_sha256 = identity
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if source_ranges
+        .as_ref()
+        .and_then(|source| source.if_diff_sha256.as_ref())
+        .is_some_and(|expected| !expected.eq_ignore_ascii_case(&diff_sha256))
+    {
+        return Err("stale_diff_coordinates: captured diff identity no longer matches; obtain new hunks before retrieving source".into());
+    }
+    let source_ranges = source_ranges
+        .as_ref()
+        .map(|source| crate::diff_source::resolve(&files, patch, source, max_files))
+        .transpose()?;
     let unmatched_paths = unmatched_paths(root, comparison, [&from, &to], &paths, &files, control)?;
     let total_files = files.len();
     let additions = files.iter().filter_map(|file| file.additions).sum();
@@ -373,12 +421,14 @@ fn capture_diff(
         returned_patch_bytes,
         patch_truncated: returned_patch_bytes < patch.len(),
         warnings: bounded_warnings(&output.stderr),
+        diff_sha256,
+        source_ranges,
     })
 }
 
 /// Git's stderr, bounded so default limits still fit direct delivery. Both
 /// ends are kept: Git prints rename-limit diagnostics last.
-fn bounded_warnings(stderr: &[u8]) -> String {
+pub(crate) fn bounded_warnings(stderr: &[u8]) -> String {
     let text = String::from_utf8_lossy(stderr);
     if text.len() <= MAX_WARNING_BYTES {
         return text.into_owned();
@@ -401,11 +451,16 @@ fn bounded_warnings(stderr: &[u8]) -> String {
 
 /// A private copy of the live index (absent before the first add); Git may
 /// rewrite the copy, never the live index or its lock.
-fn private_index_copy(
+pub(crate) fn private_index_copy(
     root: &Path,
     control: &GitCommandControl,
 ) -> Result<(tempfile::TempDir, PathBuf), String> {
-    let live = read_git(root, &["rev-parse", "--git-path", "index"], 32 * 1024, control)?;
+    let live = read_git(
+        root,
+        &["rev-parse", "--git-path", "index"],
+        32 * 1024,
+        control,
+    )?;
     let live = root.join(live.trim_end_matches(['\r', '\n']));
     let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
     let copy = directory.path().join("index");

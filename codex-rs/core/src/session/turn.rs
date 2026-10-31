@@ -514,6 +514,7 @@ pub(crate) fn run_turn(
         let mut preparation_timing_guard = None;
         let mut client_session =
             prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
+        client_session.set_turn_timing(Arc::clone(&turn_context.turn_timing_state));
         // Startup-capable clients already have a speculative owner until the first send.
         // Desktop attestation intentionally disables that path, but is available now.
         // First-send handoff cuts off an unfinished prewarm, so only a finished one owns
@@ -1136,10 +1137,6 @@ pub(crate) fn run_turn(
                         !tool_result_continuation,
                         turn_context.final_output_json_schema.is_none(),
                     );
-                    logical_generation_budget.observe_progress(
-                        request_signals.observed_successful_process_monitor()
-                            || request_signals.observed_yielded_execution(),
-                    );
                     if let Some(evidence) = request_signals.completion_evidence_key() {
                         completion_evidence = Some(evidence);
                     }
@@ -1427,6 +1424,49 @@ pub(crate) fn run_turn(
                         // A delivery candidate has no publication authority until this
                         // completion attempt survives hooks and pending-input admission.
                         let candidate = authoritative_wait_terminal_surface;
+                        // The structured-output owner gates every final before
+                        // effectful completion hooks. Repair only the answer;
+                        // never replay tools or silently coerce a candidate.
+                        if let Some(schema) = turn_context.final_output_json_schema.as_ref() {
+                            let answer = candidate.as_ref()
+                                .and_then(|result| result.canonical_message.clone())
+                                .or_else(|| output_state.answer_text());
+                            if let Err(validation) = schema.validate_text(answer.as_deref()) {
+                                output_state.invalidate_for_repair();
+                                if logical_generation_budget.can_admit(true)
+                                    && turn_context.claim_final_response_repair()
+                                {
+                                    sess.record_conversation_items(
+                                        &turn_context,
+                                        &[ResponseItem::Message {
+                                            id: None,
+                                            role: "developer".to_string(),
+                                            content: vec![ContentItem::InputText {
+                                                text: format!(
+                                                    "Final response validation failed: {validation}\nRepair the final JSON to satisfy the explicitly requested output schema. Preserve its types and constraints; do not coerce values or replay tools. Return only the corrected final JSON. This is the single tool-free final-schema repair attempt; another failure ends this turn with a recoverable validation error."
+                                                ),
+                                            }],
+                                            phase: None,
+                                            internal_chat_message_metadata_passthrough: None,
+                                        }],
+                                    ).await?;
+                                    pending_generation_request = Some(GenerationRequestDisposition {
+                                        purpose: Some(TurnTimingGenerationPurpose::Repair),
+                                        sampling: SamplingGenerationDisposition::DecisionBearing,
+                                        relevant_state_fingerprint: turn_execution
+                                            .baselines_with_tool_exposure_revision(
+                                                settled_state.mutation_revision,
+                                                settled_state.tool_exposure_revision,
+                                            ).relevant_state_fingerprint(),
+                                        failure_fingerprint: None,
+                                        terminal_completion_only: false,
+                                    }.require_terminal_completion());
+                                    pending_continuation_cause = Some(ContinuationCause::StopHook);
+                                    continue 'sampling_loop;
+                                }
+                                return Err(turn_context.final_response_validation_error(validation));
+                            }
+                        }
                         // Repair delivery before running potentially effectful completion
                         // hooks. Missing prose must not replay an after-agent command.
                         if candidate.is_none()
@@ -2134,15 +2174,8 @@ fn authoritative_wait_terminal_surface(
     }
 }
 
-// Explicit emergency budget, not a claim about remaining reasoning scope.
-// Retained-evidence analysis can use the entire allowance. Identical action/result
-// cycles are suppressed by the existing deterministic-cycle machinery instead
-// of treating evidence novelty as reasoning progress.
-const MAX_REGULAR_LOGICAL_GENERATIONS: u32 = 500;
-// Owned monitoring is free up to this many generations per renewal. Uncapped
-// credits let a turn that keeps polling or yielding run past the budget
-// without ever reaching its forced synthesis.
-const MAX_MONITORING_GENERATION_CREDITS: u32 = 16;
+// Repetition is established by execution receipts and relevant state, never
+// by a generation count. Retain only explicit owner/context terminal fences.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LogicalGenerationAdmission {
@@ -2153,39 +2186,27 @@ enum LogicalGenerationAdmission {
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct LogicalGenerationBudget {
-    regular_generations: u32,
+    regular_generations_exhausted: bool,
     terminal_generation_used: bool,
-    monitoring_credits: u32,
 }
 
 impl LogicalGenerationBudget {
-    fn observe_progress(&mut self, successful_process_monitor: bool) {
-        if successful_process_monitor
-            && self.regular_generations > 0
-            && self.monitoring_credits < MAX_MONITORING_GENERATION_CREDITS
-        {
-            self.regular_generations -= 1;
-            self.monitoring_credits += 1;
-        }
-    }
-
     fn accepted_user_input(&mut self) {
-        self.regular_generations = 0;
+        self.regular_generations_exhausted = false;
         self.terminal_generation_used = false;
-        self.monitoring_credits = 0;
     }
 
     /// The next regular request becomes the one forced final synthesis.
     fn exhaust_regular_generations(&mut self) {
-        self.regular_generations = MAX_REGULAR_LOGICAL_GENERATIONS;
+        self.regular_generations_exhausted = true;
     }
 
     fn is_exhausted(self) -> bool {
-        self.regular_generations >= MAX_REGULAR_LOGICAL_GENERATIONS && self.terminal_generation_used
+        self.regular_generations_exhausted && self.terminal_generation_used
     }
 
     fn has_regular_generation_capacity(self) -> bool {
-        self.regular_generations < MAX_REGULAR_LOGICAL_GENERATIONS
+        !self.regular_generations_exhausted
     }
 
     fn admit(&mut self, terminal_requested: bool) -> LogicalGenerationAdmission {
@@ -2196,8 +2217,7 @@ impl LogicalGenerationBudget {
             self.terminal_generation_used = true;
             return LogicalGenerationAdmission::Terminal { forced: false };
         }
-        if self.regular_generations < MAX_REGULAR_LOGICAL_GENERATIONS {
-            self.regular_generations = self.regular_generations.saturating_add(1);
+        if !self.regular_generations_exhausted {
             return LogicalGenerationAdmission::Regular;
         }
         if self.terminal_generation_used {
@@ -2241,7 +2261,7 @@ fn completion_pending_input_disposition(
     }
 }
 
-const LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE: &str = "The turn exhausted its explicit generation safety budget. This does not establish exhaustion of useful reasoning or evidence. Work is suspended, not completed. This is the final tool-free synthesis request. Do not call tools. Summarize completed work and truthfully report remaining work, failed validation, running processes, and how to resume.";
+const LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE: &str = "An explicit terminal boundary requires a final tool-free synthesis. Work is suspended, not completed. Do not call tools. Summarize completed work and truthfully report remaining work, failed validation, running processes, and how to resume.";
 
 /// A spawned agent that fills this many context windows in one turn reports
 /// what it covered instead of compacting again; its parent splits the rest.
@@ -2279,9 +2299,8 @@ async fn record_forced_terminal_budget_boundary(
     reason: ForcedTerminalReason,
 ) {
     let message = match reason {
-        ForcedTerminalReason::GenerationBudget => format!(
-            "This turn reached its explicit safety budget of {MAX_REGULAR_LOGICAL_GENERATIONS} generations. Work is suspended; the assistant will report completed and unfinished work. Send another message to resume."
-        ),
+        ForcedTerminalReason::GenerationBudget =>
+            "This turn reached an explicit terminal boundary. Work is suspended; the assistant will report completed and unfinished work. Send another message to resume.".to_string(),
         ForcedTerminalReason::SubagentContextBudget => format!(
             "This spawned agent reached its budget of {MAX_SUBAGENT_CONTEXT_PRESSURE_EVENTS} compactions in one turn. It will report what it covered and the unread scope so its parent can split the remaining work."
         ),
@@ -2582,7 +2601,7 @@ async fn report_logical_generation_budget_exhausted(
     emit_status_affecting_turn_error(
         sess,
         turn_context,
-        format!("This turn exhausted its explicit safety budget of {MAX_REGULAR_LOGICAL_GENERATIONS} generations and one final summary. Work is suspended before all requested work completed. Send another message to resume."),
+        "This turn already used its required terminal response. Work is suspended before all requested work completed. Send another message to resume.",
     )
     .await;
 }
@@ -2630,7 +2649,7 @@ fn take_convergence_observation(
 
 
 async fn record_convergence_decision(
-    _sess: &Session,
+    sess: &Session,
     turn_context: &TurnContext,
     turn_execution: &mut TurnExecutionControl,
     decision: Option<&mut SamplingConvergenceDecision>,
@@ -2641,8 +2660,20 @@ async fn record_convergence_decision(
             .turn_timing_state
             .record_proven_loop_activation();
     }
-    // Retain loop telemetry, but do not turn it into model instructions.
-    if directive.as_deref().is_some_and(|text| turn_execution.admit_directive(text)) {
+    if let Some(text) = directive
+        && turn_execution.admit_directive(&text)
+    {
+        sess.record_conversation_items(
+            turn_context,
+            &[ResponseItem::Message {
+                id: None,
+                role: "developer".into(),
+                content: vec![ContentItem::InputText { text }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            }],
+        )
+        .await?;
         turn_context
             .turn_timing_state
             .record_no_progress_directive();
@@ -4660,11 +4691,20 @@ async fn retire_consumed_tool_outputs_before_limit(
     sess: &Session,
     turn_context: &TurnContext,
 ) -> bool {
+    let mut observation = RetirementAttemptObservation::new(
+        sess,
+        turn_context,
+        "proactive",
+        false,
+        CONTEXT_PRESSURE_KEPT_GENERATIONS,
+    );
     let status = super::context_window::context_window_token_status(sess, turn_context).await;
+    observation.observe_status(&status, status.active_context_tokens);
     // Only the soft automatic-compaction scope defines a steady state. Without
     // it there is no limit to stay below, and the limit-triggered path remains
     // the only owner of retirement.
     let Some(limit) = status.auto_compact_scope_limit.filter(|limit| *limit > 0) else {
+        observation.outcome = "no_limit";
         return false;
     };
     let target = limit.saturating_mul(PROACTIVE_RETIREMENT_TARGET_NUMERATOR)
@@ -4683,6 +4723,11 @@ async fn retire_consumed_tool_outputs_before_limit(
         if call_ids.is_empty() || saved == 0 {
             // No request is re-sending retirable outputs, so no charge accrues.
             state.proactive_retirement_carried_tokens = 0;
+            observation.outcome = if excess == 0 {
+                "below_target"
+            } else {
+                "no_eligible_outputs"
+            };
             return false;
         }
         // The request that just completed re-sent these outputs.
@@ -4692,6 +4737,9 @@ async fn retire_consumed_tool_outputs_before_limit(
         state.proactive_retirement_carried_tokens = carried;
         (call_ids, saved, carried, state.history.clone())
     };
+    observation.selected_outputs = call_ids.len();
+    observation.estimate_available = true;
+    observation.estimated_saved_tokens = i64::try_from(saved).unwrap_or(i64::MAX);
     // Instructions and tool schemas stay cached across the rewrite; the clone
     // shares item storage, so estimating outside the lock copies nothing.
     let Some(history_tokens) = history.estimate_prepared_token_count_with_base_instructions(
@@ -4700,6 +4748,7 @@ async fn retire_consumed_tool_outputs_before_limit(
             text: String::new(),
         },
     ) else {
+        observation.outcome = "estimate_unavailable";
         return false;
     };
     let rewritten = u64::try_from(history_tokens)
@@ -4714,6 +4763,7 @@ async fn retire_consumed_tool_outputs_before_limit(
             rewritten_tokens = rewritten,
             "deferring proactive context retirement until re-sending the outputs costs more than the cache miss"
         );
+        observation.outcome = "not_cost_effective";
         return false;
     }
     let checkpoint = crate::tool_history::pressure_retirement_checkpoint(
@@ -4726,6 +4776,7 @@ async fn retire_consumed_tool_outputs_before_limit(
     {
         // The limit-triggered path still owns this history later.
         warn!(%error, "proactive context retirement was not recorded; leaving history unchanged");
+        observation.outcome = "publication_failed";
         return false;
     }
     sess.state.lock().await.proactive_retirement_carried_tokens = 0;
@@ -4741,6 +4792,7 @@ async fn retire_consumed_tool_outputs_before_limit(
         target,
         "retired consumed tool outputs before reaching the compaction limit"
     );
+    observation.outcome = "retired";
     true
 }
 
@@ -4773,6 +4825,92 @@ enum ContextPressureRelief {
     Compaction,
 }
 
+/// Content-free observations only: no new persistence, work queues or policy.
+/// Drop also records cancellation without calling an abandoned attempt a success.
+struct RetirementAttemptObservation<'a> {
+    thread_id: &'a codex_protocol::ThreadId,
+    turn_id: &'a str,
+    started: std::time::Instant,
+    trigger: &'static str,
+    outcome: &'static str,
+    projected: bool,
+    kept_generations: usize,
+    limits_observed: bool,
+    pressure_tokens: i64,
+    scope_tokens: i64,
+    scope_limit: Option<i64>,
+    full_limit: Option<i64>,
+    selected_outputs: usize,
+    estimate_available: bool,
+    estimated_saved_tokens: i64,
+}
+
+impl<'a> RetirementAttemptObservation<'a> {
+    fn new(
+        sess: &'a Session,
+        turn: &'a TurnContext,
+        trigger: &'static str,
+        projected: bool,
+        kept_generations: usize,
+    ) -> Self {
+        Self {
+            thread_id: &sess.thread_id,
+            turn_id: &turn.sub_id,
+            started: std::time::Instant::now(),
+            trigger,
+            outcome: "cancelled_or_abandoned",
+            projected,
+            kept_generations,
+            limits_observed: false,
+            pressure_tokens: 0,
+            scope_tokens: 0,
+            scope_limit: None,
+            full_limit: None,
+            selected_outputs: 0,
+            estimate_available: false,
+            estimated_saved_tokens: 0,
+        }
+    }
+
+    fn observe_status(
+        &mut self,
+        status: &super::context_window::ContextWindowTokenStatus,
+        pressure: i64,
+    ) {
+        self.limits_observed = true;
+        self.pressure_tokens = pressure;
+        self.scope_tokens = status.auto_compact_scope_tokens;
+        self.scope_limit = status.auto_compact_scope_limit;
+        self.full_limit = status.full_context_window_limit;
+    }
+}
+
+impl Drop for RetirementAttemptObservation<'_> {
+    fn drop(&mut self) {
+        tracing::debug!(
+            event.name = "codex.context_retirement.attempt_finished",
+            thread_id = %self.thread_id,
+            turn_id = self.turn_id,
+            trigger = self.trigger,
+            outcome = self.outcome,
+            projected = self.projected,
+            kept_generations = self.kept_generations,
+            limits_observed = self.limits_observed,
+            pressure_tokens = self.pressure_tokens,
+            scope_tokens = self.scope_tokens,
+            scope_limit_known = self.scope_limit.is_some(),
+            scope_limit = self.scope_limit.unwrap_or(0),
+            full_limit_known = self.full_limit.is_some(),
+            full_limit = self.full_limit.unwrap_or(0),
+            selected_outputs = self.selected_outputs,
+            estimate_available = self.estimate_available,
+            estimated_saved_tokens = self.estimated_saved_tokens,
+            elapsed_us = u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            "context retirement attempt settled; token savings are estimates, not latency savings"
+        );
+    }
+}
+
 /// Retires consumed tool results to their recovery pins; read_tool_output
 /// still recovers their exact bytes. Returns true when that alone brings the
 /// context under its automatic-compaction limit, so the LLM summary is
@@ -4791,6 +4929,13 @@ async fn retire_consumed_tool_outputs_for_context_pressure(
     kept_generations: usize,
     projected_pressure: Option<ProjectedPromptPressure>,
 ) -> bool {
+    let mut observation = RetirementAttemptObservation::new(
+        sess,
+        turn_context,
+        "context_limit",
+        projected_pressure.is_some(),
+        kept_generations,
+    );
     let status = match projected_pressure {
         Some(pressure) => {
             super::context_window::projected_context_window_token_status(
@@ -4803,20 +4948,29 @@ async fn retire_consumed_tool_outputs_for_context_pressure(
         }
         None => super::context_window::context_window_token_status(sess, turn_context).await,
     };
+    let pressure_tokens = projected_pressure.map_or(status.active_context_tokens, |pressure| {
+        pressure.total_tokens
+    });
+    observation.observe_status(&status, pressure_tokens);
     let Some(limit) = status.auto_compact_scope_limit.filter(|limit| *limit > 0) else {
+        observation.outcome = "no_limit";
         return false;
     };
     // Aim well below the limit so the next compaction is not one request away.
     let target = limit.saturating_mul(2) / 3;
     let Ok(excess) = u64::try_from(status.auto_compact_scope_tokens.saturating_sub(target)) else {
+        observation.outcome = "below_target";
         return false;
     };
     if excess == 0 {
+        observation.outcome = "below_target";
         return false;
     }
     let mut candidate = sess.clone_history().await;
     let (call_ids, _) = candidate.pressure_retirement_selection(kept_generations, excess);
+    observation.selected_outputs = call_ids.len();
     if call_ids.is_empty() {
+        observation.outcome = "no_eligible_outputs";
         return false;
     }
     let checkpoint = crate::tool_history::pressure_retirement_checkpoint(
@@ -4824,6 +4978,7 @@ async fn retire_consumed_tool_outputs_for_context_pressure(
         crate::tool_history::PressureRetirementTrigger::ContextLimit,
     );
     let Some(before) = candidate.estimate_token_count(turn_context) else {
+        observation.outcome = "estimate_unavailable";
         return false;
     };
     candidate.record_items(
@@ -4831,6 +4986,7 @@ async fn retire_consumed_tool_outputs_for_context_pressure(
         turn_context.model_info.truncation_policy.into(),
     );
     let Some(after) = candidate.estimate_token_count(turn_context) else {
+        observation.outcome = "estimate_unavailable";
         return false;
     };
     // Size the actual pin rewrite AND its checkpoint with sampling's estimator.
@@ -4840,6 +4996,8 @@ async fn retire_consumed_tool_outputs_for_context_pressure(
         .calibrated_prompt_tokens(turn_context, before)
         .await
         .saturating_sub(sess.calibrated_prompt_tokens(turn_context, after).await);
+    observation.estimate_available = true;
+    observation.estimated_saved_tokens = saved;
     // Check the physical window against the same total the caller triggered on.
     // `active_context_tokens` stays live even under a projection, so using it
     // here would clear a projected prompt that still overflows.
@@ -4851,6 +5009,7 @@ async fn retire_consumed_tool_outputs_for_context_pressure(
             .full_context_window_limit
             .is_none_or(|full| full_window_tokens.saturating_sub(saved) < full);
     if saved <= 0 || !fits {
+        observation.outcome = "insufficient_reclaim";
         return false;
     }
     if let Err(error) = sess
@@ -4858,6 +5017,7 @@ async fn retire_consumed_tool_outputs_for_context_pressure(
         .await
     {
         warn!(%error, "context-pressure retirement was not recorded; compacting instead");
+        observation.outcome = "publication_failed";
         return false;
     }
     // The rewrite starts a new prefix, so proactive carrying restarts too.
@@ -4872,6 +5032,7 @@ async fn retire_consumed_tool_outputs_for_context_pressure(
         .await
         .estimate_token_count(turn_context)
     else {
+        observation.outcome = "committed_estimate_unavailable";
         return false;
     };
     let committed_saved = sess
@@ -4886,6 +5047,7 @@ async fn retire_consumed_tool_outputs_for_context_pressure(
             .full_context_window_limit
             .is_some_and(|full| full_window_tokens.saturating_sub(committed_saved) >= full)
     {
+        observation.outcome = "committed_pressure_exceeded";
         return false;
     }
     info!(
@@ -4893,6 +5055,7 @@ async fn retire_consumed_tool_outputs_for_context_pressure(
         estimated_saved_tokens = saved,
         "retired consumed tool outputs instead of compacting"
     );
+    observation.outcome = "retired";
     true
 }
 
@@ -4987,6 +5150,15 @@ fn run_auto_compact<'a>(
         {
             return Ok(ContextPressureRelief::RoutineRetirement);
         }
+        tracing::debug!(
+            event.name = "codex.context_retirement.compaction_fallback",
+            thread_id = %sess.thread_id,
+            turn_id = %turn_context.sub_id,
+            reason = ?reason,
+            phase = ?phase,
+            retirement_eligible = matches!(retire_consumed_outputs, ConsumedOutputRetirement::Eligible { .. }),
+            "retirement did not clear pressure or was unavailable; invoking compaction"
+        );
         // Automatic compaction restores initial context. Reuse a snapshot already
         // captured by the caller, or capture one before dispatching compaction.
         let world_state = match prefetched_world_state {
@@ -5795,14 +5967,11 @@ fn run_sampling_request<'a>(
         drop(worker_preparation_guard);
         client_session.refresh_transport_after_cooldown();
         let max_retries = turn_context.provider.info().stream_max_retries();
-        let mut retry_state = ResponsesStreamRetryState::default();
+        let mut retry_state = ResponsesStreamRetryState::new(max_retries);
         let recovery_episode_id = format!("{}:{}", generation_id.turn_id, generation_id.ordinal);
         let mut outer_attempt_ordinal = 0_u64;
         let mut outer_retry_reason = "initial";
         let mut accepted_attempt_input = prepared_input.shared_items();
-        sess.services
-            .code_mode_service
-            .note_visible_prompt(Arc::clone(&accepted_attempt_input));
         let prompt_construction_guard = turn_context
             .turn_timing_state
             .begin_local_phase(TurnLocalPhase::PromptConstruction);
@@ -5840,6 +6009,7 @@ fn run_sampling_request<'a>(
             {
                 continue;
             }
+            retry_state.begin_attempt(&turn_context, ResponsesStreamRequest::Sampling);
             let mut attempt_progress = SamplingAttemptProgress::default();
             let dispatch_before = turn_context.turn_timing_state.latest_model_dispatch_identity();
             // The streaming/tool state machine is large in debug builds. Keep its
@@ -6007,9 +6177,6 @@ fn run_sampling_request<'a>(
                     )
                 };
                 accepted_attempt_input = retry_input.shared_items();
-                sess.services
-                    .code_mode_service
-                    .note_visible_prompt(Arc::clone(&accepted_attempt_input));
                 prompt = build_projected_prompt_from_scaffold(
                     &retry_input,
                     step_context.as_ref(),
@@ -7909,6 +8076,9 @@ fn try_run_sampling_request<'a>(
         let model_request_timing_guard = turn_context.turn_timing_state.begin_model_request_wait();
         drop(preparation_timing_guard.take());
         let boundary_session = Arc::clone(&sess);
+        let boundary_turn_context = Arc::clone(&turn_context);
+        let boundary_request_effort = request_effort.clone();
+        let boundary_cancellation_token = cancellation_token.clone();
         let boundary_turn_id = turn_context.sub_id.clone();
         let boundary_turn_timing = Arc::clone(&turn_context.turn_timing_state);
         let (mut boundary_runtime_identity, boundary_harness_build) =
@@ -7945,6 +8115,9 @@ fn try_run_sampling_request<'a>(
         let attempt_prepared: AttemptPreparedCallback = Arc::new(move |identity| {
             let tool_runtime = boundary_tool_runtime.clone();
             let sess = Arc::clone(&boundary_session);
+            let turn_context = Arc::clone(&boundary_turn_context);
+            let request_effort = boundary_request_effort.clone();
+            let cancellation_token = boundary_cancellation_token.clone();
             let turn_id = boundary_turn_id.clone();
             let turn_timing_state = Arc::clone(&boundary_turn_timing);
             let runtime_identity = boundary_runtime_identity.clone();
@@ -8092,6 +8265,40 @@ fn try_run_sampling_request<'a>(
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .extend(notice_digests);
                 drop(persistence_guard);
+                if turn_context.session_source.is_non_root_agent() {
+                    // Recheck each physical attempt after transport preparation,
+                    // sampling admission and persistence waits, not before the gate.
+                    let environments = sess.services.turn_environments.snapshot_now().await;
+                    let environment = crate::tools::handlers::wait_for_tool_environment(
+                        &environments,
+                        None,
+                        &cancellation_token,
+                    )
+                    .await
+                    .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?
+                    .ok_or_else(|| {
+                        CodexErr::InvalidRequest(
+                            "worker generation requires its selected workspace".into(),
+                        )
+                    })?;
+                    crate::client::validate_request_effort_for_model(
+                        &turn_context.model_info,
+                        request_effort.as_ref(),
+                    )
+                    .map_err(CodexErr::InvalidRequest)?;
+                    crate::tools::handlers::backend_capabilities::effective_snapshot(
+                        &environment,
+                        environment.cwd(),
+                        turn_context.file_system_sandbox_context(None, environment.cwd()),
+                        crate::tools::handlers::backend_capabilities::turn_configuration(&turn_context)
+                            .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?,
+                        codex_exec_server::CapabilityQuery::default(),
+                        true,
+                        &cancellation_token,
+                    )
+                    .await
+                    .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
+                }
                 // Request auth was resolved before this callback. A retained
                 // router/catalog must belong to that same still-current scope.
                 // Later transitions are fenced by the request's dispatch epoch.

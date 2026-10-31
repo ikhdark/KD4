@@ -286,6 +286,7 @@ async fn handle_spawn_agent(
     .await?;
     apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref(), role_locks)?;
     config.cwd = admission_cwd.clone();
+    worker_startup_preflight(&session, &turn, &config, &primary, &cancellation_token).await?;
 
     // Durable task metadata retains the historical generic Worker tag.
     let durable_role_name = agent_role_metric_label(typed_role);
@@ -343,6 +344,7 @@ async fn handle_spawn_agent(
     ));
     let mut consumed_typed_spawn = None;
     let mut admitted_launch_guard = None;
+    let mut overlap_warnings = Vec::new();
     let typed_task = if args.assignment.is_some() || legacy_message.is_some() {
         let role = typed_role;
         let coordinator = session.services.agent_control.task_coordinator();
@@ -421,7 +423,7 @@ async fn handle_spawn_agent(
         } else {
             main_repo_root
         };
-        let (draft, relevant_handles) = match args.assignment.take() {
+        let (mut draft, relevant_handles) = match args.assignment.take() {
             Some(assignment_args) => {
                 let relevant_handles = assignment_args.relevant_handles.clone();
                 (
@@ -444,6 +446,7 @@ async fn handle_spawn_agent(
                 Vec::new(),
             ),
         };
+        draft.independent_verification = args.independent_verification;
         if cancellation_token.is_cancelled() {
             if let Some(workspace) = isolated_workspace.take()
                 && let Err(error) = cleanup_isolated_worktree(&workspace).await
@@ -539,7 +542,8 @@ async fn handle_spawn_agent(
                 return Err(typed_task_store_error(error));
             }
         };
-        emit_admission_overlap_metrics(&turn.session_telemetry, admitted.overlaps);
+        emit_admission_overlap_metrics(&turn.session_telemetry, &admitted.overlaps);
+        overlap_warnings = admitted.overlaps.warnings;
         let assignment = admitted.assignment;
         let attempt = admitted.attempt;
         admitted_launch_guard = Some(AdmittedLaunchGuard {
@@ -628,12 +632,23 @@ async fn handle_spawn_agent(
         }),
         agent_job_binding: None,
     };
-    let spawned_agent = if let Some(canonical_payload) = typed_task
+    let mut effective_capabilities = JsonValue::Null;
+    let spawned_agent = async {
+    // Recheck after workspace/capsule preparation, through the same selected
+    // backend. Errors enter the normal admitted-launch cleanup below.
+    let launch_environment = crate::tools::handlers::wait_for_observed_tool_environment(
+        &step_context.environments, None, &cancellation_token,
+    ).await.map_err(|error| CodexErr::InvalidRequest(error.to_string()))?
+        .ok_or_else(|| CodexErr::InvalidRequest("worker launch environment disappeared".into()))?;
+    effective_capabilities = worker_startup_preflight(
+        &session, &turn, &config, &launch_environment, &cancellation_token,
+    ).await.map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
+    if let Some(canonical_payload) = typed_task
         .as_ref()
         .and_then(|(_, _, capsule)| capsule.as_ref())
     {
         let prepared = consumed_typed_spawn.take().ok_or_else(|| {
-            FunctionCallError::RespondToModel(
+            CodexErr::InvalidRequest(
                 "spawn_agent: typed spawn reservation became unavailable".to_string(),
             )
         })?;
@@ -670,7 +685,7 @@ async fn handle_spawn_agent(
             AgentCommunicationContext::new(AgentCommunicationKind::Spawn, session.thread_id);
         if typed_task.is_some() {
             let prepared = consumed_typed_spawn.take().ok_or_else(|| {
-                FunctionCallError::RespondToModel(
+                CodexErr::InvalidRequest(
                     "spawn_agent: typed spawn reservation became unavailable".to_string(),
                 )
             })?;
@@ -709,7 +724,8 @@ async fn handle_spawn_agent(
             )
             .await
         }
-    };
+    }
+    }.await;
     let spawned_agent = match spawned_agent {
         Ok(spawned_agent) => spawned_agent,
         Err(error) => {
@@ -847,16 +863,20 @@ async fn handle_spawn_agent(
     let hide_agent_metadata = turn.config.multi_agent_v2.hide_spawn_agent_metadata;
     if hide_agent_metadata {
         Ok(SpawnAgentResult::HiddenMetadata {
+            effective_capabilities,
             task_name,
             assignment_id,
             integration_plan,
+            overlap_warnings,
         })
     } else {
         Ok(SpawnAgentResult::WithNickname {
+            effective_capabilities,
             task_name,
             nickname,
             assignment_id,
             integration_plan,
+            overlap_warnings,
         })
     }
 }
@@ -911,7 +931,7 @@ const fn agent_role_metric_label(role: AgentRole) -> &'static str {
 
 fn emit_admission_overlap_metrics(
     session_telemetry: &SessionTelemetry,
-    overlaps: codex_agent_task_store::AdmissionOverlapSummary,
+    overlaps: &codex_agent_task_store::AdmissionOverlapSummary,
 ) {
     let count = overlaps.benign_read_overlap_count;
     if count > 0 {
@@ -1649,6 +1669,8 @@ struct SpawnAgentArgs {
     // message only; even this input always uses the same generic runtime profile.
     assignment: Option<TypedAssignmentArgs>,
     task_name: String,
+    #[serde(default)]
+    independent_verification: bool,
     workspace_strategy: Option<WorkspaceStrategy>,
     agent_type: Option<String>,
     model: Option<String>,
@@ -1768,6 +1790,7 @@ impl TypedAssignmentArgs {
     fn into_draft(self, root_session_id: String, role: AgentRole) -> AssignmentDraft {
         AssignmentDraft {
             root_session_id,
+            independent_verification: false,
             admission_origin: AssignmentAdmissionOrigin::Typed,
             role,
             capability_profile: role.capability_profile(),
@@ -1811,6 +1834,7 @@ fn legacy_message_draft(
     };
     AssignmentDraft {
         root_session_id,
+        independent_verification: false,
         admission_origin: AssignmentAdmissionOrigin::LegacyMessage {
             parent_assignment_id,
         },
@@ -2126,15 +2150,19 @@ fn typed_task_store_error(error: StoreError) -> FunctionCallError {
 #[serde(untagged)]
 pub(crate) enum SpawnAgentResult {
     WithNickname {
+        effective_capabilities: JsonValue,
         task_name: String,
         nickname: Option<String>,
         assignment_id: String,
         integration_plan: IntegrationPlan,
+        overlap_warnings: Vec<codex_agent_task_store::TaskOverlapWarning>,
     },
     HiddenMetadata {
+        effective_capabilities: JsonValue,
         task_name: String,
         assignment_id: String,
         integration_plan: IntegrationPlan,
+        overlap_warnings: Vec<codex_agent_task_store::TaskOverlapWarning>,
     },
     Reused {
         task_name: String,

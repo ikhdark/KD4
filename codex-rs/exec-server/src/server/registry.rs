@@ -94,8 +94,30 @@ pub(crate) fn build_router() -> RpcRouter<ExecServerHandler> {
         },
     );
     router.request(
+        crate::protocol::LOOKUP_EXECUTABLES_METHOD,
+        |handler: Arc<ExecServerHandler>, params: crate::protocol::LookupExecutablesParams| async move {
+            handler.lookup_executables(params).await
+        },
+    );
+    router.request(
+        crate::protocol::FS_LOOKUP_BATCH_METHOD,
+        |handler: Arc<ExecServerHandler>, params: crate::protocol::FsLookupBatchParams| async move {
+            handler.fs_lookup_batch(params).await
+        },
+    );
+    router.request(
         ENVIRONMENT_INFO_METHOD,
         |handler: Arc<ExecServerHandler>, _params: ()| async move { handler.environment_info() },
+    );
+    router.request(
+        crate::protocol::CAPABILITY_MANIFEST_METHOD,
+        |handler: Arc<ExecServerHandler>, _params: ()| async move { handler.capability_manifest() },
+    );
+    router.request(
+        crate::protocol::CAPABILITY_QUERY_METHOD,
+        |handler: Arc<ExecServerHandler>, query: crate::protocol::CapabilityQuery| async move {
+            handler.capability_report(query)
+        },
     );
     router.request(
         EXEC_READ_METHOD,
@@ -109,6 +131,13 @@ pub(crate) fn build_router() -> RpcRouter<ExecServerHandler> {
         |handler: Arc<ExecServerHandler>,
          params: crate::protocol::OwnedProcessParams<WriteParams>| async move {
             handler.write_owned(params).await
+        },
+    );
+    router.request(
+        crate::protocol::EXEC_CLOSE_STDIN_METHOD,
+        |handler: Arc<ExecServerHandler>,
+         params: crate::protocol::OwnedProcessParams<crate::protocol::CloseStdinParams>| async move {
+            handler.close_stdin_owned(params).await
         },
     );
     router.request(

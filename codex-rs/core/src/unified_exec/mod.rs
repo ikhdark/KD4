@@ -149,6 +149,7 @@ pub(crate) struct ExecCommandRequest {
     pub sandbox_cwd: PathUri,
     pub turn_environment: TurnEnvironment,
     pub tty: bool,
+    pub pipe_stdin: bool,
     pub sandbox_permissions: SandboxPermissions,
     pub additional_permissions: Option<AdditionalPermissionProfile>,
     pub additional_permissions_uri: Option<UriAdditionalPermissionProfile>,
@@ -224,6 +225,7 @@ impl PendingSpawnRegistration {
 pub(crate) struct WriteStdinRequest<'a> {
     pub process_id: u32,
     pub input: &'a str,
+    pub close_stdin: bool,
     pub yield_time_ms: u64,
     pub max_output_tokens: Option<usize>,
     pub truncation_policy: TruncationPolicy,
@@ -241,7 +243,7 @@ pub(crate) struct ProcessStore {
     reserved_process_ids: HashSet<u32>,
     // Never assign an observed handle to another process, even after replay eviction.
     used_process_ids: HashMap<u32, Option<uuid::Uuid>>,
-    finished: VecDeque<(u32, crate::tools::context::ExecCommandToolOutput)>,
+    finished: VecDeque<(u32, crate::tools::context::ExecCommandToolOutput, Option<[u64; 2]>)>,
     // Capacity admitted before launch, not yet transferred to `processes`.
     reserved_process_slots: HashSet<u32>,
 }
@@ -286,17 +288,30 @@ impl ProcessStore {
         if self.finished.len() == MAX_FINISHED {
             self.finished.pop_front();
         }
+        // Keep cursor bounds and the bounded snapshot for non-consuming literal
+        // observers. Ordinary completion replays must not redeliver its streams.
+        let stream_totals = response.process_output.as_ref().map(|snapshot| [
+            head_tail_buffer::RetainedStream::frozen(&snapshot.stdout, &snapshot.stdout_layout).total() as u64,
+            head_tail_buffer::RetainedStream::frozen(&snapshot.stderr, &snapshot.stderr_layout).total() as u64,
+        ]).or_else(|| response.stream_ranges.as_ref().map(|ranges| [ranges[0].end, ranges[1].end]));
         let mut response = response.clone();
         // A replay observes completion; it must not run PostToolUse twice.
         response.hook_command = None;
-        self.finished.push_back((id, response));
+        // The original receipt consumed these ranges. Keep completion and the
+        // full artifact reference, not another delivery of its body or streams.
+        response.raw_output.clear();
+        response.output_ranges = None;
+        response.stream_ranges = None;
+        response.stream_chunks = None;
+        response.original_token_count = Some(0);
+        self.finished.push_back((id, response, stream_totals));
         // Bound retained output as well as record count; never retain process
         // handles/tasks just to support an idempotent terminal poll.
         while self.finished.len() > 1
             && self
                 .finished
                 .iter()
-                .map(|(_, output)| {
+                .map(|(_, output, _)| {
                     output.raw_output.len()
                         + output.process_output.as_ref().map_or(0, |snapshot| {
                             snapshot.aggregated_output.len()
@@ -315,10 +330,10 @@ impl ProcessStore {
         &self,
         request: &WriteStdinRequest<'_>,
     ) -> Option<Result<crate::tools::context::ExecCommandToolOutput, UnifiedExecError>> {
-        let (_, response) = self
+        let (_, response, _) = self
             .finished
             .iter()
-            .find(|(id, _)| *id == request.process_id)?;
+            .find(|(id, _, _)| *id == request.process_id)?;
         if !request.input.is_empty() {
             return Some(Err(UnifiedExecError::process_failed(format!(
                 "process {} has exited; input was not delivered",
@@ -326,6 +341,7 @@ impl ProcessStore {
             ))));
         }
         let mut response = response.clone();
+        response.process_output = None;
         response.truncation_policy = request.truncation_policy;
         response.max_output_tokens = request.max_output_tokens;
         Some(Ok(response))
@@ -341,7 +357,7 @@ impl ProcessStore {
         let entry = self.processes.remove(&process_id)?;
         // A transport ID can never authorize a previous owner's completion.
         // Retirement republishes this owner's result after removal.
-        self.finished.retain(|(id, _)| *id != process_id);
+        self.finished.retain(|(id, _, _)| *id != process_id);
         self.used_process_ids.insert(
             process_id,
             Some(entry.process.session_capabilities(entry.tty).incarnation),

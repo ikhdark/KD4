@@ -22,6 +22,7 @@ use crate::transport::remote_control::websocket::RemoteControlStatusPublisher;
 use crate::transport::remote_control::websocket::RemoteControlWebsocket;
 
 pub use self::protocol::ClientId;
+pub use self::protocol::remote_control_user_agent;
 pub use self::segment::remote_control_response_size_error;
 use self::protocol::RemoteControlPairingStatusCode;
 use self::protocol::ServerEvent;

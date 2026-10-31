@@ -2133,6 +2133,9 @@ impl Session {
                 ))
                 .await;
             let initial_messages = startup_rollout_facts.initial_messages.take();
+            sess.input_queue.seed_mailbox_progress(std::mem::take(
+                &mut startup_rollout_facts.mailbox_progress,
+            )).await;
             let events = std::iter::once(Event {
                 id: INITIAL_SUBMIT_ID.to_owned(),
                 msg: EventMsg::SessionConfigured(SessionConfiguredEvent {

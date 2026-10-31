@@ -20,9 +20,44 @@ pub enum WaitOutcome {
 
 // Native registration and teardown can block. Keep both off async workers,
 // including when a cancelled setup finishes after its caller has gone away.
-struct Subscription {
+pub struct Subscription {
     handles: Option<(WatchRegistration, FileWatcherSubscriber)>,
     receiver: Receiver,
+}
+
+impl Subscription {
+    /// Install coverage before capturing a baseline. Events received during
+    /// capture remain queued. This grants no filesystem read authority and
+    /// does not make a multi-file baseline atomic.
+    pub async fn new(paths: Vec<WatchPath>) -> io::Result<Self> {
+        if paths.is_empty() || paths.iter().any(|path| !path.path.is_absolute()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file subscriptions require nonempty absolute watch paths",
+            ));
+        }
+        tokio::task::spawn_blocking(move || {
+            let watcher = FileWatcher::shared().map_err(io::Error::other)?;
+            let (subscriber, receiver) = watcher.add_subscriber();
+            let mut subscription = Self {
+                handles: Some((WatchRegistration::default(), subscriber)),
+                receiver,
+            };
+            let (registration, subscriber) = subscription.handles.as_mut()
+                .ok_or_else(|| io::Error::other("file subscription lost its handles"))?;
+            *registration = subscriber.register_paths(paths).map_err(io::Error::other)?;
+            Ok(subscription)
+        }).await.map_err(io::Error::other)?
+    }
+
+    /// A notification is only a reason to recheck authoritative state. In
+    /// particular, rescan_required means paths may have been lost to overflow
+    /// or degraded coverage, not that any particular file changed.
+    pub async fn recv(&mut self) -> io::Result<crate::FileWatcherEvent> {
+        self.receiver.recv().await.ok_or_else(|| io::Error::new(
+            io::ErrorKind::BrokenPipe, "filesystem watcher closed",
+        ))
+    }
 }
 
 impl Drop for Subscription {
@@ -70,24 +105,7 @@ where
         if check().await? {
             return Ok(WaitOutcome::Satisfied);
         }
-        let mut subscription = tokio::task::spawn_blocking(move || {
-            let watcher = FileWatcher::shared().map_err(io::Error::other)?;
-            let (subscriber, receiver) = watcher.add_subscriber();
-            // Install the owner before registration so all error/late-result
-            // paths also release the subscriber on a blocking worker.
-            let mut subscription = Subscription {
-                handles: Some((WatchRegistration::default(), subscriber)),
-                receiver,
-            };
-            let (registration, subscriber) = subscription
-                .handles
-                .as_mut()
-                .ok_or_else(|| io::Error::other("file wait subscription lost its handles"))?;
-            *registration = subscriber.register_paths(paths).map_err(io::Error::other)?;
-            Ok::<_, io::Error>(subscription)
-        })
-        .await
-        .map_err(io::Error::other)??;
+        let mut subscription = Subscription::new(paths).await?;
 
         loop {
             // Always recheck after registration, including events that occurred
@@ -96,12 +114,7 @@ where
             if check().await? {
                 return Ok(WaitOutcome::Satisfied);
             }
-            if subscription.receiver.recv().await.is_none() {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "filesystem watcher closed before the condition was satisfied",
-                ));
-            }
+            subscription.recv().await?;
         }
     };
     tokio::pin!(cancelled);

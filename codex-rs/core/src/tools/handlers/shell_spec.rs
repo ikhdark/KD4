@@ -7,7 +7,19 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
 
-const LEGACY_SHELL_SCRIPT_DESCRIPTION: &str = "Shell script to execute in the user's default shell. Prefer this for every command, including pipelines, redirection, shell expansion, compound statements, and builtins.";
+const SHELL_SCRIPT_DESCRIPTION: &str = "Explicit source for the selected shell (the session default when omitted), for pipelines, redirection, expansion, compound statements, or builtins. Use `program`/`args` for executables; never concatenate executable arguments into shell source.";
+const EXECUTABLE_DESCRIPTION: &str = "Executable to launch directly through the existing process owner with `args`. Prefer this for executables. Normal permission and sandbox checks still apply. Batch files require explicit shell execution.";
+const ARGUMENTS_DESCRIPTION: &str = "Literal arguments for `program`, excluding the program name. Pass each argument separately without shell quoting; the process owner handles Windows argument serialization. Shell operators and expansions remain literal data unless a shell is explicitly invoked.";
+
+fn shell_parameter() -> JsonSchema {
+    JsonSchema::string(Some("Shell executable for this command only (pwsh.exe, powershell.exe, or cmd.exe, including an explicit path). Omit to use the session default. No session or machine configuration is changed. Invalid selections fail without falling back; not valid with program/args.".into()))
+}
+
+fn login_parameter(allow_login_shell: bool) -> JsonSchema {
+    JsonSchema::boolean(Some(format!(
+        "Per-command startup semantics. PowerShell: true loads profiles; false adds -NoProfile. cmd.exe always uses /d /c (AutoRun disabled); login=true is unsupported. Defaults to {allow_login_shell}; true is allowed only when login shells are permitted. Final shell executable/startup_flags/profile_loading appear in environment_receipt."
+    )))
+}
 
 fn bounded_integer(description: String, minimum: u64, maximum: u64) -> JsonSchema {
     JsonSchema {
@@ -52,6 +64,12 @@ fn stall_timeout_schema() -> JsonSchema {
     )
 }
 
+fn quiet_on_success_schema() -> JsonSchema {
+    JsonSchema::boolean(Some(
+        "Opt in to a compact, explicit success receipt only after exit code 0, complete capture and recoverable output. Defaults to false. Failures, signals, running/unknown outcomes and retention failures keep normal diagnostics. Applies to this call only; request it again on write_stdin when collecting a long-running command.".to_string(),
+    ))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandToolOptions {
     pub allow_login_shell: bool,
@@ -69,25 +87,25 @@ pub(crate) fn create_exec_command_tool_for_policy(
     let mut properties = BTreeMap::from([
         (
             "cmd".to_string(),
-            JsonSchema::string(Some(LEGACY_SHELL_SCRIPT_DESCRIPTION.to_string())),
+            JsonSchema::string(Some(SHELL_SCRIPT_DESCRIPTION.to_string())),
         ),
         (
             "program".to_string(),
             JsonSchema::string(Some(
-                "Executable to launch directly, bypassing the shell. Use only when `cmd` cannot express the command.".to_string(),
+                EXECUTABLE_DESCRIPTION.to_string(),
             )),
         ),
         (
             "args".to_string(),
             JsonSchema::array(
                 JsonSchema::string(/*description*/ None),
-                Some("Arguments for `program`, excluding the program name.".to_string()),
+                Some(ARGUMENTS_DESCRIPTION.to_string()),
             ),
         ),
         (
             "script_body".to_string(),
             JsonSchema::string(Some(
-                "Plain PowerShell script that Codex encodes at runtime. Use only when `cmd` quoting cannot express the script."
+                "Explicit PowerShell source that Codex encodes at runtime. Prefer this for multiline PowerShell; use `program`/`args` for executables."
                     .to_string(),
             )),
         ),
@@ -112,7 +130,12 @@ pub(crate) fn create_exec_command_tool_for_policy(
                     .to_string(),
             )),
         ),
+        (
+            "pipe_stdin".to_string(),
+            JsonSchema::boolean(Some("Keep piped stdin open for write_stdin; requires tty=false. Defaults to false (immediate EOF). Finish input with write_stdin close_stdin=true, not a terminal control character.".into())),
+        ),
         ("stall_timeout_ms".to_string(), stall_timeout_schema()),
+        ("quiet_on_success".to_string(), quiet_on_success_schema()),
         (
             "yield_time_ms".to_string(),
             bounded_integer(
@@ -129,22 +152,12 @@ pub(crate) fn create_exec_command_tool_for_policy(
         ),
     ]);
     if include_shell_parameter {
-        properties.insert(
-            "shell".to_string(),
-            JsonSchema::string(Some(
-                "Shell binary to launch. Defaults to the user's default shell.".to_string(),
-            )),
-        );
+        properties.insert("shell".to_string(), shell_parameter());
     }
-    if options.allow_login_shell {
-        properties.insert(
-            "login".to_string(),
-            JsonSchema::boolean(Some(
-                "True runs the shell with -l/-i semantics; false disables them. Defaults to true."
-                    .to_string(),
-            )),
-        );
-    }
+    properties.insert(
+        "login".to_string(),
+        login_parameter(options.allow_login_shell),
+    );
     if include_environment_id {
         properties.insert(
             "environment_id".to_string(),
@@ -161,7 +174,7 @@ pub(crate) fn create_exec_command_tool_for_policy(
     ToolSpec::Function(ResponsesApiTool {
         name: "exec_command".to_string(),
         description: format!(
-            "Runs a command through `cmd`, returning output or a session ID for ongoing interaction. Resume a returned session_id with write_stdin; do not restart the command while it is live or its effects are uncertain.\n\n{}\n\n{}\n\n{}",
+            "Runs an executable through `program`/`args`, or explicit shell source through `cmd` or `script_body`, returning output or a session ID for ongoing interaction. Resume a returned session_id with write_stdin; do not restart the command while it is live or its effects are uncertain.\n\n{}\n\n{}\n\n{}",
             rg_search_admission_guidance(),
             filesystem_safety_guidance(),
             include_str!("../../../templates/command_admission_checkpoint.md").trim(),
@@ -207,27 +220,81 @@ pub(crate) fn create_foreign_shell_command_tool(
     ToolSpec::Function(tool)
 }
 
+fn process_output_cursor_schema() -> JsonSchema {
+    let stream = |name: &str| {
+        JsonSchema::object(
+            BTreeMap::from([
+                (
+                    "stream".into(),
+                    JsonSchema::string_enum(vec![name.into()], None),
+                ),
+                (
+                    "observed_bytes".into(),
+                    bounded_integer(
+                        "Previously examined bytes, not consumed or acknowledged output.".into(),
+                        0,
+                        usize::MAX as u64,
+                    ),
+                ),
+            ]),
+            Some(vec!["stream".into(), "observed_bytes".into()]),
+            Some(false.into()),
+        )
+    };
+    JsonSchema::object(
+        BTreeMap::from([
+            (
+                "kind".into(),
+                JsonSchema::string_enum(vec!["observed".into()], None),
+            ),
+            (
+                "session_id".into(),
+                bounded_integer("Originating process handle.".into(), 0, u32::MAX as u64),
+            ),
+            (
+                "incarnation".into(),
+                JsonSchema::string(Some("Originating process creation identity.".into())),
+            ),
+            ("stdout".into(), stream("stdout")),
+            ("stderr".into(), stream("stderr")),
+        ]),
+        Some(vec![
+            "kind".into(),
+            "session_id".into(),
+            "incarnation".into(),
+            "stdout".into(),
+            "stderr".into(),
+        ]),
+        Some(false.into()),
+    )
+}
 
 pub(crate) fn create_write_stdin_tool_with_max_timeout(max_timeout_ms: u64) -> ToolSpec {
     let max_timeout_ms = max_timeout_ms.max(crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS);
     let default_timeout_ms =
         crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS.min(max_timeout_ms);
     let properties = BTreeMap::from([
+        ("quiet_on_success".to_string(), quiet_on_success_schema()),
+        (
+            "status_only".to_string(),
+            JsonSchema::boolean(Some("Read the current owner's lifecycle snapshot or retained terminal evidence without collecting output, acknowledging bytes, advancing recovery/event cursors, or retiring the handle. Requires the originating incarnation. Expired owners reuse the original durable receipt and output reference, not a dead process handle. Omit input, termination, wait, output-budget and event_filter options. Returns running, exited, uncertain or unavailable; unavailable is not evidence of exit, and exited is not success or complete output delivery. This is not a command receipt for await_command; use ordinary write_stdin to collect output.".into())),
+        ),
         (
             "event_filter".to_string(),
-            JsonSchema { description: Some("Conditional process wait for readiness/error literals or exit. Observation-only: omit other controls/output budgets. Replays retained producer bytes unless after is supplied, then waits through irrelevant output until a match or terminal event. Each call closes on return or cancellation; no persistent watcher. Exit/failure are always included, even without a literal match.".into()), ..JsonSchema::object(BTreeMap::from([
+            JsonSchema { description: Some("Conditional process wait for readiness/error literals or exit. Observation-only: omit other controls/output budgets. Replays retained producer bytes unless after is supplied, then waits through irrelevant output until a match or terminal event. Empty contains subscribes only to the incarnation-bound lifecycle owner, without reading logs or advancing output_cursor. exit_status distinguishes confirmed exited, timed_out, unavailable exit ownership/evidence, and not_observed (a literal event without exit). Each call closes on return, deadline or cancellation; cancellation never terminates the process. Exit/failure are always included, even without a literal match.".into()), ..JsonSchema::object(BTreeMap::from([
                 ("contains".into(), JsonSchema::array(JsonSchema::string(Some("Nonempty literal, at most 256 UTF-8 bytes. At most 16 literals; duplicates match once per call across selected streams. Empty array waits only for exit/failure.".into())), None)),
                 ("stream".into(), JsonSchema::string_enum(vec!["any".into(), "stdout".into(), "stderr".into()], Some("Default any. PTY output is stdout.".into()))),
                 ("timeout_ms".into(), bounded_integer("Required subscription lifetime; nested Code Mode deadlines may shorten it. The first match, exit/failure, output gap, timeout or cancellation closes this call's subscription. Cancellation never terminates the process.".into(), 1, max_timeout_ms)),
-                ("after".into(), JsonSchema { description: Some("Reuse output_cursor from this same session/incarnation to skip previously examined bytes. Omit to include output emitted before subscription. Matches must end after the cursor; split literals still match. Unselected streams and exit-only waits keep the previous position. Cursor is runtime-only; it does not consume ordinary output.".into()), ..JsonSchema::object(BTreeMap::from([
-                    ("stdout".into(), bounded_integer("Previously examined stdout byte position.".into(), 0, usize::MAX as u64)),
-                    ("stderr".into(), bounded_integer("Previously examined stderr byte position.".into(), 0, usize::MAX as u64)),
-                ]), Some(vec!["stdout".into(), "stderr".into()]), Some(false.into())) }),
+                ("after".into(), JsonSchema { description: Some("Reuse the complete output_cursor unchanged. It binds observed (not consumed) positions to the process session/incarnation and each stream; unbound, foreign and swapped-stream cursors are rejected. Omit to replay retained output. Matches must end after the cursor; split literals still match. Unselected streams and exit-only waits keep their positions. Expired retention or lost lookbehind returns output_gap, never a clean skip. Runtime-only; ordinary collection remains independent.".into()), ..process_output_cursor_schema() }),
             ]), Some(vec!["contains".into(), "timeout_ms".into()]), Some(false.into())) },
         ),
         (
             "terminate".to_string(),
-            JsonSchema::boolean(Some("True confirms process termination before collecting final output. Requires empty chars. Use only with session_capabilities.cancellation=true.".to_string())),
+            JsonSchema::boolean(Some("True requests cancellation and confirms process-tree cleanup before collecting final output. Requires empty chars and session_capabilities.cancellation=true. The owner's shutdown state distinguishes cancellation_requested, shutdown_confirmed and shutdown_uncertain; root exit alone is not tree cleanup. Uncertain confirmation retains the original handle and diagnostics for recovery, not a replacement launch.".to_string())),
+        ),
+        (
+            "close_stdin".to_string(),
+            JsonSchema::boolean(Some("True closes piped stdin after previously accepted input, delivering real EOF. Idempotent; later writes fail. Requires empty chars and session_capabilities.close_stdin=true. Cannot combine with terminate, status_only, event_filter or wait_for_output=true. Terminal Ctrl-D is not pipe EOF.".into())),
         ),
         (
             "incarnation".to_string(),
@@ -235,7 +302,7 @@ pub(crate) fn create_write_stdin_tool_with_max_timeout(max_timeout_ms: u64) -> T
         ),
         (
             "wait_for_output".to_string(),
-            JsonSchema::boolean(Some("With empty chars, wait until new output or process exit rather than returning empty periodic polls. Defaults to true when chars is empty, yield_time_ms is omitted, and terminate is false; false preserves bounded polling. Cancellation and new user input remain responsive. Code mode applies no default nested deadline for this passive wait; an explicit timeout_ms still bounds it.".to_string())),
+            JsonSchema::boolean(Some("With empty chars, wait until new output or process exit rather than returning empty periodic polls. Defaults to true when chars is empty, yield_time_ms is omitted, and terminate and close_stdin are false; false preserves bounded polling. Cancellation and new user input remain responsive. Code mode applies no default nested deadline for this passive wait; an explicit timeout_ms still bounds it.".to_string())),
         ),
         (
             "session_id".to_string(),
@@ -290,7 +357,29 @@ pub(crate) fn create_write_stdin_tool_with_max_timeout(max_timeout_ms: u64) -> T
             Some(vec!["session_id".to_string(), "incarnation".to_string()]),
             Some(false.into()),
         ),
-        output_schema: Some(json!({"anyOf":[unified_exec_output_schema(), process_event_output_schema()]}).into()),
+        output_schema: Some(json!({"anyOf":[unified_exec_output_schema(), process_event_output_schema(), process_status_output_schema()]}).into()),
+    })
+}
+
+fn process_status_output_schema() -> Value {
+    json!({
+        "type":"object",
+        "description":"Read-only lifecycle snapshot, not output collection or a command completion receipt. A session_id identifies the queried handle, not proof it remains controllable. Unavailable means the owner no longer retains its observation; it must not be treated as exited. Process error messages are capped at 1024 characters.",
+        "properties":{
+            "status_only":{"const":true},
+            "session_id":{"type":"integer"},
+            "incarnation":{"type":"string"},
+            "status":{"enum":["running","exited","uncertain","unavailable"]},
+            "exit_code":{"type":["integer","null"]},
+            "error":{"type":["string","null"],"maxLength":1024},
+            "shutdown":{"enum":["cancellation_requested","shutdown_confirmed","shutdown_uncertain",null]},
+            "shutdown_error":{"type":["string","null"]},
+            "completion_provenance":{"type":"object","additionalProperties":true},
+            "output_drained":{"type":["boolean","null"]},
+            "output_reference":{"type":"object","additionalProperties":true}
+        },
+        "required":["status_only","session_id","incarnation","status","exit_code","error"],
+        "additionalProperties":false
     })
 }
 
@@ -300,54 +389,56 @@ fn process_event_output_schema() -> Value {
         "description":"Read-only conditional observation, not command completion collection. Retained stdout/stderr are replayed unless event_filter.after is supplied, then only new bytes are examined. Reuse output_cursor as after to avoid old matches across waits; a split literal ending after the cursor still matches. No normal output is consumed. Exit/failure always end the wait, even without a match; a literal wait first drains output still open at exit, up to the timeout. history_complete=false means bytes a literal wait would examine were lost, or output was still open. At most 20 events and 16 literals (256 UTF-8 bytes each); failure messages cap at 1024 Unicode characters. Collect final output with ordinary write_stdin.",
         "properties":{
             "session_id":{"type":"integer"}, "incarnation":{"type":"string"},
+            "exit_status":{"enum":["exited","timed_out","unavailable","not_observed"], "description":"Confirmed process exit, subscription timeout, unavailable lifecycle ownership/evidence, or a literal event without confirmed exit. Exit does not certify command success or output delivery."},
             "subscription_closed":{"const":true},
             "subscription_end":{"enum":["events","timeout"]},
             "history_complete":{"type":"boolean"},
-            "output_cursor":{"type":"object","properties":{
-                "stdout":{"type":"integer","minimum":0},
-                "stderr":{"type":"integer","minimum":0}
-            },"required":["stdout","stderr"],"additionalProperties":false},
+            "completion_provenance":{"type":"object","additionalProperties":true},
+            "output_drained":{"type":["boolean","null"]},
+            "output_reference":{"type":"object","additionalProperties":true},
+            "output_cursor":process_output_cursor_schema(),
             "events":{"type":"array","maxItems":20,"items":{
                 "type":"object","properties":{
                     "kind":{"enum":["output_match","output_gap","exited","failed"]},
                     "stream":{"enum":["stdout","stderr","unknown"]},
+                    "reason":{"enum":["output_unavailable","history_expired","history_unavailable"]},
                     "contains":{"type":"string"}, "exit_code":{"type":["integer","null"]},
                     "message":{"type":"string"}, "message_truncated":{"type":"boolean"}
                 },"required":["kind"],"additionalProperties":false
             }}
         },
-        "required":["session_id","incarnation","subscription_closed","subscription_end","history_complete","output_cursor","events"],
+        "required":["session_id","incarnation","exit_status","subscription_closed","subscription_end","history_complete","output_cursor","events"],
         "additionalProperties":false
     })
 }
-
 
 pub(crate) fn create_shell_command_tool_for_policy(
     options: CommandToolOptions,
     allow_escalated_sandbox_permissions: bool,
 ) -> ToolSpec {
     let mut properties = BTreeMap::from([
+        ("quiet_on_success".to_string(), quiet_on_success_schema()),
         (
             "command".to_string(),
-            JsonSchema::string(Some(LEGACY_SHELL_SCRIPT_DESCRIPTION.to_string())),
+            JsonSchema::string(Some(SHELL_SCRIPT_DESCRIPTION.to_string())),
         ),
         (
             "program".to_string(),
             JsonSchema::string(Some(
-                "Executable to launch directly, bypassing the shell. Use only when `command` cannot express the command.".to_string(),
+                EXECUTABLE_DESCRIPTION.to_string(),
             )),
         ),
         (
             "args".to_string(),
             JsonSchema::array(
                 JsonSchema::string(/*description*/ None),
-                Some("Arguments for `program`, excluding the program name.".to_string()),
+                Some(ARGUMENTS_DESCRIPTION.to_string()),
             ),
         ),
         (
             "script_body".to_string(),
             JsonSchema::string(Some(
-                "Plain PowerShell script that Codex encodes at runtime. Use only when `command` quoting cannot express the script."
+                "Explicit PowerShell source that Codex encodes at runtime. Prefer this for multiline PowerShell; use `program`/`args` for executables."
                     .to_string(),
             )),
         ),
@@ -388,22 +479,18 @@ pub(crate) fn create_shell_command_tool_for_policy(
             ),
         ),
     ]);
-    if options.allow_login_shell {
-        properties.insert(
-            "login".to_string(),
-            JsonSchema::boolean(Some(
-                "True runs with login shell semantics; false disables them. Defaults to true."
-                    .to_string(),
-            )),
-        );
-    }
+    properties.insert("shell".to_string(), shell_parameter());
+    properties.insert(
+        "login".to_string(),
+        login_parameter(options.allow_login_shell),
+    );
     properties.extend(create_approval_parameters(
         options.exec_permission_approvals_enabled,
         allow_escalated_sandbox_permissions,
     ));
 
     let description = format!(
-        "Runs a command in the user's default shell and returns its output. The native route returns text with command status and output, or structured validation evidence, without a resumable session_id. Use max_output_tokens to request a smaller output budget; larger requests are capped by policy. Use syntax supported by that shell.\n\n{}\n\n{}",
+        "Runs an executable through `program`/`args`, or explicit shell source through `command` or `script_body`, and returns its output. The native route returns text with command status and output, or structured validation evidence, without a resumable session_id. Use max_output_tokens to request a smaller output budget; larger requests are capped by policy. Use syntax supported by the selected shell for explicit shell source.\n\n{}\n\n{}",
         rg_search_admission_guidance(),
         filesystem_safety_guidance(),
     );
@@ -472,11 +559,20 @@ fn unified_exec_output_schema() -> Value {
             },
             "stdout": {
                 "type": "string",
-                "description": "Exact whole-command UTF-8 stdout, available to scripts only when streams_complete is true. Independent of the display token budget; stdout and stderr together are limited to 1 MiB."
+                "description": "Exact UTF-8 stdout for this receipt's stream_ranges[0] when stream_chunks_complete is true; never repeats previously consumed producer ranges. Whole-command data only when streams_complete is true. Independent of display budget; both slices must fit 1 MiB."
             },
             "stderr": {
                 "type": "string",
-                "description": "Exact whole-command UTF-8 stderr when streams_complete is true."
+                "description": "Exact UTF-8 stderr for this receipt's stream_ranges[1] when stream_chunks_complete is true; whole-command data only when streams_complete is true."
+            },
+            "stream_ranges": {
+                "type": "array", "minItems": 2, "maxItems": 2,
+                "description": "Independent zero-based half-open consumed producer byte ranges, stdout then stderr. Coordinates count bytes, not text equality; gaps/reduced display remain recoverable from the complete retained log. Absent when attribution is unknown.",
+                "items": {"type":"object", "properties":{"start":{"type":"integer","minimum":0},"end":{"type":"integer","minimum":0}},"required":["start","end"],"additionalProperties":false}
+            },
+            "stream_chunks_complete": {
+                "type": "boolean",
+                "description": "Both exact UTF-8 slices for this receipt's stream_ranges are present as stdout/stderr. Earlier polls' ranges are not replayed. False for unavailable, merged, oversized or non-UTF-8 streams."
             },
             "streams_complete": {
                 "type": "boolean",
@@ -487,9 +583,14 @@ fn unified_exec_output_schema() -> Value {
                 "properties": {
                     "incarnation": {"type":"string"},
                     "stdin": {"type": "boolean"},
+                    "close_stdin": {"type": "boolean"},
                     "interrupt": {"type": "boolean"},
                     "cancellation": {"type": "boolean"},
                     "polling": {"type": "boolean"},
+                    "shutdown": {
+                        "enum": ["cancellation_requested", "shutdown_confirmed", "shutdown_uncertain"],
+                        "description": "Process-owner cancellation disposition, independent of root exit. Uncertain/requested shutdown retains recovery custody."
+                    },
                     "observation": {
                         "type": "object",
                         "properties": {
@@ -502,7 +603,7 @@ fn unified_exec_output_schema() -> Value {
                         "additionalProperties": false
                     }
                 },
-                "required": ["stdin", "interrupt", "cancellation", "polling", "incarnation"],
+                "required": ["stdin", "close_stdin", "interrupt", "cancellation", "polling", "incarnation"],
                 "additionalProperties": false
             },
             "chunk_id": {
@@ -520,14 +621,23 @@ fn unified_exec_output_schema() -> Value {
             "execution_state": {
                 "type": "string",
                 "enum": ["running", "exited", "unknown", "not_started"],
-                "description": "Command process state, independent of the exec cell. Unknown means no live handle or terminal outcome is available; not_started confirms workspace admission refused before launch."
+                "description": "Command process state, independent of the exec cell. Unknown means no live handle or terminal outcome is available; not_started confirms no command launched, including admission refusal or explicit compilation-evidence reuse."
             },
             "process_exited": { "type": "boolean" },
+            "environment_receipt": {
+                "type": "object",
+                "description": "Redacted launch provenance: roots contain resolved_executable (actual created image in the selected environment, null when unavailable), executable_identity (resolution: created_process_image or unknown; kind: shell_launcher only for an observed owned shell, otherwise unknown; shim: unknown; underlying_program: null), instance_id/execution_id/os_pid and environment (cwd, selected_environment values/status, launcher_kind, shell). Direct launch mode does not establish program versus shim identity; shell payloads and shim targets are never inferred from command text. For shell launches, shell reports the prepared executable, startup_flags (no script payload), and profile_loading (enabled, not proof a profile existed). Includes sandbox-enforced -NoProfile; absent after direct-executable lowering. Covers root creation only, not shell commands or descendants. Dependencies are not captured; reproducibility is partial. Polls retain the original execution identity.",
+                "additionalProperties": true
+            },
             "search_no_match": { "type": "boolean" },
+            "quiet_success": {
+                "type": "boolean",
+                "description": "True only when explicitly requested quiet-on-success presentation was applied; terminal success and complete retained output are established."
+            },
             "output_complete": { "type": "boolean" },
             "output_reduced": { "type": "boolean" },
             "original_token_count_is_approximate": { "type": "boolean" },
-            "raw_output_artifact_retention_limit_hit": { "type": "boolean" },
+            "raw_output_artifact_retention_limit_hit": { "type": ["boolean", "null"], "description": "Null when a historical receipt does not establish capture-retention limits." },
             "raw_output_artifact_retention_limit_reason": { "type": "string" },
             "output_decoding_notice": { "type": "string" },
             "validation": {
@@ -558,9 +668,25 @@ fn unified_exec_output_schema() -> Value {
                 "type": "integer",
                 "description": "Cumulative bytes retained in the raw output artifact."
             },
+            "output_reference": {
+                "type": "object",
+                "description": "Owner-thread-scoped persistent command log, independent of displayed output. capture_complete covers producer capture; missing_bytes is null when loss is unknown, never an inferred zero. retrieval_availability is point-in-time available, pending, unavailable or unknown. Execute recovery only in its owner thread; pending logs require the existing process handle, not another launch.",
+                "properties": {
+                    "owner_thread_id": {"type":["string","null"]},
+                    "artifact_id": {"type":["string","null"]},
+                    "capture_complete": {"type":"boolean"},
+                    "retained_bytes": {"type":["integer","null"],"minimum":0},
+                    "missing_bytes": {"type":["integer","null"],"minimum":0},
+                    "missing_bytes_reason": {"type":"string"},
+                    "retrieval_availability": {"enum":["available","pending","unavailable","unknown"]},
+                    "recovery": {"type":"object","properties":{"tool":{"const":"read_tool_output"},"arguments":{"type":"object"}},"required":["tool","arguments"]}
+                },
+                "required":["owner_thread_id","artifact_id","capture_complete","retained_bytes","missing_bytes","retrieval_availability"],
+                "additionalProperties":false
+            },
             "recovery_selector": {
                 "type": "object",
-                "description": "First omitted source line range, when its coordinates are known in raw_output_artifact_id.",
+                "description": "First recovery range for compatibility; recovery.arguments.selectors includes every known omitted range in raw_output_artifact_id.",
                 "properties": {
                     "kind": {"type": "string", "enum": ["lines", "bytes"]},
                     "start": {"type": "integer", "minimum": 0},
@@ -575,14 +701,26 @@ fn unified_exec_output_schema() -> Value {
             },
             "recovery": {
                 "type": "object",
-                "description": "read_tool_output call for the retained output; a running command's artifact is readable after it exits.",
+                "description": "Ready-to-pass read_tool_output call covering every known omitted range; a running command's artifact is readable after it exits. Selection completeness does not imply full artifact delivery.",
                 "properties": {"tool":{"const":"read_tool_output"}, "arguments":{"type":"object"}},
                 "required": ["tool", "arguments"]
             },
+            "recovery_scope": {
+                "type": "string",
+                "description": "retained_command_log means recovery selects the whole retained producer log because excerpt coordinates cannot be mapped exactly. It may include already displayed bytes; follow bounded recovery continuations. Capture completeness remains separate."
+            },
             "completion_recovered": {"type":"boolean"},
+            "polled_session_id": {"type":"integer", "description":"Historical process identity, not a live continuation handle."},
+            "incarnation": {"type":"string", "description":"Creation identity bound to the retained process receipt."},
+            "completion_provenance": {"type":"object", "description":"Original completion owner and call/execution or durable rollout coordinates. Historical evidence, not control authority.", "additionalProperties":true},
+            "output_drained": {"type":["boolean","null"], "description":"Observed reader closure, separate from process exit, complete capture, and output delivery; null when not retained."},
+            "compilation_evidence_reused": {"type":"boolean", "description":"No new process or passing execution receipt. Consult original_evidence; do not pass this receipt to await_command."},
+            "status": {"const":"reused"},
+            "dependency_coverage": {"const":"complete"},
+            "original_evidence": {"type":"object", "description":"Original successful command call_id, exact command context and output_reference, unchanged by reuse.", "additionalProperties":true},
             "success": {
-                "type": "boolean",
-                "description": "Present on a recovered terminal receipt; true only when retained terminal facts establish success. Missing terminal facts are not a successful execution receipt."
+                "type": ["boolean", "null"],
+                "description": "Present on a quiet-success or recovered terminal receipt; true only when terminal facts establish success. Null means unresolved, not failure or success."
             },
             "terminal_facts_available": {
                 "type": "boolean",
@@ -612,6 +750,19 @@ fn unified_exec_output_schema() -> Value {
         },
         "required": ["output", "execution_state", "process_exited", "exit_code", "output_complete", "output_reduced", "raw_output_artifact_retention_limit_hit"],
         "oneOf": [
+            {
+                "type":"object",
+                "properties": {
+                    "compilation_evidence_reused":{"const":true},
+                    "execution_state":{"const":"not_started"},
+                    "did_run":{"const":false},
+                    "process_exited":{"const":false},
+                    "exit_code":{"type":"null"},
+                    "output_complete":{"const":false}
+                },
+                "required":["compilation_evidence_reused","did_run","original_evidence","status","dependency_coverage"],
+                "not":{"required":["session_id"]}
+            },
             {
                 "type": "object",
                 "properties": {
@@ -667,6 +818,20 @@ pub(crate) fn unified_exec_eager_output_schema() -> Value {
             "ExecCommandResult": {
                 "type": "object",
                 "properties": {
+                    "completion_recovered": {"type":"boolean"},
+                    "completion_provenance": {"type":"object", "additionalProperties":true},
+                    "polled_session_id": {"type":"integer", "description":"Historical process identity; not a live handle."},
+                    "incarnation": {"type":"string"},
+                    "output_reference": {"type":"object", "additionalProperties":true},
+                    "output_drained": {"type":["boolean","null"]},
+                    "success": {"type":["boolean","null"], "description":"Retained terminal outcome; null remains unknown."},
+                    "compilation_evidence_reused": {"type":"boolean", "description":"Historical compilation proof, not a new process. No await_command; consult original_evidence."},
+                    "original_evidence": {"type":"object", "additionalProperties":true},
+                    "environment_receipt": {
+                        "type": "object",
+                        "description": "Redacted instrumented-root launch provenance; resolve exec_command for fields. Not a dependency snapshot or trace of commands launched by a shell.",
+                        "additionalProperties": true
+                    },
                     "output": {
                         "type": "string",
                         "description": "Combined display text; may be truncated."
@@ -861,4 +1026,3 @@ fn rg_search_admission_guidance() -> &'static str {
 - Prefer native `read_file` with batched selectors over `Get-Content | Select-Object` paging when available. Keep shell reads for required encoding, streaming, or transformations.
 - Omit `max_output_tokens` unless deliberately requesting a smaller display; the host enforces output caps. When output is truncated, recover only missing evidence from the retained artifact."#
 }
-

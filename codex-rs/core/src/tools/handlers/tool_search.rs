@@ -3,6 +3,8 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::ToolSearchOutput;
 use crate::tools::context::boxed_tool_output;
+use crate::tools::exact_reuse::ExactResultCache;
+use crate::tools::exact_reuse::ExactReuseKey;
 use crate::tools::handlers::tool_search_spec::create_tool_search_tool;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
@@ -59,13 +61,14 @@ impl Tokenizer for ToolSearchTokenizer {
 pub struct ToolSearchHandler {
     search_infos: Arc<[ToolSearchInfo]>,
     cache_context: serde_json::Value,
+    inventory_revision: [u8; 32],
     name_indexes: Arc<[ToolSearchNameIndex]>,
     exact_name_index: Arc<HashMap<String, Vec<ToolSearchDocumentId>>>,
     folded_name_index: Arc<HashMap<String, Vec<String>>>,
     namespace_member_indexes: Arc<HashMap<ToolSearchDocumentId, (Vec<ToolSearchInfo>, ToolSearchIndex)>>,
     spec: ToolSpec,
     search_index: Arc<ToolSearchIndex>,
-    result_cache: Arc<Mutex<VecDeque<ToolSearchCacheEntry>>>,
+    result_cache: Arc<ExactResultCache<ToolSearchReuseKey, ToolSearchResult>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -451,10 +454,9 @@ struct ToolSearchQueryKey {
     source: Option<String>,
 }
 
-struct ToolSearchCacheEntry {
-    key: ToolSearchQueryKey,
-    result: Arc<ToolSearchResult>,
-}
+// Inventory and access configuration are revalidated by get_or_build before
+// this immutable handler can be used by the current router.
+type ToolSearchReuseKey = ExactReuseKey<ToolSearchQueryKey, [u8; 32], &'static str, [u8; 32]>;
 
 #[derive(Clone, Debug, PartialEq)]
 struct ToolSearchResult {
@@ -673,6 +675,7 @@ impl ToolSearchHandlerCache {
                 Arc::new(ToolSearchHandler::new_with_fingerprint(
                     Arc::clone(&search_infos),
                     cache_context.clone(),
+                    inventory_fingerprint,
                 ))
             }));
             match built {
@@ -809,6 +812,7 @@ impl ToolSearchHandler {
     fn new_with_fingerprint(
         search_infos: Arc<[ToolSearchInfo]>,
         cache_context: serde_json::Value,
+        inventory_revision: [u8; 32],
     ) -> Self {
         let name_indexes: Arc<[ToolSearchNameIndex]> =
             search_infos.iter().map(ToolSearchNameIndex::new).collect();
@@ -849,13 +853,17 @@ impl ToolSearchHandler {
         Self {
             search_infos,
             cache_context,
+            inventory_revision,
             name_indexes,
             exact_name_index: Arc::new(exact_name_index),
             folded_name_index: Arc::new(folded_name_index),
             namespace_member_indexes: Arc::new(namespace_member_indexes),
             spec,
             search_index,
-            result_cache: Arc::new(Mutex::new(VecDeque::new())),
+            result_cache: Arc::new(ExactResultCache::new(
+                MAX_TOOL_SEARCH_RESULT_CACHE,
+                MAX_TOOL_SEARCH_RESULT_CACHE * MAX_TOOL_SEARCH_CACHE_ENTRY_BYTES,
+            )),
         }
     }
 }
@@ -1623,12 +1631,7 @@ impl ToolSearchHandler {
     }
 
     fn cached_search_result(&self, key: &ToolSearchQueryKey) -> Option<Arc<ToolSearchResult>> {
-        let mut cache = self.result_cache();
-        let index = cache.iter().position(|entry| &entry.key == key)?;
-        let entry = cache.remove(index)?;
-        let result = entry.result.clone();
-        cache.push_back(entry);
-        Some(result)
+        self.result_cache.get(&self.reuse_key(key.clone()))
     }
 
     fn cache_search_result(&self, key: ToolSearchQueryKey, result: &Arc<ToolSearchResult>) {
@@ -1645,17 +1648,7 @@ impl ToolSearchHandler {
             return;
         }
 
-        let mut cache = self.result_cache();
-        if let Some(index) = cache.iter().position(|entry| entry.key == key) {
-            cache.remove(index);
-        }
-        cache.push_back(ToolSearchCacheEntry {
-            key,
-            result: Arc::clone(result),
-        });
-        while cache.len() > MAX_TOOL_SEARCH_RESULT_CACHE {
-            cache.pop_front();
-        }
+        self.result_cache.insert(self.reuse_key(key), Arc::clone(result), MAX_TOOL_SEARCH_CACHE_ENTRY_BYTES);
     }
 
     fn search_complete(&self, result: &ToolSearchResult) -> bool {
@@ -1668,11 +1661,12 @@ impl ToolSearchHandler {
             && result.exact_name_ambiguity.is_none()
     }
 
-    fn result_cache(&self) -> std::sync::MutexGuard<'_, VecDeque<ToolSearchCacheEntry>> {
-        match self.result_cache.lock() {
-            Ok(cache) => cache,
-            Err(poisoned) => poisoned.into_inner(),
-        }
+    fn reuse_key(&self, inputs: ToolSearchQueryKey) -> ToolSearchReuseKey {
+        // The cache is confined to this exact inventory/backend/configuration
+        // instance, never shared with a merely similar catalog or permission set.
+        ExactReuseKey { operation: "tool_search.v1", inputs,
+            source_revision: self.inventory_revision, backend: "current_router_catalog",
+            configuration: self.inventory_revision }
     }
 
 }

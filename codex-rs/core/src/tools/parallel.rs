@@ -1614,6 +1614,7 @@ impl ToolCallRuntime {
         tool_name: &codex_tools::ToolName,
         payload: Option<&ToolPayload>,
         failure_fingerprint: String,
+        failure_message: &str,
     ) {
         let Some(collector) = &self.sampling_request_signals else {
             return;
@@ -1655,6 +1656,7 @@ impl ToolCallRuntime {
             payload,
             source_dependencies,
             failure_fingerprint,
+            failure_message,
         );
     }
 
@@ -2147,7 +2149,7 @@ impl ToolCallRuntime {
                     if let (Some(collector), Some(ordinal)) = (&signal_collector, signal_ordinal) {
                         collector.record_failure(
                             ordinal,
-                            &format!("model:{other}"),
+                            &other.model_message(),
                             terminal_cause.is_some(),
                         );
                     }
@@ -2202,6 +2204,7 @@ impl ToolCallRuntime {
         cancellation_token: CancellationToken,
         admitted_revision: Option<Arc<Mutex<Option<u64>>>>,
         workspace_evidence_baseline_slot: Option<WorkspaceEvidenceBaselineSlot>,
+        dispatch_state: Arc<ToolDispatchState>,
     ) -> impl std::future::Future<Output = Result<AnyToolResult, FunctionCallError>> {
         self.step_context
             .workspace_evidence_generation_batch
@@ -2267,6 +2270,7 @@ impl ToolCallRuntime {
                     ToolCallWorkspaceEvidenceContext {
                         admitted_revision,
                         baseline_slot: workspace_evidence_baseline_slot,
+                        dispatch_state: Some(dispatch_state),
                         ..Default::default()
                     },
                 )
@@ -2318,8 +2322,14 @@ impl ToolCallRuntime {
         let cleanup_deadline = router.tool_cancellation_cleanup_deadline(&call);
         let owns_unified_exec_processes = router.tool_owns_unified_exec_processes(&call);
         let requires_commit_barrier = router.tool_cancellation_requires_commit_barrier(&call);
+        // Native command sinks must finalize before publishing cancellation,
+        // just like resumable exec and cells. Reuse the registered identity and
+        // existing bounded cleanup owner; do not start another waiter/process.
         let retains_cancelled_cell_output =
-            crate::tools::code_mode::is_orchestration_tool_name(&call.tool_name);
+            crate::tools::code_mode::is_orchestration_tool_name(&call.tool_name)
+                || (wait_for_runtime_cancellation
+                    && matches!(router.semantic_tool_name(&call.tool_name).name.as_str(),
+                        "shell" | "shell_command" | "exec_command" | "write_stdin"));
         let router = Arc::clone(router);
         let session = Arc::clone(&self.session);
         let step_context = Arc::clone(&self.step_context);
@@ -2657,6 +2667,7 @@ impl ToolCallRuntime {
                                 return Ok(AnyToolResult {
                                     call_id: dispatch_call.call_id,
                                     payload: dispatch_call.payload,
+                                    operation_history: None,
                                     // Return failure as data, never a rejected JS
                                     // promise that could cancel sibling calls.
                                     result: crate::tools::context::boxed_tool_output(
@@ -3163,6 +3174,7 @@ async fn supervise_cancelled_dispatch_cleanup(
     } = invocation;
     let mut recovery = Vec::new();
     let mut live_operations = Vec::new();
+    let mut output_reference = None;
     let mut settlement = CancelledHandlerSettlement::Unresolved { call_id: call_id.clone() };
     let mut effects = crate::tools::context::ToolEffectRecovery::unknown(None, None);
     let recovery_for = |result: Option<&serde_json::Value>, error: Option<&str>| {
@@ -3175,15 +3187,20 @@ async fn supervise_cancelled_dispatch_cleanup(
     if wait_for_runtime_cancellation {
         match tokio::time::timeout_at(cleanup_until, &mut dispatch_handle).await {
             Ok(Ok(Err(error))) => {
+                let failure = error.failure();
+                output_reference = failure.details.as_ref().and_then(|details| details.get("output_reference")).cloned();
+                live_operations.extend(failure.live_operations.iter().map(|handle| serde_json::json!(handle)));
                 settlement = CancelledHandlerSettlement::SettledFailure {
-                    call_id: call_id.clone(), result: None, error: Some(error.to_string()),
+                    call_id: call_id.clone(), result: Some(serde_json::json!({"tool_failure":failure})), error: Some(error.to_string()),
                 };
                 effects = recovery_for(None, Some(&error.to_string()));
                 recovery.push(
-                    serde_json::json!({"kind":"handler_recovery","detail":error.to_string()}),
+                    serde_json::json!({"kind":"handler_recovery","tool_failure":failure,"detail":error.to_string()}),
                 );
             }
             Ok(Ok(Ok(result))) => {
+                output_reference = result.result.projection_metadata()
+                    .and_then(|metadata| metadata.essential_inline.get("output_reference").cloned());
                 let value = result.cancellation_result();
                 settlement = if result.success_for_logging() {
                     CancelledHandlerSettlement::SettledSuccess { call_id: result.call_id, result: value.clone() }
@@ -3319,6 +3336,7 @@ async fn supervise_cancelled_dispatch_cleanup(
         });
     Some(serde_json::json!({
         "kind": "cancellation_recovery",
+        "output_reference": output_reference,
         "call_id": call_id,
         "effects_state": if effects_reported { "reported" } else { "unknown" },
         "retry_safe": false,
@@ -3449,6 +3467,7 @@ impl ToolCallRuntime {
         AnyToolResult {
             call_id: call.call_id.clone(),
             payload: call.payload.clone(),
+            operation_history: None,
             result: Box::new(AbortedToolOutput {
                 message: Self::abort_message_for(invocation, call, secs),
                 recovery: None,

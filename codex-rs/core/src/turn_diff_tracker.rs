@@ -88,6 +88,7 @@ struct OwnedPatchOperation {
     sequence: u64,
     environment_id: String,
     call_id: Option<String>,
+    agent_id: Option<String>,
     delta: AppliedPatchDelta,
     retained_bytes: usize,
 }
@@ -267,8 +268,9 @@ impl TurnDiffTracker {
         environment_id: &str,
         delta: &AppliedPatchDelta,
         call_id: Option<&str>,
+        agent_id: Option<&str>,
     ) {
-        self.retain_owned_operation(environment_id, delta, call_id);
+        self.retain_owned_operation(environment_id, delta, call_id, agent_id);
         if !delta.is_empty() {
             self.record_mutation();
         } else if !delta.is_exact() {
@@ -413,6 +415,7 @@ impl TurnDiffTracker {
     pub(crate) fn record_command_execution(&mut self, call_id: &str) {
         self.mutation_revision = self.mutation_revision.saturating_add(1);
         if !self.read_only_command_calls.contains(call_id) {
+            codex_apply_patch::invalidate_change_ownership_hints();
             self.unproven_command_revision = self.unproven_command_revision.saturating_add(1);
         }
     }
@@ -424,6 +427,7 @@ impl TurnDiffTracker {
     }
 
     pub(crate) fn record_unknown_mutation(&mut self) {
+        codex_apply_patch::invalidate_change_ownership_hints();
         self.record_mutation();
         self.invalidate();
     }
@@ -549,6 +553,7 @@ impl TurnDiffTracker {
         environment_id: &str,
         delta: &AppliedPatchDelta,
         call_id: Option<&str>,
+        agent_id: Option<&str>,
     ) {
         const MAX_BYTES: usize = 8 * 1024 * 1024;
         const MAX_OPERATIONS: usize = 64;
@@ -602,6 +607,7 @@ impl TurnDiffTracker {
             sequence: self.next_owned_operation,
             environment_id: environment_id.into(),
             call_id: call_id.map(str::to_owned),
+            agent_id: agent_id.map(str::to_owned),
             delta: delta.clone(),
             retained_bytes: bytes,
         });
@@ -654,12 +660,15 @@ impl TurnDiffTracker {
                     ),
                 };
                 serde_json::json!({ "path": applied.path, "before": before, "after": after,
-                "move_path": move_path, "displaced_destination": displaced_destination })
+                "move_path": move_path, "displaced_destination": displaced_destination,
+                "write_receipt": applied.write_receipt })
             })
             .collect::<Vec<_>>();
         Some(serde_json::json!({
             "version": 1, "scope": "historical_committed_operation", "sequence": sequence,
             "environment_id": operation.environment_id, "call_id": operation.call_id,
+            "operation_id": operation.call_id,
+            "agent_id": operation.agent_id, "ownership_advisory_only": true,
             "changes_exact_at_commit": true, "integrated_net_diff": false,
             "current_source_verified": false, "coherent_snapshot_verified": false,
             "changes": changes,

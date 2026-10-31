@@ -95,7 +95,8 @@ impl Hunk {
 #[derive(Debug, Clone)]
 pub struct UpdateFileChunk {
     /// A source line immediately preceding the chunk, or a revision-bound
-    /// `codex-range` descriptor. A textual anchor is not a containing scope.
+    /// `codex-range`, `codex-replace`, `codex-json`, or `codex-anchor` descriptor.
+    /// A textual anchor is not a containing scope.
     pub change_context: Option<String>,
 
     /// A contiguous block of lines that should be replaced with `new_lines`.

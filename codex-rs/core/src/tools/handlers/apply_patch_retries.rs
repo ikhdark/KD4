@@ -12,6 +12,7 @@ use codex_apply_patch::UpdateFileChunk;
 use codex_apply_patch::UpdateLineKind;
 use codex_utils_path_uri::PathUri;
 use serde_json::Value;
+use sha2::Digest;
 
 const MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RETAINED_PATCHES: usize = 32;
@@ -25,6 +26,56 @@ pub(crate) struct RetainedPatches {
     /// actual cause instead of one message covering every possibility. Bounded
     /// to the same receipt count; ids are small and carry no patch payload.
     retired: BTreeMap<String, RetirementCause>,
+    failures: BTreeMap<String, RepeatedPatchFailure>,
+}
+
+#[derive(Clone)]
+pub(super) struct RepeatedPatchFailure {
+    pub(super) mismatch: codex_apply_patch::PatchContextMismatch,
+    pub(super) call_id: String,
+}
+
+/// Only a fully observed, single-source preflight is reusable. No write/runtime
+/// failure, intermediate hunk result, guard, move or incomplete read qualifies.
+pub(super) fn failure_key(args: &ApplyPatchArgs, context: &str) -> Option<String> {
+    if !args.revision_guards.is_empty() || args.workdir.is_some() {
+        return None;
+    }
+    let [Hunk::UpdateFile { move_path: None, .. }] = args.hunks.as_slice() else {
+        return None;
+    };
+    let semantics = render_patch(&args.hunks, args.environment_id.as_deref(), &[]);
+    Some(hex::encode(sha2::Sha256::digest(
+        format!("patch-failure-v1\0{context}\0{semantics}").as_bytes(),
+    )))
+}
+
+impl RetainedPatches {
+    pub(super) fn has_failures(&self) -> bool { !self.failures.is_empty() }
+
+    pub(super) fn prior_failure(&self, key: &str) -> Option<RepeatedPatchFailure> {
+        self.failures.get(key).cloned()
+    }
+
+    pub(super) fn retain_failure(
+        &mut self, key: String, error: &codex_apply_patch::ApplyPatchError, call_id: &str,
+    ) {
+        let codex_apply_patch::ApplyPatchError::PatchContextMismatch(mismatch) = error else {
+            return;
+        };
+        if mismatch.edits_result_of_hunk.is_some()
+            || mismatch.current_content_sha256.len() != 64
+            || serde_json::to_vec(mismatch).map_or(true, |bytes| bytes.len() > 32 * 1024)
+        {
+            return;
+        }
+        if self.failures.len() >= MAX_RETAINED_PATCHES {
+            self.failures.pop_first();
+        }
+        self.failures.insert(key, RepeatedPatchFailure {
+            mismatch: mismatch.clone(), call_id: call_id.to_owned(),
+        });
+    }
 }
 
 #[derive(Clone, Copy)]

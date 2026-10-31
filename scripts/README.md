@@ -37,6 +37,17 @@ without building. It exits 1 if there is no match. Ordinary checkout builds do
 not freeze by default: request a bundle with `run-lane --freeze-bundle NEW_DIR`
 when one is needed.
 
+`run-lane` emits one `Build reuse:` diagnostic on stderr and retains it in
+`--timing-json` under `cacheReuse`; `find-bundle` emits `Frozen-binary reuse:`.
+Frozen-binary decisions name the failed gate and expected/observed identities.
+Missing or unreadable evidence is not a confirmed mismatch. An indexed composite
+key mismatch does not identify which source, compiler or setting differed.
+Cargo JSON artifact `fresh` observations are reported separately when captured;
+they do not explain Cargo's dirty gate or compiler-cache behavior. Without an
+invocation-scoped compiler-cache receipt, that cache's outcome remains unobserved
+(shared counters cannot attribute a build). Frozen reuse runs neither Cargo nor
+the compiler cache; absent compiler identity cannot establish an exact bundle hit.
+
 For a snapshot, set `$KD4` and `$SNAPSHOT` to their absolute repository roots,
 run from `$SNAPSHOT\codex-rs`, and supply the exact original Cargo command
 (replace the example arguments with those used for that build):

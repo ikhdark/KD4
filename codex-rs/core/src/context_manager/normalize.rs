@@ -10,6 +10,14 @@ pub(super) const MISSING_TOOL_RESULT: &str = "Result unavailable. Execution outc
 // Changing this value would change model-visible IDs and invalidate prompt caches.
 const SYNTHETIC_OUTPUT_ID_NAMESPACE: Uuid = Uuid::from_u128(0x90d38d3e_6a5b_4d52_bfe2_2f1e634bfac4);
 
+fn missing_tool_result(call_id: &str) -> FunctionCallOutputPayload {
+    let mut failure = codex_protocol::tool_failure::ToolFailure::new(
+        codex_protocol::tool_failure::ToolFailureCode::UncertainEffects,
+        MISSING_TOOL_RESULT,
+    );
+    failure.details = Some(serde_json::json!({"call_id": call_id, "response_missing": true}));
+    FunctionCallOutputPayload::from_text(failure.model_message())
+}
 
 pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
     let missing_outputs_to_insert = collect_missing_call_outputs(items, true);
@@ -65,9 +73,7 @@ fn collect_missing_call_outputs(
                     ResponseItem::FunctionCallOutput {
                         id: synthetic_output_id("fco", id.as_deref()),
                         call_id: call_id.clone(),
-                        output: FunctionCallOutputPayload::from_text(
-                            MISSING_TOOL_RESULT.to_string(),
-                        ),
+                        output: missing_tool_result(call_id),
                         internal_chat_message_metadata_passthrough: None,
                     },
                 ));
@@ -103,9 +109,7 @@ fn collect_missing_call_outputs(
                         id: synthetic_output_id("ctco", id.as_deref()),
                         call_id: call_id.clone(),
                         name: None,
-                        output: FunctionCallOutputPayload::from_text(
-                            MISSING_TOOL_RESULT.to_string(),
-                        ),
+                        output: missing_tool_result(call_id),
                         internal_chat_message_metadata_passthrough: None,
                     },
                 ));
@@ -126,9 +130,7 @@ fn collect_missing_call_outputs(
                     ResponseItem::FunctionCallOutput {
                         id: synthetic_output_id("fco", id.as_deref()),
                         call_id: call_id.clone(),
-                        output: FunctionCallOutputPayload::from_text(
-                            MISSING_TOOL_RESULT.to_string(),
-                        ),
+                        output: missing_tool_result(call_id),
                         internal_chat_message_metadata_passthrough: None,
                     },
                 ));

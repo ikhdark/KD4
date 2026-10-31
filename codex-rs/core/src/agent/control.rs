@@ -68,6 +68,7 @@ pub(crate) fn is_ancestor_reference(author: &AgentPath, reference: &str) -> bool
                 .is_some_and(|suffix| suffix.starts_with('/')))
 }
 mod execution;
+pub(crate) mod completion;
 mod legacy;
 mod residency;
 mod spawn;
@@ -1608,18 +1609,34 @@ impl AgentControl {
                     "Receipt: get_agent_task({{\"assignment_id\":\"{}\"}})\nProducer attempt: {}",
                     binding.assignment_id, binding.attempt_id,
                 ));
-                    let Some(communication) =
+                    let artifact_owner = match child_thread.as_ref() {
+                        Some(child) => Some(Arc::clone(child)),
+                        None => state.get_thread(parent_thread_id).await.ok(),
+                    };
+                    let Some(artifact_owner) = artifact_owner else {
+                        warn!(%parent_thread_id, "completion watcher has no parent artifact owner; retained task outcome requires recovery");
+                        return;
+                    };
+                    let parent_config = artifact_owner.config().await;
+                    let communication =
                     crate::session_prefix::inter_agent_completion_communication_with_diagnostics(
+                        &parent_config.codex_home,
+                        parent_thread_id,
                         parent_agent_path,
                         child_agent_path,
                         child_thread_id,
                         &status,
                         receipt.as_deref(),
                         protected_host_summary.as_deref(),
-                    )
-                else {
-                    return;
-                };
+                    ).await;
+                    let communication = match communication {
+                        Ok(Some(communication)) => communication,
+                        Ok(None) => return,
+                        Err(error) => {
+                            warn!(%error, "completion watcher could not retain complete child report");
+                            return;
+                        }
+                    };
                     let context = AgentCommunicationContext::new(
                         AgentCommunicationKind::Result,
                         child_thread_id,

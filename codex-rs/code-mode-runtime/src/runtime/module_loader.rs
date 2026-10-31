@@ -111,7 +111,7 @@ pub(super) fn resolve_tool_response(
     let resolver = v8::Local::new(&tc, &resolver);
     match response {
         Ok(result) => {
-            let value = super::output_projection::tool_result_to_v8(&mut tc, &result, &tool_name)?;
+            let value = super::output_projection::tool_result_to_v8(&mut tc, &result, &tool_name, id)?;
             resolver.resolve(&tc, value);
         }
         Err(error_text) => {

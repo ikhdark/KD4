@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use crate::operations::GitCommandControl;
-use crate::operations::run_git_output;
+use crate::operations::run_git_output_with_input;
 
 pub(crate) struct ReadCancellation(pub(crate) GitCommandControl);
 
@@ -83,8 +83,21 @@ pub(crate) fn read_git_command_with(
     limit: usize,
     control: &GitCommandControl,
 ) -> Result<std::process::Output, String> {
+    read_git_command_with_input(dir, args, index, config, limit, control, None)
+}
+
+pub(crate) fn read_git_command_with_input(
+    dir: &std::path::Path,
+    args: &[&str],
+    index: Option<&std::path::Path>,
+    config: &[(String, &str)],
+    limit: usize,
+    control: &GitCommandControl,
+    input: Option<&[u8]>,
+) -> Result<std::process::Output, String> {
     let mut command = Command::new(crate::git_executable());
-    command.current_dir(dir)
+    command
+        .current_dir(dir)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_NO_LAZY_FETCH", "1")
@@ -112,15 +125,17 @@ pub(crate) fn read_git_command_with(
     // hash-object and diff would silently fall back to non-repository mode.
     command.args(args);
     // The shared owner's cancel/timeout text describes working-file writes.
-    let output = run_git_output(command, limit, control).map_err(|error| match error.kind() {
-        std::io::ErrorKind::Interrupted => {
-            "Git read cancelled; no repository writes were requested".to_string()
+    let output = run_git_output_with_input(command, limit, control, input).map_err(|error| {
+        match error.kind() {
+            std::io::ErrorKind::Interrupted => {
+                "Git read cancelled; no repository writes were requested".to_string()
+            }
+            std::io::ErrorKind::TimedOut => {
+                "Git read exceeded its 30-second deadline; no repository writes were requested"
+                    .to_string()
+            }
+            _ => error.to_string(),
         }
-        std::io::ErrorKind::TimedOut => {
-            "Git read exceeded its 30-second deadline; no repository writes were requested"
-                .to_string()
-        }
-        _ => error.to_string(),
     })?;
     if crate::info::is_dubious_ownership_stderr(output.status.success(), &output.stderr) {
         return Err(format!(

@@ -455,13 +455,19 @@ ignored = [
 
 [profile.dev]
 # Minimize local build work; optimized runtime builds use release profiles.
-opt-level = 0
+opt-level = 2
 debug = "none"
 lto = "off"
 codegen-units = 256
 incremental = true
 debug-assertions = false
 overflow-checks = false
+
+# The first rollout write hashes the whole running executable. Unoptimized
+# SHA-256 (~86 MB/s) held every dev-profile session's first turn ~3.5 s on a
+# 300 MB binary; this small crate costs little to optimize.
+[profile.dev.package.sha2]
+opt-level = 3
 
 [profile.release]
 opt-level = 3

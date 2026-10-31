@@ -105,6 +105,22 @@ pub fn executable_sha256() -> Option<&'static str> {
         .as_deref()
 }
 
+/// Starts [`executable_sha256`] on a background thread, once per process.
+/// The first rollout metadata write waits for this hash; starting it when a
+/// session is created overlaps it with session startup instead of the first
+/// turn. A later caller blocks only until the same computation finishes.
+pub fn prehash_executable() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        // Best effort: without a thread the first caller hashes inline.
+        let _ = std::thread::Builder::new()
+            .name("executable-sha256".to_string())
+            .spawn(|| {
+                executable_sha256();
+            });
+    });
+}
+
 #[cfg(target_os = "linux")]
 fn running_executable_sha256() -> io::Result<String> {
     file_sha256(Path::new("/proc/self/exe"))

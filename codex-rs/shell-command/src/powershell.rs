@@ -260,7 +260,11 @@ pub fn is_standalone_powershell_command(script: &str) -> bool {
 /// This proof is only for resource admission: it must not authorize direct
 /// execution rewrites or authenticate runner receipts.
 pub fn standalone_powershell_inspection_argv(script: &str) -> Option<Vec<String>> {
-    try_parse_powershell_ast_analysis("pwsh", script)?.inspection_argv
+    try_parse_powershell_ast_analysis(
+        &crate::PowershellAnalysisScope::selected_executable(),
+        script,
+    )?
+    .inspection_argv
 }
 
 /// Parse an exact-shape PowerShell command only when profiles are disabled, as required by

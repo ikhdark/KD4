@@ -156,6 +156,7 @@ fn make_progress_sender(tx_event: Sender<Event>) -> SendProgress {
 pub(crate) struct ManagedClient {
     pub(crate) client: Arc<RmcpClient>,
     pub(crate) catalog: Arc<ArcSwap<NegotiatedCatalog>>,
+    tool_catalog_refresh: Sender<()>,
     pub(crate) tool_filter: ToolFilter,
     pub(crate) tool_timeout: Duration,
     pub(crate) codex_apps_tools_cache_context: Option<CodexAppsToolsCacheContext>,
@@ -599,6 +600,7 @@ pub(crate) struct AsyncManagedClient {
     pub(crate) codex_apps_tools_cache_context: Option<CodexAppsToolsCacheContext>,
     pub(crate) tool_filter: ToolFilter,
     managed_auth: Option<SharedAuthProvider>,
+    catalog_invalidated: Arc<AtomicBool>,
     pub(crate) startup_complete: Arc<AtomicBool>,
     pub(crate) connection_generation: Arc<AtomicU64>,
     pub(crate) startup_reconnect: Option<Arc<CodexAppsStartupReconnect>>,
@@ -720,6 +722,7 @@ impl AsyncManagedClient {
             tool_filter,
             startup_complete,
             managed_auth,
+            catalog_invalidated: Arc::new(AtomicBool::new(false)),
             connection_generation,
             startup_reconnect,
             tool_plugin_provenance,
@@ -757,14 +760,43 @@ impl AsyncManagedClient {
     }
 
     pub(crate) async fn client(&self) -> Result<ManagedClient, StartupOutcomeError> {
-        if let Some(client) = self
+        let client = if let Some(client) = self
             .startup_reconnect
             .as_ref()
             .and_then(|reconnect| reconnect.current_client())
         {
-            return Ok(client);
+            client
+        } else {
+            self.client.clone().await?
+        };
+        self.refresh_catalog_if_invalidated(&client);
+        Ok(client)
+    }
+
+    pub(crate) fn invalidate_tool_catalog(&self) {
+        self.catalog_invalidated.store(true, Ordering::Release);
+        let client = self
+            .startup_reconnect
+            .as_ref()
+            .and_then(|reconnect| reconnect.current_client())
+            .or_else(|| {
+                self.client
+                    .peek()
+                    .and_then(|result| result.as_ref().ok())
+                    .cloned()
+            });
+        if let Some(client) = client {
+            self.refresh_catalog_if_invalidated(&client);
         }
-        self.client.clone().await
+        // Otherwise client() forwards this request after startup completes.
+    }
+
+    fn refresh_catalog_if_invalidated(&self, client: &ManagedClient) {
+        if self.catalog_invalidated.swap(false, Ordering::AcqRel) {
+            // Full means a refresh is already queued; the existing worker owns
+            // retries and notifications received while discovery is in flight.
+            let _ = client.tool_catalog_refresh.try_send(());
+        }
     }
 
     pub(crate) async fn reconnect_failed_startup(&self) {
@@ -1496,6 +1528,7 @@ async fn start_server_task(
     let send_elicitation = elicitation_requests.make_sender(server_name.clone(), tx_event.clone());
     let send_progress = make_progress_sender(tx_event);
     let (tool_list_changed_tx, tool_list_changed_rx) = async_channel::bounded(1);
+    let tool_catalog_refresh = tool_list_changed_tx.clone();
     let weak_client = Arc::downgrade(&client);
     let changed_generation = Arc::clone(&connection_generation);
     let changed_revision = Arc::clone(&tool_catalog_revision);
@@ -1593,6 +1626,7 @@ async fn start_server_task(
     let managed = ManagedClient {
         client: Arc::clone(&client),
         catalog,
+        tool_catalog_refresh,
         tool_timeout,
         tool_filter,
         codex_apps_tools_cache_context,

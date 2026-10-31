@@ -259,6 +259,16 @@ where
     pub(crate) fn notification_route(&self, method: &str) -> Option<&NotificationRoute<S>> {
         self.notification_routes.get(method)
     }
+
+    pub(crate) fn request_methods(&self) -> Vec<String> {
+        let mut methods = self
+            .request_routes
+            .keys()
+            .map(|method| (*method).to_owned())
+            .collect::<Vec<_>>();
+        methods.sort();
+        methods
+    }
 }
 
 pub(crate) struct RpcClient {
@@ -273,6 +283,8 @@ pub(crate) struct RpcClient {
     shared_call_slots: Semaphore,
     cleanup_call_slots: Semaphore,
     next_request_id: AtomicI64,
+    // Per transport: a resumed logical client must not reuse an old backend snapshot.
+    capability_revision: std::sync::RwLock<Option<String>>,
     transport_tasks: Vec<JoinHandle<()>>,
     transport: JsonRpcTransport,
     reader_task: JoinHandle<()>,
@@ -353,12 +365,33 @@ impl RpcClient {
                 shared_call_slots: Semaphore::new(MAX_IN_FLIGHT_REGULAR_CALLS),
                 cleanup_call_slots: Semaphore::new(RESERVED_CLEANUP_CALLS),
                 next_request_id: AtomicI64::new(1),
+                capability_revision: std::sync::RwLock::new(None),
                 transport_tasks,
                 transport,
                 reader_task,
             },
             event_rx,
         )
+    }
+
+    pub(crate) fn set_capability_manifest(
+        &self,
+        manifest: Option<&crate::protocol::CapabilityManifest>,
+    ) -> Result<(), &'static str> {
+        if let Some(manifest) = manifest
+            && (manifest.schema_version != crate::protocol::CAPABILITY_MANIFEST_VERSION
+                || !manifest.revision.starts_with("v1:")
+                || manifest.backend_id.is_empty()
+                || manifest.configuration_revision.is_empty())
+        {
+            return Err("unsupported or invalid exec-server capability manifest");
+        }
+        *self
+            .capability_revision
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            manifest.map(|manifest| manifest.revision.clone());
+        Ok(())
     }
 
     pub(crate) async fn notify<P: Serialize>(
@@ -537,12 +570,33 @@ impl RpcClient {
             }
         };
         let exchange = async {
+            // Cleanup/observation of owned resources must remain possible after
+            // support drift. Their handlers still validate session/handle ownership.
+            let capability_revision = if matches!(
+                method,
+                crate::protocol::INITIALIZE_METHOD
+                    | crate::protocol::CAPABILITY_MANIFEST_METHOD
+                    | crate::protocol::CAPABILITY_QUERY_METHOD
+                    | crate::protocol::EXEC_READ_METHOD
+                    | crate::protocol::EXEC_TERMINATE_METHOD
+                    | crate::protocol::HTTP_REQUEST_CANCEL_METHOD
+                    | crate::protocol::FS_CHECKSUM_FILE_CANCEL_METHOD
+                    | crate::protocol::FS_CLOSE_METHOD
+            ) {
+                None
+            } else {
+                self.capability_revision
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+            };
             self.write_tx
                 .send(JSONRPCMessage::Request(JSONRPCRequest {
                     id: request_id.clone(),
                     method: method.to_string(),
                     params: Some(params),
                     trace: codex_otel::current_span_w3c_trace_context(),
+                    capability_revision,
                 }))
                 .await
                 .map_err(|_| RpcCallError::Closed)?;

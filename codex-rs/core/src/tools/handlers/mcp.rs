@@ -358,25 +358,21 @@ impl McpHandler {
         // This is after hook rewrites and before reserving/dispatching remote work.
         // The advertised schema may be simplified; never validate against it alone.
         let tool_input_value = serde_json::from_str::<Value>(&payload).map_err(|error| {
-            FunctionCallError::RespondToModel(format!("invalid MCP arguments: {error}"))
+            FunctionCallError::structured(codex_protocol::tool_failure::ToolFailure::invalid_json(error.line(), error.column()))
         })?;
         if !tool_input_value.is_object() {
-            return Err(FunctionCallError::RespondToModel(
-                "MCP arguments must be a JSON object".into(),
-            ));
-        }
-        let errors = self
-            .input_validator
-            .iter_errors(&tool_input_value)
-            .take(4)
-            .map(|error| error.to_string())
-            .collect::<Vec<_>>();
-        if !errors.is_empty() {
-            return Err(FunctionCallError::RespondToModel(format!(
-                "tool `{}` arguments violate its full input schema: {}",
-                self.tool_name(),
-                errors.join("; ")
+            return Err(FunctionCallError::structured(codex_protocol::tool_failure::ToolFailure::no_effects(
+                codex_protocol::tool_failure::ToolFailureCode::InvalidInput,
+                "MCP arguments rejected before execution: $: expected a JSON object",
             )));
+        }
+        if let Some(mut failure) = crate::tools::registry::argument_schema_diagnostic(
+            &self.input_validator,
+            &self.canonical_input_schema,
+            &tool_input_value,
+        ) {
+            failure.message = format!("tool `{}` rejected before execution: {}", self.tool_name(), failure.message);
+            return Err(FunctionCallError::structured(failure));
         }
         let started = Instant::now();
         let jobs = session_deferred_jobs(&session);

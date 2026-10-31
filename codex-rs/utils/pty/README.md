@@ -18,12 +18,15 @@ background descendants.
 - `combine_output_receivers(stdout_rx, stderr_rx)` → lossy `broadcast::Receiver<Vec<u8>>`. Slow
   consumers can lag and lose chunks, so use the split receivers for exact output.
 - `ProcessHandle` exposes:
-  - `writer_sender()` → `mpsc::Sender<Vec<u8>>` (stdin); `close_stdin()` drops the owner's sender
-  - `close_stdin_ordered().await` acknowledges pipe input close after queued input. Unix PTYs
-    drain accepted input, then return Unsupported instead of injecting VEOF. Drop external sender clones first.
+  - `writer_sender()` → byte-budgeted `StdinSender`; `close_stdin()` requests pipe closure and drops the owner's sender
+  - `close_stdin_ordered().await` idempotently acknowledges physical pipe closure after queued input.
+    Later writes fail. PTYs return Unsupported without injecting Ctrl-D/VEOF. Native pipe sender
+    clones cannot keep stdin open; driver-backed callers must release their sender clones.
   - `resize(TerminalSize)` and `signal(ProcessSignal)`
   - `has_exited()` and `exit_code()`
-  - `request_terminate()` cancels the Windows Job or Unix initial process group and leaves readers draining
+  - `request_terminate()` cancels the Windows Job or Unix initial process group and leaves readers draining.
+    Windows success requires job accounting to reach zero active processes; a native error or
+    five-second confirmation deadline retains the terminator for retry, even after root exit.
   - `finish()` releases an exited child without signalling it; `terminate()` does both
   - `release_pty_after_exit()` closes stdin and releases the pseudoconsole
 - `conpty_supported()` → `bool` (Windows build check; always true elsewhere)
@@ -39,6 +42,11 @@ the reader then delivers the final frame and closes. `finish()` aborts pipe read
 descendants can hold inherited handles indefinitely, but lets native PTY readers drain for up to
 two seconds. `output_capture()` records native EOF separately from forced reader shutdown;
 receiver closure alone does not certify complete capture.
+
+Failed cancellation also keeps diagnostic readers and control handles through `finish()`.
+Dropping an uncertain session transfers its terminator to reconciliation rather than releasing
+its last job/admission handle. Normal root exit still permits intentional background descendants;
+explicit cancellation of a retained job overrides that preservation.
 
 Unix `signal(Interrupt)` uses the PTY foreground group on Linux; platforms without an
 identity-safe terminal signal operation report Unsupported. Pipe interrupts retain group semantics.

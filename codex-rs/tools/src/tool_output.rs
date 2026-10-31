@@ -516,6 +516,12 @@ pub trait ToolOutput: Send {
         }
     }
 
+    /// Owner-supplied failure without rendering/cloning the full result. None
+    /// means unclassified; diagnostic text must not be used to infer a cause.
+    fn tool_failure(&self) -> Option<codex_protocol::tool_failure::ToolFailure> {
+        None
+    }
+
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem;
 
     /// Materializes the provider response and projection metadata together.
@@ -576,6 +582,9 @@ impl<T> ToolOutput for Box<T>
 where
     T: ToolOutput + ?Sized,
 {
+    fn tool_failure(&self) -> Option<codex_protocol::tool_failure::ToolFailure> {
+        (**self).tool_failure()
+    }
 
     fn log_preview(&self) -> String {
         (**self).log_preview()
@@ -1080,6 +1089,11 @@ fn is_essential_key(key: &str) -> bool {
 }
 
 impl ToolOutput for JsonToolOutput {
+    fn tool_failure(&self) -> Option<codex_protocol::tool_failure::ToolFailure> {
+        self.value.get("tool_failure")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+    }
+
 
     fn code_mode_failure_is_error(&self) -> bool {
         !self.code_mode_failure_as_data

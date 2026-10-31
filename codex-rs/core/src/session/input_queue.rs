@@ -5,6 +5,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::user_input::UserInput;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::io;
@@ -99,8 +100,12 @@ struct UserIntentState {
 struct MailboxState {
     pending_mails: VecDeque<(InterAgentCommunication, usize)>,
     bytes: usize,
-    seen_communication_ids: HashSet<codex_protocol::ResponseItemId>,
+    // true until history acknowledgment (or explicit supersession). One index
+    // owns both retry deduplication and outstanding delivery, without dual hashes.
+    seen_communication_ids: HashMap<codex_protocol::ResponseItemId, bool>,
     seen_communication_id_order: VecDeque<codex_protocol::ResponseItemId>,
+    // Retain revision watermarks after consumption, not just while mail is queued.
+    progress_revisions: indexmap::IndexMap<(codex_protocol::AgentPath, codex_protocol::AgentPath, String, String), u64>,
 }
 
 impl InputQueue {
@@ -287,6 +292,16 @@ impl InputQueue {
         &self,
         communication: InterAgentCommunication,
     ) -> Result<bool, codex_protocol::error::CodexErr> {
+        if let Some(progress) = &communication.progress
+            && (communication.trigger_turn || communication.id.is_none()
+                || progress.task_id.trim_start().is_empty() || progress.attempt_id.trim_start().is_empty()
+                || progress.task_id.len() > 256 || progress.attempt_id.len() > 256
+                || progress.revision > (1_u64 << 53) - 1)
+        {
+            return Err(codex_protocol::error::CodexErr::InvalidRequest(
+                "progress requires an identified, queue-only snapshot with nonempty task_id/attempt_id (at most 256 bytes) and an exact JavaScript integer revision".into(),
+            ));
+        }
         let full_error = || codex_protocol::error::CodexErr::InvalidRequest(format!(
             "session mailbox is full ({} messages or {} bytes); retry after messages are consumed",
             self.max_pending_mailbox_communications, self.max_pending_turn_input_bytes
@@ -294,12 +309,9 @@ impl InputQueue {
         {
             let mailbox = self.mailbox.lock().await;
             if communication.id.as_ref()
-                .is_some_and(|id| mailbox.seen_communication_ids.contains(id))
+                .is_some_and(|id| mailbox.seen_communication_ids.contains_key(id))
             {
                 return Ok(false);
-            }
-            if mailbox.pending_mails.len() >= self.max_pending_mailbox_communications {
-                return Err(full_error());
             }
         }
         // Size outside the mutex, then repeat all admission checks atomically.
@@ -308,17 +320,62 @@ impl InputQueue {
         if communication
             .id
             .as_ref()
-            .is_some_and(|id| mailbox.seen_communication_ids.contains(id))
+            .is_some_and(|id| mailbox.seen_communication_ids.contains_key(id))
         {
             return Ok(false);
         }
-        if mailbox.pending_mails.len() >= self.max_pending_mailbox_communications
-            || mailbox.bytes.saturating_add(bytes) > self.max_pending_turn_input_bytes
+        let progress_query = communication.progress.as_ref().map(|progress| ProgressQuery {
+            author: &communication.author, recipient: &communication.recipient,
+            task: &progress.task_id, attempt: &progress.attempt_id,
+        });
+        // Watermarks are never removed: a borrowed lookup yields an index that
+        // remains valid through admission, avoiding per-snapshot key allocation
+        // and repeated hashing of the same author/task/attempt identity.
+        let progress_index = progress_query.as_ref().and_then(|key| mailbox.progress_revisions.get_index_of(key));
+        if progress_query.is_some() && progress_index.is_none()
+            && mailbox.progress_revisions.len() >= self.max_seen_mailbox_communication_ids
+        {
+            return Err(codex_protocol::error::CodexErr::InvalidRequest(
+                "mailbox progress identity capacity reached; no existing revision watermark was discarded; send nonreplaceable information without progress metadata".into(),
+            ));
+        }
+        if let Some(index) = progress_index
+            && mailbox.progress_revisions.get_index(index).is_some_and(|(_, revision)|
+                communication.progress.as_ref().is_some_and(|progress| progress.revision <= *revision))
+        {
+            // Admission acknowledgement also covers a snapshot already superseded.
+            return Ok(false);
+        }
+        // A nonreplaceable message is an ordering barrier. Never move a snapshot
+        // across a result/error/blocker/control transition, even from another sender.
+        let replace = progress_query.as_ref().and_then(|key| mailbox.pending_mails.iter()
+            .enumerate().rev()
+            .take_while(|(_, (mail, _))| mail.progress.is_some())
+            .find(|(_, (mail, _))| progress_key_matches(mail, key))
+            .map(|(index, _)| index));
+        let removed_bytes = replace.map_or(0, |index| mailbox.pending_mails[index].1);
+        if (replace.is_none() && mailbox.pending_mails.len() >= self.max_pending_mailbox_communications)
+            || mailbox.bytes.saturating_sub(removed_bytes).saturating_add(bytes) > self.max_pending_turn_input_bytes
         {
             return Err(full_error());
         }
+        if let Some(index) = replace {
+            if let Some((replaced, _)) = mailbox.pending_mails.remove(index)
+                && let Some(id) = replaced.id
+            {
+                if let Some(outstanding) = mailbox.seen_communication_ids.get_mut(&id) { *outstanding = false; }
+            }
+            mailbox.bytes -= removed_bytes;
+        }
+        if let Some(progress) = &communication.progress {
+            if let Some(index) = progress_index {
+                if let Some((_, revision)) = mailbox.progress_revisions.get_index_mut(index) { *revision = progress.revision; }
+            } else if let Some(key) = progress_key(&communication) {
+                mailbox.progress_revisions.insert(key, progress.revision);
+            }
+        }
         if let Some(id) = communication.id.as_ref() {
-            mailbox.seen_communication_ids.insert(id.clone());
+            mailbox.seen_communication_ids.insert(id.clone(), true);
             mailbox.seen_communication_id_order.push_back(id.clone());
             compact_seen_mailbox_ids(&mut mailbox, self.max_seen_mailbox_communication_ids);
         }
@@ -341,11 +398,29 @@ impl InputQueue {
     ) {
         let mut mailbox = self.mailbox.lock().await;
         for id in ids {
-            if mailbox.seen_communication_ids.insert(id.clone()) {
+            if mailbox.seen_communication_ids.insert(id.clone(), false).is_none() {
                 mailbox.seen_communication_id_order.push_back(id);
                 compact_seen_mailbox_ids(&mut mailbox, self.max_seen_mailbox_communication_ids);
             }
         }
+    }
+
+    pub(super) async fn seed_mailbox_progress(&self, communications: Vec<InterAgentCommunication>) {
+        let mut mailbox = self.mailbox.lock().await;
+        for communication in communications {
+            if !communication.trigger_turn && let Some(key) = progress_key(&communication) {
+                let revision = communication.progress.as_ref().map_or(0, |progress| progress.revision);
+                mailbox.progress_revisions.entry(key).and_modify(|seen| *seen = (*seen).max(revision)).or_insert(revision);
+            }
+        }
+    }
+
+    pub(super) async fn acknowledge_mailbox_communication(&self, communication: &InterAgentCommunication) {
+        let mut mailbox = self.mailbox.lock().await;
+        if let Some(id) = &communication.id {
+            if let Some(outstanding) = mailbox.seen_communication_ids.get_mut(id) { *outstanding = false; }
+        }
+        compact_seen_mailbox_ids(&mut mailbox, self.max_seen_mailbox_communication_ids);
     }
 
     #[expect(
@@ -944,12 +1019,43 @@ impl InputQueue {
 }
 
 fn compact_seen_mailbox_ids(mailbox: &mut MailboxState, max_seen_ids: usize) {
-    while mailbox.seen_communication_id_order.len() > max_seen_ids {
+    let mut remaining = mailbox.seen_communication_id_order.len();
+    while mailbox.seen_communication_id_order.len() > max_seen_ids && remaining > 0 {
+        remaining -= 1;
         let Some(expired_id) = mailbox.seen_communication_id_order.pop_front() else {
             break;
         };
-        mailbox.seen_communication_ids.remove(&expired_id);
+        // Protect ownership transfers and failed history recording too. Queue
+        // removal alone does not acknowledge delivery.
+        if mailbox.seen_communication_ids.get(&expired_id) == Some(&true) {
+            mailbox.seen_communication_id_order.push_back(expired_id);
+        } else {
+            mailbox.seen_communication_ids.remove(&expired_id);
+        }
     }
+}
+
+fn progress_key(mail: &InterAgentCommunication) -> Option<(codex_protocol::AgentPath, codex_protocol::AgentPath, String, String)> {
+    mail.progress.as_ref().map(|progress| (mail.author.clone(), mail.recipient.clone(), progress.task_id.clone(), progress.attempt_id.clone()))
+}
+
+#[derive(Hash)]
+struct ProgressQuery<'a> {
+    author: &'a codex_protocol::AgentPath,
+    recipient: &'a codex_protocol::AgentPath,
+    task: &'a str,
+    attempt: &'a str,
+}
+
+impl indexmap::Equivalent<(codex_protocol::AgentPath, codex_protocol::AgentPath, String, String)> for ProgressQuery<'_> {
+    fn equivalent(&self, key: &(codex_protocol::AgentPath, codex_protocol::AgentPath, String, String)) -> bool {
+        &key.0 == self.author && &key.1 == self.recipient && key.2 == self.task && key.3 == self.attempt
+    }
+}
+
+fn progress_key_matches(mail: &InterAgentCommunication, key: &ProgressQuery<'_>) -> bool {
+    &mail.author == key.author && &mail.recipient == key.recipient && mail.progress.as_ref().is_some_and(|progress|
+        progress.task_id == key.task && progress.attempt_id == key.attempt)
 }
 
 
@@ -975,6 +1081,14 @@ struct ByteCounter {
 }
 
 impl io::Write for ByteCounter {
+    // This writer always consumes the full slice. Avoid the default
+    // short-write retry loop for every JSON field and escaped content chunk.
+    #[inline(always)]
+    fn write_all(&mut self, buffer: &[u8]) -> io::Result<()> {
+        self.bytes = self.bytes.saturating_add(buffer.len());
+        Ok(())
+    }
+
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         self.bytes = self.bytes.saturating_add(buffer.len());
         Ok(buffer.len())

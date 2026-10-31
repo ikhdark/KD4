@@ -132,7 +132,7 @@ pub(crate) fn fork_turn_positions_in_rollout(items: &[RolloutItem]) -> Vec<usize
             RolloutItem::InterAgentCommunication(communication) if communication.trigger_turn => {
                 fork_turn_positions.push(idx);
             }
-            RolloutItem::InterAgentCommunicationMetadata { trigger_turn } if *trigger_turn => {
+            RolloutItem::InterAgentCommunicationMetadata { trigger_turn, .. } if *trigger_turn => {
                 fork_turn_positions.push(idx);
             }
             RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {

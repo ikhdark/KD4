@@ -6,6 +6,8 @@ use crate::client::ModelClientSession;
 use crate::retry::backoff_with_cap;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
+use crate::turn_timing::retries::RetryAction;
+use crate::turn_timing::retries::RetryTrigger;
 use codex_http_client::RetryAfter;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::error::CodexErr;
@@ -49,6 +51,8 @@ pub(crate) enum ResponsesStreamRequest {
 /// failures are tracked separately; interactive recovery shares one wait budget.
 #[derive(Debug)]
 pub(crate) struct ResponsesStreamRetryState {
+    configured_retries: Option<u64>,
+    attempts_started: u64,
     retries: u64,
     connection_retries: u64,
     connection_retry_delay: Duration,
@@ -64,6 +68,8 @@ pub(crate) struct ResponsesStreamRetryState {
 impl Default for ResponsesStreamRetryState {
     fn default() -> Self {
         Self {
+            configured_retries: None,
+            attempts_started: 0,
             retries: 0,
             connection_retries: 0,
             connection_retry_delay: INITIAL_CONNECTION_RETRY_DELAY,
@@ -76,6 +82,60 @@ impl Default for ResponsesStreamRetryState {
 }
 
 impl ResponsesStreamRetryState {
+    pub(crate) fn new(max_retries: u64) -> Self {
+        Self { configured_retries: Some(max_retries), ..Self::default() }
+    }
+
+    pub(crate) fn begin_attempt(&mut self, turn: &TurnContext, request: ResponsesStreamRequest) {
+        self.attempts_started = self.attempts_started.saturating_add(1);
+        self.emit_budget(turn, request);
+    }
+
+    fn budget(&self, turn: &TurnContext) -> serde_json::Value {
+        let source = &turn.session_source;
+        let retry_limit = self.configured_retries.map_or_else(
+            || serde_json::json!({"kind": "unknown"}),
+            |limit| serde_json::json!({"kind": "finite", "value": limit}),
+        );
+        let deadline = if !is_interactive_recovery(source) {
+            serde_json::json!({"kind": "unlimited", "remaining_ms": null})
+        } else {
+            serde_json::json!({"kind": "finite", "limit_ms": INTERACTIVE_RETRY_WAIT_BUDGET.as_millis(),
+                "state": if self.wait_deadline.is_some() { "running" } else { "not_started" },
+                "remaining_ms": self.wait_deadline.map(|deadline|
+                    deadline.saturating_duration_since(tokio::time::Instant::now()).as_millis())})
+        };
+        serde_json::json!({
+            "version": 1, "owner": "responses_stream", "agent_attempts": "unknown",
+            // Repairs/account recovery do not all spend the replay counter.
+            // There is no single configured total-attempt cap to invent here.
+            "total_attempt_limit": {"kind": "unknown"},
+            "attempts_started": self.attempts_started,
+            "generation_replay": {"retry_limit": retry_limit,
+                "retries_reserved": self.retries,
+                "retries_remaining": self.configured_retries.map(|limit| limit.saturating_sub(self.retries))},
+            "bounded_connection_recovery": {"retry_limit": retry_limit,
+                "retries_reserved": self.connection_retries,
+                "retries_remaining": self.configured_retries.map(|limit| limit.saturating_sub(self.connection_retries))},
+            "network_recovery": {"retry_limit": if network_recovery_eligible(source, turn.provider.info()) {
+                "unlimited"
+            } else { "not_applicable" }, "shares_connection_counter": true},
+            "websocket_repair_used": self.repaired_explicit_rejection,
+            "deadline": deadline,
+            "transport_attempts": "owned_separately_by_transport_retry_loop",
+        })
+    }
+
+    fn emit_budget(&self, turn: &TurnContext, request: ResponsesStreamRequest) {
+        let budget = self.budget(turn);
+        tracing::info!(event.name = "codex.retry_budget", turn_id = %turn.sub_id,
+            ?request, retry_budget_json = %budget, "Responses retry owner budget");
+    }
+
+    fn visible_budget(&self, turn: &TurnContext) -> String {
+        format!(" Retry owner budget: {}", self.budget(turn))
+    }
+
     fn interactive_wait_deadline(
         &mut self,
         session_source: &SessionSource,
@@ -132,6 +192,8 @@ pub(crate) async fn handle_retryable_response_stream_error(
     }
 
     let wait_deadline = retry_state.interactive_wait_deadline(&turn_context.session_source);
+    retry_state.configured_retries = Some(max_retries);
+    retry_state.emit_budget(turn_context, request);
     check_retry_wait_budget(
         retry_after
             .map(RetryAfter::deadline)
@@ -145,6 +207,9 @@ pub(crate) async fn handle_retryable_response_stream_error(
             return Err(err);
         }
         retry_state.repaired_explicit_rejection = true;
+        retry_state.emit_budget(turn_context, request);
+        record_retry_decision(turn_context, &err, RetryAction::WebsocketRepair,
+            Some(retry_after.map_or(Duration::ZERO, |advice| advice.remaining_delay())));
         // Each typed refusal proves no sampling was accepted. Retire the
         // chain/socket so the next request carries full authoritative input.
         client_session.replace_websocket_for_recovery();
@@ -169,21 +234,24 @@ pub(crate) async fn handle_retryable_response_stream_error(
     if retry_state.retries < max_retries && should_reconnect_after_close(&err, retry_state) {
         retry_state.retries += 1;
         retry_state.reconnected_after_close = true;
+        retry_state.emit_budget(turn_context, request);
         let delay = response_stream_retry_delay(&err, retry_state.retries);
         let retry_at = retry_after
             .map(RetryAfter::deadline)
             .unwrap_or_else(|| tokio::time::Instant::now() + delay);
+        record_retry_decision(turn_context, &err, RetryAction::Reconnect, Some(delay));
         warn!(
             turn_id = %turn_context.sub_id,
             ?request,
             ?delay,
-            error = %err,
+            error = ?retry_trigger(&err),
             "provider closed the stream and invited a reconnect; rebuilding the websocket"
         );
         client_session.replace_websocket_for_recovery();
         sess.notify_stream_error(
             turn_context,
-            format!("Reconnecting... the server closed the stream (next retry in {delay:.1?})"),
+            format!("Reconnecting... the server closed the stream (next retry in {delay:.1?}){}",
+                retry_state.visible_budget(turn_context)),
             err,
         )
         .await;
@@ -228,11 +296,13 @@ pub(crate) async fn handle_retryable_response_stream_error(
         && client_session
             .try_switch_fallback_transport_after_error(&turn_context.session_telemetry, &err)
     {
+        record_retry_decision(turn_context, &err, RetryAction::FallbackHttp,
+            Some(retry_after.map_or(Duration::ZERO, |advice| advice.remaining_delay())));
         turn_context.turn_timing_state.record_model_fallback();
         sess.send_event(
             turn_context,
             EventMsg::Warning(WarningEvent {
-                message: format!("Falling back from WebSockets to HTTPS transport. {err:#}"),
+                message: format!("Falling back from WebSockets to HTTPS transport. Retry trigger: {:?}.", retry_trigger(&err)),
             }),
         )
         .await;
@@ -241,6 +311,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
         if !pre_dispatch_failure {
             retry_state.retries += 1;
         }
+        retry_state.emit_budget(turn_context, request);
         if let Some(advice) = retry_after {
             wait_for_response_retry_deadline(
                 advice.deadline(),
@@ -257,13 +328,15 @@ pub(crate) async fn handle_retryable_response_stream_error(
 
     if wait_for_connection_recovery {
         let retry_delay = retry_state.connection_retry_delay;
+        record_retry_decision(turn_context, &err, RetryAction::NetworkRecovery, Some(retry_delay));
         retry_state.connection_retries = retry_state.connection_retries.saturating_add(1);
+        retry_state.emit_budget(turn_context, request);
         warn!(
             turn_id = %turn_context.sub_id,
             ?request,
             connection_retries = retry_state.connection_retries,
             ?retry_delay,
-            error = %err,
+            error = ?retry_trigger(&err),
             "stream connection failed; waiting for the network to recover"
         );
         // A lost connection does not burn the provider attempt count, but the shared
@@ -271,8 +344,9 @@ pub(crate) async fn handle_retryable_response_stream_error(
         sess.notify_stream_error(
             turn_context,
             format!(
-                "Reconnecting... waiting for network (attempt {}, next retry in {retry_delay:.1?})",
+                "Reconnecting... waiting for network (attempt {}, next retry in {retry_delay:.1?}){}",
                 retry_state.connection_retries,
+                retry_state.visible_budget(turn_context),
             ),
             err,
         )
@@ -304,10 +378,12 @@ pub(crate) async fn handle_retryable_response_stream_error(
     if *retries < max_retries {
         *retries += 1;
         let retry_count = *retries;
+        retry_state.emit_budget(turn_context, request);
         let delay = response_stream_retry_delay(&err, retry_count);
         let retry_at = retry_after
             .map(RetryAfter::deadline)
             .unwrap_or_else(|| tokio::time::Instant::now() + delay);
+        record_retry_decision(turn_context, &err, RetryAction::Replay, Some(delay));
         log_retry(request, turn_context, &err, retry_count, max_retries, delay);
 
         // Surface retry information from the first attempt so a reconnect never looks frozen.
@@ -318,7 +394,8 @@ pub(crate) async fn handle_retryable_response_stream_error(
         };
         sess.notify_stream_error(
             turn_context,
-            format!("{status}... {retry_count}/{max_retries} (next retry in {delay:.1?})"),
+            format!("{status}... {retry_count}/{max_retries} (next retry in {delay:.1?}){}",
+                retry_state.visible_budget(turn_context)),
             err,
         )
         .await;
@@ -334,6 +411,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
         return Ok(());
     }
 
+    retry_state.emit_budget(turn_context, request);
     Err(err)
 }
 
@@ -370,8 +448,11 @@ fn should_wait_for_connection_recovery(
     provider: &ModelProviderInfo,
 ) -> bool {
     let recoverable_stall = matches!(err, CodexErr::ConnectionFailed(_));
-    recoverable_stall
-        && matches!(
+    recoverable_stall && network_recovery_eligible(session_source, provider)
+}
+
+fn network_recovery_eligible(session_source: &SessionSource, provider: &ModelProviderInfo) -> bool {
+    matches!(
             session_source,
             SessionSource::Cli | SessionSource::VSCode | SessionSource::Mcp
         )
@@ -458,6 +539,15 @@ pub(crate) async fn wait_for_account_change(
         AccountChangeWait::UsageLimit(_, account) => account.cloned().or_else(current_account),
         AccountChangeWait::MissingCredentials => None,
     };
+    turn_context.turn_timing_state.record_retry_decision(
+        match reason {
+            AccountChangeWait::UsageLimit(..) => RetryTrigger::UsageLimit,
+            AccountChangeWait::MissingCredentials => RetryTrigger::MissingCredentials,
+        },
+        None,
+        RetryAction::AccountRecovery,
+        None,
+    );
     if matches!(reason, AccountChangeWait::MissingCredentials)
         && !turn_context.provider.missing_required_credentials()
     {
@@ -523,6 +613,8 @@ pub(crate) async fn wait_for_account_change(
             "No model credentials are loaded (logged out or switching accounts). Waiting up to {minutes} min for a login before sending this request; interrupt the turn to stop waiting."
         ),
     };
+    let message = format!("{message}{} Account wait remaining: {} ms.",
+        retry_state.visible_budget(turn_context), remaining.as_millis());
     warn!(turn_id = %turn_context.sub_id, "{message}");
     sess.send_event(turn_context, EventMsg::Warning(WarningEvent { message }))
         .await;
@@ -780,7 +872,7 @@ fn log_retry(
         ResponsesStreamRequest::Sampling => {
             warn!(
                 turn_id = %turn_context.sub_id,
-                sampling_error = %err,
+                sampling_error = ?retry_trigger(err),
                 "stream disconnected - retrying sampling request ({retries}/{max_retries} in {delay:?})...",
             );
         }
@@ -789,7 +881,7 @@ fn log_retry(
                 turn_id = %turn_context.sub_id,
                 retries,
                 max_retries,
-                compact_error = %err,
+                compact_error = ?retry_trigger(err),
                 "local compaction stream failed; retrying request after delay"
             );
         }
@@ -798,9 +890,37 @@ fn log_retry(
                 turn_id = %turn_context.sub_id,
                 retries,
                 max_retries,
-                compact_error = %err,
+                compact_error = ?retry_trigger(err),
                 "remote compaction v2 stream failed; retrying request after delay"
             );
         }
     }
+}
+
+/// An allowlist, not a scrubber: arbitrary provider messages and endpoints are
+/// never copied into retry diagnostics, even when they contain unrecognized credentials.
+pub(crate) fn retry_trigger(err: &CodexErr) -> RetryTrigger {
+    match err {
+        CodexErr::TerminalResponse { source, .. } => retry_trigger(source),
+        CodexErr::ConnectionFailed(_) | CodexErr::PreDispatchRetryExhausted(_) => RetryTrigger::Connection,
+        CodexErr::UnexpectedStatus(_) | CodexErr::RegionRestricted(_) => RetryTrigger::Http,
+        CodexErr::RequestTimeout | CodexErr::Timeout => RetryTrigger::Timeout,
+        CodexErr::Stream(..) | CodexErr::ResponseStreamFailed(_) | CodexErr::IncompleteResponse(_) => RetryTrigger::Stream,
+        CodexErr::WebsocketRejected { .. } => RetryTrigger::WebsocketRejected,
+        CodexErr::ServerOverloaded { .. } => RetryTrigger::Capacity,
+        CodexErr::UsageLimitReached(_) => RetryTrigger::UsageLimit,
+        CodexErr::RefreshTokenFailed(_) => RetryTrigger::Authentication,
+        _ => RetryTrigger::Other,
+    }
+}
+
+fn record_retry_decision(
+    turn_context: &TurnContext,
+    err: &CodexErr,
+    action: RetryAction,
+    backoff: Option<Duration>,
+) {
+    turn_context.turn_timing_state.record_retry_decision(
+        retry_trigger(err), err.http_status_code_value(), action, backoff,
+    );
 }

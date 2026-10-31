@@ -56,21 +56,49 @@ fn format_bounded_subagent_error_notification(agent_reference: &str, error: &str
     }
 }
 
-pub(crate) fn inter_agent_completion_communication_with_diagnostics(
+pub(crate) async fn inter_agent_completion_communication_with_diagnostics(
+    codex_home: &std::path::Path,
+    parent_thread_id: ThreadId,
     task_name: AgentPath,
     sender: AgentPath,
     sender_thread_id: ThreadId,
     status: &AgentStatus,
     receipt: Option<&str>,
     protected_host_summary: Option<&str>,
-) -> Option<InterAgentCommunication> {
+) -> Result<Option<InterAgentCommunication>, String> {
+    if matches!(status, AgentStatus::PendingInit | AgentStatus::Running | AgentStatus::Interrupted) {
+        return Ok(None);
+    }
+    // Retain first, in the recipient's existing artifact namespace. A bounded
+    // handoff must never be the only surviving copy of a report or surfaced result.
+    let canonical = codex_tools::CanonicalToolResult::json(serde_json::json!({
+        "sender": sender, "source_thread_id": sender_thread_id,
+        "status": status, "receipt": receipt, "host_diagnostics": protected_host_summary,
+        "evidence_retrieval": "For evidence IDs produced by this child, call read_tool_output with source_thread_id set to this report's source_thread_id; retain that argument on every continuation. Only an ancestor is authorized.",
+    }));
+    let artifact = crate::tools::command_output_artifact::create_tool_history_output_artifact(
+        codex_home, &parent_thread_id.to_string(), &canonical,
+    ).await;
+    let artifact_id = artifact.artifact_id().filter(|_| artifact.complete
+        && artifact.retained_bytes == canonical.exact_bytes && artifact.unavailable_ranges.is_empty())
+        .ok_or_else(|| format!("Full child result retention failed; no lossy completion was published: {}",
+            artifact.error.as_deref().unwrap_or("incomplete artifact")))?;
+    let original_receipt = receipt;
+    let recovery = serde_json::json!({"tool":"read_tool_output", "arguments":{
+        "artifact_id":artifact_id, "selectors":[{"kind":"json_pointer", "pointer":""}],
+    }, "canonical_sha256":canonical.sha256, "canonical_bytes":canonical.exact_bytes});
+    let receipt = format!("{}\nFull result recovery: {recovery}\nSummary only: findings, errors, diagnostics or unresolved work may be omitted below. Retrieve the complete result before accepting or integrating it.", receipt.unwrap_or_default());
+    let receipt = Some(receipt.as_str());
     let message = format_inter_agent_completion_message_with_diagnostics(
         task_name.clone(),
         sender.clone(),
         status,
         receipt,
         protected_host_summary,
-    )?;
+    ).ok_or_else(|| "terminal result has no completion envelope".to_string())?;
+    if approx_token_count(&message) >= COMPLETION_MESSAGE_MAX_TOKENS {
+        return Err("Completion envelope exceeds its budget; full result retained but not delivered".into());
+    }
     let mut communication =
         InterAgentCommunication::new(sender, task_name, Vec::new(), message, false);
     if let AgentStatus::Errored(error) = status {
@@ -81,7 +109,7 @@ pub(crate) fn inter_agent_completion_communication_with_diagnostics(
             sender_thread_id.to_string().as_str(),
             communication.author.as_str(),
             communication.recipient.as_str(),
-            receipt.unwrap_or_default(),
+            original_receipt.unwrap_or_default(),
             error.as_str(),
         ] {
             digest.update((part.len() as u64).to_le_bytes());
@@ -92,7 +120,7 @@ pub(crate) fn inter_agent_completion_communication_with_diagnostics(
             hex::encode(digest.finalize()),
         )));
     }
-    Some(communication)
+    Ok(Some(communication))
 }
 
 fn format_inter_agent_completion_message_with_diagnostics(

@@ -4,6 +4,7 @@ mod confined_file;
 mod copy_failure;
 mod directory_guard;
 mod find_up;
+mod text_diagnostics;
 mod walk_gitignore;
 
 pub use conditional_mutation::FileMutationOutcome;
@@ -21,6 +22,13 @@ pub use directory_guard::lock_directory_chain;
 pub use find_up::FindUpErrorPolicy;
 pub use find_up::find_nearest_ancestor_with_markers;
 pub use find_up::find_nearest_native_ancestor_with_markers;
+pub use text_diagnostics::DecodingError;
+pub use text_diagnostics::DecodingErrorKind;
+pub use text_diagnostics::EncodingDetection;
+pub use text_diagnostics::FinalNewline;
+pub use text_diagnostics::LineEndings;
+pub use text_diagnostics::TextDiagnostics;
+pub use text_diagnostics::TextDiagnosticsScanner;
 
 use bytes::Bytes;
 use codex_protocol::config_types::WindowsSandboxLevel;
@@ -52,6 +60,67 @@ pub const FILE_READ_CHUNK_SIZE: usize = 1024 * 1024;
 /// Maximum payload of one revision-bound seek read (not a whole-file snapshot).
 pub const FILE_RANGE_MAX_BYTES: usize = 64 * 1024;
 
+/// Read-only, point-in-time name observations; never permission or revision guards.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum FileSystemLookup {
+    Canonicalize { path: PathUri },
+    FirstRegularFile { candidates: Vec<PathUri> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum FileSystemLookupResult {
+    Resolved { path: PathUri },
+    Missing,
+    Inaccessible { error: String },
+    Unsupported { error: String },
+    Invalid { error: String },
+    Unknown { error: String },
+}
+
+impl FileSystemLookupResult {
+    pub fn from_result(result: io::Result<Option<PathUri>>) -> Self {
+        match result {
+            Ok(Some(path)) => Self::Resolved { path },
+            Ok(None) => Self::Missing,
+            Err(error) => {
+                let message = error.to_string();
+                match error.kind() {
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => Self::Missing,
+                    io::ErrorKind::PermissionDenied => Self::Inaccessible { error: message },
+                    _ if cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33)) => {
+                        Self::Inaccessible { error: message }
+                    }
+                    io::ErrorKind::Unsupported => Self::Unsupported { error: message },
+                    io::ErrorKind::InvalidInput => Self::Invalid { error: message },
+                    _ => Self::Unknown { error: message },
+                }
+            }
+        }
+    }
+}
+
+pub fn validate_lookup_batch(requests: &[FileSystemLookup]) -> io::Result<()> {
+    let mut probes = 0usize;
+    let mut bytes = 0usize;
+    for request in requests {
+        let paths = match request {
+            FileSystemLookup::Canonicalize { path } => std::slice::from_ref(path),
+            FileSystemLookup::FirstRegularFile { candidates } => candidates.as_slice(),
+        };
+        probes = probes.saturating_add(paths.len());
+        for path in paths {
+            bytes = bytes.saturating_add(path.as_str().len());
+        }
+    }
+    if requests.is_empty() || requests.len() > 32 || probes > 16_384 || bytes > 4 * 1024 * 1024 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            "lookup batches require 1-32 requests, at most 16384 probes and 4 MiB of path text"));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileRangeRead {
     pub bytes: Vec<u8>,
@@ -69,6 +138,8 @@ pub struct FileDigest {
     pub file_bytes: u64,
     /// The same opaque opened-object revision as [`FileRangeRead::revision`].
     pub revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_diagnostics: Option<TextDiagnostics>,
 }
 const MAX_WALK_DEPTH: usize = 64;
 const MAX_WALK_DIRECTORIES: usize = 10_000;
@@ -675,6 +746,27 @@ async fn collect_bounded_read(
 /// Abstract filesystem access used by components that may operate locally or via
 /// a remote environment.
 pub trait ExecutorFileSystem: Send + Sync {
+    /// Ordered independent results, including duplicates. Isolation backends
+    /// override this to use one helper/RPC, without changing probe ordering.
+    fn lookup_batch<'a>(
+        &'a self,
+        requests: &'a [FileSystemLookup],
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Vec<FileSystemLookupResult>> {
+        Box::pin(async move {
+            validate_lookup_batch(requests)?;
+            let mut results = Vec::with_capacity(requests.len());
+            for request in requests {
+                let result = match request {
+                    FileSystemLookup::Canonicalize { path } => self.canonicalize(path, sandbox).await.map(Some),
+                    FileSystemLookup::FirstRegularFile { candidates } => self.first_regular_file(candidates, sandbox).await,
+                };
+                results.push(FileSystemLookupResult::from_result(result));
+            }
+            Ok(results)
+        })
+    }
+
     /// Whether native paths name this Codex process's host filesystem. Foreign
     /// Windows paths are not host paths merely because their syntax matches.
     fn uses_host_native_paths(&self) -> bool {
@@ -758,10 +850,11 @@ pub trait ExecutorFileSystem: Send + Sync {
     fn checksum_file<'a>(
         &'a self,
         path: &'a PathUri,
+        include_text_diagnostics: bool,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, Option<FileDigest>> {
         Box::pin(async move {
-            let _ = (path, sandbox);
+            let _ = (path, include_text_diagnostics, sandbox);
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "streaming file checksums are not supported by this filesystem",
@@ -792,8 +885,15 @@ pub trait ExecutorFileSystem: Send + Sync {
                         continue;
                     }
                     Err(error) => {
+                        // Wrapping the diagnostic drops raw_os_error; retain
+                        // Windows sharing-denial semantics in the portable kind.
+                        let kind = if cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33)) {
+                            io::ErrorKind::PermissionDenied
+                        } else {
+                            error.kind()
+                        };
                         return Err(io::Error::new(
-                            error.kind(),
+                            kind,
                             format!(
                                 "unable to inspect candidate {}: {error}",
                                 candidate.inferred_native_path_string()

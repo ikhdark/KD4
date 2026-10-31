@@ -109,6 +109,7 @@ fn parse_shell_command_hook_invocation(
 
 pub(super) struct RunExecLikeArgs {
     pub(super) max_output_tokens: Option<usize>,
+    pub(super) quiet_on_success: bool,
     pub(super) validation: Option<crate::validation::CommandValidation>,
     pub(super) tool_name: ToolName,
     pub(super) exec_params: ExecParams,
@@ -285,32 +286,26 @@ impl ToolOutput for LegacyShellToolOutput {
             metadata.essential_inline["validation"] =
                 crate::tools::context::declared_validation_metadata(validation);
         }
-        if self.validation_failure
+        if (self.validation_failure
+            || matches!(
+                self.outcome_for_logging(),
+                codex_tools::ToolOutputOutcome::Failure | codex_tools::ToolOutputOutcome::TimedOut
+            ))
             && let Some(canonical_output) = self.canonical_output.as_deref()
             && let Ok(diagnostics) = std::str::from_utf8(canonical_output)
             && !diagnostics.is_empty()
         {
             const VALIDATION_DIAGNOSTICS_ID: &str = "validation:diagnostics";
-            let range = validation_diagnostic_range(VALIDATION_DIAGNOSTICS_ID, canonical_output);
-            let diagnostics = range.as_ref().map_or_else(
-                || {
-                    const NOTICE: &str = "\n[diagnostic excerpt truncated; full output retained]";
-                    let end = diagnostics.floor_char_boundary(12 * 1024 - NOTICE.len());
-                    format!("{}{NOTICE}", &diagnostics[..end])
-                },
-                |range| {
-                    diagnostics
-                        .lines()
-                        .skip(range.start_line - 1)
-                        .take(range.end_line - range.start_line + 1)
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                },
-            );
+            let (diagnostics, range) =
+                failure_diagnostic_excerpt(VALIDATION_DIAGNOSTICS_ID, diagnostics);
             metadata.fragments.insert(
                 1,
                 ToolOutputProjectionFragment::new(
-                    ToolOutputProjectionFragmentKind::ValidationFailureOrFinalSummary,
+                    if self.validation_failure {
+                        ToolOutputProjectionFragmentKind::ValidationFailureOrFinalSummary
+                    } else {
+                        ToolOutputProjectionFragmentKind::ErrorOrDiagnostic
+                    },
                     diagnostics,
                 )
                 .with_id(VALIDATION_DIAGNOSTICS_ID),
@@ -336,6 +331,25 @@ impl ToolOutput for LegacyShellToolOutput {
 
     fn code_mode_result(&self, payload: &ToolPayload) -> JsonValue {
         let mut result = self.inner.code_mode_result(payload);
+        let controls: serde_json::Map<String, JsonValue> =
+            ["output_reference", "environment_receipt"]
+                .into_iter()
+                .filter_map(|key| {
+                    self.inner
+                        .essential_inline
+                        .get(key)
+                        .map(|value| (key.into(), value.clone()))
+                })
+                .collect();
+        if !controls.is_empty() {
+            if let Some(text) = result.as_str() {
+                // Keep the legacy string API while carrying the same control
+                // facts as direct projection, including cancelled settlements.
+                result = JsonValue::String(format!("{text}\n{}", JsonValue::Object(controls)));
+            } else if let Some(object) = result.as_object_mut() {
+                object.extend(controls);
+            }
+        }
         if let (Some(validation), Some(object)) = (self.validation.as_ref(), result.as_object_mut())
         {
             object.insert(
@@ -370,6 +384,14 @@ pub(super) async fn run_exec_like(
     let validation_output_owned = args.validation_launch;
     let max_output_tokens = args.max_output_tokens;
     let mut result = run_exec_like_with_exit_code(args).await?;
+    if let Some(observation) =
+        codex_utils_pty::process_observation::ProcessObservationContext::current()
+    {
+        result.output.essential_inline.insert(
+            "environment_receipt".into(),
+            serde_json::json!(observation.snapshot()),
+        );
+    }
     if let Some(signal) = result.output.sampling_request_signal.as_mut() {
         crate::tools::context::attach_command_validation(
             signal,
@@ -412,7 +434,7 @@ pub(crate) fn validation_diagnostic_range(
         return None;
     }
     let text = std::str::from_utf8(canonical_output).ok()?;
-    let lines = text.lines();
+    let lines = text.split_inclusive('\n');
     let line_count = lines.clone().count();
     let start =
         if canonical_output.len() <= MAX_DIAGNOSTIC_BYTES && line_count <= MAX_DIAGNOSTIC_LINES {
@@ -423,18 +445,27 @@ pub(crate) fn validation_diagnostic_range(
             lines
                 .clone()
                 .position(codex_command_analysis::shell_output_summary::is_critical_output_line)
-                .unwrap_or_else(|| line_count.saturating_sub(MAX_DIAGNOSTIC_LINES))
+                .unwrap_or_else(|| {
+                    let mut bytes = 0_usize;
+                    let count = lines
+                        .clone()
+                        .rev()
+                        .take(MAX_DIAGNOSTIC_LINES)
+                        .take_while(|line| {
+                            bytes = bytes.saturating_add(line.len());
+                            bytes <= MAX_DIAGNOSTIC_BYTES
+                        })
+                        .count();
+                    line_count - count
+                })
         };
     let mut bytes = 0_usize;
     let count = lines
         .clone()
         .skip(start)
         .take(MAX_DIAGNOSTIC_LINES)
-        .enumerate()
-        .take_while(|(index, line)| {
-            bytes = bytes
-                .saturating_add(line.len())
-                .saturating_add(usize::from(*index > 0));
+        .take_while(|line| {
+            bytes = bytes.saturating_add(line.len());
             bytes <= MAX_DIAGNOSTIC_BYTES
         })
         .count();
@@ -446,6 +477,59 @@ pub(crate) fn validation_diagnostic_range(
         start_line: start + 1,
         end_line: start + count,
     })
+}
+
+/// Keep the payload bounded even when a single diagnostic cannot fit as a line.
+/// Byte coordinates address the unchanged canonical log, including CRLF/Unicode.
+fn failure_diagnostic_excerpt(id: &str, text: &str) -> (String, Option<ToolOutputProjectionRange>) {
+    const MAX_BYTES: usize = 12 * 1024;
+    let mut offset = 0;
+    let diagnostic_start = text.split_inclusive('\n').find_map(|line| {
+        let start = offset;
+        offset += line.len();
+        codex_command_analysis::shell_output_summary::is_critical_output_line(line).then_some(start)
+    });
+    let range = validation_diagnostic_range(id, text.as_bytes());
+    let (start, end) = if let Some(range) = &range {
+        let start: usize = text
+            .split_inclusive('\n')
+            .take(range.start_line - 1)
+            .map(str::len)
+            .sum();
+        let bytes: usize = text
+            .split_inclusive('\n')
+            .skip(range.start_line - 1)
+            .take(range.end_line - range.start_line + 1)
+            .map(str::len)
+            .sum();
+        (start, start + bytes)
+    } else if let Some(start) = diagnostic_start {
+        (
+            start,
+            text.floor_char_boundary(start.saturating_add(MAX_BYTES).min(text.len())),
+        )
+    } else {
+        (
+            text.ceil_char_boundary(text.len().saturating_sub(MAX_BYTES)),
+            text.len(),
+        )
+    };
+    let start_line = text[..start].bytes().filter(|&byte| byte == b'\n').count() + 1;
+    let excerpt = &text[start..end];
+    let end_line = start_line
+        + excerpt.bytes().filter(|&byte| byte == b'\n').count()
+        - usize::from(excerpt.ends_with('\n'));
+    let selection = if diagnostic_start.is_some() {
+        "diagnostic_match"
+    } else {
+        "bounded_tail_fallback (no diagnostic match)"
+    };
+    (
+        format!(
+            "Failure excerpt: canonical log bytes {start}..{end} (zero-based, end-exclusive); lines {start_line}..{end_line} (one-based, inclusive; boundary lines may be partial); selection={selection}\n{excerpt}"
+        ),
+        range,
+    )
 }
 
 pub(super) async fn run_exec_like_with_exit_code(
@@ -462,9 +546,17 @@ pub(super) async fn run_exec_like_with_exit_code(
             return false;
         };
         if shell_wrapper_is_owned {
-            is_known_safe_command_in_state(&safety_command, inspection_cwd.as_path(), &inspection_env)
+            is_known_safe_command_in_state(
+                &safety_command,
+                inspection_cwd.as_path(),
+                &inspection_env,
+            )
         } else {
-            is_known_safe_direct_argv_in_state(&safety_command, inspection_cwd.as_path(), &inspection_env)
+            is_known_safe_direct_argv_in_state(
+                &safety_command,
+                inspection_cwd.as_path(),
+                &inspection_env,
+            )
         }
     })
     .await
@@ -531,13 +623,13 @@ fn restore_retained_validation_attempt(
     }
 }
 
-
 async fn run_exec_like_with_exit_code_inner(
     args: RunExecLikeArgs,
     is_validation: bool,
 ) -> Result<RunExecLikeResult, FunctionCallError> {
     let RunExecLikeArgs {
         max_output_tokens,
+        quiet_on_success,
         validation: _,
         tool_name,
         exec_params,
@@ -909,6 +1001,32 @@ async fn run_exec_like_with_exit_code_inner(
         .as_ref()
         .and_then(|capture| capture.canonical.as_ref())
         .map(|canonical| canonical.bytes.clone());
+    // Metadata priorities alone do not affect an already-small model summary.
+    // Render the same bounded, coordinate-labelled excerpt on that path too.
+    let failure_content = execution_output
+        .filter(|output| !search_no_match && (output.exit_code != 0 || output.timed_out))
+        .zip(canonical_output.as_deref())
+        .and_then(|(output, bytes)| {
+            let text = std::str::from_utf8(bytes)
+                .ok()
+                .filter(|text| !text.is_empty())?;
+            let (excerpt, _) = failure_diagnostic_excerpt("validation:diagnostics", text);
+            let duration = (output.duration.as_secs_f32() * 10.0).round() / 10.0;
+            let timeout = if output.timed_out {
+                format!(
+                    "\ncommand timed out after {} milliseconds",
+                    output.duration.as_millis()
+                )
+            } else {
+                String::new()
+            };
+            Some(format!(
+                "Exit code: {}\nWall time: {duration} seconds{timeout}\nOutput:\n{excerpt}",
+                output.exit_code
+            ))
+        });
+    let quiet_success_candidate = quiet_on_success && canonical_complete
+        && out.as_ref().is_ok_and(|output| output.exit_code == 0 && !output.timed_out);
     let raw_output_artifact = match raw_capture.map(|capture| capture.artifact) {
         Some(artifact) if !artifact.is_pending() => Some(artifact),
         // Small complete captures stay inline. A reduced display still needs a
@@ -916,7 +1034,7 @@ async fn run_exec_like_with_exit_code_inner(
         _ if canonical_complete
             && model_projection
                 .as_ref()
-                .is_some_and(|projection| projection.reduced) =>
+                .is_some_and(|projection| projection.reduced || quiet_success_candidate) =>
         {
             match canonical_output.as_deref() {
                 Some(bytes) => Some(
@@ -939,6 +1057,10 @@ async fn run_exec_like_with_exit_code_inner(
         .and_then(|((artifact, source), projection)| {
             artifact.reduction_notice(&source.aggregated_output.text, &projection.text)
         });
+    let quiet_success = quiet_success_candidate
+        && raw_output_artifact.as_ref().is_some_and(
+            crate::tools::command_output_artifact::RawOutputArtifact::capture_finalized_complete,
+        );
     let output_bearing_result = shell_result_has_execution_output(&out);
     let tool_outcome = if search_no_match {
         codex_tools::ToolOutputOutcome::Success
@@ -956,7 +1078,26 @@ async fn run_exec_like_with_exit_code_inner(
         .command_execution
         .observe_repository_revision(&turn.sub_id, observed_mutation_revision)
         .await;
-    let mut content = recover_output_bearing_shell_content(finish_result, output_bearing_result)?;
+    let mut content = recover_output_bearing_shell_content(finish_result, output_bearing_result)
+        .map_err(|error| {
+            let reference =
+                crate::tools::command_output_artifact::RawOutputArtifact::output_reference(
+                    raw_output_artifact.as_ref(),
+                );
+            // Fatal persistence errors must remain fatal, with their evidence.
+            if let FunctionCallError::Fatal(message) = error {
+                return FunctionCallError::Fatal(format!("{message}\nOutput reference: {reference}"));
+            }
+            let mut failure = error.failure();
+            failure.details.get_or_insert_with(|| json!({}))["output_reference"] = reference;
+            FunctionCallError::structured(failure)
+        })?;
+    if let Some(failure_content) = failure_content {
+        content = failure_content;
+    }
+    if quiet_success {
+        content = crate::tools::context::QUIET_SUCCESS_SUMMARY.to_string();
+    }
     if let Some(advisory) = advisory {
         content.push_str("\n\n");
         content.push_str(advisory);
@@ -966,6 +1107,34 @@ async fn run_exec_like_with_exit_code_inner(
         content.push_str(&repair_notice);
     }
     let mut essential_inline = serde_json::Map::new();
+    essential_inline.insert(
+        "output_reference".into(),
+        crate::tools::command_output_artifact::RawOutputArtifact::output_reference(
+            raw_output_artifact.as_ref(),
+        ),
+    );
+    if quiet_success {
+        essential_inline.insert("quiet_success".into(), true.into());
+        essential_inline.insert("success".into(), true.into());
+        essential_inline.insert("exit_code".into(), 0.into());
+        essential_inline.insert("process_exited".into(), true.into());
+        essential_inline.insert("execution_state".into(), "exited".into());
+        essential_inline.insert("retained_artifact_complete".into(), true.into());
+        if let Some(artifact) = &raw_output_artifact
+            && let (Some(id), Some(bytes), _) = artifact.model_projection()
+            && bytes > 0
+        {
+            essential_inline.insert(
+                "recovery".into(),
+                json!({
+                    "tool":"read_tool_output", "arguments":{
+                        "artifact_id":id.to_string(),
+                        "selectors":[{"kind":"bytes","start":0,"end":bytes}]
+                    }
+                }),
+            );
+        }
+    }
     if let Some(raw_output_artifact) = raw_output_artifact {
         if let Some(id) = raw_output_artifact.model_projection().0 {
             essential_inline.insert("raw_output_artifact_id".to_string(), json!(id.to_string()));
@@ -1089,4 +1258,3 @@ fn insert_metadata_before_output(content: &mut String, metadata: &str) {
         content.push_str(metadata);
     }
 }
-

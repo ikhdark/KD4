@@ -289,6 +289,7 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
     // unbounded stream of base64 frames. Shared byte permits follow each input
     // buffer through the runner's native-write acknowledgements.
     let (writer_tx, writer_rx) = codex_utils_pty::stdin_channel(1);
+    let (stdin_close_tx, stdin_close_receipt) = tokio::sync::watch::channel(None);
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(256);
     let stderr_rx = if tty {
         None
@@ -298,23 +299,22 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
     let (exit_tx, exit_rx) = oneshot::channel::<i32>();
 
     let outbound_tx = start_runner_pipe_writer(pipe_write);
-    let writer_handle = start_runner_stdin_writer(writer_rx, outbound_tx.clone(), tty, stdin_open);
+    let writer_handle = start_runner_stdin_writer(writer_rx, outbound_tx.clone(), tty, stdin_open, stdin_close_tx);
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::sync_channel(1);
     let terminator = {
         let outbound_tx = outbound_tx.clone();
+        let mut shutdown = super::runner_shutdown::RunnerShutdown::new(shutdown_rx);
         Some(Box::new(move || {
-            outbound_tx
+            shutdown.confirm(|| {
+                outbound_tx
                 .send(FramedMessage {
                     version: IPC_PROTOCOL_VERSION,
                     message: Message::Terminate {
                         payload: EmptyPayload::default(),
                     },
-                })
-                .map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "runner control pipe closed",
-                    )
-                })
+                }).map_err(|error| std::io::Error::new(std::io::ErrorKind::BrokenPipe,
+                    format!("runner cancellation request failed: {error}")))
+            })
         })
             as Box<dyn FnMut() -> std::io::Result<()> + Send + Sync>)
     };
@@ -325,6 +325,7 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
         stderr_rx.as_ref().map(|(tx, _rx)| tx.clone()),
         exit_tx,
         Some(outbound_tx.clone()),
+        shutdown_tx,
     );
 
     Ok(finish_driver_spawn(
@@ -335,6 +336,7 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
             exit_rx,
             terminator,
             writer_handle: Some(writer_handle),
+            stdin_close_receipt: Some(stdin_close_receipt),
             resizer: if tty {
                 Some(make_runner_resizer(outbound_tx))
             } else {

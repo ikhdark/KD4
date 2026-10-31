@@ -160,7 +160,10 @@ async fn append_output_chunk(
         pending.invalidate_output_ranges();
         completion.invalidate_output_ranges();
     }
-    pending.push_chunk(&decoded);
+    pending.push_stream_chunk(match output_stream {
+        ExecOutputStream::Stdout => 0,
+        ExecOutputStream::Stderr => 1,
+    }, &decoded);
     completion.push_chunk(&decoded);
     stream.push_chunk(chunk);
     let observed_ranges = tracing::enabled!(target: "codex_unicode_output", tracing::Level::DEBUG)
@@ -198,8 +201,8 @@ async fn flush_aggregate_output(
         }
         // Flush only at complete capture closure (not individual pipe EOF). Both
         // tails begin with a leading byte, so they cannot complete each other.
-        buffer.push_chunk(&decoder.stdout);
-        buffer.push_chunk(&decoder.stderr);
+        buffer.push_stream_chunk(0, &decoder.stdout);
+        buffer.push_stream_chunk(1, &decoder.stderr);
         if let Some(marker) = marker.as_ref() {
             // A gap must not let later continuation bytes complete an old scalar.
             buffer.push_display_notice(marker);
@@ -237,6 +240,19 @@ pub(crate) struct ProcessOutputSnapshot {
     pub(crate) stderr_layout: StreamLayout,
 }
 
+impl ProcessOutputSnapshot {
+    pub(super) fn stream_chunks(&self, ranges: Option<&[std::ops::Range<u64>; 2]>) -> Option<[String; 2]> {
+        if !self.streams_are_exact { return None; }
+        let ranges = ranges?;
+        if ranges.iter().try_fold(0u64, |total, range| total.checked_add(range.end.checked_sub(range.start)?))?
+            > super::UNIFIED_EXEC_OUTPUT_MAX_BYTES as u64 { return None; }
+        let slice = |bytes: &[u8], range: &std::ops::Range<u64>| {
+            Some(std::str::from_utf8(bytes.get(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?)?).ok()?.to_string())
+        };
+        Some([slice(&self.stdout, &ranges[0])?, slice(&self.stderr, &ranges[1])?])
+    }
+}
+
 /// Shared output state exposed to polling and streaming consumers.
 pub(crate) struct OutputHandles {
     pub(crate) output_buffer: OutputBuffer,
@@ -263,9 +279,24 @@ pub(super) struct ProcessTerminationOwner {
 
 type TerminalCompletionReceiver = watch::Receiver<Option<Result<(), String>>>;
 
+/// Dropping a confirmation future is not a successful shutdown receipt.
+struct TerminationAttempt<'a>(&'a UnifiedExecProcess);
+
+impl Drop for TerminationAttempt<'_> {
+    fn drop(&mut self) {
+        self.0.state_tx.send_modify(|state| {
+            if state.shutdown == Some(crate::tools::context::ExecShutdownStatus::CancellationRequested) {
+                state.shutdown = Some(crate::tools::context::ExecShutdownStatus::ShutdownUncertain);
+                state.shutdown_error = Some("shutdown confirmation was interrupted; process owner and recovery handles remain retained".into());
+            }
+        });
+    }
+}
+
 /// Unified wrapper over directly spawned PTY sessions and exec-server-backed
 /// processes.
 pub(crate) struct UnifiedExecProcess {
+    launch_observation: Option<codex_utils_pty::process_observation::ProcessObservationContext>,
     pub(crate) environment: std::sync::OnceLock<crate::session::turn_context::TurnEnvironment>,
     // Host-observed launch acknowledgement, before output readers or startup
     // reporting can wait. This is not an exact remote OS start timestamp.
@@ -393,6 +424,9 @@ impl UnifiedExecProcess {
     pub(super) fn validation(&self) -> Option<crate::validation::CommandValidation> {
         self.validation.get().cloned()
     }
+    pub(super) fn environment_receipt(&self) -> Option<codex_utils_pty::process_observation::ProcessStartSnapshot> {
+        self.launch_observation.as_ref().map(|context| context.snapshot())
+    }
 
     fn new(
         process_handle: ProcessHandle,
@@ -401,7 +435,7 @@ impl UnifiedExecProcess {
         raw_output_artifact: Option<RawOutputArtifact>,
     ) -> Self {
         let launch_observed_at = std::time::Instant::now();
-        let output_buffer = Arc::new(Mutex::new(HeadTailBuffer::default()));
+        let output_buffer = Arc::new(Mutex::new(HeadTailBuffer::streamed()));
         let completion_output_buffer = Arc::new(Mutex::new(HeadTailBuffer::default()));
         let stdout_buffer = Arc::new(Mutex::new(HeadTailBuffer::default()));
         let stderr_buffer = Arc::new(Mutex::new(HeadTailBuffer::default()));
@@ -428,7 +462,12 @@ impl UnifiedExecProcess {
                     let output_ready = closed_notify.notified();
                     tokio::pin!(output_ready);
                     output_ready.as_mut().enable();
-                    let exited = state.borrow().has_exited;
+                    let exited = {
+                        let state = state.borrow();
+                        state.has_exited && !matches!(state.shutdown,
+                            Some(crate::tools::context::ExecShutdownStatus::CancellationRequested
+                                | crate::tools::context::ExecShutdownStatus::ShutdownUncertain))
+                    };
                     let drained = closed.load(Ordering::Acquire);
                     if exited && drained {
                         let released = lifecycle.lock()
@@ -453,6 +492,7 @@ impl UnifiedExecProcess {
 
         Self {
             launch_observed_at,
+            launch_observation: codex_utils_pty::process_observation::ProcessObservationContext::current(),
             environment: std::sync::OnceLock::new(),
             validation: std::sync::OnceLock::new(),
             incarnation: uuid::Uuid::new_v4(),
@@ -532,6 +572,27 @@ impl UnifiedExecProcess {
             let released = self._spawn_lifecycle.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner).take();
             drop(released);
+        }
+    }
+
+    pub(super) fn set_stdin_enabled(&self, enabled: bool) {
+        self.stdin_closed.store(!enabled, Ordering::Release);
+    }
+
+    pub(super) async fn close_stdin(&self) -> Result<(), UnifiedExecError> {
+        // Commit before awaiting: cancellation must not reopen input or permit
+        // later writes while an already-requested close continues at its owner.
+        self.stdin_closed.store(true, Ordering::Release);
+        match &self.process_handle {
+            ProcessHandle::Local(handle) => handle.close_stdin_ordered().await
+                .map_err(|error| UnifiedExecError::CloseStdin { message: error.to_string() }),
+            ProcessHandle::ExecServer(handle) => match handle.close_stdin().await {
+                Ok(response) if matches!(response.status, WriteStatus::Accepted | WriteStatus::StdinClosed) => Ok(()),
+                Ok(response) => Err(UnifiedExecError::CloseStdin {
+                    message: format!("executor returned {:?}; EOF is unconfirmed", response.status),
+                }),
+                Err(error) => Err(UnifiedExecError::CloseStdin { message: error.to_string() }),
+            },
         }
     }
 
@@ -642,6 +703,15 @@ impl UnifiedExecProcess {
         (!artifact.is_pending()).then(|| artifact.clone())
     }
 
+    pub(super) fn output_reference(&self) -> serde_json::Value {
+        let artifact = self.raw_output_artifact.as_ref().and_then(|artifact| artifact.try_lock().ok());
+        let mut reference = RawOutputArtifact::output_reference(artifact.as_deref());
+        if artifact.is_none() {
+            reference["retrieval_availability"] = "unknown".into();
+        }
+        reference
+    }
+
 
     pub(super) async fn snapshot_completion_output(&self) -> ProcessOutputSnapshot {
         // Only closure observed before the reads proves no byte is still due.
@@ -674,6 +744,16 @@ impl UnifiedExecProcess {
         Arc::new(snapshot)
     }
 
+    pub(super) async fn stream_chunks(&self, ranges: Option<&[std::ops::Range<u64>; 2]>, tty: bool) -> Option<[String; 2]> {
+        if tty { return None; }
+        let ranges = ranges?;
+        if ranges.iter().try_fold(0u64, |total, range| total.checked_add(range.end.checked_sub(range.start)?))?
+            > super::UNIFIED_EXEC_OUTPUT_MAX_BYTES as u64 { return None; }
+        let stdout = self.stdout_buffer.lock().await.stream_text(&ranges[0])?;
+        let stderr = self.stderr_buffer.lock().await.stream_text(&ranges[1])?;
+        Some([stdout, stderr])
+    }
+
     pub(super) fn incarnation(&self) -> uuid::Uuid {
         self.incarnation
     }
@@ -685,7 +765,7 @@ impl UnifiedExecProcess {
         tty: bool,
     ) -> Option<(Arc<ProcessOutputSnapshot>, Option<RawOutputArtifact>)> {
         let state = self.state_rx.borrow().clone();
-        if !state.has_exited || !self.output_is_closed() {
+        if !state.has_exited || self.shutdown_is_pending() || !self.output_is_closed() {
             return None;
         }
         let terminal = self.terminal_completion.try_lock().ok()?;
@@ -778,12 +858,15 @@ impl UnifiedExecProcess {
             ProcessHandle::Local(process_handle) => {
                 if let Err(error) = process_handle.terminate() {
                     tracing::warn!(%error, "failed to terminate local unified-exec process");
+                } else {
+                    self.finish_termination();
                 }
             }
             ProcessHandle::ExecServer(process_handle) => {
                 let process_handle = Arc::clone(process_handle);
                 let termination = async move {
                     if let Err(error) = process_handle.terminate().await {
+                        process_handle.record_unresolved_termination(&error.to_string());
                         tracing::warn!(%error, "failed to terminate remote unified-exec process");
                     }
                 };
@@ -797,38 +880,40 @@ impl UnifiedExecProcess {
                 }
             }
         }
-        self.finish_termination();
     }
 
     pub(super) async fn terminate_confirmed(&self) -> Result<(), UnifiedExecError> {
-        tokio::time::timeout(
-            CONFIRMED_TERMINATION_TIMEOUT,
-            self.terminate_confirmed_inner(),
-        )
-        .await
-        .map_err(|_| {
-            UnifiedExecError::process_failed(format!(
-                "timed out confirming process termination after {CONFIRMED_TERMINATION_TIMEOUT:?}"
-            ))
-        })?
+        self.request_cancellation();
+        tokio::time::timeout(CONFIRMED_TERMINATION_TIMEOUT, async {
+            let _termination_permit = self.termination_lock.acquire().await.map_err(|_| {
+                UnifiedExecError::process_failed("termination gate is closed".to_string())
+            })?;
+            if self.shutdown_status() == Some(crate::tools::context::ExecShutdownStatus::ShutdownConfirmed) {
+                return Ok(());
+            }
+            self.termination_requested.store(true, Ordering::Release);
+            self.state_tx.send_modify(|state| {
+                state.shutdown = Some(crate::tools::context::ExecShutdownStatus::CancellationRequested);
+                state.shutdown_error = None;
+            });
+            let _attempt = TerminationAttempt(self);
+            let result = self.terminate_confirmed_inner().await;
+            self.state_tx.send_modify(|state| {
+                state.shutdown = Some(if result.is_ok() {
+                    crate::tools::context::ExecShutdownStatus::ShutdownConfirmed
+                } else {
+                    crate::tools::context::ExecShutdownStatus::ShutdownUncertain
+                });
+                state.shutdown_error = result.as_ref().err().map(ToString::to_string);
+            });
+            result
+        }).await.map_err(|_| UnifiedExecError::process_failed(format!(
+            "shutdown uncertain: timed out confirming process-tree termination after {CONFIRMED_TERMINATION_TIMEOUT:?}; owner and recovery handles retained"
+        )))?
     }
 
     async fn terminate_confirmed_inner(&self) -> Result<(), UnifiedExecError> {
-        self.termination_requested.store(true, Ordering::Release);
-        let _termination_permit = self.termination_lock.acquire().await.map_err(|_| {
-            UnifiedExecError::process_failed("termination gate is closed".to_string())
-        })?;
-        if self.has_exited() {
-            // Root exit is independent of reader custody. Explicit cancellation
-            // still releases inherited pipes without signalling the dead root.
-            match &self.process_handle {
-                ProcessHandle::Local(handle) => handle.finish(),
-                ProcessHandle::ExecServer(handle) => handle.terminate().await
-                    .map_err(|error| UnifiedExecError::process_failed(error.to_string()))?,
-            }
-            self.finish_termination();
-            return Ok(());
-        }
+        // Even an exited root can leave live descendants in the retained job.
         match &self.process_handle {
             ProcessHandle::Local(process_handle) => {
                 let process_handle = Arc::clone(process_handle);
@@ -902,10 +987,12 @@ impl UnifiedExecProcess {
         };
         crate::tools::context::ExecSessionCapabilities {
             incarnation: self.incarnation,
-            stdin: running && tty && !self.stdin_closed.load(Ordering::Acquire),
-            interrupt: running && interrupt,
-            cancellation: running || !self.output_closed.load(Ordering::Acquire),
+            stdin: running && !self.shutdown_is_pending() && !self.stdin_closed.load(Ordering::Acquire),
+            close_stdin: !tty,
+            interrupt: running && !self.shutdown_is_pending() && interrupt,
+            cancellation: running || self.shutdown_is_pending() || !self.output_closed.load(Ordering::Acquire),
             polling: true,
+            shutdown: self.shutdown_status(),
             observation: (silent_for_ms != 0).then_some(
                 crate::tools::context::ExecSilenceObservation {
                     silent_for_ms,
@@ -919,6 +1006,32 @@ impl UnifiedExecProcess {
 
     pub(super) fn termination_was_requested(&self) -> bool {
         self.termination_requested.load(Ordering::Acquire)
+    }
+
+    /// Called while the manager still holds its store gate, before handing
+    /// confirmation to an async worker. Retirement cannot race that handoff.
+    pub(super) fn request_cancellation(&self) {
+        self.termination_requested.store(true, Ordering::Release);
+        self.state_tx.send_if_modified(|state| {
+            if state.shutdown.is_some() { return false; }
+            state.shutdown = Some(crate::tools::context::ExecShutdownStatus::CancellationRequested);
+            true
+        });
+    }
+
+    pub(super) fn shutdown_status(&self) -> Option<crate::tools::context::ExecShutdownStatus> {
+        self.state_rx.borrow().shutdown
+    }
+
+    pub(super) fn shutdown_error(&self) -> Option<String> {
+        self.state_rx.borrow().shutdown_error.clone()
+    }
+
+    pub(super) fn shutdown_is_pending(&self) -> bool {
+        matches!(self.shutdown_status(), Some(
+            crate::tools::context::ExecShutdownStatus::CancellationRequested
+                | crate::tools::context::ExecShutdownStatus::ShutdownUncertain
+        ))
     }
 
     pub(super) async fn fail_and_terminate(&self, message: String) -> Result<(), UnifiedExecError> {

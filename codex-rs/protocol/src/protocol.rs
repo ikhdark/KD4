@@ -500,11 +500,23 @@ impl From<Vec<UserInput>> for Op {
     }
 }
 
+/// Explicitly replaceable state, never a result, error, blocker or control message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct AgentProgressSnapshot {
+    pub task_id: String,
+    pub attempt_id: String,
+    pub revision: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema, TS)]
 pub struct InterAgentCommunication {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub id: Option<ResponseItemId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub progress: Option<AgentProgressSnapshot>,
     pub author: AgentPath,
     pub recipient: AgentPath,
     #[serde(default)]
@@ -529,6 +541,7 @@ impl InterAgentCommunication {
     ) -> Self {
         Self {
             id: None,
+            progress: None,
             author,
             recipient,
             other_recipients,
@@ -548,6 +561,7 @@ impl InterAgentCommunication {
     ) -> Self {
         Self {
             id: None,
+            progress: None,
             author,
             recipient,
             other_recipients,
@@ -3458,7 +3472,9 @@ pub struct TurnTimingCounters {
     #[serde(default)]
     pub physical_attempt_detail_eviction_count: u32,
     pub model_request_count: u32,
+    /// Schema 37+: unique physical retry/fallback transport entries, not plans.
     pub model_retry_count: u32,
+    /// Schema 37+: unique fallback entries. A subset of model_retry_count.
     pub model_fallback_count: u32,
     pub tool_call_count: u32,
     pub approval_wait_count: u32,
@@ -5149,6 +5165,8 @@ pub enum RolloutItem {
     /// Local delivery metadata that is not part of the Responses API item.
     InterAgentCommunicationMetadata {
         trigger_turn: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        progress: Option<(AgentPath, AgentPath, AgentProgressSnapshot)>,
     },
     Compacted(CompactedItem),
     TurnContext(TurnContextItem),
@@ -5329,11 +5347,72 @@ impl WorldStateItem {
     }
 }
 
+/// Half-open positions in the active source history, not the original rollout.
+/// Null turn IDs explicitly preserve unknown ownership in older histories.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema, TS)]
+pub struct CompactionTurnRange {
+    pub start_index: usize,
+    pub end_index_exclusive: usize,
+    pub turn_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionMode {
+    Full,
+    Incremental,
+    Rebase,
+    Reuse,
+    Custom,
+    Remote,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema, TS)]
+pub struct CompactionOperation {
+    pub mode: CompactionMode,
+    /// The actual dispatch trigger, reason, implementation, phase and strategy.
+    pub request: Value,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema, TS)]
+pub struct CompactionSummarySource {
+    pub source_index: usize,
+    pub item_id: Option<String>,
+    pub sha256: String,
+    /// None for summaries predating provenance; never invent an ancestor.
+    pub operation_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema, TS)]
+pub struct CompactionProvenance {
+    pub version: u8,
+    pub operation_id: String,
+    pub operation: CompactionOperation,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub source_window_id: Option<String>,
+    /// The whole active vector was replaced, even when exact copies survive.
+    pub start_index: usize,
+    pub end_index_exclusive: usize,
+    pub first_item_id: Option<String>,
+    pub last_item_id: Option<String>,
+    /// SHA-256 of serde_json's serialization of the source ResponseItem array.
+    pub source_sha256: String,
+    pub source_turns: Vec<CompactionTurnRange>,
+    pub prior_summaries: Vec<CompactionSummarySource>,
+    pub lineage_complete: bool,
+    /// Observed source gaps; false is not certification of a complete rollout.
+    pub incomplete_history: bool,
+    pub summary_item_ids: Vec<String>,
+}
+
 #[derive(Serialize, Clone, Debug, PartialEq, JsonSchema, TS)]
 pub struct CompactedItem {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replacement_history: Option<Vec<ResponseItem>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<CompactionProvenance>,
     /// Monotonic position of this context window within the thread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_number: Option<u64>,

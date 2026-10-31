@@ -44,6 +44,8 @@ pub(crate) struct PreparedArtifactPins {
     pub(crate) payload: serde_json::Value,
     // Unadorned candidate values, scoped to this immutable preparation only.
     pub(crate) rendered_candidates: BTreeMap<String, serde_json::Value>,
+    // Explicit handles without a matching ledger pin still need access checks.
+    pub(crate) additional_references: Vec<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -468,7 +470,17 @@ impl ToolHistoryCandidate {
             return None;
         }
         let value = serde_json::from_str::<serde_json::Value>(&self.bounded_model_output).ok()?;
-        let mut fields = serde_json::Map::new();
+        let mut fields = if matches!(
+            self.tool_identity.rsplit('.').next(),
+            Some("read_file" | "read_tool_output")
+        ) {
+            compact_read_evidence(&value)
+                .as_object()
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            serde_json::Map::new()
+        };
         // Exact producer-owned relationships, independent of excerpt position.
         // If these cannot fit a receipt, leave the richer representation intact.
         for key in [
@@ -802,6 +814,10 @@ struct RecoveredArtifactCoverage {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct ToolHistoryState {
+    /// Attempt references share the existing checkpoint/journal and retain
+    /// their originating thread/call across compaction and fork reminting.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    operation_attempts: BTreeMap<String, Vec<crate::tools::operation_history::OperationAttempt>>,
     #[serde(default)]
     candidates: BTreeMap<String, ToolHistoryCandidate>,
     /// Observation order replayed by existing registration mutations. Opaque
@@ -932,6 +948,9 @@ impl WorkspaceEvidenceObservation {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ToolHistoryMutation {
+    RecordOperationAttempt {
+        attempt: Box<crate::tools::operation_history::OperationAttempt>,
+    },
     RegisterArtifactDirectory {
         artifact_id: String,
         members: BTreeSet<String>,
@@ -990,6 +1009,15 @@ pub(crate) enum ToolHistoryMutation {
 impl ToolHistoryMutation {
     pub(crate) fn apply(&self, state: &mut ToolHistoryState) -> bool {
         match self {
+            Self::RecordOperationAttempt { attempt } => {
+                let attempts = state.operation_attempts.entry(attempt.operation.clone()).or_default();
+                if attempts.iter().any(|previous| previous.thread_id == attempt.thread_id
+                    && previous.call_id == attempt.call_id) {
+                    return false;
+                }
+                attempts.push((**attempt).clone());
+                true
+            }
             Self::BindSourceInspectionOrigin {
                 artifact_id,
                 call_id,
@@ -1268,7 +1296,11 @@ fn collect_obtained_read_ranges(
                     .as_str()
                     .is_some_and(|text| text.len() as u64 == end - start)
                     || (part["data_base64"].is_string()
-                        && part["exact_bytes"].as_u64() == Some(end - start)))
+                        && part["exact_bytes"].as_u64() == Some(end - start))
+                    || part["data_hex"].as_str().is_some_and(|hex| {
+                        (end - start).checked_mul(2) == Some(hex.len() as u64)
+                            && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    }))
             {
                 ranges.push((start, end));
             }
@@ -1276,8 +1308,9 @@ fn collect_obtained_read_ranges(
     }
 }
 
-/// Preserve source identity and obtained coverage, not the potentially large
-/// payload, in the existing nested-evidence entry.
+/// Bind acquisition to its source revision and resolved selections without
+/// retaining payloads. Delivery, retention and whole-file coverage stay distinct;
+/// none of these fields certifies semantic examination.
 pub(crate) fn compact_read_evidence(value: &serde_json::Value) -> serde_json::Value {
     let mut pin = serde_json::Map::new();
     for key in [
@@ -1291,9 +1324,24 @@ pub(crate) fn compact_read_evidence(value: &serde_json::Value) -> serde_json::Va
         "selector_encoding",
         "selector_coordinate_space",
         "canonical_bytes",
+        "git_source",
+        "read_mode",
+        "file_revision",
+        "file_bytes",
         "artifact_id",
+        "retained_bytes",
         "retained_artifact_complete",
+        "complete",
+        "delivered_selection_complete",
+        "selection_status",
         "file_complete",
+        "selector_bindings",
+        "selector_errors",
+        "selector_bindings_omitted",
+        "selector_errors_omitted",
+        "continuation",
+        "continuation_stop",
+        "range_recovery",
     ] {
         if let Some(value) = value.get(key) {
             pin.insert(key.into(), value.clone());
@@ -1302,7 +1350,10 @@ pub(crate) fn compact_read_evidence(value: &serde_json::Value) -> serde_json::Va
     let mut ranges = Vec::new();
     collect_obtained_read_ranges(
         value,
-        value["canonical_bytes"].as_u64().unwrap_or(0),
+        value["canonical_bytes"]
+            .as_u64()
+            .or_else(|| value["file_bytes"].as_u64())
+            .unwrap_or(0),
         &mut ranges,
     );
     ranges.sort_unstable();
@@ -1316,10 +1367,35 @@ pub(crate) fn compact_read_evidence(value: &serde_json::Value) -> serde_json::Va
     }
     pin.insert(
         "coverage_history_complete".into(),
-        serde_json::json!(merged.len() <= 64),
+        serde_json::json!(value["coverage_history_complete"] != false && merged.len() <= 64),
     );
     merged.truncate(64);
     pin.insert("delivered_ranges".into(), serde_json::json!(merged));
+    if let Some(results) = value["results"].as_array() {
+        pin.insert(
+            "results".into(),
+            results
+                .iter()
+                .map(|result| {
+                    let mut selected = serde_json::Map::new();
+                    for key in [
+                        "selector",
+                        "status",
+                        "complete",
+                        "canonical_range",
+                        "continuation",
+                        "child_selectors",
+                    ] {
+                        if let Some(detail) = result.get(key) {
+                            selected.insert(key.into(), detail.clone());
+                        }
+                    }
+                    serde_json::Value::Object(selected)
+                })
+                .collect::<Vec<_>>()
+                .into(),
+        );
+    }
     pin.insert("historical_source".into(), true.into());
     if value["artifact_id"].is_string() {
         pin.insert("recovery_tool".into(), "read_tool_output".into());
@@ -1412,6 +1488,16 @@ pub(crate) struct ReadStatusQuery {
 }
 
 impl ToolHistoryState {
+    pub(crate) fn operation_attempt_advisory(
+        &self,
+        attempt: &crate::tools::operation_history::OperationAttempt,
+    ) -> serde_json::Value {
+        let previous = self.operation_attempts.get(&attempt.operation).into_iter().flatten()
+            .filter(|previous| attempt.same_input(previous))
+            .collect::<Vec<_>>();
+        attempt.advisory(&previous)
+    }
+
     /// Structural receipt IDs are not authentication of model-supplied claims.
     /// Compare against the already-cached local receipt, including its digest,
     /// success, freshness, evidence and recovery locator. No artifact I/O.
@@ -2661,6 +2747,28 @@ impl ToolHistoryState {
         })
     }
 
+    /// References and exact delivered selectors, not an inference of remaining
+    /// user work or semantic review. Unknown/forgotten coverage stays unknown.
+    pub(crate) fn retention_recovery_obligation(&self, id: &str) -> serde_json::Value {
+        let identity = self.artifact_identity(id);
+        let call = self.artifact_call_ids.get(id).map(String::as_str)
+            .or_else(|| self.internal_artifact_origins.get(id).map(|origin| origin.0.as_str()));
+        let directories = self.artifact_directory_members.iter()
+            .filter(|(_, members)| members.contains(id)).map(|(directory, _)| directory)
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "artifact_id":id,
+            "reference_status":if identity.is_some() {"recorded"} else {"unknown"},
+            "origin_call_id":call,
+            "canonical_bytes":identity.map(|identity| identity.0),
+            "canonical_sha256":identity.map(|identity| identity.1),
+            "referencing_artifact_directories":directories,
+            "delivered_recovery_selectors":self.recovered_artifact_selectors(id),
+            "required_remaining_work":"unknown; consult original task and selectors",
+            "coverage_semantics":"recorded exact delivery only, not semantic review; null is unknown",
+        })
+    }
+
     fn recovered_artifact_selectors(&self, id: &str) -> Option<&[serde_json::Value]> {
         let coverage = self.recovered_artifacts.get(id)?;
         (self.artifact_identity(id) == Some((coverage.bytes, coverage.sha256.as_str())))
@@ -2814,9 +2922,6 @@ impl ToolHistoryState {
     /// prompt. Compaction appends this separately from model-authored prose so retention does not
     /// depend on the model copying a receipt byte-for-byte into its summary.
     pub(crate) fn prepare_artifact_pin_payload_for_items(&self, items: &[ResponseItem]) -> Option<PreparedArtifactPins> {
-        if self.candidates.is_empty() && self.internal_artifact_origins.is_empty() {
-            return None;
-        }
         let mut candidates = self
             .artifact_reference_positions(items)
             .into_iter()
@@ -2831,6 +2936,7 @@ impl ToolHistoryState {
         enum PinReference<'a> {
             Candidate(&'a ToolHistoryCandidate),
             Internal(&'a String, &'a ArtifactOrigin),
+            Additional(&'a serde_json::Value),
         }
         let mut pins = candidates
             .into_iter()
@@ -2849,6 +2955,39 @@ impl ToolHistoryState {
                 .filter(|(id, _)| references.contains(*id) && seen.insert((*id).clone()))
                 .map(|(id, origin)| PinReference::Internal(id, origin)),
         );
+        let mut additional_references: Vec<serde_json::Value> = Vec::new();
+        let mut additional_positions = BTreeMap::<String, usize>::new();
+        for item in items.iter().rev() {
+            let Ok(value) = serde_json::to_value(item) else { continue };
+            visit_artifact_reference_objects(&value, &mut |_, object| {
+                let Some(id) = object.get("artifact_id").and_then(serde_json::Value::as_str) else {
+                    return;
+                };
+                if seen.contains(id) {
+                    return;
+                }
+                let pin = serde_json::json!({
+                    "artifact_id": id,
+                    "reference_status": "no_matching_ledger_pin",
+                    "bytes": object.get("canonical_bytes").or_else(|| object.get("bytes")),
+                    "sha256": object.get("canonical_sha256").or_else(|| object.get("sha256")),
+                });
+                if let Some(index) = additional_positions.get(id) {
+                    // A newer recovery request/check can repeat only the handle.
+                    // Do not let it erase the earlier expected byte identity.
+                    let previous = &mut additional_references[*index];
+                    for key in ["bytes", "sha256"] {
+                        if previous[key].is_null() && !pin[key].is_null() {
+                            previous[key] = pin[key].clone();
+                        }
+                    }
+                } else {
+                    additional_positions.insert(id.to_string(), additional_references.len());
+                    additional_references.push(pin);
+                }
+            });
+        }
+        pins.extend(additional_references.iter().map(PinReference::Additional));
         let total = pins.len();
         if total == 0 {
             return None;
@@ -2856,7 +2995,7 @@ impl ToolHistoryState {
         let mut payload = serde_json::json!({
             "version": 1,
             "kind": "tool_history_artifact_pins",
-            "instruction": "Use read_tool_output with an artifact_id below and selectors (search, lines, bytes, section, or json_pointer) to recover relevant exact prior output. After overflow, use the returned continuation or child_selectors. Older references may be omitted to bound context; saved outputs are unchanged.",
+            "instruction": "Follow each reference_check and its recovery route; unavailable or mismatched references are not usable evidence. Checks are point-in-time and deliver no content. Recovered selectors record historical delivery, not semantic examination. Use read_tool_output with original selectors only when needed; preserve continuations and never replay producers to recover output.",
             "omitted_artifact_count": total,
             "omitted_detail_count": 0,
             "artifacts": [],
@@ -2883,6 +3022,7 @@ impl ToolHistoryState {
                     }
                     pin
                 }
+                PinReference::Additional(pin) => pin.clone(),
             };
             if let Some(ranges) = pin["artifact_id"]
                 .as_str()
@@ -2915,7 +3055,7 @@ impl ToolHistoryState {
         }
         payload["omitted_artifact_count"] =
             serde_json::json!(total - payload["artifacts"].as_array()?.len());
-        Some(PreparedArtifactPins { payload, rendered_candidates })
+        Some(PreparedArtifactPins { payload, rendered_candidates, additional_references })
     }
 
     fn retain_retrievable_artifacts(
@@ -3681,6 +3821,7 @@ pub(crate) async fn remint_tool_history_state_for_fork(
         Some((reminted.clone(), coverage))
     }).collect();
     let mut reminted_state = ToolHistoryState {
+        operation_attempts: state.operation_attempts,
         candidates: reminted_candidates,
         observation_order: state.observation_order,
         untracked_consumption: state.untracked_consumption,
@@ -4545,6 +4686,7 @@ fn workspace_call_observes_from_arguments(
             .is_some_and(|path| {
                 path.starts_with(codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX)
                     || path.starts_with("context:unsettled-tools/")
+                    || path == crate::session::resume_inventory::LOCATOR
                     || path == crate::context::desktop_instructions::LOCATOR
                     || path == crate::session::multi_agents::USAGE_HINT_LOCATOR
                     || path == crate::turn_diff_tracker::TURN_DIFF_LOCATOR
@@ -4608,6 +4750,7 @@ fn source_dependencies_from_arguments(
         };
         if path.starts_with(codex_core_skills::SKILL_CATALOG_LOCATOR_PREFIX)
             || path.starts_with("context:unsettled-tools/")
+            || path == crate::session::resume_inventory::LOCATOR
             || path == crate::context::desktop_instructions::LOCATOR
             || path == crate::session::multi_agents::USAGE_HINT_LOCATOR
             || path == crate::turn_diff_tracker::TURN_DIFF_LOCATOR

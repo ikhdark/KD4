@@ -52,6 +52,66 @@ pub enum ToolSpec {
 }
 
 impl ToolSpec {
+    /// Input contract for one exact callable, before any provider-only projection.
+    pub fn input_schema_for(&self, name: &ToolName) -> Option<Value> {
+        let parameters = match self {
+            Self::Function(tool) if name == &ToolName::plain(tool.name.clone()) => {
+                &tool.parameters
+            }
+            Self::Namespace(namespace)
+                if name.namespace.as_deref() == Some(namespace.name.as_str()) =>
+            {
+                let tool = namespace.tools.iter().find_map(|tool| match tool {
+                    crate::ResponsesApiNamespaceTool::Function(tool) if tool.name == name.name => {
+                        Some(tool)
+                    }
+                    _ => None,
+                })?;
+                &tool.parameters
+            }
+            Self::ToolSearch { parameters, .. } if name == &ToolName::plain("tool_search") => {
+                parameters
+            }
+            _ => return None,
+        };
+        #[expect(
+            clippy::expect_used,
+            reason = "JsonSchema contains only JSON values and string-keyed maps"
+        )]
+        Some(serde_json::to_value(parameters).expect("tool input schemas serialize"))
+    }
+
+    /// Version input for one callable, not the provider's loading/visibility surface.
+    /// Preserve guidance, constraints, defaults, literal arrays and grammar; only
+    /// normalize known serialization noise at schema positions.
+    pub fn effective_callable_contract(
+        &self,
+        name: &ToolName,
+        input_schema: Option<&Value>,
+    ) -> Option<Value> {
+        if !self.callable_tool_names().contains(name) {
+            return None;
+        }
+        let mut contract = self.callable_contract();
+        let callable = if matches!(self, Self::Namespace(_)) {
+            let children = contract.get_mut("tools")?.as_array_mut()?;
+            children.retain(|child| {
+                child.get("name").and_then(Value::as_str) == Some(name.name.as_str())
+            });
+            children.first_mut()?
+        } else {
+            &mut contract
+        };
+        if let Some(fields) = callable.as_object_mut() {
+            fields.remove("defer_loading");
+            if let Some(parameters) = fields.get_mut("parameters") {
+                let schema = input_schema.cloned().unwrap_or_else(|| std::mem::take(parameters));
+                *parameters = crate::json_schema::canonical_schema(schema);
+            }
+        }
+        Some(crate::json_schema::canonical_json(contract))
+    }
+
     /// Complete callable contract, distinct from the Responses wire schema.
     pub fn callable_contract(&self) -> Value {
         #[expect(

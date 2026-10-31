@@ -83,6 +83,7 @@ use codex_otel::ModelAttemptTelemetry;
 use codex_otel::ModelAttemptTransport;
 use codex_otel::ModelContextComponentTelemetry;
 use codex_otel::ModelPromptContextCategoryTelemetry;
+use codex_otel::ModelToolResultTelemetry;
 use codex_otel::ModelToolSchemaTelemetry;
 use codex_otel::SessionTelemetry;
 use codex_otel::current_span_w3c_trace_context;
@@ -208,6 +209,7 @@ struct ModelRequestMeasurements {
     reconciliation_residual_bytes: i64,
     prompt_context_categories: Vec<PromptContextMeasurement>,
     tool_schema_breakdown: Vec<ModelToolSchemaTelemetry>,
+    tool_result_attribution: Vec<ModelToolResultTelemetry>,
     full_prompt_estimated_tokens: u64,
     reusable_prompt_estimated_tokens: Option<u64>,
     fixed_prefix_reuse_eligible: bool,
@@ -783,6 +785,7 @@ impl ModelRequestMeasurements {
             local_projection_policy_active: false,
             input_item_digests,
             fixed_prefix_item_count: context.fixed_prefix_item_count,
+            tool_result_attribution: context.tool_result_attribution,
             request_setting_digests: None,
             changed_request_settings: Vec::new(),
             fixed_prefix_items_changed: None,
@@ -2151,6 +2154,8 @@ impl ModelAttemptGuard {
             &self.measurements.prompt_context_categories,
             self.measurements.prompt_context_baseline_compared,
         );
+        let tool_result_attribution = serde_json::to_string(&self.measurements.tool_result_attribution)
+            .unwrap_or_else(|_| "[]".to_string());
         // The OTEL-only event is deliberately excluded from local SQLite logs.
         // Keep a compact, content-free completion record locally as well, so
         // cache investigations do not depend on offloaded timing snapshots.
@@ -2170,6 +2175,13 @@ impl ModelAttemptGuard {
             input_representation = self.measurements.selected_representation.map(SelectedInputRepresentation::as_str),
             diagnostics_available = !self.measurements.prompt_context_categories.is_empty(),
             prompt_context_categories = %local_prompt_context_categories,
+            prompt_token_accounting_basis = "full_logical_prompt",
+            prompt_estimate_basis = "byte_div_4_image_budget_v1",
+            tool_result_tokenizer_basis = "o200k_base_serialized_item_v1",
+            tool_result_billing_basis = "unavailable",
+            usage_basis = "provider_reported_request_totals",
+            cached_input_basis = "provider_reported_request_subset_not_additive",
+            tool_result_attribution = %tool_result_attribution,
             full_prompt_estimated_tokens = self.measurements.full_prompt_estimated_tokens,
             fixed_prefix_reuse_eligible = self.measurements.fixed_prefix_reuse_eligible,
             fixed_prefix_item_count = self.measurements.fixed_prefix_item_count,
@@ -2311,6 +2323,7 @@ impl ModelAttemptGuard {
                     .measurements
                     .density_bps(operational_relevance_proxy_tokens),
                 tool_schema_breakdown,
+                tool_result_attribution: self.measurements.tool_result_attribution.clone(),
                 full_prompt_estimated_tokens: self.measurements.full_prompt_estimated_tokens,
                 fixed_prefix_reuse_eligible: self.measurements.fixed_prefix_reuse_eligible,
                 logical_context_tokens: self.measurements.logical_context_tokens,
@@ -2929,6 +2942,7 @@ struct WebsocketTransportCache {
     retired: bool,
     session: Option<WebsocketSession>,
     fallback: WebsocketFallbackState,
+    startup_retry_decision: Option<crate::turn_timing::retries::RetryDecisionLedger>,
 }
 
 const WEBSOCKET_FALLBACK_COOLDOWN: Duration = Duration::from_secs(60);
@@ -5097,6 +5111,9 @@ impl ModelClientSession {
         }
         let mut session = self.client.new_speculative_session();
         session.startup_timing = self.startup_timing.clone();
+        // Share only passive telemetry. The speculative task still owns no
+        // generation/dispatch, and cancellation/publication ownership is unchanged.
+        session.turn_timing = self.turn_timing.clone();
         let failure_setup = Arc::new(StdMutex::new(None));
         self.preconnect_failure_setup = Some(Arc::clone(&failure_setup));
         let model_info = model_info.clone();
@@ -5272,11 +5289,38 @@ impl ModelClientSession {
             {
                 Ok(_) => return Ok(()),
                 Err(ApiError::Transport(TransportError::Http {
-                    status: StatusCode::FORBIDDEN | StatusCode::UPGRADE_REQUIRED,
+                    status: status @ (StatusCode::FORBIDDEN | StatusCode::UPGRADE_REQUIRED),
                     ..
                 })) => {
                     // An upgrade can be blocked even when ordinary HTTPS works. No prompt
                     // was sent; let HTTP report any actual authorization failure.
+                    if let Some(timing) = &self.turn_timing {
+                        timing.record_retry_decision(
+                            crate::turn_timing::retries::RetryTrigger::Http,
+                            Some(status.as_u16()),
+                            crate::turn_timing::retries::RetryAction::FallbackHttp,
+                            Some(Duration::ZERO),
+                        );
+                        timing.record_model_fallback();
+                    } else {
+                        // Startup recovery can precede allocation of any turn.
+                        // Keep its single content-free pending choice with the
+                        // transport owner until an actual route is selected.
+                        let mut cache = self.client.state.cached_websocket_transport.lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        cache.startup_retry_decision.get_or_insert_with(Default::default).plan(
+                            codex_protocol::timing::process_monotonic_ns(),
+                            crate::turn_timing::retries::RetryPlan {
+                                generation_index: None,
+                                clock_id: codex_protocol::timing::process_clock_domain_id(),
+                                trigger: crate::turn_timing::retries::RetryTrigger::Http,
+                                http_status: Some(status.as_u16()),
+                                action: crate::turn_timing::retries::RetryAction::FallbackHttp,
+                                source: None,
+                                backoff_ns: Some(0),
+                            },
+                        );
+                    }
                     self.client.force_http_fallback(session_telemetry);
                     return Ok(());
                 }
@@ -5291,6 +5335,7 @@ impl ModelClientSession {
                             request_auth_snapshot.as_ref(),
                             session_telemetry,
                             &provider,
+                            self.turn_timing.as_ref(),
                         )
                         .await?,
                     );
@@ -5740,6 +5785,7 @@ impl ModelClientSession {
                                     request_auth_snapshot.as_ref(),
                                     session_telemetry,
                                     &self.client.state.provider,
+                                    self.turn_timing.as_ref(),
                                 )
                                 .await?,
                             );
@@ -5949,11 +5995,20 @@ impl ModelClientSession {
             match connection_result {
                 Ok(_) => {}
                 Err(ApiError::Transport(TransportError::Http {
-                    status: StatusCode::FORBIDDEN | StatusCode::UPGRADE_REQUIRED,
+                    status: status @ (StatusCode::FORBIDDEN | StatusCode::UPGRADE_REQUIRED),
                     ..
                 })) => {
                     // Only a rejected handshake is replayable here, never a 403 from an
                     // established response stream or the subsequent HTTP request.
+                    if let Some(timing) = &self.turn_timing {
+                        timing.record_retry_decision(
+                            crate::turn_timing::retries::RetryTrigger::Http,
+                            Some(status.as_u16()),
+                            crate::turn_timing::retries::RetryAction::FallbackHttp,
+                            Some(Duration::ZERO),
+                        );
+                        timing.record_model_fallback();
+                    }
                     return Ok(WebsocketStreamOutcome::FallbackToHttp);
                 }
                 Err(ApiError::Transport(unauthorized_transport))
@@ -5967,6 +6022,7 @@ impl ModelClientSession {
                             request_auth_snapshot.as_ref(),
                             session_telemetry,
                             &self.client.state.provider,
+                            self.turn_timing.as_ref(),
                         )
                         .await?,
                     );
@@ -6242,6 +6298,7 @@ impl ModelClientSession {
                                     &identity.sampling_request_id,
                                     &identity.physical_attempt_id,
                                     false,
+                                    crate::turn_timing::retries::RetryRoute::Websocket,
                                 );
                             }
                             if let Some(identity) = &transport_identity {
@@ -6704,7 +6761,15 @@ impl ModelClientSession {
                                 && failed_preconnect_setup == self.failed_websocket_setup;
                         }
                         match websocket_result? {
-                            WebsocketStreamOutcome::Stream(stream) => return Ok(stream),
+                            WebsocketStreamOutcome::Stream(stream) => {
+                                let pending = self.client.state.cached_websocket_transport.lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .startup_retry_decision.take();
+                                if let Some(mut decision) = pending {
+                                    decision.finish(codex_protocol::timing::process_monotonic_ns(), None);
+                                }
+                                return Ok(stream);
+                            }
                             WebsocketStreamOutcome::FallbackToHttp => {
                                 self.try_switch_fallback_transport(session_telemetry);
                             }
@@ -6712,6 +6777,16 @@ impl ModelClientSession {
                     }
 
                     self.last_stream_transport = Some(ModelAttemptTransport::ResponsesHttp);
+                    let pending = self.client.state.cached_websocket_transport.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .startup_retry_decision.take();
+                    if let Some(decision) = pending
+                        && let Some(timing) = &self.turn_timing
+                    {
+                        // Release the transport cache before touching turn timing:
+                        // no inverse cache/timing lock order or new wait is introduced.
+                        timing.adopt_startup_retry_decision(decision);
+                    }
                     Box::pin(self.stream_responses_api(
                         prompt,
                         model_info,
@@ -7399,11 +7474,20 @@ async fn handle_unauthorized(
     rejected_auth: Option<&CodexAuth>,
     session_telemetry: &SessionTelemetry,
     provider: &SharedModelProvider,
+    turn_timing: Option<&Arc<TurnTimingState>>,
 ) -> Result<UnauthorizedRecoveryExecution> {
     let debug = extract_response_debug_context(&transport);
     if let Some(recovery) = auth_recovery
         && recovery.has_next()
     {
+        if let Some(timing) = turn_timing {
+            timing.record_retry_decision(
+                crate::turn_timing::retries::RetryTrigger::Authentication,
+                match &transport { TransportError::Http { status, .. } => Some(status.as_u16()), _ => None },
+                crate::turn_timing::retries::RetryAction::AuthRecovery,
+                None,
+            );
+        }
         let mode = recovery.mode_name();
         let phase = recovery.step_name();
         let result = match request_auth.auth_recovery_revision() {
@@ -7541,6 +7625,7 @@ struct ModelRequestTelemetryContext {
 }
 
 struct ApiTelemetry {
+    retry_backoff: StdMutex<Option<crate::turn_timing::TurnTimingGuard>>,
     websocket_response: Option<(ResponseAttemptIdentity, ModelAttemptClock)>,
     first_response_event: AtomicBool,
     model_request: Option<ModelRequestTelemetryContext>,
@@ -7560,6 +7645,7 @@ impl ApiTelemetry {
         auth_env_telemetry: AuthEnvTelemetry,
     ) -> Self {
         Self {
+            retry_backoff: StdMutex::new(None),
             websocket_response: None,
             first_response_event: AtomicBool::new(false),
             session_telemetry,
@@ -7574,6 +7660,46 @@ impl ApiTelemetry {
 }
 
 impl RequestTelemetry for ApiTelemetry {
+    fn on_retry_budget(&self, budget: codex_client::RetryBudget) {
+        let record = serde_json::json!({
+            "version": 1, "owner": "transport_retry_loop",
+            "logical_request_id": self.logical_request_id,
+            "attempt_limit": {"kind": "finite", "value": budget.max_attempts.to_string()},
+            "attempts_started": budget.attempts_started.to_string(),
+            "attempts_remaining": budget.attempts_remaining.to_string(),
+            "deadline_limit": "unlimited_at_this_owner",
+            "remaining_time": "unlimited_at_this_owner",
+            "outer_deadline": "unknown", "agent_attempts": "unknown",
+        });
+        tracing::info!(event.name = "codex.retry_budget", retry_budget_json = %record,
+            "transport retry owner budget");
+    }
+
+    fn on_retry_scheduled(&self, _attempt: u64, error: &TransportError, delay: Duration) {
+        use crate::turn_timing::retries::RetryAction;
+        use crate::turn_timing::retries::RetryTrigger;
+        if let Some(timing) = self.model_request.as_ref().and_then(|request| request.timing.as_ref()) {
+            let (trigger, status) = match error {
+                TransportError::Http { status, .. } => (RetryTrigger::Http, Some(status.as_u16())),
+                TransportError::Timeout | TransportError::ConnectionTimeout => (RetryTrigger::Timeout, None),
+                TransportError::Connection(_) | TransportError::PreDispatch(_) => (RetryTrigger::Connection, None),
+                TransportError::Network(_) => (RetryTrigger::Stream, None),
+                _ => (RetryTrigger::Other, None),
+            };
+            timing.record_retry_decision(trigger, status, RetryAction::TransportRetry, Some(delay));
+            let guard = timing.begin_retry_backoff();
+            let previous = self.retry_backoff.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner).replace(guard);
+            drop(previous);
+        }
+    }
+
+    fn on_retry_wait_finished(&self, _attempt: u64, _duration: Duration, _completed: bool) {
+        let guard = self.retry_backoff.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        drop(guard);
+    }
+
     fn on_request_dispatched(&self) {
         self.on_request_dispatched_attempt(0);
     }
@@ -7623,6 +7749,7 @@ impl RequestTelemetry for ApiTelemetry {
                     &context.identity.sampling_request_id,
                     &physical_attempt_id,
                     context.retry_index > 0 || transport_attempt > 0,
+                    crate::turn_timing::retries::RetryRoute::Http,
                 );
             }
             tracing::info!(

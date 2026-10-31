@@ -147,6 +147,13 @@ impl RunnerOutbound {
         self.0.0.changed.notify_waiters();
     }
 
+    pub(super) async fn input_close_result(&self) -> anyhow::Result<()> {
+        self.input_closed().await;
+        let state = self.0.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+        anyhow::ensure!(state.input_closed, "runner stopped before confirming stdin close");
+        Ok(())
+    }
+
     pub(super) async fn input_closed(&self) {
         loop {
             let notified = self.0.0.changed.notified();

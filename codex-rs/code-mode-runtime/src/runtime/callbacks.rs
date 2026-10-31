@@ -805,10 +805,11 @@ fn tool_timeout_ms(
                 return codex_code_mode_protocol::tool_owned_timeout_with_grace(timeout_ms);
             }
             if is_write_stdin && input.is_some_and(|input| {
-                input["event_filter"].is_null() && input["wait_for_output"].as_bool().unwrap_or_else(|| {
+                input["status_only"] != true && input["event_filter"].is_null() && input["wait_for_output"].as_bool().unwrap_or_else(|| {
                     input["chars"].as_str().unwrap_or_default().is_empty()
                         && input["yield_time_ms"].is_null()
                         && input["terminate"] != true
+                        && input["close_stdin"] != true
                 })
             }) {
                 return 0;

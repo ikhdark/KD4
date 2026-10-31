@@ -998,6 +998,16 @@ async fn emit_patch_end(
         )
         .await;
 
+    match &tracker_update {
+        TurnDiffTrackerUpdate::Track { delta, .. }
+            if ctx.patch_environment.is_some_and(|environment| !environment.environment.is_remote()) => {
+                codex_apply_patch::record_change_provenance(
+                    Some(&ctx.session.thread_id().to_string()), Some(ctx.call_id), delta,
+                );
+            }
+        TurnDiffTrackerUpdate::Invalidate => codex_apply_patch::invalidate_change_ownership_hints(),
+        _ => {}
+    }
     if let Some(tracker) = ctx.turn_diff_tracker {
         let patch_modes = match &tracker_update {
             TurnDiffTrackerUpdate::Track { delta, .. } => delta.preimage_modes().clone(),
@@ -1019,6 +1029,7 @@ async fn emit_patch_end(
                         environment_id.as_deref().unwrap_or_default(),
                         delta,
                         Some(ctx.call_id),
+                        Some(&ctx.session.thread_id().to_string()),
                     );
                     guard.take_unified_diff_if_changed()
                 }

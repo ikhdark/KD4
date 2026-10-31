@@ -50,6 +50,8 @@ pub(crate) struct SendMessageArgs {
     pub(crate) task_name: Option<String>,
     pub(crate) targets: Option<Vec<String>>,
     pub(crate) message: String,
+    pub(crate) message_id: Option<String>,
+    pub(crate) progress: Option<codex_protocol::protocol::AgentProgressSnapshot>,
 }
 
 impl SendMessageArgs {
@@ -114,6 +116,8 @@ impl SendMessageHandler {
                 MessageDeliveryMode::QueueOnly,
                 target,
                 args.message,
+                args.message_id,
+                args.progress,
             )
             .await
             .map(boxed_tool_output),
@@ -126,16 +130,20 @@ impl SendMessageHandler {
                         let mut recipient_invocation = invocation.clone();
                         recipient_invocation.call_id = format!("{}:{index}", invocation.call_id);
                         let message = message.clone();
+                        let message_id = args.message_id.clone();
+                        let progress = args.progress.clone();
                         async move {
                             match handle_message_string_tool(
                                 recipient_invocation,
                                 MessageDeliveryMode::QueueOnly,
                                 target.clone(),
                                 message,
+                                message_id,
+                                progress,
                             )
                             .await
                             {
-                                Ok(_) => serde_json::json!({"target": target, "status": "queued"}),
+                                Ok(output) => serde_json::json!({"target": target, "status": "queued", "acknowledgment": serde_json::from_str::<serde_json::Value>(&output.into_text()).ok()}),
                                 Err(error) => serde_json::json!({
                                     "target": target, "status": "failed", "error": error.to_string()
                                 }),
@@ -197,6 +205,8 @@ impl FollowupTaskHandler {
             MessageDeliveryMode::TriggerTurn,
             args.target,
             args.message,
+            None,
+            None,
         )
         .await
         .map(boxed_tool_output)
@@ -255,8 +265,13 @@ pub(crate) async fn handle_message_string_tool(
     mode: MessageDeliveryMode,
     target: String,
     message: String,
+    message_id: Option<String>,
+    progress: Option<codex_protocol::protocol::AgentProgressSnapshot>,
 ) -> Result<FunctionToolOutput, FunctionCallError> {
     let message = message_content(message)?;
+    if message_id.as_ref().is_some_and(|id| id.trim().is_empty() || id.len() > 256) {
+        return Err(FunctionCallError::RespondToModel("message_id must be nonempty and at most 256 bytes".into()));
+    }
     let ToolInvocation {
         session,
         step_context,
@@ -345,7 +360,17 @@ pub(crate) async fn handle_message_string_tool(
     };
     let context = AgentCommunicationContext::new(kind, session.thread_id)
         .with_sender_turn(turn.sub_id.clone());
-    let communication = mode.apply(communication);
+    let mut communication = mode.apply(communication);
+    use sha2::Digest;
+    let retry_identity = message_id.as_deref()
+        .map(|id| ("retry", "", id))
+        .unwrap_or(("invocation", turn.sub_id.as_str(), call_id.as_str()));
+    let identity = serde_json::to_vec(&(session.thread_id, receiver_thread_id,
+        retry_identity)).map_err(|error|
+        FunctionCallError::RespondToModel(format!("message identity serialization failed: {error}")))?;
+    let identity = format!("agent-message-{}", hex::encode(sha2::Sha256::digest(identity)));
+    communication.id = Some(codex_protocol::ResponseItemId::from_server(identity.clone()));
+    communication.progress = progress;
     let control = &session.services.agent_control;
     control
         .validate_inter_agent_communication(&communication, &context)
@@ -380,5 +405,9 @@ pub(crate) async fn handle_message_string_tool(
     )
     .await;
 
-    Ok(FunctionToolOutput::from_text(String::new(), Some(true)))
+    Ok(FunctionToolOutput::from_text(serde_json::json!({
+        "message_id": message_id.unwrap_or(identity),
+        "accepted": true,
+        "acknowledgment": "queue admission, including an already accepted identity or superseded progress revision; not consumption or task completion",
+    }).to_string(), Some(true)))
 }

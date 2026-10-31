@@ -237,14 +237,18 @@ impl GitCommandControl {
         self.cancelled.store(true, Ordering::Release);
     }
 
-    fn check(&self) -> std::io::Result<()> {
+    pub(crate) fn check(&self) -> std::io::Result<()> {
         if self.cancelled.load(Ordering::Acquire) {
-            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted,
-                "Git operation cancelled; working files may be partially changed; inspect before retrying"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "Git operation cancelled; working files may be partially changed; inspect before retrying",
+            ));
         }
         if Instant::now() >= self.deadline {
-            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut,
-                "Git operation exceeded 30 seconds; working files may be partially changed; inspect before retrying"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Git operation exceeded 30 seconds; working files may be partially changed; inspect before retrying",
+            ));
         }
         Ok(())
     }
@@ -290,15 +294,38 @@ pub(crate) fn read_git_output(
 /// Use temporary files, not pipe-reader threads which can outlive cancellation.
 /// The existing Windows Job owner contains filters/helpers before they can run.
 pub(crate) fn run_git_output(
-    mut command: Command,
+    command: Command,
     stdout_limit: usize,
     control: &GitCommandControl,
 ) -> std::io::Result<std::process::Output> {
+    run_git_output_with_input(command, stdout_limit, control, None)
+}
+
+/// File-backed stdin preserves the same bounded process lifetime without a
+/// pipe writer that could block or outlive cancellation.
+pub(crate) fn run_git_output_with_input(
+    mut command: Command,
+    stdout_limit: usize,
+    control: &GitCommandControl,
+    input: Option<&[u8]>,
+) -> std::io::Result<std::process::Output> {
     control.check()?;
+    let stdin = if let Some(input) = input {
+        use std::io::Seek;
+        use std::io::Write;
+        let mut file = tempfile::tempfile()?;
+        file.write_all(input)?;
+        file.rewind()?;
+        std::process::Stdio::from(file)
+    } else {
+        std::process::Stdio::null()
+    };
     let stdout = tempfile::tempfile()?;
     let stderr = tempfile::tempfile()?;
-    command.stdin(std::process::Stdio::null())
-        .stdout(stdout.try_clone()?).stderr(stderr.try_clone()?);
+    command
+        .stdin(stdin)
+        .stdout(stdout.try_clone()?)
+        .stderr(stderr.try_clone()?);
     #[cfg(windows)]
     let managed = {
         use std::os::windows::process::CommandExt;

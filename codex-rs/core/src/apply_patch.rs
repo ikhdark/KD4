@@ -71,7 +71,10 @@ pub(crate) async fn apply_patch(
             }))
         }
         SafetyCheck::Reject { reason } => InternalApplyPatchInvocation::Output(Err(
-            FunctionCallError::RespondToModel(format!("patch rejected: {reason}")),
+            FunctionCallError::structured(codex_protocol::tool_failure::ToolFailure::no_effects(
+                codex_protocol::tool_failure::ToolFailureCode::PermissionDenied,
+                format!("patch rejected: {reason}"),
+            )),
         )),
     }
 }

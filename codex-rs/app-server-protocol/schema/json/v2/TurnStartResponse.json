@@ -447,6 +447,13 @@
             "null"
           ]
         },
+        "incarnation": {
+          "description": "Identity of the process owner that observed these facts; absent in legacy records.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "output_drained": {
           "type": "boolean"
         },

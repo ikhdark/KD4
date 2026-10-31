@@ -238,6 +238,36 @@ impl ToolDispatchState {
         self.handler_started.load(Ordering::Acquire)
     }
 
+    /// Observe the cancellation owner, not elapsed time or a caller's intent.
+    /// The second phase read prevents handler entry racing a terminal outcome
+    /// from being reported as a still-running invocation.
+    pub(crate) fn execution_observation(&self) -> JsonValue {
+        loop {
+            let phase = self.state.load(Ordering::Acquire);
+            let handler_started = self.handler_started();
+            if self.state.load(Ordering::Acquire) != phase {
+                continue;
+            }
+            let (state, terminal_outcome) = match phase {
+                value if value == ToolDispatchPhase::WaitingForAdmission as u8 => ("queued", None),
+                value if value == ToolDispatchPhase::Admitted as u8 =>
+                    (if handler_started { "running" } else { "admitted" }, None),
+                value if value == ToolDispatchPhase::Completed as u8 => ("terminal", Some("completed")),
+                value if value == ToolDispatchPhase::AccountingUnconfirmed as u8 =>
+                    ("terminal", Some("accounting_unconfirmed")),
+                value if value == ToolDispatchPhase::AbortedBeforeAdmission as u8 =>
+                    ("terminal", Some("aborted_before_admission")),
+                value if value == ToolDispatchPhase::AbortedAfterAdmission as u8 =>
+                    ("terminal", Some("aborted_after_admission")),
+                _ => ("unknown", None),
+            };
+            return serde_json::json!({
+                "state": state, "terminal_outcome": terminal_outcome,
+                "handler_started": handler_started,
+            });
+        }
+    }
+
     pub(crate) fn is_terminal(&self) -> bool {
         matches!(
             self.state.load(Ordering::Acquire),
@@ -900,11 +930,15 @@ impl ToolOutput for FunctionToolOutput {
 pub struct ApplyPatchToolOutput {
     pub text: String,
     pub success: bool,
+    pub operation_id: String,
+    pub outcome: &'static str,
     pub changes: Vec<JsonValue>,
+    pub manifest: Vec<codex_apply_patch::PatchManifestEntry>,
     pub changes_exact: bool,
     pub environment_id: Option<String>,
     pub retry: Option<JsonValue>,
     pub diagnostics: Vec<JsonValue>,
+    pub tool_failure: Option<codex_protocol::tool_failure::ToolFailure>,
 
 }
 
@@ -918,14 +952,15 @@ pub(crate) fn failed_patch_text(text: &str, retry: Option<&JsonValue>) -> String
 }
 
 impl ApplyPatchToolOutput {
-    pub fn from_text(text: String) -> Self {
-        Self::from_delta(text, true, &Default::default(), None)
+    pub fn from_text(text: String, operation_id: String) -> Self {
+        Self::from_delta(text, true, &Default::default(), operation_id, None)
     }
 
     pub(crate) fn from_delta(
         text: String,
         success: bool,
         delta: &codex_apply_patch::AppliedPatchDelta,
+        operation_id: String,
         environment_id: Option<String>,
     ) -> Self {
         use codex_apply_patch::AppliedPatchFileChange;
@@ -1021,6 +1056,8 @@ impl ApplyPatchToolOutput {
                 {
                     return serde_json::json!({
                         "path": applied.path, "kind": kind, "move_path": move_path,
+                        "outcome": "committed",
+                        "write_receipt": applied.write_receipt,
                     });
                 }
                 // Hunk +coordinates refer to the committed post-edit source,
@@ -1038,6 +1075,8 @@ impl ApplyPatchToolOutput {
                 remaining_diff_bytes -= end;
                 let mut change = serde_json::json!({
                     "path": applied.path, "kind": kind, "move_path": move_path,
+                    "outcome": "committed",
+                    "write_receipt": applied.write_receipt,
                     "unified_diff": &unified_diff[..end],
                     "diff_complete": end == unified_diff.len(),
                     "diff_bytes": unified_diff.len(),
@@ -1084,11 +1123,26 @@ impl ApplyPatchToolOutput {
         Self {
             text,
             success,
+            operation_id,
+            // Filesystem effects are independent of call success: a failed
+            // suffix can leave a committed prefix, and uncertainty wins even
+            // when the executor returned success. Never infer atomicity.
+            outcome: if !delta.is_exact() {
+                "unknown"
+            } else if !delta.is_empty() {
+                "committed"
+            } else if success {
+                "unchanged"
+            } else {
+                "failed"
+            },
             changes,
+            manifest: delta.manifest(),
             changes_exact: delta.is_exact(),
             environment_id,
             retry: None,
             diagnostics,
+            tool_failure: None,
 
         }
     }
@@ -1096,6 +1150,37 @@ impl ApplyPatchToolOutput {
     pub(crate) fn with_retry(mut self, retry: Option<JsonValue>) -> Self {
         self.retry = retry;
         self
+    }
+
+    pub(crate) fn with_failure(mut self, failure: codex_protocol::tool_failure::ToolFailure) -> Self {
+        self.tool_failure = Some(failure);
+        self
+    }
+
+    pub(crate) fn failure(&self) -> Option<codex_protocol::tool_failure::ToolFailure> {
+        use codex_protocol::tool_failure::{ToolEffectsState, ToolFailure, ToolFailureCode};
+        if self.success && self.changes_exact { return None; }
+        let mut failure = self.tool_failure.clone().unwrap_or_else(||
+            ToolFailure::new(ToolFailureCode::Failed, "Patch failed; inspect the retained diagnostic and change receipt."));
+        failure.retry_safe = false;
+        failure.effects = if !self.changes_exact {
+            // The cause remains in the existing details, but uncertainty wins
+            // over an otherwise correctable input classification.
+            let cause_code = failure.code;
+            failure.code = ToolFailureCode::UncertainEffects;
+            failure.details.get_or_insert_with(|| serde_json::json!({}))["cause_code"] = serde_json::json!(cause_code);
+            failure.safe_next_actions.insert(0, "Inspect the committed receipt and current files; additional changes may be unreported. Do not replay the patch.".into());
+            ToolEffectsState::Unknown
+        } else if self.changes.is_empty() { ToolEffectsState::None } else {
+            failure.safe_next_actions.insert(0, "Preserve the reported committed changes; reconcile and submit only the unfinished suffix.".into());
+            ToolEffectsState::Reported
+        };
+        if !self.changes.is_empty() {
+            failure.execution_state = codex_protocol::tool_failure::ToolExecutionState::Completed;
+        } else if !self.changes_exact {
+            failure.execution_state = codex_protocol::tool_failure::ToolExecutionState::Unknown;
+        }
+        Some(failure)
     }
 
 
@@ -1119,7 +1204,8 @@ impl ApplyPatchToolOutput {
             match diagnostic["kind"].as_str() {
                 Some(
                     kind @ ("trailing_whitespace" | "space_before_tab" | "conflict_marker"
-                    | "syntax_regression" | "syntax_check_skipped"),
+                    | "syntax_regression" | "syntax_check_skipped"
+                    | "historical_reversal" | "historical_reversal_check_skipped"),
                 ) => {
                     *counts.entry(kind).or_default() += 1;
                     let bytes = diagnostic.to_string().len();
@@ -1146,7 +1232,19 @@ impl ApplyPatchToolOutput {
 
     fn model_text_with_diagnostics(&self, include_diagnostics: bool) -> String {
         let mut text = if self.success {
-            if self.diagnostics.is_empty() || !include_diagnostics {
+            if self.outcome == "unchanged" {
+                "Success. unchanged: no file bytes were written.".to_string()
+            } else if self.outcome == "unknown" {
+                let message = "Patch completed with unknown filesystem effects; inspect the affected files.";
+                if self.diagnostics.is_empty() || !include_diagnostics {
+                    message.to_string()
+                } else {
+                    format!(
+                        "{message} Advisory patch diagnostics: {}",
+                        self.diagnostic_display()
+                    )
+                }
+            } else if self.diagnostics.is_empty() || !include_diagnostics {
                 "Success. Updated the files.".to_string()
             } else {
                 format!(
@@ -1157,6 +1255,14 @@ impl ApplyPatchToolOutput {
         } else {
             failed_patch_text(&self.text, self.retry.as_ref())
         };
+        if let Some(failure) = self.failure() {
+            text.push_str(&format!("\n{}", failure.model_message()));
+        }
+        text.push_str(&format!("\nOperation: {} ({}).", self.operation_id, self.outcome));
+        text.push_str("\nPublication is per file, not multi-file atomic; rollback is best-effort.");
+        if !self.manifest.is_empty() {
+            text.push_str(&format!("\nChange manifest: {}", serde_json::json!(self.manifest)));
+        }
         // Failure text already renders typed mismatch evidence; add only
         // advisories about changes that remain committed.
         if !self.success && include_diagnostics {
@@ -1197,11 +1303,15 @@ impl ApplyPatchToolOutput {
         text
     }
 
-    fn structured_result(&self) -> JsonValue {
+    pub(crate) fn structured_result(&self) -> JsonValue {
         let mut result = serde_json::json!({
             "success": self.success,
+            "operation_id": self.operation_id,
+            "outcome": self.outcome,
+            "multi_file_atomic": false,
             "text": self.text,
             "changes": self.changes,
+            "manifest": self.manifest,
             "changes_exact": self.changes_exact,
             "environment_id": self.environment_id,
             "diagnostics": self.diagnostics,
@@ -1209,12 +1319,19 @@ impl ApplyPatchToolOutput {
         if let Some(retry) = &self.retry {
             result["retry"] = retry.clone();
         }
+        if let Some(failure) = self.failure() {
+            result["tool_failure"] = serde_json::json!(failure);
+        }
 
         result
     }
 }
 
 impl ToolOutput for ApplyPatchToolOutput {
+    fn tool_failure(&self) -> Option<codex_protocol::tool_failure::ToolFailure> {
+        self.failure()
+    }
+
     fn requires_canonical_artifact(&self) -> bool {
         // The small direct receipt deliberately omits displaced bytes and
         // repetitive advisories. Retain them even when that receipt fits.
@@ -1257,11 +1374,17 @@ impl ToolOutput for ApplyPatchToolOutput {
             spillable_text: vec![self.model_text_with_diagnostics(false)],
             essential_inline: serde_json::json!({
                 "success": self.success,
+                "operation_id": self.operation_id,
+                "outcome": self.outcome,
+                "multi_file_atomic": false,
                 "changes_count": self.changes.len(),
+                "manifest_count": self.manifest.len(),
+                "manifest_recovery_json_pointer": "/manifest",
                 "changes_exact": self.changes_exact,
                 "environment_id": self.environment_id,
                 "retry": self.retry,
                 "diagnostics": self.diagnostic_display(),
+                "tool_failure": self.failure(),
             }),
             requested_limit: None,
             predetermined_ranges: Vec::new(),
@@ -1302,6 +1425,17 @@ impl AbortedToolOutput {
         use codex_protocol::tool_failure::ToolFailureCode;
         let mut failure = ToolFailure::new(ToolFailureCode::Cancelled, &self.message);
         if let Some(recovery) = &self.recovery {
+            let settlement = &recovery["handler_settlement"];
+            if settlement["disposition"] == "settled_success" {
+                failure.execution_state = codex_protocol::tool_failure::ToolExecutionState::Completed;
+            } else if settlement["disposition"] == "settled_failure"
+                && let Some(result) = settlement.get("result").filter(|result| !result.is_null())
+            {
+                failure.execution_state = result.get("tool_failure")
+                    .and_then(|value| serde_json::from_value::<ToolFailure>(value.clone()).ok())
+                    .map(|failure| failure.execution_state)
+                    .unwrap_or(codex_protocol::tool_failure::ToolExecutionState::Completed);
+            }
             failure.effects = match recovery["effects_state"].as_str() {
                 Some("none") => ToolEffectsState::None,
                 Some("reported") => ToolEffectsState::Reported,
@@ -1326,6 +1460,10 @@ impl AbortedToolOutput {
 }
 
 impl ToolOutput for AbortedToolOutput {
+    fn tool_failure(&self) -> Option<codex_protocol::tool_failure::ToolFailure> {
+        Some(self.failure())
+    }
+
     fn log_preview(&self) -> String {
         telemetry_preview(&self.rendered())
     }
@@ -1392,9 +1530,13 @@ pub struct ExecSessionCapabilities {
     /// Creation identity; numeric IDs alone are never authority across runtimes.
     pub incarnation: uuid::Uuid,
     pub stdin: bool,
+    pub close_stdin: bool,
     pub interrupt: bool,
     pub cancellation: bool,
     pub polling: bool,
+    /// Cancellation disposition from the retained process owner, not root exit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shutdown: Option<ExecShutdownStatus>,
     /// Latest owner-observed silence interval, independent of display reduction.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observation: Option<ExecSilenceObservation>,
@@ -1414,8 +1556,17 @@ pub enum ExecObservationReason {
     NoOutputObserved,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecShutdownStatus {
+    CancellationRequested,
+    ShutdownConfirmed,
+    ShutdownUncertain,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecCommandToolOutput {
+    pub(crate) environment_receipt: Option<codex_utils_pty::process_observation::ProcessStartSnapshot>,
     /// Bounded process-owned streams, separate from the display projection.
     pub(crate) process_output: Option<Arc<crate::unified_exec::ProcessOutputSnapshot>>,
     pub(crate) error: Option<String>,
@@ -1428,8 +1579,13 @@ pub struct ExecCommandToolOutput {
     pub raw_output: Vec<u8>,
     /// Exact coordinates supplied by the collector, never inferred from artifact size.
     pub(crate) output_ranges: Option<crate::unified_exec::head_tail_buffer::OutputChunkRanges>,
+    /// Producer byte ranges consumed by this receipt, independently per pipe.
+    pub(crate) stream_ranges: Option<[std::ops::Range<u64>; 2]>,
+    pub(crate) stream_chunks: Option<[String; 2]>,
     pub truncation_policy: TruncationPolicy,
     pub max_output_tokens: Option<usize>,
+    /// Per-receipt presentation opt-in; never inferred from an empty output.
+    pub quiet_on_success: bool,
     pub process_id: Option<u32>,
     pub session_capabilities: Option<ExecSessionCapabilities>,
     pub exit_code: Option<i32>,
@@ -1629,11 +1785,20 @@ impl ToolOutput for ExecCommandToolOutput {
         #[derive(Serialize)]
         struct UnifiedExecCodeModeResult {
             #[serde(skip_serializing_if = "Option::is_none")]
+            environment_receipt: Option<codex_utils_pty::process_observation::ProcessStartSnapshot>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            quiet_success: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            success: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             error: Option<String>,
             #[serde(skip_serializing_if = "Option::is_none")]
             stdout: Option<String>,
             #[serde(skip_serializing_if = "Option::is_none")]
             stderr: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            stream_ranges: Option<[std::ops::Range<u64>; 2]>,
+            stream_chunks_complete: bool,
             #[serde(skip_serializing_if = "Option::is_none")]
             streams_complete: Option<bool>,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -1673,6 +1838,8 @@ impl ToolOutput for ExecCommandToolOutput {
             #[serde(skip_serializing_if = "Option::is_none")]
             recovery: Option<JsonValue>,
             #[serde(skip_serializing_if = "Option::is_none")]
+            recovery_scope: Option<&'static str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             validation: Option<JsonValue>,
             #[serde(skip_serializing_if = "Vec::is_empty")]
             pending_deferred_completions: Vec<String>,
@@ -1684,6 +1851,7 @@ impl ToolOutput for ExecCommandToolOutput {
             cumulative_streams_complete: Option<bool>,
             #[serde(skip_serializing_if = "Option::is_none")]
             retained_artifact_complete: Option<bool>,
+            output_reference: JsonValue,
         }
 
         let (raw_output_artifact_id, raw_output_artifact_bytes, raw_output_artifact_error) =
@@ -1695,8 +1863,8 @@ impl ToolOutput for ExecCommandToolOutput {
                 None => (None, None, None),
             };
         // Output is this poll's chunk, including an empty terminal drain.
-        // Cumulative exact streams are exposed separately as stdout/stderr;
-        // replaying them here would duplicate bytes for polling consumers.
+        // Terminal exact streams expose only this receipt's producer ranges;
+        // previously consumed prefixes remain in the retained transcript.
         let raw_output = String::from_utf8_lossy(&self.raw_output);
         // A script shows this result to the model only by printing it into
         // its cell. Bound it to fit there, so the command's own projection,
@@ -1721,40 +1889,34 @@ impl ToolOutput for ExecCommandToolOutput {
         let model_output = self.projected_model_output_at_limit(raw_output.as_ref(), limits);
         let output_reduced = model_output.reduced;
         let output = model_output.text;
-        let recovery_selector = self.missing_output_selector(
+        let recovery_selectors = self.missing_output_selectors(
             &raw_output,
             &output,
-            model_output.first_omitted_lines,
+            &model_output.omitted_lines,
             model_output.ranked_excerpt,
             raw_output_artifact_bytes,
         );
+        let recovery_selector = recovery_selectors.first().cloned();
 
         // Exact programmatic access does not inherit the display-token budget.
         // Never offer a truncated or lossy string as JSON. Larger/binary streams
         // remain unavailable here; the combined output artifact is still retained.
-        let streams = self.process_output.as_ref().and_then(|snapshot| {
-            (self.process_exited
-                && self.process_id.is_none()
-                && snapshot.streams_are_exact
-                && snapshot.stdout.len().saturating_add(snapshot.stderr.len())
-                    <= crate::unified_exec::UNIFIED_EXEC_OUTPUT_MAX_BYTES)
-                .then(|| {
-                    Some((
-                        String::from_utf8(snapshot.stdout.clone()).ok()?,
-                        String::from_utf8(snapshot.stderr.clone()).ok()?,
-                    ))
-                })
-                .flatten()
-        });
-        let streams_complete = Some(streams.is_some());
+        let streams = self.stream_chunks.as_ref();
+        let stream_chunks_complete = streams.is_some();
+        let streams_complete = Some(stream_chunks_complete && self.process_exited && self.process_id.is_none() && self.stream_ranges.as_ref()
+            .is_some_and(|ranges| ranges.iter().all(|range| range.start == 0)));
         let (stdout, stderr) = streams
-            .map(|(stdout, stderr)| (Some(stdout), Some(stderr)))
+            .map(|[stdout, stderr]| (Some(stdout.clone()), Some(stderr.clone())))
             .unwrap_or_default();
         let raw_output_artifact_retention_limit_hit = self
             .raw_output_artifact
             .as_ref()
             .is_some_and(RawOutputArtifact::retention_limit_hit);
         let result = UnifiedExecCodeModeResult {
+            output_reference: RawOutputArtifact::output_reference(self.raw_output_artifact.as_ref()),
+            environment_receipt: self.environment_receipt.clone(),
+            quiet_success: self.quiet_success_applied().then_some(true),
+            success: self.quiet_success_applied().then_some(true),
             current_chunk_display_complete: !output_reduced,
             cumulative_streams_complete: streams_complete,
             retained_artifact_complete: raw_output_artifact_id.as_ref().map(|_| {
@@ -1767,13 +1929,14 @@ impl ToolOutput for ExecCommandToolOutput {
                     && raw_output_artifact_error.is_none()
                     && !raw_output_artifact_retention_limit_hit
             }),
+            recovery_scope: self.recovery_scope(&recovery_selectors),
             recovery: raw_output_artifact_id
                 .as_ref()
-                .zip(recovery_selector.as_ref())
-                .map(|(artifact_id, selector)| {
+                .filter(|_| !recovery_selectors.is_empty())
+                .map(|artifact_id| {
                     serde_json::json!({
                         "tool":"read_tool_output", "arguments": {
-                            "artifact_id":artifact_id, "selectors":[selector]
+                            "artifact_id":artifact_id, "selectors":recovery_selectors
                         }
                     })
                 }),
@@ -1783,6 +1946,8 @@ impl ToolOutput for ExecCommandToolOutput {
                 .or_else(|| self.exit_code.and_then(windows_abnormal_exit_notice)),
             stdout,
             stderr,
+            stream_ranges: self.stream_ranges.clone(),
+            stream_chunks_complete,
             streams_complete,
             recovery_selector,
             chunk_id: (!self.chunk_id.is_empty()).then(|| self.chunk_id.clone()),
@@ -2284,6 +2449,77 @@ pub(crate) fn attach_command_validation(
 
 
 impl ExecCommandToolOutput {
+    pub(crate) fn withhold_unacknowledged_output(&mut self) {
+        self.raw_output.clear();
+        self.output_ranges = None;
+        self.stream_ranges = None;
+        self.stream_chunks = None;
+        self.original_token_count = Some(0);
+    }
+
+    fn quiet_success_candidate(&self) -> bool {
+        self.quiet_on_success
+            && self.process_exited
+            && self.process_id.is_none()
+            && self.exit_code == Some(0)
+            && self.error.is_none()
+            && self.process_output.as_ref().is_some_and(|snapshot| {
+                snapshot.output_closed
+            })
+    }
+
+    fn quiet_success_applied(&self) -> bool {
+        self.quiet_success_candidate()
+            && self
+                .raw_output_artifact
+                .as_ref()
+                .is_some_and(|artifact| {
+                    artifact.capture_finalized_complete()
+                        && (artifact.is_plain_command_log()
+                            || self.process_output.as_ref().is_some_and(|snapshot| {
+                                snapshot.streams_are_exact
+                                    && snapshot.aggregated_output_is_exact
+                                    && artifact.retained_bytes()
+                                        == Some(snapshot.aggregated_output.len() as u64)
+                            }))
+                })
+    }
+
+    fn missing_output_selectors(
+        &self,
+        raw_output: &str,
+        output: &str,
+        marked_lines: &[(usize, usize)],
+        ranked_excerpt: bool,
+        artifact_bytes: Option<u64>,
+    ) -> Vec<JsonValue> {
+        if marked_lines.is_empty() {
+            return self
+                .missing_output_selector(raw_output, output, None, ranked_excerpt, artifact_bytes)
+                .into_iter()
+                .collect();
+        }
+        let mut selectors = Vec::new();
+        for &lines in marked_lines {
+            if let Some(selector) = self.missing_output_selector(
+                raw_output, output, Some(lines), ranked_excerpt, artifact_bytes,
+            ) && !selectors.contains(&selector)
+            {
+                selectors.push(selector);
+            }
+        }
+        selectors
+    }
+
+    fn recovery_scope(&self, selectors: &[JsonValue]) -> Option<&'static str> {
+        let artifact = self.raw_output_artifact.as_ref()?;
+        let [selector] = selectors else { return None; };
+        (artifact.is_plain_command_log()
+            && selector["kind"] == "bytes"
+            && selector["start"].as_u64() == Some(0)
+            && selector["end"].as_u64() == artifact.retained_bytes())
+            .then_some("retained_command_log")
+    }
 
     fn missing_output_selector(
         &self,
@@ -2294,6 +2530,10 @@ impl ExecCommandToolOutput {
         artifact_bytes: Option<u64>,
     ) -> Option<JsonValue> {
         let retained = artifact_bytes?;
+        if self.quiet_success_applied() {
+            return (retained > 0)
+                .then(|| serde_json::json!({"kind":"bytes", "start":0, "end":retained}));
+        }
         if self.raw_output_artifact.as_ref().is_some_and(RawOutputArtifact::is_plain_command_log) {
             // Equal lengths do not prove equal order after per-stream UTF-8
             // aggregation. Whole-log line numbers require the collector's map.
@@ -2308,15 +2548,20 @@ impl ExecCommandToolOutput {
                 return Some(serde_json::json!({"kind":"lines","start":start,"end":end}));
             }
             // Poll byte offsets do not establish whole-log line numbers.
-            // Offer a plain first page rather than inventing coordinates.
+            // A first-page hint cannot recover an omitted middle or suffix.
+            // Name the full retained log instead; the reader owns bounded
+            // pages and continuation, and recovery_scope labels the overlap.
             // The projection normalizes CRLF; that alone omits nothing.
             let differs = if raw_output.contains("\r\n") {
                 raw_output.replace("\r\n", "\n") != output
             } else {
                 raw_output != output
             };
-            return (differs || self.output_ranges.as_ref().is_some_and(|r| r.gap.is_some()))
-                .then(|| serde_json::json!({"kind":"lines","start":1,"end":200}));
+            return (retained > 0
+                && (differs
+                    || retained > self.raw_output.len() as u64
+                    || self.output_ranges.as_ref().is_some_and(|r| r.gap.is_some())))
+                .then(|| serde_json::json!({"kind":"bytes","start":0,"end":retained}));
         }
         if self.raw_output.is_empty() {
             return None;
@@ -2393,6 +2638,34 @@ impl ExecCommandToolOutput {
         codex_home: &std::path::Path,
         thread_id: &str,
     ) {
+        let failed_terminal = self.outcome_for_logging() == ToolOutputOutcome::Failure
+            && self.process_exited && self.process_id.is_none();
+        if self.process_id.is_some() {
+            self.raw_output_artifact.get_or_insert_with(|| RawOutputArtifact::pending(codex_home, thread_id));
+        }
+        if (self.quiet_success_candidate() || failed_terminal)
+            && self
+                .raw_output_artifact
+                .as_ref()
+                .is_none_or(RawOutputArtifact::is_pending)
+        {
+            // A terminal poll may have no new bytes. Retain the complete owning
+            // snapshot, not just that poll's suffix, before hiding any output.
+            if let Some(snapshot) = &self.process_output
+                && (failed_terminal || snapshot.streams_are_exact)
+                && snapshot.aggregated_output_is_exact
+                && snapshot.output_closed
+            {
+                self.raw_output_artifact = Some(
+                    crate::tools::command_output_artifact::create_raw_output_artifact(
+                        codex_home,
+                        thread_id,
+                        &snapshot.aggregated_output,
+                    )
+                    .await,
+                );
+            }
+        }
         if self.raw_output.is_empty()
             || self
                 .output_ranges
@@ -2403,6 +2676,12 @@ impl ExecCommandToolOutput {
                 .as_ref()
                 .is_some_and(|artifact| !artifact.is_pending())
         {
+            return;
+        }
+        // Failure receipts must never turn harness diagnostics into a complete
+        // producer transcript. Unknown capture remains explicitly unavailable.
+        if failed_terminal {
+            self.raw_output_artifact.get_or_insert_with(|| RawOutputArtifact::pending(codex_home, thread_id));
             return;
         }
         let raw_output = String::from_utf8_lossy(&self.raw_output);
@@ -2528,12 +2807,19 @@ impl ExecCommandToolOutput {
                 .with_id("output_decoding_notice"),
             );
         }
+        let quiet_success = self.quiet_success_applied();
+        let displayed_output = if quiet_success {
+            QUIET_SUCCESS_SUMMARY
+        } else {
+            raw_output
+        };
         let mut output_fragment = ToolOutputProjectionFragment::new(
             ToolOutputProjectionFragmentKind::ContextualSpillableText,
-            raw_output,
+            displayed_output,
         )
         .with_id("output");
-        if self.process_id.is_none()
+        if !quiet_success
+            && self.process_id.is_none()
             && self.process_exited
             && let Some(exit_code) = self.exit_code
         {
@@ -2580,7 +2866,7 @@ impl ExecCommandToolOutput {
             // it applies the model budget exactly once. The process status is
             // already preserved below as essential inline metadata, and the
             // existing artifact ID lets the boundary reuse the raw artifact.
-            spillable_text: vec![raw_output.replace("\r\n", "\n")],
+            spillable_text: vec![displayed_output.replace("\r\n", "\n")],
             essential_inline: {
                 let mut metadata = serde_json::json!({
                 "chunk_id": &self.chunk_id,
@@ -2593,13 +2879,32 @@ impl ExecCommandToolOutput {
                 "original_token_count": self.original_token_count,
                 "repair_notice": &self.repair_notice,
                 "raw_output_artifact_id": raw_output_artifact_id,
+                "output_reference": RawOutputArtifact::output_reference(self.raw_output_artifact.as_ref()),
                 "raw_output_artifact_bytes": raw_output_artifact_bytes,
                 "raw_output_artifact_error": raw_output_artifact_error,
                 "raw_output_artifact_retention_limit_hit": raw_output_artifact_retention_limit_hit,
                 "raw_output_artifact_retention_limit_reason": raw_output_artifact_retention_limit_reason,
                 });
+                if quiet_success {
+                    metadata["quiet_success"] = true.into();
+                    metadata["success"] = true.into();
+                    metadata["retained_artifact_complete"] = true.into();
+                    metadata["output_reduced"] = (!raw_output.is_empty()).into();
+                    if let Some(selector) = self.missing_output_selector(
+                        raw_output, displayed_output, None, false, raw_output_artifact_bytes,
+                    ) {
+                        metadata["recovery"] = serde_json::json!({
+                            "tool":"read_tool_output", "arguments": {
+                                "artifact_id":raw_output_artifact_id, "selectors":[selector]
+                            }
+                        });
+                    }
+                }
                 if let Some(validation) = self.declared_validation_metadata() {
                     metadata["validation"] = validation;
+                }
+                if let Some(receipt) = &self.environment_receipt {
+                    metadata["environment_receipt"] = serde_json::json!(receipt);
                 }
                 if let Some(error) = &self.error {
                     metadata["error"] = JsonValue::String(error.clone());
@@ -2729,6 +3034,18 @@ impl ExecCommandToolOutput {
         raw_output: &str,
         limits: OutputLimitResolution,
     ) -> ProjectedModelOutput {
+        if self.quiet_success_applied() {
+            return ProjectedModelOutput {
+                text: QUIET_SUCCESS_SUMMARY.to_string(),
+                reduced: self
+                    .raw_output_artifact
+                    .as_ref()
+                    .and_then(RawOutputArtifact::retained_bytes)
+                    .is_some_and(|bytes| bytes > 0),
+                omitted_lines: Vec::new(),
+                ranked_excerpt: false,
+            };
+        }
         let source_bytes = raw_output.len() as u64;
         // Recovery selectors address retained bytes, not normalized presentation.
         let summarized = self.summarized_output(raw_output, limits.applied_limit);
@@ -2748,17 +3065,16 @@ impl ExecCommandToolOutput {
         let line_summary = summarized
             .as_deref()
             .and_then(crate::tools::shell_output_summary::line_summary_omitted_group);
-        let (truncated, first_omitted_lines) = match summarized.as_deref() {
+        let (truncated, omitted_lines) = match summarized.as_deref() {
             // These coordinates are chunk-relative. The output owner translates
             // them before exposing a cumulative artifact recovery selector.
             None => {
                 let marked = formatted_truncate_text_with_line_markers(raw_output, limits);
-                let first_omitted_lines = marked.first_omitted_line_range();
-                (marked.output, first_omitted_lines)
+                (marked.output, marked.omitted_lines)
             }
             content => (
                 formatted_truncate_text_with_output_limit(content.unwrap_or(raw_output), limits),
-                line_summary.flatten(),
+                line_summary.flatten().into_iter().collect(),
             ),
         };
         let was_truncated = truncated.was_truncated;
@@ -2778,7 +3094,7 @@ impl ExecCommandToolOutput {
         }
         // Inline line markers count from this chunk, while the artifact id
         // addresses the cumulative output. Say so rather than invite a lines read.
-        if first_omitted_lines.is_some()
+        if !omitted_lines.is_empty()
             && let Some(start) = self
                 .output_ranges
                 .as_ref()
@@ -2800,7 +3116,7 @@ impl ExecCommandToolOutput {
                     && !raw_output.is_empty()
                     && artifact_has_more_bytes),
             text: projected_text,
-            first_omitted_lines,
+            omitted_lines,
             ranked_excerpt: line_summary.is_some(),
         }
     }
@@ -2810,6 +3126,17 @@ impl ExecCommandToolOutput {
 
         let projected = self.projected_model_output(raw_output, None);
         let mut fields = serde_json::Map::new();
+        fields.insert("output_reference".into(), RawOutputArtifact::output_reference(self.raw_output_artifact.as_ref()));
+        if let Some(receipt) = &self.environment_receipt {
+            fields.insert("environment_receipt".into(), serde_json::json!(receipt));
+        }
+        if self.quiet_success_applied() {
+            fields.insert("quiet_success".into(), true.into());
+            fields.insert("success".into(), true.into());
+            fields.insert("process_exited".into(), true.into());
+            fields.insert("execution_state".into(), "exited".into());
+            fields.insert("retained_artifact_complete".into(), true.into());
+        }
         if let Some(code) = self.exit_code {
             fields.insert("exit_code".into(), code.into());
         }
@@ -2831,21 +3158,25 @@ impl ExecCommandToolOutput {
                 .and_then(|a| a.model_projection().0)
         {
             fields.insert("artifact_id".into(), id.to_string().into());
-            if let Some(selector) = self.missing_output_selector(
+            let selectors = self.missing_output_selectors(
                 raw_output,
                 &projected.text,
-                projected.first_omitted_lines,
+                &projected.omitted_lines,
                 projected.ranked_excerpt,
                 self.raw_output_artifact
                     .as_ref()
                     .and_then(RawOutputArtifact::retained_bytes),
-            ) {
+            );
+            if let Some(selector) = selectors.first() {
                 fields.insert("recovery_selector".into(), selector.clone());
+                if let Some(scope) = self.recovery_scope(&selectors) {
+                    fields.insert("recovery_scope".into(), scope.into());
+                }
                 fields.insert(
                     "recovery".into(),
                     serde_json::json!({
                         "tool":"read_tool_output", "arguments": {
-                            "artifact_id":id.to_string(), "selectors":[selector]
+                            "artifact_id":id.to_string(), "selectors":selectors
                         }
                     }),
                 );
@@ -2919,11 +3250,14 @@ fn predetermined_validation_ranges(
     .collect()
 }
 
+pub(crate) const QUIET_SUCCESS_SUMMARY: &str =
+    "Command completed successfully (exit code 0); output retained for recovery.";
+
 struct ProjectedModelOutput {
     text: String,
     reduced: bool,
-    /// Bounded first run the text's line markers report omitted from the raw output.
-    first_omitted_lines: Option<(usize, usize)>,
+    /// Every run the text's line markers report omitted from the raw output.
+    omitted_lines: Vec<(usize, usize)>,
     /// The text is a line summary: selected lines in ranked, not contiguous, order.
     ranked_excerpt: bool,
 }

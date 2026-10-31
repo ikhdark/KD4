@@ -377,12 +377,18 @@ pub(crate) async fn validate_mutation_endpoints(
             }
         );
 
+        let snapshot_guarded = matches!(hunk, Hunk::UpdateFile { chunks, .. }
+            if chunks.iter().any(|chunk| crate::unique_anchor::is_anchor_chunk(chunk)
+                || chunk.change_context.as_deref()
+                .is_some_and(|context| context.starts_with(crate::counted_replace::PREFIX))));
         for path in std::iter::once(source_path).chain(move_path) {
             let identity = mutation_endpoint_identity(fs, &path, sandbox).await?;
-            if let Some((previous_path, previous_hunk, previous_in_place)) =
-                mutation_endpoints.insert(identity, (path.clone(), hunk_index + 1, in_place))
+            if let Some((previous_path, previous_hunk, previous_in_place, previous_snapshot_guarded)) =
+                mutation_endpoints.insert(identity, (path.clone(), hunk_index + 1, in_place, snapshot_guarded))
             {
-                if in_place && previous_in_place {
+                // Literal and anchor edits bind to the starting file, not an
+                // earlier hunk's result, including aliased endpoint spellings.
+                if in_place && previous_in_place && !snapshot_guarded && !previous_snapshot_guarded {
                     previous_updates[hunk_index] = Some(previous_hunk - 1);
                     continue;
                 }

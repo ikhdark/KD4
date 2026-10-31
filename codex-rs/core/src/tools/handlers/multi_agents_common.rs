@@ -281,7 +281,53 @@ pub(crate) fn apply_spawn_agent_runtime_overrides(
         })?;
     let turn_cwd = turn.cwd().clone();
     config.cwd = turn_cwd;
+    config.validation_mode = turn.validation_mode;
     Ok(())
+}
+
+pub(crate) async fn worker_startup_preflight(
+    session: &Session,
+    turn: &TurnContext,
+    config: &Config,
+    environment: &crate::session::turn_context::TurnEnvironment,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<JsonValue, FunctionCallError> {
+    if config.validation_mode != turn.validation_mode
+        || config.permissions.approval_policy.value() != turn.approval_policy.value()
+        || config.permissions.allow_login_shell != turn.config.permissions.allow_login_shell
+    {
+        return Err(FunctionCallError::RespondToModel("worker preflight rejected divergent inherited restrictions".into()));
+    }
+    let model = config.model.as_deref().filter(|model| !model.trim().is_empty())
+        .ok_or_else(|| FunctionCallError::RespondToModel("worker preflight requires a resolved model".into()))?;
+    let info = models_manager_for_spawn_config(session, turn, config)
+        .get_model_info(model, &config.to_models_manager_config()).await;
+    let effort = crate::client::request_effort_for_model(&info, config.model_reasoning_effort.clone());
+    crate::client::validate_request_effort_for_model(&info, effort.as_ref())
+        .map_err(FunctionCallError::RespondToModel)?;
+    let cwd = codex_utils_path_uri::PathUri::from_abs_path(&config.cwd);
+    let mut sandbox = turn.file_system_sandbox_context(None, &cwd);
+    sandbox.permissions = config.permissions.permission_profile().clone().into();
+    sandbox.workspace_roots = config.workspace_roots.iter()
+        .map(codex_utils_path_uri::PathUri::from_abs_path).collect();
+    super::backend_capabilities::effective_snapshot(
+        environment, &cwd, sandbox,
+        serde_json::json!({
+            "model_provider_id": config.model_provider_id,
+            "model_provider_revision": super::backend_capabilities::configuration_identity(&config.model_provider)?,
+            "model": model, "model_metadata_fallback": info.used_fallback_model_metadata,
+            "input_modalities": info.input_modalities, "responses_lite": info.use_responses_lite,
+            "reasoning_effort": effort, "service_tier": config.service_tier,
+            "developer_instructions_revision": super::backend_capabilities::configuration_identity(&config.developer_instructions)?,
+            "base_override_revision": super::backend_capabilities::configuration_identity(&config.base_instructions)?,
+            "approval_policy": config.permissions.approval_policy.value(),
+            "validation_mode": config.validation_mode,
+            "allow_login_shell": config.permissions.allow_login_shell,
+            "shell_environment_policy_revision": super::backend_capabilities::shell_environment_policy_identity(&config.permissions.shell_environment_policy)?,
+            "permission_semantics": "restrictions_only_not_a_grant",
+        }),
+        codex_exec_server::CapabilityQuery::default(), true, cancellation,
+    ).await
 }
 
 /// Resolves role-locked model settings, explicit per-spawn overrides, and built-in defaults.

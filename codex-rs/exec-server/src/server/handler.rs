@@ -173,7 +173,10 @@ impl ExecServerHandler {
             .session
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session);
-        Ok(InitializeResponse { session_id })
+        Ok(InitializeResponse {
+            session_id,
+            capability_manifest: Some(self.capability_manifest_snapshot()?),
+        })
     }
 
     pub(crate) fn initialized(&self) -> Result<(), String> {
@@ -235,6 +238,13 @@ impl ExecServerHandler {
             .process()
             .write_owned(params)
             .await
+    }
+
+    pub(crate) async fn close_stdin_owned(
+        &self,
+        params: crate::protocol::OwnedProcessParams<crate::protocol::CloseStdinParams>,
+    ) -> Result<WriteResponse, JSONRPCErrorError> {
+        self.require_initialized_for("exec")?.process().close_stdin_owned(params).await
     }
 
     pub(crate) async fn signal_owned(
@@ -304,6 +314,76 @@ impl ExecServerHandler {
     pub(crate) fn environment_info(&self) -> Result<EnvironmentInfo, JSONRPCErrorError> {
         self.require_initialized_for("environment info")?;
         Ok(EnvironmentInfo::local())
+    }
+
+    pub(crate) async fn lookup_executables(
+        &self,
+        params: crate::protocol::LookupExecutablesParams,
+    ) -> Result<Vec<codex_file_system::FileSystemLookupResult>, JSONRPCErrorError> {
+        self.require_initialized_for("executable lookup")?;
+        let filesystem = crate::LocalFileSystem::with_runtime_paths(self.runtime_paths.clone());
+        crate::executable_lookup::lookup_executables(&filesystem, &params)
+            .await.map_err(|error| invalid_params(error.to_string()))
+    }
+
+    pub(crate) async fn fs_lookup_batch(
+        &self,
+        params: crate::protocol::FsLookupBatchParams,
+    ) -> Result<Vec<codex_file_system::FileSystemLookupResult>, JSONRPCErrorError> {
+        self.require_initialized_for("filesystem lookup")?;
+        let filesystem = crate::LocalFileSystem::with_runtime_paths(self.runtime_paths.clone());
+        crate::ExecutorFileSystem::lookup_batch(&filesystem, &params.requests, params.sandbox.as_ref())
+            .await.map_err(crate::fs_helper::map_fs_error)
+    }
+
+    pub(crate) fn capability_manifest(
+        &self,
+    ) -> Result<crate::protocol::CapabilityManifest, JSONRPCErrorError> {
+        self.require_initialized_for("capability discovery")?;
+        self.capability_manifest_snapshot()
+    }
+
+    fn capability_manifest_snapshot(
+        &self,
+    ) -> Result<crate::protocol::CapabilityManifest, JSONRPCErrorError> {
+        crate::capabilities::manifest(
+            &self.runtime_paths,
+            "codex-exec-server",
+            crate::server::registry::shared_router().request_methods(),
+            true,
+        ).map_err(|error| internal_error(error.to_string()))
+    }
+
+    pub(crate) fn capability_report(
+        &self,
+        query: crate::protocol::CapabilityQuery,
+    ) -> Result<crate::protocol::CapabilityReport, JSONRPCErrorError> {
+        self.require_initialized_for("capability discovery")?;
+        query.validate().map_err(|error| invalid_params(error.into()))?;
+        Ok(crate::protocol::CapabilityReport::new(Some(self.capability_manifest_snapshot()?), query))
+    }
+
+    pub(crate) fn revalidate_capabilities(
+        &self,
+        expected: Option<&str>,
+    ) -> Result<(), JSONRPCErrorError> {
+        let Some(expected) = expected else {
+            return Ok(());
+        };
+        let current = self.capability_manifest_snapshot()?;
+        if expected == current.revision {
+            return Ok(());
+        }
+        Err(JSONRPCErrorError {
+            code: crate::protocol::STALE_CAPABILITY_MANIFEST_ERROR_CODE,
+            message: "capability manifest changed; no operation ran. Refresh capability discovery before deciding whether to submit a new operation. Support is not permission.".into(),
+            data: Some(serde_json::json!({
+                "kind": "stale_capability_manifest",
+                "effects": "none",
+                "expectedRevision": expected,
+                "currentRevision": current.revision,
+            })),
+        })
     }
 
 
@@ -617,6 +697,17 @@ impl ExecServerHandler {
     async fn release_http_body_stream(&self, request_id: &str) {
         let mut active_body_stream_ids = self.active_body_stream_ids.lock().await;
         active_body_stream_ids.remove(request_id);
+    }
+
+    pub(crate) async fn release_rejected_http_body_stream(
+        &self,
+        request_id: &str,
+        rpc_id: &RequestId,
+    ) {
+        let mut active = self.active_body_stream_ids.lock().await;
+        if active.get(request_id).is_some_and(|(id, _)| id == rpc_id) {
+            active.remove(request_id);
+        }
     }
 
     pub(crate) async fn reserve_http_body_stream(

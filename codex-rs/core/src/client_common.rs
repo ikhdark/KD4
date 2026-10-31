@@ -1,3 +1,5 @@
+mod repeated_bodies;
+
 use crate::context::PromptProvenanceSidecar;
 use crate::stable_context::StableContextManifest;
 use crate::tool_history::ToolHistorySubstitution;
@@ -45,7 +47,21 @@ pub(crate) struct ToolSchemaArtifact {
 }
 
 impl ToolSchemaArtifact {
-    pub(crate) fn new(specs: Vec<ToolSpec>) -> Self {
+    pub(crate) fn new(mut specs: Vec<ToolSpec>) -> Self {
+        // Order only the effective surface, after permission/exposure gates and
+        // collision resolution. Never reorder schema arrays or promote tools.
+        // Stable sorts preserve the relative order of any duplicate identities.
+        specs.sort_by(|left, right| left.name().cmp(right.name()));
+        for spec in &mut specs {
+            if let ToolSpec::Namespace(namespace) = spec {
+                namespace.tools.sort_by(|left, right| match (left, right) {
+                    (
+                        codex_tools::ResponsesApiNamespaceTool::Function(left),
+                        codex_tools::ResponsesApiNamespaceTool::Function(right),
+                    ) => left.name.cmp(&right.name),
+                });
+            }
+        }
         let specs: Arc<[ToolSpec]> = specs.into();
         let serialized: Arc<[u8]> = serde_json::to_vec(specs.as_ref())
             .unwrap_or_default()
@@ -150,7 +166,9 @@ impl DeferredDynamicHistoryMeasurement {
 #[derive(Debug)]
 pub(crate) struct FormattedPromptInput {
     source: Weak<[ResponseItem]>,
-    input: Arc<[ResponseItem]>,
+    use_lite: bool,
+    // None records an unchanged projection without retaining its weak source.
+    input: Option<Arc<[ResponseItem]>>,
 }
 
 /// API request payload for a single model turn
@@ -158,7 +176,7 @@ pub(crate) struct FormattedPromptInput {
 pub struct Prompt {
     /// Conversation context input items.
     pub input: Arc<[ResponseItem]>,
-    // Admission and dispatch share at most the four immutable Lite projections.
+    // Admission and dispatch share the selected immutable request projections.
     // Weak source identity fences later mutations without retaining old histories.
     pub(crate) formatted_inputs: Arc<Mutex<Vec<FormattedPromptInput>>>,
 
@@ -318,32 +336,38 @@ impl Prompt {
     }
 
     fn formatted_input(&self, source: &Arc<[ResponseItem]>, use_lite: bool) -> Arc<[ResponseItem]> {
-        if !use_lite {
-            return Arc::clone(source);
-        }
         let identity = Arc::downgrade(source);
         {
             let cached = self.formatted_inputs.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(entry) = cached.iter().find(|entry| Weak::ptr_eq(&entry.source, &identity)) {
-                return Arc::clone(&entry.input);
+            if let Some(entry) = cached.iter().find(|entry| {
+                entry.use_lite == use_lite && Weak::ptr_eq(&entry.source, &identity)
+            }) {
+                return entry.input.as_ref().map_or_else(|| Arc::clone(source), Arc::clone);
             }
         }
-        if !has_image_details(source) {
-            return Arc::clone(source);
+        // Work only on the selected, complete request. Never persist references
+        // based on a previous prompt: retirement/fallback may remove its owner.
+        let mut input = repeated_bodies::deduplicate(source);
+        if use_lite && has_image_details(&input) {
+            strip_image_details(Arc::make_mut(&mut input));
         }
-        let mut input = Arc::clone(source);
-        strip_image_details(Arc::make_mut(&mut input));
         let mut cached = self.formatted_inputs.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(entry) = cached.iter().find(|entry| Weak::ptr_eq(&entry.source, &identity)) {
-            return Arc::clone(&entry.input);
+        if let Some(entry) = cached.iter().find(|entry| {
+            entry.use_lite == use_lite && Weak::ptr_eq(&entry.source, &identity)
+        }) {
+            return entry.input.as_ref().map_or_else(|| Arc::clone(source), Arc::clone);
         }
         cached.retain(|entry| entry.source.strong_count() != 0);
-        if cached.len() == 4 {
+        if cached.len() == 8 {
             cached.remove(0);
         }
-        cached.push(FormattedPromptInput { source: identity, input: Arc::clone(&input) });
+        cached.push(FormattedPromptInput {
+            source: identity,
+            use_lite,
+            input: (!Arc::ptr_eq(&input, source)).then(|| Arc::clone(&input)),
+        });
         input
     }
 

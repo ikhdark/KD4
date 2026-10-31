@@ -45,6 +45,9 @@ const WAIVE_AGENT_GATE_TOOL: &str = "waive_agent_gate";
 const ABANDON_AGENT_TASK_TOOL: &str = "abandon_agent_task";
 
 pub(crate) struct GetAgentTaskHandler;
+pub(crate) use partial_result::GetAgentPartialResultHandler;
+pub(crate) use partial_result::GroupAgentFindingsHandler;
+pub(crate) use partial_result::PublishAgentPartialResultHandler;
 pub(crate) struct SubmitAgentReceiptHandler;
 pub(crate) struct SetAgentGateHandler;
 pub(crate) struct AmendAgentTaskHandler;
@@ -122,6 +125,52 @@ define_handler!(
     false
 );
 
+async fn load_authorized_task(
+    coordinator: &crate::agent::task_coordinator::AgentTaskCoordinator,
+    turn: &crate::session::turn_context::TurnContext,
+    assignment_id: AssignmentId,
+    observation_limit: usize,
+    tool_name: &'static str,
+) -> Result<AgentTask, FunctionCallError> {
+    let caller_binding = coordinator.binding_for_turn(&turn);
+    if crate::agent::task_capabilities::is_independent_review_source(&turn.session_source)
+        && caller_binding.is_none()
+    {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "{tool_name}: independent reviewers require their current bound task"
+        )));
+    }
+    let task = coordinator
+        .get_agent_task(assignment_id, Some(observation_limit))
+        .await
+        .map_err(|error| task_store_error(tool_name, error))?;
+    if crate::agent::task_capabilities::is_independent_review_source(&turn.session_source)
+        && let Some(binding) = &caller_binding
+    {
+        let caller = if binding.assignment_id == assignment_id {
+            task.clone()
+        } else {
+            coordinator
+                .get_agent_task(binding.assignment_id, Some(0))
+                .await
+                .map_err(|error| task_store_error(tool_name, error))?
+        };
+        let current = caller.current_attempt.attempt_id == binding.attempt_id
+            && caller.assignment.root_session_id == binding.root_session_id;
+        let immediate_child = matches!(task.assignment.admission_origin,
+            AssignmentAdmissionOrigin::LegacyMessage { parent_assignment_id: Some(parent) }
+            if parent == binding.assignment_id)
+            && caller.assignment.root_session_id == task.assignment.root_session_id
+            && caller.assignment.repository_id == task.assignment.repository_id;
+        if !current || (binding.assignment_id != assignment_id && !immediate_child) {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "{tool_name}: independent reviewers may read only their current bound task or its immediate children"
+            )));
+        }
+    }
+    Ok(task)
+}
+
 async fn handle_get_agent_task(
     invocation: ToolInvocation,
 ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
@@ -143,40 +192,17 @@ async fn handle_get_agent_task(
 
     let coordinator = session.services.agent_control.task_coordinator();
     let caller_binding = coordinator.binding_for_turn(&turn);
-    if crate::agent::task_capabilities::is_independent_review_source(&turn.session_source)
-        && caller_binding.is_none()
-    {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "{GET_AGENT_TASK_TOOL}: independent reviewers require their current bound task"
-        )));
-    }
-    let task = coordinator
-        .get_agent_task(assignment_id, Some(observation_limit))
-        .await
-        .map_err(|error| task_store_error(GET_AGENT_TASK_TOOL, error))?;
-    if crate::agent::task_capabilities::is_independent_review_source(&turn.session_source)
-        && let Some(binding) = &caller_binding
-    {
-        let caller = if binding.assignment_id == assignment_id {
-            task.clone()
-        } else {
-            coordinator
-                .get_agent_task(binding.assignment_id, Some(0))
-                .await
-                .map_err(|error| task_store_error(GET_AGENT_TASK_TOOL, error))?
-        };
-        let current = caller.current_attempt.attempt_id == binding.attempt_id
-            && caller.assignment.root_session_id == binding.root_session_id;
-        let immediate_child = matches!(task.assignment.admission_origin,
-            AssignmentAdmissionOrigin::LegacyMessage { parent_assignment_id: Some(parent) }
-            if parent == binding.assignment_id)
-            && caller.assignment.root_session_id == task.assignment.root_session_id
-            && caller.assignment.repository_id == task.assignment.repository_id;
-        if !current || (binding.assignment_id != assignment_id && !immediate_child) {
-            return Err(FunctionCallError::RespondToModel(format!(
-                "{GET_AGENT_TASK_TOOL}: independent reviewers may read only their current bound task or its immediate children"
-            )));
-        }
+    let task = load_authorized_task(
+        coordinator, &turn, assignment_id, observation_limit, GET_AGENT_TASK_TOOL,
+    ).await?;
+    if let Some(attempt_id) = args.attempt_id {
+        let attempt_id = AttemptId::parse(&attempt_id)
+            .map_err(|error| task_store_error(GET_AGENT_TASK_TOOL, error))?;
+        let store = coordinator.store().ok_or_else(|| FunctionCallError::RespondToModel(
+            "get_agent_task: task store is unavailable".into()))?;
+        let (attempt, receipt) = store.get_agent_attempt(assignment_id, attempt_id).await
+            .map_err(|error| task_store_error(GET_AGENT_TASK_TOOL, error))?;
+        return Ok(boxed_tool_output(AgentAttemptResult { attempt, receipt, acceptance: "not_evaluated" }));
     }
     let (cold_review_context, receipt_handoffs) = if caller_binding
         .as_ref()
@@ -739,6 +765,7 @@ fn task_store_error(tool_name: &'static str, error: StoreError) -> FunctionCallE
 #[serde(deny_unknown_fields)]
 struct GetAgentTaskArgs {
     assignment_id: String,
+    attempt_id: Option<String>,
     observation_limit: Option<usize>,
 }
 
@@ -1689,6 +1716,13 @@ struct AmendAgentTaskResult {
 }
 
 #[derive(Debug, Serialize)]
+struct AgentAttemptResult {
+    attempt: Attempt,
+    receipt: Option<AgentReceipt>,
+    acceptance: &'static str,
+}
+
+#[derive(Debug, Serialize)]
 struct WaiveAgentGateResult {
     gate: AgentGate,
 }
@@ -1825,6 +1859,7 @@ impl ToolOutput for SubmitAgentReceiptResult {
 }
 impl_json_output!(SetAgentGateResult, SET_AGENT_GATE_TOOL);
 impl_json_output!(AmendAgentTaskResult, AMEND_AGENT_TASK_TOOL);
+impl_json_output!(AgentAttemptResult, GET_AGENT_TASK_TOOL);
 impl_json_output!(WaiveAgentGateResult, WAIVE_AGENT_GATE_TOOL);
 impl_json_output!(AbandonAgentTaskResult, ABANDON_AGENT_TASK_TOOL);
 
@@ -1832,6 +1867,7 @@ fn get_agent_task_spec() -> ToolSpec {
     function_spec(
         GET_AGENT_TASK_TOOL,
         "Read a durable task's current attempt, gates, receipt, evidence and recent observations. \
+         With attempt_id, recover only that exact attempt and its sealed receipt, even after a follow-up; this historical result is not acceptance or current gate state. \
          Bound Reviewers, Verifiers and Integrators use their OWN assignment_id for compact \
          target/dependency handoffs. Recover only needed contract, receipt or evidence fields \
          with read_tool_output using canonical_recovery.artifact_id and the supplied JSON pointers. \
@@ -1853,6 +1889,10 @@ fn get_agent_task_spec() -> ToolSpec {
                         "Number of newest observations to return. Defaults to 20; capped at 100."
                             .to_string(),
                     )),
+                ),
+                (
+                    "attempt_id",
+                    JsonSchema::string(Some("Optional exact producer attempt from a completion result_recovery reference; returns attempt and receipt only.".into())),
                 ),
             ],
             &["assignment_id"],
@@ -2258,5 +2298,8 @@ fn object_schema<const N: usize>(
         Some(false.into()),
     )
 }
+
+#[path = "partial_result.rs"]
+mod partial_result;
 
 

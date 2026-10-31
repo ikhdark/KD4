@@ -42,6 +42,11 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     let clear_timeout = helper_function(scope, "clearTimeout", clear_timeout_callback)?;
     let set_timeout = helper_function(scope, "setTimeout", set_timeout_callback)?;
     let text = helper_function(scope, "text", text_callback)?;
+    let extract_result = helper_function(
+        scope,
+        "extract_result",
+        super::output_projection::extract_result_callback,
+    )?;
     let format_tool_result =
         helper_function(scope, "format_tool_result", format_tool_result_callback)?;
     let image = helper_function(scope, "image", image_callback)?;
@@ -84,6 +89,7 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     set_global(scope, global, "clearTimeout", clear_timeout.into())?;
     set_global(scope, global, "setTimeout", set_timeout.into())?;
     set_global(scope, global, "text", text.into())?;
+    set_global(scope, global, "extract_result", extract_result.into())?;
     set_global(
         scope,
         global,
@@ -123,6 +129,11 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     v8::Script::compile(scope, graph_source, None)
         .and_then(|script| script.run(scope))
         .ok_or_else(|| "failed to install dependency graph helper".to_string())?;
+    let pagination = v8::String::new(scope, include_str!("search_pagination.js"))
+        .ok_or_else(|| "failed to allocate search pagination helper".to_string())?;
+    v8::Script::compile(scope, pagination, None)
+        .and_then(|script| script.run(scope))
+        .ok_or_else(|| "failed to install search pagination helper".to_string())?;
     let orchestration = v8::String::new(scope, include_str!("orchestration.js"))
         .ok_or_else(|| "failed to allocate orchestration helpers".to_string())?;
     v8::Script::compile(scope, orchestration, None)

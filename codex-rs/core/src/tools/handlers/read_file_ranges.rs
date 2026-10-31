@@ -22,6 +22,26 @@ pub(super) enum ByteEncoding {
     Base64,
 }
 
+pub(super) fn binary_recovery(
+    path: &PathUri,
+    environment_id: &str,
+    start: u64,
+    end: u64,
+    revision: Option<&str>,
+) -> serde_json::Value {
+    json!(["hex", "base64"].map(|encoding| {
+        let mut arguments = json!({
+            "path":path.inferred_native_path_string(), "environment_id":environment_id,
+            "encoding":encoding,
+            "selectors":[{"kind":"bytes", "start":start, "end":end.min(start.saturating_add(256))}],
+        });
+        if let Some(revision) = revision {
+            arguments["if_file_revision"] = json!(revision);
+        }
+        json!({"tool":"read_file", "arguments":arguments})
+    }))
+}
+
 pub(super) async fn read_ranges(
     invocation: &ToolInvocation,
     args: &ReadFileArgs,
@@ -58,8 +78,9 @@ pub(super) async fn read_ranges(
             .model_info
             .truncation_policy
             .into();
-        policy
-            .token_budget()
+        invocation.step_context.model_output_token_limit(
+            &invocation.session, policy.token_budget(),
+        ).await
             .saturating_sub(2_000)
             .saturating_mul(4)
             .saturating_div(6)
@@ -69,59 +90,84 @@ pub(super) async fn read_ranges(
     let mut file_bytes = None;
     let mut results = Vec::new();
     let mut pending = Vec::new();
-    for (start, end) in requested {
-        if remaining == 0 {
-            pending.push(json!({"kind":"bytes", "start":start, "end":end}));
-            continue;
+    let mut cursor = 0;
+    while cursor < requested.len() && remaining > 0 {
+        // Fit whole selectors together; the first oversized selector gets its
+        // original bounded prefix. EOF savings remain usable by the next group.
+        // Duplicate delivery still counts against the existing payload budget.
+        let mut group = Vec::new();
+        let mut planned = 0usize;
+        while let Some(&(start, end)) = requested.get(cursor) {
+            let len = (end - start).min(remaining as u64) as usize;
+            if !group.is_empty() && len > remaining - planned { break; }
+            group.push((cursor, start, end, start + len as u64));
+            planned += len;
+            cursor += 1;
+            if planned == remaining { break; }
         }
-        if invocation.cancellation_token.is_cancelled() {
-            return Err(error("read_file cancelled".into()));
-        }
-        let len = (end - start).min(remaining as u64) as usize;
-        let read = fs
-            .read_file_range(path, start, len, revision.as_deref(), Some(sandbox))
-            .await
-            .map_err(|err| error(format!("unable to read byte range: {err}")))?;
-        if file_bytes.is_some_and(|size| size != read.file_bytes)
-            || revision
-                .as_ref()
-                .is_some_and(|expected| expected != &read.revision)
-        {
-            return Err(error(
-                "file revision changed during byte-range batch; no mixed-revision bytes delivered"
-                    .into(),
-            ));
-        }
-        file_bytes = Some(read.file_bytes);
-        revision = Some(read.revision);
-        let delivered_end = start + read.bytes.len() as u64;
-        let selected_end = end.min(read.file_bytes);
-        let complete = delivered_end == selected_end;
-        remaining -= read.bytes.len();
-        let mut result = json!({
-            "selector":{"kind":"bytes", "start":start, "end":end},
-            "canonical_range":{"start":start, "end":delivered_end},
-            "exact_bytes":read.bytes.len(), "status":"ok", "complete":complete,
-        });
-        match args.encoding {
-            Some(ByteEncoding::Hex) => result["data_hex"] = json!(hex::encode(&read.bytes)),
-            Some(ByteEncoding::Base64) => {
-                result["data_base64"] = json!(STANDARD.encode(&read.bytes))
+        let merged = crate::tools::command_output_artifact::normalize_byte_ranges_with_fit(
+            group.iter().map(|&(_, start, _, end)| (start, end)).collect(),
+            |_, _| true,
+        );
+        let mut acquired = Vec::with_capacity(merged.len());
+        for (start, end) in merged {
+            let read = tokio::select! {
+                biased;
+                _ = invocation.cancellation_token.cancelled() => return Err(error("read_file cancelled".into())),
+                read = fs.read_file_range(path, start, (end - start) as usize, revision.as_deref(), Some(sandbox)) =>
+                    read.map_err(|err| error(format!("unable to read byte range: {err}")))?,
+            };
+            if file_bytes.is_some_and(|size| size != read.file_bytes)
+                || revision.as_ref().is_some_and(|expected| expected != &read.revision)
+                || read.bytes.len() as u64 != end.min(read.file_bytes).saturating_sub(start)
+            {
+                return Err(error("file revision changed or range incomplete during byte-range batch; no mixed-revision bytes delivered".into()));
             }
-            // NUL bytes mark binary data or UTF-16 code units even when the
-            // page is valid UTF-8; deliver those pages as bytes, not text.
-            None => match std::str::from_utf8(&read.bytes) {
-                Ok(text) if !read.bytes.contains(&0) => result["text"] = json!(text),
-                _ => result["data_base64"] = json!(STANDARD.encode(&read.bytes)),
-            },
+            file_bytes = Some(read.file_bytes);
+            revision = Some(read.revision);
+            acquired.push((start, end, read.bytes));
         }
-        if !complete {
-            let next = json!({"kind":"bytes", "start":delivered_end, "end":end});
-            result["continuation"] = next.clone();
-            pending.push(next);
+        for (selector_index, start, end, planned_end) in group {
+            let (base, _, bytes) = acquired.iter()
+                .find(|(base, limit, _)| *base <= start && *limit >= planned_end)
+                .expect("normalized range covers each admitted selector");
+            let offset = (start - base).min(bytes.len() as u64) as usize;
+            let len = (planned_end - start).min(bytes.len().saturating_sub(offset) as u64) as usize;
+            let bytes = &bytes[offset..offset + len];
+            let delivered_end = start + len as u64;
+            let selected_end = end.min(file_bytes.expect("range acquired")).max(start);
+            let complete = delivered_end == selected_end;
+            remaining -= len;
+            let mut result = json!({
+                "selector":{"kind":"bytes", "start":start, "end":end},
+                "selector_index":selector_index,
+                "canonical_range":{"start":start, "end":delivered_end},
+                "exact_bytes":len, "status":"ok", "complete":complete,
+            });
+            match args.encoding {
+                Some(ByteEncoding::Hex) => result["data_hex"] = json!(hex::encode(bytes)),
+                Some(ByteEncoding::Base64) => result["data_base64"] = json!(STANDARD.encode(bytes)),
+                None => {
+                    if let Some(classification) = super::encoding::classify_page(bytes, start == 0) {
+                        result["classification"] = json!(classification);
+                        result["binary_recovery"] = binary_recovery(
+                            path, environment_id, start, delivered_end, revision.as_deref(),
+                        );
+                        result["data_base64"] = json!(STANDARD.encode(bytes));
+                    } else if let Ok(text) = std::str::from_utf8(bytes) {
+                        result["text"] = json!(text);
+                    }
+                }
+            }
+            if !complete {
+                let next = json!({"kind":"bytes", "start":delivered_end, "end":end});
+                result["continuation"] = next.clone();
+                pending.push(next);
+            }
+            results.push(result);
         }
-        results.push(result);
     }
+    pending.extend(requested[cursor..].iter().map(|&(start, end)| json!({"kind":"bytes","start":start,"end":end})));
     if invocation.cancellation_token.is_cancelled() {
         return Err(error("read_file cancelled".into()));
     }

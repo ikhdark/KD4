@@ -35,13 +35,18 @@ pub(crate) use resource_lock::Handler as AgentLockHandler;
 pub(crate) use spawn::Handler as SpawnAgentHandler;
 pub(crate) use task::AbandonAgentTaskHandler;
 pub(crate) use task::AmendAgentTaskHandler;
+pub(crate) use task::GetAgentPartialResultHandler;
 pub(crate) use task::GetAgentTaskHandler;
+pub(crate) use task::GroupAgentFindingsHandler;
+pub(crate) use task::PublishAgentPartialResultHandler;
 pub(crate) use task::SetAgentGateHandler;
 pub(crate) use task::SubmitAgentReceiptHandler;
 pub(crate) use task::WaiveAgentGateHandler;
 pub(crate) use wait::Handler as WaitAgentHandler;
 
 mod interrupt_agent;
+mod edit_intents;
+pub(crate) use edit_intents::Handler as DeclareEditIntentsHandler;
 mod list_agents;
 mod message_tool;
 mod resource_lock;

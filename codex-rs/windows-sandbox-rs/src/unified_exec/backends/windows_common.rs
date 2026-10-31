@@ -41,36 +41,43 @@ pub(crate) fn start_runner_stdin_writer(
     outbound_tx: RunnerOutbound,
     normalize_newlines: bool,
     stdin_open: bool,
+    stdin_close_tx: tokio::sync::watch::Sender<Option<codex_utils_pty::StdinCloseResult>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut windows_input = WindowsTtyInputNormalizer::default();
-        loop {
-            let bytes = tokio::select! {
-                biased;
-                _ = outbound_tx.input_closed() => return,
-                bytes = writer_rx.recv() => match bytes { Some(bytes) => bytes, None => break },
-            };
-            let bytes = std::sync::Arc::new(bytes);
-            let normalized = normalize_newlines.then(|| windows_input.normalize(&bytes));
-            let input = normalized.as_deref().unwrap_or(&bytes);
-            for chunk in input.chunks(IO_CHUNK_BYTES) {
-                let message = Message::Stdin {
-                    payload: StdinPayload {
-                        data_b64: encode_bytes(chunk),
+        let result: anyhow::Result<()> = async {
+            let mut windows_input = WindowsTtyInputNormalizer::default();
+            loop {
+                let bytes = tokio::select! {
+                    biased;
+                    _ = outbound_tx.input_closed() => {
+                        outbound_tx.input_close_result().await?;
+                        return Ok(());
                     },
+                    bytes = writer_rx.recv() => match bytes { Some(bytes) => bytes, None => break },
                 };
-                if outbound_tx.send_data(message, Some(std::sync::Arc::clone(&bytes))).await.is_err() {
-                    return;
+                let bytes = std::sync::Arc::new(bytes);
+                let normalized = normalize_newlines.then(|| windows_input.normalize(&bytes));
+                let input = normalized.as_deref().unwrap_or(&bytes);
+                for chunk in input.chunks(IO_CHUNK_BYTES) {
+                    let message = Message::Stdin {
+                        payload: StdinPayload {
+                            data_b64: encode_bytes(chunk),
+                        },
+                    };
+                    outbound_tx.send_data(message, Some(std::sync::Arc::clone(&bytes))).await?;
                 }
             }
-        }
-        if stdin_open {
-            let _ = outbound_tx
-                .send_data(Message::CloseStdin {
-                    payload: EmptyPayload::default(),
-                }, None)
-                .await;
-        }
+            if stdin_open {
+                outbound_tx
+                    .send_data(Message::CloseStdin {
+                        payload: EmptyPayload::default(),
+                    }, None)
+                    .await?;
+                outbound_tx.input_close_result().await?;
+            }
+            Ok(())
+        }.await;
+        stdin_close_tx.send_replace(Some(result.map_err(|error| (std::io::ErrorKind::BrokenPipe, error.to_string()))));
     })
 }
 
@@ -80,6 +87,7 @@ pub(crate) fn start_runner_stdout_reader(
     stderr_tx: Option<mpsc::Sender<Vec<u8>>>,
     exit_tx: oneshot::Sender<i32>,
     outbound: Option<RunnerOutbound>,
+    shutdown_tx: std::sync::mpsc::SyncSender<bool>,
 ) {
     // Independent bounded stream consumers never hold up the frame parser.
     // The runner's per-stream window makes try_send below nonblocking even
@@ -158,6 +166,7 @@ pub(crate) fn start_runner_stdout_reader(
                     }
                 }
                 Message::Exit { payload } => {
+                    let _ = shutdown_tx.send(payload.shutdown_confirmed);
                     let _ = exit_tx.send(payload.exit_code);
                     break;
                 }

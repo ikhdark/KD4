@@ -335,6 +335,25 @@ pub struct ModelPromptContextCategoryTelemetry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ModelToolResultTelemetry {
+    /// Position in the full logical input, not an incremental wire suffix.
+    pub input_index: usize,
+    pub kind: &'static str,
+    /// Originating outer tool from the logical input. Missing or conflicting
+    /// call identities stay unknown; nested Code Mode sources are not inferred.
+    pub tool_name: Option<String>,
+    pub tool_namespace: Option<String>,
+    pub call_id_sha256: String,
+    pub representation_sha256: String,
+    pub serialized_bytes: u64,
+    /// Same byte/image heuristic as the prompt categories; not provider usage.
+    pub estimated_tokens: u64,
+    /// o200k estimate of the final serialized item, including its envelope.
+    /// Unavailable for image/encrypted payloads, never a per-result bill.
+    pub tokenizer_estimate: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ModelToolSchemaTelemetry {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -406,6 +425,7 @@ pub struct ModelAttemptTelemetry {
     pub operational_relevance_proxy_tokens: u64,
     pub operational_relevance_proxy_density_bps: u32,
     pub tool_schema_breakdown: Vec<ModelToolSchemaTelemetry>,
+    pub tool_result_attribution: Vec<ModelToolResultTelemetry>,
     pub full_prompt_estimated_tokens: u64,
     pub fixed_prefix_reuse_eligible: bool,
     pub logical_context_tokens: i64,
@@ -1635,6 +1655,8 @@ impl SessionTelemetry {
             .unwrap_or_else(|_| "[]".to_string());
         let tool_schema_breakdown = serde_json::to_string(&record.tool_schema_breakdown)
             .unwrap_or_else(|_| "[]".to_string());
+        let tool_result_attribution = serde_json::to_string(&record.tool_result_attribution)
+            .unwrap_or_else(|_| "[]".to_string());
         let prompt_category_estimated_tokens = record
             .prompt_context_categories
             .iter()
@@ -1709,6 +1731,12 @@ impl SessionTelemetry {
                 envelope_overhead_bytes = record.envelope_overhead_bytes,
                 reconciliation_residual_bytes = record.reconciliation_residual_bytes,
                 prompt_token_accounting_basis = "full_logical_prompt",
+                prompt_estimate_basis = "byte_div_4_image_budget_v1",
+                tool_result_tokenizer_basis = "o200k_base_serialized_item_v1",
+                tool_result_billing_basis = "unavailable",
+                usage_basis = "provider_reported_request_totals",
+                cached_input_basis = "provider_reported_request_subset_not_additive",
+                tool_result_attribution = %tool_result_attribution,
                 prompt_context_categories = %prompt_context_categories,
                 prompt_category_estimated_tokens = prompt_category_estimated_tokens,
                 relevance_proxy_basis = "producer_selected_context_plus_observed_tool_calls",

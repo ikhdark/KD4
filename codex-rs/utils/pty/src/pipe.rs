@@ -61,6 +61,16 @@ struct PipeChildTerminator {
 }
 
 impl ChildTerminator for PipeChildTerminator {
+    #[cfg(windows)]
+    fn tree_is_empty(&self) -> io::Result<bool> {
+        self.managed.tree_is_empty()
+    }
+
+    #[cfg(windows)]
+    fn replay_control(&self) -> Option<Box<dyn ChildTerminator>> {
+        Some(Box::new(self.managed.replay_job()))
+    }
+
     fn signal(&mut self, signal: ProcessSignal) -> io::Result<()> {
         match signal {
             ProcessSignal::Interrupt => {
@@ -172,6 +182,16 @@ async fn spawn_process_with_stdin_mode(
 ) -> Result<SpawnedProcess> {
     if program.is_empty() {
         anyhow::bail!("missing program for pipe spawn");
+    }
+    // std::process::Command implicitly invokes CMD for batch files. Native argv
+    // must not acquire shell semantics; match ConPTY's explicit-shell boundary.
+    #[cfg(windows)]
+    if Path::new(program).extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+    }) {
+        anyhow::bail!(
+            "Pipe spawn cannot execute batch argv directly; invoke cmd.exe /d /c with an explicit shell script"
+        );
     }
 
     #[cfg(not(unix))]
@@ -298,19 +318,40 @@ async fn finish_pipe_process_setup(
     let stderr = child.stderr.take();
 
     let (writer_tx, mut writer_rx) = crate::stdin_channel(128);
+    let (stdin_close_tx, mut stdin_close_rx) = tokio::sync::watch::channel(false);
+    let (stdin_receipt_tx, stdin_receipt_rx) = tokio::sync::watch::channel(None);
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
     let (stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(128);
     let writer_handle = if let Some(stdin) = stdin {
         tokio::spawn(async move {
             let mut writer = stdin;
-            while let Some(bytes) = writer_rx.recv().await {
-                if writer.write_all(&bytes).await.is_err() || writer.flush().await.is_err() {
-                    break;
+            let result: io::Result<()> = async {
+                loop {
+                    let bytes = tokio::select! {
+                        biased;
+                        _ = stdin_close_rx.changed(), if !writer_rx.is_closed() => {
+                            // Reject new reservations, but drain all accepted bytes.
+                            // Sender clones cannot keep the pipe open after close.
+                            writer_rx.close();
+                            continue;
+                        }
+                        bytes = writer_rx.recv() => match bytes {
+                            Some(bytes) => bytes,
+                            None => break,
+                        },
+                    };
+                    writer.write_all(&bytes).await?;
+                    writer.flush().await?;
                 }
-            }
+                writer.shutdown().await
+            }.await;
+            // The OS write handle must be gone before EOF is acknowledged.
+            drop(writer);
+            stdin_receipt_tx.send_replace(Some(result.map_err(|error| (error.kind(), error.to_string()))));
         })
     } else {
         drop(writer_rx);
+        stdin_receipt_tx.send_replace(Some(Ok(())));
         tokio::spawn(async {})
     };
 
@@ -408,7 +449,9 @@ async fn finish_pipe_process_setup(
         None,
         /*resizer*/ None,
     )
-    .with_output_capture(capture);
+    .with_output_capture(capture)
+    .with_stdin_close_request(stdin_close_tx)
+    .with_stdin_close_receipt(stdin_receipt_rx);
 
     Ok(SpawnedProcess {
         session: handle,
@@ -426,7 +469,19 @@ pub async fn spawn_process(
     env: &HashMap<String, String>,
     arg0: &Option<String>,
 ) -> Result<SpawnedProcess> {
-    spawn_process_with_stdin_mode(program, args, cwd, env, arg0, PipeStdinMode::Piped, &[]).await
+    spawn_process_with_inherited_fds(program, args, cwd, env, arg0, &[]).await
+}
+
+/// Spawn with writable pipe input, preserving selected descriptors on Unix.
+pub async fn spawn_process_with_inherited_fds(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    env: &HashMap<String, String>,
+    arg0: &Option<String>,
+    inherited_fds: &[i32],
+) -> Result<SpawnedProcess> {
+    spawn_process_with_stdin_mode(program, args, cwd, env, arg0, PipeStdinMode::Piped, inherited_fds).await
 }
 
 /// Spawn a process using regular pipes, but close stdin immediately.

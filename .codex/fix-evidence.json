@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "fixes": [{
+    "id": "read-file-search-enclosing-default",
+    "commit": "8e64f7aebb54b058123e2c28107d41c29a91f2ce",
+    "paths": ["codex-rs/core/src/tools/handlers/read_file_structure.rs"],
+    "receipts": [{
+      "kind": "defect",
+      "path": "../../KDR/docs/KD4_FAILURE_AUDIT.md",
+      "sha256": "f085968d8ed9b955c71e89f320dcb14f047874bb021109a6bd86b2474bf0fe26"
+    }]
+  }, {
+    "id": "historical-reversal-advisory-runtime",
+    "paths": [
+      "codex-rs/git-utils/src/reversal.rs",
+      "codex-rs/git-utils/src/lib.rs",
+      "codex-rs/core/src/tools/handlers/apply_patch.rs",
+      "codex-rs/core/src/tools/handlers/apply_patch_spec.rs",
+      "codex-rs/core/src/tools/context.rs"
+    ],
+    "receipts": [{
+      "kind": "benchmark",
+      "path": "audits/historical-reversal/runtime.json",
+      "sha256": "72ed68e67c9670cf1a12e2c7896fc36e5a8c2704d232b59bbb2315f8b72211fc"
+    }]
+  }, {
+    "id": "validator-and-catalog-correction-hints",
+    "paths": ["codex-rs/core/src/tools/registry.rs"],
+    "receipts": [{
+      "kind": "defect",
+      "path": "audits/tool-corrections-final-reuse-2026-10-31/dev-baseline.json",
+      "sha256": "4eb5613ed81dd7d152d3e0abf2383b4e9bb3bfb2ee03c81328b8545ff3fa6805"
+    }, {
+      "kind": "defect",
+      "path": "audits/tool-corrections-final-reuse-2026-10-31/dev-candidate.json",
+      "sha256": "4a368e6733b1b45cdbe1aca2bec2a5aacc73f00cc6bbc79450eeebf97d93bb02"
+    }]
+  }, {
+    "id": "accepted-final-reuse-obligation-gates",
+    "paths": [
+      "codex-rs/core/src/session/turn_execution.rs",
+      "codex-rs/code-mode-protocol/src/description/exec_prompt.rs"
+    ],
+    "receipts": [{
+      "kind": "defect",
+      "path": "audits/tool-corrections-final-reuse-2026-10-31/dev-baseline.json",
+      "sha256": "4eb5613ed81dd7d152d3e0abf2383b4e9bb3bfb2ee03c81328b8545ff3fa6805"
+    }, {
+      "kind": "defect",
+      "path": "audits/tool-corrections-final-reuse-2026-10-31/dev-candidate.json",
+      "sha256": "4a368e6733b1b45cdbe1aca2bec2a5aacc73f00cc6bbc79450eeebf97d93bb02"
+    }]
+  },
+    {
+      "id": "16-20-batched-source-hydration-rejected-rolled-back",
+      "paths": [
+        "codex-rs/code-mode-runtime/src/runtime/orchestration.js",
+        "codex-rs/code-mode-protocol/src/description/exec_prompt.rs"
+      ],
+      "receipts": [
+        {
+          "kind": "defect",
+          "path": "audits/16-20-hydration-initialization/baseline-defects.json",
+          "sha256": "2457b107fdde6328643e99a0bdc26cd8a56a9361a8bd834e2fb268da8611d3d6"
+        },
+        {
+          "kind": "benchmark",
+          "path": "audits/16-20-hydration-initialization/dev-baseline.json",
+          "sha256": "d5f831841e21d4d382541dab51f7dddeffaf8df7be893b6ea8ce302736b0c9d3"
+        },
+        {
+          "kind": "benchmark",
+          "path": "audits/16-20-hydration-initialization/dev-candidate.json",
+          "sha256": "7c9bca9167233bb97dfa9491c80dd4ec4183913c49448e9465d84860bf5cf68b"
+        },
+        {
+          "kind": "benchmark",
+          "path": "audits/16-20-hydration-initialization/dev-comparison.json",
+          "sha256": "4cbacbe2a87303a1933dcbc5304a77240ade0e839bdd231853208875cd9a30a2"
+        },
+        {
+          "kind": "benchmark",
+          "path": "audits/16-20-hydration-initialization/comparison.json",
+          "sha256": "8ed7e1305e1aebaab8039260dee87563b9443128f165763ab851fc86b251550e"
+        },
+        {
+          "kind": "defect",
+          "path": "audits/16-20-hydration-initialization/rollback-identities.json",
+          "sha256": "3a3d14fd4f852ea2bad699f374a7ddbd0aadcd55be5386d7809ca862ef52cd4b"
+        }
+      ]
+    }
+  ]
+}

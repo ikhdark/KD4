@@ -33,6 +33,25 @@ pub enum OutgoingMessage {
     Error(OutgoingError),
 }
 
+impl OutgoingMessage {
+    /// Only streaming deltas may wait for later already-ready frames. Everything
+    /// else (including new lifecycle/readiness events) ends the current batch.
+    pub(crate) fn can_batch(&self) -> bool {
+        matches!(
+            self,
+            Self::AppServerNotification(
+                ServerNotification::AgentMessageDelta(_)
+                    | ServerNotification::PlanDelta(_)
+                    | ServerNotification::ReasoningSummaryTextDelta(_)
+                    | ServerNotification::ReasoningTextDelta(_)
+                    | ServerNotification::CommandExecutionOutputDelta(_)
+                    | ServerNotification::CommandExecOutputDelta(_)
+                    | ServerNotification::ProcessOutputDelta(_)
+            )
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OutgoingResponse {
     pub id: RequestId,

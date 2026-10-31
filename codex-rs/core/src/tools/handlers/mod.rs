@@ -1,21 +1,31 @@
 pub(crate) mod agent_jobs;
 pub(crate) mod agent_jobs_spec;
 pub(crate) mod apply_patch;
+mod apply_patch_operations;
 pub(crate) mod apply_patch_retries;
 pub(crate) mod apply_patch_spec;
 pub(crate) use codex_command_analysis::command_preflight;
 pub(crate) use codex_command_analysis::command_search;
 pub(crate) use codex_command_analysis::command_shape;
+pub(crate) mod backend_capabilities;
+mod canonical_paths;
+mod cargo_workspace;
 mod checksum_file;
+mod classify_paths;
 mod compare_artifacts;
 mod current_time;
 mod dynamic;
 pub(crate) mod extension_tools;
 mod git_blame;
+mod git_conflicts;
 mod git_inspection;
+mod git_status;
+mod line_ending_diagnostics;
+mod line_map;
 mod list_available_plugins_to_install;
 pub(crate) mod list_available_plugins_to_install_spec;
 mod list_files;
+mod list_processes;
 mod lookup_executable;
 pub(crate) mod mcp;
 mod mcp_resource;
@@ -47,6 +57,7 @@ mod view_image;
 pub(crate) mod view_image_spec;
 mod wait_for_environment;
 mod wait_for_file;
+mod wait_processes;
 
 use codex_protocol::request_permissions::UriAdditionalPermissionProfile;
 use codex_sandboxing::policy_transforms::intersect_uri_permission_profiles;
@@ -71,16 +82,25 @@ pub(crate) use crate::tools::code_mode::CodeModeExecuteHandler;
 pub(crate) use crate::tools::code_mode::CodeModeWaitHandler;
 use crate::tools::handlers::command_shape::CommandInvocation;
 pub use apply_patch::ApplyPatchHandler;
+pub(crate) use backend_capabilities::BackendCapabilitiesHandler;
+pub(crate) use canonical_paths::CanonicalPathsHandler;
+pub(crate) use cargo_workspace::CargoWorkspaceHandler;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 pub(crate) use checksum_file::ChecksumFileHandler;
+pub(crate) use classify_paths::ClassifyPathsHandler;
 pub(crate) use compare_artifacts::CompareArtifactsHandler;
 pub use current_time::CurrentTimeHandler;
 pub use dynamic::DynamicToolHandler;
 pub(crate) use git_blame::GitBlameHandler;
+pub(crate) use git_conflicts::GitConflictsHandler;
 pub(crate) use git_inspection::GitInspectionHandler;
+pub(crate) use git_status::GitStatusHandler;
+pub(crate) use line_ending_diagnostics::LineEndingDiagnosticsHandler;
+pub(crate) use line_map::LineMapHandler;
 pub use list_available_plugins_to_install::ListAvailablePluginsToInstallHandler;
 pub(crate) use list_files::ListFilesHandler;
+pub(crate) use list_processes::ListProcessesHandler;
 pub(crate) use lookup_executable::LookupExecutableHandler;
 pub use mcp::McpHandler;
 pub use mcp_resource::ListMcpResourceTemplatesHandler;
@@ -114,6 +134,7 @@ pub(crate) use unified_exec::validate_exec_command_arguments;
 pub use view_image::ViewImageHandler;
 pub(crate) use wait_for_environment::WaitForEnvironmentHandler;
 pub(crate) use wait_for_file::WaitForFileHandler;
+pub(crate) use wait_processes::WaitProcessesHandler;
 
 tokio::task_local! {
     static PARSED_FUNCTION_ARGUMENTS: ParsedFunctionArguments;
@@ -125,7 +146,7 @@ tokio::task_local! {
 #[derive(Clone, Debug)]
 pub(crate) struct ParsedFunctionArguments {
     raw: Arc<str>,
-    value: Result<Arc<Value>, Arc<str>>,
+    value: Result<Arc<Value>, Arc<codex_protocol::tool_failure::ToolFailure>>,
 }
 
 impl ParsedFunctionArguments {
@@ -148,12 +169,12 @@ impl ParsedFunctionArguments {
             raw: Arc::from(arguments),
             value: serde_json::from_str(arguments)
                 .map(Arc::new)
-                .map_err(|err| Arc::from(err.to_string())),
+                .map_err(|err| Arc::new(codex_protocol::tool_failure::ToolFailure::invalid_json(err.line(), err.column()))),
         }
     }
 
     pub(crate) fn value(&self) -> Result<&Value, &str> {
-        self.value.as_deref().map_err(std::convert::AsRef::as_ref)
+        self.value.as_deref().map_err(|failure| failure.message.as_str())
     }
 
     fn deserialize<T>(&self, arguments: &str) -> Option<Result<T, FunctionCallError>>
@@ -164,14 +185,8 @@ impl ParsedFunctionArguments {
             return None;
         }
         Some(match &self.value {
-            Ok(value) => T::deserialize(value.as_ref()).map_err(|err| {
-                invalid_arguments(format!(
-                    "failed to parse function arguments: {err}"
-                ))
-            }),
-            Err(message) => Err(invalid_arguments(format!(
-                "failed to parse function arguments: {message}"
-            ))),
+            Ok(value) => deserialize_argument_value(value),
+            Err(failure) => Err(FunctionCallError::structured(failure.as_ref().clone())),
         })
     }
 
@@ -216,16 +231,38 @@ where
     {
         return parsed;
     }
-    serde_json::from_str(arguments).map_err(|err| {
-        invalid_arguments(format!("failed to parse function arguments: {err}"))
-    })
+    ParsedFunctionArguments::from_raw(arguments).deserialize(arguments)
+        .expect("fresh parsed arguments match their input")
 }
 
-fn invalid_arguments(message: String) -> FunctionCallError {
-    FunctionCallError::structured(codex_protocol::tool_failure::ToolFailure::no_effects(
+fn deserialize_argument_value<T>(value: &Value) -> Result<T, FunctionCallError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    serde_path_to_error::deserialize(value).map_err(|error| {
+        use serde_path_to_error::Segment;
+        let mut path = String::new();
+        for segment in error.path() {
+            let name = match segment {
+                Segment::Seq { index } => index.to_string(),
+                Segment::Map { key } => key.clone(),
+                Segment::Enum { .. } | Segment::Unknown => break,
+            };
+            path.push('/');
+            path.push_str(&name.replace('~', "~0").replace('/', "~1"));
+        }
+        // Serde's error text can contain a rejected credential or source body.
+        // The registry adds schema-derived expectations where available.
+        let mut failure = codex_protocol::tool_failure::ToolFailure::no_effects(
         codex_protocol::tool_failure::ToolFailureCode::InvalidInput,
-        message,
-    ))
+            "Arguments rejected before execution: a field does not satisfy the advertised contract.",
+        );
+        failure.field_errors.push(codex_protocol::tool_failure::ToolFieldError {
+            path, expected: "a value accepted by the advertised field contract".into(),
+            correction: "Correct this field using its advertised type, allowed values and bounds.".into(),
+        });
+        FunctionCallError::structured(failure)
+    })
 }
 
 fn updated_hook_command(updated_input: &Value) -> Result<&str, FunctionCallError> {

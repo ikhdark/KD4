@@ -2189,6 +2189,10 @@ impl<'de> Deserialize<'de> for SearchToolCallParams {
 /// `arguments` field should deserialize to this struct.
 #[derive(Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 pub struct ShellCommandToolCallParams {
+    /// Explicit, per-receipt compact success with retained output; default false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub quiet_on_success: Option<bool>,
     /// Optional model-visible output token budget, capped by policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -2208,6 +2212,10 @@ pub struct ShellCommandToolCallParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub script_body: Option<String>,
+    /// Shell executable for this command only; never changes session or machine defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub shell: Option<String>,
     pub workdir: Option<String>,
 
     /// Whether to run the shell with login shell semantics
@@ -2467,11 +2475,7 @@ impl CallToolResult {
                 convert_mcp_content_item(parsed, Cow::Owned(content))
             })
             .collect();
-        mcp_items_to_function_call_output_payload(
-            items,
-            self.structured_content.as_ref(),
-            success,
-        )
+        mcp_items_to_function_call_output_payload(items, self.structured_content.as_ref(), success)
     }
 }
 
@@ -2693,4 +2697,3 @@ impl std::fmt::Display for FunctionCallOutputPayload {
 }
 
 // (Moved event mapping logic into codex-core to avoid coupling protocol to UI-facing events.)
-

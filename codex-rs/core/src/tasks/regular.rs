@@ -121,19 +121,26 @@ async fn validate_final_response(
     ctx: &TurnContext,
     result: &TurnTaskResult,
 ) -> codex_protocol::error::Result<()> {
-    if result.surfaced_result.is_none()
-        && result.required_tool_terminal.is_none()
+    if result.required_tool_terminal.is_none()
         && ctx.post_tool_stop_reason.get().is_none()
         && let Some(schema) = ctx.final_output_json_schema.as_ref()
         && ctx.terminal_error.lock().await.is_none()
     {
         schema
-            .validate_text(result.last_agent_message.as_deref())
-            .map_err(|error| {
-                codex_protocol::error::CodexErr::Fatal(format!(
-                    "Final response violates the output schema: {error}"
-                ))
-            })?;
+            .validate_text(
+                result
+                    .surfaced_result
+                    .as_ref()
+                    .and_then(|result| result.canonical_message.as_deref())
+                    .or_else(|| {
+                        result
+                            .accepted_final_message
+                            .as_ref()
+                            .map(|message| message.text.as_str())
+                    })
+                    .or(result.last_agent_message.as_deref()),
+            )
+            .map_err(|error| ctx.final_response_validation_error(error))?;
     }
     Ok(())
 }

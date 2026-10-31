@@ -5,6 +5,8 @@ pub(crate) struct ProcessState {
     pub(crate) exit_observed_at: Option<std::time::Instant>,
     pub(crate) failure_message: Option<String>,
     pub(crate) sandbox_denied: bool,
+    pub(crate) shutdown: Option<crate::tools::context::ExecShutdownStatus>,
+    pub(crate) shutdown_error: Option<String>,
 }
 
 impl ProcessState {
@@ -18,6 +20,8 @@ impl ProcessState {
             ),
             failure_message: self.failure_message.clone(),
             sandbox_denied: self.sandbox_denied,
+            shutdown: self.shutdown,
+            shutdown_error: self.shutdown_error.clone(),
         }
     }
 
@@ -28,6 +32,8 @@ impl ProcessState {
             exit_observed_at: self.exit_observed_at,
             failure_message: Some(message),
             sandbox_denied: self.sandbox_denied,
+            shutdown: self.shutdown,
+            shutdown_error: self.shutdown_error.clone(),
         }
     }
 }

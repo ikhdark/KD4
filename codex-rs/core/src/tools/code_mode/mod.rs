@@ -1,7 +1,6 @@
 mod delegate;
 mod execute_handler;
 pub(crate) mod execute_spec;
-mod repeated_bodies;
 mod response_adapter;
 mod wait_handler;
 pub(crate) mod wait_spec;
@@ -118,10 +117,6 @@ pub(crate) struct CodeModeService {
     receipt_capacity: Arc<tokio::sync::Semaphore>,
     cell_parent_call_ids: Mutex<HashMap<String, String>>,
     shutting_down: AtomicBool,
-    /// Input of the latest sampling request, which issued the running cells.
-    visible_prompt: Mutex<Option<Arc<[codex_protocol::models::ResponseItem]>>>,
-    /// Bodies last printed as a reference; the next print repeats them.
-    elided_bodies: Mutex<std::collections::HashSet<[u8; 32]>>,
 }
 
 #[derive(Default)]
@@ -173,10 +168,11 @@ struct CodeModePacketMetrics {
     inline_recovery_bytes: usize,
     recovery_metadata_bytes: usize,
     pending_recovery_metadata: std::collections::BTreeMap<usize, usize>,
-    /// `{call_id, tool_name}` of admitted calls that have not settled. Carried
+    /// Owner-backed identities of submitted calls that have not settled. Carried
     /// across packets like their reservations, so a terminal packet can name
     /// work the script stopped waiting for.
-    pending_call_identities: std::collections::BTreeMap<usize, JsonValue>,
+    pending_call_identities: std::collections::BTreeMap<usize, PendingNestedCall>,
+    settled_call_transitions: Vec<JsonValue>,
     /// Settled outcomes the script never observed: its wait was cancelled
     /// (wrapper deadline or cell end) and it saw only an error.
     unobserved_settlements: Vec<FunctionCallOutputContentItem>,
@@ -187,6 +183,13 @@ struct CodeModePacketMetrics {
     /// delivered packet. That delivery is the only projection the recovered
     /// evidence crosses after its own bounded read.
     tool_output_recovery_count: u32,
+}
+
+#[derive(Clone)]
+struct PendingNestedCall {
+    identity: JsonValue,
+    dispatch: Arc<crate::tools::context::ToolDispatchState>,
+    last_observation: Option<JsonValue>,
 }
 
 struct CodeModeDeliveryIntent {
@@ -379,6 +382,7 @@ struct CodeModePacketReceipt {
     tool_output_recovery_count: u32,
     output_budget: Option<usize>,
     unsettled_nested_calls: Vec<JsonValue>,
+    nested_call_transitions: Vec<JsonValue>,
     unobserved_settlements: Vec<FunctionCallOutputContentItem>,
     omitted_unobserved_settlement_count: usize,
 }
@@ -550,34 +554,7 @@ impl CodeModeService {
             receipt_capacity: Arc::new(tokio::sync::Semaphore::new(256)),
             cell_parent_call_ids: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
-            visible_prompt: Mutex::new(None),
-            elided_bodies: Mutex::new(std::collections::HashSet::new()),
         }
-    }
-
-    /// Records the input of a sampling request before it is sent. Cells it
-    /// issues do not print source bodies again that it holds verbatim.
-    pub(crate) fn note_visible_prompt(&self, items: Arc<[codex_protocol::models::ResponseItem]>) {
-        *self
-            .visible_prompt
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(items);
-    }
-
-    pub(super) fn elide_bodies_already_in_context(&self, output: &mut FunctionToolOutput) {
-        let Some(prompt) = self
-            .visible_prompt
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-        else {
-            return;
-        };
-        let mut elided = self
-            .elided_bodies
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        repeated_bodies::elide_bodies_already_in_context(&mut output.body, &prompt, &mut elided);
     }
 
     pub(crate) fn with_recovery_path(mut self, path: impl AsRef<std::path::Path>) -> Self {
@@ -822,7 +799,7 @@ impl CodeModeService {
         }
     }
 
-    /// Names an admitted nested call until it settles, so a terminal packet
+    /// Names a submitted nested call until it settles, so a terminal packet
     /// can report work the script stopped waiting for. A closed packet is not
     /// recreated.
     fn record_packet_call_identity(
@@ -831,6 +808,9 @@ impl CodeModeService {
         ordinal: usize,
         call_id: &str,
         tool_name: &str,
+        parent_call_id: Option<&str>,
+        runtime_tool_call_id: &str,
+        dispatch: Arc<crate::tools::context::ToolDispatchState>,
     ) {
         if let Some(metrics) = self
             .packet_admission
@@ -841,7 +821,15 @@ impl CodeModeService {
         {
             metrics.pending_call_identities.insert(
                 ordinal,
-                serde_json::json!({"call_id": call_id, "tool_name": tool_name}),
+                PendingNestedCall {
+                    identity: serde_json::json!({
+                        "call_id": call_id, "tool_name": tool_name,
+                        "parent_call_id": parent_call_id, "cell_id": cell_id.as_str(),
+                        "runtime_tool_call_id": runtime_tool_call_id,
+                    }),
+                    dispatch,
+                    last_observation: None,
+                },
             );
         }
     }
@@ -1519,7 +1507,26 @@ impl CodeModeService {
             return;
         };
         metrics.pending_recovery_metadata.remove(&ordinal);
-        metrics.pending_call_identities.remove(&ordinal);
+        if let Some(pending) = metrics.pending_call_identities.remove(&ordinal) {
+            let mut entry = pending.identity;
+            entry["execution"] = pending.dispatch.execution_observation();
+            if entry["execution"]["state"] == "queued" {
+                // This packet owner rejected the call before dispatch. It
+                // cannot claim the dispatch owner admitted or ran anything.
+                entry["execution"] = serde_json::json!({
+                    "state": "terminal", "terminal_outcome": "rejected_before_dispatch",
+                    "handler_started": false,
+                });
+            }
+            // An ordinary settled result is already the terminal receipt.
+            // Close a previously reported live state once, without echoing
+            // every successful nested result into a second notification.
+            if pending.last_observation.is_some()
+                || entry["execution"]["terminal_outcome"] != "completed"
+            {
+                metrics.settled_call_transitions.push(entry);
+            }
+        }
         metrics.delivery_blocked |= required_terminal.is_some()
             || nested_result.as_ref().is_some_and(|result| result.failed)
             || !post_tool_use_feedback.is_empty();
@@ -1583,6 +1590,22 @@ impl CodeModeService {
             .packet_admission
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Piggyback meaningful transitions on an already-requested packet.
+        // No polling task, notification, model wakeup, or guessed queue rank.
+        let mut unsettled_nested_calls = Vec::new();
+        let mut nested_call_transitions = Vec::new();
+        if let Some(metrics) = admission.cells.get_mut(cell_id) {
+            for pending in metrics.pending_call_identities.values_mut() {
+                let observation = pending.dispatch.execution_observation();
+                let mut entry = pending.identity.clone();
+                entry["execution"] = observation.clone();
+                if pending.last_observation.as_ref() != Some(&observation) {
+                    nested_call_transitions.push(entry.clone());
+                    pending.last_observation = Some(observation);
+                }
+                unsettled_nested_calls.push(entry);
+            }
+        }
         let mut metrics = admission
             .cells
             .get_mut(cell_id)
@@ -1630,6 +1653,7 @@ impl CodeModeService {
         metrics
             .nested_results
             .sort_unstable_by_key(|result| result.ordinal);
+        nested_call_transitions.append(&mut metrics.settled_call_transitions);
         CodeModePacketReceipt {
             command_states: metrics.command_states,
             post_tool_use_feedback: metrics.post_tool_use_feedback,
@@ -1639,7 +1663,8 @@ impl CodeModeService {
             first_required_terminal: metrics.first_required_terminal,
             tool_output_recovery_count: metrics.tool_output_recovery_count,
             output_budget: metrics.output_budget,
-            unsettled_nested_calls: metrics.pending_call_identities.into_values().collect(),
+            unsettled_nested_calls,
+            nested_call_transitions,
             unobserved_settlements: metrics.unobserved_settlements,
             omitted_unobserved_settlement_count: metrics.omitted_unobserved_settlement_count,
         }
@@ -1769,6 +1794,7 @@ pub(super) fn handle_runtime_response(
     exec: &ExecContext,
     response: RuntimeResponse,
     max_output_tokens: Option<usize>,
+    context_token_limit: usize,
     started_at: std::time::Instant,
 ) -> Result<RuntimeResponseOutput, String> {
     // Nested tool results have already crossed their owning tool boundary. Keep
@@ -1779,7 +1805,8 @@ pub(super) fn handle_runtime_response(
         .config
         .tool_output_token_limit
         .unwrap_or(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL)
-        .min(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL);
+        .min(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL)
+        .min(context_token_limit);
     let original_image_detail_supported = can_request_original_image_detail(&exec.turn.model_info);
 
     let cell_id = runtime_response_cell_id(&response);
@@ -1822,6 +1849,12 @@ pub(super) fn handle_runtime_response(
         "code-mode packet admission receipt"
     );
     let mut post_tool_use_feedback = packet.post_tool_use_feedback;
+    if !packet.nested_call_transitions.is_empty() {
+        post_tool_use_feedback.push(FunctionCallOutputContentItem::InputText {
+            text: serde_json::json!({"nested_call_transitions": packet.nested_call_transitions,
+                "notice": "Invocation state from the dispatch owner; terminal does not prove child-process exit or rollback. Resume this cell through its existing handle; do not relaunch its work."}).to_string(),
+        });
+    }
     let cancelled_nested_calls = matches!(&response, RuntimeResponse::Terminated { .. }).then(|| {
         let mut calls = packet.nested_recovery.values().map(|entry| {
             // Reuse the existing exact-artifact index instead of placing a
@@ -3121,9 +3154,13 @@ async fn call_nested_tool(
             &cell_id,
             nested_call_id
                 .len()
-                .saturating_add(tool_name.to_string().len()),
+                .saturating_add(tool_name.to_string().len())
+                .saturating_add(parent_tool_call_id.as_ref().map_or(0, String::len))
+                .saturating_add(cell_id.as_str().len())
+                .saturating_add(runtime_tool_call_id.len()),
         )
         .map_err(|message| FunctionCallError::RespondToModel(message.to_string()))?;
+    let dispatch_state = Arc::new(crate::tools::context::ToolDispatchState::new());
     exec.session
         .services
         .code_mode_service
@@ -3132,6 +3169,9 @@ async fn call_nested_tool(
             packet_ordinal,
             &nested_call_id,
             &tool_name.to_string(),
+            parent_tool_call_id.as_deref(),
+            &runtime_tool_call_id,
+            Arc::clone(&dispatch_state),
         );
     if is_exec_tool_name(&tool_name) {
         let message = format!("{PUBLIC_TOOL_NAME} cannot invoke itself");
@@ -3157,7 +3197,8 @@ async fn call_nested_tool(
                     cell_id.as_str(),
                     &tool_name,
                     None,
-                    nested_failure_fingerprint(&tool_name, &error),
+                    nested_failure_fingerprint(&nested_call_id, &error),
+                    &error,
                 )
                 .await;
             exec.session
@@ -3195,7 +3236,8 @@ async fn call_nested_tool(
                 cell_id.as_str(),
                 &tool_name,
                 Some(&payload),
-                nested_failure_fingerprint(&tool_name, &message),
+                nested_failure_fingerprint(&nested_call_id, &message),
+                &message,
             )
             .await;
         exec.session
@@ -3239,6 +3281,7 @@ async fn call_nested_tool(
             cancellation_token,
             Some(Arc::clone(&admitted_revision)),
             None,
+            dispatch_state,
         )
         .await;
     let mut result = match result {
@@ -3247,12 +3290,19 @@ async fn call_nested_tool(
             let message = error.model_message();
             let (retained_output, output_truncated, _) = bounded_failed_nested_text(&message);
             let terminal_cause = required_tool_error_terminal_cause(&error);
+            // The attempted payload is authoritative when no pre-tool hook
+            // could replace it. Retain that action for repeated-failure
+            // detection; hook-rewritten failures still have unknown arguments.
+            let failure_payload = (!exec.session.hooks().has_handler_for(
+                codex_protocol::protocol::HookEventName::PreToolUse,
+            )).then_some(&payload);
             tool_runtime
                 .record_code_mode_failure(
                     cell_id.as_str(),
                     &tool_name,
-                    None,
-                    nested_failure_fingerprint(&tool_name, &message),
+                    failure_payload,
+                    nested_failure_fingerprint(&nested_call_id, &message),
+                    &message,
                 )
                 .await;
             exec.session
@@ -3655,6 +3705,7 @@ async fn call_nested_tool(
                     codex_protocol::tool_failure::ToolFailureCode::Failed,
                     format!("tool `{tool_name}` returned a failed result"),
                 );
+                failure.execution_state = codex_protocol::tool_failure::ToolExecutionState::Completed;
                 failure.details = Some(script_result);
                 failure
             });
@@ -3745,16 +3796,38 @@ fn retained_nested_output(
     result_value: &JsonValue,
     retained_json: String,
 ) -> String {
+    if let Some(reference) = result_value.get("tool_failure")
+        .and_then(|failure| failure.get("details"))
+        .and_then(|details| details.get("output_reference"))
+        .filter(|reference| reference.is_object())
+    {
+        // The full cancellation envelope can exceed the nested excerpt cap.
+        // Keep an independently parseable control line outside that excerpt.
+        let controls = serde_json::json!({"output_reference":reference,
+            "live_operations":result_value["tool_failure"]["live_operations"]}).to_string();
+        let budget = MAX_RETAINED_NESTED_RESULT_BYTES.saturating_sub(controls.len() + 129);
+        return format!("{controls}\n{}", codex_utils_string::truncate_middle_chars(&retained_json, budget));
+    }
     if tool_name.namespace.is_none()
         && matches!(tool_name.name.as_str(), "exec_command" | "write_stdin")
         && let Some(text) = result_value["output"].as_str()
     {
+        let mut controls = serde_json::Map::new();
+        for key in ["exit_code", "execution_state", "process_exited", "session_id", "session_capabilities", "output_reference", "error", "tool_failure"] {
+            if let Some(value) = result_value.get(key) {
+                controls.insert(key.into(), value.clone());
+            }
+        }
+        let controls = JsonValue::Object(controls).to_string();
         let mut rendered = format!("exit_code: {}\n{}", result_value["exit_code"], text);
         if let Some(repair) = result_value["repair"].as_str() {
             rendered.push('\n');
             rendered.push_str(repair);
         }
-        codex_utils_string::truncate_middle_chars(&rendered, MAX_RETAINED_NESTED_RESULT_BYTES - 128)
+        // Control/recovery facts are not spillable command text. In particular
+        // a cancelled cell may see only this settlement, not the original result.
+        let budget = MAX_RETAINED_NESTED_RESULT_BYTES.saturating_sub(controls.len() + 129);
+        format!("{controls}\n{}", codex_utils_string::truncate_middle_chars(&rendered, budget))
     } else {
         retained_json
     }
@@ -4036,6 +4109,7 @@ pub(crate) fn command_result_state(result: &JsonValue) -> Option<JsonValue> {
     let mut state = serde_json::json!({});
     for key in [
         "error",
+        "environment_receipt",
         "chunk_id",
         "session_id",
         "exit_code",
@@ -4043,6 +4117,8 @@ pub(crate) fn command_result_state(result: &JsonValue) -> Option<JsonValue> {
         "session_capabilities",
         "process_exited",
         "search_no_match",
+        "quiet_success",
+        "success",
         "pending_deferred_completions",
         "output_complete",
         "output_reduced",
@@ -4066,7 +4142,9 @@ pub(crate) fn command_result_state(result: &JsonValue) -> Option<JsonValue> {
             "tool": "write_stdin", "arguments": {"session_id": session_id, "incarnation": incarnation, "chars": ""}
         });
     }
-    if let Some(artifact_id) = result.get("raw_output_artifact_id")
+    if let Some(recovery) = result.get("recovery").filter(|value| value.is_object()) {
+        state["recovery"] = recovery.clone();
+    } else if let Some(artifact_id) = result.get("raw_output_artifact_id")
         && let Some(selector) = result.get("recovery_selector")
     {
         state["recovery"] = serde_json::json!({
@@ -4086,28 +4164,17 @@ fn command_state_session(state: &JsonValue) -> Option<&JsonValue> {
         .or_else(|| state.get("session_id").filter(|value| !value.is_null()))
 }
 
-fn nested_failure_fingerprint(tool_name: &ToolName, error: &str) -> String {
+fn nested_failure_fingerprint(instance: &str, error: &str) -> String {
     if let Some(json_start) = error.find('{')
         && let Ok(value) = serde_json::from_str::<JsonValue>(&error[json_start..])
         && let Some(fingerprint) = value
-            .get("fingerprint")
-            .or_else(|| {
-                value
-                    .get("failure")
-                    .and_then(|failure| failure.get("fingerprint"))
-            })
+            .pointer("/tool_failure/details/operation_history/instance/fingerprint")
             .and_then(JsonValue::as_str)
             .filter(|fingerprint| !fingerprint.is_empty())
     {
         return fingerprint.to_string();
     }
-    let normalized = error.split_whitespace().collect::<Vec<_>>().join(" ");
-    format!(
-        "code_mode.nested_tool.{}",
-        hex::encode(Sha256::digest(
-            format!("{tool_name}\0{normalized}").as_bytes()
-        ))
-    )
+    format!("code_mode.unclassified_instance.{instance}")
 }
 
 fn build_nested_tool_payload(

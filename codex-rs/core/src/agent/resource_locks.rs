@@ -125,6 +125,13 @@ pub(crate) struct AgentResourceLock {
 }
 
 #[derive(Serialize)]
+struct AgentLockWait {
+    admission_wait_ms: u64,
+    // Historical owner-mutex observation, not a claim of current ownership.
+    last_observed_holder: AgentResourceLock,
+}
+
+#[derive(Serialize)]
 pub(crate) struct AgentLockResult {
     pub(crate) status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -133,6 +140,8 @@ pub(crate) struct AgentLockResult {
     locks: Vec<AgentResourceLock>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wait: Option<AgentLockWait>,
 }
 
 impl AgentLockResult {
@@ -146,7 +155,16 @@ impl AgentLockResult {
             lock,
             locks: Vec::new(),
             reason,
+            wait: None,
         }
+    }
+
+    fn with_wait(mut self, started: Option<tokio::time::Instant>, holder: Option<AgentResourceLock>) -> Self {
+        self.wait = started.zip(holder).map(|(started, last_observed_holder)| AgentLockWait {
+            admission_wait_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            last_observed_holder,
+        });
+        self
     }
 }
 
@@ -166,8 +184,9 @@ impl AgentResourceLocks {
         Self::acquire_locked(&mut self.lock(), session, resource, cancellation, None)
     }
 
-    /// `deadline` bounds only the wait. Expiry removes the waiter and returns
-    /// `timed_out` as data, never a thrown error or a later acquisition.
+    /// `deadline` bounds only the wait, defaulting to 30 seconds when absent.
+    /// Expiry removes the waiter and returns `timed_out` as data, never a thrown
+    /// error or a later acquisition.
     pub(crate) async fn acquire_wait(
         &self,
         session: &Arc<Session>,
@@ -175,17 +194,33 @@ impl AgentResourceLocks {
         cancellation: &CancellationToken,
         deadline: Option<tokio::time::Instant>,
     ) -> AgentLockResult {
+        let deadline = deadline.unwrap_or_else(|| {
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30)
+        });
         let mut registration: Option<WaitRegistration<'_>> = None;
+        let mut wait_started = None;
+        let mut last_observed_holder = None;
         loop {
             let (result, next) = {
                 let mut state = self.lock();
-                let result = Self::acquire_locked(
-                    &mut state,
-                    session,
-                    resource.clone(),
-                    cancellation,
-                    registration.as_ref().map(|current| current.id),
-                );
+                let result = if registration.is_some()
+                    && !cancellation.is_cancelled()
+                    && tokio::time::Instant::now() >= deadline
+                {
+                    AgentLockResult::new(
+                        "timed_out",
+                        state.locks.get(&resource).map(|held| held.info.clone()),
+                        Some("the lock-wait deadline elapsed; the waiter was removed and no ownership was granted. Retry in a later call; do not busy-loop"),
+                    )
+                } else {
+                    Self::acquire_locked(
+                        &mut state,
+                        session,
+                        resource.clone(),
+                        cancellation,
+                        registration.as_ref().map(|current| current.id),
+                    )
+                };
                 let next = if result.status == "busy" {
                     let id = Uuid::now_v7();
                     let (sender, receiver) = oneshot::channel();
@@ -222,24 +257,24 @@ impl AgentResourceLocks {
             // dropping it earlier could wake every waiter on the same release.
             drop(registration.take());
             let Some((guard, receiver)) = next else {
-                return result;
+                return result.with_wait(wait_started, last_observed_holder);
             };
+            wait_started.get_or_insert_with(tokio::time::Instant::now);
+            // The busy result and waiter registration were observed atomically
+            // above. Neither silence nor a wakeup supplies a holder identity.
+            last_observed_holder = result.lock;
+            let prerequisite = last_observed_holder.as_ref().map(|holder| format!(
+                "agent_lock:{}:holder={}:acquisition={}", holder.resource, holder.owner, holder.token,
+            )).unwrap_or_else(|| format!("agent_lock:{resource}"));
             registration = Some(guard);
             tracing::debug!(thread_id = %session.thread_id, resource = %resource, "agent_lock waiter registered");
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => {
-                    return AgentLockResult::new("cancelled", None, Some("acquisition was cancelled"));
+                    return AgentLockResult::new("cancelled", None, Some("acquisition was cancelled"))
+                        .with_wait(wait_started, last_observed_holder);
                 }
-                signal = receiver => {
-                    tracing::debug!(thread_id = %session.thread_id, resource = %resource, notified = signal.is_ok(), "agent_lock waiter retry");
-                }
-                _ = async {
-                    match deadline {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        None => std::future::pending::<()>().await,
-                    }
-                } => {
+                _ = tokio::time::sleep_until(deadline) => {
                     // Deregister first: its Drop retakes the owner mutex and
                     // passes on any in-flight wakeup.
                     drop(registration.take());
@@ -247,8 +282,11 @@ impl AgentResourceLocks {
                     return AgentLockResult::new(
                         "timed_out",
                         holder,
-                        Some("the enclosing call deadline elapsed first; the waiter was removed and no ownership was granted. Retry in a later call; do not busy-loop"),
-                    );
+                        Some("the lock-wait deadline elapsed; the waiter was removed and no ownership was granted. Retry in a later call; do not busy-loop"),
+                    ).with_wait(wait_started, last_observed_holder);
+                }
+                signal = crate::tools::tool_dispatch_trace::observe_resource_wait(&prerequisite, receiver) => {
+                    tracing::debug!(thread_id = %session.thread_id, resource = %resource, notified = signal.is_ok(), "agent_lock waiter retry");
                 }
             }
         }
@@ -377,6 +415,7 @@ impl AgentResourceLocks {
                 .map(|held| held.info.clone())
                 .collect(),
             reason: None,
+            wait: None,
         }
     }
 

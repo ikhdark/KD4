@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use super::code_sections;
 use super::code_sections::CodeItem;
+use super::markdown_sections;
 use crate::tools::command_output_artifact::ReadToolOutputError;
 use crate::tools::command_output_artifact::ToolOutputSelector;
 
@@ -95,6 +96,9 @@ impl<'de> Deserialize<'de> for FileSelector {
             Err(error) => error,
         };
         let exact = match ToolOutputSelector::deserialize(&value) {
+            Ok(ToolOutputSelector::Tail { .. }) => return Err(serde::de::Error::custom(
+                "tail is read_tool_output-only; capture this source with read_file, then tail its artifact_id",
+            )),
             Ok(selector) => return Ok(Self::Exact(selector)),
             Err(error) => error,
         };
@@ -102,7 +106,7 @@ impl<'de> Deserialize<'de> for FileSelector {
             Some("symbol" | "enclosing" | "search") => structure.to_string(),
             Some("bytes" | "lines" | "section" | "json_pointer" | "structured") => exact.to_string(),
             Some(other) => format!(
-                "unsupported read_file selector kind `{}`; use one of {FILE_SELECTOR_KINDS} ({{\"kind\":\"section\",\"id\":\"outline\"}} lists Rust/Python items)",
+                "unsupported read_file selector kind `{}`; use one of {FILE_SELECTOR_KINDS} ({{\"kind\":\"section\",\"id\":\"outline\"}} lists Rust/Python items or Markdown headings)",
                 other.chars().take(64).collect::<String>()
             ),
             None => {
@@ -337,6 +341,16 @@ pub(super) fn resolve_batch(
             }
         }
     }
+    let markdown = selectors.iter().any(|selector| matches!(selector,
+        FileSelector::Exact(ToolOutputSelector::Section { .. })))
+        .then(|| std::str::from_utf8(&canonical.bytes).ok().and_then(|source|
+            markdown_sections::sections(path, source, &canonical.sha256,
+                Instant::now() + Duration::from_secs(2))))
+        .flatten();
+    let has_markdown = markdown.is_some();
+    if let Some(sections) = markdown {
+        canonical.sections = sections;
+    }
     let mut resolved = Vec::new();
     let mut failures = Vec::new();
     let mut bindings = Vec::new();
@@ -358,8 +372,10 @@ pub(super) fn resolve_batch(
                     }
             )
         );
-        let result = if requires_items && items.is_none() {
-            Err(ReadToolOutputError::InvalidRange("structural selectors require a .rs or .py file parsed within the time limit; use lines or search otherwise".into()))
+        let markdown_section = has_markdown && matches!(&selector,
+            FileSelector::Exact(ToolOutputSelector::Section { .. }));
+        let result = if requires_items && items.is_none() && !markdown_section {
+            Err(ReadToolOutputError::InvalidRange("symbol, enclosing and enclosing search require .rs or .py; sections also support .md and .markdown. Parsing must finish within the time limit; use lines or ordinary search otherwise".into()))
         } else {
             resolve_items(items.as_deref().unwrap_or_default(), vec![selector.clone()])
         };

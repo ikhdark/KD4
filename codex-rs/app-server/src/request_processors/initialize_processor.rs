@@ -163,7 +163,14 @@ impl InitializeRequestProcessor {
             self.rpc_transport,
         );
         set_default_client_residency_requirement(self.config.enforce_residency.value());
-        let user_agent = get_codex_user_agent();
+        // Relay probes and phone clients must see the same compatibility version
+        // as enrollment. Keep local Desktop's development marker and model/API
+        // request identity unchanged; transport origin is not client-supplied.
+        let user_agent = if self.outgoing.connection_is_remote_control(connection_id).await {
+            codex_app_server_transport::remote_control_user_agent()
+        } else {
+            get_codex_user_agent()
+        };
         let mut enabled_features: Vec<_> = self
             .config
             .features

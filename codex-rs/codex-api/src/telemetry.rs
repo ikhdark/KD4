@@ -7,8 +7,8 @@ use codex_client::StreamResponse;
 use codex_client::TransportError;
 use codex_client::TransportPhase;
 use codex_client::TransportPhaseObservation;
-use codex_client::run_with_retry;
-use codex_client::run_with_retry_non_idempotent;
+use codex_client::run_with_retry_observed;
+use codex_client::run_with_retry_non_idempotent_observed;
 use http::StatusCode;
 use std::future::Future;
 use std::sync::Arc;
@@ -179,9 +179,10 @@ where
     F: Clone + Fn(Request) -> Fut,
     Fut: Future<Output = Result<T, TransportError>>,
 {
-    run_with_retry(policy, make_request, move |req, attempt| {
+    let retry_telemetry = telemetry.clone();
+    run_with_retry_observed(policy, make_request, move |req, attempt| {
         observe_request_attempt(telemetry.clone(), send.clone(), req, attempt)
-    })
+    }, retry_telemetry.as_deref())
     .await
 }
 
@@ -196,7 +197,8 @@ where
     F: Clone + Fn(Request, u64) -> Fut,
     Fut: Future<Output = Result<T, TransportError>>,
 {
-    run_with_retry_non_idempotent(policy, make_request, move |req, attempt| {
+    let retry_telemetry = telemetry.clone();
+    run_with_retry_non_idempotent_observed(policy, make_request, move |req, attempt| {
         let send = send.clone();
         observe_request_attempt(
             telemetry.clone(),
@@ -204,7 +206,7 @@ where
             req,
             attempt,
         )
-    })
+    }, retry_telemetry.as_deref())
     .await
 }
 

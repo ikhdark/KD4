@@ -769,6 +769,9 @@ impl ExecServerClient {
                 )));
             }
             rpc_client
+                .set_capability_manifest(response.capability_manifest.as_ref())
+                .map_err(|message| ExecServerError::Protocol(message.into()))?;
+            rpc_client
                 .notify(INITIALIZED_METHOD, &serde_json::json!({}))
                 .await?;
             Ok(response)
@@ -784,6 +787,35 @@ impl ExecServerClient {
         params: crate::LookupExecutableParams,
     ) -> Result<crate::LookupExecutableResponse, ExecServerError> {
         self.call(crate::protocol::LOOKUP_EXECUTABLE_METHOD, &params).await
+    }
+
+    pub async fn lookup_executables(
+        &self,
+        params: crate::protocol::LookupExecutablesParams,
+    ) -> Result<Vec<codex_file_system::FileSystemLookupResult>, ExecServerError> {
+        self.call(crate::protocol::LOOKUP_EXECUTABLES_METHOD, &params).await
+    }
+
+    pub async fn fs_lookup_batch(
+        &self,
+        params: crate::protocol::FsLookupBatchParams,
+    ) -> Result<Vec<codex_file_system::FileSystemLookupResult>, ExecServerError> {
+        self.call(crate::protocol::FS_LOOKUP_BATCH_METHOD, &params).await
+    }
+
+    /// Refresh support on this exact transport, without granting any permission
+    /// or automatically replaying an operation rejected for a stale manifest.
+    pub async fn capability_manifest(
+        &self,
+    ) -> Result<crate::protocol::CapabilityManifest, ExecServerError> {
+        let rpc_client = self.rpc_client().await?;
+        let manifest = self
+            .call_rpc(&rpc_client, crate::protocol::CAPABILITY_MANIFEST_METHOD, &())
+            .await?;
+        rpc_client
+            .set_capability_manifest(Some(&manifest))
+            .map_err(|message| ExecServerError::Protocol(message.into()))?;
+        Ok(manifest)
     }
 
     pub async fn exec(&self, params: ExecParams) -> Result<ExecResponse, ExecServerError> {
@@ -843,6 +875,17 @@ impl ExecServerClient {
             },
         )
         .await
+    }
+
+    /// Idempotently close piped input after accepted writes.
+    pub async fn close_stdin(
+        &self,
+        process_id: &ProcessId,
+    ) -> Result<WriteResponse, ExecServerError> {
+        self.call(
+            crate::protocol::EXEC_CLOSE_STDIN_METHOD,
+            &crate::protocol::CloseStdinParams { process_id: process_id.clone() },
+        ).await
     }
 
     pub async fn signal(
@@ -1168,6 +1211,7 @@ impl ExecServerClient {
                             ExecServerError::Server {
                                 code: -32601
                                     | -32602
+                                    | crate::protocol::STALE_CAPABILITY_MANIFEST_ERROR_CODE
                                     | crate::rpc::PROCESS_START_REFUSED_ERROR_CODE,
                                 ..
                             }
@@ -1877,6 +1921,22 @@ impl Session {
                 {
                     continue;
                 }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    pub(crate) async fn close_stdin(&self) -> Result<WriteResponse, ExecServerError> {
+        let params = crate::protocol::OwnedProcessParams {
+            incarnation: Some(self.state.incarnation.clone()),
+            params: crate::protocol::CloseStdinParams { process_id: self.process_id.clone() },
+        };
+        loop {
+            match self.client.call(crate::protocol::EXEC_CLOSE_STDIN_METHOD, &params).await {
+                Ok(response) => return Ok(response),
+                Err(error) if is_transport_closed_error(&error)
+                    && matches!(self.client.recovery_policy, RecoveryPolicy::Wait)
+                    && !self.client.inner.is_failed() => continue,
                 Err(error) => return Err(error),
             }
         }

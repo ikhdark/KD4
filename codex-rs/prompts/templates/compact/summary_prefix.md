@@ -9,6 +9,8 @@ solely because compaction occurred.
 
 Preserve the user’s constraints, unresolved issues, and distinctions between
 verified, unverified, planned, blocked, and uncertain work.
+Follow artifact sidecars' storage-owner reference checks and recovery routes;
+availability is point-in-time, not proof that content was delivered or examined.
 User prohibitions and out-of-scope declarations remain binding until superseded
 by an applicable instruction; stale evidence alone does not retire them.
 

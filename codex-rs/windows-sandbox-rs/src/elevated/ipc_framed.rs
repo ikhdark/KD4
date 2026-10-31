@@ -128,6 +128,9 @@ pub struct ResizePayload {
 pub struct ExitPayload {
     pub exit_code: i32,
     pub timed_out: bool,
+    /// An older runner's root exit cannot certify descendant cleanup.
+    #[serde(default)]
+    pub shutdown_confirmed: bool,
 }
 
 /// Error payload sent when the runner fails to spawn or stream.

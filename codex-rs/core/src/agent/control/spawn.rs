@@ -527,6 +527,7 @@ fn clone_forked_rollout_item(item: &RolloutItem, hints: &[String]) -> RolloutIte
     if let RolloutItem::Compacted(compacted) = item {
         RolloutItem::Compacted(codex_protocol::protocol::CompactedItem {
             message: compacted.message.clone(),
+            provenance: compacted.provenance.clone(),
             replacement_history: compacted.replacement_history.as_ref().map(|history| {
                 history.iter().filter(|item| keep_forked_replacement_item(item, hints)).cloned().collect()
             }),

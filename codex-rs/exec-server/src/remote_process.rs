@@ -129,6 +129,10 @@ impl ExecProcess for RemoteExecProcess {
         Box::pin(RemoteExecProcess::write(self, chunk))
     }
 
+    fn close_stdin(&self) -> ExecProcessFuture<'_, WriteResponse> {
+        Box::pin(self.session.close_stdin())
+    }
+
     fn signal(&self, signal: ProcessSignal) -> ExecProcessFuture<'_, ()> {
         Box::pin(RemoteExecProcess::signal(self, signal))
     }

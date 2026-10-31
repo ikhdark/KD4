@@ -8,6 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+codex-file-watcher = { workspace = true }
 codex-file-system = { workspace = true }
 codex-protocol = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
@@ -16,6 +17,7 @@ codex-utils-pty = { workspace = true }
 futures = { workspace = true, features = ["alloc"] }
 regex = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+sha2 = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "process", "rt", "time"] }

@@ -4,8 +4,14 @@ pub(crate) mod capture;
 #[path = "artifact_comparison.rs"]
 pub(crate) mod comparison;
 
+#[path = "line_mapping.rs"]
+pub(crate) mod line_mapping;
+
 #[path = "structured_extraction.rs"]
 pub(crate) mod structured;
+
+#[path = "retention_pressure.rs"]
+pub(crate) mod pressure;
 
 #[cfg(windows)]
 #[path = "artifact_snapshot_cache.rs"]
@@ -30,6 +36,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::SystemTime;
+use crate::tools::exact_reuse::ExactResultCache;
+use crate::tools::exact_reuse::ExactReuseKey;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -87,6 +95,10 @@ pub(crate) const ARTIFACT_SEARCH_MAX_RESULTS: usize = 100;
 pub(crate) const ARTIFACT_SEARCH_MAX_CONTEXT_LINES: usize = 20;
 pub(crate) const ARTIFACT_SEARCH_MAX_QUERY_BYTES: usize = 1_024;
 pub(crate) const ARTIFACT_REGEX_MAX_SEARCH_BYTES: usize = 1024 * 1024;
+pub(crate) const ARTIFACT_TAIL_DEFAULT_LINES: usize = 200;
+pub(crate) const ARTIFACT_TAIL_MAX_LINES: usize = 2_000;
+pub(crate) const ARTIFACT_TAIL_DEFAULT_BYTES: usize = 16_384;
+pub(crate) const ARTIFACT_TAIL_MAX_BYTES: usize = 1024 * 1024;
 const ARTIFACT_REGEX_SIZE_LIMIT: usize = 1024 * 1024;
 const LOGICAL_ARTIFACT_METADATA_VERSION: u8 = 1;
 
@@ -106,6 +118,12 @@ pub(crate) enum ToolOutputSelector {
     Lines {
         start: usize,
         end: usize,
+    },
+    Tail {
+        #[serde(default = "artifact_tail_default_lines")]
+        lines: usize,
+        #[serde(default = "artifact_tail_default_bytes")]
+        max_bytes: usize,
     },
     Section {
         id: String,
@@ -158,6 +176,87 @@ impl ToolOutputSelector {
 
 const fn artifact_search_default_max_results() -> usize {
     ARTIFACT_SEARCH_DEFAULT_MAX_RESULTS
+}
+
+const fn artifact_tail_default_lines() -> usize {
+    ARTIFACT_TAIL_DEFAULT_LINES
+}
+
+const fn artifact_tail_default_bytes() -> usize {
+    ARTIFACT_TAIL_DEFAULT_BYTES
+}
+
+/// The extra lookbehind byte distinguishes a clipped first line from a line
+/// boundary without scanning the prefix. Neither it nor the prefix is delivered.
+pub(super) fn tail_window_limit(
+    selector: &ToolOutputSelector,
+    source_budget: usize,
+) -> Result<usize, &'static str> {
+    let ToolOutputSelector::Tail { lines, max_bytes } = selector else {
+        return Err("expected a tail selector");
+    };
+    if !(1..=ARTIFACT_TAIL_MAX_LINES).contains(lines)
+        || !(1..=ARTIFACT_TAIL_MAX_BYTES).contains(max_bytes)
+    {
+        return Err("tail requires 1..2000 lines and 1..1048576 max_bytes");
+    }
+    Ok((*max_bytes).min(source_budget).saturating_add(1))
+}
+
+/// Select at most N LF-delimited lines from a bounded EOF window. A final LF
+/// terminates its line, not an extra empty line; nonempty unterminated EOF counts
+/// as one line. A byte cap may return a partial first line, including split UTF-8.
+pub(super) fn tail_selector_result(
+    selector: ToolOutputSelector,
+    window: &[u8],
+    source_end: u64,
+    source_budget: usize,
+) -> ToolOutputSelectorResult {
+    let limit = match tail_window_limit(&selector, source_budget) {
+        Ok(limit) => limit,
+        Err(message) => return invalid_selector_result(selector, message),
+    };
+    let ToolOutputSelector::Tail { lines, .. } = &selector else {
+        unreachable!("validated tail selector");
+    };
+    if source_budget == 0 {
+        return ToolOutputSelectorResult::state(selector, ToolOutputSelectorStatus::AggregateOmitted);
+    }
+    let window_start = source_end.saturating_sub(window.len() as u64);
+    let mut start = window.len().saturating_sub(limit - 1);
+    let mut boundaries = 0;
+    for index in (start..window.len()).rev() {
+        if window[index] == b'\n' && index + 1 != window.len() {
+            boundaries += 1;
+            if boundaries == *lines {
+                start = index + 1;
+                break;
+            }
+        }
+    }
+    let bytes = &window[start..];
+    let source_start = window_start + start as u64;
+    let first_line_partial = source_start > 0
+        && start.checked_sub(1).and_then(|index| window.get(index)) != Some(&b'\n');
+    let last_line_unterminated = bytes.last().is_some_and(|byte| *byte != b'\n');
+    let lines_returned = bytes.iter().filter(|byte| **byte == b'\n').count()
+        + usize::from(last_line_unterminated);
+    let children = (source_start > 0).then_some(ToolOutputSelector::Bytes {
+        start: 0,
+        end: source_start,
+    }).into_iter().collect();
+    let value = serde_json::json!({
+        "lines_returned": lines_returned,
+        "first_line_partial": first_line_partial,
+        "last_line_unterminated": last_line_unterminated,
+        "requested_lines_complete": !first_line_partial && (lines_returned == *lines || source_start == 0),
+        "window_bytes": window.len(),
+    });
+    let mut result = successful_exact_selector_result(
+        selector, CanonicalByteRange::new(source_start, source_end), children, bytes,
+    );
+    result.value = Some(value);
+    result
 }
 
 const fn artifact_search_default_context_lines() -> usize {
@@ -636,6 +735,7 @@ struct RetentionRegistry {
     access_clock: u64,
     pending_sync: BTreeMap<PathBuf, u64>,
     next_sync: u64,
+    evictions: std::collections::VecDeque<pressure::EvictionReceipt>,
 }
 
 #[derive(Debug, Clone)]
@@ -1597,6 +1697,47 @@ async fn unlock_created_output_file(file: File) -> std::io::Result<File> {
 }
 
 impl RawOutputArtifact {
+    /// Point-in-time recovery facts, not a retention lease or proof of delivery.
+    /// Unknown producer loss must not be reported as zero missing bytes.
+    pub(crate) fn output_reference(artifact: Option<&Self>) -> Value {
+        let (owner, id, bytes, complete, availability) = match artifact {
+            Some(Self::Pending { thread_id, .. }) =>
+                (Some(thread_id.as_str()), None, None, false, "pending"),
+            Some(Self::Stored { id, path, bytes, finalized, truncated, .. }) => (
+                path.parent().and_then(Path::file_name).and_then(|name| name.to_str()),
+                Some(*id), Some(*bytes), *finalized && !*truncated,
+                if *finalized { "available" } else { "pending" },
+            ),
+            Some(Self::Failed { id, owned_path, bytes, .. }) => (
+                owned_path.as_deref().and_then(Path::parent)
+                    .and_then(Path::file_name).and_then(|name| name.to_str()),
+                *id, Some(*bytes), false,
+                if id.is_some() { "unknown" } else { "unavailable" },
+            ),
+            None => (None, None, None, false, "unavailable"),
+        };
+        let mut reference = serde_json::json!({
+            "owner_thread_id": owner,
+            "artifact_id": id.map(|id| id.to_string()),
+            "capture_complete": complete,
+            "retained_bytes": bytes,
+            "missing_bytes": complete.then_some(0u64),
+            "retrieval_availability": availability,
+        });
+        if !complete {
+            reference["missing_bytes_reason"] = "Producer loss is not quantified; pending capture or retained bytes alone do not establish total output.".into();
+        }
+        if let Some(id) = id {
+            reference["recovery"] = serde_json::json!({
+                "tool":"read_tool_output", "arguments":{
+                    "artifact_id":id.to_string(),
+                    "selectors":[{"kind":"tail","lines":200,"max_bytes":4096}]
+                }
+            });
+        }
+        reference
+    }
+
     pub(crate) fn is_plain_command_log(&self) -> bool {
         matches!(self, Self::Stored { path, .. } | Self::Failed { owned_path: Some(path), .. }
             if path.parent().and_then(|p| p.parent()).and_then(|p| p.file_name())
@@ -5165,7 +5306,7 @@ impl ReadToolOutputError {
                 owner_thread_id,
                 known_descendant,
             } => format!(
-                "artifact belongs to another thread ({owner_thread_id}{}), not this one; it has not expired, but read_tool_output reads only artifacts retained by the calling thread. Have the owning thread read it, or re-read the original source; output already in context remains usable.",
+                "artifact handle was found in another thread ({owner_thread_id}{}), not this one; this ownership hint does not authenticate its bytes or retention. read_tool_output reads only artifacts retained by the calling thread. Have the owning thread recover it and share the needed evidence; output already in context remains usable. Do not replay its producer.",
                 if *known_descendant {
                     ", a descendant agent of this thread"
                 } else {
@@ -5766,7 +5907,7 @@ fn selector_range(
         ToolOutputSelector::Section { id } => metadata.sections.iter()
             .find(|section| section.id == *id).map(|section| section.canonical_range)
             .ok_or(ToolOutputSelectorStatus::NotFound),
-        ToolOutputSelector::Search { .. } | ToolOutputSelector::Structured { .. } => Err(ToolOutputSelectorStatus::Invalid),
+        ToolOutputSelector::Tail { .. } | ToolOutputSelector::Search { .. } | ToolOutputSelector::Structured { .. } => Err(ToolOutputSelectorStatus::Invalid),
     }
 }
 
@@ -5816,7 +5957,7 @@ fn normalized_selector_order_key(
                 ToolOutputSelector::Lines { .. } => 1,
                 ToolOutputSelector::Section { .. } => 2,
                 ToolOutputSelector::JsonPointer { .. } => 3,
-                ToolOutputSelector::Search { .. } | ToolOutputSelector::Structured { .. } => unreachable!(),
+                ToolOutputSelector::Tail { .. } | ToolOutputSelector::Search { .. } | ToolOutputSelector::Structured { .. } => unreachable!(),
             };
             (range.start, range.end, kind, serialized)
         }
@@ -5929,26 +6070,9 @@ fn normalize_tool_output_selectors_with_fit(
     // a range the caller never asked for and that cannot be returned. A merge
     // that would no longer fit the fragment ceiling is skipped, so selectors
     // that each fit keep working instead of collapsing into one that fails.
-    byte_ranges.sort_unstable();
-    let mut merged_bytes = Vec::<(u64, u64)>::new();
-    for (start, end) in byte_ranges {
-        match merged_bytes.last_mut() {
-            // Already covered: dropping it removes work without growing a range.
-            Some((_, previous_end)) if end <= *previous_end => {}
-            Some((previous_start, previous_end)) if start <= *previous_end => {
-                let candidate = ToolOutputSelector::Bytes {
-                    start: *previous_start,
-                    end,
-                };
-                if fits(&candidate) {
-                    *previous_end = end;
-                } else {
-                    merged_bytes.push((start, end));
-                }
-            }
-            _ => merged_bytes.push((start, end)),
-        }
-    }
+    let merged_bytes = normalize_byte_ranges_with_fit(byte_ranges, |start, end| {
+        fits(&ToolOutputSelector::Bytes { start, end })
+    });
     let merged_lines = normalize_line_ranges_within_ceiling(line_ranges, |start, end| {
         fits(&ToolOutputSelector::Lines { start, end })
     });
@@ -5965,6 +6089,31 @@ fn normalize_tool_output_selectors_with_fit(
         .collect::<Vec<_>>();
     normalized.sort_by_cached_key(|selector| normalized_selector_order_key(selector, metadata));
     normalized
+}
+
+/// Half-open byte unions; callers retain selector bindings and apply encoding
+/// only after slicing the acquired bytes at each original selector boundary.
+pub(crate) fn normalize_byte_ranges_with_fit(
+    mut byte_ranges: Vec<(u64, u64)>,
+    fits: impl Fn(u64, u64) -> bool,
+) -> Vec<(u64, u64)> {
+    byte_ranges.sort_unstable();
+    let mut merged_bytes = Vec::<(u64, u64)>::new();
+    for (start, end) in byte_ranges {
+        match merged_bytes.last_mut() {
+            // Already covered: dropping it removes work without growing a range.
+            Some((_, previous_end)) if end <= *previous_end => {}
+            Some((previous_start, previous_end)) if start <= *previous_end => {
+                if fits(*previous_start, end) {
+                    *previous_end = end;
+                } else {
+                    merged_bytes.push((start, end));
+                }
+            }
+            _ => merged_bytes.push((start, end)),
+        }
+    }
+    merged_bytes
 }
 
 pub(crate) fn normalize_line_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
@@ -6155,29 +6304,16 @@ enum SearchBudget {
     SelectorBytes(usize),
 }
 
-#[derive(Clone, PartialEq, Eq)]
-struct AuthenticatedSearchCountKey {
-    artifact_id: String,
-    retained_sha256: String,
-    retained_bytes: u64,
-    query: String,
-    case_insensitive: bool,
-    start_byte: u64,
-}
+type AuthenticatedSearchCountKey = ExactReuseKey<(String, u64), (String, String, u64), &'static str, bool>;
 
-fn search_count_cache() -> &'static StdMutex<std::collections::VecDeque<(AuthenticatedSearchCountKey, usize)>> {
-    static CACHE: OnceLock<StdMutex<std::collections::VecDeque<(AuthenticatedSearchCountKey, usize)>>> = OnceLock::new();
-    CACHE.get_or_init(|| StdMutex::new(std::collections::VecDeque::new()))
+fn search_count_cache() -> &'static ExactResultCache<AuthenticatedSearchCountKey, usize> {
+    static CACHE: OnceLock<ExactResultCache<AuthenticatedSearchCountKey, usize>> = OnceLock::new();
+    CACHE.get_or_init(|| ExactResultCache::new(128, 256 * 1024))
 }
 
 fn remember_search_count(key: AuthenticatedSearchCountKey, count: usize) {
-    let mut cache = search_count_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(index) = cache.iter().position(|(candidate, _)| candidate == &key) {
-        cache.remove(index);
-    }
-    cache.push_back((key, count));
-    // Counts only: never keep artifact bytes, file handles, or family leases.
-    while cache.len() > 128 { cache.pop_front(); }
+    let charge = key.inputs.0.len() + key.source_revision.0.len() + key.source_revision.1.len() + 128;
+    search_count_cache().insert(key, Arc::new(count), charge);
 }
 
 // Reuse the exact matcher, coordinates, hydration and pagination for plain logs.
@@ -6291,9 +6427,11 @@ fn search_logical_artifact(
         (metadata.capture_complete && metadata.retained_bytes == metadata.canonical_bytes)
             .then_some(&metadata.canonical_sha256)
     });
-    let cache_key = retained_digest.filter(|_| !regex && metadata.version != 0).map(|digest| AuthenticatedSearchCountKey {
-        artifact_id: metadata.artifact_id.clone(), retained_sha256: digest.clone(),
-        retained_bytes: metadata.retained_bytes, query: query.clone(), case_insensitive, start_byte,
+    let cache_key = retained_digest.filter(|_| !regex && metadata.version != 0).map(|digest| ExactReuseKey {
+        operation: "artifact.literal_search_count.v1",
+        inputs: (query.clone(), start_byte),
+        source_revision: (metadata.artifact_id.clone(), digest.clone(), metadata.retained_bytes),
+        backend: "authenticated_snapshot", configuration: case_insensitive,
     });
     let known_total = previous_results.iter().rev().find_map(|previous| {
         let ToolOutputSelector::Search {
@@ -6321,8 +6459,7 @@ fn search_logical_artifact(
             None
         }
     }).or_else(|| cache_key.as_ref().and_then(|key| {
-        search_count_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter().rev().find(|(candidate, _)| candidate == key).map(|(_, count)| *count)
+        search_count_cache().get(key).map(|count| *count)
     }));
     let mut total_matches = known_total.unwrap_or(0);
     let mut indexed_matches = Vec::with_capacity(max_results);
@@ -6369,7 +6506,7 @@ fn search_logical_artifact(
             (cache_key.as_ref(), result.continuation.as_ref(), result.value.as_ref())
             && let Some(count) = value["remaining_match_count"].as_u64().and_then(|count| usize::try_from(count).ok())
         {
-            let mut key = key.clone(); key.start_byte = *start_byte;
+            let mut key = key.clone(); key.inputs.1 = *start_byte;
             remember_search_count(key, count);
         }
     };
@@ -6766,7 +6903,7 @@ fn successful_exact_selector_result(
                 result.child_selectors.clear();
             }
         }
-        ToolOutputSelector::Lines { .. } | ToolOutputSelector::Section { .. } => {
+        ToolOutputSelector::Tail { .. } | ToolOutputSelector::Lines { .. } | ToolOutputSelector::Section { .. } => {
             match std::str::from_utf8(bytes) {
                 Ok(text) => result.text = Some(text.to_string()),
                 Err(_) => result.data_base64 = Some(BASE64_STANDARD.encode(bytes)),
@@ -6775,6 +6912,145 @@ fn successful_exact_selector_result(
         ToolOutputSelector::Bytes { .. } | ToolOutputSelector::Search { .. } | ToolOutputSelector::Structured { .. } => unreachable!(),
     }
     result
+}
+
+/// Recovery for an absent JSON pointer. Every present ancestor of a requested
+/// pointer is indexed, so the deepest one and its actual member addresses turn
+/// a guessed path into one corrected selector. Names only; never value previews.
+fn json_pointer_miss_hint(
+    metadata: &LogicalArtifactMetadata,
+    snapshot: &[u8],
+    pointer: &str,
+) -> Option<String> {
+    const LISTED: usize = 24;
+    const MAX_LISTED_NAME_BYTES: usize = 96;
+    struct Names(Vec<String>);
+    impl<'de> Deserialize<'de> for Names {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct Visitor;
+            impl<'de> serde::de::Visitor<'de> for Visitor {
+                type Value = Names;
+                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    formatter.write_str("a JSON object")
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Names, A::Error> {
+                    let mut names = Vec::new();
+                    while let Some((name, _)) = map.next_entry::<String, serde::de::IgnoredAny>()? {
+                        names.push(name);
+                    }
+                    Ok(Names(names))
+                }
+            }
+            deserializer.deserialize_map(Visitor)
+        }
+    }
+    let mut end = pointer.len();
+    let (parent, entry) = loop {
+        end = pointer[..end].rfind('/')?;
+        if let Some(entry) = metadata.json_pointers.get(&pointer[..end]) {
+            break (&pointer[..end], entry);
+        }
+    };
+    let missing = pointer[end + 1..]
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .replace("~1", "/")
+        .replace("~0", "~");
+    let quoted = |value: &str| serde_json::to_string(value).unwrap_or_default();
+    let owner = if parent.is_empty() {
+        "the document root".to_string()
+    } else {
+        format!("the deepest present ancestor {}", quoted(parent))
+    };
+    let text = std::str::from_utf8(validated_snapshot_range(snapshot, entry.range).ok()?).ok()?;
+    let text = text.trim_start();
+    if text.starts_with('[') {
+        let count = serde_json::from_str::<Vec<serde::de::IgnoredAny>>(text).ok()?.len();
+        let position = missing.parse::<usize>().ok().filter(|_| missing == "0" || !missing.starts_with('0'));
+        return Some(match (count, position) {
+            (0, _) => format!("{owner} is an empty array"),
+            (_, Some(position)) if position >= count => format!(
+                "{owner} is an array of {count} elements, so index {position} is past its end; valid members are {} through {}",
+                quoted(&format!("{parent}/0")), quoted(&format!("{parent}/{}", count - 1)),
+            ),
+            _ => format!(
+                "{owner} is an array of {count} elements; arrays are addressed by decimal index, {} through {}",
+                quoted(&format!("{parent}/0")), quoted(&format!("{parent}/{}", count - 1)),
+            ),
+        });
+    }
+    if !text.starts_with('{') {
+        return Some(format!(
+            "{owner} is a scalar value, so it has no member {}",
+            quoted(&missing)
+        ));
+    }
+    let Names(names) = serde_json::from_str(text).ok()?;
+    if names.is_empty() {
+        return Some(format!("{owner} is an empty object"));
+    }
+    let address = |name: &str| quoted(&format!("{parent}/{}", name.replace('~', "~0").replace('/', "~1")));
+    // Case and containment slips first, then small edit distances.
+    let wanted = missing.to_lowercase();
+    let mut closest = names
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| name.len() <= MAX_LISTED_NAME_BYTES)
+        .filter_map(|(position, name)| {
+            let lower = name.to_lowercase();
+            let rank = if lower == wanted {
+                0
+            } else if wanted.len() >= 3 && (lower.contains(&wanted) || wanted.contains(&lower)) {
+                1
+            } else {
+                let limit = (wanted.chars().count() / 3).clamp(1, 3);
+                let distance = bounded_edit_distance(&lower, &wanted, limit)?;
+                1 + distance
+            };
+            Some((rank, position, name))
+        })
+        .collect::<Vec<_>>();
+    closest.sort();
+    let closest = closest
+        .iter()
+        .take(3)
+        .map(|(_, _, name)| address(name))
+        .collect::<Vec<_>>();
+    let listed = names
+        .iter()
+        .filter(|name| name.len() <= MAX_LISTED_NAME_BYTES)
+        .take(LISTED)
+        .map(|name| address(name))
+        .collect::<Vec<_>>();
+    let omitted = names.len() - listed.len();
+    Some(format!(
+        "{owner} is an object with {} member{}{}; members: {}{}",
+        names.len(),
+        if names.len() == 1 { "" } else { "s" },
+        if closest.is_empty() { String::new() } else { format!("; closest: {}", closest.join(", ")) },
+        listed.join(", "),
+        if omitted == 0 { String::new() } else { format!(", … (+{omitted} more)") },
+    ))
+}
+
+/// Levenshtein distance when it is at most `limit`; short names only.
+fn bounded_edit_distance(left: &str, right: &str, limit: usize) -> Option<usize> {
+    let left = left.chars().collect::<Vec<_>>();
+    let right = right.chars().collect::<Vec<_>>();
+    if left.len().abs_diff(right.len()) > limit || left.len() > 64 || right.len() > 64 {
+        return None;
+    }
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    for (row, left_char) in left.iter().enumerate() {
+        let mut current = vec![row + 1; right.len() + 1];
+        for (column, right_char) in right.iter().enumerate() {
+            let substitution = previous[column] + usize::from(left_char != right_char);
+            current[column + 1] = substitution.min(previous[column + 1] + 1).min(current[column] + 1);
+        }
+        previous = current;
+    }
+    previous.last().copied().filter(|distance| *distance <= limit)
 }
 
 fn exact_selector_result(
@@ -6800,9 +7076,18 @@ fn exact_selector_result(
     {
         Ok(result) => result,
         Err(status) => {
+            let hint = match (&selector, status) {
+                (ToolOutputSelector::JsonPointer { pointer }, ToolOutputSelectorStatus::NotFound) => {
+                    json_pointer_miss_hint(metadata, snapshot, pointer)
+                }
+                _ => None,
+            };
             let mut result = ToolOutputSelectorResult::state(selector, status);
             result.message = Some(match status {
-                ToolOutputSelectorStatus::NotFound => "selector was not found".to_string(),
+                ToolOutputSelectorStatus::NotFound => match hint {
+                    Some(hint) => format!("selector was not found; {hint}"),
+                    None => "selector was not found".to_string(),
+                },
                 _ => "selector is invalid for this artifact".to_string(),
             });
             return result;
@@ -6844,7 +7129,11 @@ fn internally_drain_exact_subdivisions(
     {
         return None;
     }
-    let (range, children, _) = selector_range_and_children(&original.selector, metadata).ok()?;
+    let (range, children, _) = if matches!(original.selector, ToolOutputSelector::Tail { .. }) {
+        (original.canonical_range, original.child_selectors.clone(), None)
+    } else {
+        selector_range_and_children(&original.selector, metadata).ok()?
+    };
     if range != Some(plan.range) {
         return None;
     }
@@ -6854,6 +7143,9 @@ fn internally_drain_exact_subdivisions(
     let bytes = validated_snapshot_range(snapshot, plan.range).ok()?;
     let mut completed =
         successful_exact_selector_result(original.selector.clone(), plan.range, children, bytes);
+    if matches!(original.selector, ToolOutputSelector::Tail { .. }) {
+        completed.value = original.value.clone();
+    }
     completed.subdivision_plan = Some(plan.clone());
     completed.message = Some(format!(
         "internally drained all {} deterministic byte subdivisions",
@@ -6923,7 +7215,17 @@ fn select_logical_artifact(
     {
         return too_large_result(selector, range, children, metadata, snapshot, fragment_token_ceiling);
     }
-    let mut result = exact_selector_result(metadata, snapshot, selector.clone());
+    let mut result = if matches!(selector, ToolOutputSelector::Tail { .. }) {
+        match tail_window_limit(&selector, structured_source_bytes) {
+            Ok(limit) => tail_selector_result(
+                selector.clone(), &snapshot[snapshot.len().saturating_sub(limit)..],
+                snapshot.len() as u64, structured_source_bytes,
+            ),
+            Err(message) => invalid_selector_result(selector.clone(), message),
+        }
+    } else {
+        exact_selector_result(metadata, snapshot, selector.clone())
+    };
     let range = result.canonical_range;
     let children = result.child_selectors.clone();
     let individual = ReadToolOutputResult {
@@ -6942,6 +7244,7 @@ fn select_logical_artifact(
         && !response_fits_recovery_token_ceiling(&individual, final_token_ceiling)
         && let Some(range) = range
     {
+        let value = matches!(selector, ToolOutputSelector::Tail { .. }).then(|| result.value.clone()).flatten();
         result = too_large_result(
             selector,
             range,
@@ -6950,6 +7253,7 @@ fn select_logical_artifact(
             snapshot,
             fragment_token_ceiling,
         );
+        result.value = value;
     }
     result
 }
@@ -7022,10 +7326,13 @@ pub(crate) async fn read_tool_output_selectors_with_ceiling_and_reuse(
 /// One authenticated immutable observation. Cross-call reuse is permitted only
 /// while an OS-enforced lease pins the complete family and its namespace;
 /// ordinary mutable artifacts are authenticated anew on every call.
+type SnapshotSelectionKey = ExactReuseKey<Vec<ToolOutputSelector>, (String, String), &'static str, (usize, usize)>;
+
 pub(crate) struct ToolOutputSnapshot {
     metadata: LogicalArtifactMetadata,
     bytes: Vec<u8>,
     indexed_metadata: OnceLock<ValidatedJsonPointers>,
+    selections: ExactResultCache<SnapshotSelectionKey, ReadToolOutputResult>,
 }
 
 impl ToolOutputSnapshot {
@@ -7072,6 +7379,24 @@ impl ToolOutputSnapshot {
     ) -> Result<ReadToolOutputResult, ReadToolOutputError> {
         let snapshot = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
+            // Loading the snapshot rechecks custody/access and authenticates
+            // its bytes (or a live OS-enforced immutable lease) before this
+            // pure cache is reachable. Confine it to that observation: metadata
+            // and structural indexes cannot change beneath a cached selection.
+            // Cheap byte/line reads and unknown/incomplete sources execute normally.
+            let key = (snapshot.metadata.version != 0
+                && snapshot.metadata.complete && snapshot.metadata.capture_complete
+                && selectors.iter().any(|selector| matches!(selector,
+                    ToolOutputSelector::Search { .. } | ToolOutputSelector::Structured { .. }
+                    | ToolOutputSelector::JsonPointer { .. } | ToolOutputSelector::Section { .. })))
+                .then(|| ExactReuseKey {
+                    operation: "artifact.selection.v1", inputs: selectors.clone(),
+                    source_revision: (snapshot.metadata.artifact_id.clone(), snapshot.metadata.canonical_sha256.clone()),
+                    backend: "authenticated_snapshot", configuration: (token_ceiling, source_bytes),
+                });
+            if let Some(result) = key.as_ref().and_then(|key| snapshot.selections.get(key)) {
+                return Ok((*result).clone());
+            }
             // Derive missing lexical addresses once per authenticated recovery
             // transaction, regardless of how the snapshot was first selected.
             let targeted;
@@ -7090,14 +7415,22 @@ impl ToolOutputSnapshot {
             } else {
                 None
             };
-            select_tool_output_snapshot_indexed(
+            let result = select_tool_output_snapshot_indexed(
                 &snapshot.metadata,
                 &snapshot.bytes,
                 selectors,
                 token_ceiling,
                 pointers,
                 source_bytes,
-            )
+            )?;
+            if let Some(key) = key && result.complete
+                && let Ok(bytes) = serde_json::to_vec(&result)
+                && bytes.len() <= 256 * 1024
+            {
+                let charge = bytes.len() + serde_json::to_vec(&key.inputs).map_or(0, |bytes| bytes.len());
+                snapshot.selections.insert(key, Arc::new(result.clone()), charge);
+            }
+            Ok(result)
         })
         .await
         .map_err(|err| ReadToolOutputError::Io(format!("failed to select artifact: {err}")))?
@@ -7146,6 +7479,111 @@ pub(crate) async fn load_tool_output_snapshot(
     .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))?
 }
 
+/// Shared by handle audits and compaction. Authentication stays with recovery's
+/// storage owners; an empty selection never records delivery or examination.
+pub(crate) async fn audit_tool_output_reference(
+    home: &Path,
+    thread_id: &str,
+    artifact_id: &str,
+    recovery_bytes: usize,
+) -> (Value, bool) {
+    let mut command_log = true;
+    let observation = match capture::read_command_log(home, thread_id, artifact_id, &[], 0).await {
+        Ok(Some(output)) => Ok(output),
+        Ok(None) => {
+            command_log = false;
+            match load_tool_output_snapshot(home, thread_id, artifact_id).await {
+                Ok(snapshot) => snapshot.select(Vec::new(), RECOVERY_AGGREGATE_TOKEN_CEILING).await
+                    .and_then(|output| serde_json::to_value(output)
+                        .map(|mut output| {
+                            output["historical_authenticity"] = snapshot.historical_authenticity().into();
+                            output
+                        })
+                        .map_err(|error| ReadToolOutputError::Io(error.to_string()))),
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    let mut audit = serde_json::json!({
+        "kind": "evidence_handle_audit",
+        "artifact_id": artifact_id,
+        "owner_thread_id": null,
+        "access": "unavailable",
+        "content_delivered_by_check": false,
+        "content_examined_by_check": false,
+        "retention": {"observed": "unknown", "guarantee": "point_in_time_only", "indefinite": false},
+        "recovery": {"tool": "read_tool_output", "arguments": {"artifact_id": artifact_id, "audit_only": true}},
+    });
+    match observation {
+        Ok(output) => {
+            audit["access"] = "readable".into();
+            audit["owner_thread_id"] = thread_id.into();
+            audit["identity"] = serde_json::json!({
+                "canonical_sha256": output["canonical_sha256"],
+                "canonical_bytes": output["canonical_bytes"],
+                "historical_authenticity": output["historical_authenticity"],
+            });
+            audit["retention"]["observed"] = "retained".into();
+            audit["retention"]["retained_bytes"] = output["retained_bytes"].clone();
+            audit["retention"]["retained_artifact_complete"] = output["retained_artifact_complete"].clone();
+            if let Some(ranges) = output.get("unavailable_ranges") {
+                audit["retention"]["unavailable_ranges"] = ranges.clone();
+            }
+            audit["recovery"]["arguments"] = serde_json::json!({
+                "artifact_id": artifact_id,
+                "selectors": [{"kind": "bytes", "start": 0,
+                    "end": output["canonical_bytes"].as_u64().unwrap_or_default().min(recovery_bytes as u64)}],
+            });
+            audit["message"] = "Readable now in this thread; check delivered no source bytes. Retained bytes and capture completeness are separate from selection delivery or semantic examination. This grants no future retention, cross-thread access or current-source freshness.".into();
+        }
+        Err(error) => {
+            let error = if error == ReadToolOutputError::Expired {
+                match find_other_thread_artifact_owner(home, thread_id, artifact_id).await {
+                    Some(owner_thread_id) => ReadToolOutputError::OwnedByOtherThread {
+                        owner_thread_id, known_descendant: false,
+                    },
+                    None => error,
+                }
+            } else { error };
+            let (access, reason) = match &error {
+                ReadToolOutputError::InvalidArtifactId => {
+                    audit["recovery"] = serde_json::json!({
+                        "instruction": "Recover the exact canonical artifact UUID from the original owner receipt; do not retry the malformed handle or replay its producer.",
+                    });
+                    ("invalid", "invalid_artifact_id")
+                }
+                ReadToolOutputError::StillWriting => {
+                    audit["recovery"] = serde_json::json!({
+                        "instruction": "Resume the live operation with its original owner-issued handle; wait for retention to finish. Do not poll this artifact or replay its producer.",
+                    });
+                    ("writing", "retention_pending")
+                }
+                ReadToolOutputError::OwnedByOtherThread { owner_thread_id, .. } => {
+                    audit["owner_thread_id"] = owner_thread_id.clone().into();
+                    audit["recovery"] = serde_json::json!({
+                        "owner_thread_id": owner_thread_id,
+                        "instruction": "Have the owning thread recover and share the required evidence using its original selectors. Do not retry this handle in the calling thread or replay its producer.",
+                    });
+                    ("other_thread", "different_owner")
+                }
+                ReadToolOutputError::Expired => {
+                    audit["recovery"]["instruction"] = "Use output already delivered or inspect affected state. Preserve the handle and original selectors; absence here does not prove global expiry or authorize producer replay.".into();
+                    ("unavailable", "not_found_in_calling_thread")
+                }
+                _ => {
+                    audit["recovery"]["instruction"] = "Preserve the handle and original selectors; resolve the reported storage or access failure before recovery. Use already delivered output; do not replay producer effects.".into();
+                    ("unavailable", "storage_error")
+                }
+            };
+            audit["access"] = access.into();
+            audit["reason"] = reason.into();
+            audit["message"] = error.for_model().into();
+        }
+    }
+    (audit, command_log)
+}
+
 #[cfg(not(windows))]
 fn load_tool_output_snapshot_uncached(
     path: &Path,
@@ -7165,6 +7603,7 @@ fn load_tool_output_snapshot_with_observation(
         metadata,
         bytes,
         indexed_metadata: OnceLock::new(),
+        selections: ExactResultCache::new(4, 1024 * 1024),
     }))
 }
 
@@ -7186,31 +7625,33 @@ pub(crate) async fn find_other_thread_artifact_owner(
     if id.to_string() != artifact_id {
         return None;
     }
-    let root = codex_home.join("tool-output");
+    let roots = [codex_home.join("tool-output"), codex_home.join("command-output")];
     let thread_id = thread_id.to_string();
     let file_name = format!("{id}.log");
     run_blocking_artifact_io(move || {
-        let entries = match std::fs::read_dir(&root) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        for entry in entries.take(OTHER_THREAD_ARTIFACT_SCAN_LIMIT) {
-            let Ok(entry) = entry else { continue };
-            let Ok(owner) = entry.file_name().into_string() else {
-                continue;
+        for root in roots {
+            let entries = match std::fs::read_dir(&root) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
             };
-            // Directories without valid thread IDs are not thread-owned, and
-            // reparse points are not followed into another location.
-            if owner == thread_id
-                || codex_protocol::ThreadId::from_string(&owner).is_err()
-                || !entry.file_type().is_ok_and(|kind| kind.is_dir())
-            {
-                continue;
-            }
-            let base = std::fs::symlink_metadata(entry.path().join(&file_name));
-            if base.is_ok_and(|base| base.is_file() && !metadata_is_reparse_point(&base)) {
-                return Ok(Some(owner));
+            for entry in entries.take(OTHER_THREAD_ARTIFACT_SCAN_LIMIT) {
+                let Ok(entry) = entry else { continue };
+                let Ok(owner) = entry.file_name().into_string() else {
+                    continue;
+                };
+                // Directories without valid thread IDs are not thread-owned,
+                // and reparse points are not followed into another location.
+                if owner == thread_id
+                    || codex_protocol::ThreadId::from_string(&owner).is_err()
+                    || !entry.file_type().is_ok_and(|kind| kind.is_dir())
+                {
+                    continue;
+                }
+                let base = std::fs::symlink_metadata(entry.path().join(&file_name));
+                if base.is_ok_and(|base| base.is_file() && !metadata_is_reparse_point(&base)) {
+                    return Ok(Some(owner));
+                }
             }
         }
         Ok(None)
@@ -7322,7 +7763,7 @@ fn select_tool_output_snapshot_indexed(
         // Mirror the recovery owner's in-order source-byte charges so a later
         // structured page is shortened to what earlier selections leave.
         let structured_source_bytes = if source_bytes != usize::MAX
-            && matches!(selector, ToolOutputSelector::Structured { .. })
+            && matches!(selector, ToolOutputSelector::Structured { .. } | ToolOutputSelector::Tail { .. })
         {
             let remaining =
                 response
@@ -8588,6 +9029,11 @@ fn enforce_indexed_thread_retention_blocking(
             {
                 return true;
             }
+            let reason = pressure::EvictionReason {
+                scope: "thread",
+                artifact_count_limit: thread_unprotected.saturating_add(reserved_artifacts) > max_retained_artifacts_per_thread(),
+                logical_storage_byte_limit: thread_bytes.saturating_add(reserved_bytes) > MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD,
+            };
             index.threads.get(&directory).and_then(|thread| {
                 thread.unprotected_paths.iter().find_map(|path| {
                     let record = index.records.get(path)?;
@@ -8595,6 +9041,7 @@ fn enforce_indexed_thread_retention_blocking(
                         || {
                             (
                                 path.clone(),
+                                reason,
                                 RetentionIndexToken {
                                     root: root.to_path_buf(),
                                     generation: Some(state.generation),
@@ -8606,10 +9053,10 @@ fn enforce_indexed_thread_retention_blocking(
                 })
             })
         };
-        let Some((path, token)) = candidate else {
+        let Some((path, reason, token)) = candidate else {
             return true;
         };
-        match remove_inactive_output_path_blocking(path.clone()) {
+        match remove_inactive_output_path_blocking(path.clone(), reason) {
             InactiveRemovalOutcome::RemovedOrAbsent => {
                 publish_known_remove(&token, &path, LogicalRetentionMutation::Delete, true);
             }
@@ -8649,11 +9096,17 @@ fn enforce_indexed_global_retention_blocking(
             {
                 return true;
             }
+            let reason = pressure::EvictionReason {
+                scope: "global",
+                artifact_count_limit: index.unprotected.saturating_add(reserved_artifacts) > max_retained_artifacts_total(),
+                logical_storage_byte_limit: index.unprotected_bytes.saturating_add(reserved_bytes) > MAX_RETAINED_ARTIFACT_BYTES_TOTAL,
+            };
             index.global_order.iter().find_map(|(_, path)| {
                 let record = index.records.get(path)?;
                 (!record.protected && path != &keep_path && !skipped.contains(path)).then(|| {
                     (
                         path.clone(),
+                        reason,
                         RetentionIndexToken {
                             root: root.to_path_buf(),
                             generation: Some(state.generation),
@@ -8663,10 +9116,10 @@ fn enforce_indexed_global_retention_blocking(
                 })
             })
         };
-        let Some((path, token)) = candidate else {
+        let Some((path, reason, token)) = candidate else {
             return true;
         };
-        match remove_inactive_output_path_blocking(path.clone()) {
+        match remove_inactive_output_path_blocking(path.clone(), reason) {
             InactiveRemovalOutcome::RemovedOrAbsent => {
                 publish_known_remove(&token, &path, LogicalRetentionMutation::Delete, true);
             }
@@ -9258,7 +9711,12 @@ fn enforce_retention_scan_locked_blocking(
         if path == keep_path || protected {
             continue;
         }
-        match remove_inactive_output_path_blocking(path) {
+        let reason = pressure::EvictionReason {
+            scope: "thread",
+            artifact_count_limit: remove_count > 0,
+            logical_storage_byte_limit: total_bytes.saturating_add(reserved_bytes) > MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD,
+        };
+        match remove_inactive_output_path_blocking(path, reason) {
             InactiveRemovalOutcome::RemovedOrAbsent => {
                 remove_count = remove_count.saturating_sub(1);
                 total_bytes = total_bytes.saturating_sub(bytes);
@@ -9354,7 +9812,12 @@ fn enforce_global_retention_scan_locked_blocking(
             break;
         }
         if !protected && path != keep_path {
-            match remove_inactive_output_path_blocking(path) {
+            let reason = pressure::EvictionReason {
+                scope: "global",
+                artifact_count_limit: remove_count > 0,
+                logical_storage_byte_limit: total_bytes.saturating_add(reserved_bytes) > MAX_RETAINED_ARTIFACT_BYTES_TOTAL,
+            };
+            match remove_inactive_output_path_blocking(path, reason) {
                 InactiveRemovalOutcome::RemovedOrAbsent => {
                     remove_count = remove_count.saturating_sub(1);
                     total_bytes = total_bytes.saturating_sub(bytes);
@@ -9757,7 +10220,7 @@ fn retention_sweep_semaphore(root: &Path) -> Arc<Semaphore> {
 
 
 
-fn remove_inactive_output_path_blocking(path: PathBuf) -> InactiveRemovalOutcome {
+fn remove_inactive_output_path_blocking(path: PathBuf, reason: pressure::EvictionReason) -> InactiveRemovalOutcome {
     // Release completed recovery residency before the existing writer/retention
     // admission probes; otherwise a cache lease would look like active work.
     #[cfg(windows)]
@@ -9793,7 +10256,12 @@ fn remove_inactive_output_path_blocking(path: PathBuf) -> InactiveRemovalOutcome
         }
         Err(err) => return InactiveRemovalOutcome::Ambiguous(err),
     }
-    match remove_logical_artifact_files(&path) {
+    let before = pressure::before_eviction(&path);
+    let removal = remove_logical_artifact_files(&path);
+    let removed = removal.is_ok()
+        || removal.as_ref().is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+    pressure::record_eviction(&path, reason, before, removed);
+    match removal {
         Ok(()) => InactiveRemovalOutcome::RemovedOrAbsent,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             InactiveRemovalOutcome::RemovedOrAbsent

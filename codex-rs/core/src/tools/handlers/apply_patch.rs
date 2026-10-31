@@ -21,12 +21,14 @@ use crate::tools::context::ApplyPatchToolOutput;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolInvocation;
+use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::handlers::apply_granted_turn_permissions;
 use crate::tools::handlers::apply_patch_retries;
+use crate::tools::handlers::apply_patch_operations;
 use crate::tools::handlers::apply_patch_spec::create_apply_patch_freeform_tool;
 use crate::tools::handlers::resolve_tool_environment;
 use crate::tools::handlers::updated_hook_command;
@@ -81,9 +83,7 @@ impl ApplyPatchInterceptionError {
             _ => None,
         };
         Self {
-            error: FunctionCallError::RespondToModel(format!(
-                "apply_patch verification failed: {error}"
-            )),
+            error: FunctionCallError::structured(crate::tools::runtimes::apply_patch::patch_failure(&error)),
             proof,
         }
     }
@@ -168,7 +168,7 @@ impl ToolArgumentDiffConsumer for ApplyPatchArgumentDiffConsumer {
 impl ApplyPatchArgumentDiffConsumer {
     fn push_delta(&mut self, call_id: String, delta: &str) -> Option<PatchApplyUpdatedEvent> {
         self.input.push_str(delta);
-        if apply_patch_retries::is_retry(&self.input) || self.parse_error.is_some() {
+        if self.input.contains("*** Operation ID:") || apply_patch_retries::is_retry(&self.input) || self.parse_error.is_some() {
             return None;
         }
         match self.parser.push_delta_in_place(delta) {
@@ -205,21 +205,29 @@ impl ApplyPatchArgumentDiffConsumer {
     fn finish_update_on_complete(
         &mut self,
     ) -> Result<Option<PatchApplyUpdatedEvent>, FunctionCallError> {
+        let (operation, patch) = apply_patch_operations::split(&self.input)?;
+        if operation.is_some() {
+            if !apply_patch_retries::is_retry(&patch) {
+                codex_apply_patch::parse_patch(&patch).map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
+            }
+            return Ok(None);
+        }
         if apply_patch_retries::is_retry(&self.input) {
             apply_patch_retries::validate_retry(&self.input)
                 .map_err(FunctionCallError::RespondToModel)?;
             return Ok(None);
         }
         if let Some(err) = &self.parse_error {
-            return Err(FunctionCallError::RespondToModel(format!(
-                "failed to parse apply_patch: {err}"
+            return Err(FunctionCallError::structured(crate::tools::runtimes::apply_patch::patch_failure(
+                &codex_apply_patch::ApplyPatchError::ParseError(err.clone()),
             )));
         }
 
         if let Err(err) = self.parser.finish_in_place() {
             self.pending = None;
-            let response =
-                FunctionCallError::RespondToModel(format!("failed to parse apply_patch: {err}"));
+            let response = FunctionCallError::structured(crate::tools::runtimes::apply_patch::patch_failure(
+                &codex_apply_patch::ApplyPatchError::ParseError(err.clone()),
+            ));
             self.parse_error = Some(err);
             return Err(response);
         }
@@ -531,20 +539,65 @@ impl ToolExecutor<ToolInvocation> for ApplyPatchHandler {
         true
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle(&self, mut invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
         Box::pin(async move {
+            let ToolPayload::Custom { input } = &invocation.payload else {
+                return self.handle_call(invocation).await.map(boxed_tool_output);
+            };
+            let original = input.clone();
+            let (declared_id, patch) = apply_patch_operations::split(input)?;
+            let operation_id = declared_id.unwrap_or_else(|| invocation.call_id.clone());
+            let scope = invocation.step_context.environments.turn_environments.iter().map(|e|
+                serde_json::json!({"id":e.environment_id, "owner":e.owner_id(), "cwd":e.cwd()})).collect::<Vec<_>>();
+            let binding = serde_json::json!({"patch":original, "environments":scope});
+            let home = invocation.step_context.turn.config.codex_home.clone();
+            let thread = invocation.session.thread_id.to_string();
+            let id = operation_id.clone();
+            let admission = tokio::task::spawn_blocking(move || apply_patch_operations::begin(&home, &thread, &id, binding))
+                .await.map_err(|e| FunctionCallError::Fatal(format!("Patch operation admission failed: {e}")))??;
+            let operation = match admission {
+                apply_patch_operations::Admission::Recovered(mut receipt) => {
+                    receipt["historical_receipt"] = serde_json::json!(true);
+                    receipt["current_freshness_verified"] = serde_json::json!(false);
+                    let success = receipt["success"].as_bool();
+                    return Ok(boxed_tool_output(codex_tools::JsonToolOutput::with_success(receipt, success)
+                        .with_code_mode_failure_as_data()));
+                }
+                apply_patch_operations::Admission::New(operation) => operation,
+            };
+            invocation.payload = ToolPayload::Custom { input: patch };
+            let terminal_tasks = invocation.session.terminal_tasks.clone();
+            let handler = Self::new(self.multi_environment);
+            // The tracked owner outlives observer cancellation, including the
+            // durable receipt write after filesystem finalization.
+            terminal_tasks.spawn(async move {
             let cancellation = invocation.cancellation_token.clone();
-            match self.handle_call(invocation).await {
+            let result = match handler.handle_call(invocation).await {
+                Err(FunctionCallError::Structured(failure)) if !cancellation.is_cancelled() => {
+                    Ok(ApplyPatchToolOutput::from_delta(
+                        failure.message.clone(), false, &Default::default(), operation_id.clone(), None,
+                    ).with_failure(*failure))
+                }
                 Err(FunctionCallError::RespondToModel(text)) if !cancellation.is_cancelled() => {
-                    Ok(boxed_tool_output(ApplyPatchToolOutput::from_delta(
+                    Ok(ApplyPatchToolOutput::from_delta(
                         text,
                         false,
                         &Default::default(),
+                        operation_id.clone(),
                         None,
-                    )))
+                    ))
                 }
                 result => result,
+            };
+            let mut result = result;
+            if let Ok(output) = &mut result {
+                output.operation_id = operation_id;
+                let receipt = output.structured_result();
+                tokio::task::spawn_blocking(move || operation.finish(&receipt)).await
+                    .map_err(|e| FunctionCallError::Fatal(format!("Patch receipt owner failed: {e}")))??;
             }
+            result.map(boxed_tool_output)
+            }).await.map_err(|e| FunctionCallError::Fatal(format!("Patch operation owner failed: {e}")))?
         })
     }
 }
@@ -553,7 +606,7 @@ impl ApplyPatchHandler {
     async fn handle_call(
         &self,
         invocation: ToolInvocation,
-    ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
+    ) -> Result<ApplyPatchToolOutput, FunctionCallError> {
         let ToolInvocation {
             session,
             step_context,
@@ -600,8 +653,8 @@ impl ApplyPatchHandler {
                     1,
                     &[("failure_kind", "parse")],
                 );
-                return Err(FunctionCallError::RespondToModel(format!(
-                    "apply_patch verification failed: {parse_error}"
+                return Err(FunctionCallError::structured(crate::tools::runtimes::apply_patch::patch_failure(
+                    &codex_apply_patch::ApplyPatchError::ParseError(parse_error),
                 )));
             }
         };
@@ -625,8 +678,11 @@ impl ApplyPatchHandler {
             })
             .sum();
         let retained_input = args.patch.clone();
+        let requested_hunks = args.hunks.clone();
 
         let cancellation = cancellation_token.clone();
+        let mut unattempted = codex_apply_patch::AppliedPatchDelta::default();
+        let mut response_environment_id = None;
         let result = async {
             let selected_environment_id =
                 require_environment_id(args.environment_id.as_deref(), self.multi_environment)?;
@@ -643,6 +699,8 @@ impl ApplyPatchHandler {
                     "apply_patch requires a selected execution environment.".to_string(),
                 ));
             };
+            unattempted = codex_apply_patch::AppliedPatchDelta::unattempted(&requested_hunks, turn_environment.cwd());
+            response_environment_id = Some(turn_environment.environment_id.clone());
             tracker.lock().await.observe_environment_scope(&step_context.environments, turn_environment);
             if retry_scope.as_ref().is_some_and(|(id, instance, cwd)| {
                 id != &turn_environment.environment_id
@@ -675,14 +733,50 @@ impl ApplyPatchHandler {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .consume(id).map_err(FunctionCallError::RespondToModel)?;
             }
-            match codex_apply_patch::verify_apply_patch_args(
-                args,
-                turn_environment.cwd(),
-                fs.as_ref(),
-                Some(&sandbox),
-            )
-            .await
+            let failure_context = || serde_json::json!([
+                turn_environment.environment_id, turn_environment.owner_id(),
+                turn_environment.cwd(), sandbox,
+            ]).to_string();
+            // Ordinary cold successful patches do not render/hash a second
+            // copy of their payload merely to populate a failure-only cache.
+            let has_failures = retry_id.is_none() && session.services.retained_patches.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner).has_failures();
+            let failure_key = has_failures.then(||
+                apply_patch_retries::failure_key(&args, &failure_context())).flatten();
+            // An explicit retained Retry Patch intentionally re-verifies, even
+            // without amendments. Hooks and workspace admission ran normally.
+            let prior = if retry_id.is_none() {
+                failure_key.as_deref().and_then(|key| session.services.retained_patches.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner).prior_failure(key))
+            } else { None };
+            let mut reused_failure = None;
+            if let Some(prior) = prior
+                && let Some(hunk) = args.hunks.first()
+                && let Ok(path) = hunk.resolve_path(turn_environment.cwd())
+                && fs.canonicalize(&path, Some(&sandbox)).await.ok()
+                    .is_some_and(|path| path.to_string() == prior.mismatch.canonical_path)
+                && fs.get_metadata(&path, Some(&sandbox)).await.ok()
+                    .is_some_and(|metadata| metadata.is_file && metadata.size <= 8 * 1024 * 1024)
+                && let Ok(Some(digest)) = fs.checksum_file(&path, false, Some(&sandbox)).await
+                && digest.file_bytes <= 8 * 1024 * 1024
             {
+                if digest.sha256 == prior.mismatch.current_content_sha256 {
+                    reused_failure = Some(prior);
+                }
+            }
+            let failure_was_reused = reused_failure.is_some();
+            let repeated_note = reused_failure.as_ref().map(|prior| format!(
+                "\nReused confirmed no-effect preflight failure from call {}: patch semantics, source revision and engine context match. Use the retained Retry Patch receipt for intentional re-verification.",
+                prior.call_id,
+            )).unwrap_or_default();
+            let verified = match reused_failure {
+                Some(prior) => codex_apply_patch::MaybeApplyPatchVerified::CorrectnessError(
+                    codex_apply_patch::ApplyPatchError::PatchContextMismatch(prior.mismatch)),
+                None => codex_apply_patch::verify_apply_patch_args(
+                    args, turn_environment.cwd(), fs.as_ref(), Some(&sandbox),
+                ).await,
+            };
+            match verified {
                 codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
                     let (file_paths, effective_additional_permissions, file_system_sandbox_policy) =
                         effective_patch_permissions(
@@ -704,7 +798,7 @@ impl ApplyPatchHandler {
                     match invocation {
                         InternalApplyPatchInvocation::Output(item) => {
                             let content = item?;
-                            Ok(boxed_tool_output(ApplyPatchToolOutput::from_text(content)))
+                            Ok(ApplyPatchToolOutput::from_text(content, call_id.clone()))
                         }
                         InternalApplyPatchInvocation::DelegateToRuntime(apply) => {
                             let changes = convert_apply_patch_to_protocol(&apply.action);
@@ -740,11 +834,22 @@ impl ApplyPatchHandler {
                                 workspace_operation_permit,
                             )
                             .await?;
-                            Ok(boxed_tool_output(output))
+                            Ok(output)
                         }
                     }
                 }
                 codex_apply_patch::MaybeApplyPatchVerified::CorrectnessError(parse_error) => {
+                    if !failure_was_reused
+                        && matches!(&parse_error, codex_apply_patch::ApplyPatchError::PatchContextMismatch(_))
+                    {
+                        let key = failure_key.or_else(|| codex_apply_patch::parse_patch(&retained_input).ok()
+                            .and_then(|args| apply_patch_retries::failure_key(&args, &failure_context())));
+                        if let Some(key) = key {
+                            session.services.retained_patches.lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .retain_failure(key, &parse_error, &call_id);
+                        }
+                    }
                     session.services.session_telemetry.counter(
                         "codex.apply_patch.verification_failed",
                         1,
@@ -792,11 +897,15 @@ impl ApplyPatchHandler {
 
                     let read_note =
                         read_snapshot_note(&session, turn_environment, mismatches).await;
-                    Ok(boxed_tool_output(ApplyPatchToolOutput::from_delta(
-                        format!("apply_patch verification failed: {parse_error}{read_note}"), false,
-                        &Default::default(), Some(turn_environment.environment_id.clone()),
+                    let rejected = codex_apply_patch::AppliedPatchDelta::rejected(
+                        &requested_hunks, turn_environment.cwd(), &parse_error,
+                    );
+                    Ok(ApplyPatchToolOutput::from_delta(
+                        format!("apply_patch verification failed: {parse_error}{read_note}{repeated_note}"), false,
+                        &rejected, call_id.clone(), Some(turn_environment.environment_id.clone()),
                     ).with_retry(retry).with_patch_mismatch(mismatch)
-                    ))
+                        .with_failure(crate::tools::runtimes::apply_patch::patch_failure(&parse_error))
+                    )
                 }
                 codex_apply_patch::MaybeApplyPatchVerified::ShellParseError(error) => {
                     tracing::trace!("Failed to parse apply_patch input, {error:?}");
@@ -831,7 +940,19 @@ impl ApplyPatchHandler {
                 .session_telemetry
                 .histogram(name, value, &[("outcome", outcome)]);
         }
-        result
+        match result {
+            Err(FunctionCallError::Structured(failure)) if !cancellation.is_cancelled() => {
+                Ok(ApplyPatchToolOutput::from_delta(
+                    failure.message.clone(), false, &unattempted, call_id, response_environment_id,
+                ).with_failure(*failure))
+            }
+            Err(FunctionCallError::RespondToModel(text)) if !cancellation.is_cancelled() => {
+                Ok(ApplyPatchToolOutput::from_delta(
+                    text, false, &unattempted, call_id, response_environment_id,
+                ))
+            }
+            result => result,
+        }
     }
 }
 
@@ -855,7 +976,8 @@ impl CoreToolRuntime for ApplyPatchHandler {
                 let ToolPayload::Custom { input } = payload else {
                     return None;
                 };
-                let args = codex_apply_patch::parse_patch(input).ok()?;
+                let (_, patch) = apply_patch_operations::split(input).ok()?;
+                let args = codex_apply_patch::parse_patch(&patch).ok()?;
                 if args.environment_id.is_some() {
                     return None;
                 }
@@ -896,16 +1018,17 @@ impl CoreToolRuntime for ApplyPatchHandler {
     fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
         let tool_name = self.pre_tool_use_hook_name(&invocation.tool_name, &invocation.payload)?;
         let mut command = apply_patch_payload_command(&invocation.payload)?;
-        if apply_patch_retries::is_retry(&command)
+        let (operation_id, patch) = apply_patch_operations::split(&command).ok()?;
+        if apply_patch_retries::is_retry(&patch)
             && let Ok(retry) = invocation
                 .session
                 .services
                 .retained_patches
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .prepare(&command)
+                .prepare(&patch)
         {
-            command = retry.args.patch;
+            command = apply_patch_operations::with_id(&retry.args.patch, operation_id.as_deref()).ok()?;
         }
         Some(PreToolUsePayload {
             tool_name,
@@ -922,11 +1045,14 @@ impl CoreToolRuntime for ApplyPatchHandler {
         mut invocation: ToolInvocation,
         updated_input: serde_json::Value,
     ) -> Result<ToolInvocation, FunctionCallError> {
-        let patch = updated_hook_command(&updated_input)?;
-        if let ToolPayload::Custom { input } = &invocation.payload
-            && apply_patch_retries::is_retry(input)
+        let updated = updated_hook_command(&updated_input)?;
+        let original = apply_patch_payload_command(&invocation.payload).unwrap_or_default();
+        let (operation_id, original_patch) = apply_patch_operations::split(&original)?;
+        let command = apply_patch_operations::with_id(updated, operation_id.as_deref())?;
+        let (_, patch) = apply_patch_operations::split(&command)?;
+        if apply_patch_retries::is_retry(&original_patch)
         {
-            codex_apply_patch::parse_patch(patch)
+            codex_apply_patch::parse_patch(&patch)
                 .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
             let mut retained = invocation
                 .session
@@ -935,7 +1061,7 @@ impl CoreToolRuntime for ApplyPatchHandler {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let retry = retained
-                .prepare(input)
+                .prepare(&original_patch)
                 .map_err(FunctionCallError::RespondToModel)?;
             let environment = resolve_tool_environment(
                 &invocation.step_context.environments,
@@ -952,7 +1078,7 @@ impl CoreToolRuntime for ApplyPatchHandler {
                 ));
             }
             let receipt = retained
-                .replace_after_hook(&retry.id, patch, &invocation.call_id)
+                .replace_after_hook(&retry.id, &patch, &invocation.call_id)
                 .map_err(FunctionCallError::RespondToModel)?;
             #[expect(
                 clippy::expect_used,
@@ -962,14 +1088,14 @@ impl CoreToolRuntime for ApplyPatchHandler {
                 .as_str()
                 .expect("retained replacement id");
             invocation.payload = ToolPayload::Custom {
-                input: format!("*** Begin Patch\n*** Retry Patch: {id}\n*** End Patch"),
+                input: apply_patch_operations::with_id(&format!("*** Begin Patch\n*** Retry Patch: {id}\n*** End Patch"), operation_id.as_deref())?,
             };
             drop(retained);
             return Ok(invocation);
         }
         invocation.payload = match invocation.payload {
             ToolPayload::Custom { .. } => ToolPayload::Custom {
-                input: patch.to_string(),
+                input: command,
             },
             payload => payload,
         };
@@ -1147,24 +1273,42 @@ async fn run_owned_patch(
             &tool_ctx.call_id,
             tracker.as_ref(),
         );
+        use codex_protocol::tool_failure::{ToolFailure, ToolFailureCode};
+        let terminal_failure = if req.cancellation_token.is_cancelled() {
+            Some(ToolFailure::new(ToolFailureCode::Cancelled, "Patch operation was cancelled; cancellation is not rollback."))
+        } else if matches!(&out,
+            Err(crate::tools::sandboxing::ToolError::Denied(_)) |
+            Err(crate::tools::sandboxing::ToolError::Codex(codex_protocol::error::CodexErr::Sandbox(
+                codex_protocol::error::SandboxErr::Denied { .. }
+            )))
+        ) {
+            Some(ToolFailure::new(ToolFailureCode::PermissionDenied, "Patch execution was denied by the active permission policy."))
+        } else { runtime.failure().cloned() };
         let result = emitter.finish(event_ctx, out, delta.as_ref()).await;
+        let unattempted = codex_apply_patch::parse_patch(&req.action.patch).map(|args|
+            codex_apply_patch::AppliedPatchDelta::unattempted(&args.hunks, &req.action.cwd))
+            .unwrap_or_default();
+        let receipt_delta = if runtime.committed_delta().manifest().is_empty() {
+            &unattempted
+        } else { runtime.committed_delta() };
         let result = match result {
             Ok(text) => Ok(ApplyPatchToolOutput::from_delta(
                 text,
                 true,
-                runtime.committed_delta(),
+                receipt_delta,
+                tool_ctx.call_id.clone(),
                 Some(req.turn_environment.environment_id.clone()),
             )),
-            Err(FunctionCallError::RespondToModel(text))
-                if !req.cancellation_token.is_cancelled() =>
-            {
+            Err(FunctionCallError::RespondToModel(text)) => {
                 // Shell interception can verify relative paths after `cd`.
                 // The dedicated tool cannot select that working directory, so
                 // never offer a receipt that would replay those paths elsewhere.
                 // A receipt also replays the submitted revision guards, so a
                 // stale guard needs a fresh reconciled patch instead.
                 let retry = (req.action.cwd == *req.turn_environment.cwd()
-                    && !runtime.revision_guard_mismatch())
+                    && !runtime.revision_guard_mismatch()
+                    && !terminal_failure.as_ref().is_some_and(|failure|
+                        matches!(failure.code, ToolFailureCode::PermissionDenied | ToolFailureCode::Cancelled)))
                     .then(|| {
                         tool_ctx
                             .session
@@ -1182,19 +1326,36 @@ async fn run_owned_patch(
                             )
                     })
                     .flatten();
+                let failure = terminal_failure.unwrap_or_else(||
+                    codex_protocol::tool_failure::ToolFailure::new(
+                        codex_protocol::tool_failure::ToolFailureCode::Failed,
+                        "Patch failed; inspect the retained diagnostic and committed receipt.",
+                    ));
                 Ok(ApplyPatchToolOutput::from_delta(
                     text,
                     false,
-                    runtime.committed_delta(),
+                    receipt_delta,
+                    tool_ctx.call_id.clone(),
                     Some(req.turn_environment.environment_id.clone()),
                 )
                 .with_retry(retry)
-                .with_patch_mismatch(runtime.patch_mismatch()))
+                .with_patch_mismatch(runtime.patch_mismatch())
+                .with_failure(failure))
             }
             Err(error) => Err(error),
         };
-        // Release the workspace gate after the committed delta reaches consumers.
+        let reversal_candidates = historical_reversal_candidates(receipt_delta);
+        // Release the workspace gate before optional history reads. Advisories
+        // must neither hold mutation locks nor change execution/approval results.
         drop(runtime);
+        let mut result = result;
+        if let Ok(output) = &mut result
+            && !reversal_candidates.is_empty()
+        {
+            output.diagnostics.extend(patch_reversal_warnings(
+                &req, tool_ctx.turn.as_ref(), reversal_candidates,
+            ).await);
+        }
         result
     };
     terminal_tasks
@@ -1213,6 +1374,99 @@ async fn run_owned_patch(
         })?
 }
 
+fn historical_reversal_candidates(
+    delta: &codex_apply_patch::AppliedPatchDelta,
+) -> Vec<codex_git_utils::ReversalCandidate> {
+    use codex_apply_patch::AppliedPatchFileChange;
+    let mut net = std::collections::BTreeMap::new();
+    let mut bytes = 0usize;
+    for change in delta.changes() {
+        let (old, new) = match &change.change {
+            AppliedPatchFileChange::Add { content, overwritten_content } => (
+                overwritten_content.as_deref().unwrap_or(""), content.as_str(),
+            ),
+            AppliedPatchFileChange::Update { old_content, new_content, .. } => (
+                old_content.as_str(), new_content.as_str(),
+            ),
+            AppliedPatchFileChange::Delete { content } => (content.as_str(), ""),
+        };
+        bytes = bytes.saturating_add(old.len()).saturating_add(new.len());
+        if bytes > 256 * 1024 || net.len() > 8 {
+            // Check before endpoint_change clones any source buffers. On a
+            // partial input, do not blame an intermediate edit later undone.
+            return vec![codex_git_utils::ReversalCandidate {
+                path: PathBuf::new(), lines: Vec::new(),
+            }];
+        }
+        let endpoint = delta.endpoint_change(change);
+        let baseline = net.remove(&endpoint.path).map(|(before, _)| before);
+        if matches!(&change.change, AppliedPatchFileChange::Delete { .. }) {
+            continue;
+        }
+        let path = match endpoint.change {
+            AppliedPatchFileChange::Update { move_path: Some(path), .. } => path,
+            _ => endpoint.path,
+        };
+        net.entry(path).and_modify(|(_, after)| *after = new)
+            .or_insert((baseline.unwrap_or(old), new));
+    }
+    if net.len() > 8 {
+        return vec![codex_git_utils::ReversalCandidate { path: PathBuf::new(), lines: Vec::new() }];
+    }
+    let mut candidates = Vec::new();
+    for (path, (old, new)) in net {
+        let previous = old.lines().map(str::trim).collect::<BTreeSet<_>>();
+        let lines = new.lines().enumerate().filter_map(|(index, text)| {
+            let text = text.trim();
+            (!previous.contains(text) && text.chars().any(char::is_alphanumeric))
+                .then(|| (index + 1, text.to_owned()))
+        }).collect::<Vec<_>>();
+        if !lines.is_empty() {
+            candidates.push(codex_git_utils::ReversalCandidate { path, lines });
+        }
+    }
+    candidates
+}
+
+async fn patch_reversal_warnings(
+    req: &ApplyPatchRequest,
+    turn: &TurnContext,
+    candidates: Vec<codex_git_utils::ReversalCandidate>,
+) -> Vec<serde_json::Value> {
+    let skipped = |reason: &str| vec![serde_json::json!({
+        "kind": "historical_reversal_check_skipped", "advisory_only": true, "reason": reason,
+    })];
+    if req.turn_environment.environment.is_remote()
+        || !turn.file_system_sandbox_policy().has_full_disk_read_access()
+    {
+        return skipped("requires_local_full_disk_read_access");
+    }
+    let Ok(cwd) = req.action.cwd.to_abs_path() else {
+        return skipped("local_working_directory_unavailable");
+    };
+    let check = codex_git_utils::historical_reversal_warnings(cwd.to_path_buf(), candidates);
+    let checked = tokio::select! {
+        _ = req.cancellation_token.cancelled() => return skipped("cancelled"),
+        checked = tokio::time::timeout(Duration::from_millis(500), check) => checked,
+    };
+    let Ok(Ok(check)) = checked else {
+        return skipped("history_unavailable_or_budget_exceeded");
+    };
+    let mut diagnostics = check.warnings.into_iter().map(|warning| {
+        let mut warning = serde_json::to_value(warning).unwrap_or_default();
+        warning["head"] = serde_json::json!(check.head);
+        warning["scope"] = serde_json::json!("32 path-relevant first-parent commits within 30 days; same path, trimmed-line equality, not semantic equivalence");
+        warning
+    }).collect::<Vec<_>>();
+    if !check.skipped.is_empty() {
+        diagnostics.push(serde_json::json!({
+            "kind": "historical_reversal_check_skipped", "advisory_only": true,
+            "reason": "path_input_or_history_capture_limit", "paths": check.skipped,
+        }));
+    }
+    diagnostics
+}
+
 /// A failed intercepted patch reports what the apply_patch tool reports: the
 /// exactness note, the committed-change inventory and, when the model can use
 /// it through that tool, the retained retry receipt.
@@ -1225,7 +1479,14 @@ fn intercepted_patch_failure(
     } else {
         output.with_retry(None)
     };
-    FunctionCallError::RespondToModel(output.model_text())
+    let mut failure = output.failure().unwrap_or_else(||
+        codex_protocol::tool_failure::ToolFailure::new(
+            codex_protocol::tool_failure::ToolFailureCode::Failed, "Intercepted patch failed.",
+        ));
+    // Preserve the established mutation/recovery receipt through shell relay.
+    let receipt = output.code_mode_result(&ToolPayload::Custom { input: String::new() });
+    failure.details = Some(serde_json::json!({"patch_result": receipt}));
+    FunctionCallError::structured(failure)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1341,7 +1602,7 @@ pub(crate) async fn intercept_apply_patch(
                         )
                         .into());
                     }
-                    Ok(Some(FunctionToolOutput::from_text(output.text, Some(true))))
+                    Ok(Some(FunctionToolOutput::from_text(output.model_text(), Some(true))))
                 }
             }
         }

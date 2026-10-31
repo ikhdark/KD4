@@ -185,7 +185,8 @@ impl ToolExecutor<ToolInvocation> for SaveTurnDiffHandler {
                 .await
                 .map_err(save_error)?
             {
-                codex_exec_server::FileMutationOutcome::Committed => {}
+                codex_exec_server::FileMutationOutcome::Committed
+                | codex_exec_server::FileMutationOutcome::Unchanged => {}
                 codex_exec_server::FileMutationOutcome::Conflict => {
                     return Err(FunctionCallError::RespondToModel(format!(
                         "refusing to replace existing diff artifact {native_path}; choose a new name"

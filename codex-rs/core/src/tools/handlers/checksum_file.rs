@@ -106,6 +106,7 @@ pub(super) struct FileChecksum {
     pub(super) sha256: String,
     pub(super) bytes_hashed: u64,
     pub(super) source_identity: String,
+    pub(super) text_diagnostics: Option<codex_file_system::TextDiagnostics>,
 }
 
 pub(super) struct ChecksumFailure {
@@ -119,6 +120,15 @@ pub(super) async fn checksum_source(
     invocation: &ToolInvocation,
     path: &str,
     environment_id: Option<&str>,
+) -> Result<FileChecksum, ChecksumFailure> {
+    stream_source(invocation, path, environment_id, false).await
+}
+
+pub(super) async fn stream_source(
+    invocation: &ToolInvocation,
+    path: &str,
+    environment_id: Option<&str>,
+    include_text_diagnostics: bool,
 ) -> Result<FileChecksum, ChecksumFailure> {
     let error = |message: String| ChecksumFailure {
         reason: "source_unavailable",
@@ -153,7 +163,7 @@ pub(super) async fn checksum_source(
     let digest = tokio::select! {
         biased;
         _ = invocation.cancellation_token.cancelled() => return Err(cancelled()),
-        result = filesystem.checksum_file(&path, Some(&sandbox)) => result,
+        result = filesystem.checksum_file(&path, include_text_diagnostics, Some(&sandbox)) => result,
     }
     .map_err(|err| ChecksumFailure {
         reason: match err.kind() {
@@ -184,6 +194,7 @@ pub(super) async fn checksum_source(
         sha256: digest.sha256,
         bytes_hashed: digest.file_bytes,
         source_identity: digest.revision,
+        text_diagnostics: digest.text_diagnostics,
     })
 }
 

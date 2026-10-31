@@ -72,6 +72,8 @@ pub(crate) struct StepContext {
     pub(crate) mcp: Arc<McpRuntimeSnapshot>,
     /// Shared by accepted calls and retries of this sampling step only.
     mcp_tool_snapshot: Arc<OnceCell<McpToolSnapshot>>,
+    /// One history estimate per sampling step, shared by direct and nested output owners.
+    output_context_tokens: Arc<OnceCell<Option<usize>>>,
     /// The finalized tool plan advertised and executed for this exact sampling request.
     tool_router: OnceLock<Arc<ToolRouter>>,
     /// Workspace evidence shared by every direct and nested call accepted in
@@ -90,6 +92,7 @@ impl StepContext {
     pub(crate) fn for_retry_attempt(&self) -> Self {
         Self {
             workspace_evidence_generation_batch: Arc::new(WorkspaceEvidenceGenerationBatch::new()),
+            output_context_tokens: Arc::new(OnceCell::new()),
             ..self.clone()
         }
     }
@@ -113,12 +116,42 @@ impl StepContext {
             selected_capability_roots,
             mcp,
             mcp_tool_snapshot,
+            output_context_tokens: Arc::new(OnceCell::new()),
             tool_router: OnceLock::new(),
             workspace_evidence_generation_batch: Arc::new(WorkspaceEvidenceGenerationBatch::new()),
             loaded_agents_md,
             agents_md_stable_context,
             agents_md_freshness,
         }
+    }
+
+    /// Bound presentation, not script-visible data processing. Keep half the
+    /// remaining context for sibling outputs and the next model response; never
+    /// shrink a coherent packet when the existing ceiling already fits there.
+    /// This is a per-result allowance, not a reservation or a compaction gate.
+    pub(crate) async fn model_output_token_limit(
+        &self,
+        session: &crate::session::Session,
+        hard_limit: usize,
+    ) -> usize {
+        let available = self
+            .output_context_tokens
+            .get_or_init(|| async {
+                let window = self.turn.model_context_window().filter(|window| *window > 0)?;
+                let used = session.get_context_tokens_for_turn(&self.turn).await.max(0);
+                let available =
+                    usize::try_from(window.saturating_sub(used).max(0)).unwrap_or(usize::MAX) / 2;
+                tracing::debug!(
+                    event.name = "codex.output_context_budget",
+                    context_window = window,
+                    context_tokens = used,
+                    output_token_limit = available,
+                    "captured per-result output allowance for this sampling step"
+                );
+                Some(available)
+            })
+            .await;
+        available.map_or(hard_limit, |available| hard_limit.min(available))
     }
 
     pub(crate) async fn mcp_tool_snapshot(&self) -> &McpToolSnapshot {

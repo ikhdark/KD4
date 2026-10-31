@@ -190,6 +190,7 @@ pub enum CodexErrKind {
     Interrupted,
     UnexpectedStatus,
     InvalidRequest,
+    FinalResponseValidation,
     InvalidImageRequest,
     UsageLimitReached,
     ServerOverloaded,
@@ -250,6 +251,7 @@ impl From<&CodexErr> for CodexErrKind {
                 CodexErrKind::UnexpectedStatus
             }
             CodexErr::InvalidRequest(_) => CodexErrKind::InvalidRequest,
+            CodexErr::FinalResponseValidation(_) => CodexErrKind::FinalResponseValidation,
             CodexErr::InvalidImageRequest() => CodexErrKind::InvalidImageRequest,
             CodexErr::UsageLimitReached(_) => CodexErrKind::UsageLimitReached,
             CodexErr::ServerOverloaded { .. } => CodexErrKind::ServerOverloaded,

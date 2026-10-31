@@ -259,6 +259,24 @@ async fn run_connection_with_shutdown(
                     );
                     if let Some((method, route)) = request_route {
                         let initialized = handler.is_initialized();
+                        // Check before admission-time controls/reservations as well
+                        // as after queued dependencies, immediately before execution.
+                        if let Err(error) = handler
+                            .revalidate_capabilities(request.capability_revision.as_deref())
+                        {
+                            request_metrics.set_result("stale_capability_manifest");
+                            if send_outbound(
+                                &outgoing_tx,
+                                RpcServerOutboundMessage::Error {
+                                    request_id: request.id,
+                                    error,
+                                },
+                                &cancelled,
+                            ).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
                         let control = initialized
                             && matches!(
                                 method,
@@ -284,6 +302,7 @@ async fn run_connection_with_shutdown(
                                     | crate::protocol::EXEC_SIGNAL_METHOD
                                     | crate::protocol::EXEC_TERMINATE_METHOD
                                     | crate::protocol::ENVIRONMENT_INFO_METHOD
+                                    | crate::protocol::CAPABILITY_MANIFEST_METHOD
                                     | crate::protocol::HTTP_REQUEST_METHOD
                                     | crate::protocol::HTTP_REQUEST_CANCEL_METHOD
                                     | crate::protocol::FS_CHECKSUM_FILE_CANCEL_METHOD
@@ -481,7 +500,8 @@ async fn run_connection_with_shutdown(
                             .flatten();
                         let mut predecessor = if admitted_terminate.is_some() || admitted_cancel.is_some() {
                             None
-                        } else if initialized && method == crate::protocol::EXEC_WRITE_METHOD {
+                        } else if initialized && matches!(method,
+                            crate::protocol::EXEC_WRITE_METHOD | crate::protocol::EXEC_CLOSE_STDIN_METHOD) {
                             // A blocked terminal owns only its own FIFO. Starts
                             // still depend on prior filesystem/environment work.
                             process_id
@@ -514,7 +534,8 @@ async fn run_connection_with_shutdown(
                             last_ordered.take()
                         };
                         filesystem_cohort.retain(|completion| completion.clone().now_or_never().is_none());
-                        if initialized && !independent_read && method != crate::protocol::EXEC_WRITE_METHOD
+                        if initialized && !independent_read && !matches!(method,
+                            crate::protocol::EXEC_WRITE_METHOD | crate::protocol::EXEC_CLOSE_STDIN_METHOD)
                             && !filesystem_cohort.is_empty()
                         {
                             // Reads form a finite cohort between mutation/start
@@ -538,7 +559,8 @@ async fn run_connection_with_shutdown(
                                 if let Some(handle) = read_handle {
                                     filesystem_handle_reads.insert(handle, completion.clone());
                                 }
-                            } else if method == crate::protocol::EXEC_WRITE_METHOD {
+                            } else if matches!(method,
+                                crate::protocol::EXEC_WRITE_METHOD | crate::protocol::EXEC_CLOSE_STDIN_METHOD) {
                                 if let Some(id) = process_id.as_ref() {
                                     process_writes.insert(id.clone(), completion.clone());
                                 }
@@ -555,6 +577,20 @@ async fn run_connection_with_shutdown(
                             }
                         }
                         let request_span = request_span(method, &request);
+                        // Cancellation already executed at admission under its
+                        // current revision; never relabel it as an unsent refusal.
+                        let capability_revision = if admitted_cancel.is_some() {
+                            None
+                        } else {
+                            request.capability_revision.clone()
+                        };
+                        let capability_request_id = request.id.clone();
+                        let capability_handler = Arc::clone(&handler);
+                        let reserved_http = admitted_http
+                            .as_ref()
+                            .and_then(|result| result.as_ref().ok())
+                            .filter(|params| params.stream_response)
+                            .map(|params| params.request_id.clone());
                         let response: std::pin::Pin<
                             Box<
                                 dyn std::future::Future<Output = Option<RpcServerOutboundMessage>>
@@ -648,12 +684,30 @@ async fn run_connection_with_shutdown(
                                     },
                                 }
                             } else { None };
-                            let message = tokio::select! {
-                                message = response => message,
-                                _ = request_cancelled.cancelled() => {
-                                    request_span.record("result", "disconnected");
-                                    request_metrics.set_result("disconnected");
-                                    return false;
+                            let message = if let Err(error) = capability_handler
+                                .revalidate_capabilities(capability_revision.as_deref())
+                            {
+                                // The unpolled response owns RAII process/checksum
+                                // reservations. HTTP reservations live in the handler.
+                                drop(response);
+                                if let Some(request_id) = reserved_http {
+                                    capability_handler
+                                        .release_rejected_http_body_stream(
+                                            &request_id, &capability_request_id,
+                                        )
+                                        .await;
+                                }
+                                Some(RpcServerOutboundMessage::Error {
+                                    request_id: capability_request_id, error,
+                                })
+                            } else {
+                                tokio::select! {
+                                    message = response => message,
+                                    _ = request_cancelled.cancelled() => {
+                                        request_span.record("result", "disconnected");
+                                        request_metrics.set_result("disconnected");
+                                        return false;
+                                    }
                                 }
                             };
                             let result = request_result(&message);

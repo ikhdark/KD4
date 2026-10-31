@@ -65,6 +65,13 @@ impl<'de> Deserialize<'de> for JSONRPCMessage {
         }
 
         #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum CapabilityRevision {
+            Revision(String),
+            Invalid(serde::de::IgnoredAny),
+        }
+
+        #[derive(Deserialize)]
         struct Envelope {
             #[serde(default, deserialize_with = "present")]
             id: Option<RequestId>,
@@ -78,6 +85,8 @@ impl<'de> Deserialize<'de> for JSONRPCMessage {
             // Only requests interpret trace metadata; other message types have
             // historically accepted it as an unknown extension field.
             trace: Option<Trace>,
+            #[serde(rename = "capabilityRevision")]
+            capability_revision: Option<CapabilityRevision>,
         }
 
         struct EnvelopeVisitor;
@@ -108,6 +117,13 @@ impl<'de> Deserialize<'de> for JSONRPCMessage {
                 id,
                 method,
                 params: envelope.params,
+                capability_revision: match envelope.capability_revision {
+                    Some(CapabilityRevision::Revision(revision)) => Some(revision),
+                    Some(CapabilityRevision::Invalid(_)) => {
+                        return Err(serde::de::Error::custom("invalid capability revision metadata"));
+                    }
+                    None => None,
+                },
                 trace: match envelope.trace {
                     Some(Trace::Context(trace)) => Some(trace),
                     Some(Trace::Invalid(_)) => {
@@ -140,6 +156,13 @@ pub struct JSONRPCRequest {
     pub params: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace: Option<W3cTraceContext>,
+    /// Expected support snapshot. Checked again before execution, never an authority token.
+    #[serde(
+        default,
+        rename = "capabilityRevision",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub capability_revision: Option<String>,
 }
 
 /// A notification that does not expect a response.

@@ -87,7 +87,7 @@ impl RetainedOutputChunk {
 
 struct RunningProcess {
     start_generation: Arc<ProcessStart>,
-    session: ExecCommandSession,
+    session: Arc<ExecCommandSession>,
     tty: bool,
     pipe_stdin: bool,
     accepted_stdin_write_ids: Arc<Mutex<AcceptedStdinWriteIds>>,
@@ -119,6 +119,7 @@ struct RunningProcess {
 /// bounded deduplication window; they cannot provide an ordered retirement floor.
 #[derive(Default)]
 struct AcceptedStdinWriteIds {
+    closed: bool,
     ids: HashSet<String>,
     order: VecDeque<String>,
     retired_through: [Option<u64>; 2],
@@ -297,30 +298,35 @@ impl LocalProcess {
     pub(crate) async fn shutdown(&self) {
         self.inner.notification_shutdown.cancel();
         let remaining = {
-            let mut processes = self.inner.processes.lock().await;
+            let processes = self.inner.processes.lock().await;
             processes
-                .drain()
+                .iter()
                 .filter_map(|(process_id, process)| match process {
                     ProcessEntry::Starting(start) => {
                         start.preparation_cancelled.cancel();
                         None
                     }
+                    ProcessEntry::Running(process) if process.closed
+                        && !process.termination_requested.load(Ordering::Acquire) => None,
                     ProcessEntry::Running(process) => {
                         process.termination_requested.store(true, Ordering::Release);
-                        Some((process_id, process))
+                        Some(LocalExecProcess {
+                            identity: ProcessStartIdentity(Arc::clone(&process.start_generation)),
+                            process_id: process_id.clone(),
+                            backend: self.clone(),
+                            wake_tx: process.wake_tx.clone(),
+                            events: process.events.clone(),
+                        })
                     }
                 })
                 .collect::<Vec<_>>()
         };
-        for (process_id, process) in remaining {
-            match process.session.terminate() {
-                Ok(()) => tracing::info!(%process_id, cleanup_outcome = "termination_requested", "process shutdown cleanup"),
+        for process in remaining {
+            let process_id = &process.process_id;
+            match process.terminate().await {
+                Ok(()) => tracing::info!(%process_id, cleanup_outcome = "shutdown_confirmed", "process shutdown cleanup"),
                 Err(error) => {
-                    tracing::error!(%process_id, %error, cleanup_outcome = "unresolved", "process shutdown cleanup failed");
-                    // Retain the failed identity for inspection or a later
-                    // cleanup attempt, without replacing a newer incarnation.
-                    self.inner.processes.lock().await.entry(process_id)
-                        .or_insert(ProcessEntry::Running(process));
+                    tracing::error!(%process_id, %error, cleanup_outcome = "shutdown_uncertain", "process shutdown cleanup failed; owner retained");
                 }
             }
         }
@@ -520,7 +526,7 @@ impl LocalProcess {
                 process_id.clone(),
                 ProcessEntry::Running(Box::new(RunningProcess {
                     start_generation: Arc::clone(&start),
-                    session: spawned.session,
+                    session: Arc::new(spawned.session),
                     tty,
                     pipe_stdin,
                     accepted_stdin_write_ids: Arc::new(
@@ -757,25 +763,28 @@ impl LocalProcess {
             )
         };
 
-        if accepted_stdin_write_ids
-            .lock()
-            .await
-            .already_accepted(&params.write_id)?
         {
-            return Ok(WriteResponse {
-                status: WriteStatus::Accepted,
-            });
+            let accepted = accepted_stdin_write_ids.lock().await;
+            if accepted.already_accepted(&params.write_id)? {
+                return Ok(WriteResponse { status: WriteStatus::Accepted });
+            }
+            if accepted.closed {
+                return Ok(WriteResponse { status: WriteStatus::StdinClosed });
+            }
         }
 
         let permit = writer_tx
             .reserve(params.chunk.into_inner())
             .await
-            .map_err(|_| internal_error("failed to write to process stdin".to_string()))?;
+            .map_err(|_| invalid_request("stdin is closed; input was not accepted".to_string()))?;
         let mut accepted_stdin_write_ids = accepted_stdin_write_ids.lock().await;
         if accepted_stdin_write_ids.already_accepted(&params.write_id)? {
             return Ok(WriteResponse {
                 status: WriteStatus::Accepted,
             });
+        }
+        if accepted_stdin_write_ids.closed {
+            return Ok(WriteResponse { status: WriteStatus::StdinClosed });
         }
 
         // After this synchronous send, record the write id before any further await.
@@ -787,6 +796,39 @@ impl LocalProcess {
         Ok(WriteResponse {
             status: WriteStatus::Accepted,
         })
+    }
+
+    pub(crate) async fn close_stdin_bound(
+        &self,
+        params: crate::protocol::CloseStdinParams,
+        identity: Option<&ProcessStartIdentity>,
+    ) -> Result<WriteResponse, JSONRPCErrorError> {
+        let (session, accepted) = {
+            let processes = self.inner.processes.lock().await;
+            let Some(process) = processes.get(&params.process_id) else {
+                return Ok(WriteResponse { status: WriteStatus::UnknownProcess });
+            };
+            if identity.is_some_and(|identity| !identity.matches(process)) {
+                return Err(invalid_request("process handle has expired or was replaced".into()));
+            }
+            let ProcessEntry::Running(process) = process else {
+                return Ok(WriteResponse { status: WriteStatus::Starting });
+            };
+            if process.tty {
+                return Err(invalid_request("cannot close terminal input; explicit stdin EOF requires a pipe, not Ctrl-D".into()));
+            }
+            (Arc::clone(&process.session), Arc::clone(&process.accepted_stdin_write_ids))
+        };
+        // Serialize close admission with the synchronous write-id/send commit.
+        // Never hold the process store or write gate while draining native I/O.
+        {
+            let mut accepted = accepted.lock().await;
+            accepted.closed = true;
+            session.close_stdin();
+        }
+        session.close_stdin_ordered().await
+            .map_err(|error| invalid_request(format!("stdin close failed: {error}")))?;
+        Ok(WriteResponse { status: WriteStatus::Accepted })
     }
 
     pub(crate) async fn signal_process_bound(
@@ -828,7 +870,7 @@ impl LocalProcess {
         params: TerminateParams,
         identity: Option<ProcessStartIdentity>,
     ) -> Result<TerminateResponse, JSONRPCErrorError> {
-        let running = {
+        let session = {
             let mut process_map = self.inner.processes.lock().await;
             if let Some(identity) = identity {
                 let matches = match process_map.get(&params.process_id) {
@@ -844,30 +886,35 @@ impl LocalProcess {
             }
             match process_map.get_mut(&params.process_id) {
                 Some(ProcessEntry::Running(process)) => {
-                    if process.exit_code.is_some() {
-                        if !process.closed {
-                            process.termination_requested.store(true, Ordering::Release);
-                            process.session.finish();
-                        }
-                        return Ok(TerminateResponse { running: false });
-                    }
-                    if !process.termination_requested.load(Ordering::Acquire) {
-                        process.session.request_terminate().map_err(|err| {
-                            internal_error(format!("failed to terminate process: {err}"))
-                        })?;
-                        process.termination_requested.store(true, Ordering::Release);
-                    }
-                    true
+                    process.termination_requested.store(true, Ordering::Release);
+                    Arc::clone(&process.session)
                 }
                 Some(ProcessEntry::Starting(start)) => {
                     start.preparation_cancelled.cancel();
                     process_map.remove(&params.process_id);
-                    true
+                    return Ok(TerminateResponse { running: true });
                 }
-                None => false,
+                None => return Ok(TerminateResponse { running: false }),
             }
         };
-
+        // Native tree confirmation can wait. Do not hold the process map or an
+        // async worker while it runs; the worker retains this exact incarnation
+        // if its RPC future is cancelled. Errors leave the record retryable.
+        let worker_session = Arc::clone(&session);
+        tokio::task::spawn_blocking(move || worker_session.request_terminate())
+            .await
+            .map_err(|error| internal_error(format!("shutdown uncertain: termination worker failed: {error}")))?
+            .map_err(|error| internal_error(format!("shutdown uncertain: failed to confirm process tree cleanup: {error}")))?;
+        let running = !session.has_exited();
+        maybe_emit_closed(params.process_id.clone(), Arc::clone(&self.inner)).await;
+        let closed = {
+            let processes = self.inner.processes.lock().await;
+            matches!(processes.get(&params.process_id), Some(ProcessEntry::Running(process))
+                if process.closed && Arc::ptr_eq(&process.session, &session))
+        };
+        if closed {
+            session.finish();
+        }
         Ok(TerminateResponse { running })
     }
 }
@@ -935,6 +982,13 @@ impl ExecBackend for LocalProcess {
 }
 
 impl LocalExecProcess {
+    async fn close_stdin(&self) -> Result<WriteResponse, ExecServerError> {
+        self.backend.close_stdin_bound(
+            crate::protocol::CloseStdinParams { process_id: self.process_id.clone() },
+            Some(&self.identity),
+        ).await.map_err(map_handler_error)
+    }
+
     async fn read(
         &self,
         after_seq: Option<u64>,
@@ -1037,6 +1091,10 @@ impl ExecProcess for LocalExecProcess {
 
     fn write(&self, chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse> {
         Box::pin(LocalExecProcess::write(self, chunk))
+    }
+
+    fn close_stdin(&self) -> ExecProcessFuture<'_, WriteResponse> {
+        Box::pin(LocalExecProcess::close_stdin(self))
     }
 
     // `exec_write` finishes every await before its synchronous send, so a
@@ -1245,6 +1303,11 @@ async fn maybe_emit_closed(process_id: ProcessId, inner: Arc<Inner>) {
         if process.closed || process.finalizing || process.open_streams != 0 {
             return;
         }
+        if process.termination_requested.load(Ordering::Acquire)
+            && !process.session.termination_is_confirmed()
+        {
+            return;
+        }
         let Some(exit_code) = process.exit_code else {
             return;
         };
@@ -1306,9 +1369,10 @@ async fn maybe_emit_closed(process_id: ProcessId, inner: Arc<Inner>) {
             return;
         }
         process.sandbox_denied = assessment.unwrap_or(false);
-        // Native custody ends at confirmed root exit plus drained readers, not
-        // at replay expiry. The record retains only replayable evidence.
-        process.session.finish();
+        // Release empty jobs promptly; retained records must still be able to
+        // cancel descendants after a natural root exit, without cancelling them
+        // merely because output finished or the replay record later expires.
+        process.session.finish_for_replay();
         process.closed = true;
         let seq = process.next_seq;
         process.next_seq += 1;

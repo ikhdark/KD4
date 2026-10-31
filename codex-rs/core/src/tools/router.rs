@@ -351,15 +351,10 @@ impl ToolRouter {
                         tool.exposure() == crate::tools::registry::ToolExposure::Deferred
                     })
                     .map(|tool| {
-                        let name = tool.tool_name();
-                        let encoded = serde_json::to_vec(&serde_json::json!({
-                            "provenance": name.to_string(),
-                            "provider_authority": tool.provider_authority(),
-                            "spec_sha256": tool.canonical_spec_sha256(),
-                            "callable_contract": tool.spec().callable_contract(),
-                        }))
-                        .unwrap_or_default();
-                        (name.clone(), hex::encode(Sha256::digest(encoded)))
+                        (
+                            tool.tool_name().clone(),
+                            tool.effective_contract_revision().to_owned(),
+                        )
                     })
                     .collect(),
             )
@@ -475,6 +470,8 @@ impl ToolRouter {
                     // discovery index. Persist only their canonical identity here so
                     // the rollout manifest does not scale with every registered schema.
                     "spec_sha256": tool.canonical_spec_sha256(),
+                    "identity": name,
+                    "effective_contract_revision": tool.effective_contract_revision(),
                 })
             })
             .collect::<Vec<_>>();

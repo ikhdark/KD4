@@ -209,6 +209,10 @@ impl From<ExecCommandStatus> for CommandExecutionStatus {
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq)]
 pub struct CommandExecutionOutputMetadata {
+    /// Identity of the process owner that observed these facts; absent in legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub incarnation: Option<String>,
     /// Process termination and output drain are independent observations.
     pub process_exited: bool,
     pub output_drained: bool,

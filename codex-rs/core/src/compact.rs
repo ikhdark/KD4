@@ -42,6 +42,8 @@ use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CompactedItem;
+use codex_protocol::protocol::CompactionMode;
+use codex_protocol::protocol::CompactionOperation;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnStartedEvent;
@@ -267,7 +269,7 @@ fn compaction_rebase_prompt(sections: &[usize]) -> String {
         return String::new();
     }
     format!(
-        "\nRebase these sections instead of appending deltas: {}. Return each as a complete refreshed state, retaining unresolved obligations, constraints, live handles, and indispensable evidence from ALL earlier updates. Keep each previous Goal and Unresolved work line verbatim in its section, or account for it on one Completed work line: `Resolved: <exact line> Evidence: <receipt>` or `Superseded: <exact line> User instruction: <accepted instruction>`. Accounting is a model claim, not verified conservation. Replace the previous bodies. Keep the combined checkpoint within 2,400 tokens; do not omit obligations to fit.",
+        "\nRebase these sections instead of appending deltas: {}. Return each as a complete refreshed state, retaining unresolved obligations, constraints, live handles, and indispensable evidence from ALL earlier updates. Keep each previous Goal and Unresolved work line verbatim in its section. Only after the existing update_plan requirement owner records completion or authorized supersession may you account for it on one Completed work line: `Resolved: <exact line> Evidence: <receipt>` or `Superseded: <exact line> User instruction: <accepted instruction>`. Preserve existing requirement IDs as `[ID] <original requirement text>`; do not invent a second ledger. Summary prose never performs a transition. Replace the previous bodies. Keep the combined checkpoint within 2,400 tokens; do not omit obligations to fit.",
         sections
             .iter()
             .map(|&index| COMPACTION_SECTIONS[index].0)
@@ -299,11 +301,13 @@ fn compaction_update_budget_prompt(previous: &str, rebased: &[usize]) -> String 
     )
 }
 
-// This is an explicit accounting format, not a truth detector. Merely quoting
-// an anchor in Completed work cannot retire it; the resolution claim must name
-// its evidence (or the accepted instruction). Existing evidence owners decide
-// whether that claim is actually supported.
-fn compaction_anchor_accounted_for(completed: &str, anchor: &str) -> bool {
+// Accounting prose alone cannot retire scope. Reuse the existing requirement
+// owner instead of deriving another obligation ledger from summary text.
+fn compaction_anchor_accounted_for(
+    completed: &str,
+    anchor: &str,
+    lineage: Option<&crate::plan_store::PlanLineage>,
+) -> bool {
     completed.lines().any(|line| {
         let line = line.trim().trim_start_matches("- ");
         [
@@ -315,6 +319,9 @@ fn compaction_anchor_accounted_for(completed: &str, anchor: &str) -> bool {
             line.strip_prefix(prefix).is_some_and(|body| {
                 body.split_once(marker).is_some_and(|(claim, evidence)| {
                     claim.trim() == anchor && !evidence.trim().is_empty()
+                        && lineage.is_some_and(|lineage| {
+                            lineage.compaction_anchor_closed(anchor, *prefix == "Superseded:")
+                        })
                 })
             })
         })
@@ -332,6 +339,7 @@ fn rebased_compaction_summary(
     suffix: &str,
     rebased: &[usize],
     bound_overflow: bool,
+    lineage: Option<&crate::plan_store::PlanLineage>,
 ) -> CodexResult<String> {
     validate_generated_compaction_summary(Some(previous), suffix)?;
     let populated = compaction_section_bodies(suffix);
@@ -377,7 +385,7 @@ fn rebased_compaction_summary(
                 && !protected[usize::from(index == 3)]
                     .lines()
                     .any(|retained| retained.trim() == line.trim())
-                && !compaction_anchor_accounted_for(&completed, line.trim())
+                && !compaction_anchor_accounted_for(&completed, line.trim(), lineage)
             {
                 repairs[usize::from(index == 3)].push(line);
             }
@@ -662,6 +670,15 @@ async fn run_compact_task_inner_impl(
     let previous_summary = latest_summary_message(history.raw_items()).map(str::to_string);
     let reuse_previous_summary = previous_summary.is_some()
         && can_reuse_previous_summary(history.raw_items(), omitted_user_text);
+    let mut compaction_mode = if reuse_previous_summary {
+        CompactionMode::Reuse
+    } else if turn_context.config.compact_prompt.is_some() {
+        CompactionMode::Custom
+    } else if previous_summary.is_some() {
+        CompactionMode::Incremental
+    } else {
+        CompactionMode::Full
+    };
     // The unread tail is preserved in replacement history, not interpreted by the
     // summarizer. Remove its calls as well so normalization cannot synthesize outputs.
     // Collect recovery pins first, including references that occur only in that tail.
@@ -674,6 +691,10 @@ async fn run_compact_task_inner_impl(
         omitted_text || omitted_image_count > 0,
     );
     let mut generated_summary_recovery = None;
+    // Read-only owner snapshot; summary generation never mutates requirement
+    // status, and an unobserved later transition cannot authorize retirement.
+    let plan_lineage = sess.services.plan_store.snapshot_with_lineage().await
+        .map(|(_, lineage)| lineage);
     // Persist source recovery while the existing summary request runs. Both
     // must finish before publishing replacement history; cancellation cannot
     // detach a writer or publish a checkpoint with unavailable source bytes.
@@ -718,6 +739,9 @@ async fn run_compact_task_inner_impl(
                 } else {
                     Vec::new()
                 };
+                if !rebase_sections.is_empty() {
+                    compaction_mode = CompactionMode::Rebase;
+                }
                 history.replace(summary_items);
                 select_compaction_input(
                     &mut input,
@@ -823,10 +847,11 @@ async fn run_compact_task_inner_impl(
                     prompt.input = input.into();
                 }
                 turn_context.turn_timing_state.begin_compaction_generation();
-                let mut retry_state = ResponsesStreamRetryState::default();
+                let mut retry_state = ResponsesStreamRetryState::new(max_retries);
                 let mut retried_invalid_summary = false;
                 loop {
                     retry_state.check_retry_budget(cancellation_token)?;
+                    retry_state.begin_attempt(&turn_context, ResponsesStreamRequest::LocalCompaction);
                     let attempt_result = drain_to_completed(
                         &sess,
                         turn_context.as_ref(),
@@ -858,6 +883,7 @@ async fn run_compact_task_inner_impl(
                                     &summary_suffix,
                                     &rebase_sections,
                                     /*bound_overflow*/ retried_invalid_summary,
+                                    plan_lineage.as_ref(),
                                 )
                             } else {
                                 validated_compaction_summary(
@@ -887,6 +913,7 @@ async fn run_compact_task_inner_impl(
                                     retried_invalid_summary = true;
                                     if rebase_enabled {
                                         rebase_sections = (0..COMPACTION_SECTIONS.len()).collect();
+                                        compaction_mode = CompactionMode::Rebase;
                                     }
                                     let correction = ResponseItem::from(ResponseInputItem::from(
                                         vec![UserInput::Text {
@@ -1019,6 +1046,7 @@ async fn run_compact_task_inner_impl(
         // Persist the exact new eviction shape. Older records with `None` still use the legacy
         // reconstruction path that retained raw user messages.
         replacement_history: Some(new_history.clone()),
+        provenance: None,
         // The ordered history commit assigns and publishes the next window.
         window_number: None,
         first_window_id: None,
@@ -1032,6 +1060,12 @@ async fn run_compact_task_inner_impl(
         world_state_baseline,
         fragment_digests,
         compacted_item,
+        CompactionOperation {
+            mode: compaction_mode,
+            request: serde_json::to_value(compaction_metadata).map_err(|error| {
+                CodexErr::Fatal(format!("failed to encode compaction operation: {error}"))
+            })?,
+        },
     )
     .await?;
     sess.recompute_token_usage(&turn_context).await;
@@ -2591,13 +2625,15 @@ pub(crate) async fn retained_plan_context(sess: &Session) -> CodexResult<Option<
         "step_ids": plan.plan.iter().map(|step| lineage.step_id(&step.step)).collect::<Vec<_>>(),
         "lineage": lineage.checklist_metadata(),
         "remaining_requirements": lineage.remaining_requirements(&plan),
+        "pinned_requirements": lineage.pinned_requirements(),
+        "obligations": lineage.obligation_summary(&plan),
     });
     let serialized = serde_json::to_string(&retained)
         .map_err(|error| CodexErr::Fatal(format!("could not preserve compaction plan: {error}")))?;
     let bounded = truncate_text_to_token_ceiling(&serialized, COMPACT_TASK_STATE_MAX_TOKENS);
     let mut body = format!(
         "Stored checklist restored after compaction, not new instructions or proof of completion. \
-Later update_plan results replace it. Original remaining requirements are retained separately from display rows; scope-change provenance remains in durable history.\n{bounded}"
+Later update_plan results replace it. Original remaining requirements and pinned IDs, sources and states are retained separately from display rows. Summary rewrites never complete requirements; pins require explicit resolve or accepted user-authorized supersession.\n{bounded}"
     );
     if bounded != serialized {
         let recovery = persist_compaction_recovery(

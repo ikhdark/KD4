@@ -2385,7 +2385,9 @@ def _cargo_command_with_message_format(command: Sequence[str]) -> list[str]:
     return [*result[: index + 1], FREEZE_MESSAGE_FORMAT, *result[index + 1 :]]
 
 
-def _cargo_executables(messages: Path) -> list[Path]:
+def _cargo_executables(
+    messages: Path, freshness: dict[str, object] | None = None,
+) -> list[Path]:
     executables: dict[str, Path] = {}
     with messages.open(encoding="utf-8", errors="replace") as stream:
         for line in stream:
@@ -2395,9 +2397,19 @@ def _cargo_executables(messages: Path) -> list[Path]:
                 message = json.loads(line)
             except ValueError:
                 continue
-            if message.get("reason") == "compiler-artifact" and message.get("executable"):
-                path = Path(message["executable"])
-                executables.setdefault(source_root_identity(path), path)
+            if message.get("reason") == "compiler-artifact":
+                if freshness is not None:
+                    freshness["status"] = "observed"
+                    freshness.setdefault("artifacts", []).append({
+                        "packageId": message.get("package_id"),
+                        "target": message.get("target"),
+                        "profile": message.get("profile"),
+                        "fresh": message.get("fresh"),
+                        "cause": "not reported by Cargo compiler-artifact messages",
+                    })
+                if message.get("executable"):
+                    path = Path(message["executable"])
+                    executables.setdefault(source_root_identity(path), path)
     return list(executables.values())
 
 
@@ -2525,29 +2537,104 @@ def index_bundle(bundle_dir: Path, key: str) -> None:
         stream.write(json.dumps({"bundle": str(bundle_dir), "key": key}) + "\n")
 
 
-def _verified_receipt(bundle: Path, key: str) -> Mapping[str, object] | None:
+def _reuse_decision(
+    decisions: list[dict[str, object]] | None, gate: str, status: str,
+    *, candidate: object = None, expected: object = None, observed: object = None,
+) -> None:
+    if decisions is not None:
+        decisions.append({"gate": gate, "status": status, "candidate": str(candidate) if candidate is not None else None,
+                          "expected": expected, "observed": observed})
+
+
+def _cache_evidence_summary(evidence: Mapping[str, object]) -> dict[str, object]:
+    """Keep console diagnostics compact; timing JSON retains complete evidence."""
+    summary = {key: value for key, value in evidence.items()
+               if key not in ("artifacts", "decisions")}
+    artifacts = evidence.get("artifacts")
+    if isinstance(artifacts, list):
+        summary["artifactCounts"] = {
+            "fresh": sum(item.get("fresh") is True for item in artifacts),
+            "notFresh": sum(item.get("fresh") is False for item in artifacts),
+            "unknown": sum(item.get("fresh") is not True and item.get("fresh") is not False
+                           for item in artifacts),
+        }
+    decisions = evidence.get("decisions")
+    if isinstance(decisions, list):
+        counts: dict[str, int] = {}
+        for decision in decisions:
+            key = f"{decision.get('gate')}:{decision.get('status')}"
+            counts[key] = counts.get(key, 0) + 1
+        summary["decisionCounts"] = counts
+        if decisions:
+            summary["lastDecision"] = decisions[-1]
+    return summary
+
+
+def _verified_receipt(
+    bundle: Path, key: str, decisions: list[dict[str, object]] | None = None,
+) -> Mapping[str, object] | None:
+    gate = "receipt_read"
+    candidate = bundle / BUNDLE_RECEIPT_NAME
+    expected: object = "readable JSON receipt"
     try:
         receipt = json.loads((bundle / BUNDLE_RECEIPT_NAME).read_text(encoding="utf-8"))
-        if (
-            receipt.get("version") == BUNDLE_RECEIPT_VERSION
-            and receipt.get("exitCode") == 0
-            and receipt.get("binaries")
-            and _reuse_key(receipt) == key
-            and all(
-                _file_sha256(bundle / entry["name"]) == entry["sha256"]
-                for entry in receipt["binaries"]
-            )
-        ):
-            return receipt
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        pass
+        for gate, expected in (("version", BUNDLE_RECEIPT_VERSION), ("exitCode", 0)):
+            observed = receipt.get(gate)
+            if observed != expected:
+                _reuse_decision(decisions, gate, "missing_evidence" if observed is None else "mismatch",
+                                candidate=bundle, expected=expected, observed=observed)
+                return None
+        gate = "reuse_identity_evidence"
+        expected = "recorded command, build context, source manifest hash and compiler identity"
+        # Two missing compiler identities are not a confirmed match. Keep this
+        # distinct from a known composite-key mismatch and from Cargo freshness.
+        manifest = receipt.get("sourceManifest")
+        gaps = [field for field in ("command", "buildContext", "rustc") if not receipt.get(field)]
+        if not isinstance(manifest, dict) or not manifest.get("sha256"):
+            gaps.append("sourceManifest.sha256")
+        if gaps:
+            _reuse_decision(decisions, gate, "missing_evidence", candidate=bundle,
+                            expected="recorded reuse identities", observed={"missing": gaps})
+            return None
+        gate = "receipt_reuse_key"
+        expected = key
+        actual_key = _reuse_key(receipt)
+        if actual_key != key:
+            _reuse_decision(decisions, gate, "mismatch", candidate=bundle, expected=key, observed=actual_key)
+            return None
+        gate = "binary_manifest"
+        expected = "nonempty binary manifest"
+        if not receipt.get("binaries"):
+            _reuse_decision(decisions, gate, "missing_evidence", candidate=bundle,
+                            expected="nonempty binary manifest", observed=receipt.get("binaries"))
+            return None
+        for entry in receipt["binaries"]:
+            gate = "binary_sha256"
+            binary = bundle / entry["name"]
+            candidate = binary
+            expected = entry["sha256"]
+            actual_hash = _file_sha256(binary)
+            if actual_hash != entry["sha256"]:
+                _reuse_decision(decisions, gate, "mismatch", candidate=binary,
+                                expected=entry["sha256"], observed=actual_hash)
+                return None
+        _reuse_decision(decisions, "verified_bundle", "match", candidate=bundle, expected=key, observed=actual_key)
+        return receipt
+    except OSError as error:
+        _reuse_decision(decisions, gate, "missing_evidence", candidate=candidate, expected=expected, observed=str(error))
+    except (ValueError, KeyError, TypeError, AttributeError) as error:
+        _reuse_decision(decisions, gate, "invalid_evidence", candidate=candidate, expected=expected, observed=str(error))
     return None
 
 
-def _newest_indexed_bundle(key: str) -> tuple[Path, Mapping[str, object]] | None:
+def _newest_indexed_bundle(
+    key: str, decisions: list[dict[str, object]] | None = None,
+) -> tuple[Path, Mapping[str, object]] | None:
     try:
         lines = bundle_index_path().read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
+    except FileNotFoundError as error:
+        _reuse_decision(decisions, "bundle_index", "missing_evidence",
+                        candidate=bundle_index_path(), expected=key, observed=str(error))
         return None
     candidates: dict[str, Path] = {}
     for line in lines:
@@ -2555,12 +2642,21 @@ def _newest_indexed_bundle(key: str) -> tuple[Path, Mapping[str, object]] | None
             entry = json.loads(line)
             if entry.get("key") == key:
                 candidates[source_root_identity(Path(entry["bundle"]))] = Path(entry["bundle"])
-        except (ValueError, KeyError, TypeError, AttributeError):
+            else:
+                # The index contains only a composite key. It proves this gate
+                # failed, not which source, compiler or setting caused it.
+                _reuse_decision(decisions, "indexed_reuse_key",
+                                "missing_evidence" if entry.get("key") is None else "mismatch",
+                                candidate=entry.get("bundle"), expected=key, observed=entry.get("key"))
+        except (ValueError, KeyError, TypeError, AttributeError) as error:
+            _reuse_decision(decisions, "index_entry", "invalid_evidence", observed=str(error))
             continue
+    if not lines:
+        _reuse_decision(decisions, "bundle_index", "missing_evidence", expected=key, observed="empty index")
     matches = [
         (str(receipt.get("createdUtc", "")), bundle, receipt)
         for bundle in candidates.values()
-        if (receipt := _verified_receipt(bundle, key)) is not None
+        if (receipt := _verified_receipt(bundle, key, decisions)) is not None
     ]
     if not matches:
         return None
@@ -2677,7 +2773,8 @@ def find_legacy_bundles(
 
 
 def find_reusable_bundle(
-    *, repo_root: Path, command: Sequence[str], search_roots: Sequence[Path] = ()
+    *, repo_root: Path, command: Sequence[str], search_roots: Sequence[Path] = (),
+    decisions: list[dict[str, object]] | None = None,
 ) -> tuple[Path | None, int]:
     """Newest frozen bundle built from identical compiled inputs and settings.
 
@@ -2721,7 +2818,7 @@ def find_reusable_bundle(
             except (OSError, ValueError, TypeError, AttributeError):
                 continue
             indexed.add(source_root_identity(bundle))
-    newest = _newest_indexed_bundle(wanted)
+    newest = _newest_indexed_bundle(wanted, decisions)
     return (newest[0] if newest is not None else None), scanned
 
 
@@ -2760,6 +2857,13 @@ def run_in_cargo_lane(
     started = time.perf_counter()
     record = {"command": list(command), "requestedLane": requested_lane,
               "exitCode": None, "cargoExitCode": None, "status": "running"}
+    reuse_decisions: list[dict[str, object]] = []
+    cache_reuse = {
+        "frozenBinary": {"status": "not_requested", "decisions": reuse_decisions},
+        "cargoFreshness": {"status": "not_run"},
+        "compilerCache": {"status": "not_run"},
+    }
+    record["cacheReuse"] = cache_reuse
     try:
         if not repo_root.is_dir():
             # The lane is named for this root; a mistyped root would silently
@@ -2777,6 +2881,7 @@ def run_in_cargo_lane(
         child_env = os.environ.copy()
         child_env.update(local_rust_env(child_env, repo_root=repo_root, which=shutil.which))
         child_env.setdefault("RUST_MIN_STACK", RUST_MIN_STACK_BYTES)
+        cache_reuse["compilerCache"]["configuredWrapper"] = child_env.get("RUSTC_WRAPPER")
         build_context = cargo_build_context(repo_root, command, child_env)
         mirrors_root = source_mirrors_root()
         skipped = _source_mirror_skip_reason(
@@ -2802,14 +2907,18 @@ def run_in_cargo_lane(
         )
         source = _source_manifest(repo_root) if freeze else None
         rustc = _rustc_identity(child_env, Path.cwd()) if freeze else None
+        if source is not None and rebuild:
+            cache_reuse["frozenBinary"].update(status="disabled", gate="explicit_rebuild")
         if source is not None and not rebuild:
+            cache_reuse["frozenBinary"]["status"] = "miss"
             reuse = _newest_indexed_bundle(_reuse_key({
                 "command": list(command),
                 "sourceManifest": source.summary(),
                 "buildContext": build_context,
                 "rustc": rustc,
-            }))
+            }), reuse_decisions)
             if reuse is not None:
+                cache_reuse["frozenBinary"]["status"] = "hit"
                 bundle_dir, binaries = _reuse_bundle(reuse[0], reuse[1], freeze_bundle_dir)
                 record.update(
                     exitCode=0, status="complete", reusedFrom=str(reuse[0]),
@@ -2894,6 +3003,13 @@ def run_in_cargo_lane(
                     if messages_path is not None
                     else open(os.devnull, "w", encoding="utf-8")
                 ) as messages:
+                    cache_reuse["cargoFreshness"].update(
+                        status="not_observed", cause="Cargo freshness reasons were not captured",
+                    )
+                    cache_reuse["compilerCache"].update(
+                        status="not_observed",
+                        cause="no invocation-scoped compiler-cache receipt; shared cache counters cannot attribute this build",
+                    )
                     code = run_owned(
                         child_command, env=child_env, cwd=child_cwd,
                         creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0),
@@ -2903,6 +3019,10 @@ def run_in_cargo_lane(
                     ).returncode
                 record["cargoExitCode"] = code
                 record["exitCode"] = code
+                executables = (
+                    _cargo_executables(messages_path, cache_reuse["cargoFreshness"])
+                    if messages_path is not None else []
+                )
                 if code == 0:
                     try:
                         (target_dir / ".lane-build-context.json").write_text(
@@ -2921,7 +3041,6 @@ def run_in_cargo_lane(
                                 "source changed during the build; no bundle was frozen. "
                                 "Coordinate source writes, or use an eligible --source-mirror always build."
                             )
-                    executables = _cargo_executables(messages_path)
                     bundle_dir = freeze_bundle_dir
                     if bundle_dir is None and executables:
                         store = bundle_store_root()
@@ -2961,7 +3080,19 @@ def run_in_cargo_lane(
                 raise
             finally:
                 if messages_path is not None:
-                    messages_path.unlink(missing_ok=True)
+                    original_error = sys.exception()
+                    try:
+                        messages_path.unlink(missing_ok=True)
+                    except OSError as cleanup_error:
+                        if original_error is None:
+                            raise
+                        # A compiler/cache descendant may still hold this log.
+                        # Never replace the actual build/ownership failure with
+                        # a secondary Windows sharing violation during cleanup.
+                        raise RuntimeError(
+                            f"{type(original_error).__name__}: {original_error}; "
+                            f"Cargo message log retained after cleanup failed: {cleanup_error}"
+                        ) from original_error
                 if state_path is not None:
                     # Later rewrites must postdate this build's compilations.
                     # Entries let the next snapshot pick its nearest slot.
@@ -2980,6 +3111,9 @@ def run_in_cargo_lane(
         record.update(exitCode=2, status="failed", error=str(error))
         raise
     finally:
+        print("Build reuse: " + json.dumps({
+            key: _cache_evidence_summary(value) for key, value in cache_reuse.items()
+        }), file=sys.stderr)
         if stream is not None:
             record["totalMs"] = (time.perf_counter() - started) * 1000
             try:
@@ -3832,11 +3966,17 @@ def main(argv: list[str] | None = None) -> int:
                 command_args = command_args[1:]
             if not command_args:
                 raise ValueError("find-bundle requires the build command after --")
+            reuse_decisions: list[dict[str, object]] = []
             bundle, scanned = find_reusable_bundle(
                 repo_root=args.repo_root.absolute(),
                 command=command_args,
                 search_roots=args.search_root,
+                decisions=reuse_decisions,
             )
+            print("Frozen-binary reuse: " + json.dumps(_cache_evidence_summary({
+                "status": "hit" if bundle is not None else "miss", "decisions": reuse_decisions,
+                "cargoFreshness": "not_run", "compilerCache": "not_run",
+            })), file=sys.stderr)
             if bundle is None and args.include_legacy:
                 legacy = find_legacy_bundles(
                     repo_root=args.repo_root.absolute(),

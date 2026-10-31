@@ -278,6 +278,18 @@ impl LocalFileSystem {
 }
 
 impl ExecutorFileSystem for LocalFileSystem {
+    fn lookup_batch<'a>(
+        &'a self,
+        requests: &'a [codex_file_system::FileSystemLookup],
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Vec<codex_file_system::FileSystemLookupResult>> {
+        Box::pin(async move {
+            codex_file_system::validate_lookup_batch(requests)?;
+            let (fs, sandbox) = self.file_system_for(sandbox)?;
+            fs.lookup_batch(requests, sandbox).await
+        })
+    }
+
     fn read_file_range<'a>(
         &'a self,
         path: &'a PathUri,
@@ -296,11 +308,12 @@ impl ExecutorFileSystem for LocalFileSystem {
     fn checksum_file<'a>(
         &'a self,
         path: &'a PathUri,
+        include_text_diagnostics: bool,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, Option<codex_file_system::FileDigest>> {
         Box::pin(async move {
             let (fs, sandbox) = self.file_system_for(sandbox)?;
-            fs.checksum_file(path, sandbox).await
+            fs.checksum_file(path, include_text_diagnostics, sandbox).await
         })
     }
 
@@ -674,11 +687,12 @@ impl ExecutorFileSystem for UnsandboxedFileSystem {
     fn checksum_file<'a>(
         &'a self,
         path: &'a PathUri,
+        include_text_diagnostics: bool,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, Option<codex_file_system::FileDigest>> {
         Box::pin(async move {
             reject_platform_sandbox_context(sandbox)?;
-            self.file_system.checksum_file(path, None).await
+            self.file_system.checksum_file(path, include_text_diagnostics, None).await
         })
     }
 
@@ -1183,13 +1197,14 @@ impl ExecutorFileSystem for DirectFileSystem {
     fn checksum_file<'a>(
         &'a self,
         path: &'a PathUri,
+        include_text_diagnostics: bool,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, Option<codex_file_system::FileDigest>> {
         Box::pin(async move {
             reject_sandbox_context(sandbox)?;
             let path = path.to_abs_path()?;
             run_cancellable_file_system_task(move |cancel| {
-                checksum_file_sync(path.as_path(), &cancel)
+                checksum_file_sync(path.as_path(), include_text_diagnostics, &cancel)
             })
             .await
         })
@@ -1507,6 +1522,7 @@ fn read_full_at(file: &std::fs::File, offset: u64, buffer: &mut [u8]) -> io::Res
 /// the pass is refused. `None` reports a change.
 fn checksum_file_sync(
     path: &Path,
+    include_text_diagnostics: bool,
     cancel: &CancellationToken,
 ) -> io::Result<Option<codex_file_system::FileDigest>> {
     use sha2::Digest as _;
@@ -1516,6 +1532,8 @@ fn checksum_file_sync(
     let (file, metadata) = regular_file::open_sync(path)?;
     let revision = file_range_revision(&file, &metadata)?;
     let mut hasher = sha2::Sha256::new();
+    let mut diagnostics = include_text_diagnostics
+        .then(codex_file_system::TextDiagnosticsScanner::default);
     let mut buffer = vec![0u8; FILE_READ_CHUNK_SIZE];
     let mut check = vec![0u8; FILE_READ_CHUNK_SIZE];
     let mut file_bytes = 0u64;
@@ -1535,6 +1553,9 @@ fn checksum_file_sync(
             return Ok(None);
         }
         hasher.update(&buffer[..read]);
+        if let Some(diagnostics) = &mut diagnostics {
+            diagnostics.push(&buffer[..read]);
+        }
     }
     if file_bytes != metadata.len() || revision != file_range_revision(&file, &file.metadata()?)? {
         return Ok(None);
@@ -1559,6 +1580,7 @@ fn checksum_file_sync(
         sha256,
         file_bytes,
         revision,
+        text_diagnostics: diagnostics.map(codex_file_system::TextDiagnosticsScanner::finish),
     }))
 }
 

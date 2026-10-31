@@ -76,6 +76,10 @@ pub(crate) struct PlanLineage {
 pub(crate) struct PlanRequirement {
     pub(crate) text: String,
     pub(crate) status: StepStatus,
+    /// Authentic accepted input that introduced a pinned requirement. Absent
+    /// on historical checklist-only obligations; never inferred from summaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source: Option<PlanInputReference>,
     /// Model-proposed retirement, not accepted user authorization. Kept under
     /// the historical field name for replay compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,6 +96,44 @@ pub(crate) struct PlanObligationSummary {
 }
 
 impl PlanLineage {
+    /// Summary prose is not a transition. Only the checklist owner can retire
+    /// an identified or unambiguous legacy anchor, including authorized supersession.
+    pub(crate) fn compaction_anchor_closed(&self, anchor: &str, superseded: bool) -> bool {
+        let anchor = anchor.trim().trim_start_matches("- ");
+        let (id, requirement) = if anchor.starts_with('[') {
+            let Some((id, text)) = anchor.strip_prefix('[').and_then(|rest| rest.split_once(']')) else {
+                return false;
+            };
+            let Some(requirement) = self.requirements.get(id) else {
+                return false;
+            };
+            if text.trim() != requirement.text {
+                return false;
+            }
+            (id, requirement)
+        } else {
+            // Older checkpoints did not carry IDs. Bind only a unique exact
+            // text match to this same owner; never guess between requirements
+            // or accept summary prose as a completion/scope-change transition.
+            let mut matches = self.requirements.iter()
+                .filter(|(_, requirement)| requirement.text == anchor);
+            let Some((id, requirement)) = matches.next() else {
+                return false;
+            };
+            if matches.next().is_some() {
+                return false;
+            }
+            (id.as_str(), requirement)
+        };
+        if superseded {
+                requirement.superseded_reason.is_some()
+                    && self.accepted_supersessions.contains_key(id)
+            } else {
+                requirement.status == StepStatus::Completed
+                    && requirement.superseded_reason.is_none()
+            }
+    }
+
     pub(crate) fn obligation_summary(&self, plan: &UpdatePlanArgs) -> PlanObligationSummary {
         if self.requirements.is_empty() && !plan.plan.is_empty() {
             return Self::from_plan(Some(plan)).obligation_summary(plan);
@@ -141,6 +183,26 @@ impl PlanLineage {
         }).collect()
     }
 
+    pub(crate) fn pinned_requirements(&self) -> BTreeMap<String, serde_json::Value> {
+        self.requirements.iter().filter_map(|(id, requirement)| {
+            let source = requirement.source.as_ref()?;
+            let state = if requirement.superseded_reason.is_some()
+                && self.accepted_supersessions.contains_key(id)
+            {
+                "superseded"
+            } else {
+                match requirement.status {
+                    StepStatus::Pending => "pending",
+                    StepStatus::InProgress => "in_progress",
+                    StepStatus::Completed => "completed",
+                }
+            };
+            Some((id.clone(), serde_json::json!({
+                "text": requirement.text, "source": source, "state": state,
+            })))
+        }).collect()
+    }
+
     fn is_empty(&self) -> bool {
         self.requirements.is_empty()
             && self.step_requirements.is_empty()
@@ -173,6 +235,7 @@ impl PlanLineage {
                 && self.requirements.get(&id).is_some_and(|requirement| {
                     requirement.text == step.step && requirement.status == step.status
                         && requirement.superseded_reason.is_none()
+                        && requirement.source.is_none()
                 })
             {
                 compact.requirements.remove(&id);
@@ -276,6 +339,7 @@ impl PlanLineage {
                     PlanRequirement {
                         text: step.step.clone(),
                         status: step.status,
+                        source: None,
                         superseded_reason: None,
                     },
                 );
@@ -344,7 +408,8 @@ impl PlanLineage {
             )]
             let requirement = self.requirements.get_mut(&id).expect("known requirement");
             requirement.status =
-                if completed && (same_text || self.resolved_requirements.contains(&id)) {
+                if completed && ((same_text && requirement.source.is_none())
+                    || self.resolved_requirements.contains(&id)) {
                     requirement.superseded_reason = None;
                     StepStatus::Completed
                 } else if in_progress || renamed_completion {
@@ -454,7 +519,7 @@ pub(crate) struct PlanStatusUpdate {
     pub(crate) status: StepStatus,
 }
 
-/// Exactly one of plan or set is supplied.
+/// Exactly one of plan, set or a nonempty pin is supplied.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PlanToolArgs {
@@ -464,6 +529,8 @@ pub(crate) struct PlanToolArgs {
     pub(crate) sampling_revision: Option<PlanSamplingRevision>,
     pub(crate) plan: Option<Vec<PlanStepArg>>,
     pub(crate) set: Option<Vec<PlanStatusUpdate>>,
+    #[serde(default)]
+    pub(crate) pin: Vec<PinnedRequirementArg>,
     pub(crate) expected_step_revisions: Option<BTreeMap<String, u64>>,
     #[serde(default)]
     pub(crate) superseded: Vec<SupersededStep>,
@@ -492,7 +559,15 @@ pub(crate) struct PlanInputReference {
     pub(crate) sha256: String,
 }
 
-/// Reconstructed only for a structural scope retirement. Never populated from
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PinnedRequirementArg {
+    pub(crate) text: String,
+    /// Omission binds to the latest authentic user text, not model prose.
+    pub(crate) source: Option<PlanInputReference>,
+}
+
+/// Reconstructed only for pinning or a structural scope retirement. Never populated from
 /// model arguments, rendered context, tool output, or inter-agent messages.
 #[derive(Debug, Default)]
 pub(crate) struct PlanScopeInputs {
@@ -557,7 +632,7 @@ impl PlanScopeInputs {
 
 impl PlanToolArgs {
     pub(crate) fn needs_scope_inputs(&self, previous: Option<&UpdatePlanArgs>) -> bool {
-        self.plan.as_ref().is_some_and(|plan| {
+        !self.pin.is_empty() || !self.superseded.is_empty() || self.plan.as_ref().is_some_and(|plan| {
             (!self.superseded.is_empty() || !self.scope_change_instructions.is_empty()
                 || !self.scope_change_refs.is_empty())
                 && (previous.is_none_or(|old| old.plan.len() != plan.len()
@@ -865,6 +940,7 @@ impl PlanStore {
             sampling_revision,
             plan,
             set: statuses,
+            pin,
             expected_step_revisions,
             superseded,
             scope_change_instructions,
@@ -873,8 +949,13 @@ impl PlanStore {
             resolve,
             scope_inputs,
         } = args;
+        if usize::from(plan.is_some()) + usize::from(statuses.is_some())
+            + usize::from(!pin.is_empty()) != 1 {
+            return Err("provide exactly one of plan, set or a nonempty pin; no changes were made".into());
+        }
         if plan.is_none() && (!superseded.is_empty() || !scope_change_instructions.is_empty()
-            || !scope_change_refs.is_empty() || scope_change_reviewed_revision.is_some())
+            || !scope_change_refs.is_empty()
+            || (scope_change_reviewed_revision.is_some() && pin.is_empty()))
         {
             return Err("scope changes require a structural plan replacement; no changes were made".into());
         }
@@ -946,6 +1027,33 @@ impl PlanStore {
         }
         let mut current = guard.clone();
         let mut lineage = current.lineage.clone();
+        if !pin.is_empty() {
+            let inputs = scope_inputs.as_ref().ok_or(
+                "pinning requires authentic accepted user input; no changes were made"
+            )?;
+            for pinned in pin {
+                if pinned.text.trim().is_empty() {
+                    return Err("pinned requirement text cannot be empty; no changes were made".into());
+                }
+                let source = pinned.source.or_else(|| inputs.references.iter().rev()
+                    .find(|reference| Some(&reference.input_id) == inputs.latest.as_ref()).cloned());
+                let source = source.filter(|reference| inputs.permits(
+                    reference, scope_change_reviewed_revision.as_deref(),
+                )).ok_or_else(|| format!(
+                    "pin source must cite authentic accepted user text, reconciled with later input; no changes were made. Available input provenance: {}",
+                    inputs.reconciliation()
+                ))?;
+                let bytes = serde_json::to_vec(&(&pinned.text, &source))
+                    .map_err(|error| format!("could not identify pinned requirement: {error}"))?;
+                let id = format!("pin-{}", hex::encode(Sha256::digest(bytes)));
+                // Additive and idempotent: never replace outstanding scope or
+                // reopen a completed/superseded requirement on a repeated pin.
+                lineage.requirements.entry(id).or_insert(PlanRequirement {
+                    text: pinned.text, status: StepStatus::Pending,
+                    source: Some(source), superseded_reason: None,
+                });
+            }
+        }
         let next = if let Some(plan) = plan {
             let mut steps = HashSet::new();
             if plan.iter().any(|item| item.step.trim().is_empty()) {
@@ -959,7 +1067,7 @@ impl PlanStore {
             let structural = current.plan.as_ref().is_none_or(|previous| {
                 previous.plan.len() != plan.len()
                     || previous.plan.iter().zip(&plan).any(|(old, new)| old.step != new.step)
-            }) || plan.iter().any(|step| !step.continues.is_empty());
+            }) || plan.iter().any(|step| !step.continues.is_empty()) || !superseded.is_empty();
             if structural {
                 let explanation = account_for_removed_steps(
                     current.plan.as_ref(), &lineage, &plan, &superseded, explanation,
@@ -1016,14 +1124,15 @@ impl PlanStore {
                 lineage.step_requirements.get(&lineage.step_id(&step.step))
                     .is_some_and(|ids| ids.contains(&id))
             });
-            if !lineage.requirements.contains_key(&id) || descendants.next().is_none()
+            let pinned = lineage.requirements.get(&id).is_some_and(|r| r.source.is_some());
+            if !lineage.requirements.contains_key(&id) || (descendants.next().is_none() && !pinned)
                 || next.plan.iter().any(|step| {
                     step.status != StepStatus::Completed
                         && lineage.step_requirements.get(&lineage.step_id(&step.step))
                             .is_some_and(|ids| ids.contains(&id))
                 })
             {
-                return Err(format!("resolve requires a known requirement with all descendant steps completed: {id}; no changes were made"));
+                return Err(format!("resolve requires a known pinned requirement or original requirement with descendants, and all descendant steps completed: {id}; no changes were made"));
             }
             lineage.resolved_requirements.insert(id.clone());
             if let Some(requirement) = lineage.requirements.get_mut(&id) {

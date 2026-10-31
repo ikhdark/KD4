@@ -53,12 +53,14 @@ pub(crate) struct ExecCommandArgs {
     shell: Option<String>,
     login: Option<bool>,
     tty: bool,
+    pipe_stdin: bool,
     yield_time_ms: u64,
     /// Whether the caller chose `yield_time_ms` rather than its default.
     yield_time_requested: bool,
     stall_timeout_ms: Option<u64>,
     stall_timeout_requested: bool,
     max_output_tokens: Option<usize>,
+    quiet_on_success: bool,
     sandbox_permissions: SandboxPermissions,
     additional_permissions: Option<AdditionalPermissionProfile>,
     justification: Option<String>,
@@ -89,9 +91,13 @@ struct RawExecCommandArgs {
     #[serde(default = "default_tty")]
     tty: bool,
     #[serde(default)]
+    pipe_stdin: bool,
+    #[serde(default)]
     yield_time_ms: Option<i128>,
     #[serde(default)]
     max_output_tokens: Option<usize>,
+    #[serde(default)]
+    quiet_on_success: bool,
     #[serde(default)]
     sandbox_permissions: SandboxPermissions,
     #[serde(default)]
@@ -121,6 +127,9 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
     type Error = String;
 
     fn try_from(raw: RawExecCommandArgs) -> Result<Self, Self::Error> {
+        if raw.tty && raw.pipe_stdin {
+            return Err("pipe_stdin requires tty=false; terminal input is not a pipe".into());
+        }
         let mut names = std::collections::BTreeSet::new();
         for (name, value) in &raw.env {
             if name.is_empty() || name.contains(['=', '\0']) || value.contains('\0') {
@@ -178,6 +187,7 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
             shell: raw.shell,
             login: raw.login,
             tty: raw.tty,
+            pipe_stdin: raw.pipe_stdin,
             yield_time_ms,
             yield_time_requested: raw.yield_time_ms.is_some(),
             stall_timeout_ms: raw
@@ -186,6 +196,7 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
                 .filter(|timeout| *timeout != 0),
             stall_timeout_requested: raw.stall_timeout_ms.is_some(),
             max_output_tokens: raw.max_output_tokens,
+            quiet_on_success: raw.quiet_on_success,
             sandbox_permissions: raw.sandbox_permissions,
             additional_permissions: raw.additional_permissions,
             justification: raw.justification,
@@ -350,9 +361,9 @@ pub(crate) fn get_command(
     }
 
     if invocation.is_argv() {
-        if args.shell.is_some() {
+        if args.shell.is_some() || args.login.is_some() {
             return Err(
-                "`shell` is only valid for script commands; omit it when `kind` is `argv`."
+                "`shell` and `login` are only valid for script commands; omit them with program/args."
                     .to_string(),
             );
         }
@@ -375,6 +386,12 @@ pub(crate) fn get_command(
         .transpose()
         .map_err(|err| err.to_string())?;
     let shell = model_shell.as_ref().unwrap_or(session_shell.as_ref());
+    if shell.shell_type == ShellType::Cmd && args.login == Some(true) {
+        return Err(
+            "cmd.exe does not support login/profile loading; omit `login` or set it to false."
+                .into(),
+        );
+    }
     let command = invocation
         .to_exec_args(shell, use_login_shell)
         .map_err(|error| error.to_string())?;
@@ -386,4 +403,3 @@ pub(crate) fn get_command(
         preflight_shell_type: Some(shell.shell_type),
     })
 }
-

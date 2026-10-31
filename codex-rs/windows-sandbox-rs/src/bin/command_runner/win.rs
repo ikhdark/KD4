@@ -842,15 +842,15 @@ fn spawn_stdin_writer(
                 break;
             }
         }
-        if let Some(flow) = &flow {
-            let _ = flow.send(Message::StdinClosed {
-                payload: EmptyPayload::default(),
-            });
-        }
         // SAFETY: Ownership of the stdin write handle was transferred to this worker, which closes
         // it exactly once after its write loop ends.
         unsafe {
             CloseHandle(handle);
+        }
+        if let Some(flow) = &flow {
+            let _ = flow.send(Message::StdinClosed {
+                payload: EmptyPayload::default(),
+            });
         }
     });
     stdin_tx
@@ -1013,6 +1013,20 @@ pub fn main() -> Result<()> {
         }
     };
 
+    // A root wait cannot certify a failed/asynchronous job stop. Keep this
+    // native owner, control handles and job until the requested tree cleanup
+    // is confirmed; the parent can time out without losing reconciliation.
+    let shutdown_confirmed = if job.termination_was_requested() {
+        loop {
+            match job.terminate() {
+                Ok(()) => break true,
+                Err(error) => {
+                    log_note(&format!("runner shutdown uncertain; retaining job: {error}"), log_dir);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+    } else { false };
     let exit_code: Option<i32>;
     // SAFETY: The spawn result owns both process/thread handles until this cleanup. raw_exit is
     // writable for GetExitCodeProcess, and each non-null handle is closed once after
@@ -1039,7 +1053,7 @@ pub fn main() -> Result<()> {
         let _ = guard.take();
     }
     // Preserved or breakaway descendants can hold inherited output handles open indefinitely, and
-    // a preserved job ignores Terminate, so reader EOF must not withhold the exit frame.
+    // reader EOF must not withhold the exit frame.
     let readers = std::iter::once(&out_thread)
         .chain(err_thread.as_ref())
         .collect::<Vec<_>>();
@@ -1066,6 +1080,7 @@ pub fn main() -> Result<()> {
                 payload: ExitPayload {
                     exit_code,
                     timed_out,
+                    shutdown_confirmed,
                 },
             },
         };

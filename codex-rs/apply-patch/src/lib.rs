@@ -1,9 +1,14 @@
+mod counted_replace;
 mod invocation;
+mod json_edit;
+mod manifest;
 mod parser;
+mod provenance;
 mod seek_sequence;
 mod standalone_executable;
 mod streaming_parser;
 mod transaction;
+mod unique_anchor;
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -35,6 +40,9 @@ pub use streaming_parser::StreamingPatchParser;
 use thiserror::Error;
 
 pub use invocation::apply_patch_command_cwd;
+pub use provenance::change_ownership_hints;
+pub use provenance::invalidate_change_ownership_hints;
+pub use provenance::record_change_provenance;
 pub use invocation::apply_patch_command_scope;
 pub use invocation::maybe_parse_apply_patch_verified;
 pub use invocation::maybe_parse_apply_patch_verified_for_environment;
@@ -43,6 +51,9 @@ pub use standalone_executable::main;
 pub use standalone_executable::run_main_with_args;
 
 use crate::invocation::ExtractHeredocError;
+pub use manifest::PatchByteIdentity;
+pub use manifest::PatchFileOutcome;
+pub use manifest::PatchManifestEntry;
 
 /// Special argv[1] flag used when the Codex executable self-invokes to run the
 /// internal `apply_patch` path.
@@ -113,6 +124,13 @@ pub enum PatchContextMismatchKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PatchCandidateLocation {
+    pub line_start: usize,
+    pub line_end: usize,
+    pub advisory_only: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PatchContextMismatch {
     pub kind: PatchContextMismatchKind,
     pub hunk_ordinal: usize,
@@ -123,6 +141,9 @@ pub struct PatchContextMismatch {
     pub current_line_start: usize,
     pub current_line_end: usize,
     pub current_excerpt: String,
+    pub expected_excerpt: String,
+    pub expected_source_sha256: Option<String>,
+    pub candidate_locations: Vec<PatchCandidateLocation>,
     pub message: String,
     /// The earlier hunk for the same file whose in-memory result this hunk
     /// edits; the current lines and hash then describe that result.
@@ -132,6 +153,18 @@ pub struct PatchContextMismatch {
 
 impl fmt::Display for PatchContextMismatch {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.expected_excerpt.is_empty() {
+            writeln!(formatter, "Expected excerpt (bounded):\n{}", self.expected_excerpt)?;
+        }
+        if let Some(hash) = &self.expected_source_sha256 {
+            writeln!(formatter, "Expected source sha256: {hash}")?;
+        }
+        if !self.candidate_locations.is_empty() {
+            writeln!(formatter, "Nearby candidate locations (advisory only; no guessed application): {}",
+                self.candidate_locations.iter().map(|candidate|
+                    format!("{}-{}", candidate.line_start, candidate.line_end))
+                    .collect::<Vec<_>>().join(", "))?;
+        }
         if self.current_line_start == 0 {
             return write!(
                 formatter,
@@ -306,11 +339,12 @@ pub struct AppliedPatchDelta {
     // Captured before mutation, including deletes; never reconstructed later.
     endpoint_identities: HashMap<PathBuf, String>,
     preimage_modes: HashMap<PathBuf, String>,
+    manifest: manifest::PatchManifest,
 }
 
 impl AppliedPatchDelta {
     fn new(changes: Vec<AppliedPatchChange>, exact: bool) -> Self {
-        Self { changes, exact, endpoint_identities: HashMap::new(), preimage_modes: HashMap::new() }
+        Self { changes, exact, endpoint_identities: HashMap::new(), preimage_modes: HashMap::new(), manifest: Default::default() }
     }
 
     fn empty() -> Self {
@@ -326,6 +360,18 @@ impl AppliedPatchDelta {
     pub fn changes(&self) -> &[AppliedPatchChange] {
         &self.changes
     }
+
+    pub fn unattempted(hunks: &[Hunk], cwd: &PathUri) -> Self {
+        Self { manifest: manifest::PatchManifest::new(hunks, cwd), ..Self::empty() }
+    }
+
+    pub fn rejected(hunks: &[Hunk], cwd: &PathUri, error: &ApplyPatchError) -> Self {
+        let mut delta = Self::unattempted(hunks, cwd);
+        delta.manifest.reject(error);
+        delta
+    }
+
+    pub fn manifest(&self) -> Vec<PatchManifestEntry> { self.manifest.snapshot() }
 
     /// Continuity paths only. Original spellings and executor URIs remain in
     /// `changes()` for display, recovery and mutation authority.
@@ -409,6 +455,8 @@ impl AppliedPatchDelta {
             self.endpoint_identities.insert(path, identity);
         }
         self.changes.extend(other.changes);
+        self.manifest.entries.extend(other.manifest.entries);
+        self.manifest.final_identities.extend(other.manifest.final_identities);
         self.exact &= other.exact;
     }
 }
@@ -424,9 +472,18 @@ impl Default for AppliedPatchDelta {
 pub struct AppliedPatchChange {
     pub path: PathBuf,
     pub change: AppliedPatchFileChange,
+    /// Exact replacement bytes accepted by the mutation owner, never a reread.
+    /// None for deletions and a move whose destination was already identical.
+    pub write_receipt: Option<AppliedPatchWriteReceipt>,
     // The public paths are legacy presentation values, not executor authority.
     path_uri: PathUri,
     move_path_uri: Option<PathUri>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AppliedPatchWriteReceipt {
+    pub sha256: String,
+    pub bytes: usize,
 }
 
 impl AppliedPatchChange {
@@ -609,7 +666,7 @@ async fn apply_hunks_with_verified_action(
     is_cancelled: &(dyn Fn() -> bool + Sync),
     verified: Option<&ApplyPatchAction>,
 ) -> Result<AppliedPatchDelta, ApplyPatchFailure> {
-    let mut delta = AppliedPatchDelta::empty();
+    let mut delta = AppliedPatchDelta::unattempted(hunks, cwd);
     // Keep endpoint ownership alive through failure reconciliation and rollback,
     // not just the successful write path. Preflight has no filesystem effects.
     let mut _transaction = None;
@@ -645,18 +702,31 @@ async fn apply_hunks_with_verified_action(
     .await;
     match result {
         Ok(()) => {
-            if let Err(error) = print_summary(hunks, stdout) {
+            let summary = if delta.is_exact() && delta.is_empty() {
+                writeln!(stdout, "Success. unchanged: no file bytes were written.")
+            } else {
+                print_summary(hunks, stdout)
+            };
+            if let Err(error) = summary {
                 let _ = write!(stderr, "{error}\n{}", delta.failure_summary());
                 return Err(ApplyPatchFailure::new(ApplyPatchError::from(error), delta));
             }
             Ok(delta)
         }
         Err(error) => {
+            // Record the failed endpoint before rollback changes the receipt phase.
+            if let Some(error) = error.downcast_ref::<ApplyPatchError>() {
+                delta.manifest.reject(error);
+            } else {
+                delta.manifest.reject(&ApplyPatchError::ComputeReplacements(String::new()));
+            }
+            delta.manifest.rolling_back = true;
             let recovery_path = error
                 .downcast_ref::<PatchRecoveryRequired>()
                 .map(|recovery| &recovery.path);
             let rollback_errors =
                 rollback_committed_changes(&mut delta, fs, sandbox, recovery_path).await;
+            delta.manifest.rolling_back = false;
             let error = if rollback_errors.is_empty() {
                 error
             } else {
@@ -718,6 +788,7 @@ async fn rollback_committed_changes(
                         path: destination,
                         path_uri: destination_uri,
                         move_path_uri: None,
+                        write_receipt: applied.write_receipt,
                         change: AppliedPatchFileChange::Add {
                             content: new_content,
                             overwritten_content: overwritten_move_content,
@@ -727,6 +798,7 @@ async fn rollback_committed_changes(
                         path: applied.path,
                         path_uri: applied.path_uri,
                         move_path_uri: None,
+                        write_receipt: None,
                         change: AppliedPatchFileChange::Delete {
                             content: old_content,
                         },
@@ -746,6 +818,7 @@ async fn rollback_committed_changes(
                         path: applied.path,
                         path_uri: applied.path_uri,
                         move_path_uri: None,
+                        write_receipt: applied.write_receipt,
                         change,
                     }]
                 }
@@ -753,6 +826,7 @@ async fn rollback_committed_changes(
                     path: applied.path,
                     path_uri: applied.path_uri,
                     move_path_uri,
+                    write_receipt: applied.write_receipt,
                     change,
                 }],
             }
@@ -766,6 +840,7 @@ async fn rollback_committed_changes(
             // displaced-object recovery unfinished. Equality cannot authorize
             // rolling that endpoint back as part of the earlier prefix.
             delta.exact = false;
+            delta.manifest.uncertain(path);
             continue;
         }
         let (expected, original) = match &applied.change {
@@ -793,6 +868,7 @@ async fn rollback_committed_changes(
             || !remove_failure_was_side_effect_free(path, expected, fs, sandbox).await
         {
             delta.exact = false;
+            delta.manifest.uncertain(path);
             continue;
         }
         let restored = conditional_mutation(
@@ -802,18 +878,18 @@ async fn rollback_committed_changes(
             original.map(|content| content.as_bytes().to_vec()),
             sandbox,
             &mut delta.exact,
+            &mut delta.manifest,
         )
         .await;
         match restored {
-            Ok(()) => {
+            Ok(_) => {
                 delta.changes.remove(index);
             }
             Err(error) => {
                 // Keep any actual displaced-object recovery locator visible
                 // instead of discarding the rollback error behind the first failure.
                 errors.push(format!("{error:#}"));
-                delta.exact &=
-                    remove_failure_was_side_effect_free(path, expected, fs, sandbox).await;
+                reconcile_failed_mutation(&error, path, expected, fs, sandbox, &mut delta.exact, &mut delta.manifest).await;
             }
         }
     }
@@ -917,7 +993,7 @@ async fn apply_hunks_to_files(
                 Ok(value) => value,
                 Err(error) => {
                     if !error.is::<PatchNoWriteConflict>() {
-                        delta.exact &= remove_failure_was_side_effect_free($path, $before, fs, sandbox).await;
+                        reconcile_failed_mutation(&error, $path, $before, fs, sandbox, &mut delta.exact, &mut delta.manifest).await;
                     }
                     return Err(anyhow::Error::from(error));
                 }
@@ -935,6 +1011,7 @@ async fn apply_hunks_to_files(
             .into());
         }
         let path_uri = hunk.resolve_path(cwd)?;
+        delta.manifest.begin_hunk(hunk_index);
         if let Some(mode) = preimage_mode(&path_uri, fs).await {
             delta.preimage_modes.entry(path_uri.to_path_buf()).or_insert(mode);
         }
@@ -952,7 +1029,7 @@ async fn apply_hunks_to_files(
                     "Add File is create-only; {} already exists. Use Update File with a current codex-range source hash for a whole-file replacement.",
                     path_uri.inferred_native_path_string(),
                 );
-                try_write!(
+                let write_receipt = try_write!(
                     write_file_with_missing_parent_retry(
                         fs,
                         &path_uri,
@@ -960,6 +1037,7 @@ async fn apply_hunks_to_files(
                         contents.clone().into_bytes(),
                         sandbox,
                         &mut delta.exact,
+                        &mut delta.manifest,
                     )
                     .await,
                     &path_uri,
@@ -972,6 +1050,7 @@ async fn apply_hunks_to_files(
                     path: path_uri.to_path_buf(),
                     path_uri,
                     move_path_uri: None,
+                    write_receipt,
                     change: AppliedPatchFileChange::Add {
                         content: contents.clone(),
                         overwritten_content,
@@ -1003,6 +1082,7 @@ async fn apply_hunks_to_files(
                     None,
                     sandbox,
                     &mut delta.exact,
+                    &mut delta.manifest,
                 )
                 .await
                 .with_context(|| {
@@ -1012,12 +1092,7 @@ async fn apply_hunks_to_files(
                     )
                 }) {
                     if !error.is::<PatchNoWriteConflict>() {
-                        delta.exact &= remove_failure_was_side_effect_free(
-                        &path_uri,
-                        Some(&deleted_content),
-                        fs,
-                        sandbox,
-                        ).await;
+                        reconcile_failed_mutation(&error, &path_uri, Some(&deleted_content), fs, sandbox, &mut delta.exact, &mut delta.manifest).await;
                     }
                     return Err(error);
                 }
@@ -1025,6 +1100,7 @@ async fn apply_hunks_to_files(
                     path: path_uri.to_path_buf(),
                     path_uri,
                     move_path_uri: None,
+                    write_receipt: None,
                     change: AppliedPatchFileChange::Delete {
                         content: deleted_content,
                     },
@@ -1085,7 +1161,7 @@ async fn apply_hunks_to_files(
                     note_existing_path_delta_support(&dest_uri, fs, sandbox, &mut delta.exact).await;
                     let overwritten_move_content = destinations.get(&dest_uri)
                         .context("move destination was not prepared")?.clone();
-                    try_write!(
+                    let write_receipt = try_write!(
                         write_file_with_missing_parent_retry(
                             fs,
                             &dest_uri,
@@ -1093,6 +1169,7 @@ async fn apply_hunks_to_files(
                             new_contents.clone().into_bytes(),
                             sandbox,
                             &mut delta.exact,
+                            &mut delta.manifest,
                         )
                         .await,
                         &dest_uri,
@@ -1102,15 +1179,18 @@ async fn apply_hunks_to_files(
                         delta.preimage_modes.entry(dest_uri.to_path_buf()).or_insert(mode);
                     }
                     let dest_write_change_index = delta.changes.len();
-                    delta.changes.push(AppliedPatchChange {
-                        path: dest_uri.to_path_buf(),
-                        path_uri: dest_uri.clone(),
-                        move_path_uri: None,
-                        change: AppliedPatchFileChange::Add {
-                            content: new_contents.clone(),
-                            overwritten_content: overwritten_move_content.clone(),
-                        },
-                    });
+                    if write_receipt.is_some() {
+                        delta.changes.push(AppliedPatchChange {
+                            path: dest_uri.to_path_buf(),
+                            path_uri: dest_uri.clone(),
+                            move_path_uri: None,
+                            write_receipt: write_receipt.clone(),
+                            change: AppliedPatchFileChange::Add {
+                                content: new_contents.clone(),
+                                overwritten_content: overwritten_move_content.clone(),
+                            },
+                        });
+                    }
                     if is_cancelled() {
                         return Err(io::Error::new(
                             io::ErrorKind::Interrupted,
@@ -1140,6 +1220,7 @@ async fn apply_hunks_to_files(
                         None,
                         sandbox,
                         &mut delta.exact,
+                        &mut delta.manifest,
                     )
                     .await
                     .with_context(|| {
@@ -1149,19 +1230,15 @@ async fn apply_hunks_to_files(
                         )
                     }) {
                         if !error.is::<PatchNoWriteConflict>() {
-                            delta.exact &= remove_failure_was_side_effect_free(
-                            &path_uri,
-                            Some(&original_contents),
-                            fs,
-                            sandbox,
-                            ).await;
+                            reconcile_failed_mutation(&error, &path_uri, Some(&original_contents), fs, sandbox, &mut delta.exact, &mut delta.manifest).await;
                         }
                         return Err(error);
                     }
-                    delta.changes[dest_write_change_index] = AppliedPatchChange {
+                    let moved = AppliedPatchChange {
                         path: path_uri.to_path_buf(),
                         path_uri,
                         move_path_uri: Some(dest_uri.clone()),
+                        write_receipt,
                         change: AppliedPatchFileChange::Update {
                             move_path: Some(dest_uri.to_path_buf()),
                             old_content: original_contents,
@@ -1169,17 +1246,23 @@ async fn apply_hunks_to_files(
                             new_content: new_contents,
                         },
                     };
+                    if dest_write_change_index < delta.changes.len() {
+                        delta.changes[dest_write_change_index] = moved;
+                    } else {
+                        delta.changes.push(moved);
+                    }
                 } else {
                     // An update requires the source to remain present; unlike add/move,
                     // it must not recreate a parent removed after the source read.
-                    try_write!(
+                    let write_receipt = try_write!(
                         conditional_mutation(
                             fs,
                             &path_uri,
                             Some(&original_contents),
                             Some(new_contents.clone().into_bytes()),
                             sandbox,
-                            &mut delta.exact
+                            &mut delta.exact,
+                            &mut delta.manifest,
                         )
                         .await
                         .with_context(|| format!(
@@ -1189,10 +1272,15 @@ async fn apply_hunks_to_files(
                         &path_uri,
                         Some(original_contents.as_str())
                     );
+                    if write_receipt.is_none() {
+                        delta.manifest.finish_hunk();
+                        continue;
+                    }
                     delta.changes.push(AppliedPatchChange {
                         path: path_uri.to_path_buf(),
                         path_uri,
                         move_path_uri: None,
+                        write_receipt,
                         change: AppliedPatchFileChange::Update {
                             move_path: None,
                             old_content: original_contents,
@@ -1203,6 +1291,7 @@ async fn apply_hunks_to_files(
                 }
             }
         }
+        delta.manifest.finish_hunk();
     }
     Ok(())
 }
@@ -1218,9 +1307,17 @@ pub(crate) async fn validate_revision_guards(
     let mut failures = Vec::new();
     for guard in guards {
         let path = cwd.join(&guard.path.to_string_lossy())?;
+        let mut current_excerpt = String::new();
         let current = if guard.expected_sha256.is_some() {
             match fs.read_file(&path, sandbox).await {
-                Ok(bytes) => Some(hex::encode(Sha256::digest(&bytes))),
+                Ok(bytes) => {
+                    let hash = hex::encode(Sha256::digest(&bytes));
+                    if guard.expected_sha256.as_ref() != Some(&hash)
+                        && let Ok(text) = std::str::from_utf8(&bytes) {
+                        current_excerpt = bounded_expected_lines(text.lines());
+                    }
+                    Some(hash)
+                }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => None,
                 Err(source) => return Err(ApplyPatchError::IoError(IoError {
                     context: format!(
@@ -1245,10 +1342,13 @@ pub(crate) async fn validate_revision_guards(
         };
         if current != guard.expected_sha256 {
             failures.push(format!(
-                "Revision guard failed for {}: expected {}, current {}",
+                "Revision guard failed for {}: expected {}, current {}{}",
                 path.inferred_native_path_string(),
                 guard.expected_sha256.as_deref().unwrap_or("absent"),
                 current.as_deref().unwrap_or("absent"),
+                if current_excerpt.is_empty() { String::new() } else {
+                    format!("\nCurrent excerpt (bounded, from line 1; expected guard supplies a hash only):\n{current_excerpt}")
+                },
             ));
         }
     }
@@ -1564,14 +1664,17 @@ fn ensure_rebased_updates_keep_their_sites(
 
 /// The 1-based ordinal of the first textual chunk whose site, its `@@` anchor
 /// line followed by its old lines, `source` does not contain exactly once at
-/// any match tier. Revision-bound ranges are checked by their whole-file hash.
+/// any match tier. Revision-bound edits are checked by their whole-file hash.
 fn chunk_without_unique_site(source: &str, chunks: &[UpdateFileChunk]) -> Option<usize> {
     let lines = PreparedSource::new(source).logical_lines;
     chunks
         .iter()
         .position(|chunk| {
             let context = chunk.change_context.as_ref();
-            if context.is_some_and(|context| context.starts_with("codex-range ")) {
+            if json_edit::is_json_chunk(chunk)
+                || unique_anchor::is_anchor_chunk(chunk)
+                || context.is_some_and(|context| context.starts_with("codex-range ")
+                || context.starts_with(counted_replace::PREFIX)) {
                 return false;
             }
             let site = context
@@ -1630,6 +1733,22 @@ async fn remove_failure_was_side_effect_free(
     }
 }
 
+async fn reconcile_failed_mutation(
+    error: &anyhow::Error,
+    path: &PathUri,
+    expected: Option<&str>,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
+    exact: &mut bool,
+    manifest: &mut manifest::PatchManifest,
+) {
+    let unchanged = remove_failure_was_side_effect_free(path, expected, fs, sandbox).await;
+    *exact &= unchanged;
+    if unchanged && !error.is::<PatchRecoveryRequired>() {
+        manifest.confirm_no_write(path, expected);
+    }
+}
+
 async fn note_existing_path_delta_support(
     path: &PathUri,
     fs: &dyn ExecutorFileSystem,
@@ -1651,9 +1770,10 @@ async fn write_file_with_missing_parent_retry(
     contents: Vec<u8>,
     sandbox: Option<&FileSystemSandboxContext>,
     exact: &mut bool,
-) -> anyhow::Result<()> {
-    match conditional_mutation(fs, path, expected, Some(contents.clone()), sandbox, exact).await {
-        Ok(()) => Ok(()),
+    manifest: &mut manifest::PatchManifest,
+) -> anyhow::Result<Option<AppliedPatchWriteReceipt>> {
+    match conditional_mutation(fs, path, expected, Some(contents.clone()), sandbox, exact, manifest).await {
+        Ok(receipt) => Ok(receipt),
         Err(err)
             if err
                 .downcast_ref::<io::Error>()
@@ -1669,15 +1789,14 @@ async fn write_file_with_missing_parent_retry(
                         )
                     })?;
             }
-            conditional_mutation(fs, path, expected, Some(contents), sandbox, exact)
+            conditional_mutation(fs, path, expected, Some(contents), sandbox, exact, manifest)
                 .await
                 .with_context(|| {
                     format!(
                         "Failed to write file {}",
                         path.inferred_native_path_string()
                     )
-                })?;
-            Ok(())
+                })
         }
         Err(err) => Err(err).with_context(|| {
             format!(
@@ -1711,18 +1830,33 @@ async fn conditional_mutation(
     replacement: Option<Vec<u8>>,
     sandbox: Option<&FileSystemSandboxContext>,
     exact: &mut bool,
-) -> anyhow::Result<()> {
+    manifest: &mut manifest::PatchManifest,
+) -> anyhow::Result<Option<AppliedPatchWriteReceipt>> {
     use codex_exec_server::FileMutationOutcome;
-    match fs
+    // Hash the actual raw write buffer, including BOM/encoding and terminators.
+    // Publish it only on Committed; no subsequent path read can certify this write.
+    let receipt = replacement.as_ref().map(|bytes| AppliedPatchWriteReceipt {
+        sha256: hex::encode(Sha256::digest(bytes)),
+        bytes: bytes.len(),
+    });
+    let outcome = match fs
         .mutate_file_if_matches(
             path,
             expected.map(|text| text.as_bytes().to_vec()),
             replacement,
             sandbox,
         )
-        .await?
-    {
-        FileMutationOutcome::Committed => Ok(()),
+        .await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                manifest.uncertain(path);
+                return Err(error.into());
+            }
+        };
+    manifest.record(path, expected, receipt.as_ref(), &outcome);
+    match outcome {
+        FileMutationOutcome::Committed => Ok(receipt),
+        FileMutationOutcome::Unchanged => Ok(None),
         FileMutationOutcome::Conflict => Err(PatchNoWriteConflict { path: path.clone() }.into()),
         FileMutationOutcome::RecoveryRequired {
             retained_path,
@@ -1841,6 +1975,36 @@ fn new_contents_from_prepared(
     let original_contents = source.contents;
     if chunks.is_empty() {
         return Ok(original_contents.to_string());
+    }
+
+    let explain_rejection = |mut error: ApplyPatchError| {
+        if let ApplyPatchError::ComputeReplacements(message)
+            | ApplyPatchError::RevisionGuardMismatch(message) = &mut error {
+            let hash = source.hash.get_or_init(|| hex::encode(Sha256::digest(original_contents.as_bytes())));
+            let expected = bounded_expected_lines(chunks.iter().flat_map(|chunk|
+                chunk.old_lines.iter().map(String::as_str)));
+            let current = bounded_expected_lines(original_contents.lines());
+            let _ = write!(message, "\nFile: {path} (source sha256: {hash})\nExpected patch excerpt (bounded; may be empty for hash-only edits):\n{expected}\nCurrent excerpt (bounded, from line 1):\n{current}");
+        }
+        error
+    };
+
+    if chunks.iter().any(unique_anchor::is_anchor_chunk) {
+        return unique_anchor::replace(path, original_contents, chunks).map_err(explain_rejection);
+    }
+
+    if chunks.iter().any(json_edit::is_json_chunk) {
+        return json_edit::apply(original_contents, chunks, source.newline).map_err(|error| {
+            ApplyPatchError::ComputeReplacements(format!(
+                "{}: {error}", path.inferred_native_path_string(),
+            ))
+        }).map_err(explain_rejection);
+    }
+
+    if chunks.iter().any(|chunk| chunk.change_context.as_deref()
+        .is_some_and(|context| context.starts_with(counted_replace::PREFIX)))
+    {
+        return counted_replace::replace(path, original_contents, chunks).map_err(explain_rejection);
     }
 
     // Match logical lines, but keep the original physical lines for untouched
@@ -2084,6 +2248,7 @@ impl<'a> ChunkMatcher<'a> {
         PatchMismatchSource {
             original_lines: self.original_lines,
             original_contents: self.original_contents,
+            chunks: self.chunks,
             path: self.path_uri,
             hunk_ordinal: self.hunk_ordinal,
             source_hash: Some(self.source_hash),
@@ -2672,13 +2837,20 @@ impl<'a> ChunkMatcher<'a> {
             ));
         }
         let first = rendered.first().copied().unwrap_or_default();
-        located_patch_mismatch(
+        let mut error = located_patch_mismatch(
             self.source(),
             chunk_index + 1,
             PatchContextMismatchKind::AmbiguousMatch,
             message,
             bounded_source_excerpt(lines, first, first + 1),
-        )
+        );
+        if let ApplyPatchError::PatchContextMismatch(mismatch) = &mut error {
+            mismatch.candidate_locations = rendered.iter().take(AMBIGUITY_EXCERPT_LIMIT)
+                .map(|&start| PatchCandidateLocation {
+                    line_start: start + 1, line_end: start + pattern_len.max(1), advisory_only: true,
+                }).collect();
+        }
+        error
     }
 
     fn context_not_found(&self, chunk_index: usize) -> ApplyPatchError {
@@ -2816,6 +2988,7 @@ fn bounded_expected_lines<'a>(lines: impl Iterator<Item = &'a str>) -> String {
 struct PatchMismatchSource<'a> {
     original_lines: &'a [String],
     original_contents: &'a str,
+    chunks: &'a [UpdateFileChunk],
     path: &'a PathUri,
     hunk_ordinal: Option<usize>,
     source_hash: Option<&'a std::cell::OnceCell<String>>,
@@ -2847,6 +3020,21 @@ fn located_patch_mismatch(
         hex::encode(Sha256::digest(source.original_contents.as_bytes()))
     };
     let current_content_sha256 = source.source_hash.map_or_else(hash, |cache| cache.get_or_init(hash).clone());
+    let chunk = source.chunks.get(chunk_ordinal.saturating_sub(1));
+    let expected_excerpt = chunk.map(|chunk| {
+        if chunk.old_lines.is_empty() {
+            bounded_expected_lines(chunk.change_context.iter()
+                .filter(|context| !context.starts_with("codex-range ")).map(String::as_str))
+        } else { bounded_expected_lines(chunk.old_lines.iter().map(String::as_str)) }
+    }).unwrap_or_default();
+    let expected_source_sha256 = chunk.and_then(|chunk| chunk.change_context.as_deref())
+        .and_then(|context| context.strip_prefix("codex-range "))
+        .and_then(|handle| handle.split_once(" sha256:").map(|(_, hash)| hash))
+        .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(str::to_owned);
+    let candidate_locations = (current_line_start != 0).then(|| PatchCandidateLocation {
+        line_start: current_line_start, line_end: current_line_end, advisory_only: true,
+    }).into_iter().collect();
     ApplyPatchError::PatchContextMismatch(PatchContextMismatch {
         kind,
         hunk_ordinal,
@@ -2856,6 +3044,9 @@ fn located_patch_mismatch(
         current_line_start,
         current_line_end,
         current_excerpt,
+        expected_excerpt,
+        expected_source_sha256,
+        candidate_locations,
         message,
         edits_result_of_hunk: None,
     })

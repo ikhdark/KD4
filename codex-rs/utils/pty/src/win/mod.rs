@@ -66,6 +66,10 @@ pub struct WinChild {
 }
 
 impl WinChild {
+    pub(crate) fn job(&self) -> Arc<JobObject> {
+        Arc::clone(&self.job)
+    }
+
     pub(crate) fn new(proc: OwnedHandle, job: Arc<JobObject>) -> Self {
         Self {
             proc: Arc::new(Mutex::new(proc)),

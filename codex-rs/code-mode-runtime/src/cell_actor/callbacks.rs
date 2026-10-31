@@ -142,7 +142,12 @@ pub(super) fn spawn_tool<H: CellHost>(
                     } else {
                         timeout_cancellation.cause().map(|cause| cause.describe()).unwrap_or_else(|| "nested tool cancelled".into())
                     };
-                    Err(ToolFailure::new(ToolFailureCode::Cancelled, message).model_message())
+                    let code = if timeout_cancellation.cause() == Some(CancellationCause::NestedDeadline) {
+                        ToolFailureCode::TimedOut
+                    } else {
+                        ToolFailureCode::Cancelled
+                    };
+                    Err(ToolFailure::new(code, message).model_message())
                 }
             }
         })
@@ -172,11 +177,15 @@ pub(super) fn spawn_tool<H: CellHost>(
                 RuntimeCommand::ToolResponseAfterDeadline {
                     id: id.clone(),
                     result,
-                    error_text: ToolFailure::new(ToolFailureCode::Cancelled, if receipt_cancellation.cause() == Some(CancellationCause::NestedDeadline) {
+                    error_text: ToolFailure::new(if receipt_cancellation.cause() == Some(CancellationCause::NestedDeadline) {
+                        ToolFailureCode::TimedOut
+                    } else {
+                        ToolFailureCode::Cancelled
+                    }, if receipt_cancellation.cause() == Some(CancellationCause::NestedDeadline) {
                         format!("nested tool `{tool_name}` exceeded its {}ms timeout; completed evidence is in error.results.completed.value; do not replay its effects", timeout.as_millis())
                     } else {
                         receipt_cancellation.cause().map(|cause| cause.describe()).unwrap_or_else(|| "nested tool cancelled".into())
-                    }).model_message(),
+                    }).with_completed_execution().model_message(),
                 },
                 None,
             ),
@@ -190,11 +199,22 @@ pub(super) fn spawn_tool<H: CellHost>(
             Ok(Err(error_text)) => (
                 RuntimeCommand::ToolError {
                     id: id.clone(),
-                    error_text: if serde_json::from_str::<serde_json::Value>(&error_text).ok()
+                    error_text: if let Some(mut failure) = serde_json::from_str::<serde_json::Value>(&error_text).ok()
                         .and_then(|value| value.get("tool_failure").cloned())
-                        .and_then(|value| serde_json::from_value::<ToolFailure>(value).ok()).is_some()
+                        .and_then(|value| serde_json::from_value::<ToolFailure>(value).ok())
                     {
-                        error_text
+                        // The delegate may observe the cancellation signal before
+                        // the wrapper's timer branch wins. Keep its owner-issued
+                        // handles, output references and effect certainty intact.
+                        if failure.code == ToolFailureCode::Cancelled
+                            && receipt_cancellation.cause() == Some(CancellationCause::NestedDeadline)
+                        {
+                            failure.code = ToolFailureCode::TimedOut;
+                            failure.safe_next_actions.extend(ToolFailure::new(
+                                ToolFailureCode::TimedOut, "",
+                            ).safe_next_actions);
+                        }
+                        failure.model_message()
                     } else {
                         ToolFailure::new(ToolFailureCode::Failed, error_text).model_message()
                     },

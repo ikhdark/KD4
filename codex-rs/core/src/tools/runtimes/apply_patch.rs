@@ -68,6 +68,7 @@ pub struct ApplyPatchRuntime {
     committed_delta: AppliedPatchDelta,
     patch_mismatch: Option<codex_apply_patch::PatchContextMismatch>,
     revision_guard_mismatch: bool,
+    failure: Option<codex_protocol::tool_failure::ToolFailure>,
     workspace_tracking_started: bool,
     workspace_tracking_finished: bool,
     mutation_repo_root: Option<PathBuf>,
@@ -111,6 +112,10 @@ impl ApplyPatchRuntime {
 
     pub(crate) fn revision_guard_mismatch(&self) -> bool {
         self.revision_guard_mismatch
+    }
+
+    pub(crate) fn failure(&self) -> Option<&codex_protocol::tool_failure::ToolFailure> {
+        self.failure.as_ref()
     }
 
     pub async fn finish_pending_workspace_tracking(&mut self, ctx: &ToolCtx) {
@@ -480,6 +485,7 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
                 Ok(delta) => (delta, "none", false),
                 Err(failure) => {
                     let (error, delta) = failure.into_parts();
+                    self.failure = Some(patch_failure(&error));
                     // Preflight reports conflicts in order, so the first typed
                     // mismatch is the one a retry must correct first.
                     match &error {
@@ -568,5 +574,79 @@ pub(crate) fn patch_failure_kind(error: &codex_apply_patch::ApplyPatchError) -> 
         ApplyPatchError::ImplicitInvocation => "implicit_invocation",
         ApplyPatchError::EnvironmentIdMismatch { .. } => "environment_mismatch",
     }
+}
+
+/// Classify only typed owner evidence, never diagnostic substrings or patch bodies.
+pub(crate) fn patch_failure(error: &codex_apply_patch::ApplyPatchError) -> codex_protocol::tool_failure::ToolFailure {
+    use codex_apply_patch::{ApplyPatchError, PatchContextMismatchKind};
+    use codex_protocol::tool_failure::{ToolFailure, ToolFailureCode, ToolFieldError};
+    let mismatch_code = |kind| match kind {
+        PatchContextMismatchKind::StaleRange => ToolFailureCode::StaleInput,
+        PatchContextMismatchKind::AmbiguousMatch => ToolFailureCode::AmbiguousAnchor,
+        PatchContextMismatchKind::ContextNotFound | PatchContextMismatchKind::ExpectedLinesNotFound => ToolFailureCode::MissingAnchor,
+        PatchContextMismatchKind::MalformedRange => ToolFailureCode::InvalidSyntax,
+        _ => ToolFailureCode::InvalidInput,
+    };
+    let code = match error {
+        ApplyPatchError::ParseError(_) => ToolFailureCode::InvalidSyntax,
+        ApplyPatchError::RevisionGuardMismatch(_) => ToolFailureCode::StaleInput,
+        ApplyPatchError::PatchContextMismatch(mismatch) => mismatch_code(mismatch.kind),
+        ApplyPatchError::MultiplePatchConflicts { mismatches, .. } => mismatches.first()
+            .map(|mismatch| mismatch_code(mismatch.kind)).unwrap_or(ToolFailureCode::InvalidInput),
+        ApplyPatchError::IoError(error) => {
+            if std::error::Error::source(error).and_then(|error| error.downcast_ref::<std::io::Error>())
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied) {
+                ToolFailureCode::PermissionDenied
+            } else { ToolFailureCode::Failed }
+        }
+        _ => ToolFailureCode::InvalidInput,
+    };
+    let (message, expected) = match code {
+        ToolFailureCode::InvalidSyntax => ("Patch syntax is invalid.", "the advertised patch grammar and valid range syntax"),
+        ToolFailureCode::StaleInput => ("Patch source revision is stale.", "the current source revision after reconciling intended changes"),
+        ToolFailureCode::MissingAnchor => ("Patch anchor or contiguous old lines were not found.", "an existing anchor followed immediately by the complete old lines"),
+        ToolFailureCode::AmbiguousAnchor => ("Patch anchor matches more than one location.", "one uniquely identified source location"),
+        ToolFailureCode::PermissionDenied => ("Patch filesystem access was denied.", "access permitted by the active filesystem policy"),
+        ToolFailureCode::Failed => ("Patch filesystem operation failed.", "an available target through the selected filesystem owner"),
+        _ => ("Patch input does not match the source contract.", "valid paths and ordered, exact source preimages"),
+    };
+    let mut failure = if matches!(error, ApplyPatchError::IoError(_)) {
+        ToolFailure::new(code, message).with_completed_execution()
+    } else {
+        ToolFailure::no_effects(code, message)
+    };
+    failure.field_errors.push(ToolFieldError {
+        path: String::new(), expected: expected.into(), correction: failure.safe_next_actions[0].clone(),
+    });
+    let mismatches = match error {
+        ApplyPatchError::PatchContextMismatch(mismatch) => std::slice::from_ref(mismatch),
+        ApplyPatchError::MultiplePatchConflicts { mismatches, .. } => mismatches.as_slice(),
+        _ => &[],
+    };
+    if !mismatches.is_empty() {
+        failure.details = Some(serde_json::json!({"conflicts": mismatches.iter().map(|mismatch| serde_json::json!({
+            "code": mismatch_code(mismatch.kind), "kind": mismatch.kind,
+            "path": mismatch.canonical_path, "hunk": mismatch.hunk_ordinal, "chunk": mismatch.chunk_ordinal,
+            "current_content_sha256": mismatch.current_content_sha256,
+            "expected_excerpt": mismatch.expected_excerpt,
+            "expected_source_sha256": mismatch.expected_source_sha256,
+            "current_line_start": mismatch.current_line_start, "current_line_end": mismatch.current_line_end,
+            "current_excerpt": mismatch.current_excerpt,
+            "candidate_locations": mismatch.candidate_locations,
+            "edits_result_of_hunk": mismatch.edits_result_of_hunk,
+        })).collect::<Vec<_>>() }));
+    }
+    if let ApplyPatchError::ParseError(codex_apply_patch::ParseError::InvalidHunkError { line_number, .. }) = error {
+        failure.details = Some(serde_json::json!({"line": line_number}));
+    }
+    if let ApplyPatchError::RevisionGuardMismatch(diagnostic) = error {
+        // The owner already bounds each available source excerpt; preserve its
+        // expected/current identities on shell interception as well as direct calls.
+        failure.details = Some(serde_json::json!({"revision_guard_diagnostic": diagnostic}));
+    }
+    if let ApplyPatchError::ComputeReplacements(diagnostic) = error {
+        failure.details = Some(serde_json::json!({"owner_diagnostic": diagnostic}));
+    }
+    failure
 }
 

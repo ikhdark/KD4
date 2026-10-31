@@ -40,7 +40,6 @@ use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-
 /// Request payload used by the unified-exec runtime after approvals and
 /// sandbox preferences have been resolved for the current turn.
 #[derive(Clone, Debug)]
@@ -66,6 +65,7 @@ pub struct UnifiedExecRequest {
     pub explicit_env_overrides: HashMap<String, String>,
     pub has_command_env_overrides: bool,
     pub tty: bool,
+    pub pipe_stdin: bool,
     pub sandbox_permissions: SandboxPermissions,
     pub additional_permissions: Option<AdditionalPermissionProfile>,
     pub additional_permissions_uri: Option<UriAdditionalPermissionProfile>,
@@ -112,6 +112,7 @@ pub struct UnifiedExecApprovalKey {
     pub environment_overrides: std::collections::BTreeMap<String, String>,
     pub cwd: PathUri,
     pub tty: bool,
+    pub pipe_stdin: bool,
     pub sandbox_permissions: SandboxPermissions,
     pub additional_permissions: Option<UriAdditionalPermissionProfile>,
 }
@@ -149,7 +150,6 @@ fn build_unified_exec_sandbox_command(
 }
 
 impl<'a> UnifiedExecRuntime<'a> {
-
     pub(crate) fn new_with_pending_spawns(
         manager: &'a UnifiedExecProcessManager,
         pending_spawns: PendingSpawnRegistration,
@@ -186,6 +186,7 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
             environment_overrides: req.explicit_env_overrides.clone().into_iter().collect(),
             cwd: req.cwd.clone(),
             tty: req.tty,
+            pipe_stdin: req.pipe_stdin,
             sandbox_permissions: req.sandbox_permissions,
             additional_permissions: req.canonical_additional_permissions(),
         }]
@@ -276,12 +277,10 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
     }
 }
 
-
 impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExecRuntime<'a> {
     fn sandbox_cwd<'b>(&self, req: &'b UnifiedExecRequest) -> Option<&'b PathUri> {
         Some(&req.sandbox_cwd)
     }
-
 
     async fn run(
         &mut self,
@@ -314,11 +313,18 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
             .shell_for_environment(&req.turn_environment)
             .await
             .map_err(|error| ToolError::Rejected(error.to_string()))?;
-        let shell = session_shell.as_ref();
-        let shell_snapshot_location = req
-            .turn_environment
-            .shell_snapshot_for_config(&req.cwd, &ctx.turn.config)
-            .await;
+        let selected_shell = req.shell_wrapper_is_owned.then(|| crate::shell::Shell {
+            shell_type: req.shell_type,
+            shell_path: std::path::PathBuf::from(&req.command[0]),
+        });
+        let shell = selected_shell.as_ref().unwrap_or(session_shell.as_ref());
+        let shell_snapshot_location = if shell == session_shell.as_ref() {
+            req.turn_environment
+                .shell_snapshot_for_config(&req.cwd, &ctx.turn.config)
+                .await
+        } else {
+            None
+        };
         let env = req.env.clone();
         let mut env = env;
         let command = prepare_shell_command(ShellCommandPreparation {
@@ -365,6 +371,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
             .map_err(ToolError::Rejected)?;
         }
 
+        let shell_startup_command = command.clone();
         let additional_read_roots = shell_snapshot_additional_read_roots(
             shell_snapshot_location.as_deref(),
             attempt.sandbox,
@@ -394,22 +401,79 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
         ).await.map_err(ToolError::Rejected)?;
         crate::validation_task::begin_policy_attempt(ctx).await.map_err(ToolError::Rejected)?;
         let spawned = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let result = self
-            .manager
-            .open_session_with_exec_env(
-                req.process_id,
-                command,
-                additional_read_roots,
-                options,
-                permissions.as_ref(),
-                attempt,
-                req.exec_server_env_config.clone(),
-                req.tty,
-                Box::new(ObservedSpawnLifecycle::new(Arc::clone(&spawned), validation_resource)),
-                Some(req.raw_output_artifact.clone()),
-                req.turn_environment.environment.as_ref(),
-                Some(req.turn_environment.exec_backend()),
-                &pending_spawns,
+        let remote = req.turn_environment.environment.is_remote();
+        let mut environment_receipt = codex_utils_pty::environment_receipt::LaunchEnvironment::new(
+            req.turn_environment.environment_id.clone(),
+            req.cwd.to_string(),
+            if req.shell_wrapper_is_owned && req.command.first().is_some_and(|program| {
+                std::path::Path::new(program) == std::path::Path::new(&command.program)
+            }) { "shell_launcher" } else { "direct_executable" }.into(),
+            if remote { "requested_overrides; executor_effective_environment_unknown" }
+                else { "prepared_launch_environment" }.into(),
+            req.explicit_env_overrides.iter().map(|(name, requested)| {
+                let value = if remote { Some(requested.clone()) } else {
+                    env.iter().find(|(key, _)| key.eq_ignore_ascii_case(name))
+                        .map(|(_, value)| value.clone())
+                };
+                (name.clone(), value)
+            }),
+        )
+        .with_shell_command(&shell_startup_command, req.shell_wrapper_is_owned);
+        // Reuse the argv-role and environment path owners. No filesystem probes,
+        // second traversal, symlink canonicalization or shell-text inference.
+        environment_receipt.search_roots =
+            codex_command_analysis::command_search::rg_search_path_operands(std::slice::from_ref(
+                &req.command_for_approval,
+            ))
+            .map(|mut paths| {
+                if paths.is_empty() {
+                    paths.push(".".into());
+                }
+                paths
+                    .into_iter()
+                    .map(|requested| {
+                        let resolved = if requested == "-" {
+                            Err("stdin is not a filesystem root".to_string())
+                        } else {
+                            req.cwd
+                                .join(&requested)
+                                .map(|path| path.inferred_native_path_string())
+                                .map_err(|error| error.to_string())
+                        };
+                        let (resolved, error) = match resolved {
+                            Ok(path) => (Some(path), None),
+                            Err(error) => (None, Some(error)),
+                        };
+                        codex_utils_pty::environment_receipt::SearchRoot {
+                            requested,
+                            resolved,
+                            error,
+                        }
+                    })
+                    .collect()
+            });
+        let result =
+            codex_utils_pty::process_observation::ProcessObservationContext::scope_environment(
+                environment_receipt,
+                self.manager.open_session_with_exec_env(
+                    req.process_id,
+                    command,
+                    additional_read_roots,
+                    options,
+                    permissions.as_ref(),
+                    attempt,
+                    req.exec_server_env_config.clone(),
+                    req.tty,
+                    req.pipe_stdin,
+                    Box::new(ObservedSpawnLifecycle::new(
+                        Arc::clone(&spawned),
+                        validation_resource,
+                    )),
+                    Some(req.raw_output_artifact.clone()),
+                    req.turn_environment.environment.as_ref(),
+                    Some(req.turn_environment.exec_backend()),
+                    &pending_spawns,
+                ),
             )
             .await;
         // Every launcher reports creation through `after_spawn`. A failed

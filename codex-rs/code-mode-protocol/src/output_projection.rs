@@ -50,7 +50,8 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
             });
     let command_streams = tool.namespace.is_none()
         && matches!(tool.name.as_str(), "exec_command" | "write_stdin")
-        && object.get("streams_complete") == Some(&Value::Bool(true))
+        && (object.get("streams_complete") == Some(&Value::Bool(true))
+            || object.get("stream_chunks_complete") == Some(&Value::Bool(true)))
         && object.get("stdout").is_some_and(Value::is_string)
         && object.get("stderr").is_some_and(Value::is_string);
     let mcp_content = (!local_text_tool)
@@ -388,6 +389,7 @@ fn plan_receipt(raw: &Value) -> Option<Value> {
             matches!(
                 key.as_str(),
                 "message" | "effect" | "no_progress" | "revision" | "step_ids"
+                    | "obligations" | "remaining_requirements"
             )
         })
         .map(|(key, value)| (key.clone(), value.clone()))

@@ -10,7 +10,10 @@ use crate::tools::effective_tool_mode;
 use crate::tools::exposure::AgentSurfaceStage;
 use crate::tools::exposure::ToolExposureIdentity;
 use crate::tools::handlers::ApplyPatchHandler;
+use crate::tools::handlers::CanonicalPathsHandler;
+use crate::tools::handlers::CargoWorkspaceHandler;
 use crate::tools::handlers::ChecksumFileHandler;
+use crate::tools::handlers::ClassifyPathsHandler;
 use crate::tools::handlers::CodeModeExecuteHandler;
 use crate::tools::handlers::CodeModeWaitHandler;
 use crate::tools::handlers::CompareArtifactsHandler;
@@ -19,6 +22,8 @@ use crate::tools::handlers::DynamicToolHandler;
 use crate::tools::handlers::ExecCommandHandler;
 use crate::tools::handlers::ExecCommandHandlerOptions;
 use crate::tools::handlers::GitBlameHandler;
+use crate::tools::handlers::LineEndingDiagnosticsHandler;
+use crate::tools::handlers::LineMapHandler;
 use crate::tools::handlers::ListAvailablePluginsToInstallHandler;
 use crate::tools::handlers::ListFilesHandler;
 use crate::tools::handlers::ListMcpResourceTemplatesHandler;
@@ -57,6 +62,10 @@ use crate::tools::handlers::multi_agents_v2::AgentLockHandler;
 use crate::tools::handlers::multi_agents_v2::AmendAgentTaskHandler;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
 use crate::tools::handlers::multi_agents_v2::GetAgentTaskHandler;
+use crate::tools::handlers::multi_agents_v2::GetAgentPartialResultHandler;
+use crate::tools::handlers::multi_agents_v2::GroupAgentFindingsHandler;
+use crate::tools::handlers::multi_agents_v2::PublishAgentPartialResultHandler;
+use crate::tools::handlers::multi_agents_v2::DeclareEditIntentsHandler;
 use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
 use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHandlerV2;
@@ -785,6 +794,7 @@ fn build_code_mode_executors(
     let mut has_nested_list_files = false;
     let mut lazy_builtin_tool_names = Vec::new();
     let mut canonical_input_schemas = HashMap::new();
+    let mut effective_contract_revisions = HashMap::new();
     let deferred_tools_guidance_enabled = search_tool_enabled(turn_context);
     for executor in executors {
         let exposure = executor.exposure();
@@ -803,9 +813,13 @@ fn build_code_mode_executors(
         }
 
         let mut spec = executor.spec().clone();
-        if let Some(schema) = executor.runtime().code_mode_input_schema() {
-            canonical_input_schemas.insert(executor.tool_name().clone(), schema);
+        if let Some(schema) = executor.effective_input_schema() {
+            canonical_input_schemas.insert(executor.tool_name().clone(), schema.clone());
         }
+        effective_contract_revisions.insert(
+            executor.tool_name().clone(),
+            executor.effective_contract_revision().to_owned(),
+        );
         has_nested_apply_patch |= executor.tool_name() == &ToolName::plain("apply_patch");
         has_nested_list_files |= executor.authorization_class() != TypedToolClass::DynamicExternal
             && executor.tool_name() == &ToolName::plain("list_files");
@@ -815,6 +829,13 @@ fn build_code_mode_executors(
             && let Some(properties) = &mut tool.parameters.properties
         {
             properties.remove("force_fresh");
+            if let Some(properties) = canonical_input_schemas
+                .get_mut(executor.tool_name())
+                .and_then(|schema| schema.get_mut("properties"))
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                properties.remove("force_fresh");
+            }
         }
 
         if exposure == ToolExposure::Deferred {
@@ -886,7 +907,7 @@ fn build_code_mode_executors(
                     }
                 }
                 if definition.name == "apply_patch" {
-                    definition.description = format!("{}\nNested apply_patch is available: await tools.apply_patch(patchText). Result: {{success, text, changes, changes_exact, environment_id, diagnostics, retry?}}; check success before continuing.", definition.description).into();
+                    definition.description = format!("{}\nNested apply_patch is available: await tools.apply_patch(patchText). Result: {{success, operation_id, outcome, text, changes, changes_exact, environment_id, diagnostics, tool_failure?, retry?}}; outcome is committed/unchanged/failed/unknown, independently of success; multi_file_atomic is false. changes[].write_receipt hashes exact committed bytes, not current freshness; check success before continuing.", definition.description).into();
                 } else if definition.name == "read_file" {
                     definition.description = format!("{}\nResult fields: path, retained_bytes, complete, file_complete, retained_artifact_complete, results. Snapshot reads add total_lines, source_sha256, canonical_bytes and optional artifact_id, continuation, page_selectors, snapshot_error, canonical_sha256 (decoded UTF-16 snapshot identity; join recovery pages on it when present), unchanged; live byte pages instead add read_mode:byte_ranges, file_bytes, file_revision and, when incomplete, range_recovery. Each results[] item has selector, status, complete and text, value or data_hex/data_base64 (search hydrated_ranges), with recovery fields when incomplete.", definition.description).into();
                 }
@@ -946,6 +967,7 @@ fn build_code_mode_executors(
         code_mode_nested_tool_specs,
         deferred_code_mode_nested_tool_specs,
         &canonical_input_schemas,
+        &effective_contract_revisions,
     )?)];
     result.push(Arc::new(CodeModeWaitHandler));
     Ok(result)
@@ -1193,9 +1215,20 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Planne
                     }),
                     TypedToolClass::Shell,
                 );
+                planned_tools.add_with_exposure_and_authorization_class(
+                    CargoWorkspaceHandler,
+                    if search_tool_enabled(turn_context) { ToolExposure::Deferred } else { ToolExposure::Direct },
+                    TypedToolClass::Shell,
+                );
             }
             planned_tools.add_with_authorization_class(
                 WriteStdinHandler::new(turn_context.config.background_terminal_max_timeout),
+                TypedToolClass::Shell,
+            );
+            planned_tools.add_with_authorization_class(
+                crate::tools::handlers::WaitProcessesHandler::new(
+                    turn_context.config.background_terminal_max_timeout,
+                ),
                 TypedToolClass::Shell,
             );
 
@@ -1221,6 +1254,12 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Planne
             if primary_environment_uses_foreign_cwd(context.step_context) {
                 planned_tools.add_with_authorization_class(
                     WriteStdinHandler::new(turn_context.config.background_terminal_max_timeout),
+                    TypedToolClass::Shell,
+                );
+                planned_tools.add_with_authorization_class(
+                    crate::tools::handlers::WaitProcessesHandler::new(
+                        turn_context.config.background_terminal_max_timeout,
+                    ),
                     TypedToolClass::Shell,
                 );
             }
@@ -1265,6 +1304,11 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
         if search_tool_enabled(turn_context) { ToolExposure::Deferred } else { ToolExposure::Direct },
         TypedToolClass::ReadSearch,
     );
+    planned_tools.add_with_exposure_and_authorization_class(
+        LineMapHandler,
+        if search_tool_enabled(turn_context) { ToolExposure::Deferred } else { ToolExposure::Direct },
+        TypedToolClass::ReadSearch,
+    );
     // Host skill locators remain readable even when no execution environment exists.
     // The handler still requires an environment for ordinary filesystem paths.
     planned_tools.add_with_authorization_class(ReadFileHandler, TypedToolClass::ReadSearch);
@@ -1281,7 +1325,22 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
             TypedToolClass::ReadSearch,
         );
         planned_tools.add_with_exposure_and_authorization_class(
+            crate::tools::handlers::BackendCapabilitiesHandler,
+            if search_tool_enabled(turn_context) { ToolExposure::Deferred } else { ToolExposure::Direct },
+            TypedToolClass::ReadSearch,
+        );
+        planned_tools.add_with_exposure_and_authorization_class(
+            CanonicalPathsHandler,
+            if search_tool_enabled(turn_context) { ToolExposure::Deferred } else { ToolExposure::Direct },
+            TypedToolClass::ReadSearch,
+        );
+        planned_tools.add_with_exposure_and_authorization_class(
             ChecksumFileHandler,
+            if search_tool_enabled(turn_context) { ToolExposure::Deferred } else { ToolExposure::Direct },
+            TypedToolClass::ReadSearch,
+        );
+        planned_tools.add_with_exposure_and_authorization_class(
+            LineEndingDiagnosticsHandler,
             if search_tool_enabled(turn_context) { ToolExposure::Deferred } else { ToolExposure::Direct },
             TypedToolClass::ReadSearch,
         );
@@ -1339,10 +1398,34 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
                 );
             }
             planned_tools.add_with_exposure_and_authorization_class(
+                crate::tools::handlers::GitStatusHandler,
+                if search_tool_enabled(turn_context) { ToolExposure::Deferred } else { ToolExposure::Direct },
+                TypedToolClass::ReadSearch,
+            );
+            planned_tools.add_with_exposure_and_authorization_class(
+                crate::tools::handlers::GitConflictsHandler,
+                if search_tool_enabled(turn_context) { ToolExposure::Deferred } else { ToolExposure::Direct },
+                TypedToolClass::ReadSearch,
+            );
+            planned_tools.add_with_exposure_and_authorization_class(
+                ClassifyPathsHandler,
+                if search_tool_enabled(turn_context) { ToolExposure::Deferred } else { ToolExposure::Direct },
+                TypedToolClass::ReadSearch,
+            );
+            planned_tools.add_with_exposure_and_authorization_class(
                 GitBlameHandler,
                 if search_tool_enabled(turn_context) { ToolExposure::Deferred } else { ToolExposure::Direct },
                 TypedToolClass::ReadSearch,
             );
+            // Host-side readers, gated like Git: they read local files or
+            // processes directly rather than through the environment.
+            if cfg!(windows) {
+                planned_tools.add_with_exposure_and_authorization_class(
+                    crate::tools::handlers::ListProcessesHandler,
+                    if search_tool_enabled(turn_context) { ToolExposure::Deferred } else { ToolExposure::Direct },
+                    TypedToolClass::ReadSearch,
+                );
+            }
         }
         planned_tools.add_with_authorization_class(
             crate::tools::handlers::SaveTurnDiffHandler,
@@ -1562,6 +1645,11 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
             exposure,
             TypedToolClass::AgentCommunication,
         );
+        planned_tools.add_arc_with_exposure_and_authorization_class(
+            multi_agent_v2_handler(DeclareEditIntentsHandler, tool_namespace),
+            exposure,
+            TypedToolClass::OwnTask,
+        );
         if agent_surface_stage != AgentSurfaceStage::TypedAdministration {
             return;
         }
@@ -1571,11 +1659,26 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
             TypedToolClass::OwnTask,
         );
         planned_tools.add_arc_with_exposure_and_authorization_class(
+            multi_agent_v2_handler(GetAgentPartialResultHandler, tool_namespace),
+            exposure,
+            TypedToolClass::OwnTask,
+        );
+        planned_tools.add_arc_with_exposure_and_authorization_class(
+            multi_agent_v2_handler(GroupAgentFindingsHandler, tool_namespace),
+            exposure,
+            TypedToolClass::OwnTask,
+        );
+        planned_tools.add_arc_with_exposure_and_authorization_class(
             multi_agent_v2_handler(SetAgentGateHandler, tool_namespace),
             exposure,
             TypedToolClass::OwnTask,
         );
         if turn_context.session_source.is_non_root_agent() {
+            planned_tools.add_arc_with_exposure_and_authorization_class(
+                multi_agent_v2_handler(PublishAgentPartialResultHandler, tool_namespace),
+                exposure,
+                TypedToolClass::OwnTask,
+            );
             planned_tools.add_arc_with_exposure_and_authorization_class(
                 multi_agent_v2_handler(SubmitAgentReceiptHandler, tool_namespace),
                 exposure,

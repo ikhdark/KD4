@@ -264,7 +264,6 @@ impl Approvable<ShellRequest> for ShellRuntime {
 }
 
 impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
-
     async fn run(
         &mut self,
         req: &ShellRequest,
@@ -285,14 +284,24 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             .shell_for_environment(&req.turn_environment)
             .await
             .map_err(|error| ToolError::Rejected(error.to_string()))?;
-        let shell = session_shell.as_ref();
-        let shell_snapshot_location = req
-            .turn_environment
-            .shell_snapshot_for_config(
-                &codex_utils_path_uri::PathUri::from_abs_path(&req.cwd),
-                &ctx.turn.config,
-            )
-            .await;
+        let selected_shell =
+            req.shell_type
+                .filter(|_| req.shell_wrapper_is_owned)
+                .map(|shell_type| crate::shell::Shell {
+                    shell_type,
+                    shell_path: std::path::PathBuf::from(&req.command[0]),
+                });
+        let shell = selected_shell.as_ref().unwrap_or(session_shell.as_ref());
+        let shell_snapshot_location = if shell == session_shell.as_ref() {
+            req.turn_environment
+                .shell_snapshot_for_config(
+                    &codex_utils_path_uri::PathUri::from_abs_path(&req.cwd),
+                    &ctx.turn.config,
+                )
+                .await
+        } else {
+            None
+        };
         let mut env = req.env.clone();
         let command = prepare_shell_command(ShellCommandPreparation {
             command: &req.command,
@@ -337,6 +346,26 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             .map_err(ToolError::Rejected)?;
         }
 
+        let environment_receipt = codex_utils_pty::environment_receipt::LaunchEnvironment::new(
+            req.turn_environment.environment_id.clone(),
+            codex_utils_path_uri::PathUri::from_abs_path(&req.cwd).to_string(),
+            if req.shell_wrapper_is_owned {
+                "shell_launcher"
+            } else {
+                "direct_executable"
+            }
+            .into(),
+            "prepared_launch_environment".into(),
+            req.explicit_env_overrides.iter().map(|(name, _)| {
+                (
+                    name.clone(),
+                    env.iter()
+                        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                        .map(|(_, value)| value.clone()),
+                )
+            }),
+        )
+        .with_shell_command(&command, req.shell_wrapper_is_owned);
         let additional_read_roots = shell_snapshot_additional_read_roots(
             shell_snapshot_location.as_deref(),
             attempt.sandbox,
@@ -354,10 +383,7 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             capture_policy: ExecCapturePolicy::ShellTool,
         };
         let mut env = attempt
-            .env_for(
-                command,
-                options,
-            )
+            .env_for(command, options)
             .await
             .map_err(ToolError::Codex)?;
         env.windows_sandbox_additional_read_roots = additional_read_roots;
@@ -378,29 +404,41 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         let capture_home = ctx.turn.config.codex_home.clone();
         let stdout_stream = Self::stdout_stream(ctx, progress);
         let owns_resource = validation_resource.is_some();
-        let execution = async move {
-            let _validation_resource = validation_resource;
-            crate::tools::command_output_artifact::capture::capture_legacy_output(
-                &capture_home,
-                &thread_id,
-                execute_exec_request_with_after_spawn(env, stdout_stream, after_spawn),
-            ).await
-        };
+        let execution =
+            codex_utils_pty::process_observation::ProcessObservationContext::scope_environment(
+                environment_receipt,
+                async move {
+                    let _validation_resource = validation_resource;
+                    crate::tools::command_output_artifact::capture::capture_legacy_output(
+                        &capture_home,
+                        &thread_id,
+                        execute_exec_request_with_after_spawn(env, stdout_stream, after_spawn),
+                    )
+                    .await
+                },
+            );
         let terminal_tasks = ctx.session.terminal_tasks.clone();
         let dispatch_timing = crate::tools::tool_dispatch_trace::active_tool_dispatch_timing();
         let execution = async move {
             if owns_resource {
                 // A dropped tool observer must not release a running child's
                 // resource. Existing session shutdown owns this task's cleanup.
-                terminal_tasks.spawn(async move {
-                    match dispatch_timing {
-                        Some(timing) => crate::tools::tool_dispatch_trace::scope_tool_dispatch_timing(
-                            timing, execution,
-                        ).await,
-                        None => execution.await,
-                    }
-                }).await.map_err(|error|
-                    ToolError::Rejected(format!("Python test execution owner failed: {error}")))
+                terminal_tasks
+                    .spawn(async move {
+                        match dispatch_timing {
+                            Some(timing) => {
+                                crate::tools::tool_dispatch_trace::scope_tool_dispatch_timing(
+                                    timing, execution,
+                                )
+                                .await
+                            }
+                            None => execution.await,
+                        }
+                    })
+                    .await
+                    .map_err(|error| {
+                        ToolError::Rejected(format!("Python test execution owner failed: {error}"))
+                    })
             } else {
                 Ok(execution.await)
             }
@@ -457,4 +495,3 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         Ok(out)
     }
 }
-

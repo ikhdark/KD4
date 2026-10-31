@@ -149,6 +149,7 @@ enum ContinuationStopReason {
     SelectorNotFound,
     PageReadError,
     RepeatedSelector,
+    NoProgress,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -161,6 +162,7 @@ struct RecoveryContinuationStopV1 {
     message: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     page_selectors: Vec<ToolOutputSelector>,
+    remaining_selectors: Vec<ToolOutputSelector>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -240,6 +242,7 @@ impl RecoveryContinuationState {
         });
         self.continuation_stop = Some(RecoveryContinuationStopV1 {
             page_selectors: Vec::new(),
+            remaining_selectors: self.remaining_selectors(),
             version: 1,
             reason,
             selector,
@@ -253,6 +256,7 @@ impl RecoveryContinuationState {
                 ContinuationStopReason::InvalidSelector => "The selector is invalid. Correct it using the selector result message and the read_tool_output schema.",
                 ContinuationStopReason::SelectorNotFound => "The selector did not find the requested content. Inspect the artifact structure or revise the selector.",
                 ContinuationStopReason::RepeatedSelector => "The continuation repeated an already consumed selector. Stop this traversal and choose a different selector.",
+                ContinuationStopReason::NoProgress => "The continuation did not advance within the original selection. Preserve recovered pages and inspect the remaining selectors; do not rerun the producer.",
                 ContinuationStopReason::PageReadError => "The continuation page could not be read.",
             }.to_string()),
         });
@@ -271,12 +275,48 @@ impl RecoveryContinuationState {
         };
         self.continuation_stop = Some(RecoveryContinuationStopV1 {
             page_selectors: Vec::new(),
+            remaining_selectors: self.remaining_selectors(),
             version: 1,
             reason: ContinuationStopReason::PageReadError,
             selector: Some(selector),
             resumable,
             message: Some(error.for_model()),
         });
+    }
+
+    // Describe every unfinished original owner, not just the page which hit a
+    // limit. Subtract delivered fragments without widening the original range;
+    // unrelated siblings must survive cancellation and output-budget stops.
+    fn remaining_selectors(&self) -> Vec<ToolOutputSelector> {
+        let delivered = self.output.delivered_ranges();
+        let mut remaining = Vec::new();
+        for (index, owner) in self.output.results[..self.initial_result_count].iter().enumerate() {
+            if self.reconstructed[index].is_some()
+                || (owner.status == ToolOutputSelectorStatus::Ok && owner.complete)
+            {
+                continue;
+            }
+            if let Some(range) = owner.canonical_range {
+                let mut cursor = range.start;
+                for &(start, end) in &delivered {
+                    if cursor < start.min(range.end) {
+                        remaining.push(ToolOutputSelector::Bytes { start: cursor, end: start.min(range.end) });
+                    }
+                    cursor = cursor.max(end.min(range.end));
+                    if cursor >= range.end { break; }
+                }
+                if cursor < range.end {
+                    remaining.push(ToolOutputSelector::Bytes { start: cursor, end: range.end });
+                }
+            } else if owner.status == ToolOutputSelectorStatus::Ok && owner.selector.is_search() {
+                // A search cursor is a new requested page, not missing context
+                // from this one. Preserve its caller limits and exact children.
+                remaining.extend(owner.child_selectors.iter().cloned());
+            } else {
+                remaining.push(owner.selector.clone());
+            }
+        }
+        remaining
     }
 
     // Internal draining follows bounded child ranges. Across model calls the
@@ -374,6 +414,10 @@ impl RecoveryContinuationState {
         if predecessor.continuation.as_ref() != Some(selector)
             || page.artifact_id != self.output.artifact_id
             || page.canonical_sha256 != self.output.canonical_sha256
+            || page.canonical_bytes != self.output.canonical_bytes
+            || page.retained_bytes != self.output.retained_bytes
+            || page.capture_complete != self.output.capture_complete
+            || page.unavailable_ranges != self.output.unavailable_ranges
         {
             return Err(ContinuationStopReason::IdentityDrift);
         }
@@ -381,6 +425,29 @@ impl RecoveryContinuationState {
             return Err(ContinuationStopReason::IncompleteOwnerResult);
         }
         let selector_failed = selector_stop_reason(page.results[0].status).is_some();
+        if !selector_failed {
+            let result = &page.results[0];
+            if let ToolOutputSelector::Bytes { start, end } = selector {
+                // A smaller child is allowed, but not a backwards, empty or
+                // escaping interval. Each accepted page must deliver bytes or
+                // strictly subdivide this exact unfinished extent.
+                let advances = result.canonical_range.is_some_and(|range|
+                    *start <= range.start && range.start < range.end && range.end <= *end)
+                    && (!page.delivered_ranges().is_empty() || result.value.is_some());
+                let subdivides = matches!(result.continuation.as_ref(), Some(ToolOutputSelector::Bytes { start: next, end: limit })
+                    if *next == *start && *next < *limit && *limit < *end);
+                if !advances && !subdivides { return Err(ContinuationStopReason::NoProgress); }
+                if let Some(ToolOutputSelector::Bytes { start: next, end: limit }) = &result.continuation
+                    && (*next < *start || *limit > *end || next >= limit
+                        || (advances && result.canonical_range.is_some_and(|range| *next < range.end)))
+                {
+                    return Err(ContinuationStopReason::NoProgress);
+                }
+            }
+            if result.continuation.as_ref() == Some(selector) {
+                return Err(ContinuationStopReason::NoProgress);
+            }
+        }
 
         let previous_length = self.output.results.len();
         let previous_complete = self.output.complete;
@@ -509,6 +576,16 @@ impl RecoveryContinuationState {
             // Report the local error after draining independent work, without
             // replacing a global identity/cancellation/budget stop.
             self.record_stop(reason, Some(selector));
+        }
+        if self.continuation_stop.is_none()
+            && let Some(owner) = self.output.results[..self.initial_result_count].iter().enumerate()
+                .find_map(|(index, owner)| (!owner.complete && self.reconstructed[index].is_none()).then_some(owner))
+        {
+            let recoverable = owner.continuation.is_some() || !owner.child_selectors.is_empty();
+            self.record_stop(
+                if recoverable { ContinuationStopReason::Budget } else { ContinuationStopReason::IncompleteOwnerResult },
+                Some(owner.selector.clone()),
+            );
         }
         loop {
             if self
@@ -853,11 +930,15 @@ fn reconstruct_selection(
     result.complete = true;
     result.exact_bytes = Some(bytes.len() as u64);
     result.continuation = None;
-    result.child_selectors.clear();
+    if !matches!(owner.selector, ToolOutputSelector::Tail { .. }) {
+        result.child_selectors.clear();
+    }
     result.subdivision_plan = None;
     result.message = None;
     result.text = None;
-    result.value = None;
+    if !matches!(owner.selector, ToolOutputSelector::Tail { .. }) {
+        result.value = None;
+    }
     result.data_base64 = None;
     if matches!(owner.selector, ToolOutputSelector::JsonPointer { .. }) {
         result.value = Some(serde_json::from_slice(&bytes).ok()?);
@@ -927,6 +1008,9 @@ fn next_owner_continuation(
 #[serde(deny_unknown_fields)]
 struct ReadToolOutputArgs {
     artifact_id: String,
+    source_thread_id: Option<codex_protocol::ThreadId>,
+    #[serde(default)]
+    audit_only: bool,
     #[serde(default)]
     selectors: Option<Vec<ToolOutputSelector>>,
     #[serde(default)]
@@ -1033,16 +1117,35 @@ impl CoreToolRuntime for ReadToolOutputHandler {
     }
 }
 
-struct RecoveryAttemptObservation {
+struct RecoveryAttemptObservation<'a> {
+    thread_id: &'a codex_protocol::ThreadId,
+    turn_id: &'a str,
+    call_id: &'a str,
+    source_thread_id: codex_protocol::ThreadId,
+    artifact_id: String,
     started: std::time::Instant,
     phase: &'static str,
     completed: bool,
+    delivery_scope: &'static str,
+    selection_observed: bool,
+    selection_successful: bool,
+    selection_complete: bool,
+    retained_artifact_complete: bool,
 }
 
-impl Drop for RecoveryAttemptObservation {
+impl Drop for RecoveryAttemptObservation<'_> {
     fn drop(&mut self) {
         tracing::info!(event.name = "codex.tool_output_recovery.attempt_finished",
+            thread_id = %self.thread_id, turn_id = self.turn_id, call_id = self.call_id,
+            source_thread_id = %self.source_thread_id, artifact_id = self.artifact_id.as_str(),
             phase = self.phase, completed = self.completed,
+            delivery_scope = self.delivery_scope,
+            selection_observed = self.selection_observed,
+            selection_successful = self.selection_successful,
+            selection_complete = self.selection_complete,
+            retained_artifact_complete = self.retained_artifact_complete,
+            model_delivery_verified = false,
+            elapsed_us = u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX),
             elapsed_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "output recovery attempt settled (including failed and abandoned attempts)");
         if let Some(metrics) = codex_otel::global() {
@@ -1056,7 +1159,17 @@ async fn handle_read_tool_output(
     invocation: ToolInvocation,
 ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
     let mut attempt = RecoveryAttemptObservation {
+        thread_id: &invocation.session.thread_id,
+        turn_id: &invocation.step_context.turn.sub_id,
+        call_id: &invocation.call_id,
+        source_thread_id: invocation.session.thread_id,
+        artifact_id: String::new(),
         started: std::time::Instant::now(), phase: "arguments", completed: false,
+        delivery_scope: "unknown",
+        selection_observed: false,
+        selection_successful: false,
+        selection_complete: false,
+        retained_artifact_complete: false,
     };
     let ToolPayload::Function { ref arguments } = invocation.payload else {
         return Err(FunctionCallError::RespondToModel(
@@ -1064,8 +1177,61 @@ async fn handle_read_tool_output(
         ));
     };
     let args = parse_read_tool_output_args(arguments)?;
+    let source_thread_id = args.source_thread_id.unwrap_or(invocation.session.thread_id);
+    attempt.source_thread_id = source_thread_id;
+    // Do not put arbitrary malformed argument text into diagnostic logs.
+    attempt.artifact_id = args.artifact_id
+        .parse::<crate::tools::command_output_artifact::ToolOutputArtifactId>()
+        .ok()
+        .map(|id| id.to_string())
+        .filter(|id| id == &args.artifact_id)
+        .unwrap_or_default();
+    attempt.phase = "authorization";
+    let foreign_source = source_thread_id != invocation.session.thread_id;
+    if foreign_source {
+        // Possession of a child-private ID is not authority. Verify persisted
+        // spawn lineage, without waking or asking the producer to run again.
+        let subtree = invocation.session.services.agent_control
+            .list_live_agent_subtree_thread_ids(invocation.session.thread_id).await
+            .map_err(|error| FunctionCallError::RespondToModel(format!("cannot authorize artifact owner: {error}")))?;
+        if !subtree.contains(&source_thread_id) {
+            return Err(FunctionCallError::RespondToModel("source_thread_id must name this thread or its verified descendant; peer/ancestor/unrelated artifacts remain private".into()));
+        }
+    }
+    if args.audit_only {
+        if args.selectors.is_some() || args.start_line.is_some() || args.end_line.is_some()
+            || args.ranges.is_some() || args.max_bytes.is_some() || args.cell_recovery
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "audit_only cannot be combined with content selectors or delivery controls; no content was read".into(),
+            ));
+        }
+        attempt.phase = "metadata_audit";
+        let result = audit_evidence_handle(&invocation, &args.artifact_id, source_thread_id).await;
+        attempt.completed = result.is_ok();
+        return result;
+    }
     let selectors = resolved_selectors(&args)?;
     let code_mode_recovery = matches!(&invocation.source, ToolCallSource::CodeMode { .. });
+    attempt.delivery_scope = if code_mode_recovery { "code_mode" } else { "direct" };
+    let delivery_policy = if code_mode_recovery {
+        None
+    } else {
+        let policy: codex_protocol::protocol::TruncationPolicy =
+            invocation.step_context.turn.model_info.truncation_policy.into();
+        let limit = invocation
+            .step_context
+            .model_output_token_limit(&invocation.session, policy.token_budget())
+            .await;
+        Some(match policy {
+            codex_protocol::protocol::TruncationPolicy::Bytes(bytes) => {
+                codex_protocol::protocol::TruncationPolicy::Bytes(bytes.min(limit.saturating_mul(4)))
+            }
+            codex_protocol::protocol::TruncationPolicy::Tokens(_) => {
+                codex_protocol::protocol::TruncationPolicy::Tokens(limit)
+            }
+        })
+    };
     let max_bytes = match (code_mode_recovery, args.max_bytes) {
         (true, None) => READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES,
         (true, Some(bytes)) if bytes > READ_TOOL_OUTPUT_MAX_BYTES => {
@@ -1078,9 +1244,7 @@ async fn handle_read_tool_output(
     let command_delivery_limit = if code_mode_recovery {
         READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES
     } else {
-        let policy: codex_protocol::protocol::TruncationPolicy =
-            invocation.step_context.turn.model_info.truncation_policy.into();
-        policy.byte_budget()
+        delivery_policy.expect("direct recovery has a delivery policy").byte_budget()
     };
     let mut command_limit = max_bytes;
     let mut command_identity = None;
@@ -1088,10 +1252,11 @@ async fn handle_read_tool_output(
     // already the halving retry after a cut that did not shrink the envelope.
     let mut previous_envelope = usize::MAX;
     let mut halved_after_stall = false;
+    attempt.phase = "command_selection";
     loop {
-        let Some(output) = crate::tools::command_output_artifact::capture::read_command_log(
+        let Some(mut output) = crate::tools::command_output_artifact::capture::read_command_log(
             invocation.step_context.turn.config.codex_home.as_path(),
-            &invocation.session.thread_id.to_string(), &args.artifact_id,
+            &source_thread_id.to_string(), &args.artifact_id,
             &selectors, command_limit,
         ).await.map_err(|error| FunctionCallError::RespondToModel(error.for_model()))? else {
             if command_identity.is_some() {
@@ -1101,6 +1266,7 @@ async fn handle_read_tool_output(
             }
             break;
         };
+        if foreign_source { output["source_thread_id"] = serde_json::json!(source_thread_id); }
         let identity = (output["canonical_sha256"].clone(), output["canonical_bytes"].clone());
         if command_identity.as_ref().is_some_and(|previous| previous != &identity) {
             return Err(FunctionCallError::RespondToModel(
@@ -1170,6 +1336,11 @@ async fn handle_read_tool_output(
                 "source": "artifact", "scope": output["artifact_id"],
                 "identity": {"sha256": output["canonical_sha256"], "ranges": ranges},
             }));
+        attempt.selection_observed = true;
+        attempt.selection_successful = success;
+        attempt.selection_complete = output["complete"] == true;
+        attempt.retained_artifact_complete = output["retained_artifact_complete"] == true;
+        attempt.phase = "command_delivery";
         let mut result = JsonToolOutput::with_success(output, Some(success))
             .with_code_mode_failure_as_data();
         if let Some(evidence) = evidence {
@@ -1201,18 +1372,20 @@ async fn handle_read_tool_output(
     } else if code_mode_recovery {
         CODE_MODE_RECOVERY_TOKEN_CEILING
     } else {
-        RECOVERY_AGGREGATE_TOKEN_CEILING
+        RECOVERY_AGGREGATE_TOKEN_CEILING.min(
+            delivery_policy.expect("direct recovery has a delivery policy").token_budget(),
+        )
     };
     attempt.phase = "snapshot_load";
     let snapshot = match load_tool_output_snapshot(
         invocation.step_context.turn.config.codex_home.as_path(),
-        &invocation.session.thread_id.to_string(),
+        &source_thread_id.to_string(),
         &args.artifact_id,
     )
     .await
     {
         Ok(snapshot) => snapshot,
-        Err(ReadToolOutputError::Expired) => {
+        Err(ReadToolOutputError::Expired) if !foreign_source => {
             let error = missing_artifact_error(&invocation, &args.artifact_id).await;
             return Err(FunctionCallError::RespondToModel(error.for_model()));
         }
@@ -1230,14 +1403,7 @@ async fn handle_read_tool_output(
         token_ceiling,
         max_bytes,
         &invocation.cancellation_token,
-        (!code_mode_recovery).then(|| {
-            invocation
-                .step_context
-                .turn
-                .model_info
-                .truncation_policy
-                .into()
-        }),
+        delivery_policy,
     )
     .await
     .map_err(|err| FunctionCallError::RespondToModel(err.for_model()))?;
@@ -1263,6 +1429,10 @@ async fn handle_read_tool_output(
         drained_continuation_pages,
     );
     let successful = recovery_call_succeeded(&output, continuation_stop.as_ref());
+    attempt.selection_observed = true;
+    attempt.selection_successful = successful;
+    attempt.selection_complete = output.complete;
+    attempt.retained_artifact_complete = output.capture_complete;
     let evidence = output.delivered_evidence().map(|identity| {
         serde_json::json!({
             "source": "artifact",
@@ -1279,7 +1449,9 @@ async fn handle_read_tool_output(
         FunctionCallError::RespondToModel(format!("failed to serialize recovery result: {err}"))
     })?;
     output["historical_authenticity"] = serde_json::json!(snapshot.historical_authenticity());
+    if foreign_source { output["source_thread_id"] = serde_json::json!(source_thread_id); }
     let inspection_delivery = successful
+        && !foreign_source
         && snapshot.historical_authenticity() == "authenticated"
         && !invocation.cancellation_token.is_cancelled();
     let acquired = if inspection_delivery {
@@ -1290,7 +1462,7 @@ async fn handle_read_tool_output(
     let mut inner = recovery_tool_output(output, successful, evidence.clone());
     attempt.phase = "delivery";
     crate::tools::context::ensure_exact_model_delivery(&inner, &invocation)?;
-    if evidence.is_some() {
+    if evidence.is_some() && !foreign_source {
         invocation.session.record_tool_history_recovery(
             args.artifact_id.clone(), invocation.call_id.clone(), selectors,
         ).await;
@@ -1341,6 +1513,36 @@ fn record_recovery_metrics(invocation: &ToolInvocation) {
             .code_mode_service
             .record_packet_tool_output_recovery(cell_id);
     }
+}
+
+/// Audit through the same owners as recovery. This is a point-in-time access
+/// observation, not content delivery, semantic evidence or a retention lease.
+async fn audit_evidence_handle(
+    invocation: &ToolInvocation,
+    artifact_id: &str,
+    source_thread_id: codex_protocol::ThreadId,
+) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
+    let home = invocation.step_context.turn.config.codex_home.as_path();
+    let thread_id = source_thread_id.to_string();
+    let (mut audit, command_log) =
+        crate::tools::command_output_artifact::audit_tool_output_reference(
+            home, &thread_id, artifact_id, READ_TOOL_OUTPUT_MAX_BYTES,
+        ).await;
+    let readable = audit["access"] == "readable";
+    let directory = home.join(if command_log { "command-output" } else { "tool-output" }).join(&thread_id);
+    audit["retention"]["pressure"] = crate::tools::command_output_artifact::pressure::audit(
+        directory, artifact_id.to_string(),
+    ).await;
+    if source_thread_id == invocation.session.thread_id {
+        let history = invocation.session.clone_history().await;
+        audit["retention"]["recovery_obligation"] = history.tool_history_state_ref()
+            .retention_recovery_obligation(artifact_id);
+    } else if audit["recovery"]["arguments"].is_object() {
+        audit["recovery"]["arguments"]["source_thread_id"] = serde_json::json!(source_thread_id);
+    }
+    let output = JsonToolOutput::with_success(audit, Some(readable)).with_code_mode_failure_as_data();
+    crate::tools::context::ensure_exact_model_delivery(&output, invocation)?;
+    Ok(boxed_tool_output(output))
 }
 
 // Ownership diagnosis must not turn a failed lookup into a long wait.
@@ -1489,7 +1691,7 @@ fn parse_read_tool_output_args(arguments: &str) -> Result<ReadToolOutputArgs, Fu
 /// reports only the schema's accepted selector kinds.
 pub(crate) fn file_only_selector_hint(arguments: &str) -> Option<String> {
     file_only_selector_kind(arguments).map(|kind| format!(
-        "`{kind}` selectors are read_file-only; snapshots take bytes, lines, section, json_pointer, structured or search selectors. On a Rust/Python snapshot saved with an outline, select {{\"kind\":\"section\",\"id\":\"outline\"}} for item IDs, then {{\"kind\":\"section\",\"id\":\"<item id>\"}}; otherwise search or select lines here, or use read_file on the current file"
+        "`{kind}` selectors are read_file-only; snapshots take bytes, lines, tail, section, json_pointer, structured or search selectors. On a Rust/Python or Markdown snapshot saved with an outline, select {{\"kind\":\"section\",\"id\":\"outline\"}} for item IDs, then {{\"kind\":\"section\",\"id\":\"<item id>\"}}; otherwise search or select lines here, or use read_file on the current file"
     ))
 }
 
@@ -1747,8 +1949,7 @@ async fn drain_recovery_snapshot_with_source_budget(
         .iter()
         .filter_map(|selector| serde_json::to_string(selector).ok())
         .map(|text| codex_utils_string::approx_token_count(&text))
-        .max()
-        .unwrap_or_default()
+        .sum::<usize>()
         .saturating_add(256);
     let output = if recovery_envelope_fits(
         &complete_output, None, token_ceiling.saturating_sub(reserve),
@@ -1783,6 +1984,11 @@ async fn drain_recovery_snapshot_with_source_budget(
     };
     let mut projected_bytes = structured_bytes(&state.output.results);
     loop {
+        if cancellation_token.is_cancelled() {
+            let selector = state.first_pending_selector();
+            state.record_stop(ContinuationStopReason::Cancelled, selector);
+            break;
+        }
         let (result_index, mut selector) = match state.next_step() {
             ContinuationStep::Complete => break,
             ContinuationStep::Stop(reason) => {

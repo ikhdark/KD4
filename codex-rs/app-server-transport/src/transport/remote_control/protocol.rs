@@ -19,7 +19,8 @@ pub(super) fn remote_control_app_server_version() -> &'static str {
     }
 }
 
-pub(super) fn remote_control_user_agent() -> String {
+/// Keep enrollment, relay headers, and remote initialize replies on one version.
+pub fn remote_control_user_agent() -> String {
     codex_login::default_client::get_codex_user_agent_with_version(
         remote_control_app_server_version(),
     )

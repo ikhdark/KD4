@@ -8,6 +8,10 @@ use crate::tools::command_output_artifact::ARTIFACT_SEARCH_MAX_CONTEXT_LINES;
 use crate::tools::command_output_artifact::ARTIFACT_SEARCH_MAX_QUERY_BYTES;
 use crate::tools::command_output_artifact::ARTIFACT_SEARCH_MAX_RESULTS;
 use crate::tools::command_output_artifact::ARTIFACT_REGEX_MAX_SEARCH_BYTES;
+use crate::tools::command_output_artifact::ARTIFACT_TAIL_DEFAULT_BYTES;
+use crate::tools::command_output_artifact::ARTIFACT_TAIL_DEFAULT_LINES;
+use crate::tools::command_output_artifact::ARTIFACT_TAIL_MAX_BYTES;
+use crate::tools::command_output_artifact::ARTIFACT_TAIL_MAX_LINES;
 
 pub(crate) const READ_TOOL_OUTPUT_TOOL_NAME: &str = "read_tool_output";
 pub(crate) const READ_TOOL_OUTPUT_MAX_BYTES: usize = 16_384;
@@ -16,7 +20,20 @@ pub(crate) const READ_TOOL_OUTPUT_MAX_SELECTORS: usize = 64;
 pub(crate) const READ_TOOL_OUTPUT_MAX_LEGACY_RANGES: usize = READ_TOOL_OUTPUT_MAX_SELECTORS;
 
 pub(crate) fn tool_output_selector_schema() -> JsonSchema {
-    selector_schema(true)
+    let mut schema = selector_schema(true);
+    if let Some(variants) = &mut schema.one_of {
+        variants.push(selector_variant(
+            "tail",
+            BTreeMap::from([
+                ("lines".into(), bounded_integer(1, ARTIFACT_TAIL_MAX_LINES as u64,
+                    format!("Last LF-delimited lines; default {ARTIFACT_TAIL_DEFAULT_LINES}, cap {ARTIFACT_TAIL_MAX_LINES}. Nonempty unterminated EOF counts as a line; a final LF adds no empty line. CRLF bytes are preserved."))),
+                ("max_bytes".into(), bounded_integer(1, ARTIFACT_TAIL_MAX_BYTES as u64,
+                    format!("Maximum suffix source bytes; default {ARTIFACT_TAIL_DEFAULT_BYTES}, cap {ARTIFACT_TAIL_MAX_BYTES}, also limited by the call's remaining max_bytes. Command logs seek to this EOF window plus at most one lookbehind byte; snapshots reuse authenticated bytes. A clipped first line is returned, with exact canonical_range and base64 for split UTF-8/binary. value reports lines_returned, first_line_partial, last_line_unterminated, requested_lines_complete and window_bytes. complete means the bounded suffix was delivered, not that all requested lines fit. child_selectors address the preceding prefix without auto-fetching it."))),
+            ]),
+            vec![],
+        ));
+    }
+    schema
 }
 
 pub(crate) fn file_selector_schema() -> JsonSchema {
@@ -35,7 +52,7 @@ pub(crate) fn file_selector_schema() -> JsonSchema {
             .as_mut()
             .and_then(|properties| properties.get_mut("id"))
     {
-        id.description = Some("Use outline for a paged Rust/Python item listing (names, signatures, lines, tests, explicit module paths, and unverified linked_path_candidates), then a returned item ID for exact source. Imports are not listed; the first page gives their line runs as import_ranges. Verify module candidates through the selected filesystem only when following them. IDs are source-hash-bound; read_tool_output preserves them on the original snapshot. Ordinary reads do not parse code.".to_string());
+        id.description = Some("Use outline for a paged Rust/Python item listing (names, signatures, lines, tests, explicit module paths, and unverified linked_path_candidates) or Markdown headings (titles, levels, parent IDs, exact heading/section byte ranges), then a returned ID for exact source including descendants. Duplicate Markdown titles have distinct IDs; ATX/Setext headings are recognized outside code blocks. Imports are not listed; the first page gives their line runs as import_ranges. Verify module candidates through the selected filesystem only when following them. IDs are source-hash-bound; read_tool_output preserves them on the original snapshot. Ordinary reads do not parse code.".to_string());
     }
     if let Some(variants) = &mut schema.one_of {
         variants.push(selector_variant(
@@ -93,7 +110,7 @@ fn selector_schema(include_sections: bool) -> JsonSchema {
             BTreeMap::from([(
                 "id".to_string(),
                 JsonSchema::string(Some(
-                    "Stable section ID advertised by the original projection. A Rust/Python snapshot saved with an outline lists item IDs at id outline; select an item ID where read_file takes a symbol name.".to_string(),
+                    "Stable section ID advertised by the original projection. A Rust/Python or Markdown snapshot saved with an outline lists source-bound item IDs at id outline; select a returned ID for exact source.".to_string(),
                 )),
             )]),
             vec!["id"],
@@ -190,7 +207,7 @@ fn selector_schema(include_sections: bool) -> JsonSchema {
 pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
     let selector_schema = tool_output_selector_schema();
     let artifact_id = JsonSchema::string(Some(
-        "Opaque UUID from a tool projection retained by this thread; other agents cannot read it.".to_string(),
+        "Opaque UUID retained by this thread, or by the verified descendant named by source_thread_id.".to_string(),
     ));
     let selectors = bounded_array(
         selector_schema.clone(),
@@ -201,12 +218,25 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: READ_TOOL_OUTPUT_TOOL_NAME.to_string(),
-        description: "Read a saved tool-output snapshot without rerunning the tool. Artifacts are thread-private: passing an ID to another agent does not grant access. Have the owning agent recover and share the needed evidence instead. Batch known searches or selections in one call to share authenticated snapshot validation. Search results include matching text in results[].value.hydrated_ranges; a complete search page can still have more matches. Returns exact text or data_base64 for arbitrary bytes up to max_bytes plus continuation metadata; complete indicates requested-selection delivery, not full capture or current workspace freshness. Command logs and indexed snapshots share bounded fixed-string/regex search, match coordinates, context and continuations. Command-log search is limited to 16 MiB retained bytes (regex: 1 MiB); larger logs retain streaming bytes, lines and structured extraction. Command logs do not support section or json_pointer. A running command's artifact is not readable until it exits; resume its live handle first. A line that cannot fit returns an exact byte continuation for the remaining selection in this same artifact; use that continuation rather than read_file, which requires a bounded whole-file text snapshot. Source snapshots retain advanced selectors. UTF-16 read_file snapshots retain decoded UTF-8 without the BOM: every recovery selector and canonical_sha256/canonical_bytes addresses that decoded snapshot, not original UTF-16 bytes, code units or the original-byte source_sha256. Capture gaps and disk failures remain explicitly incomplete. Check retained_artifact_complete and continuation_stop.reason/resumable; preserve successful siblings and recover only required missing selections. In an exec cell, call advertised recovery.arguments before returning; follow resumable budget/page_limit continuations while ranges advance, and report non-resumable failures or gaps instead of looping. For a required full 753-line diff with lines 1-24 delivered, recover lines 25-753 from the saved artifact in that same cell. Consume pages in-script and print only needed evidence to avoid another enclosing display truncation; do not raise default limits or dump huge results. Never rerun the producer merely to recover output.".to_string(),
+        description: "Read a saved tool-output snapshot without rerunning the tool. Artifacts default to this thread. An ancestor may supply source_thread_id to read a verified descendant's retained evidence without waking it; peers, ancestors and unrelated threads remain inaccessible. Keep source_thread_id on every continuation. An ID alone grants no access. Batch known searches or selections in one call to share authenticated snapshot validation. Search results include matching text in results[].value.hydrated_ranges; a complete search page can still have more matches. Returns exact text or data_base64 for arbitrary bytes up to max_bytes plus continuation metadata; complete indicates requested-selection delivery, not full capture or current workspace freshness. Command logs and indexed snapshots share bounded fixed-string/regex search, match coordinates, context and continuations. Command-log search is limited to 16 MiB retained bytes (regex: 1 MiB); larger logs retain streaming bytes, lines, bounded tail and structured extraction. tail selects the last lines within a byte cap; its exact canonical_range and partial-line metadata permit prefix recovery through child_selectors without automatic prefix reads. Command logs do not support section or json_pointer. A running command's artifact is not readable until it exits; resume its live handle first. A line that cannot fit returns an exact byte continuation for the remaining selection in this same artifact; use that continuation rather than read_file, which requires a bounded whole-file text snapshot. Source snapshots retain advanced selectors. UTF-16 read_file snapshots retain decoded UTF-8 without the BOM: every recovery selector and canonical_sha256/canonical_bytes addresses that decoded snapshot, not original UTF-16 bytes, code units or the original-byte source_sha256. Capture gaps and disk failures remain explicitly incomplete. Check retained_artifact_complete and continuation_stop.reason/resumable; remaining_selectors lists the exact unfinished selections across all siblings; preserve successful siblings and recover only required missing selections. In an exec cell, call advertised recovery.arguments before returning; follow resumable budget/page_limit continuations while ranges advance, and report non-resumable failures or gaps instead of looping. For a required full 753-line diff with lines 1-24 delivered, recover lines 25-753 from the saved artifact in that same cell. Consume pages in-script and print only needed evidence to avoid another enclosing display truncation; do not raise default limits or dump huge results. Never rerun the producer merely to recover output.".to_string(),
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::object(
+        parameters: JsonSchema {
+            one_of: Some(vec![
+                JsonSchema::object(BTreeMap::from([("audit_only".into(),
+                    JsonSchema { enum_values: Some(vec![serde_json::json!(false)]), ..JsonSchema::boolean(None) })]),
+                    Some(vec!["selectors".into()]), None),
+                JsonSchema::object(BTreeMap::from([("audit_only".into(),
+                    JsonSchema { enum_values: Some(vec![serde_json::json!(true)]), ..JsonSchema::boolean(None) })]),
+                    Some(vec!["audit_only".into()]), None),
+            ]),
+            ..JsonSchema::object(
             BTreeMap::from([
                 ("artifact_id".to_string(), artifact_id),
+                ("source_thread_id".into(), JsonSchema::string(Some("Optional artifact owner thread UUID. Only this thread or its verified descendants are authorized. No worker wake or permission transfer. Retain this argument on every continuation; foreign evidence does not acquire current-source inspection credit.".into()))),
+                ("audit_only".to_string(), JsonSchema::boolean(Some(
+                    "Audit this handle without content: identity/authenticity, thread ownership/access, logical retained bytes versus unique physical file allocation (shared backing counted once within the thread/store), and known eviction reasons with affected recovery references/selectors. Eviction receipts cover only this process's last 128 evictions; missing reasons and remaining required work are unknown. Physical observations are non-atomic and exclude filesystem metadata/block-level sharing; artifact physical totals are not additive. Use alone with artifact_id; cannot combine with selectors or delivery controls. No retention lease, acquisition receipt or cross-thread access is created.".into(),
+                ))),
                 ("selectors".to_string(), selectors),
                 ("max_bytes".to_string(), bounded_integer(1, u64::MAX,
                     format!("Maximum delivered source bytes. Direct calls default to and are capped at {READ_TOOL_OUTPUT_MAX_BYTES}. Code-mode scripts default to {READ_TOOL_OUTPUT_SCRIPT_MAX_BYTES} bytes and automatically drain selected continuations within that source budget, a 1 MiB serialized payload cap, and 64 continuation pages; an explicit smaller limit is preserved. Print only needed evidence. Metadata/escaping can produce a smaller page with a structured resumable stop."))),
@@ -214,10 +244,44 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
                     "Set by a truncated exec cell's recovery.arguments: the read gets room in its cell beyond the output budget, up to the exec ceiling.".to_string(),
                 ))),
             ]),
-            Some(vec!["artifact_id".to_string(), "selectors".to_string()]),
+            Some(vec!["artifact_id".to_string()]),
             Some(false.into()),
-        ),
-        output_schema: Some(read_tool_output_output_schema(selector_schema).into()),
+            )
+        },
+        output_schema: Some({
+            let mut schema = serde_json::json!({"anyOf": [
+            read_tool_output_output_schema(selector_schema),
+            {"type":"object","properties":{
+                "kind":{"const":"evidence_handle_audit"},
+                "artifact_id":{"type":"string"},
+                "owner_thread_id":{"type":["string","null"]},
+                "access":{"enum":["readable","other_thread","unavailable","invalid","writing"]},
+                "reason":{"type":"string"},
+                "content_delivered_by_check":{"const":false},
+                "content_examined_by_check":{"const":false},
+                "identity":{"type":"object","description":"Producer identity and its verification level, not current-source freshness. Command-log origins remain explicitly unverified."},
+                "retention":{"type":"object","properties":{
+                    "observed":{"enum":["retained","unknown"]},
+                    "guarantee":{"const":"point_in_time_only"},"indefinite":{"const":false},
+                    "retained_bytes":{"type":"integer","minimum":0},
+                    "retained_artifact_complete":{"type":"boolean"},
+                    "unavailable_ranges":{"type":"array","items":{"type":"object"}},
+                    "pressure":{"type":"object"},
+                    "recovery_obligation":{"type":"object"}
+                },"required":["observed","guarantee","indefinite"],"additionalProperties":false},
+                "message":{"type":"string"},
+                "recovery":{"type":"object","description":"Same-owner bounded content recipe, audit retry after cause changes, or an owning-thread recovery instruction. Failed audits preserve the requested handle; no permission transfer."}
+            },"required":["kind","artifact_id","owner_thread_id","access","retention","message","recovery"],"additionalProperties":false}
+            ]});
+            // Recovery selectors use root-relative references. Adding an audit
+            // branch must not strand their definitions inside the first arm.
+            if let Some(definitions) = schema["anyOf"][0].as_object_mut()
+                .and_then(|recovery| recovery.remove("$defs"))
+            {
+                schema["$defs"] = definitions;
+            }
+            schema
+        }.into()),
     })
 }
 
@@ -240,6 +304,7 @@ pub(crate) fn read_tool_output_output_schema(mut selector_schema: JsonSchema) ->
         "type": "object",
         "properties": {
             "artifact_id": {"type": "string"},
+            "source_thread_id": {"type": "string", "description": "Verified descendant artifact owner; retain this argument on subsequent selections/continuations."},
             "canonical_sha256": {"type": "string"},
             "historical_authenticity": {"type": "string", "enum": ["authenticated", "unverified"], "description": "Whether retained bytes match a producer-time digest. Independent of complete delivery, full capture, or current workspace freshness. Missing legacy receipts are unverified."},
             "canonical_bytes": {"type": "integer", "minimum": 0},
@@ -268,14 +333,15 @@ pub(crate) fn read_tool_output_output_schema(mut selector_schema: JsonSchema) ->
                     "version": {"type": "integer", "enum": [1]},
                     "reason": {"type": "string", "enum": [
                         "budget", "page_limit", "cancelled", "identity_drift", "incomplete_owner_result",
-                        "invalid_selector", "selector_not_found", "page_read_error", "repeated_selector"
+                        "invalid_selector", "selector_not_found", "page_read_error", "repeated_selector", "no_progress"
                     ]},
                     "selector": {"anyOf": [{"$ref": "#/$defs/selector"}, {"type": "null"}]},
                     "resumable": {"type": "boolean"},
+                    "remaining_selectors": {"type": "array", "items": {"$ref": "#/$defs/selector"}, "description": "Exact unfinished selections across all original owners, excluding delivered fragments. Keep artifact_id and source_thread_id; never rerun the producer. A search cursor for a new page is not automatically widened into this selection."},
                     "message": {"type": "string"},
                     "page_selectors": {"type": "array", "maxItems": 8, "items": {"$ref": "#/$defs/selector"}, "description": "First up to eight independent pages of the unconsumed selector. Fetch in parallel; selector still describes the full remainder."}
                 },
-                "required": ["version", "reason", "selector", "resumable"],
+                "required": ["version", "reason", "selector", "resumable", "remaining_selectors"],
                 "additionalProperties": false
             }
         },
@@ -298,7 +364,7 @@ pub(crate) fn read_tool_output_output_schema(mut selector_schema: JsonSchema) ->
                     "exact_bytes": {"type": "integer", "minimum": 0},
                     "canonical_range": {"$ref": "#/$defs/range"},
                     "text": {"type": "string"},
-                    "value": {"description": "Exact selected JSON value, search_result, or a structured page: rows [{row,value}], errors [{row,message}], malformed_rows and rows_scanned counts, rows_exhausted, coverage_complete. Structured values are projections, not exact source-byte acquisition; continuation resumes the same selection at the next unconsumed input row."},
+                    "value": {"description": "Exact selected JSON value, search_result, tail metadata (lines_returned, first_line_partial, last_line_unterminated, requested_lines_complete, window_bytes), or a structured page: rows [{row,value}], errors [{row,message}], malformed_rows and rows_scanned counts, rows_exhausted, coverage_complete. Structured values are projections, not exact source-byte acquisition; continuation resumes the same selection at the next unconsumed input row."},
                     "data_base64": {"type": "string"},
                     "subdivision_plan": {
                         "type": "object",

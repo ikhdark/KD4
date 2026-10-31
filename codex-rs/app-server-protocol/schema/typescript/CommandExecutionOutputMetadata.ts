@@ -4,6 +4,10 @@
 
 export type CommandExecutionOutputMetadata = {
 /**
+ * Identity of the process owner that observed these facts; absent in legacy records.
+ */
+incarnation?: string,
+/**
  * Process termination and output drain are independent observations.
  */
 process_exited: boolean, output_drained: boolean, aggregated_output_is_exact: boolean, streams_are_exact: boolean, decoding_lossy: boolean, display_reduced: boolean,

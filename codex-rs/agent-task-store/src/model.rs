@@ -249,6 +249,9 @@ pub enum WorkspaceStrategy {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AssignmentDraft {
     pub root_session_id: String,
+    /// Advisory task intent; does not grant permissions or imply acceptance.
+    #[serde(default)]
+    pub independent_verification: bool,
     #[serde(default)]
     pub admission_origin: AssignmentAdmissionOrigin,
     pub role: AgentRole,
@@ -290,9 +293,32 @@ impl PrimaryInvestigationIdentity {
 }
 
 #[doc(hidden)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AdmissionOverlapSummary {
     pub benign_read_overlap_count: u32,
+    pub warnings: Vec<TaskOverlapWarning>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TaskOverlapWarning {
+    pub assignment_id: AssignmentId,
+    pub attempt_id: AttemptId,
+    pub task_name: Option<String>,
+    pub agent_path: Option<String>,
+    pub thread_id: Option<String>,
+    pub kind: TaskOverlapKind,
+    pub objective_matches: bool,
+    pub deliverable_overlap: bool,
+    pub contract_overlap: bool,
+    pub scope_overlap: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskOverlapKind {
+    PotentialDuplicate,
+    IndependentVerification,
+    RelatedWork,
 }
 
 #[doc(hidden)]
@@ -420,6 +446,7 @@ impl AssignmentDraft {
         Ok(Assignment {
             assignment_id: AssignmentId::new(),
             root_session_id: self.root_session_id,
+            independent_verification: self.independent_verification,
             admission_origin: self.admission_origin,
             repository_id: repository_identity(repo_root)?.id,
             role: self.role,
@@ -452,6 +479,8 @@ impl AssignmentDraft {
 pub struct Assignment {
     pub assignment_id: AssignmentId,
     pub root_session_id: String,
+    #[serde(default)]
+    pub independent_verification: bool,
     #[serde(default)]
     pub admission_origin: AssignmentAdmissionOrigin,
     /// Stable hash of the Git repository lineage (or canonical root outside Git). The private
@@ -848,6 +877,8 @@ pub enum ObservationKind {
     Mutation,
     GateChanged,
     ReceiptSealed,
+    /// Provisional evidence publication, never a receipt or terminal outcome.
+    PartialResult,
     /// Host-only terminal diagnostics; does not modify acceptance or sealed receipts.
     HostCompletion,
     Completed,
@@ -870,6 +901,7 @@ impl ObservationKind {
                 | Self::Mutation
                 | Self::GateChanged
                 | Self::ReceiptSealed
+                | Self::PartialResult
                 | Self::Completed
                 | Self::NeedsMain
                 | Self::Violated

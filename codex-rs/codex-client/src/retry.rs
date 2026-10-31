@@ -1,9 +1,11 @@
+use crate::telemetry::RequestTelemetry;
+use crate::telemetry::RetryBudget;
 use codex_http_client::Request;
 use codex_http_client::TransportError;
 use rand::RngExt;
 use std::future::Future;
 use std::time::Duration;
-use tokio::time::sleep;
+use tokio::time::Instant;
 
 /// Longest self-imposed wait between attempts. Server `Retry-After` advice is
 /// a minimum wait and is not capped.
@@ -15,6 +17,17 @@ pub struct RetryPolicy {
     pub max_retries: u64,
     pub base_delay: Duration,
     pub retry_on: RetryOn,
+}
+
+impl RetryPolicy {
+    /// Snapshot after entering the zero-based loop attempt. Widen before adding
+    /// the initial attempt, so even u64::MAX remains a finite, exact limit.
+    pub fn budget(&self, attempt: u64) -> RetryBudget {
+        let max_attempts = u128::from(self.max_retries) + 1;
+        let attempts_started = u128::from(attempt) + 1;
+        RetryBudget { max_attempts, attempts_started,
+            attempts_remaining: max_attempts.saturating_sub(attempts_started) }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -100,8 +113,21 @@ fn exponential_backoff(base: Duration, retry_number: u64) -> Duration {
 /// an outer deadline.
 pub async fn run_with_retry<T, F, Fut>(
     policy: RetryPolicy,
+    make_req: impl FnMut() -> Request,
+    op: F,
+) -> Result<T, TransportError>
+where
+    F: Fn(Request, u64) -> Fut,
+    Fut: Future<Output = Result<T, TransportError>>,
+{
+    run_with_retry_observed(policy, make_req, op, None).await
+}
+
+pub async fn run_with_retry_observed<T, F, Fut>(
+    policy: RetryPolicy,
     mut make_req: impl FnMut() -> Request,
     op: F,
+    telemetry: Option<&dyn RequestTelemetry>,
 ) -> Result<T, TransportError>
 where
     F: Fn(Request, u64) -> Fut,
@@ -110,6 +136,9 @@ where
     let mut attempt = 0;
     loop {
         let req = make_req();
+        if let Some(telemetry) = telemetry {
+            telemetry.on_retry_budget(policy.budget(attempt));
+        }
         match op(req, attempt).await {
             Ok(resp) => return Ok(resp),
             Err(err)
@@ -118,16 +147,10 @@ where
                     .should_retry(&err, attempt, policy.max_retries) =>
             {
                 let retry_number = attempt + 1;
-                if let Some(advice) = err.retry_after() {
-                    tokio::time::sleep_until(advice.deadline()).await;
-                } else {
-                    sleep(capped_backoff(
-                        policy.base_delay,
-                        retry_number,
-                        MAX_RETRY_DELAY,
-                    ))
-                    .await;
-                }
+                let deadline = err.retry_after().map(|advice| advice.deadline()).unwrap_or_else(|| {
+                    Instant::now() + capped_backoff(policy.base_delay, retry_number, MAX_RETRY_DELAY)
+                });
+                observe_retry_wait(telemetry, attempt, &err, deadline).await;
                 attempt = retry_number;
             }
             Err(err) => return Err(err),
@@ -139,8 +162,21 @@ where
 /// have happened before transport dispatch.
 pub async fn run_with_retry_non_idempotent<T, F, Fut>(
     policy: RetryPolicy,
+    make_req: impl FnMut() -> Request,
+    op: F,
+) -> Result<T, TransportError>
+where
+    F: Fn(Request, u64) -> Fut,
+    Fut: Future<Output = Result<T, TransportError>>,
+{
+    run_with_retry_non_idempotent_observed(policy, make_req, op, None).await
+}
+
+pub async fn run_with_retry_non_idempotent_observed<T, F, Fut>(
+    policy: RetryPolicy,
     mut make_req: impl FnMut() -> Request,
     op: F,
+    telemetry: Option<&dyn RequestTelemetry>,
 ) -> Result<T, TransportError>
 where
     F: Fn(Request, u64) -> Fut,
@@ -149,6 +185,9 @@ where
     let mut attempt = 0;
     loop {
         let req = make_req();
+        if let Some(telemetry) = telemetry {
+            telemetry.on_retry_budget(policy.budget(attempt));
+        }
         match op(req, attempt).await {
             Ok(resp) => return Ok(resp),
             Err(err)
@@ -159,15 +198,48 @@ where
                 ) =>
             {
                 let retry_number = attempt + 1;
-                sleep(capped_backoff(
-                    policy.base_delay,
-                    retry_number,
-                    MAX_RETRY_DELAY,
-                ))
-                .await;
+                let deadline = Instant::now()
+                    + capped_backoff(policy.base_delay, retry_number, MAX_RETRY_DELAY);
+                observe_retry_wait(telemetry, attempt, &err, deadline).await;
                 attempt = retry_number;
             }
             Err(err) => return Err(err),
         }
     }
+}
+
+async fn observe_retry_wait(
+    telemetry: Option<&dyn RequestTelemetry>,
+    attempt: u64,
+    error: &TransportError,
+    deadline: Instant,
+) {
+    struct WaitGuard<'a> {
+        telemetry: Option<&'a dyn RequestTelemetry>,
+        attempt: u64,
+        start: Instant,
+        completed: bool,
+    }
+    impl Drop for WaitGuard<'_> {
+        fn drop(&mut self) {
+            if let Some(telemetry) = self.telemetry {
+                telemetry.on_retry_wait_finished(
+                    self.attempt, self.start.elapsed(), self.completed,
+                );
+            }
+        }
+    }
+    if let Some(telemetry) = telemetry {
+        telemetry.on_retry_scheduled(
+            attempt, error, deadline.saturating_duration_since(Instant::now()),
+        );
+    }
+    let mut guard = WaitGuard {
+        telemetry,
+        attempt,
+        start: Instant::now(),
+        completed: false,
+    };
+    tokio::time::sleep_until(deadline).await;
+    guard.completed = true;
 }
