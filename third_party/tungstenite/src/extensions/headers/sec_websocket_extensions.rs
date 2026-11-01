@@ -261,13 +261,4 @@ impl<T: WriteTo> WriteTo for CommaDelimited<&[T]> {
     }
 }
 
-impl<T: WriteTo, const N: usize> WriteTo for CommaDelimited<[T; N]> {
-    fn encoded_len(&self) -> usize {
-        CommaDelimited(self.0.as_slice()).encoded_len()
-    }
-
-    fn write_with(&self, write: &mut (impl FnMut(&[u8]) + ?Sized)) {
-        CommaDelimited(self.0.as_slice()).write_with(write);
-    }
-}
 

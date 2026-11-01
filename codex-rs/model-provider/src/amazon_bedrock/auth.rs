@@ -27,8 +27,7 @@ const AWS_REGION_ENV_VAR: &str = "AWS_REGION";
 const AWS_DEFAULT_REGION_ENV_VAR: &str = "AWS_DEFAULT_REGION";
 
 pub(super) enum BedrockAuthMethod {
-    ManagedBearerToken { token: String, region: String },
-    EnvBearerToken { token: String, region: String },
+    BearerToken { token: String, region: String },
     AwsSdkAuth { context: AwsAuthContext },
 }
 
@@ -42,13 +41,13 @@ pub(super) fn known_region(
     if let Some(auth) = managed_auth {
         return Some(auth.region.clone());
     }
-    if non_empty_env_var_from(AWS_BEARER_TOKEN_BEDROCK_ENV_VAR, std::env::var).is_some() {
-        return bearer_token_region(aws, std::env::var).ok();
+    if non_empty_env_var(AWS_BEARER_TOKEN_BEDROCK_ENV_VAR).is_some() {
+        return bearer_token_region(aws).ok();
     }
     sdk_context
         .get()
         .map(|context| context.region().to_string())
-        .or_else(|| bearer_token_region(aws, std::env::var).ok())
+        .or_else(|| bearer_token_region(aws).ok())
 }
 
 pub(super) async fn resolve_auth_method(
@@ -58,15 +57,15 @@ pub(super) async fn resolve_auth_method(
     sdk_context: &tokio::sync::OnceCell<AwsAuthContext>,
 ) -> Result<BedrockAuthMethod> {
     if let Some(managed_auth) = managed_auth {
-        return Ok(BedrockAuthMethod::ManagedBearerToken {
+        return Ok(BedrockAuthMethod::BearerToken {
             token: managed_auth.api_key.clone(),
             region: managed_auth.region.clone(),
         });
     }
 
-    if let Some(token) = non_empty_env_var_from(AWS_BEARER_TOKEN_BEDROCK_ENV_VAR, std::env::var) {
-        let region = bearer_token_region(aws, std::env::var)?;
-        return Ok(BedrockAuthMethod::EnvBearerToken { token, region });
+    if let Some(token) = non_empty_env_var(AWS_BEARER_TOKEN_BEDROCK_ENV_VAR) {
+        let region = bearer_token_region(aws)?;
+        return Ok(BedrockAuthMethod::BearerToken { token, region });
     }
 
     // Cache the SDK context, not credentials. Signing still asks its refreshable
@@ -88,15 +87,14 @@ pub(super) async fn resolve_auth_method(
 impl BedrockAuthMethod {
     pub(super) fn region(&self) -> &str {
         match self {
-            Self::ManagedBearerToken { region, .. } | Self::EnvBearerToken { region, .. } => region,
+            Self::BearerToken { region, .. } => region,
             Self::AwsSdkAuth { context } => context.region(),
         }
     }
 
     pub(super) fn into_provider(self, endpoint: BedrockEndpoint) -> SharedAuthProvider {
         match self {
-            BedrockAuthMethod::ManagedBearerToken { token, .. }
-            | BedrockAuthMethod::EnvBearerToken { token, .. } => Arc::new(BearerAuthProvider {
+            BedrockAuthMethod::BearerToken { token, .. } => Arc::new(BearerAuthProvider {
                 token: Some(token),
                 account_id: None,
                 is_fedramp_account: false,
@@ -108,23 +106,17 @@ impl BedrockAuthMethod {
     }
 }
 
-fn non_empty_env_var_from(
-    name: &'static str,
-    env_var: impl Fn(&'static str) -> std::result::Result<String, std::env::VarError>,
-) -> Option<String> {
-    env_var(name)
+fn non_empty_env_var(name: &'static str) -> Option<String> {
+    std::env::var(name)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
 
-fn bearer_token_region(
-    aws: &ModelProviderAwsAuthInfo,
-    env_var: impl Fn(&'static str) -> std::result::Result<String, std::env::VarError> + Copy,
-) -> Result<String> {
+fn bearer_token_region(aws: &ModelProviderAwsAuthInfo) -> Result<String> {
     region_from_config(aws)
-        .or_else(|| non_empty_env_var_from(AWS_REGION_ENV_VAR, env_var))
-        .or_else(|| non_empty_env_var_from(AWS_DEFAULT_REGION_ENV_VAR, env_var))
+        .or_else(|| non_empty_env_var(AWS_REGION_ENV_VAR))
+        .or_else(|| non_empty_env_var(AWS_DEFAULT_REGION_ENV_VAR))
         .ok_or_else(|| {
             CodexErr::Fatal(
                 "Amazon Bedrock bearer token auth requires \

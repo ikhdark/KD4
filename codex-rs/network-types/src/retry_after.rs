@@ -6,6 +6,19 @@ use std::time::Duration;
 use std::time::SystemTime;
 use tokio::time::Instant;
 
+/// Parses delay seconds or an HTTP date without requiring a representable deadline.
+/// Callers capture `now` at receipt and retain their own monotonic receipt time.
+pub fn parse_retry_after_delay(value: &str, now: SystemTime) -> Option<Duration> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        value.parse().ok().map(Duration::from_secs)
+    } else {
+        httpdate::parse_http_date(value)
+            .ok()
+            .map(|date| date.duration_since(now).unwrap_or_default())
+    }
+}
+
 /// The earliest time a server advised making a follow-up request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RetryAfter(Instant);
@@ -26,15 +39,7 @@ impl RetryAfter {
         // Sample wall time first so a scheduling pause cannot shorten the server's deadline.
         let now = SystemTime::now();
         let received_at = Instant::now();
-        let value = value.trim();
-        let delay = if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
-            Duration::from_secs(value.parse().ok()?)
-        } else {
-            httpdate::parse_http_date(value)
-                .ok()?
-                .duration_since(now)
-                .unwrap_or_default()
-        };
+        let delay = parse_retry_after_delay(value, now)?;
         received_at.checked_add(delay).map(Self)
     }
 

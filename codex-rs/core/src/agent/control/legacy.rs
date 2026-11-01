@@ -10,27 +10,18 @@ impl AgentControl {
     /// Submit a shutdown request for a live agent without marking it explicitly closed in
     /// persisted spawn-edge state.
     pub(crate) async fn shutdown_live_agent(&self, agent_id: ThreadId) -> CodexResult<String> {
-        self.shutdown_live_agent_with_timeout(agent_id, AGENT_SHUTDOWN_TIMEOUT)
-            .await
-    }
-
-    pub(crate) async fn shutdown_live_agent_with_timeout(
-        &self,
-        agent_id: ThreadId,
-        shutdown_timeout: std::time::Duration,
-    ) -> CodexResult<String> {
         let control = self.clone();
         // The owner survives both a foreground timeout and caller cancellation, including
         // cancellation during persistence or shutdown submission.
         let shutdown =
             tokio::spawn(async move { control.shutdown_live_agent_to_completion(agent_id).await });
-        match tokio::time::timeout(shutdown_timeout, shutdown).await {
+        match tokio::time::timeout(AGENT_SHUTDOWN_TIMEOUT, shutdown).await {
             Ok(Ok(result)) => result,
             Ok(Err(error)) => Err(CodexErr::Fatal(format!(
                 "agent {agent_id} shutdown task failed: {error}"
             ))),
             Err(_) => Err(CodexErr::Fatal(format!(
-                "timed out waiting for agent {agent_id} to terminate after {shutdown_timeout:?}"
+                "timed out waiting for agent {agent_id} to terminate after {AGENT_SHUTDOWN_TIMEOUT:?}"
             ))),
         }
     }

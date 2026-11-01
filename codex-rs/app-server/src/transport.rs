@@ -1,9 +1,9 @@
-use crate::message_processor::ConnectionSessionState;
+use codex_app_server_rpc::connection_session::ConnectionSessionState;
 use crate::outgoing_message::OutgoingEnvelope;
 use crate::outgoing_message::OutgoingWriteReceipt;
-use codex_app_server_protocol::ExperimentalApi;
-use codex_app_server_protocol::ServerRequest;
-use codex_app_server_protocol::JSONRPCRequest;
+use codex_app_server_protocol_types::ExperimentalApi;
+use codex_app_server_protocol_types::ServerRequest;
+use codex_app_server_protocol_types::JSONRPCRequest;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -22,12 +22,9 @@ pub(crate) use codex_app_server_transport::ConnectionId;
 pub(crate) use codex_app_server_transport::ConnectionOrigin;
 pub(crate) use codex_app_server_transport::OutgoingMessage;
 pub(crate) use codex_app_server_transport::QueuedOutgoingMessage;
-pub(crate) use codex_app_server_transport::RemoteControlEnableError;
-pub(crate) use codex_app_server_transport::RemoteControlHandle;
 pub(crate) use codex_app_server_transport::RemoteControlPolicy;
 pub(crate) use codex_app_server_transport::RemoteControlStartConfig;
 pub use codex_app_server_transport::RemoteControlStartupMode;
-pub(crate) use codex_app_server_transport::RemoteControlUnavailable;
 pub(crate) use codex_app_server_transport::TransportEvent;
 pub(crate) use codex_app_server_transport::acquire_app_server_startup_lock;
 pub use codex_app_server_transport::app_server_control_socket_path;
@@ -199,7 +196,7 @@ fn coalesce_stdio_text(left: &mut QueuedOutgoingMessage, right: &QueuedOutgoingM
             }
         }};
     }
-    use codex_app_server_protocol::ServerNotification;
+    use codex_app_server_protocol_types::ServerNotification;
     match (left, right) {
         (ServerNotification::AgentMessageDelta(a), ServerNotification::AgentMessageDelta(b)) => append!(a, b),
         (ServerNotification::PlanDelta(a), ServerNotification::PlanDelta(b)) => append!(a, b),

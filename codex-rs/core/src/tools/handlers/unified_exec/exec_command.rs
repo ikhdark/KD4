@@ -278,12 +278,10 @@ pub(super) async fn attach_hidden_rg_directory_advisory(
             if candidates.is_empty() {
                 return None;
             }
-            let root = workspace.resolve_workspace_root(cwd).await.ok()??;
-            let ignored = crate::git_workspace::git_ignored_paths(&root, &candidates).await;
+            workspace.resolve_workspace_root(cwd).await.ok()??;
             Some(
                 candidates
                     .into_iter()
-                    .filter(|path| !ignored.contains(path))
                     .map(|path| path.display().to_string())
                     .collect::<Vec<_>>(),
             )
@@ -358,6 +356,9 @@ impl ExecCommandHandler {
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let preparation_phase =
             crate::tools::tool_dispatch_trace::begin_tool_phase("exec_handler_preparation");
+        let allow_native_analysis = crate::tools::parallel::native_workspace_analysis_cwd(
+            &invocation.step_context, &invocation.payload,
+        ).is_some();
         let ToolInvocation {
             session,
             step_context,
@@ -491,7 +492,7 @@ impl ExecCommandHandler {
                 original_resolved_command.command[0].clone(),
             );
         }
-        let policy_cwd = if environment_is_remote {
+        let policy_cwd = if !allow_native_analysis {
             None
         } else {
             native_cwd
@@ -514,13 +515,7 @@ impl ExecCommandHandler {
             original_invocation,
             &original_resolved_command.safety_command,
             original_resolved_command.preflight_shell_type,
-            if environment_is_remote {
-                None
-            } else {
-                native_cwd
-                    .as_ref()
-                    .map(codex_utils_absolute_path::AbsolutePathBuf::as_path)
-            },
+            policy_cwd,
         )
         .await
         .map_err(|issue| {
@@ -565,13 +560,7 @@ impl ExecCommandHandler {
         let validation_analysis = crate::validation::resolve_command_launch_analysis_with_shell(
             &command_invocation,
             resolved_command.preflight_shell_type,
-            if environment_is_remote {
-                None
-            } else {
-                native_cwd
-                    .as_ref()
-                    .map(codex_utils_absolute_path::AbsolutePathBuf::as_path)
-            },
+            policy_cwd,
             args.validation.clone(),
         );
         let search_analysis = async {
@@ -608,9 +597,8 @@ impl ExecCommandHandler {
             search_no_match_eligible?
         };
         let hook_command = command_invocation.display_command();
-        // Implicit skill detection requires a native path, so foreign PathUri
-        // workdirs are intentionally skipped here.
-        if let Some(native_cwd) = native_cwd.as_ref() {
+        // A representable remote cwd is not a host-local skill source.
+        if !environment_is_remote && let Some(native_cwd) = native_cwd.as_ref() {
             maybe_emit_implicit_skill_invocation(
                 session.as_ref(),
                 context.turn.as_ref(),
@@ -730,7 +718,7 @@ impl ExecCommandHandler {
         if let Some(validation) = validation.as_mut() {
             validation.execution_context = Some(crate::validation::ValidationExecutionContext {
                 environment_id: turn_environment.environment_id.clone(),
-                cwd: if environment_is_remote {
+                cwd: if !allow_native_analysis {
                     None
                 } else {
                     native_cwd.as_ref().map(|cwd| cwd.as_path().to_path_buf())
@@ -759,7 +747,7 @@ impl ExecCommandHandler {
         let identity_phase =
             crate::tools::tool_dispatch_trace::begin_tool_phase("exec_workspace_identity");
         let workspace_identity = match cwd.to_abs_path() {
-            Ok(cwd) => {
+            Ok(cwd) if allow_native_analysis => {
                 session
                     .services
                     .command_execution
@@ -769,7 +757,7 @@ impl ExecCommandHandler {
                     )
                     .await
             }
-            Err(_) => None,
+            _ => None,
         };
         drop(identity_phase);
         let key_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("exec_attempt_key");
@@ -793,28 +781,6 @@ impl ExecCommandHandler {
             .with_search_environment(&effective_environment);
         drop(key_phase);
         let validation_attempt = validation_launch;
-        let reuse_phase =
-            crate::tools::tool_dispatch_trace::begin_tool_phase("exec_running_validation_reuse");
-        if validation
-            .as_ref()
-            .is_some_and(crate::validation::CommandValidation::is_validation)
-            && let Some((process_id, execution_id)) = session
-                .services
-                .command_execution
-                .identical_running_process(&attempt_key)
-                .await
-            && let Some(response) = manager
-                .reuse_running_validation(
-                    process_id,
-                    execution_id,
-                    turn.model_info.truncation_policy.into(),
-                    max_output_tokens,
-                )
-                .await
-        {
-            return Ok(boxed_tool_output(response));
-        }
-        drop(reuse_phase);
         let _suite_permit = match crate::validation_task::reserve_policy(
             &session, &turn, &call_id, policy_classification,
             validation_launch,

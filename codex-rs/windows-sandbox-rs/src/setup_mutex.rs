@@ -36,6 +36,14 @@ pub(crate) fn acquire_setup_mutex_for_launch() -> Result<SetupMutexGuard> {
     acquire_named_setup_mutex(SETUP_MUTEX_NAME, 5_000)
 }
 
+/// ACL updates are native read/modify/write sequences, not atomic merges.
+/// One distinct mutex covers policy SIDs, path aliases and inherited ACL updates.
+/// Callers must not acquire setup/state locks while holding this leaf guard.
+pub(crate) fn acquire_acl_mutation_mutex() -> Result<SetupMutexGuard> {
+    acquire_named_setup_mutex("Global\\CodexSandboxAclMutation", 5_000)
+        .map_err(|err| err.context("serialize sandbox ACL mutation"))
+}
+
 fn acquire_named_setup_mutex(name: &str, timeout_ms: u32) -> Result<SetupMutexGuard> {
     let name = to_wide(OsStr::new(name));
     // SAFETY: name is a terminated UTF-16 buffer retained for the call, and the optional

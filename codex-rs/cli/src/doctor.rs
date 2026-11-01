@@ -789,7 +789,6 @@ fn run_sync_check(
     let start = Instant::now();
     let mut check = f();
     check.duration_ms = start.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
-    progress.finish(label, check.status);
     check
 }
 
@@ -809,7 +808,6 @@ where
         tokio::select! {
             mut check = &mut future => {
                 check.duration_ms = start.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
-                progress.finish(label, check.status);
                 return check;
             }
             _ = progress_interval.tick() => {
@@ -1435,7 +1433,7 @@ fn provider_specific_auth_check(
 }
 
 fn stored_auth_mode(auth: &codex_login::AuthDotJson) -> &'static str {
-    match stored_auth_mode_value(auth) {
+    match auth.resolved_mode() {
         AuthMode::ApiKey => "api_key",
         AuthMode::Chatgpt => "chatgpt",
         AuthMode::ChatgptAuthTokens => "chatgpt_auth_tokens",
@@ -1446,27 +1444,12 @@ fn stored_auth_mode(auth: &codex_login::AuthDotJson) -> &'static str {
     }
 }
 
-fn stored_auth_mode_value(auth: &AuthDotJson) -> AuthMode {
-    if let Some(mode) = auth.auth_mode {
-        return mode;
-    }
-    if auth.personal_access_token.is_some() {
-        AuthMode::PersonalAccessToken
-    } else if auth.bedrock_api_key.is_some() {
-        AuthMode::BedrockApiKey
-    } else if auth.openai_api_key.is_some() {
-        AuthMode::ApiKey
-    } else {
-        AuthMode::Chatgpt
-    }
-}
-
 fn stored_auth_issues(
     auth: &AuthDotJson,
     env_var_present: impl Fn(&str) -> bool,
 ) -> Vec<&'static str> {
     let mut issues = Vec::new();
-    match stored_auth_mode_value(auth) {
+    match auth.resolved_mode() {
         AuthMode::ApiKey => {
             let stored_key_present = auth
                 .openai_api_key
@@ -2741,7 +2724,6 @@ struct ReachabilityPlan {
 struct ReachabilityEndpoint {
     label: String,
     url: String,
-    required: bool,
     route_probe_url: Option<String>,
 }
 
@@ -2808,7 +2790,7 @@ fn provider_auth_reachability_mode_from_auth(
     if env_var_present(CODEX_ACCESS_TOKEN_ENV_VAR) {
         return ProviderAuthReachabilityMode::Chatgpt;
     }
-    match stored_auth.map(stored_auth_mode_value) {
+    match stored_auth.map(AuthDotJson::resolved_mode) {
         Some(AuthMode::ApiKey | AuthMode::BedrockApiKey) => ProviderAuthReachabilityMode::ApiKey,
         Some(
             AuthMode::Chatgpt
@@ -2844,13 +2826,11 @@ fn provider_reachability_plan_from_parts(
             url: provider_base_url
                 .unwrap_or("https://api.openai.com/v1")
                 .to_string(),
-            required: true,
             route_probe_url: provider_route_probe_url,
         }],
         ProviderAuthReachabilityMode::Chatgpt => vec![ReachabilityEndpoint {
             label: "ChatGPT".to_string(),
             url: provider_base_url.unwrap_or(chatgpt_base_url).to_string(),
-            required: true,
             route_probe_url: None,
         }],
         ProviderAuthReachabilityMode::NotRequired => provider_base_url
@@ -2858,7 +2838,6 @@ fn provider_reachability_plan_from_parts(
                 vec![ReachabilityEndpoint {
                     label: format!("{provider_id} API"),
                     url: url.to_string(),
-                    required: true,
                     route_probe_url: provider_route_probe_url,
                 }]
             })
@@ -2920,7 +2899,6 @@ async fn provider_reachability_check(plan: ReachabilityPlan) -> DoctorCheck {
     }
 
     let mut failures = Vec::new();
-    let mut optional_failures = Vec::new();
     let mut route_failures = Vec::new();
     let mut route_warnings = Vec::new();
     let mut issues = Vec::new();
@@ -2931,20 +2909,11 @@ async fn provider_reachability_check(plan: ReachabilityPlan) -> DoctorCheck {
                 endpoint.label, endpoint.url
             )),
             Err(err) => {
-                let requirement = if endpoint.required {
-                    "required"
-                } else {
-                    "optional"
-                };
                 details.push(format!(
-                    "{} base URL: {} {err} ({requirement})",
+                    "{} base URL: {} {err} (required)",
                     endpoint.label, endpoint.url
                 ));
-                if endpoint.required {
-                    failures.push(endpoint.url);
-                } else {
-                    optional_failures.push(endpoint.url);
-                }
+                failures.push(endpoint.url);
                 continue;
             }
         }
@@ -3005,7 +2974,7 @@ async fn provider_reachability_check(plan: ReachabilityPlan) -> DoctorCheck {
 
     let (status, summary) = provider_reachability_outcome(
         failures.len() + route_failures.len(),
-        optional_failures.len() + route_warnings.len(),
+        route_warnings.len(),
     );
     let mut check = DoctorCheck::new(
         "network.provider_reachability",
@@ -3154,7 +3123,11 @@ fn stdio_command_resolves(
     }
 
     let Some(path_env) = server_env
-        .and_then(|env| env.get("PATH").map(String::as_str))
+        .and_then(|env| {
+            env.iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+                .map(|(_, value)| value.as_str())
+        })
         .map(std::ffi::OsString::from)
         .or_else(|| env::var_os("PATH"))
     else {
@@ -3182,14 +3155,10 @@ fn stdio_command_resolves(
 
 fn executable_path_exists(path: &Path) -> Result<(), String> {
     match std::fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => executable_file_permission(path, &metadata),
+        Ok(metadata) if metadata.is_file() => Ok(()),
         Ok(_) => Err("path is not a file".to_string()),
         Err(err) => Err(err.to_string()),
     }
-}
-
-fn executable_file_permission(_path: &Path, _metadata: &std::fs::Metadata) -> Result<(), String> {
-    Ok(())
 }
 
 fn path_readiness(details: &mut Vec<String>, label: &str, path: &Path) -> bool {

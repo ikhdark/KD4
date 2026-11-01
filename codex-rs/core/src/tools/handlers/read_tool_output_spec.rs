@@ -20,7 +20,7 @@ pub(crate) const READ_TOOL_OUTPUT_MAX_SELECTORS: usize = 64;
 pub(crate) const READ_TOOL_OUTPUT_MAX_LEGACY_RANGES: usize = READ_TOOL_OUTPUT_MAX_SELECTORS;
 
 pub(crate) fn tool_output_selector_schema() -> JsonSchema {
-    let mut schema = selector_schema(true);
+    let mut schema = selector_schema();
     if let Some(variants) = &mut schema.one_of {
         variants.push(selector_variant(
             "tail",
@@ -37,7 +37,7 @@ pub(crate) fn tool_output_selector_schema() -> JsonSchema {
 }
 
 pub(crate) fn file_selector_schema() -> JsonSchema {
-    let mut schema = selector_schema(true);
+    let mut schema = selector_schema();
     if let Some(variants) = &mut schema.one_of
         && let Some(section) = variants.iter_mut().find(|variant| {
             variant
@@ -73,7 +73,7 @@ pub(crate) fn file_selector_schema() -> JsonSchema {
     schema
 }
 
-fn selector_schema(include_sections: bool) -> JsonSchema {
+fn selector_schema() -> JsonSchema {
     let mut variants = vec![
         selector_variant(
             "bytes",
@@ -104,18 +104,16 @@ fn selector_schema(include_sections: bool) -> JsonSchema {
             vec!["start", "end"],
         ),
     ];
-    if include_sections {
-        variants.push(selector_variant(
-            "section",
-            BTreeMap::from([(
-                "id".to_string(),
-                JsonSchema::string(Some(
-                    "Stable section ID advertised by the original projection. A Rust/Python or Markdown snapshot saved with an outline lists source-bound item IDs at id outline; select a returned ID for exact source.".to_string(),
-                )),
-            )]),
-            vec!["id"],
-        ));
-    }
+    variants.push(selector_variant(
+        "section",
+        BTreeMap::from([(
+            "id".to_string(),
+            JsonSchema::string(Some(
+                "Stable section ID advertised by the original projection. A Rust/Python or Markdown snapshot saved with an outline lists source-bound item IDs at id outline; select a returned ID for exact source.".to_string(),
+            )),
+        )]),
+        vec!["id"],
+    ));
     variants.push(selector_variant(
         "json_pointer",
         BTreeMap::from([(
@@ -458,7 +456,6 @@ pub(crate) fn read_tool_output_output_schema(mut selector_schema: JsonSchema) ->
                     .and_then(|kind| kind.enum_values.as_ref())
                     .is_some_and(|values| {
                         values == &vec![serde_json::json!("search")]
-                            || values == &vec![serde_json::json!("search_index")]
                     })
             })
         });

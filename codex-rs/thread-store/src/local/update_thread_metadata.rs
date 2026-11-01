@@ -15,7 +15,6 @@ use tracing::warn;
 
 use super::LocalThreadStore;
 use super::helpers::ResolvedRolloutPath;
-use super::helpers::distinct_thread_metadata_title;
 use super::helpers::git_info_from_parts;
 use super::helpers::permission_profile_to_metadata_value;
 use super::helpers::resolve_rollout_path;
@@ -305,7 +304,7 @@ async fn update_thread_metadata_owned(
             store,
             thread_id,
             name.unwrap_or_default(),
-            updated.as_ref().and_then(distinct_thread_metadata_title).is_some(),
+            updated.as_ref().is_some_and(|metadata| metadata.title_is_explicit),
         )
         .await?;
     }
@@ -430,8 +429,11 @@ async fn apply_metadata_update(
                     }
                     if let Some(name) = patch.name {
                         metadata.title = name.unwrap_or_default();
+                        metadata.title_is_explicit = true;
                     }
-                    if let Some(title) = patch.title {
+                    if let Some(title) = patch.title
+                        && !metadata.title_is_explicit
+                    {
                         metadata.title = title;
                     }
                     if let Some(model_provider) = patch.model_provider {
@@ -525,20 +527,12 @@ async fn apply_metadata_update(
     } else {
         Ok(None)
     };
-    let updated_metadata = match (state_db.is_some(), sqlite_write_result) {
-        (true, Ok(metadata)) => metadata,
-        (true, Err(err)) if require_sqlite_write || !sqlite_write_error_is_best_effort(&err) => {
+    let updated_metadata = match sqlite_write_result {
+        Ok(metadata) => metadata,
+        Err(err) if require_sqlite_write || !sqlite_write_error_is_best_effort(&err) => {
             return Err(err);
         }
-        (true, Err(err)) => {
-            warn!("state db update_thread_metadata failed for {thread_id}: {err}");
-            None
-        }
-        (false, Ok(metadata)) => metadata,
-        (false, Err(err)) if require_sqlite_write || !sqlite_write_error_is_best_effort(&err) => {
-            return Err(err);
-        }
-        (false, Err(err)) => {
+        Err(err) => {
             warn!("state db update_thread_metadata failed for {thread_id}: {err}");
             None
         }

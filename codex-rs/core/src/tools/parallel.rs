@@ -50,7 +50,6 @@ use crate::tools::tool_dispatch_trace::scope_tool_dispatch_timing;
 use crate::turn_timing::ToolCallTimingLineage;
 use crate::turn_timing::TurnTimingState;
 use codex_protocol::error::CodexErr;
-use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
@@ -409,7 +408,6 @@ pub(crate) async fn run_workspace_hook_with_receipt<T: Send + 'static>(
             codex_hooks::observe_command_effects(Arc::clone(&entered), work),
         )).await;
         let mutation_receipt = if entered.load(std::sync::atomic::Ordering::Acquire) {
-            session.services.git_workspace.note_host_workspace_mutation();
             let mut tracker = tracker.lock().await;
             let before_revision = tracker.current_mutation_revision();
             tracker.record_unknown_mutation();
@@ -430,45 +428,55 @@ pub(crate) async fn run_workspace_hook_with_receipt<T: Send + 'static>(
     }).await.map_err(|error| FunctionCallError::Fatal(format!("hook owner failed: {error}")))?
 }
 
-/// Historical call sites keep an inert boundary while old rollouts remain readable.
-pub(crate) struct WorkspaceEvidenceGenerationBatch;
-
-pub(crate) struct WorkspaceEvidenceGenerationFlush {
-    pub(crate) prefetched_workspace_identity: Option<Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
-}
-
-impl WorkspaceEvidenceGenerationBatch {
-    pub(crate) fn new() -> Self { Self }
-    async fn capture_baseline_for_tool(
-        &self, _cache: &crate::git_workspace::GitWorkspaceCache, _turn: Option<&TurnContext>,
-        _classification: &crate::tool_history::WorkspaceCallClassification, _tool_name: &str, _mutation_revision: u64,
-    ) -> WorkspaceEvidenceBaseline { WorkspaceEvidenceBaseline::default() }
-    pub(crate) async fn record_captured_identity(&self, _cwd: &std::path::Path, _mutation_revision: u64,
-        _identity: Option<crate::git_workspace::WorkspaceEvidenceIdentity>) {}
-    pub(crate) async fn prefetch_identity_after_mutation(&self, _session: &Session, _turn: &TurnContext,
-        _cwd: &std::path::Path, _mutation_revision: u64) {}
-    fn retain_generation_owner(&self, _session: &Arc<Session>, _turn: &Arc<TurnContext>, _tracker: &SharedTurnDiffTracker) {}
-    pub(crate) fn register_call(&self, _call_id: &str) -> bool { false }
-    pub(crate) fn accepts_call(&self, _call_id: &str) -> bool { false }
-    fn record_code_mode_workspace_observation(&self, _call_id: &str, _mutation_revision: u64) {}
-    fn record_workspace_observation(&self, _call_id: &str) {}
-    pub(crate) fn record_mutation(&self, _call_id: &str, _cwd: std::path::PathBuf,
-        _paths: Option<std::collections::BTreeSet<std::path::PathBuf>>, _observe_command_ledger: bool) -> bool { false }
-    fn queue_response(&self, _response: &ResponseInputItem, _classification: &crate::tool_history::WorkspaceCallClassification,
-        _dependencies: std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
-        _observations: Vec<crate::git_workspace::SourcePathChangeObservation>, _timing: Option<Arc<ToolDispatchTiming>>) -> bool { false }
-    pub(crate) async fn flush(self: &Arc<Self>, _session: &Session, _turn: &TurnContext,
-        _tracker: &SharedTurnDiffTracker) -> CodexResult<WorkspaceEvidenceGenerationFlush> {
-        Ok(WorkspaceEvidenceGenerationFlush {
-            prefetched_workspace_identity: None,
-        })
-    }
-}
-
 fn workspace_tool_may_use_parallel_gate(supports_parallel: bool, workspace_capable: bool) -> bool {
     supports_parallel && !workspace_capable
 }
 
+
+/// Native dependency expansion may read Cargo/configuration files. Use only the
+/// frozen selected executor whose filesystem and complete read policy authorize
+/// host-native reads; matching path syntax alone does not prove local custody.
+pub(crate) fn native_workspace_analysis_cwd(
+    step: &StepContext,
+    payload: &ToolPayload,
+) -> Option<codex_utils_absolute_path::AbsolutePathBuf> {
+    if !step.turn.file_system_sandbox_policy().has_full_disk_read_access() {
+        return None;
+    }
+    let ToolPayload::Function { arguments } = payload else {
+        return None;
+    };
+    let arguments = serde_json::from_str::<serde_json::Value>(arguments).ok()?;
+    let arguments = arguments.as_object()?;
+    let environment = match arguments.get("environment_id") {
+        None | Some(serde_json::Value::Null) => step.environments.primary(),
+        Some(serde_json::Value::String(id)) => step.environments.turn_environments
+            .iter().find(|environment| environment.environment_id == *id),
+        _ => None,
+    }?;
+    if environment.environment.is_remote()
+        || !environment.environment.get_filesystem().uses_host_native_paths()
+        || environment.cwd().infer_path_convention()
+            != Some(codex_utils_path_uri::PathConvention::native())
+    {
+        return None;
+    }
+    environment.cwd().to_abs_path().ok()
+}
+
+async fn classify_workspace_call_at_admission(
+    tool_identity: String,
+    payload: ToolPayload,
+    step: &StepContext,
+) -> Result<(crate::tool_history::WorkspaceCallClassification, bool), tokio::task::JoinError> {
+    let native_cwd = native_workspace_analysis_cwd(step, &payload);
+    crate::tool_history::classify_workspace_tool_call_at_admission(
+        tool_identity,
+        payload,
+        native_cwd.as_ref().unwrap_or(&step.turn.config.cwd).to_path_buf(),
+        native_cwd.is_some(),
+    ).await
+}
 
 /// Resolve native file dependencies using the same ready environment as the
 /// handler. Remote/starting/unknown environments have no host-watcher proof.
@@ -476,7 +484,7 @@ fn native_file_classification(
     original: crate::tool_history::WorkspaceCallClassification,
     tool_identity: &str,
     payload: &ToolPayload,
-    environments: &crate::environment_selection::TurnEnvironmentSnapshot,
+    step: &StepContext,
 ) -> crate::tool_history::WorkspaceCallClassification {
     if !matches!(
         tool_identity,
@@ -487,25 +495,13 @@ fn native_file_classification(
     let mut conservative = original;
     conservative.source_dependencies.clear();
     conservative.source_scope_complete = false;
+    let Some(cwd) = native_workspace_analysis_cwd(step, payload) else {
+        return conservative;
+    };
     let ToolPayload::Function { arguments } = payload else {
         return conservative;
     };
     let Ok(mut arguments) = serde_json::from_str::<serde_json::Value>(arguments) else {
-        return conservative;
-    };
-    let environment = match arguments.get("environment_id") {
-        None | Some(serde_json::Value::Null) => environments.primary(),
-        Some(serde_json::Value::String(id)) => environments
-            .turn_environments
-            .iter()
-            .find(|environment| environment.environment_id == *id),
-        _ => None,
-    };
-    let Some(environment) = environment.filter(|environment| !environment.environment.is_remote())
-    else {
-        return conservative;
-    };
-    let Ok(cwd) = environment.cwd().to_abs_path() else {
         return conservative;
     };
     if let Some(arguments) = arguments.as_object_mut() {
@@ -517,6 +513,7 @@ fn native_file_classification(
             arguments: arguments.to_string(),
         },
         cwd.as_path(),
+        true,
     )
 }
 
@@ -524,14 +521,19 @@ fn workspace_tool_call_classifications_for_dispatch(
     source: &ToolCallSource,
     tool_identity: &str,
     payload: &ToolPayload,
-    default_cwd: &std::path::Path,
+    step: &StepContext,
     admission_hint: Option<crate::tool_history::WorkspaceCallClassification>,
 ) -> (
     crate::tool_history::WorkspaceCallClassification,
     Option<crate::tool_history::WorkspaceCallClassification>,
 ) {
     let admission = admission_hint.unwrap_or_else(|| {
-        crate::tool_history::classify_workspace_tool_call(tool_identity, payload, default_cwd)
+        let native_cwd = native_workspace_analysis_cwd(step, payload);
+        crate::tool_history::classify_workspace_tool_call(
+            tool_identity, payload,
+            native_cwd.as_ref().unwrap_or(&step.turn.config.cwd).as_path(),
+            native_cwd.is_some(),
+        )
     });
     let inner_evidence = (!matches!(source, ToolCallSource::Direct)).then(|| admission.clone());
     (admission, inner_evidence)
@@ -548,20 +550,19 @@ async fn executed_workspace_classification(
     original: &crate::tool_history::WorkspaceCallClassification,
     tool_identity: &str,
     executed_payload: Option<&ToolPayload>,
-    default_cwd: &std::path::Path,
-    environments: &crate::environment_selection::TurnEnvironmentSnapshot,
+    step: &StepContext,
 ) -> Result<crate::tool_history::WorkspaceCallClassification, FunctionCallError> {
     let Some(payload) = executed_payload else {
         return Ok(original.clone());
     };
-    crate::tool_history::classify_workspace_tool_call_at_admission(
+    classify_workspace_call_at_admission(
         tool_identity.to_string(),
         payload.clone(),
-        default_cwd.to_path_buf(),
+        step,
     )
     .await
     .map(|(classification, _)| {
-        native_file_classification(classification, tool_identity, payload, environments)
+        native_file_classification(classification, tool_identity, payload, step)
     })
     .map_err(|error| FunctionCallError::Fatal(format!("executed payload analysis failed: {error}")))
 }
@@ -579,8 +580,9 @@ async fn workspace_resource_key_for_admission(
     cache: &Arc<crate::git_workspace::WorkspaceRootCache>,
     supports_parallel: bool,
     workspace_capable: bool,
+    allow_native_filesystem_reads: bool,
 ) -> Option<std::path::PathBuf> {
-    if !supports_parallel || !workspace_capable {
+    if !supports_parallel || !workspace_capable || !allow_native_filesystem_reads {
         return None;
     }
     // Root validation touches .git markers, so cache hits also run off-runtime.
@@ -648,16 +650,10 @@ fn workspace_resource_gate(
     gate
 }
 
-/// Pre-admission workspace state captured for one tool call. Fields stay
-/// module-private: callers outside this module only pass the opaque slot.
-#[derive(Clone, Default)]
-pub(crate) struct WorkspaceEvidenceBaseline {
-    revision: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
-    cache_hit: bool,
-    timed_out_git_dependencies: Vec<crate::git_workspace::WorkspaceEvidenceGitDependency>,
-    source_dependencies: std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
-    source_path_observations: Vec<crate::git_workspace::SourcePathChangeObservation>,
-}
+/// Records baseline admission without claiming a Git/source snapshot.
+/// Presence remains distinct from no baseline for dependency selection.
+#[derive(Clone)]
+pub(crate) struct WorkspaceEvidenceBaseline;
 
 fn is_passive_workspace_poll(router: &ToolRouter, call: &ToolCall) -> bool {
     router.semantic_tool_name(&call.tool_name) == codex_tools::ToolName::plain("write_stdin")
@@ -683,7 +679,6 @@ struct ToolCallWorkspaceEvidenceContext {
 struct WorkspaceEvidenceAfterCall<'a> {
     response: &'a ResponseInputItem,
     baseline: Option<WorkspaceEvidenceBaseline>,
-    mutation_advanced: bool,
     source_dependencies_override:
         Option<std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>>,
     classification: &'a crate::tool_history::WorkspaceCallClassification,
@@ -692,11 +687,9 @@ struct WorkspaceEvidenceAfterCall<'a> {
 
 struct WorkspaceEvidenceObservation<'a> {
     response: &'a ResponseInputItem,
-    revision: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
     captured_current: bool,
     source_scope_complete: bool,
     source_dependencies: std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
-    source_path_observations: Vec<crate::git_workspace::SourcePathChangeObservation>,
     workspace_gate_guard: Option<WorkspaceGateGuard>,
 }
 
@@ -1139,39 +1132,6 @@ async fn acquire_workspace_gate_with_additions(
     .attributed(global_holders, true)
 }
 
-async fn capture_workspace_evidence_baseline(
-    _cache: &crate::git_workspace::GitWorkspaceCache,
-    _turn: Option<&TurnContext>,
-    _cwd: &std::path::Path,
-    _source_dependencies: std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
-    _reuse_latest: bool,
-) -> WorkspaceEvidenceBaseline {
-    WorkspaceEvidenceBaseline::default()
-}
-
-fn finish_workspace_evidence_capture(
-    baseline: &WorkspaceEvidenceBaseline,
-    mutation_advanced: bool,
-) -> (
-    Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
-    bool,
-) {
-    let revision = baseline.revision.clone();
-    // The mutation tracker covers the command's own workspace effects. When
-    // it stays unchanged, the authoritative pre-dispatch identity remains the
-    // post-dispatch identity even for an opaque command. Sampling refreshes
-    // the identity again before projection, so external races still fail
-    // closed. Gate concurrency does not control whether an otherwise unchanged
-    // result is allowed to reach the next model request.
-    // A non-Git capture can succeed without an identity. This flag tracks
-    // instrumented mutations only; projection must still verify freshness.
-    let captured_current = !mutation_advanced
-        && revision
-            .as_ref()
-            .is_none_or(|identity| !identity.unavailable);
-    (revision, captured_current)
-}
-
 fn workspace_evidence_source_dependencies(
     baseline: Option<&WorkspaceEvidenceBaseline>,
     source_dependencies_override: Option<
@@ -1182,12 +1142,19 @@ fn workspace_evidence_source_dependencies(
     source_dependencies_override.cloned().unwrap_or_else(|| {
         baseline.map_or_else(
             || classification.source_dependencies.clone(),
-            |baseline| baseline.source_dependencies.clone(),
+            |_| Default::default(),
         )
     })
 }
 
 impl ToolCallRuntime {
+    pub(crate) fn native_workspace_analysis_cwd(
+        &self,
+        payload: &ToolPayload,
+    ) -> Option<codex_utils_absolute_path::AbsolutePathBuf> {
+        native_workspace_analysis_cwd(&self.step_context, payload)
+    }
+
     pub(crate) fn mcp_auth_scope_is_current(&self) -> bool {
         self.step_context.mcp.manager().managed_auth_scope_is_current()
     }
@@ -1318,23 +1285,11 @@ impl ToolCallRuntime {
     }
 
 
-    pub(crate) async fn flush_workspace_evidence_generation(
-        &self,
-    ) -> CodexResult<WorkspaceEvidenceGenerationFlush> {
-        self.session
-            .flush_workspace_evidence_generation(
-                &self.step_context.turn,
-                &self.step_context.workspace_evidence_generation_batch,
-                &self.tracker,
-            )
-            .await
-    }
-
     async fn register_passive_poll_evidence(
         session: &Session,
         turn: &TurnContext,
         response: &ResponseInputItem,
-        baseline: Option<WorkspaceEvidenceBaseline>,
+        _baseline: Option<WorkspaceEvidenceBaseline>,
     ) -> bool {
         // Process bytes have no proven workspace observation interval. A live
         // writer can change files without a terminal mutation revision, and a
@@ -1347,11 +1302,9 @@ impl ToolCallRuntime {
             turn,
             WorkspaceEvidenceObservation {
                 response,
-                revision: baseline.and_then(|baseline| baseline.revision),
                 captured_current: false,
                 source_scope_complete: false,
                 source_dependencies: Default::default(),
-                source_path_observations: Vec::new(),
                 workspace_gate_guard: None,
             },
         )
@@ -1368,37 +1321,12 @@ impl ToolCallRuntime {
             std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
         >,
         classification: &crate::tool_history::WorkspaceCallClassification,
-        timing: Option<Arc<ToolDispatchTiming>>,
     ) -> bool {
         if !classification.observes_workspace {
             return false;
         }
-        if mutation_advanced {
-            let source_dependencies = workspace_evidence_source_dependencies(
-                baseline.as_ref(),
-                source_dependencies_override.as_ref(),
-                classification,
-            );
-            let source_path_observations = baseline
-                .as_ref()
-                .filter(|baseline| baseline.source_dependencies == source_dependencies)
-                .map(|baseline| baseline.source_path_observations.clone())
-                .unwrap_or_default();
-            if self
-                .step_context
-                .workspace_evidence_generation_batch
-                .queue_response(
-                    response,
-                    classification,
-                    source_dependencies,
-                    source_path_observations,
-                    timing,
-                )
-            {
-                return true;
-            }
-        }
-        // Only a fresh workspace capture needs synchronization with tool effects.
+        // Preserve admission ordering without a compatible baseline or after
+        // an instrumented mutation.
         let gate_guard = if baseline.is_none() || mutation_advanced {
             Some(
                 WorkspaceGateGuard::Shared {
@@ -1415,13 +1343,10 @@ impl ToolCallRuntime {
             WorkspaceEvidenceAfterCall {
                 response,
                 baseline,
-                mutation_advanced,
                 source_dependencies_override,
                 classification,
                 workspace_gate_guard: gate_guard,
             },
-            None,
-            None,
         )
         .await
     }
@@ -1430,13 +1355,10 @@ impl ToolCallRuntime {
         session: &Session,
         turn: &TurnContext,
         input: WorkspaceEvidenceAfterCall<'_>,
-        generation_batch: Option<&Arc<WorkspaceEvidenceGenerationBatch>>,
-        timing: Option<Arc<ToolDispatchTiming>>,
     ) -> bool {
         let WorkspaceEvidenceAfterCall {
             response,
             baseline,
-            mutation_advanced,
             source_dependencies_override,
             classification,
             workspace_gate_guard,
@@ -1449,59 +1371,19 @@ impl ToolCallRuntime {
             source_dependencies_override.as_ref(),
             classification,
         );
-        let source_path_observations = baseline
-            .as_ref()
-            .filter(|baseline| baseline.source_dependencies == source_dependencies)
-            .map(|baseline| baseline.source_path_observations.clone())
-            .unwrap_or_default();
-        if mutation_advanced
-            && generation_batch.is_some_and(|batch| {
-                batch.queue_response(
-                    response,
-                    classification,
-                    source_dependencies.clone(),
-                    source_path_observations.clone(),
-                    timing,
-                )
-            })
-        {
-            drop(workspace_gate_guard);
-            return true;
-        }
         let workspace_gate_guard =
             workspace_gate_guard.map(WorkspaceGateGuard::downgrade_for_observation);
-        let (revision, captured_current) = match baseline.as_ref() {
-            Some(baseline) if !mutation_advanced => {
-                finish_workspace_evidence_capture(baseline, mutation_advanced)
-            }
-            _ => {
-                // A mutation or refined payload can invalidate the pre-dispatch
-                // baseline. Capture the
-                // authoritative post-call identity instead of publishing an
-                // observation that is stale from birth. `None` remains an
-                // authoritative identity for a non-Git workspace.
-                let revision = session
-                    .services
-                    .git_workspace
-                    .workspace_evidence_for_turn(turn, &classification.workspace_cwd)
-                    .await
-                    .identity;
-                (revision, true)
-            }
-        };
-        // Identity capture is complete. History projection and persistence do not
-        // need the workspace lease, even when they wait for session state.
+        // History projection and persistence do not need the workspace lease,
+        // even when they wait for session state.
         drop(workspace_gate_guard);
         Self::register_workspace_evidence_observation(
             session,
             turn,
             WorkspaceEvidenceObservation {
                 response,
-                revision,
-                captured_current,
+                captured_current: true,
                 source_scope_complete: classification.source_scope_complete,
                 source_dependencies,
-                source_path_observations,
                 workspace_gate_guard: None,
             },
         )
@@ -1525,11 +1407,10 @@ impl ToolCallRuntime {
             turn.model_info.truncation_policy.into(),
         ).await;
         if let Some(observation) = crate::tool_history::WorkspaceEvidenceObservation::from_response_item_with_freshness(
-            input.revision, &response, input.source_dependencies, input.captured_current,
+            None, &response, input.source_dependencies, input.captured_current,
         ) {
             session.register_workspace_evidence(
-                observation.with_source_scope_complete(input.source_scope_complete)
-                    .with_source_path_observations(input.source_path_observations),
+                observation.with_source_scope_complete(input.source_scope_complete),
                 (),
             ).await;
         }
@@ -1630,10 +1511,10 @@ impl ToolCallRuntime {
         // classification as successful results (including known writers).
         let source_dependencies = match payload {
             None => None,
-            Some(payload) => match crate::tool_history::classify_workspace_tool_call_at_admission(
+            Some(payload) => match classify_workspace_call_at_admission(
                 tool_name.name.to_string(),
                 payload.clone(),
-                self.step_context.turn.config.cwd.to_path_buf(),
+                &self.step_context,
             )
             .await
             {
@@ -1737,9 +1618,6 @@ impl ToolCallRuntime {
         timing: Arc<ToolDispatchTiming>,
         admission_hint: Option<(crate::tool_history::WorkspaceCallClassification, bool)>,
     ) -> impl std::future::Future<Output = Result<ToolCallCompletion, CodexErr>> {
-        self.step_context
-            .workspace_evidence_generation_batch
-            .register_call(&call.call_id);
         let tool_call_timing_guard = ToolCallTimingGuard::capture_for_turn(
             Arc::clone(&timing),
             Arc::clone(&self.step_context.turn.turn_timing_state),
@@ -1793,17 +1671,17 @@ impl ToolCallRuntime {
             let _tool_call_timing_guard = tool_call_timing_guard;
             let (workspace_call_classification, read_only) = match admission_hint {
                 Some(classification) => classification,
-                None => crate::tool_history::classify_workspace_tool_call_at_admission(
+                None => classify_workspace_call_at_admission(
                     call.tool_name.name.to_string(),
                     call.payload.clone(),
-                    self.step_context.turn.config.cwd.to_path_buf(),
+                    &self.step_context,
                 ).await.map_err(|error| CodexErr::Fatal(format!(
                     "workspace admission analysis failed: {error}"
                 )))?,
             };
             let workspace_call_classification = native_file_classification(
                 workspace_call_classification, call.tool_name.name.as_str(), &call.payload,
-                &self.step_context.environments,
+                &self.step_context,
             );
             let pre_tool_use_hook_may_run = self.pre_tool_use_hook_may_run(&call);
             if !pre_tool_use_hook_may_run
@@ -1911,15 +1789,6 @@ impl ToolCallRuntime {
                 captured_workspace_baseline.unzip();
             evidence_timing.record_outcome(tool_dispatch_outcome_label(&result));
             evidence_timing.mark_output_collected();
-            if let Some(collector) = signal_collector.as_ref()
-                && !crate::tools::code_mode::is_exec_tool_name(&owner_tool_name)
-            {
-                let timing_snapshot = evidence_timing.snapshot(TokioInstant::now());
-                if let Some(runtime_ms) = timing_snapshot.first_poll_to_output_collected_ms
-                    .or(timing_snapshot.total_duration_ms) {
-                    collector.record_child_runtime_for_call(&error_call.call_id, runtime_ms);
-                }
-            }
             match result {
                 Ok(mut response) => {
                     let mutation_advanced = if let Some(before) = mutation_revision_before {
@@ -1985,8 +1854,7 @@ impl ToolCallRuntime {
                             &workspace_call_classification,
                             owner_tool_name.name.as_str(),
                             Some(&response.payload).filter(|payload| *payload != &owner_payload),
-                            self.step_context.turn.config.cwd.as_path(),
-                            &self.step_context.environments,
+                            &self.step_context,
                         ).await.map_err(|error| CodexErr::Fatal(error.to_string()))?;
                     let code_mode_exec = crate::tools::code_mode::is_exec_tool_name(&owner_tool_name);
                     let source_dependencies_override = owner_key.as_deref().and_then(|owner_key| {
@@ -2042,26 +1910,7 @@ impl ToolCallRuntime {
                                                 .to_path_buf(),
                                             source_dependencies: source_dependencies.clone(),
                                         };
-                                    let capture_revision = mutation_tracker
-                                        .lock().await.current_mutation_revision();
-                                    let baseline = capture_workspace_evidence_baseline(
-                                        self.session.services.git_workspace.as_ref(),
-                                        Some(&self.step_context.turn),
-                                        &classification.workspace_cwd,
-                                        classification.source_dependencies.clone(),
-                                        true,
-                                    )
-                                    .await;
-                                    let tracker = mutation_tracker.lock().await;
-                                    if tracker.current_mutation_revision() == capture_revision {
-                                        self.step_context.workspace_evidence_generation_batch
-                                            .record_captured_identity(
-                                                &classification.workspace_cwd,
-                                                capture_revision,
-                                                baseline.revision.clone(),
-                                            ).await;
-                                    }
-                                    drop(tracker);
+                                    let baseline = WorkspaceEvidenceBaseline;
                                     (Some(baseline), classification)
                                 }
                                 None => {
@@ -2096,7 +1945,6 @@ impl ToolCallRuntime {
                         mutation_advanced,
                         source_dependencies_override,
                         &evidence_classification,
-                        Some(Arc::clone(&evidence_timing)),
                     )
                     .await };
                     if evidence_classification.observes_workspace && !workspace_evidence_deferred {
@@ -2166,7 +2014,6 @@ impl ToolCallRuntime {
                         mutation_advanced,
                         None,
                         &workspace_call_classification,
-                        Some(Arc::clone(&evidence_timing)),
                     )
                     .await };
                     if observes_workspace && !workspace_evidence_deferred {
@@ -2206,17 +2053,11 @@ impl ToolCallRuntime {
         workspace_evidence_baseline_slot: Option<WorkspaceEvidenceBaselineSlot>,
         dispatch_state: Arc<ToolDispatchState>,
     ) -> impl std::future::Future<Output = Result<AnyToolResult, FunctionCallError>> {
-        self.step_context
-            .workspace_evidence_generation_batch
-            .register_call(&call.call_id);
         let timing = Arc::new(ToolDispatchTiming::new_with_turn_clock(
             Arc::clone(&self.step_context.turn.turn_timing_state),
             TokioInstant::now(),
             /*eager*/ false,
         ));
-        let nested_code_mode = matches!(&source, ToolCallSource::CodeMode { .. });
-        let timing_call_id = call.call_id.clone();
-        let signal_collector = self.sampling_request_signals.clone();
         let accepted = if let ToolCallSource::CodeMode { parent_call_id, .. } = &source {
             self.step_context.turn.tool_call_acceptance.try_accept(|| {
                 self.step_context
@@ -2280,15 +2121,6 @@ impl ToolCallRuntime {
             // ordinary handler path, but cancellation and future early-return
             // paths must record collection before this lifecycle guard drops.
             timing.mark_output_collected();
-            if nested_code_mode && let Some(collector) = signal_collector.as_ref() {
-                let timing_snapshot = timing.snapshot(TokioInstant::now());
-                if let Some(runtime_ms) = timing_snapshot
-                    .first_poll_to_output_collected_ms
-                    .or(timing_snapshot.total_duration_ms)
-                {
-                    collector.record_child_runtime_for_call(&timing_call_id, runtime_ms);
-                }
-            }
             result
         }
     }
@@ -2352,10 +2184,6 @@ impl ToolCallRuntime {
         // where code-mode dependency overrides are also available. Nested
         // code-mode calls have no such outer layer and register here.
         let model_issued = matches!(&source, ToolCallSource::Direct);
-        let code_mode_parent_call_id = match &source {
-            ToolCallSource::CodeMode { parent_call_id, .. } => parent_call_id.clone(),
-            _ => None,
-        };
         let abort_turn = Arc::clone(&turn);
         let dispatch_state = dispatch_state.unwrap_or_else(|| Arc::new(ToolDispatchState::new()));
         let admission_dispatch_state = Arc::clone(&dispatch_state);
@@ -2376,11 +2204,6 @@ impl ToolCallRuntime {
         let tracks_workspace = workspace_capable
             || !supports_parallel
             || router.delegates_workspace_admission(&evidence_call);
-        if tracks_workspace {
-            step_context
-                .workspace_evidence_generation_batch
-                .retain_generation_owner(&session, &turn, &tracker);
-        }
         let evidence_tracker = Arc::clone(&tracker);
 
         let dispatch_span = trace_span!(
@@ -2419,10 +2242,10 @@ impl ToolCallRuntime {
                 let admission_tool_name = router.semantic_tool_name(&dispatch_call.tool_name);
                 let (admission, mut read_only) = match workspace_admission_hint {
                     Some(classification) => classification,
-                    None => crate::tool_history::classify_workspace_tool_call_at_admission(
+                    None => classify_workspace_call_at_admission(
                         admission_tool_name.name.to_string(),
                         dispatch_call.payload.clone(),
-                        turn.config.cwd.to_path_buf(),
+                        &step_context,
                     )
                     .await
                     .map_err(|error| {
@@ -2435,14 +2258,14 @@ impl ToolCallRuntime {
                     admission,
                     admission_tool_name.name.as_str(),
                     &dispatch_call.payload,
-                    &step_context.environments,
+                    &step_context,
                 );
                 let (workspace_admission_classification, workspace_call_classification) =
                     workspace_tool_call_classifications_for_dispatch(
                         &source,
                         admission_tool_name.name.as_str(),
                         &dispatch_call.payload,
-                        turn.config.cwd.as_path(),
+                        &step_context,
                         Some(admission),
                     );
                 let projection_source_dependencies = projection_source_dependencies.or_else(|| {
@@ -2477,10 +2300,10 @@ impl ToolCallRuntime {
                 let (workspace_admission_classification, workspace_call_classification) =
                     if hook_rewrote_input {
                         let (classification, rewritten_read_only) =
-                            crate::tool_history::classify_workspace_tool_call_at_admission(
+                            classify_workspace_call_at_admission(
                                 admission_tool_name.name.to_string(),
                                 dispatch_call.payload.clone(),
-                                turn.config.cwd.to_path_buf(),
+                                &step_context,
                             )
                             .await
                             .map_err(|error| {
@@ -2495,13 +2318,13 @@ impl ToolCallRuntime {
                             classification,
                             admission_tool_name.name.as_str(),
                             &dispatch_call.payload,
-                            &step_context.environments,
+                            &step_context,
                         );
                         workspace_tool_call_classifications_for_dispatch(
                             &source,
                             admission_tool_name.name.as_str(),
                             &dispatch_call.payload,
-                            turn.config.cwd.as_path(),
+                            &step_context,
                             Some(classification),
                         )
                     } else {
@@ -2526,6 +2349,7 @@ impl ToolCallRuntime {
                     &canonical_workspace_resources,
                     supports_parallel,
                     workspace_capable,
+                    native_workspace_analysis_cwd(&step_context, &dispatch_call.payload).is_some(),
                 )
                 .await;
                 let additions = if let (Some(root), Some(paths), Some(environment)) = (
@@ -2620,9 +2444,6 @@ impl ToolCallRuntime {
                             "resource:diff_tracker", tracker.lock(),
                         ).await
                     };
-                    guard.activate_workspace_evidence_generation_batch(
-                        &step_context.workspace_evidence_generation_batch,
-                    );
                     if read_only
                         && router
                             .semantic_capabilities(&evidence_call.tool_name)
@@ -2739,7 +2560,7 @@ impl ToolCallRuntime {
                 let overlap_baseline = router.prepares_during_workspace_baseline(&dispatch_call);
                 let baseline_capture = async {
                     let prefetched_workspace_evidence =
-                        if let Some(classification) = evidence_capture_classification {
+                        if evidence_capture_classification.is_some() {
                             // The repository lease must precede baseline work. A queued
                             // call must neither spend Git/disk resources nor carry an
                             // observation made before its execution boundary.
@@ -2752,16 +2573,6 @@ impl ToolCallRuntime {
                                         "resource:evidence_tracker", evidence_tracker.lock(),
                                     ).await.current_mutation_revision()
                                 };
-                            if passive_poll
-                                && let Some(parent_call_id) = code_mode_parent_call_id.as_deref()
-                            {
-                                step_context
-                                    .workspace_evidence_generation_batch
-                                    .record_code_mode_workspace_observation(
-                                        parent_call_id,
-                                        admitted_mutation_revision,
-                                    );
-                            }
                             if let Some(slot) = admitted_revision.as_ref() {
                                 *slot
                                     .lock()
@@ -2770,47 +2581,10 @@ impl ToolCallRuntime {
                             }
                             timing.record_boundary(ToolLifecycleBoundary::EvidenceTrackerWaitEnd);
                             let evidence_capture_started = Instant::now();
-                            let baseline = step_context
-                                .workspace_evidence_generation_batch
-                                .capture_baseline_for_tool(
-                                    session.services.git_workspace.as_ref(),
-                                    Some(&turn),
-                                    classification,
-                                    admission_tool_name.name.as_str(),
-                                    admitted_mutation_revision,
-                                )
-                                .await;
+                            let baseline = WorkspaceEvidenceBaseline;
                             let capture_duration = evidence_capture_started.elapsed();
                             timing.record_workspace_evidence_before(capture_duration);
-                            timing.record_workspace_evidence_before_attribution(
-                                baseline.cache_hit,
-                                baseline
-                                    .timed_out_git_dependencies
-                                    .iter()
-                                    .map(|dependency| dependency.as_str().to_string())
-                                    .collect(),
-                            );
-                            if !baseline.revision.as_ref().is_some_and(|identity| {
-                                !identity.unavailable
-                                    && !baseline.source_path_observations.is_empty()
-                                    && identity.repository_root.is_some()
-                                    && identity.worktree_identity.is_none()
-                            }) && turn
-                                .environments
-                                .primary()
-                                .is_some_and(|environment| !environment.environment.is_remote())
-                            {
-                                session
-                                    .services
-                                    .command_execution
-                                    .observe_workspace_baseline(
-                                        &turn.sub_id,
-                                        admitted_mutation_revision,
-                                        &classification.workspace_cwd,
-                                        baseline.revision.clone(),
-                                    )
-                                    .await;
-                            }
+                            timing.record_workspace_evidence_before_attribution(false, Vec::new());
                             if let Some(slot) = workspace_evidence_baseline_slot.as_ref() {
                                 // Nested dispatch still owns history evidence. Exporting
                                 // replay proof must not consume its pre-read baseline.
@@ -2880,23 +2654,13 @@ impl ToolCallRuntime {
                         if passive_poll {
                             // Retain admission ordering, not a claim that later process
                             // output observes this epoch. Its evidence stays unverified.
-                            step_context
-                                .workspace_evidence_generation_batch
-                                .record_workspace_observation(&evidence_call.call_id);
                             drop(gate_guard.take());
                         }
                         (baseline, dispatch.await)
                     };
-                let (evidence_revision_before, evidence_mutation_revision_before) =
-                    prefetched_workspace_evidence.unzip();
+                let evidence_revision_before =
+                    prefetched_workspace_evidence.map(|(baseline, _)| baseline);
                 timing.mark_output_collected();
-                // Ordinary calls retain effect ordering under the lease. Passive
-                // polls recorded admission above and never claim current evidence.
-                if tracks_workspace && !passive_poll {
-                    step_context
-                        .workspace_evidence_generation_batch
-                        .record_workspace_observation(&evidence_call.call_id);
-                }
                 if post_dispatch_state.is_aborted() {
                     return result;
                 }
@@ -2915,8 +2679,7 @@ impl ToolCallRuntime {
                                 .ok()
                                 .map(|result| &result.payload)
                                 .filter(|payload| *payload != &evidence_call.payload),
-                            turn.config.cwd.as_path(),
-                            &step_context.environments,
+                            &step_context,
                         )
                         .await?,
                     ),
@@ -2964,22 +2727,6 @@ impl ToolCallRuntime {
                         return result;
                     };
                     let evidence_capture_started = Instant::now();
-                    let mutation_revision =
-                        evidence_tracker.lock().await.current_mutation_revision();
-                    if !passive_poll
-                        && let Some(parent_call_id) = code_mode_parent_call_id.as_deref()
-                    {
-                        // Record while the workspace lease is held. Registration
-                        // can release it before persisting the observation.
-                        step_context
-                            .workspace_evidence_generation_batch
-                            .record_code_mode_workspace_observation(
-                                parent_call_id,
-                                mutation_revision,
-                            );
-                    }
-                    let mutation_advanced = evidence_mutation_revision_before
-                        .is_some_and(|before| mutation_revision > before);
                     let workspace_evidence_deferred = if passive_poll {
                         drop(gate_guard);
                         Self::register_passive_poll_evidence(
@@ -2996,13 +2743,10 @@ impl ToolCallRuntime {
                             WorkspaceEvidenceAfterCall {
                                 response,
                                 baseline: evidence_revision_before,
-                                mutation_advanced,
                                 source_dependencies_override,
                                 classification,
                                 workspace_gate_guard: gate_guard,
                             },
-                            Some(&step_context.workspace_evidence_generation_batch),
-                            Some(Arc::clone(&timing)),
                         )
                         .await
                     };

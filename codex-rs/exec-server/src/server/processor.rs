@@ -164,13 +164,7 @@ async fn run_connection_with_shutdown(
                     None => break,
                 },
             };
-            let json_message = match encode_server_message(message) {
-                Ok(json_message) => json_message,
-                Err(err) => {
-                    warn!("failed to serialize exec-server outbound message: {err}");
-                    break;
-                }
-            };
+            let json_message = encode_server_message(message);
             if tokio::select! {
                 biased;
                 _ = outbound_cancelled.cancelled() => true,

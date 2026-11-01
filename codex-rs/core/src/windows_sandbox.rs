@@ -1,100 +1,20 @@
-use crate::config::Config;
 use crate::config::edit::ConfigEditsBuilder;
-use codex_config::config_toml::ConfigToml;
-use codex_config::types::WindowsSandboxModeToml;
-use codex_features::Feature;
-use codex_features::Features;
-use codex_features::FeaturesToml;
 use codex_login::default_client::originator;
 use codex_otel::sanitize_metric_tag_value;
-use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
-pub trait WindowsSandboxLevelExt {
-    fn from_config(config: &Config) -> WindowsSandboxLevel;
-    fn from_features(features: &Features) -> WindowsSandboxLevel;
-}
-
-impl WindowsSandboxLevelExt for WindowsSandboxLevel {
-    fn from_config(config: &Config) -> WindowsSandboxLevel {
-        match config.permissions.windows_sandbox_mode {
-            Some(WindowsSandboxModeToml::Elevated) => WindowsSandboxLevel::Elevated,
-            Some(WindowsSandboxModeToml::Unelevated) => WindowsSandboxLevel::RestrictedToken,
-            None => Self::from_features(&config.features),
-        }
-    }
-
-    fn from_features(features: &Features) -> WindowsSandboxLevel {
-        if features.enabled(Feature::WindowsSandboxElevated) {
-            return WindowsSandboxLevel::Elevated;
-        }
-        if features.enabled(Feature::WindowsSandbox) {
-            WindowsSandboxLevel::RestrictedToken
-        } else {
-            WindowsSandboxLevel::Disabled
-        }
-    }
-}
-
-pub fn windows_sandbox_level_from_config(config: &Config) -> WindowsSandboxLevel {
-    WindowsSandboxLevel::from_config(config)
-}
-
-pub fn windows_sandbox_level_from_features(features: &Features) -> WindowsSandboxLevel {
-    WindowsSandboxLevel::from_features(features)
-}
-
-pub fn resolve_windows_sandbox_mode(cfg: &ConfigToml) -> Option<WindowsSandboxModeToml> {
-    cfg.windows
-        .as_ref()
-        .and_then(|windows| windows.sandbox)
-        .or_else(|| legacy_windows_sandbox_mode(cfg.features.as_ref()))
-}
-
-pub fn resolve_windows_sandbox_private_desktop(cfg: &ConfigToml) -> bool {
-    cfg.windows
-        .as_ref()
-        .and_then(|windows| windows.sandbox_private_desktop)
-        .unwrap_or(true)
-}
-
-pub fn legacy_windows_sandbox_mode(
-    features: Option<&FeaturesToml>,
-) -> Option<WindowsSandboxModeToml> {
-    let entries = features.map(FeaturesToml::entries)?;
-    legacy_windows_sandbox_mode_from_entries(&entries)
-}
-
-pub fn legacy_windows_sandbox_mode_from_entries(
-    entries: &BTreeMap<String, bool>,
-) -> Option<WindowsSandboxModeToml> {
-    if entries
-        .get(Feature::WindowsSandboxElevated.key())
-        .copied()
-        .unwrap_or(false)
-    {
-        return Some(WindowsSandboxModeToml::Elevated);
-    }
-    if entries
-        .get(Feature::WindowsSandbox.key())
-        .copied()
-        .unwrap_or(false)
-        || entries
-            .get("enable_experimental_windows_sandbox")
-            .copied()
-            .unwrap_or(false)
-    {
-        Some(WindowsSandboxModeToml::Unelevated)
-    } else {
-        None
-    }
-}
+pub use codex_runtime_config::windows_sandbox::WindowsSandboxLevelExt;
+pub use codex_runtime_config::windows_sandbox::windows_sandbox_level_from_config;
+pub use codex_runtime_config::windows_sandbox::windows_sandbox_level_from_features;
+pub use codex_runtime_config::windows_sandbox::resolve_windows_sandbox_mode;
+pub use codex_runtime_config::windows_sandbox::resolve_windows_sandbox_private_desktop;
+pub use codex_runtime_config::windows_sandbox::legacy_windows_sandbox_mode;
+pub use codex_runtime_config::windows_sandbox::legacy_windows_sandbox_mode_from_entries;
 
 pub fn sandbox_setup_is_complete(codex_home: &Path) -> bool {
     codex_windows_sandbox::sandbox_setup_is_complete(codex_home)

@@ -862,7 +862,6 @@ fn persist_agent_identity_record(
     let mut auth = expected.clone();
     if auth.resolved_mode() != AuthMode::Chatgpt
         || auth.tokens.as_ref() != Some(expected_tokens)
-        || guard.as_ref().and_then(|auth| auth.tokens.as_ref()) != Some(expected_tokens)
     {
         return Err(std::io::Error::other("authentication changed during identity bootstrap"));
     }
@@ -2110,23 +2109,7 @@ impl UnauthorizedRecovery {
                     }
                 }
             }
-            UnauthorizedRecoveryStep::RefreshToken => {
-                let refreshed = self.manager
-                    .refresh_token_for_recovery(
-                        self.expected_epoch,
-                        self.expected_account_id.as_deref(),
-                        rejected_revision,
-                    )
-                    .await?;
-                if !refreshed {
-                    return Ok(self.reuse_replacement());
-                }
-                self.step = UnauthorizedRecoveryStep::Done;
-                return Ok(UnauthorizedRecoveryStepResult {
-                    auth_state_changed: Some(true),
-                });
-            }
-            UnauthorizedRecoveryStep::ExternalRefresh => {
+            UnauthorizedRecoveryStep::RefreshToken | UnauthorizedRecoveryStep::ExternalRefresh => {
                 let refreshed = self.manager
                     .refresh_token_for_recovery(
                         self.expected_epoch,

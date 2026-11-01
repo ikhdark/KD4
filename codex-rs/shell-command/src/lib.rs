@@ -27,10 +27,6 @@ pub fn escape_powershell_single_quoted(input: &str) -> String {
     escaped
 }
 
-/// Renders one PowerShell single-quoted string literal.
-pub fn quote_powershell_single_quoted(input: &str) -> String {
-    format!("'{}'", escape_powershell_single_quoted(input))
-}
 
 /// Quote one Windows command-line argument using the rules followed by
 /// `CommandLineToArgvW` and the Microsoft C runtime.

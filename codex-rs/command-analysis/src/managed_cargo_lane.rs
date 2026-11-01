@@ -21,7 +21,10 @@ fn rejected(detail: &str) -> String {
 /// Inside a tree that publishes a lane marker, the neutral "no repository-specific
 /// runner" advice contradicts that tree's own managed entrypoint, so name the
 /// marker instead and let the caller consult its documented runner.
-fn rejected_build(detail: &str, cwd: &Path) -> String {
+fn rejected_build(detail: &str, cwd: &Path, allow_native_filesystem_reads: bool) -> String {
+    if !allow_native_filesystem_reads {
+        return rejected("Cannot inspect managed target ownership under restricted filesystem read permissions.");
+    }
     match managed_target(cwd) {
         Ok(Some(root)) => format!(
             "Raw Cargo launch rejected; no build started. {detail} Cargo admission resolves the command's effective target/build directories; this tree is reserved by a lane marker under {}, so use the managed test/build entrypoint documented for it rather than a raw Cargo command.",
@@ -35,6 +38,7 @@ pub async fn check_managed_cargo_lane(
     command: &[String],
     cwd: &Path,
     env: &HashMap<String, String>,
+    allow_native_filesystem_reads: bool,
 ) -> Result<(), String> {
     // Decode identity before taking the non-Cargo path: shell quoting and
     // EncodedCommand can hide even a literal Cargo program from a raw scan.
@@ -50,7 +54,7 @@ pub async fn check_managed_cargo_lane(
         return Ok(());
     }
     let (command, cwd, env) = (command.to_vec(), cwd.to_path_buf(), env.clone());
-    crate::run_blocking_command_analysis(move || check(&command, &cwd, &env, 0))
+    crate::run_blocking_command_analysis(move || check(&command, &cwd, &env, 0, allow_native_filesystem_reads))
         .await
         .map_err(|error| rejected(&format!("Target admission worker failed: {error}")))?
 }
@@ -60,6 +64,7 @@ fn check(
     cwd: &Path,
     env: &HashMap<String, String>,
     depth: usize,
+    allow_native_filesystem_reads: bool,
 ) -> Result<(), String> {
     if depth > 8 {
         return Err(rejected(
@@ -109,7 +114,7 @@ fn check(
                 .map_err(|_| rejected("PowerShell EncodedCommand is not UTF-16LE."))?;
             let mut decoded = command[..index + 1].to_vec();
             decoded.extend(["-Command".into(), script]);
-            return check(&decoded, cwd, env, depth + 1);
+            return check(&decoded, cwd, env, depth + 1, allow_native_filesystem_reads);
         }
         let parsed = std::cell::OnceCell::new();
         let parsed = || parsed.get_or_init(|| argv_commands(command, Some(shell)));
@@ -136,7 +141,7 @@ fn check(
                 .filter(|stage| !stage.iter().any(|arg| arg.contains(['%', '!']))),
         };
         if let Some(argv) = standalone {
-            return check(&argv, cwd, env, depth + 1);
+            return check(&argv, cwd, env, depth + 1, allow_native_filesystem_reads);
         }
         // Flattening cannot prove the effective cwd/environment of a build.
         // A failed precise lowering must not turn a visible build into admission.
@@ -148,12 +153,13 @@ fn check(
             return Err(rejected_build(
                 "Cannot resolve Cargo's effective shell state; use standalone literal argv.",
                 cwd,
+                allow_native_filesystem_reads,
             ));
         }
         // Read-only commands remain admissible.
         if let Some(stages) = parsed() {
             for stage in stages {
-                check(stage, cwd, env, depth + 1)?;
+                check(stage, cwd, env, depth + 1, allow_native_filesystem_reads)?;
             }
         }
         return Ok(());
@@ -250,7 +256,7 @@ fn check(
                 break;
             }
         }
-        return check(&args[start..], &child_cwd, &child, depth + 1);
+        return check(&args[start..], &child_cwd, &child, depth + 1, allow_native_filesystem_reads);
     }
     if program_name(program).eq_ignore_ascii_case("call") {
         return check(
@@ -258,6 +264,7 @@ fn check(
             cwd,
             env,
             depth + 1,
+            allow_native_filesystem_reads,
         );
     }
     if !program_name(program).eq_ignore_ascii_case("cargo") {
@@ -274,6 +281,12 @@ fn check(
     }
     if cargo_builtin(subcommand) && !raw_build(command) {
         return Ok(());
+    }
+    // Configuration, aliases, workspace membership and target identity below
+    // use native reads. Refuse rather than skipping mandatory lane admission
+    // or treating a sandboxed command as a grant for host-side inspection.
+    if !allow_native_filesystem_reads {
+        return Err(rejected("Cargo target admission requires unrestricted host filesystem read permissions; no configuration was read and no command was started."));
     }
     let original_cwd = cwd;
     let mut cwd = cwd.to_path_buf();
@@ -360,7 +373,7 @@ fn check(
             let mut expanded = command[..subcommand_index + 1].to_vec();
             expanded.extend(words);
             expanded.extend_from_slice(&args[subcommand_index + 1..]);
-            return check(&expanded, original_cwd, env, depth + 1);
+            return check(&expanded, original_cwd, env, depth + 1, allow_native_filesystem_reads);
         }
     }
     if !raw_build(command) {

@@ -11,7 +11,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tonic_prost_build::configure()
         .build_client(true)
-        .build_server(true)
+        .build_server(false)
         .out_dir(&proto_dir)
         .compile_protos(&[proto_file], std::slice::from_ref(&proto_dir))?;
 

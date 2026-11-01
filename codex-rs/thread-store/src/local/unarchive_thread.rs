@@ -15,33 +15,18 @@ pub(super) async fn unarchive_thread(
     store: &LocalThreadStore,
     params: ArchiveThreadParams,
 ) -> ThreadStoreResult<StoredThread> {
-    unarchive_thread_with_touch(store, params, touch_modified_time).await
-}
-
-async fn unarchive_thread_with_touch<F>(
-    store: &LocalThreadStore,
-    params: ArchiveThreadParams,
-    touch: F,
-) -> ThreadStoreResult<StoredThread>
-where
-    F: FnOnce(&std::path::Path) -> std::io::Result<()> + Send + 'static,
-{
     let store = store.clone();
-    tokio::spawn(async move { unarchive_thread_owned(&store, params, touch).await })
+    tokio::spawn(async move { unarchive_thread_owned(&store, params).await })
         .await
         .map_err(|error| ThreadStoreError::Internal {
             message: error.to_string(),
         })?
 }
 
-async fn unarchive_thread_owned<F>(
+async fn unarchive_thread_owned(
     store: &LocalThreadStore,
     params: ArchiveThreadParams,
-    touch: F,
-) -> ThreadStoreResult<StoredThread>
-where
-    F: FnOnce(&std::path::Path) -> std::io::Result<()> + Send + 'static,
-{
+) -> ThreadStoreResult<StoredThread> {
     let thread_id = params.thread_id;
     let _lease = store.acquire_writer_lease(thread_id, false).await?;
     let state_db_ctx = store.state_db().await;
@@ -118,7 +103,7 @@ where
     }
 
     let touch_result = tokio::task::spawn_blocking(move || {
-        touch(restored_path.as_path())?;
+        touch_modified_time(restored_path.as_path())?;
         std::fs::metadata(&restored_path)?.modified()
     })
     .await

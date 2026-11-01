@@ -1,10 +1,8 @@
 /*
 Module: orchestrator
 
-Central place for approvals + sandbox selection + retry semantics. Drives a
-simple sequence for any ToolRuntime: approval → select sandbox → attempt →
-retry with an escalated sandbox strategy only when a denial is proven safe to
-replay (no re-approval thanks to caching).
+Central place for approvals and sandbox selection. Each ToolRuntime gets one
+attempt; a completed sandbox-denial result does not prove replay is safe.
 */
 use crate::hook_runtime::run_permission_request_hooks;
 use crate::tools::flat_tool_name;
@@ -17,15 +15,14 @@ use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::ToolRuntime;
 use crate::tools::sandboxing::default_exec_approval_requirement;
 use crate::tools::sandboxing::sandbox_override_for_first_attempt;
-use crate::tools::sandboxing::unsandboxed_execution_allowed;
 use codex_hooks::PermissionRequestDecision;
 use codex_otel::ToolDecisionSource;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
-use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ReviewDecision;
 use codex_sandboxing::SandboxType;
+use codex_sandboxing::SandboxablePreference;
 use codex_sandboxing::select_initial;
 use codex_sandboxing::should_sandbox;
 use std::time::Instant;
@@ -72,8 +69,6 @@ impl ToolOrchestrator {
         let otel_ci = &tool_ctx.call_id;
 
         // 1) Approval
-        let mut already_approved = false;
-
         let file_system_sandbox_policy = turn_ctx.file_system_sandbox_policy();
         let network_sandbox_policy = turn_ctx.network_sandbox_policy();
         let requirement = tool.exec_approval_requirement(req).unwrap_or_else(|| {
@@ -110,7 +105,6 @@ impl ToolOrchestrator {
                 .await?;
 
                 Self::reject_if_not_approved(decision).await?;
-                already_approved = true;
             }
         }
 
@@ -120,7 +114,7 @@ impl ToolOrchestrator {
             &requirement,
             &file_system_sandbox_policy,
         );
-        let sandbox_preference = tool.sandbox_preference();
+        let sandbox_preference = SandboxablePreference::Auto;
         let sandbox_requested = match sandbox_override {
             SandboxOverride::BypassSandboxFirstAttempt => false,
             SandboxOverride::NoOverride => should_sandbox(
@@ -171,167 +165,6 @@ impl ToolOrchestrator {
                 Ok(OrchestratorRunResult {
                     output: out,
                 })
-            }
-            Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
-                output,
-                network_policy_decision,
-            }))) => {
-                if network_policy_decision.is_some() {
-                    otel.sandbox_outcome(
-                        &otel_tn,
-                        otel_ci,
-                        "denied",
-                        initial_duration,
-                        /*escalated_duration*/ None,
-                    );
-                    return Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
-                        output,
-                        network_policy_decision,
-                    })));
-                }
-                if !tool.escalate_on_failure() || !tool.sandbox_denial_replay_is_safe() {
-                    otel.sandbox_outcome(
-                        &otel_tn,
-                        otel_ci,
-                        "denied",
-                        initial_duration,
-                        /*escalated_duration*/ None,
-                    );
-                    return Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
-                        output,
-                        network_policy_decision,
-                    })));
-                }
-                let unsandboxed_allowed =
-                    unsandboxed_execution_allowed(&file_system_sandbox_policy);
-                // Under `Never` or `OnRequest`, do not retry without sandbox;
-                // surface a concise sandbox denial that preserves the
-                // original output.
-                if !tool.wants_no_sandbox_approval(approval_policy) {
-                    otel.sandbox_outcome(
-                        &otel_tn, otel_ci, "denied", initial_duration, None,
-                    );
-                    return Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
-                        output, network_policy_decision,
-                    })));
-                }
-                if !unsandboxed_allowed {
-                    otel.sandbox_outcome(
-                        &otel_tn,
-                        otel_ci,
-                        "denied",
-                        initial_duration,
-                        /*escalated_duration*/ None,
-                    );
-                    return Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
-                        output,
-                        network_policy_decision,
-                    })));
-                }
-                let bypass_retry_approval = tool
-                    .should_bypass_approval(approval_policy, already_approved);
-                if !bypass_retry_approval {
-                    let retry_reason = build_denial_reason_from_output(output.as_ref());
-                    let approval_ctx = ApprovalCtx {
-                        session: &tool_ctx.session,
-                        turn: &tool_ctx.turn,
-                        call_id: &tool_ctx.call_id,
-                        retry_reason: Some(retry_reason),
-                        network_approval_context: None,
-                    };
-
-                    let permission_request_run_id = format!("{}:retry", tool_ctx.call_id);
-                    let decision = Self::request_approval(
-                        tool,
-                        req,
-                        &permission_request_run_id,
-                        approval_ctx,
-                        tool_ctx,
-                        &otel,
-                    )
-                    .await;
-                    let approved = match decision {
-                        Ok(decision) => Self::reject_if_not_approved(decision).await,
-                        Err(error) => Err(error),
-                    };
-                    if let Err(error) = approved {
-                        return Err(ToolError::Denied(format!(
-                            "retry refused; no second attempt: {error:?}\nInitial command exit code: {}\nCommand output:\n{}",
-                            output.exit_code,
-                            bounded_denial_diagnostic(output.as_ref())
-                                .unwrap_or_else(|| "[no diagnostic output]".into()),
-                        )));
-                    }
-                }
-
-                let retry_sandbox_requested = !unsandboxed_allowed
-                    && should_sandbox(
-                        &file_system_sandbox_policy,
-                        network_sandbox_policy,
-                        sandbox_preference,
-                        false,
-                    );
-                let retry_sandbox = if retry_sandbox_requested {
-                    select_initial(
-                        &file_system_sandbox_policy,
-                        network_sandbox_policy,
-                        sandbox_preference,
-                        turn_ctx.windows_sandbox_level,
-                        false,
-                    )
-                } else {
-                    SandboxType::None
-                };
-                let retry_attempt = SandboxAttempt {
-                    codex_home: &turn_ctx.config.codex_home,
-                    sandbox: retry_sandbox,
-                    sandbox_requested: retry_sandbox_requested,
-                    permissions: &turn_ctx.permission_profile,
-                    exec_server_permissions: turn_ctx.config.permissions.permission_profile(),
-                    sandbox_cwd: &sandbox_policy_cwd,
-                    workspace_roots,
-                    windows_sandbox_level: turn_ctx.windows_sandbox_level,
-                    windows_sandbox_private_desktop: turn_ctx
-                        .config
-                        .permissions
-                        .windows_sandbox_private_desktop,
-                                };
-
-                // Second attempt.
-                if let Some(timing) =
-                    crate::tools::tool_dispatch_trace::active_tool_dispatch_timing()
-                {
-                    timing.increment_retry_count();
-                }
-                let escalated_attempt_start = Instant::now();
-                let retry_result = Self::run_attempt(tool, req, tool_ctx, &retry_attempt).await;
-                let escalated_duration = escalated_attempt_start.elapsed();
-                match retry_result {
-                    Ok(output) => {
-                        otel.sandbox_outcome(
-                            &otel_tn,
-                            otel_ci,
-                            "escalated",
-                            initial_duration,
-                            Some(escalated_duration),
-                        );
-                        Ok(OrchestratorRunResult {
-                            output,
-                        })
-                    }
-                    Err(err) => {
-                        if let Some(outcome) = sandbox_outcome_from_tool_error(&err) {
-                            otel.sandbox_outcome(
-                                &otel_tn,
-                                otel_ci,
-                                outcome,
-                                initial_duration,
-                                Some(escalated_duration),
-                            );
-                        }
-                        Err(err)
-                    }
-                }
             }
             Err(err) => {
                 if let Some(outcome) = sandbox_outcome_from_tool_error(&err) {
@@ -432,30 +265,3 @@ fn sandbox_outcome_from_tool_error(err: &ToolError) -> Option<&'static str> {
         ToolError::Denied(_) | ToolError::Rejected(_) | ToolError::Codex(_) => None,
     }
 }
-
-fn build_denial_reason_from_output(output: &ExecToolCallOutput) -> String {
-    let reason = "command failed; retry without sandbox?";
-    match bounded_denial_diagnostic(output) {
-        Some(excerpt) => format!("{reason}\nCommand output:\n{excerpt}"),
-        None => reason.to_string(),
-    }
-}
-
-fn bounded_denial_diagnostic(output: &ExecToolCallOutput) -> Option<String> {
-    let diagnostic = [
-        &output.stderr.text,
-        &output.aggregated_output.text,
-        &output.stdout.text,
-    ]
-    .into_iter()
-    .map(|text| text.trim())
-    .find(|text| !text.is_empty());
-    let diagnostic = diagnostic?;
-    let mut chars = diagnostic.chars();
-    let mut excerpt: String = chars.by_ref().take(1_024).collect();
-    if chars.next().is_some() {
-        excerpt.push('…');
-    }
-    Some(excerpt)
-}
-

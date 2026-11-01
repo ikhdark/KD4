@@ -23,7 +23,7 @@ axum = { workspace = true, default-features = false, features = [
 base64 = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 codex-api = { workspace = true }
-codex-app-server-protocol = { workspace = true }
+codex-app-server-protocol-types = { workspace = true }
 codex-client = { workspace = true }
 codex-http-client = { workspace = true }
 codex-login = { workspace = true }

@@ -177,12 +177,10 @@ fn build_exec_otel_provider(
     )
 }
 
-enum InitialOperation {
-    UserTurn {
-        items: Vec<UserInput>,
-        output_schema: Option<Value>,
-        allow_no_prose: bool,
-    },
+struct InitialOperation {
+    items: Vec<UserInput>,
+    output_schema: Option<Value>,
+    allow_no_prose: bool,
 }
 
 enum StdinPromptBehavior {
@@ -308,13 +306,10 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     )
     .await?;
 
-    let (_stdout_with_ansi, stderr_with_ansi) = match color {
-        cli::Color::Always => (true, true),
-        cli::Color::Never => (false, false),
-        cli::Color::Auto => (
-            supports_color::on_cached(Stream::Stdout).is_some(),
-            supports_color::on_cached(Stream::Stderr).is_some(),
-        ),
+    let stderr_with_ansi = match color {
+        cli::Color::Always => true,
+        cli::Color::Never => false,
+        cli::Color::Auto => supports_color::on_cached(Stream::Stderr).is_some(),
     };
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_ansi(stderr_with_ansi)
@@ -711,12 +706,6 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
             last_message_file.clone(),
         )),
     };
-    if let Some(ExecCommand::Resume(args)) = command.as_ref()
-        && !args.last
-        && args.session_id.is_none()
-    {
-        anyhow::bail!("resume requires a session ID or name, or the --last flag");
-    }
     if oss {
         // We're in the oss section, so provider_id should be Some
         // Let's handle None case gracefully though just in case
@@ -868,12 +857,12 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
         .in_current_span(),
     );
 
-    let task_id = match initial_operation {
-        InitialOperation::UserTurn {
+    let task_id = {
+        let InitialOperation {
             items,
             output_schema,
             allow_no_prose,
-        } => {
+        } = initial_operation;
             event_processor.record_turn_submission();
             let response: TurnStartResponse = send_request_with_response(
                 &client,
@@ -910,7 +899,6 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
             let task_id = response.turn.id;
             info!("Sent prompt with event ID: {task_id}");
             task_id
-        }
     };
     exec_span.record("turn.id", task_id.as_str());
 
@@ -1629,6 +1617,11 @@ async fn resolve_resume_thread_id(
             )
             .await?;
         for thread in titled_threads {
+            // A first-message fallback is not a name; let genuine legacy names
+            // resolve through the compatibility index below.
+            if thread.thread_name() != Some(session_id) {
+                continue;
+            }
             if args.all || cwds_match(config.cwd.as_path(), &thread.cwd) {
                 return Ok(thread.id.to_string());
             }
@@ -2014,7 +2007,7 @@ async fn prepare_initial_operation(
         });
     }
     Ok((
-        InitialOperation::UserTurn {
+        InitialOperation {
             items,
             output_schema,
             allow_no_prose,

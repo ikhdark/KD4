@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::ffi::OsString;
 
 pub const FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME: &str = "codex-connectivity-diagnostics.txt";
 const PROXY_ENV_VARS: &[&str] = &[
@@ -31,17 +30,8 @@ impl FeedbackDiagnostics {
     }
 
     pub fn collect_from_env() -> Self {
-        Self::collect_from_pairs(std::env::vars_os())
-    }
-
-    fn collect_from_pairs<I, K, V>(pairs: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: Into<OsString>,
-    {
-        let env = pairs
-            .into_iter()
-            .filter_map(|(key, _)| key.into().into_string().ok())
+        let env = std::env::vars_os()
+            .filter_map(|(key, _)| key.into_string().ok())
             .map(|key| {
                 if cfg!(windows) {
                     key.to_ascii_uppercase()

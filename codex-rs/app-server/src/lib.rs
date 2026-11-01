@@ -1,6 +1,9 @@
 #![recursion_limit = "256"]
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
+use codex_app_server_config::config_manager;
+use codex_app_server_config::config_warnings::{config_warning_from_error, exec_policy_config_warning};
+use codex_app_server_rpc::{error_code, outgoing_message};
 use codex_arg0::Arg0DispatchPaths;
 use codex_config::ConfigLayerStackOrdering;
 use codex_config::LoaderOverrides;
@@ -27,13 +30,12 @@ use std::time::Duration;
 use crate::analytics_utils::analytics_events_client_from_config;
 use crate::config_manager::ConfigManager;
 use crate::connection_cleanup::ConnectionCleanupTasks;
-use crate::message_processor::MessageProcessor;
-use crate::message_processor::MessageProcessorArgs;
+use codex_app_server_handlers::MessageProcessor;
+use codex_app_server_handlers::MessageProcessorArgs;
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingEnvelope;
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::QueuedOutgoingMessage;
-use crate::thread_state::ConnectionCapabilities;
 use crate::transport::CHANNEL_CAPACITY;
 use crate::transport::ConnectionOrigin;
 use crate::transport::ConnectionState;
@@ -52,17 +54,12 @@ use crate::transport::start_stdio_connection;
 use crate::transport::start_websocket_acceptor;
 use crate::transport::validate_websocket_listener;
 use codex_analytics::AppServerRpcTransport;
-use codex_app_server_protocol::ConfigWarningNotification;
-use codex_app_server_protocol::JSONRPCMessage;
-use codex_app_server_protocol::JSONRPCRequest;
-use codex_app_server_protocol::RemoteControlStatusChangedNotification;
-use codex_app_server_protocol::ServerNotification;
-use codex_app_server_protocol::TextPosition as AppTextPosition;
-use codex_app_server_protocol::TextRange as AppTextRange;
+use codex_app_server_protocol_types::ConfigWarningNotification;
+use codex_app_server_protocol_types::JSONRPCMessage;
+use codex_app_server_protocol_types::JSONRPCRequest;
+use codex_app_server_protocol_types::RemoteControlStatusChangedNotification;
+use codex_app_server_protocol_types::ServerNotification;
 use codex_config::ConfigLayerSource;
-use codex_config::ConfigLoadError;
-use codex_config::TextRange as CoreTextRange;
-use codex_core::ExecPolicyError;
 use codex_core::check_execpolicy_for_warnings;
 use codex_core::config::find_codex_home;
 use codex_exec_server::EnvironmentManager;
@@ -105,39 +102,8 @@ fn emit_startup_warning(warning: &ConfigWarningNotification) {
 }
 
 mod analytics_utils;
-mod app_info;
-mod app_server_tracing;
-mod attestation;
-mod bespoke_event_handling;
-mod build_info;
-mod command_exec;
-mod config_layer;
-mod config_manager;
-mod config_manager_service;
 mod connection_cleanup;
-mod connection_rpc_gate;
-mod current_time;
-mod dynamic_tools;
-mod error_code;
-mod extensions;
-mod external_auth;
-mod filters;
-mod fs_watch;
-mod fuzzy_file_search;
-mod image_url;
 pub mod in_process;
-mod mcp_refresh;
-mod message_processor;
-mod models;
-mod models_refresh_worker;
-mod outgoing_message;
-mod request_processors;
-mod request_serialization;
-mod runtime_provenance;
-mod server_request_error;
-mod skills_watcher;
-mod thread_state;
-mod thread_status;
 mod transport;
 
 pub use crate::error_code::INPUT_TOO_LARGE_ERROR_CODE;
@@ -284,15 +250,8 @@ async fn process_connection_request(
         }
         connection.outbound_experimental_api_enabled
             .store(experimental_api_enabled, std::sync::atomic::Ordering::Release);
-        processor.initialize_processor
-            .send_initialize_notifications_to_connection(connection_id).await;
-        processor.thread_processor.thread_state_manager.connection_initialized(
-            connection_id,
-            ConnectionCapabilities {
-                request_attestation: connection.session.request_attestation(),
-                experimental_api: experimental_api_enabled,
-            },
-        ).await;
+        processor.send_initialize_notifications_to_connection(connection_id).await;
+        processor.connection_initialized(connection_id, &connection.session).await;
         // Serialize the initial snapshot and readiness with changed-status sends.
         // Sample only after acquiring publication ownership: a value captured
         // before initialization can otherwise overwrite a newer broadcast.
@@ -454,69 +413,6 @@ impl ShutdownState {
     }
 }
 
-fn config_warning_from_error(
-    summary: impl Into<String>,
-    err: &std::io::Error,
-) -> ConfigWarningNotification {
-    let (path, range) = match config_error_location(err) {
-        Some((path, range)) => (Some(path), Some(range)),
-        None => (None, None),
-    };
-    ConfigWarningNotification {
-        summary: summary.into(),
-        details: Some(err.to_string()),
-        path,
-        range,
-    }
-}
-
-fn config_error_location(err: &std::io::Error) -> Option<(String, AppTextRange)> {
-    err.get_ref()
-        .and_then(|err| err.downcast_ref::<ConfigLoadError>())
-        .map(|err| {
-            let config_error = err.config_error();
-            (
-                config_error.path.to_string_lossy().to_string(),
-                app_text_range(&config_error.range),
-            )
-        })
-}
-
-fn exec_policy_warning_location(err: &ExecPolicyError) -> (Option<String>, Option<AppTextRange>) {
-    match err {
-        ExecPolicyError::ParsePolicy { path, source } => {
-            if let Some(location) = source.location() {
-                return (Some(location.path), Some(app_text_range(&location.range)));
-            }
-            (Some(path.clone()), None)
-        }
-        _ => (None, None),
-    }
-}
-
-fn exec_policy_config_warning(err: &ExecPolicyError) -> ConfigWarningNotification {
-    let (path, range) = exec_policy_warning_location(err);
-    ConfigWarningNotification {
-        summary: "Error parsing rules; custom rules not applied.".to_string(),
-        details: Some(err.to_string()),
-        path,
-        range,
-    }
-}
-
-fn app_text_range(range: &CoreTextRange) -> AppTextRange {
-    AppTextRange {
-        start: AppTextPosition {
-            line: range.start.line,
-            column: range.start.column,
-        },
-        end: AppTextPosition {
-            line: range.end.line,
-            column: range.end.column,
-        },
-    }
-}
-
 fn project_config_warning(config: &Config) -> Option<ConfigWarningNotification> {
     let mut disabled_folders = Vec::new();
 
@@ -573,11 +469,7 @@ fn log_format_from_env() -> LogFormat {
     LogFormat::from_env_value(value.as_deref())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PluginStartupTasks {
-    Start,
-    Skip,
-}
+pub use codex_app_server_handlers::PluginStartupTasks;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppServerRuntimeOptions {
@@ -1060,11 +952,8 @@ pub async fn run_main(
             remote_control_handle: Some(remote_control_handle.clone()),
             plugin_startup_tasks: runtime_options.plugin_startup_tasks,
         }));
-        let mut thread_created_rx = processor.thread_manager.subscribe_thread_created();
-        let mut running_turn_count_rx = processor
-            .thread_processor
-            .thread_watch_manager
-            .subscribe_running_turn_count();
+        let mut thread_created_rx = processor.subscribe_thread_created();
+        let mut running_turn_count_rx = processor.subscribe_running_turn_count();
         let mut connections = HashMap::<ConnectionId, Arc<ConnectionState>>::new();
         let mut connection_cleanup_tasks = ConnectionCleanupTasks::new();
         // Initialization watchdogs share `connection_cleanup_tasks`; release them
@@ -1129,12 +1018,13 @@ pub async fn run_main(
                     _ = tokio::time::sleep_until(shutdown_state.deadline.unwrap_or_else(|| tokio::time::Instant::now() + SHUTDOWN_TIMEOUT)), if shutdown_state.requested() => {
                         shutdown_state.forced = true;
                     }
-                    shutdown_signal_result = &mut shutdown_signal_wait, if graceful_signal_restart_enabled && !shutdown_state.forced() => {
+                    shutdown_signal_result = &mut shutdown_signal_wait, if graceful_signal_restart_enabled && !shutdown_state.forced() && !shutdown_state.signal_listener_failed => {
                         shutdown_signal_wait.set(shutdown_signal());
                         let signal = match shutdown_signal_result {
                             Ok(signal) => signal,
                             Err(err) => {
                                 warn!("failed to listen for shutdown signal during graceful restart drain: {err}");
+                                shutdown_state.signal_listener_failed = true;
                                 continue;
                             }
                         };
@@ -1314,8 +1204,7 @@ pub async fn run_main(
                             .collect();
                         let processor = Arc::clone(&processor);
                         thread_attachment_tasks.spawn(async move {
-                            processor.thread_processor
-                                .handle_thread_created_event(created, initialized_connection_ids).await
+                            processor.handle_thread_created_event(created, initialized_connection_ids).await
                         });
                     }
                 }
@@ -1327,7 +1216,7 @@ pub async fn run_main(
             shutdown_state
                 .finish_cleanup(
                     async {
-                        processor.account_processor.cancel_active_login().await;
+                        processor.cancel_active_login().await;
                         futures::future::join_all(
                             connections.values().map(|connection_state| {
                                 connection_state.session.rpc_gate.shutdown()
@@ -1336,8 +1225,8 @@ pub async fn run_main(
                         .await;
                         connection_cleanup_tasks.drain().await;
                         processor.drain_background_tasks().await;
-                        processor.thread_processor.shutdown_threads().await;
-                        processor.thread_processor.wait_for_background_tasks().await;
+                        processor.shutdown_threads().await;
+                        processor.wait_for_background_tasks().await;
                         processor.finish_shutdown_delivery().await;
                         if disconnect_all {
                             let _ = outbound_control_tx

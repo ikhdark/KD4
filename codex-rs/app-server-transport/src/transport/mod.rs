@@ -4,9 +4,9 @@ use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingError;
 use crate::outgoing_message::OutgoingMessage;
 use crate::outgoing_message::QueuedOutgoingMessage;
-use codex_app_server_protocol::JSONRPCMessage;
-use codex_app_server_protocol::OverloadReason;
-use codex_app_server_protocol::overloaded_error;
+use codex_app_server_protocol_types::JSONRPCMessage;
+use codex_app_server_protocol_types::OverloadReason;
+use codex_app_server_protocol_types::overloaded_error;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_home_dir::find_codex_home;
 use std::net::SocketAddr;
@@ -328,7 +328,7 @@ fn ingress_message_is_control(message: &JSONRPCMessage) -> bool {
         JSONRPCMessage::Response(_) | JSONRPCMessage::Error(_) => true,
         JSONRPCMessage::Notification(notification) => notification.method == "initialized",
         JSONRPCMessage::Request(request) => {
-            codex_app_server_protocol::client_request_is_control(&request.method)
+            codex_app_server_protocol_types::client_request_is_control(&request.method)
                 && serialized_request_bytes_up_to(request, 64 * 1024) <= 64 * 1024
         }
     }

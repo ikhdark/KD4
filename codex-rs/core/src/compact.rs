@@ -64,7 +64,6 @@ pub use codex_prompts::COMPACTION_BASE_INSTRUCTIONS;
 pub use codex_prompts::INCREMENTAL_SUMMARIZATION_PROMPT;
 pub use codex_prompts::SUMMARIZATION_PROMPT;
 pub use codex_prompts::SUMMARY_PREFIX;
-const COMPACTION_SUMMARY_ITEM_ID_PREFIX: &str = "msg_compaction_summary_";
 const COMPACTION_SUMMARY_ITEM_ID_BASE: &str = "msg_compaction_summary";
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 16_000;
 const COMPACT_AGENT_MESSAGE_MAX_TOKENS: usize = 8_000;
@@ -416,30 +415,6 @@ fn rebased_compaction_summary(
     ))
 }
 
-enum CompactionClientSession<'a, T> {
-    Reused(&'a mut T),
-    Owned(T),
-}
-
-impl<T> AsMut<T> for CompactionClientSession<'_, T> {
-    fn as_mut(&mut self) -> &mut T {
-        match self {
-            Self::Reused(value) => value,
-            Self::Owned(value) => value,
-        }
-    }
-}
-
-fn reuse_or_create_compaction_client_session<'a, T>(
-    reusable: Option<&'a mut T>,
-    create: impl FnOnce() -> T,
-) -> CompactionClientSession<'a, T> {
-    match reusable {
-        Some(value) => CompactionClientSession::Reused(value),
-        None => CompactionClientSession::Owned(create()),
-    }
-}
-
 pub(crate) struct InlineAutoCompactReuse<'a> {
     pub(crate) client_session: &'a mut ModelClientSession,
     pub(crate) prefetched_workspace_identity:
@@ -762,13 +737,7 @@ async fn run_compact_task_inner_impl(
                     turn_context.model_info.truncation_policy.into(),
                 );
 
-                let workspace_identity = workspace_identity_for_compaction(
-                    sess.as_ref(),
-                    turn_context.as_ref(),
-                    &history,
-                    prefetched_workspace_identity,
-                )
-                .await;
+                let workspace_identity = prefetched_workspace_identity.cloned().flatten();
                 // History stays available for the pinned input below, used only
                 // when this exact input cannot fit the model window.
                 let turn_input = local_compaction_prompt_items(
@@ -797,11 +766,11 @@ async fn run_compact_task_inner_impl(
                 // The caller reaches this point only after its response stream has closed: `run_turn`
                 // compacts from the post-sampling branch, and pre-sampling compaction runs before any
                 // stream is opened. Retries inside this compact turn keep sharing the one session.
-                let mut client_session =
-                    reuse_or_create_compaction_client_session(client_session, || {
-                        sess.services.model_client.new_session()
-                    });
-                let client_session = client_session.as_mut();
+                let mut owned_client_session = None;
+                let client_session = match client_session {
+                    Some(client_session) => client_session,
+                    None => owned_client_session.insert(sess.services.model_client.new_session()),
+                };
                 let window_id = sess.current_window_id().await;
                 let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
                     sess.installation_id.clone(),
@@ -1085,29 +1054,6 @@ async fn run_compact_task_inner_impl(
     Ok(summary_text)
 }
 
-async fn workspace_identity_for_compaction(
-    sess: &Session,
-    turn_context: &TurnContext,
-    history: &crate::context_manager::ContextManager,
-    prefetched_workspace_identity: Option<&Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
-) -> Option<crate::git_workspace::WorkspaceEvidenceIdentity> {
-    match prefetched_workspace_identity {
-        // `Some(None)` is an authoritative capture of a non-Git workspace and must suppress a
-        // second repository probe just as an ordinary identity does.
-        Some(workspace_identity) => workspace_identity.clone(),
-        None if history.requires_workspace_evidence_validation() => {
-            sess.services
-                .git_workspace
-                .workspace_evidence_for_turn(turn_context, turn_context.config.cwd.as_path())
-                .await
-                .identity
-        }
-        // Inspect the actual summarizer history after replacement. Unknown and
-        // legacy tool provenance require validation through the same predicate
-        // used by ordinary sampling; plain conversation has no consumer.
-        None => None,
-    }
-}
 
 pub(crate) fn strip_compaction_startup_envelopes(
     items: impl Into<Arc<[ResponseItem]>>,
@@ -1476,12 +1422,6 @@ fn truncate_compaction_summary(summary: &str, max_tokens: usize) -> String {
             (heading, budget, updates)
         })
         .collect::<Vec<_>>();
-    // Section allocations are guidance, not independent ceilings. Preserve an
-    // already-fitting checkpoint verbatim. Position alone does not establish
-    // that an intermediate goal constraint was superseded.
-    if approx_token_count(summary) <= max_tokens {
-        return summary.to_string();
-    }
     let full_preamble = preamble.join("\n");
     let full_bodies = sections
         .iter()
@@ -2785,9 +2725,6 @@ fn compaction_text_recovery_sidecar(
     serde_json::to_string(&value).ok()
 }
 
-pub(crate) fn is_summary_message(message: &str) -> bool {
-    message.starts_with(format!("{SUMMARY_PREFIX}\n").as_str())
-}
 
 fn compaction_summary_item(summary_text: String) -> ResponseItem {
     compaction_summary_item_with_artifact_pins(summary_text, None)
@@ -2810,28 +2747,9 @@ fn compaction_summary_item_with_artifact_pins(
     }
 }
 
-fn compaction_summary_text(item: &ResponseItem) -> Option<&str> {
-    let ResponseItem::Message {
-        id: Some(id),
-        role,
-        content,
-        ..
-    } = item
-    else {
-        return None;
-    };
-    if role != "user" || !id.as_str().starts_with(COMPACTION_SUMMARY_ITEM_ID_PREFIX) {
-        return None;
-    }
-    content.iter().find_map(|content| match content {
-        ContentItem::InputText { text } if is_summary_message(text) => Some(text.as_str()),
-        _ => None,
-    })
-}
+use codex_conversation::compact::compaction_summary_text;
 
-pub(crate) fn is_compaction_summary_item(item: &ResponseItem) -> bool {
-    compaction_summary_text(item).is_some()
-}
+pub(crate) use codex_conversation::compact::is_compaction_summary_item;
 
 fn latest_summary_message(items: &[ResponseItem]) -> Option<&str> {
     items.iter().rev().find_map(compaction_summary_text)
@@ -2897,45 +2815,13 @@ pub(crate) fn build_compacted_history(
     user_messages: &[CompactedUserMessage],
     summary_text: &str,
 ) -> Vec<ResponseItem> {
-    build_compacted_history_with_limit(
-        initial_context,
-        user_messages,
-        summary_text,
-        COMPACT_USER_MESSAGE_MAX_TOKENS,
-    )
-}
-
-fn build_compacted_history_with_limit(
-    history: Vec<ResponseItem>,
-    user_messages: &[CompactedUserMessage],
-    summary_text: &str,
-    max_tokens: usize,
-) -> Vec<ResponseItem> {
-    build_compacted_history_with_limits(
-        history,
-        user_messages,
-        summary_text,
-        max_tokens,
-        MAX_RETAINED_USER_IMAGES,
-        MAX_RETAINED_USER_IMAGE_BYTES,
-    )
-}
-
-fn build_compacted_history_with_limits(
-    history: Vec<ResponseItem>,
-    user_messages: &[CompactedUserMessage],
-    summary_text: &str,
-    max_tokens: usize,
-    max_images: usize,
-    max_image_bytes: usize,
-) -> Vec<ResponseItem> {
     let (mut history, _retained_image_count, omitted_image_count, _selected_indices) =
         append_bounded_user_messages(
-            history,
+            initial_context,
             user_messages,
-            max_tokens,
-            max_images,
-            max_image_bytes,
+            COMPACT_USER_MESSAGE_MAX_TOKENS,
+            MAX_RETAINED_USER_IMAGES,
+            MAX_RETAINED_USER_IMAGE_BYTES,
         );
 
     let mut summary_text = if summary_text.is_empty() {
@@ -3238,24 +3124,6 @@ fn compacted_image_notice_index(content: &[UserInput], index: usize) -> Option<u
     (index > 1 && compacted_image_binding(content, index - 2).is_some()).then(|| index - 2)
 }
 
-#[derive(Default)]
-struct LocalCompactionAccumulator {
-    items: Vec<ResponseItem>,
-}
-
-impl LocalCompactionAccumulator {
-    fn record_output(&mut self, item: ResponseItem) {
-        self.items.push(item);
-    }
-
-    fn complete(self, token_usage: Option<TokenUsage>) -> LocalCompactionOutput {
-        LocalCompactionOutput {
-            items: self.items,
-            token_usage,
-        }
-    }
-}
-
 struct LocalCompactionOutput {
     items: Vec<ResponseItem>,
     token_usage: Option<TokenUsage>,
@@ -3296,7 +3164,7 @@ async fn drain_to_completed(
         sess.update_rate_limits(turn_context, snapshot.clone()).await;
     }
     let mut stream = stream_result?;
-    let mut accumulator = LocalCompactionAccumulator::default();
+    let mut items = Vec::new();
     let mut model_stream_processing_handoff: Option<crate::turn_timing::TurnTimingGuard> = None;
     loop {
         let model_stream_wait_timing_guard =
@@ -3352,13 +3220,13 @@ async fn drain_to_completed(
         }
         match event {
             ResponseEvent::OutputItemDone(item) => {
-                accumulator.record_output(item);
+                items.push(item);
             }
             ResponseEvent::RateLimits(snapshot) => {
                 sess.update_rate_limits(turn_context, snapshot).await;
             }
             ResponseEvent::Completed { token_usage, .. } => {
-                return Ok(accumulator.complete(token_usage));
+                return Ok(LocalCompactionOutput { items, token_usage });
             }
             _ => continue,
         }

@@ -335,7 +335,12 @@ impl Client {
         method: &str,
         url: &str,
     ) -> std::result::Result<(String, String), RequestError> {
-        let res = req.send().await.map_err(anyhow::Error::from)?;
+        let res = codex_http_client::with_dispatch_guard(
+            self.auth_provider.dispatch_guard(),
+            req.send(),
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
         let status = res.status();
         let content_type = res
             .headers()

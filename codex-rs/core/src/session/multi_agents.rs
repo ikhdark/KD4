@@ -6,7 +6,7 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 
 /// Host-owned `read_file` locator for the configured delegation guidance.
-pub(crate) const USAGE_HINT_LOCATOR: &str = "context:multi-agent";
+pub(crate) use codex_conversation::MULTI_AGENT_USAGE_HINT_LOCATOR as USAGE_HINT_LOCATOR;
 
 /// Sent instead of the root guidance while delegation needs an explicit
 /// request, so a session that never delegates does not resend it every step.

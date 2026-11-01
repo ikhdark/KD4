@@ -1042,10 +1042,11 @@ class CodexClient:
         login_id: str,
     ) -> AccountLoginCompletedNotification:
         """Block until the matching interactive login attempt completes."""
-        self.register_login_notifications(login_id)
+        router = self._router
+        router.register_login(login_id)
         try:
             while True:
-                notification = self.next_login_notification(login_id)
+                notification = router.next_login_notification(login_id)
                 if (
                     notification.method == "account/login/completed"
                     and isinstance(notification.payload, AccountLoginCompletedNotification)
@@ -1053,7 +1054,7 @@ class CodexClient:
                 ):
                     return notification.payload
         finally:
-            self.unregister_login_notifications(login_id)
+            router.unregister_login(login_id)
 
     def stream_text(
         self,

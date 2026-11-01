@@ -7,16 +7,9 @@ import tomllib
 from .targets import REPO_ROOT
 
 
-def _default_cargo_toml() -> Path:
-    return REPO_ROOT / "codex-rs" / "Cargo.toml"
-
-
 @cache
 def read_workspace_version(cargo_toml: Path | None = None) -> str:
-    return _read_workspace_version_uncached(cargo_toml or _default_cargo_toml())
-
-
-def _read_workspace_version_uncached(cargo_toml: Path) -> str:
+    cargo_toml = cargo_toml or REPO_ROOT / "codex-rs" / "Cargo.toml"
     data = tomllib.loads(cargo_toml.read_text(encoding="utf-8"))
     version = data.get("workspace", {}).get("package", {}).get("version")
     if isinstance(version, str) and version.strip():

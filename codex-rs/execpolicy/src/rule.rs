@@ -356,7 +356,6 @@ pub(crate) fn validate_match_examples(
 /// Ensure that no rule matches any provided negative example.
 pub(crate) fn validate_not_match_examples(
     policy: &Policy,
-    _rules: &[RuleRef],
     not_matches: &[Vec<String>],
 ) -> Result<()> {
     let options = MatchOptions {

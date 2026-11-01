@@ -314,12 +314,15 @@ where
         let mut delivery = std::collections::VecDeque::new();
         let mut delivery_deadline = None;
         let mut frames_drained_after_pong_deadline = 0usize;
-        let mut normal_close = false;
-        'relay: loop {
+        let terminal_event = 'relay: loop {
             if delivery.len() < CHANNEL_CAPACITY {
                 match inbound_decoder.push_with_limit(&[], CHANNEL_CAPACITY - delivery.len()) {
                     Ok(messages) => delivery.extend(messages.into_iter().map(JsonRpcConnectionEvent::Message)),
-                    Err(error) => { send_malformed(&incoming_tx, error.to_string()); break; }
+                    Err(error) => {
+                        break 'relay Some(JsonRpcConnectionEvent::MalformedMessage {
+                            reason: error.to_string(),
+                        });
+                    }
                 }
             }
             if !delivery.is_empty() {
@@ -329,13 +332,14 @@ where
             let now = tokio::time::Instant::now();
             let gap_deadline = inbound_ciphertexts.gap_deadline();
             if gap_deadline.is_some_and(|deadline| deadline <= now) {
-                send_disconnected(&incoming_tx, &disconnected_tx,
-                    super::ordered_ciphertext::CIPHERTEXT_GAP_TIMEOUT_REASON.into());
-                return;
+                break 'relay Some(JsonRpcConnectionEvent::Disconnected {
+                    reason: Some(super::ordered_ciphertext::CIPHERTEXT_GAP_TIMEOUT_REASON.into()),
+                });
             }
             if delivery_deadline.is_some_and(|deadline| deadline <= now) {
-                send_disconnected(&incoming_tx, &disconnected_tx, "application_backpressure".into());
-                return;
+                break 'relay Some(JsonRpcConnectionEvent::Disconnected {
+                    reason: Some("application_backpressure".into()),
+                });
             }
             // A Pong cannot be observed while we deliberately pause socket reads.
             // Keep the existing application-stall deadline instead of declaring
@@ -344,8 +348,9 @@ where
             let pong_expired = pong_deadline.is_some_and(|deadline| deadline <= now);
             if pong_expired && (frames_drained_after_pong_deadline >= MAX_FRAMES_DRAINED_AFTER_PONG_DEADLINE
                 || std::pin::Pin::new(&mut reader).peek().now_or_never().is_none()) {
-                send_disconnected(&incoming_tx, &disconnected_tx, WEBSOCKET_PONG_TIMEOUT_REASON.into());
-                return;
+                break 'relay Some(JsonRpcConnectionEvent::Disconnected {
+                    reason: Some(WEBSOCKET_PONG_TIMEOUT_REASON.into()),
+                });
             }
             // Give due keepalives priority over another data fragment.
             if can_read && sink.is_some() && pong_watchdog.deadline().is_none() && keepalive.tick().now_or_never().is_some() {
@@ -372,8 +377,9 @@ where
                     writing = None;
                     sink = Some(returned_sink);
                     if let Err(reason) = result {
-                        send_disconnected(&incoming_tx, &disconnected_tx, reason);
-                        return;
+                        break 'relay Some(JsonRpcConnectionEvent::Disconnected {
+                            reason: Some(reason),
+                        });
                     }
                     if ping {
                         // The peer's response clock starts only after the Ping flushes.
@@ -383,7 +389,7 @@ where
                     }
                 }
                 permit = incoming_tx.reserve(), if !delivery.is_empty() => {
-                    let Ok(permit) = permit else { break; };
+                    let Ok(permit) = permit else { break 'relay None; };
                     if let Some(event) = delivery.pop_front() { permit.send(event); }
                     delivery_deadline = (!delivery.is_empty()).then(|| tokio::time::Instant::now() + WEBSOCKET_PONG_TIMEOUT);
                 }
@@ -393,22 +399,34 @@ where
                 pong_during_ping = false;
                 }
                 message = outgoing_rx.recv(), if pending_outbound.is_none() && !pong_expired => {
-                    let Some(message) = message else { break; };
+                    let Some(message) = message else { break 'relay None; };
                     pending_outbound = Some(match frame_jsonrpc_message(&message) {
                         Ok(frame) => (frame, 0),
-                        Err(error) => { send_malformed(&incoming_tx, error.to_string()); break; }
+                        Err(error) => {
+                            break 'relay Some(JsonRpcConnectionEvent::MalformedMessage {
+                                reason: error.to_string(),
+                            });
+                        }
                     });
                 }
                 _ = std::future::ready(()), if pending_outbound.is_some() && sink.is_some() && !pong_expired => {
                     let seq = match take_next_sequence(&mut next_outbound_seq) {
                         Ok(seq) => seq,
-                        Err(error) => { send_malformed(&incoming_tx, error.to_string()); break; }
+                        Err(error) => {
+                            break 'relay Some(JsonRpcConnectionEvent::MalformedMessage {
+                                reason: error.to_string(),
+                            });
+                        }
                     };
                     let Some((frame, offset)) = pending_outbound.as_mut() else { continue; };
                     let end = (*offset + NOISE_RECORD_PLAINTEXT_LEN).min(frame.len());
                     let encrypted = match transport.encrypt(&frame[*offset..end]) {
                         Ok(encrypted) => encrypted,
-                        Err(error) => { send_malformed(&incoming_tx, error.to_string()); break; }
+                        Err(error) => {
+                            break 'relay Some(JsonRpcConnectionEvent::MalformedMessage {
+                                reason: error.to_string(),
+                            });
+                        }
                     };
                     *offset = end;
                     if end == frame.len() { pending_outbound = None; }
@@ -420,11 +438,19 @@ where
                     let Some(ciphertext) = pending_inbound.pop_front() else { continue; };
                     let plaintext = match transport.decrypt(&ciphertext) {
                         Ok(plaintext) => plaintext,
-                        Err(error) => { send_malformed(&incoming_tx, format!("Noise relay decryption failed: {error}")); break; }
+                        Err(error) => {
+                            break 'relay Some(JsonRpcConnectionEvent::MalformedMessage {
+                                reason: format!("Noise relay decryption failed: {error}"),
+                            });
+                        }
                     };
                     match inbound_decoder.push_with_limit(&plaintext, CHANNEL_CAPACITY - delivery.len()) {
                         Ok(messages) => delivery.extend(messages.into_iter().map(JsonRpcConnectionEvent::Message)),
-                        Err(error) => { send_malformed(&incoming_tx, error.to_string()); break; }
+                        Err(error) => {
+                            break 'relay Some(JsonRpcConnectionEvent::MalformedMessage {
+                                reason: error.to_string(),
+                            });
+                        }
                     }
                 }
                 incoming = reader.next(), if can_read => {
@@ -437,22 +463,35 @@ where
                         Some(Ok(Message::Binary(payload))) => {
                             let frame = match decode_relay_message_frame(&payload) {
                                 Ok(frame) => frame,
-                                Err(error) => { send_malformed(&incoming_tx, error.to_string()); break; }
+                                Err(error) => {
+                                    break 'relay Some(JsonRpcConnectionEvent::MalformedMessage {
+                                        reason: error.to_string(),
+                                    });
+                                }
                             };
                             if frame.stream_id != stream_id { continue; }
                             match frame.validate() {
                                 Ok(RelayFrameBodyKind::Data) => {
                                     match frame.into_data().and_then(|data| inbound_ciphertexts.push(data.seq, data.payload)) {
                                         Ok(ciphertexts) => pending_inbound.extend(ciphertexts),
-                                        Err(error) => { send_malformed(&incoming_tx, error.to_string()); break 'relay; }
+                                        Err(error) => {
+                                            break 'relay Some(JsonRpcConnectionEvent::MalformedMessage {
+                                                reason: error.to_string(),
+                                            });
+                                        }
                                     }
                                 }
                                 Ok(RelayFrameBodyKind::Reset) => {
-                                    send_disconnected(&incoming_tx, &disconnected_tx, NOISE_RELAY_RESET_DISCONNECT_REASON.into());
-                                    return;
+                                    break 'relay Some(JsonRpcConnectionEvent::Disconnected {
+                                        reason: Some(NOISE_RELAY_RESET_DISCONNECT_REASON.into()),
+                                    });
                                 }
                                 Ok(RelayFrameBodyKind::Ack | RelayFrameBodyKind::Resume | RelayFrameBodyKind::Heartbeat) => {}
-                                _ => { send_malformed(&incoming_tx, "Noise relay received invalid post-handshake frame".into()); break; }
+                                _ => {
+                                    break 'relay Some(JsonRpcConnectionEvent::MalformedMessage {
+                                        reason: "Noise relay received invalid post-handshake frame".into(),
+                                    });
+                                }
                             }
                         }
                         Some(Ok(Message::Pong(_))) => {
@@ -461,37 +500,39 @@ where
                             frames_drained_after_pong_deadline = 0;
                         }
                         Some(Ok(Message::Ping(_) | Message::Frame(_))) => {}
-                        Some(Ok(Message::Text(_))) => { send_malformed(&incoming_tx, "Noise relay transport expects binary protobuf frames".into()); break; }
+                        Some(Ok(Message::Text(_))) => {
+                            break 'relay Some(JsonRpcConnectionEvent::MalformedMessage {
+                                reason: "Noise relay transport expects binary protobuf frames".into(),
+                            });
+                        }
                         Some(Ok(Message::Close(_))) | None => {
-                            normal_close = true;
-                            break;
+                            break 'relay None;
                         }
-                        Some(Err(error)) => { debug!("Noise relay websocket read failed: {error}"); break; }
+                        Some(Err(error)) => { debug!("Noise relay websocket read failed: {error}"); break 'relay None; }
                     }
                 }
             }
-        }
-        if normal_close {
-            // Stop socket work, but preserve authenticated messages already
-            // accepted before Close/EOF. Publish disconnection only after this
-            // ordered drain; a stalled application still has one fixed bound.
-            drop(writing);
-            drop(sink);
-            drop(reader);
-            if let Some(deadline) = delivery_deadline {
-                while let Some(event) = delivery.pop_front() {
-                    match tokio::time::timeout_at(deadline, incoming_tx.send(event)).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(_)) => break,
-                        Err(_) => {
-                            send_disconnected(&incoming_tx, &disconnected_tx, "application_backpressure".into());
-                            return;
-                        }
-                    }
-                }
-            }
-        }
+        };
+        // Stop socket work before draining accepted authenticated messages on
+        // every terminal path, not only peer Close/EOF. The watch fences new
+        // calls; RpcClient preserves ordered responses for existing calls.
+        drop(writing);
+        drop(sink);
+        drop(reader);
         let _ = disconnected_tx.send(true);
+        let deadline = delivery_deadline.unwrap_or_else(|| {
+            tokio::time::Instant::now() + WEBSOCKET_PONG_TIMEOUT
+        });
+        for event in delivery.into_iter().chain(terminal_event) {
+            match tokio::time::timeout_at(deadline, incoming_tx.send(event)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    send_disconnected(&incoming_tx, &disconnected_tx, "application_backpressure".into());
+                    return;
+                }
+            }
+        }
     }
     .instrument(stream_span));
 
@@ -539,10 +580,6 @@ where
         Ok(Err(error)) => Err(error.to_string()),
         Err(_) => Err("websocket write timed out".to_string()),
     }
-}
-
-fn send_malformed(incoming_tx: &mpsc::Sender<JsonRpcConnectionEvent>, reason: String) {
-    let _ = incoming_tx.try_send(JsonRpcConnectionEvent::MalformedMessage { reason });
 }
 
 fn send_disconnected(

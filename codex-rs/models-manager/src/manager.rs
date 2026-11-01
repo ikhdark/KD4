@@ -278,12 +278,6 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
     /// Returns a static set of presets seeded with the configured model.
     fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask>;
 
-    /// Attempt to list models without blocking, using the current cached state.
-    ///
-    /// Returns an error if the internal lock cannot be acquired.
-    fn try_list_models(&self) -> Result<Vec<ModelPreset>, TryLockError> {
-        Ok(self.try_list_models_shared()?.as_ref().clone())
-    }
 
     /// Attempt to return the current picker projection without copying it.
     fn try_list_models_shared(&self) -> Result<Arc<Vec<ModelPreset>>, TryLockError> {

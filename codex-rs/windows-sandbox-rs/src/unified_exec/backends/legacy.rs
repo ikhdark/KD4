@@ -13,8 +13,8 @@ use crate::process::read_handle_loop;
 use crate::process::spawn_process_with_pipes;
 use crate::process::wait_for_output_readers;
 use crate::spawn_prep::LegacyAclSids;
-use crate::spawn_prep::SpawnPrepOptions;
 use crate::spawn_prep::apply_legacy_session_acl_rules;
+use crate::allow::compute_deny_write_paths_for_permissions;
 use crate::spawn_prep::legacy_session_capability_roots;
 use crate::spawn_prep::prepare_legacy_session_security;
 use crate::spawn_prep::prepare_legacy_spawn_context;
@@ -512,10 +512,6 @@ fn spawn_windows_sandbox_session_legacy_blocking(
         cwd,
         &mut env_map,
         &command,
-        SpawnPrepOptions {
-            inherit_path: false,
-            add_git_safe_directory: false,
-        },
     )?;
     if !common.permissions.has_full_disk_read_access() {
         anyhow::bail!("Restricted read-only access requires the elevated Windows sandbox backend");
@@ -535,11 +531,15 @@ fn spawn_windows_sandbox_session_legacy_blocking(
         &env_map,
         codex_home,
     );
+    let deny_write_paths = compute_deny_write_paths_for_permissions(
+        &common.permissions, &common.current_dir, &env_map, &additional_deny_write_paths,
+    );
     let security = prepare_legacy_session_security(
         common.uses_write_capabilities,
         codex_home,
         cwd,
         capability_roots,
+        &deny_write_paths,
     )?;
     // SAFETY: successful preparation transfers one valid owned token to this
     // operation. Retain it through ACL errors/cancellation until the waiter owns it.

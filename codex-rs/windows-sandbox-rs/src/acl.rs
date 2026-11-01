@@ -272,10 +272,6 @@ unsafe fn path_mask_allows_with_scope(
 }
 
 pub(crate) unsafe fn dacl_has_any_read_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -> bool {
-    dacl_has_read_deny_with_scope(p_dacl, psid, true)
-}
-
-unsafe fn dacl_has_read_deny_with_scope(p_dacl: *mut ACL, psid: *mut c_void, include_inherit_only: bool) -> bool {
     if p_dacl.is_null() {
         return false;
     }
@@ -299,9 +295,6 @@ unsafe fn dacl_has_read_deny_with_scope(p_dacl: *mut ACL, psid: *mut c_void, inc
         let hdr = &*(p_ace as *const ACE_HEADER);
         if hdr.AceType != ACCESS_DENIED_ACE_TYPE {
             continue; // ACCESS_DENIED_ACE_TYPE
-        }
-        if !include_inherit_only && (hdr.AceFlags & INHERIT_ONLY_ACE) != 0 {
-            continue;
         }
         let ace = &*(p_ace as *const ACCESS_DENIED_ACE);
         let base = p_ace as usize;
@@ -328,6 +321,7 @@ unsafe fn ensure_allow_mask_aces_with_inheritance_impl(
     inheritance: u32,
     access_mode: i32,
 ) -> Result<bool> {
+    let _acl_guard = crate::setup_mutex::acquire_acl_mutation_mutex()?;
     let (p_dacl, p_sd) = fetch_dacl_handle(path)?;
     let mut entries: Vec<EXPLICIT_ACCESS_W> = Vec::new();
     for sid in sids {
@@ -430,6 +424,7 @@ pub unsafe fn ensure_allow_mask_aces_with_inheritance(
 /// Each SID pointer must remain valid for this call, and `path` must name an
 /// existing directory.
 pub unsafe fn ensure_directory_traversal_aces(path: &Path, sids: &[*mut c_void]) -> Result<bool> {
+    let _acl_guard = crate::setup_mutex::acquire_acl_mutation_mutex()?;
     // MAXIMUM_ALLOWED would also request DELETE and conflict with ordinary
     // directory readers that do not share deletion. Only ACL access is needed.
     // Retain one no-follow handle for both the query and the update.
@@ -709,29 +704,8 @@ unsafe fn dacl_has_complete_deny(
         && (!recursive || (files & required == required && directories & required == required))
 }
 
-unsafe fn set_deny_entries_in_acl(
-    path: &Path,
-    explicit: &EXPLICIT_ACCESS_W,
-    dacl: *mut ACL,
-    replacement: &mut *mut ACL,
-) -> u32 {
-    let _ = path;
-    SetEntriesInAclW(1, explicit, dacl, replacement)
-}
-
-unsafe fn set_deny_named_security_info(path: &Path, dacl: *mut ACL) -> u32 {
-    SetNamedSecurityInfoW(
-        to_wide(path).as_ptr().cast_mut(),
-        1,
-        DACL_SECURITY_INFORMATION,
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        dacl,
-        std::ptr::null_mut(),
-    )
-}
-
 unsafe fn add_deny_ace(path: &Path, psid: *mut c_void, kind: DenyAceKind) -> Result<bool> {
+    let _acl_guard = crate::setup_mutex::acquire_acl_mutation_mutex()?;
     let mut p_sd: *mut c_void = std::ptr::null_mut();
     let mut p_dacl: *mut ACL = std::ptr::null_mut();
     let code = GetNamedSecurityInfoW(
@@ -770,12 +744,20 @@ unsafe fn add_deny_ace(path: &Path, psid: *mut c_void, kind: DenyAceKind) -> Res
         explicit.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
         explicit.Trustee = trustee;
         let mut p_new_dacl: *mut ACL = std::ptr::null_mut();
-        let code = set_deny_entries_in_acl(path, &explicit, p_dacl, &mut p_new_dacl);
+        let code = SetEntriesInAclW(1, &explicit, p_dacl, &mut p_new_dacl);
         let write_result = if code != ERROR_SUCCESS {
             Err(std::io::Error::from_raw_os_error(code as i32))
                 .with_context(|| format!("SetEntriesInAclW failed for {}", path.display()))
         } else {
-            let code = set_deny_named_security_info(path, p_new_dacl);
+            let code = SetNamedSecurityInfoW(
+                to_wide(path).as_ptr().cast_mut(),
+                1,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                p_new_dacl,
+                std::ptr::null_mut(),
+            );
             if code == ERROR_SUCCESS {
                 Ok(true)
             } else {
@@ -814,6 +796,7 @@ pub unsafe fn add_deny_read_ace(path: &Path, psid: *mut c_void) -> Result<bool> 
 /// # Safety
 /// Caller must pass a valid SID pointer and an existing path.
 pub unsafe fn revoke_deny_read_ace(path: &Path, psid: *mut c_void) -> Result<bool> {
+    let _acl_guard = crate::setup_mutex::acquire_acl_mutation_mutex()?;
     let (p_dacl, p_sd) = fetch_dacl_handle(path)?;
     let result = (|| -> Result<bool> {
         if p_dacl.is_null() {
@@ -894,6 +877,3 @@ pub unsafe fn revoke_deny_read_ace(path: &Path, psid: *mut c_void) -> Result<boo
 
 const CONTAINER_INHERIT_ACE: u32 = 0x2;
 const OBJECT_INHERIT_ACE: u32 = 0x1;
-
-// Fault only the external OS operation, on the calling thread and exact path.
-// Public ACL application, journaling, rollback, and admission checks stay real.

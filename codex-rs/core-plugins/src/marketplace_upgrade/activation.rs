@@ -19,6 +19,31 @@ struct InstalledMarketplaceMetadata {
     revision: String,
 }
 
+pub(crate) fn installed_marketplace_source_identity(root: &Path) -> Result<Option<String>, String> {
+    use std::io::Read;
+    let file = match std::fs::File::open(installed_marketplace_metadata_path(root)) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("failed to read marketplace source identity: {err}")),
+    };
+    let mut contents = String::new();
+    file.take(65537).read_to_string(&mut contents)
+        .map_err(|err| format!("failed to read marketplace source identity: {err}"))?;
+    if contents.len() > 65536 {
+        return Err("marketplace source identity is too large".to_string());
+    }
+    let metadata: InstalledMarketplaceMetadata = serde_json::from_str(&contents)
+        .map_err(|err| format!("invalid marketplace source identity: {err}"))?;
+    if metadata.source_type != MarketplaceSourceType::Git {
+        return Err("installed marketplace identity is not a Git source".to_string());
+    }
+    git_source_identity(&metadata.source, metadata.ref_name.as_deref(), &metadata.sparse_paths).map(Some)
+}
+
+pub(super) fn git_source_identity(source: &str, ref_name: Option<&str>, sparse_paths: &[String]) -> Result<String, String> {
+    serde_json::to_string(&("git", source, ref_name, sparse_paths)).map_err(|err| err.to_string())
+}
+
 pub(super) fn installed_marketplace_metadata_matches(
     root: &Path,
     marketplace: &ConfiguredGitMarketplace,

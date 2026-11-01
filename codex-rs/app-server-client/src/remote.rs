@@ -22,22 +22,22 @@ use crate::AppServerInitializeResponse;
 use crate::RequestResult;
 use crate::SHUTDOWN_TIMEOUT;
 use crate::TypedRequestError;
-use codex_app_server_protocol::ClientNotification;
-use codex_app_server_protocol::ClientRequest;
-use codex_app_server_protocol::InitializeParams;
-use codex_app_server_protocol::JSONRPCError;
-use codex_app_server_protocol::JSONRPCErrorError;
-use codex_app_server_protocol::JSONRPCMessage;
-use codex_app_server_protocol::JSONRPCNotification;
-use codex_app_server_protocol::JSONRPCRequest;
-use codex_app_server_protocol::JSONRPCResponse;
-use codex_app_server_protocol::OverloadReason;
-use codex_app_server_protocol::RequestId;
-use codex_app_server_protocol::Result as JsonRpcResult;
-use codex_app_server_protocol::ServerNotification;
-use codex_app_server_protocol::ServerRequest;
-use codex_app_server_protocol::overloaded_error;
-use codex_app_server_protocol::server_notification_requires_delivery;
+use codex_app_server_protocol_types::ClientNotification;
+use codex_app_server_protocol_types::ClientRequest;
+use codex_app_server_protocol_types::InitializeParams;
+use codex_app_server_protocol_types::JSONRPCError;
+use codex_app_server_protocol_types::JSONRPCErrorError;
+use codex_app_server_protocol_types::JSONRPCMessage;
+use codex_app_server_protocol_types::JSONRPCNotification;
+use codex_app_server_protocol_types::JSONRPCRequest;
+use codex_app_server_protocol_types::JSONRPCResponse;
+use codex_app_server_protocol_types::OverloadReason;
+use codex_app_server_protocol_types::RequestId;
+use codex_app_server_protocol_types::Result as JsonRpcResult;
+use codex_app_server_protocol_types::ServerNotification;
+use codex_app_server_protocol_types::ServerRequest;
+use codex_app_server_protocol_types::overloaded_error;
+use codex_app_server_protocol_types::server_notification_requires_delivery;
 use codex_http_client::maybe_build_rustls_client_config_with_custom_ca;
 use codex_uds::UnixStream;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -187,19 +187,6 @@ impl std::fmt::Debug for RemoteAppServerEndpoint {
                 .field("socket_path", socket_path)
                 .field("expected_home", expected_home)
                 .finish(),
-        }
-    }
-}
-
-impl RemoteAppServerEndpoint {
-    /// Whether this endpoint can carry a bearer token without exposing it over
-    /// a non-loopback plaintext WebSocket connection.
-    pub fn supports_auth_token(&self) -> bool {
-        match self {
-            Self::WebSocket { websocket_url, .. } => {
-                Url::parse(websocket_url).is_ok_and(|url| websocket_url_supports_auth_token(&url))
-            }
-            Self::UnixSocket { .. } | Self::DiscoveredUnixSocket { .. } => false,
         }
     }
 }
@@ -884,20 +871,7 @@ impl RemoteAppServerClient {
     where
         T: DeserializeOwned,
     {
-        let method = request.method_name().to_string();
-        let response =
-            self.request(request)
-                .await
-                .map_err(|source| TypedRequestError::Transport {
-                    method: method.clone(),
-                    source,
-                })?;
-        let result = response.map_err(|source| TypedRequestError::Server {
-            method: method.clone(),
-            source,
-        })?;
-        serde_json::from_value(result)
-            .map_err(|source| TypedRequestError::Deserialize { method, source })
+        self.request_handle().request_typed(request).await
     }
 
     pub async fn notify(&self, notification: ClientNotification) -> IoResult<()> {
@@ -1059,19 +1033,7 @@ impl RemoteAppServerRequestHandle {
         T: DeserializeOwned,
     {
         let method = request.method_name().to_string();
-        let response =
-            self.request(request)
-                .await
-                .map_err(|source| TypedRequestError::Transport {
-                    method: method.clone(),
-                    source,
-                })?;
-        let result = response.map_err(|source| TypedRequestError::Server {
-            method: method.clone(),
-            source,
-        })?;
-        serde_json::from_value(result)
-            .map_err(|source| TypedRequestError::Deserialize { method, source })
+        crate::decode_typed_response(method, self.request(request).await)
     }
 }
 
@@ -1220,7 +1182,6 @@ where
     timeout(initialize_timeout, async {
         let initialize_request_id = RequestId::String("initialize".to_string());
         let mut pending_events = Vec::new();
-        let mut initialize_response = None;
         write_jsonrpc_message(
             stream,
             JSONRPCMessage::Request(jsonrpc_request_from_client_request(
@@ -1233,7 +1194,7 @@ where
         )
         .await?;
 
-        loop {
+        let initialize_response = loop {
             match stream.next().await {
                 Some(Ok(Message::Text(text))) => {
                     let message = serde_json::from_str::<JSONRPCMessage>(&text).map_err(|err| {
@@ -1243,9 +1204,7 @@ where
                     })?;
                     match message {
                         JSONRPCMessage::Response(response) if response.id == initialize_request_id => {
-                            initialize_response =
-                                Some(AppServerInitializeResponse::from_json(response.result));
-                            break Ok(());
+                            break Ok(AppServerInitializeResponse::from_json(response.result));
                         }
                         JSONRPCMessage::Error(error) if error.id == initialize_request_id => {
                             break Err(IoError::other(format!(
@@ -1332,9 +1291,6 @@ where
             }
         }?;
 
-        let initialize_response = initialize_response.ok_or_else(|| {
-            IoError::new(ErrorKind::InvalidData, "missing remote initialize response")
-        })?;
         if let Some(expected) = expected_home {
             let actual = initialize_response.codex_home()
                 .and_then(|home| AbsolutePathBuf::from_absolute_path(home).ok())

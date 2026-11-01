@@ -22,45 +22,45 @@ use anyhow::bail;
 use clap::ArgAction;
 use clap::Parser;
 use clap::Subcommand;
-use codex_app_server_protocol::AccountLoginCompletedNotification;
-use codex_app_server_protocol::ClientInfo;
-use codex_app_server_protocol::ClientRequest;
-use codex_app_server_protocol::CommandExecutionApprovalDecision;
-use codex_app_server_protocol::CommandExecutionRequestApprovalParams;
-use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
-use codex_app_server_protocol::DynamicToolSpec;
-use codex_app_server_protocol::FileChangeApprovalDecision;
-use codex_app_server_protocol::FileChangeRequestApprovalParams;
-use codex_app_server_protocol::FileChangeRequestApprovalResponse;
-use codex_app_server_protocol::GetAccountRateLimitsResponse;
-use codex_app_server_protocol::InitializeCapabilities;
-use codex_app_server_protocol::InitializeParams;
-use codex_app_server_protocol::InitializeResponse;
-use codex_app_server_protocol::JSONRPCMessage;
-use codex_app_server_protocol::JSONRPCNotification;
-use codex_app_server_protocol::JSONRPCRequest;
-use codex_app_server_protocol::JSONRPCResponse;
-use codex_app_server_protocol::LoginAccountResponse;
-use codex_app_server_protocol::ModelListParams;
-use codex_app_server_protocol::ModelListResponse;
-use codex_app_server_protocol::RequestId;
-use codex_app_server_protocol::ServerNotification;
-use codex_app_server_protocol::ServerRequest;
-use codex_app_server_protocol::ThreadDecrementElicitationParams;
-use codex_app_server_protocol::ThreadDecrementElicitationResponse;
-use codex_app_server_protocol::ThreadIncrementElicitationParams;
-use codex_app_server_protocol::ThreadIncrementElicitationResponse;
-use codex_app_server_protocol::ThreadItem;
-use codex_app_server_protocol::ThreadListParams;
-use codex_app_server_protocol::ThreadListResponse;
-use codex_app_server_protocol::ThreadResumeParams;
-use codex_app_server_protocol::ThreadResumeResponse;
-use codex_app_server_protocol::ThreadStartParams;
-use codex_app_server_protocol::ThreadStartResponse;
-use codex_app_server_protocol::TurnStartParams;
-use codex_app_server_protocol::TurnStartResponse;
-use codex_app_server_protocol::TurnStatus;
-use codex_app_server_protocol::UserInput as V2UserInput;
+use codex_app_server_protocol_types::AccountLoginCompletedNotification;
+use codex_app_server_protocol_types::ClientInfo;
+use codex_app_server_protocol_types::ClientRequest;
+use codex_app_server_protocol_types::CommandExecutionApprovalDecision;
+use codex_app_server_protocol_types::CommandExecutionRequestApprovalParams;
+use codex_app_server_protocol_types::CommandExecutionRequestApprovalResponse;
+use codex_app_server_protocol_types::DynamicToolSpec;
+use codex_app_server_protocol_types::FileChangeApprovalDecision;
+use codex_app_server_protocol_types::FileChangeRequestApprovalParams;
+use codex_app_server_protocol_types::FileChangeRequestApprovalResponse;
+use codex_app_server_protocol_types::GetAccountRateLimitsResponse;
+use codex_app_server_protocol_types::InitializeCapabilities;
+use codex_app_server_protocol_types::InitializeParams;
+use codex_app_server_protocol_types::InitializeResponse;
+use codex_app_server_protocol_types::JSONRPCMessage;
+use codex_app_server_protocol_types::JSONRPCNotification;
+use codex_app_server_protocol_types::JSONRPCRequest;
+use codex_app_server_protocol_types::JSONRPCResponse;
+use codex_app_server_protocol_types::LoginAccountResponse;
+use codex_app_server_protocol_types::ModelListParams;
+use codex_app_server_protocol_types::ModelListResponse;
+use codex_app_server_protocol_types::RequestId;
+use codex_app_server_protocol_types::ServerNotification;
+use codex_app_server_protocol_types::ServerRequest;
+use codex_app_server_protocol_types::ThreadDecrementElicitationParams;
+use codex_app_server_protocol_types::ThreadDecrementElicitationResponse;
+use codex_app_server_protocol_types::ThreadIncrementElicitationParams;
+use codex_app_server_protocol_types::ThreadIncrementElicitationResponse;
+use codex_app_server_protocol_types::ThreadItem;
+use codex_app_server_protocol_types::ThreadListParams;
+use codex_app_server_protocol_types::ThreadListResponse;
+use codex_app_server_protocol_types::ThreadResumeParams;
+use codex_app_server_protocol_types::ThreadResumeResponse;
+use codex_app_server_protocol_types::ThreadStartParams;
+use codex_app_server_protocol_types::ThreadStartResponse;
+use codex_app_server_protocol_types::TurnStartParams;
+use codex_app_server_protocol_types::TurnStartResponse;
+use codex_app_server_protocol_types::TurnStatus;
+use codex_app_server_protocol_types::UserInput as V2UserInput;
 use codex_core::config::Config;
 use codex_otel::OtelProvider;
 use codex_otel::current_span_w3c_trace_context;
@@ -508,10 +508,7 @@ fn kill_listeners_on_same_port(listen: &str, deadline: Instant) -> Result<()> {
     let grace_deadline = Instant::now() + Duration::from_millis(300);
     for pid in pids {
         println!("killing listener pid {pid} on port {port}");
-        let term_status = terminate_process(pid, false, deadline)?;
-        if !term_status.success() {
-            continue;
-        }
+        let _ = terminate_process(pid, false, deadline)?;
     }
 
     let remaining = listeners_after_grace(
@@ -561,22 +558,6 @@ async fn send_message(
     .await
 }
 
-pub async fn send_message_v2(
-    codex_bin: &Path,
-    config_overrides: &[String],
-    user_message: String,
-    dynamic_tools: &Option<Vec<DynamicToolSpec>>,
-) -> Result<()> {
-    let endpoint = Endpoint::SpawnCodex(codex_bin.to_path_buf());
-    send_message_v2_endpoint(
-        &endpoint,
-        config_overrides,
-        user_message,
-        /*experimental_api*/ true,
-        dynamic_tools,
-    )
-    .await
-}
 
 async fn send_message_v2_endpoint(
     endpoint: &Endpoint,
@@ -1235,14 +1216,7 @@ struct CodexClient {
     operation_deadline: Option<Instant>,
     wire_dump: bool,
     pending_notifications: VecDeque<JSONRPCNotification>,
-    command_approval_behavior: CommandApprovalBehavior,
     command_approval_count: usize,
-    last_turn_error_message: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum CommandApprovalBehavior {
-    AlwaysAccept,
 }
 
 
@@ -1311,9 +1285,7 @@ impl CodexClient {
             operation_deadline: None,
             wire_dump: std::env::var_os("CODEX_APP_SERVER_TEST_CLIENT_WIRE_DUMP").is_some(),
             pending_notifications: VecDeque::new(),
-            command_approval_behavior: CommandApprovalBehavior::AlwaysAccept,
             command_approval_count: 0,
-            last_turn_error_message: None,
         }
     }
 
@@ -1477,7 +1449,7 @@ impl CodexClient {
         let request_id = self.request_id();
         let request = ClientRequest::LoginAccount {
             request_id: request_id.clone(),
-            params: codex_app_server_protocol::LoginAccountParams::Chatgpt {
+            params: codex_app_server_protocol_types::LoginAccountParams::Chatgpt {
                 app_brand: None,
                 codex_streamlined_login: false,
                 use_hosted_login_success_page: false,
@@ -1491,7 +1463,7 @@ impl CodexClient {
         let request_id = self.request_id();
         let request = ClientRequest::LoginAccount {
             request_id: request_id.clone(),
-            params: codex_app_server_protocol::LoginAccountParams::ChatgptDeviceCode,
+            params: codex_app_server_protocol_types::LoginAccountParams::ChatgptDeviceCode,
         };
 
         self.send_request(request, request_id, "account/login/start")
@@ -1582,7 +1554,6 @@ impl CodexClient {
     }
 
     fn stream_turn(&mut self, thread_id: &str, turn_id: &str) -> Result<()> {
-        self.last_turn_error_message = None;
         loop {
             let notification = self.next_notification()?;
 
@@ -1647,14 +1618,9 @@ impl CodexClient {
                 }
                 ServerNotification::TurnCompleted(payload) => {
                     if payload.thread_id == thread_id && payload.turn.id == turn_id {
-                        self.last_turn_error_message = payload
-                            .turn
-                            .error
-                            .as_ref()
-                            .map(|error| error.message.clone());
                         println!("\n< turn/completed notification: {:?}", payload.turn.status);
                         if payload.turn.status == TurnStatus::Failed
-                            && let Some(error) = payload.turn.error
+                            && let Some(error) = payload.turn.error.as_ref()
                         {
                             println!("[turn error] {}", error.message);
                         }
@@ -1662,8 +1628,8 @@ impl CodexClient {
                             bail!(
                                 "turn {turn_id} ended with {:?}: {}",
                                 payload.turn.status,
-                                self.last_turn_error_message
-                                    .as_deref()
+                                payload.turn.error.as_ref()
+                                    .map(|error| error.message.as_str())
                                     .unwrap_or("no error details")
                             );
                         }
@@ -1893,9 +1859,7 @@ impl CodexClient {
             println!("< proposed network policy amendments: {network_policy_amendments:?}");
         }
 
-        let decision = match self.command_approval_behavior {
-            CommandApprovalBehavior::AlwaysAccept => CommandExecutionApprovalDecision::Accept,
-        };
+        let decision = CommandExecutionApprovalDecision::Accept;
         let response = CommandExecutionRequestApprovalResponse {
             decision: decision.clone(),
         };

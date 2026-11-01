@@ -42,56 +42,6 @@ struct RunnerTransportRequest {
     proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
 }
 
-fn spawn_runner_transport_with_retry<T>(
-    sandbox_creds: SandboxCreds,
-    request: &RunnerTransportRequest,
-    mut spawn: impl FnMut(&Path, &Path, &SandboxCreds, Option<&Path>, SpawnRequest) -> Result<T>,
-    refresh: impl FnOnce(
-        &ResolvedWindowsSandboxPermissions,
-        &Path,
-        &HashMap<String, String>,
-        &Path,
-        Option<&[PathBuf]>,
-        &[PathBuf],
-        bool,
-        Option<&[PathBuf]>,
-        &[PathBuf],
-        &[PathBuf],
-        bool,
-        crate::WindowsSandboxProxySettingsMode,
-    ) -> Result<SandboxCreds>,
-) -> Result<T> {
-    retry_runner_spawn_once(
-        sandbox_creds,
-        &request.spawn_request.command,
-        |sandbox_creds| {
-            spawn(
-                &request.codex_home,
-                &request.cwd,
-                &sandbox_creds,
-                request.logs_base_dir.as_deref(),
-                request.spawn_request.clone(),
-            )
-        },
-        || {
-            refresh(
-                &request.permissions,
-                &request.cwd,
-                &request.env_map,
-                &request.codex_home,
-                request.read_roots_override.as_deref(),
-                &request.additional_read_roots,
-                request.read_roots_include_platform_defaults,
-                request.write_roots_override.as_deref(),
-                &request.deny_read_paths_override,
-                &request.deny_write_paths_override,
-                request.proxy_enforced,
-                request.proxy_settings_mode,
-            )
-        },
-    )
-}
-
 async fn spawn_runner_transport_task(
     sandbox_creds: SandboxCreds,
     request: RunnerTransportRequest,
@@ -104,14 +54,37 @@ async fn spawn_runner_transport_task(
     let (result_tx, result_rx) = oneshot::channel();
     tokio::task::spawn_blocking(move || {
         if result_tx.is_closed() || admission.is_cancelled() { return; }
-        let result = spawn_runner_transport_with_retry(
+        let result = retry_runner_spawn_once(
             sandbox_creds,
-            &request,
-            |home, cwd, creds, logs, request| spawn_runner_transport_with_admission(home, cwd, creds, logs, request, &admission),
-            |permissions, cwd, env, home, read, additional, defaults, write, deny_read, deny_write, proxy, mode| {
+            &request.spawn_request.command,
+            |creds| {
+                spawn_runner_transport_with_admission(
+                    &request.codex_home,
+                    &request.cwd,
+                    &creds,
+                    request.logs_base_dir.as_deref(),
+                    request.spawn_request.clone(),
+                    &admission,
+                )
+            },
+            || {
                 anyhow::ensure!(!admission.is_cancelled(), "runner launch cancelled before credential refresh");
                 let token = crate::WindowsSandboxCancellationToken::new({ let admission = std::sync::Arc::clone(&admission); move || admission.is_cancelled() });
-                refresh_logon_sandbox_creds(permissions, cwd, env, home, read, additional, defaults, write, deny_read, deny_write, proxy, mode, Some(&token))
+                refresh_logon_sandbox_creds(
+                    &request.permissions,
+                    &request.cwd,
+                    &request.env_map,
+                    &request.codex_home,
+                    request.read_roots_override.as_deref(),
+                    &request.additional_read_roots,
+                    request.read_roots_include_platform_defaults,
+                    request.write_roots_override.as_deref(),
+                    &request.deny_read_paths_override,
+                    &request.deny_write_paths_override,
+                    request.proxy_enforced,
+                    request.proxy_settings_mode,
+                    Some(&token),
+                )
             },
         );
         // An undelivered transport still owns process rollback, so cancellation
@@ -324,7 +297,7 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
         stdout_tx,
         stderr_rx.as_ref().map(|(tx, _rx)| tx.clone()),
         exit_tx,
-        Some(outbound_tx.clone()),
+        outbound_tx.clone(),
         shutdown_tx,
     );
 

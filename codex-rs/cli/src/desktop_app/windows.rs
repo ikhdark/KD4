@@ -11,11 +11,10 @@ pub async fn run_windows_app_open_or_install(
     workspace: PathBuf,
     download_url_override: Option<String>,
 ) -> anyhow::Result<()> {
-    let workspace_path = workspace.display().to_string();
     let display_workspace = display_workspace_path(&workspace);
     if codex_app_is_installed().await? {
         eprintln!("Opening Codex Desktop workspace {display_workspace}...");
-        open_url(&codex_new_thread_url(&workspace_path)).await?;
+        open_url(&super::codex_new_thread_url(&workspace)).await?;
         return Ok(());
     }
 
@@ -74,12 +73,6 @@ async fn open_url(url: &str) -> anyhow::Result<()> {
     }
 }
 
-fn codex_new_thread_url(workspace: &str) -> String {
-    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-    serializer.append_pair("path", workspace);
-    let query = serializer.finish();
-    format!("codex://threads/new?{query}")
-}
 
 fn display_workspace_path(workspace: &Path) -> String {
     let path = workspace.display().to_string();

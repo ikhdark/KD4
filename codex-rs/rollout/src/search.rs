@@ -113,7 +113,7 @@ async fn search_rollout_matches_with_query(
     )
     .await?
     else {
-        return scan_rollout_matches(root.as_path(), query).await;
+        return scan_rollout_matches(root.as_path(), query, /*compressed_only*/ false).await;
     };
     let Some(plain_matches) = ripgrep_rollout_paths(
         rg_command,
@@ -124,7 +124,7 @@ async fn search_rollout_matches_with_query(
     )
     .await?
     else {
-        return scan_rollout_matches(root.as_path(), query).await;
+        return scan_rollout_matches(root.as_path(), query, /*compressed_only*/ false).await;
     };
     let mut matches = HashMap::new();
     for (path, snippet) in plain_matches {
@@ -140,7 +140,7 @@ async fn search_rollout_matches_with_query(
             insert_rollout_match(&mut matches, path, snippet);
         }
     }
-    for (path, snippet) in scan_compressed_rollout_matches(root.as_path(), query).await? {
+    for (path, snippet) in scan_rollout_matches(root.as_path(), query, /*compressed_only*/ true).await? {
         insert_rollout_match(&mut matches, path, snippet);
     }
     Ok(matches)
@@ -394,6 +394,7 @@ fn insert_rollout_match(
 async fn scan_rollout_matches(
     root: &Path,
     query: &RolloutSearchQuery,
+    compressed_only: bool,
 ) -> io::Result<RolloutSearchMatches> {
     let mut matches = HashMap::new();
     let mut dirs = vec![root.to_path_buf()];
@@ -417,6 +418,9 @@ async fn scan_rollout_matches(
             let Some(rollout_file) = compression::RolloutFile::from_path(path) else {
                 continue;
             };
+            if compressed_only && !rollout_file.is_compressed() {
+                continue;
+            }
             let (matched, snippet) = inspect_rollout_match(
                 rollout_file.path(),
                 &query.json_matcher,
@@ -462,54 +466,6 @@ pub async fn first_rollout_content_match_snippet(
     RolloutSearchQuery::new(search_term)?
         .first_content_match_snippet(path)
         .await
-}
-
-async fn scan_compressed_rollout_matches(
-    root: &Path,
-    query: &RolloutSearchQuery,
-) -> io::Result<RolloutSearchMatches> {
-    let mut matches = HashMap::new();
-    let mut dirs = vec![root.to_path_buf()];
-
-    while let Some(dir) = dirs.pop() {
-        let mut entries = match tokio::fs::read_dir(dir).await {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err),
-        };
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            let file_type = entry.file_type().await?;
-            if file_type.is_dir() {
-                dirs.push(path);
-                continue;
-            }
-            if !file_type.is_file() {
-                continue;
-            }
-            let Some(rollout_file) = compression::RolloutFile::from_path(path) else {
-                continue;
-            };
-            if !rollout_file.is_compressed() {
-                continue;
-            }
-            let (matched, snippet) = inspect_rollout_match(
-                rollout_file.path(),
-                &query.json_matcher,
-                &query.text_matcher,
-            )
-            .await?;
-            if matched {
-                insert_rollout_match(
-                    &mut matches,
-                    compression::plain_rollout_path(rollout_file.path()),
-                    snippet,
-                );
-            }
-        }
-    }
-
-    Ok(matches)
 }
 
 fn json_escaped_search_term(search_term: &str) -> io::Result<String> {

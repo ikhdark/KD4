@@ -254,17 +254,6 @@ pub(crate) async fn repair_legacy_validation_index_migration_order(
     pool: &SqlitePool,
     migrator: &Migrator,
 ) -> anyhow::Result<()> {
-    repair_legacy_validation_index_migration_order_inner(
-        pool,
-        migrator,
-    )
-    .await
-}
-
-async fn repair_legacy_validation_index_migration_order_inner(
-    pool: &SqlitePool,
-    migrator: &Migrator,
-) -> anyhow::Result<()> {
     let Some(validation_migration) = migrator
         .migrations
         .iter()

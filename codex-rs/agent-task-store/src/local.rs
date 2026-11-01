@@ -871,6 +871,7 @@ impl LocalAgentTaskStore {
         let terminal = sqlx::query_scalar::<_, String>(
             "SELECT body_json FROM observations WHERE attempt_id = ? AND kind = ?
              AND json_extract(body_json, '$.call_id') NOT LIKE '%:parent-delivery'
+             AND json_extract(body_json, '$.call_id') NOT LIKE '%:result-retention'
              ORDER BY sequence DESC LIMIT 1",
         )
         .bind(current_attempt.attempt_id.to_string())
@@ -884,13 +885,18 @@ impl LocalAgentTaskStore {
                 "{}:parent-delivery",
                 terminal.call_id.as_deref().unwrap_or_default()
             );
+            let legacy_retention_origin = format!(
+                "{}:result-retention",
+                terminal.call_id.as_deref().unwrap_or_default()
+            );
             let delivery = sqlx::query_scalar::<_, String>(
                 "SELECT body_json FROM observations WHERE attempt_id = ? AND kind = ?
-                 AND json_extract(body_json, '$.call_id') = ? ORDER BY sequence DESC LIMIT 1",
+                 AND json_extract(body_json, '$.call_id') IN (?, ?) ORDER BY sequence DESC LIMIT 1",
             )
             .bind(current_attempt.attempt_id.to_string())
             .bind(encode(&ObservationKind::HostCompletion)?)
             .bind(delivery_origin)
+            .bind(legacy_retention_origin)
             .fetch_optional(&mut *transaction)
             .await?
             .map(|body| decode::<RuntimeObservation>(&body))
@@ -2972,63 +2978,6 @@ impl LocalAgentTaskStore {
                 self.notify_wake_waiters();
             }
             result
-        })
-    }
-
-    /// Read-only early reuse check. Final admitted creation still repeats the
-    /// same predicate under its transaction to handle simultaneous misses.
-    pub fn reusable_explorer_assignment<'a>(
-        &'a self,
-        repo_root: &'a Path,
-        draft: AssignmentDraft,
-    ) -> TaskStoreFuture<'a, Option<AssignmentId>> {
-        Box::pin(async move {
-            let root = repo_root.to_path_buf();
-            let (repository, mut assignment, scope_case) = tokio::task::spawn_blocking(move || {
-                let repository = repository_identity(&root)?;
-                let assignment = draft.normalize(&root)?;
-                let scope_case = CandidateScopeCase::observe(
-                    &root,
-                    &assignment.read_scope,
-                    &assignment.write_scope,
-                );
-                Ok::<_, StoreError>((repository, assignment, scope_case))
-            })
-            .await
-            .map_err(|error| StoreError::CorruptData(error.to_string()))??;
-            assignment.validate_selective_role_contract()?;
-            if assignment.repository_id != repository.id {
-                return Err(StoreError::InvalidScope(
-                    "repository root changed during reuse lookup".to_string(),
-                ));
-            }
-            assignment.workspace_id = repository.workspace_id.clone();
-            if assignment.role != AgentRole::Explorer
-                || assignment.workspace_strategy == WorkspaceStrategy::Isolated
-            {
-                return Ok(None);
-            }
-            let mut transaction = self.pool.begin().await?;
-            validate_dependencies_tx(
-                &mut transaction,
-                assignment.assignment_id,
-                Some(&assignment.repository_id),
-                &assignment.dependencies,
-            )
-            .await?;
-            let result =
-                selective_admission_tx(&mut transaction, &assignment, &scope_case, false).await;
-            transaction.rollback().await?;
-            match result {
-                // Only an investigation still in flight can be shared. Sealed
-                // receipts have no binding to the inputs the producer observed.
-                Err(StoreError::AdmissionRejected {
-                    reason: AdmissionRejectionReason::DuplicateExplorerInvestigation,
-                    reusable_assignment_id,
-                }) => Ok(reusable_assignment_id),
-                Ok(_) => Ok(None),
-                Err(error) => Err(error),
-            }
         })
     }
 
@@ -5295,8 +5244,8 @@ async fn selective_admission_tx(
     let observed = tracing::enabled!(target: "codex_storage_runtime", tracing::Level::TRACE)
         .then(std::time::Instant::now);
     let rows = sqlx::query(
-        "SELECT assignments.body_json, repositories.workspace_id, attempts.state,
-                attempts.sealed_at, attempts.attempt_id, attempts.amendment_json,
+        "SELECT assignments.body_json, repositories.workspace_id,
+                attempts.attempt_id, attempts.amendment_json,
                 bindings.task_name, bindings.agent_path, bindings.thread_id
          FROM assignments
          JOIN assignment_repositories repositories USING (assignment_id)
@@ -5329,19 +5278,6 @@ async fn selective_admission_tx(
     for row in rows {
         let existing: Assignment = decode(row.get::<String, _>("body_json").as_str())?;
         let existing_workspace_id = row.get::<String, _>("workspace_id");
-        let existing_state: AttemptState = decode(row.get::<String, _>("state").as_str())?;
-        let existing_is_active = existing_state == AttemptState::Active
-            && row.try_get::<Option<String>, _>("sealed_at")?.is_none();
-        // An identical task description is not an observed-input contract.
-        // Active producers may already have read obsolete bytes. Until source
-        // generations and dependency receipts are bound, admit fresh reads.
-
-        if !existing_is_active {
-            // Even persisted seal-time fingerprints cannot prove what the
-            // producer read. Until observed inputs are bound to the result,
-            // completed investigations never certify fresh reuse.
-            continue;
-        }
         let read_overlaps = existing.read_scope.iter().any(|existing_scope| {
             assignment
                 .read_scope

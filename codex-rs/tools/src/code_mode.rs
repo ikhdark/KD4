@@ -1,8 +1,8 @@
 use crate::ResponsesApiNamespaceTool;
 use crate::ToolName;
 use crate::ToolSpec;
-use codex_code_mode::CodeModeToolKind;
-use codex_code_mode::ToolDefinition as CodeModeToolDefinition;
+use codex_code_mode_protocol::CodeModeToolKind;
+use codex_code_mode_protocol::ToolDefinition as CodeModeToolDefinition;
 
 const CODE_MODE_TOOL_SEARCH_RESULT_GUIDANCE: &str = "In code mode, inspect `status` and `search_complete` before reusing a discovery result. `completed` is complete; `incomplete` remains retryable, including bounded matches or an unavailable catalog even with zero omitted contracts. `omitted_result_count` counts omitted contracts when known; `aborted` has a null count. Reuse complete results only for the same catalog version, query, limit, scope, and permissions. `direct_only_tools` overrides local resolution: these excluded names are activated for the next direct model interface, not this cell. Resolve returned or `activated_omitted_tools` names with `resolve_tool(name)`; repeat or refine discovery when enumeration is incomplete. A returned namespace tool outside `direct_only_tools` is callable as `resolve_tool(\"<namespace>.<name>\")`.";
 
@@ -102,7 +102,7 @@ pub fn augment_tool_spec_for_code_mode(spec: ToolSpec) -> ToolSpec {
                                 .as_ref()
                                 .map(crate::ToolOutputSchema::to_value),
                         };
-                        tool.description = codex_code_mode::augment_tool_definition(definition)
+                        tool.description = codex_code_mode_protocol::augment_tool_definition(definition)
                             .description
                             .to_string();
                     }
@@ -119,8 +119,8 @@ pub fn augment_tool_spec_for_code_mode(spec: ToolSpec) -> ToolSpec {
 /// exactly one callable; use `collect_code_mode_tool_definitions` for catalogs.
 pub fn tool_spec_to_code_mode_tool_definition(spec: &ToolSpec) -> Option<CodeModeToolDefinition> {
     let definition = code_mode_tool_definition_for_spec(spec)?;
-    codex_code_mode::is_code_mode_nested_tool(&definition.name)
-        .then(|| codex_code_mode::augment_tool_definition(definition))
+    codex_code_mode_protocol::is_code_mode_nested_tool(&definition.name)
+        .then(|| codex_code_mode_protocol::augment_tool_definition(definition))
 }
 
 pub fn collect_code_mode_tool_definitions<'a>(
@@ -136,7 +136,7 @@ pub fn collect_code_mode_tool_definitions_with_input_schemas<'a>(
     let mut tool_definitions = specs
         .into_iter()
         .flat_map(code_mode_tool_definitions_for_spec)
-        .filter(|definition| codex_code_mode::is_code_mode_nested_tool(&definition.name))
+        .filter(|definition| codex_code_mode_protocol::is_code_mode_nested_tool(&definition.name))
         .collect::<Vec<_>>();
     tool_definitions.sort_by(|left, right| {
         left.name
@@ -150,14 +150,14 @@ pub fn collect_code_mode_tool_definitions_with_input_schemas<'a>(
             if let Some(schema) = canonical_input_schemas.get(&definition.tool_name) {
                 definition.input_schema = Some(schema.clone());
             }
-            codex_code_mode::augment_tool_definition(definition)
+            codex_code_mode_protocol::augment_tool_definition(definition)
         })
         .collect()
 }
 
 fn augmented_description_for_spec(spec: &ToolSpec) -> Option<String> {
     code_mode_tool_definition_for_spec(spec)
-        .map(codex_code_mode::augment_tool_definition)
+        .map(codex_code_mode_protocol::augment_tool_definition)
         .map(|definition| definition.description.to_string())
 }
 
@@ -245,5 +245,5 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
 }
 
 pub fn code_mode_name_for_tool_name(tool_name: &ToolName) -> String {
-    codex_code_mode::legacy_code_mode_identifier(tool_name)
+    codex_code_mode_protocol::legacy_code_mode_identifier(tool_name)
 }

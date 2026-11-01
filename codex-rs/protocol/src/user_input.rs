@@ -73,20 +73,6 @@ impl TextElement {
         }
     }
 
-    /// Returns a copy of this element with a remapped byte range.
-    ///
-    /// The placeholder is preserved as-is; callers must ensure the new range
-    /// still refers to the same logical element (and same placeholder)
-    /// within the new text.
-    pub fn map_range<F>(&self, map: F) -> Self
-    where
-        F: FnOnce(ByteRange) -> ByteRange,
-    {
-        Self {
-            byte_range: map(self.byte_range),
-            placeholder: self.placeholder.clone(),
-        }
-    }
 
     pub fn set_placeholder(&mut self, placeholder: Option<String>) {
         self.placeholder = placeholder;

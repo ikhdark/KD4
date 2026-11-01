@@ -261,9 +261,7 @@ impl<S: Read + Write, C: Callback> HandshakeRole for ServerHandshake<S, C> {
                             )
                         })?
                         .extensions;
-                    let (extensions, agreed) = extensions_config
-                        .accept_offers(&extensions)
-                        .map_err(ProtocolError::from)?;
+                    let (extensions, agreed) = extensions_config.accept_offers(&extensions);
 
                     if let Some(agreed) = agreed {
                         response.headers_mut().typed_insert(agreed)

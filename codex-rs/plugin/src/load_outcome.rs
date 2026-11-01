@@ -5,7 +5,6 @@ use std::sync::Arc;
 use crate::PluginSkillRoot;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
-use crate::AppConnectorId;
 use crate::AppDeclaration;
 use crate::PluginCapabilitySummary;
 use crate::PluginHookSource;
@@ -23,6 +22,8 @@ pub struct LoadedPlugin<M> {
     pub manifest_description: Option<String>,
     pub tool_exposure: Option<PluginToolExposure>,
     pub root: AbsolutePathBuf,
+    /// Exact committed publication observed while parsing this capability snapshot.
+    pub installation_id: Option<String>,
     pub enabled: bool,
     pub skill_roots: Vec<AbsolutePathBuf>,
     pub disabled_skill_paths: HashSet<AbsolutePathBuf>,
@@ -183,14 +184,6 @@ impl<M: Clone> PluginLoadOutcome<M> {
         mcp_servers
     }
 
-    pub fn effective_apps(&self) -> Vec<AppConnectorId> {
-        app_connector_ids_from_declarations(
-            self.plugins
-                .iter()
-                .filter(|plugin| plugin.is_active())
-                .flat_map(|plugin| plugin.apps.iter()),
-        )
-    }
 
     pub fn effective_plugin_hook_sources(&self) -> Vec<PluginHookSource> {
         self.plugins

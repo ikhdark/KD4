@@ -1238,9 +1238,6 @@ async fn run_owned_patch(
             .await
             .map(|result| result.output)
         };
-        // A retry can also end through denial or a hook error. Every terminal
-        // path must finalize evidence retained by the preceding attempt.
-        runtime.finish_pending_workspace_tracking(&tool_ctx).await;
         let (out, delta) = match out {
             Ok(output) => (Ok(output.exec_output), Some(output.delta)),
             Err(_)

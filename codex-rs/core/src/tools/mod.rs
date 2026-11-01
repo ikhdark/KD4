@@ -1,9 +1,9 @@
 pub(crate) mod code_mode;
 pub(crate) mod command_execution;
-pub(crate) mod command_output_artifact;
+pub(crate) use codex_tool_artifacts as command_output_artifact;
 pub(crate) mod context;
 pub(crate) mod events;
-pub(crate) mod exact_reuse;
+pub(crate) use codex_tool_artifacts::exact_reuse;
 pub(crate) mod exposure;
 pub(crate) mod handlers;
 pub(crate) mod hook_names;
@@ -18,7 +18,7 @@ pub(crate) mod runtimes;
 pub(crate) mod sandboxing;
 pub(crate) use codex_command_analysis::shell_output_summary;
 pub(crate) mod spec_plan;
-pub(crate) mod tool_dispatch_trace;
+pub(crate) use codex_turn_timing::tool_dispatch_trace;
 
 use std::borrow::Cow;
 

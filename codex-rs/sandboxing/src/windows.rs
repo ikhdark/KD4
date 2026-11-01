@@ -16,10 +16,8 @@ use crate::compatibility_sandbox_policy_for_permission_profile;
 /// The elevated Windows backend consumes extra deny-read paths plus explicit
 /// read and write roots during setup/refresh. The unelevated restricted-token
 /// backend derives write roots from the permission profile and consumes extra
-/// deny-write carveouts that need preparation before launch. Read-root overrides are layered on top of the
-/// baseline helper roots that the elevated setup path needs to launch the
-/// sandboxed command; split policies that opt into platform defaults carry
-/// that explicitly with the override.
+/// deny-write carveouts that need preparation before launch. Complete readable-root
+/// allowlists are refused: shared sandbox accounts retain additive read grants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowsSandboxFilesystemOverrides {
     pub read_roots_override: Option<Vec<PathBuf>>,
@@ -83,12 +81,6 @@ pub fn resolve_windows_restricted_token_filesystem_overrides(
     let needs_direct_runtime_enforcement = file_system_sandbox_policy
         .needs_direct_runtime_enforcement(network_sandbox_policy, sandbox_policy_cwd);
 
-    if permission_profile_supports_windows_restricted_token_sandbox(permission_profile)
-        && !needs_direct_runtime_enforcement
-    {
-        return Ok(None);
-    }
-
     if !permission_profile_supports_windows_restricted_token_sandbox(permission_profile) {
         let permission_profile_name = permission_profile_display_name(permission_profile);
         return Err(format!(
@@ -99,13 +91,17 @@ pub fn resolve_windows_restricted_token_filesystem_overrides(
 
     // The restricted-token backend can still enforce split write restrictions,
     // but its WRITE_RESTRICTED token does not make capability SID deny-read ACEs
-    // participate in read access checks. Read restrictions therefore require the
-    // elevated backend, even when the filesystem root remains readable.
+    // participate in read access checks. Complete read allowlists are unsupported
+    // by either backend; explicit deny-read entries require the elevated backend.
     if !windows_policy_has_root_read_access(&file_system_sandbox_policy, sandbox_policy_cwd) {
         return Err(
-            "windows unelevated restricted-token sandbox cannot enforce split filesystem read restrictions directly; refusing to run unsandboxed"
+            "windows sandbox cannot enforce a complete readable-root allowlist with shared sandbox accounts; refusing to run unsandboxed"
                 .to_string(),
         );
+    }
+
+    if !needs_direct_runtime_enforcement {
+        return Ok(None);
     }
 
     let additional_deny_read_paths = codex_windows_sandbox::resolve_windows_deny_read_paths(
@@ -224,29 +220,19 @@ pub fn resolve_windows_elevated_filesystem_overrides(
         .iter()
         .map(|(path, _)| path)
         .collect();
-    let split_readable_roots: Vec<PathBuf> = file_system_sandbox_policy
-        .get_readable_roots_with_cwd(sandbox_policy_cwd)
-        .into_iter()
-        .map(AbsolutePathBuf::into_path_buf)
-        .map(&normalize_path)
-        .collect();
     let split_root_paths: Vec<PathBuf> = split_writable_roots
         .iter()
         .map(|root| normalize_path(root.root.to_path_buf()))
         .collect();
     let split_root_path_set: BTreeSet<&PathBuf> = split_root_paths.iter().collect();
 
-    // `has_full_disk_read_access()` is intentionally false when deny-read
-    // entries exist. For Windows setup overrides, the important question is
-    // whether the baseline still reads from the filesystem root and only needs
-    // additional deny ACLs layered on top.
-    let split_has_root_read_access =
-        windows_policy_has_root_read_access(&file_system_sandbox_policy, sandbox_policy_cwd);
-    let read_roots_override = if split_has_root_read_access {
-        None
-    } else {
-        Some(split_readable_roots)
-    };
+    // Explicit deny-read entries still use the elevated deny owner. Positive
+    // read allowlists cannot be isolated from persistent shared-account grants.
+    if !windows_policy_has_root_read_access(&file_system_sandbox_policy, sandbox_policy_cwd) {
+        return Err(
+            "windows sandbox cannot enforce a complete readable-root allowlist with shared sandbox accounts; refusing to run unsandboxed".to_string(),
+        );
+    }
 
     let write_roots_override = if split_root_path_set == legacy_root_paths {
         None
@@ -290,8 +276,7 @@ pub fn resolve_windows_elevated_filesystem_overrides(
         Vec::new()
     };
 
-    if read_roots_override.is_none()
-        && write_roots_override.is_none()
+    if write_roots_override.is_none()
         && additional_deny_read_paths.is_empty()
         && additional_deny_write_paths.is_empty()
     {
@@ -299,9 +284,8 @@ pub fn resolve_windows_elevated_filesystem_overrides(
     }
 
     Ok(Some(WindowsSandboxFilesystemOverrides {
-        read_roots_include_platform_defaults: read_roots_override.is_some()
-            && file_system_sandbox_policy.include_platform_defaults(),
-        read_roots_override,
+        read_roots_include_platform_defaults: false,
+        read_roots_override: None,
         write_roots_override,
         additional_deny_read_paths,
         additional_deny_write_paths,
@@ -318,10 +302,8 @@ fn windows_policy_has_root_read_access(
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
     cwd: &AbsolutePathBuf,
 ) -> bool {
-    let Some(root) = cwd.as_path().ancestors().last() else {
-        return false;
-    };
-    file_system_sandbox_policy.can_read_path_with_cwd(root, cwd.as_path())
+    codex_windows_sandbox::validate_windows_read_policy(file_system_sandbox_policy, cwd.as_path())
+        .is_ok()
 }
 
 fn permission_profile_display_name(permission_profile: &PermissionProfile) -> &'static str {

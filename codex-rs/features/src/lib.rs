@@ -13,6 +13,11 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use toml::Table;
 
+/// Minimum configurable ceiling for background write_stdin waits.
+pub const MIN_EMPTY_YIELD_TIME_MS: u64 = 5_000;
+/// Default maximum background terminal wait.
+pub const DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS: u64 = 300_000;
+
 /// Minimum supported per-session thread cap for multi-agent v2.
 pub const MULTI_AGENT_V2_MIN_CONCURRENT_THREADS_PER_SESSION: usize = 1;
 /// Default per-session thread cap for multi-agent v2, including the root agent.

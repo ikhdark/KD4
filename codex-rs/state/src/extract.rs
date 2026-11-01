@@ -2,7 +2,6 @@ use crate::model::ThreadMetadata;
 use chrono::DateTime;
 use chrono::Utc;
 use codex_protocol::items::TurnItem;
-use codex_protocol::models::ResponseItem;
 use codex_protocol::persisted_thread_settings::PersistedThreadSettingsReducer;
 use codex_protocol::persisted_thread_settings::reduce_persisted_thread_settings;
 use codex_protocol::protocol::EventMsg;
@@ -97,7 +96,7 @@ fn apply_non_setting_rollout_item(metadata: &mut ThreadMetadata, item: &RolloutI
         RolloutItem::SessionMeta(meta_line) => apply_session_meta_from_item(metadata, meta_line),
         RolloutItem::TurnContext(_) => {}
         RolloutItem::EventMsg(event) => apply_event_msg(metadata, event),
-        RolloutItem::ResponseItem(item) => apply_response_item(metadata, item),
+        RolloutItem::ResponseItem(_) => {}
         RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. } => {}
         RolloutItem::Compacted(_)
@@ -228,8 +227,6 @@ fn apply_event_msg(metadata: &mut ThreadMetadata, event: &EventMsg) {
     }
 }
 
-fn apply_response_item(_metadata: &mut ThreadMetadata, _item: &ResponseItem) {}
-
 fn apply_user_message(metadata: &mut ThreadMetadata, user: &UserMessageEvent) {
     if metadata.first_user_message.is_none() || metadata.preview.is_none() {
         let preview = user_message_preview(user);
@@ -238,7 +235,7 @@ fn apply_user_message(metadata: &mut ThreadMetadata, user: &UserMessageEvent) {
         }
         set_preview_if_empty(metadata, preview);
     }
-    if metadata.title.is_empty() {
+    if !metadata.title_is_explicit && metadata.title.is_empty() {
         let title = strip_user_message_prefix(user.message.as_str());
         if !title.is_empty() {
             metadata.title = title.to_string();

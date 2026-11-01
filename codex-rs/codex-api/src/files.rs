@@ -220,14 +220,13 @@ pub async fn upload_openai_file_with_pool(
     file_size_bytes: u64,
     contents: impl Stream<Item = std::io::Result<Bytes>> + Send + 'static,
 ) -> Result<UploadedOpenAiFile, OpenAiFileError> {
-    upload_openai_file_with_pool_and_finalize_timeout(
+    upload_openai_file_contents_with_pool(
         base_url,
         auth,
         http_clients,
         file_name,
         file_size_bytes,
         OpenAiFileContents::Stream(Box::pin(contents)),
-        OPENAI_FILE_FINALIZE_TIMEOUT,
     )
     .await
 }
@@ -241,26 +240,24 @@ pub async fn upload_openai_file_bytes_with_pool(
     file_name: String,
     contents: Bytes,
 ) -> Result<UploadedOpenAiFile, OpenAiFileError> {
-    upload_openai_file_with_pool_and_finalize_timeout(
+    upload_openai_file_contents_with_pool(
         base_url,
         auth,
         http_clients,
         file_name,
         u64::try_from(contents.len()).unwrap_or(u64::MAX),
         OpenAiFileContents::Replayable(contents),
-        OPENAI_FILE_FINALIZE_TIMEOUT,
     )
     .await
 }
 
-async fn upload_openai_file_with_pool_and_finalize_timeout(
+async fn upload_openai_file_contents_with_pool(
     base_url: &str,
     auth: &dyn AuthProvider,
     http_clients: &RouteAwareClientPool,
     file_name: String,
     file_size_bytes: u64,
     contents: OpenAiFileContents,
-    finalize_timeout: Duration,
 ) -> Result<UploadedOpenAiFile, OpenAiFileError> {
     if file_size_bytes > OPENAI_FILE_UPLOAD_LIMIT_BYTES {
         return Err(OpenAiFileError::FileTooLarge {
@@ -312,7 +309,12 @@ async fn upload_openai_file_with_pool_and_finalize_timeout(
         };
         let mut retries = 0;
         loop {
-            let (error, retryable, server_advice) = match request.send().await {
+            let response = codex_http_client::with_dispatch_guard(
+                auth.dispatch_guard(),
+                request.send(),
+            )
+            .await;
+            let (error, retryable, server_advice) = match response {
                 Ok(response) => {
                     let status = response.status();
                     let server_advice = blob_upload_retry_after(response.headers());
@@ -357,7 +359,7 @@ async fn upload_openai_file_with_pool_and_finalize_timeout(
         }
 
         let finalize_url = file_endpoint_url(base_url, Some(&create_payload.file_id), true)?;
-        let finalize_deadline = Instant::now() + finalize_timeout;
+        let finalize_deadline = Instant::now() + OPENAI_FILE_FINALIZE_TIMEOUT;
         loop {
             let remaining = finalize_deadline
                 .checked_duration_since(Instant::now())

@@ -1,0 +1,30 @@
+use super::ContextualUserFragment;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginInstructions {
+    text: String,
+}
+
+impl PluginInstructions {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self { text: text.into() }
+    }
+}
+
+impl ContextualUserFragment for PluginInstructions {
+    fn role(&self) -> &'static str {
+        "developer"
+    }
+
+    fn markers(&self) -> (&'static str, &'static str) {
+        Self::type_markers()
+    }
+
+    fn type_markers() -> (&'static str, &'static str) {
+        ("", "")
+    }
+
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(&self.text)
+    }
+}

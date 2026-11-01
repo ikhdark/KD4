@@ -76,7 +76,6 @@ async fn first_layer_config_error_from_entries(layers: &[ConfigLayerEntry]) -> O
 /// - system    `%ProgramData%\OpenAI\Codex\requirements.toml`
 /// - cloud:    enterprise-managed cloud config bundle requirements
 /// - legacy:   managed_config.toml reinterpreted as requirements.toml
-/// - admin:    managed preferences (*)
 ///
 /// For backwards compatibility, we also load from
 /// `managed_config.toml` and map it to `requirements.toml`.
@@ -120,7 +119,6 @@ pub async fn load_config_layers_state(
     let mut requirements_layers = Vec::new();
     let mut bundle_requirements_layers = Vec::new();
     let mut system_requirements_layer = None;
-    let managed_preferences_requirements_layer;
     let mut cloud_config_layers = Vec::new();
 
     if !ignore_managed_requirements {
@@ -139,17 +137,13 @@ pub async fn load_config_layers_state(
             cloud_config_layers = enterprise_managed_config;
         }
 
-        managed_preferences_requirements_layer = None;
-
         // Honor the system requirements.toml location.
         let requirements_toml_file = system_requirements_toml_file_with_overrides(&overrides)?;
         system_requirements_layer = load_requirements_toml(fs, &requirements_toml_file).await?;
-    } else {
-        managed_preferences_requirements_layer = None;
     }
 
     let loaded_config_layers =
-        layer_io::load_config_layers_internal(fs, codex_home, overrides.clone(), strict_config)
+        layer_io::load_config_layers_internal(fs, overrides.clone(), strict_config)
             .await?;
     if !ignore_managed_requirements {
         requirements_layers.extend(system_requirements_layer);
@@ -159,7 +153,6 @@ pub async fn load_config_layers_state(
         requirements_layers.extend(requirements_layers_from_legacy_scheme(
             loaded_config_layers.clone(),
         )?);
-        requirements_layers.extend(managed_preferences_requirements_layer);
     }
 
     let config_requirements_toml = compose_requirements(requirements_layers)?.unwrap_or_default();
@@ -362,10 +355,7 @@ pub async fn load_config_layers_state(
     // `managed_config.toml` that do not have an equivalent in
     // `ConfigRequirements`, note users can still override these values on a
     // per-turn basis in the TUI and VS Code.
-    let LoadedConfigLayers {
-        managed_config,
-        managed_config_from_mdm,
-    } = loaded_config_layers;
+    let LoadedConfigLayers { managed_config } = loaded_config_layers;
     if let Some(config) = managed_config {
         let managed_parent = config.file.as_path().parent().ok_or_else(|| {
             io::Error::new(
@@ -384,25 +374,6 @@ pub async fn load_config_layers_state(
             managed_config,
             config.raw_toml,
             base_dir,
-        ));
-    }
-    if let Some(config) = managed_config_from_mdm {
-        // As a general rule, config from MDM should _not_ include relative
-        // paths, starting with `./`, but a path starting with `~/` _is_ a
-        // supported use case. Because resolve_relative_paths_in_config_toml()
-        // relies on AbsolutePathBufGuard to resolve `~/`, we must supply a
-        // value for base_dir. Preserve that same base on the layer so later
-        // raw-TOML diagnostics parse with the same path semantics.
-        let raw_toml_base_dir = AbsolutePathBuf::from_absolute_path(codex_home)?;
-        let managed_config = resolve_relative_paths_in_config_toml(
-            config.managed_config,
-            raw_toml_base_dir.as_path(),
-        )?;
-        layers.push(ConfigLayerEntry::new_with_raw_toml(
-            ConfigLayerSource::LegacyManagedConfigTomlFromMdm,
-            managed_config,
-            config.raw_toml,
-            raw_toml_base_dir,
         ));
     }
 
@@ -1008,16 +979,9 @@ fn windows_program_data_dir_from_known_folder() -> io::Result<PathBuf> {
 fn requirements_layers_from_legacy_scheme(
     loaded_config_layers: LoadedConfigLayers,
 ) -> io::Result<Vec<RequirementsLayerEntry>> {
-    // List the file-backed legacy layer first because requirements layers are
-    // composed lowest-precedence to highest-precedence, and MDM has higher
-    // precedence than the legacy managed_config.toml file.
-    let LoadedConfigLayers {
-        managed_config,
-        managed_config_from_mdm,
-    } = loaded_config_layers;
+    let LoadedConfigLayers { managed_config } = loaded_config_layers;
 
-    let layer_count =
-        usize::from(managed_config.is_some()) + usize::from(managed_config_from_mdm.is_some());
+    let layer_count = usize::from(managed_config.is_some());
     let mut layers = Vec::with_capacity(layer_count);
     for (source, config) in managed_config
         .map(|c| {
@@ -1027,12 +991,6 @@ fn requirements_layers_from_legacy_scheme(
             )
         })
         .into_iter()
-        .chain(managed_config_from_mdm.map(|config| {
-            (
-                RequirementSource::LegacyManagedConfigTomlFromMdm,
-                config.managed_config,
-            )
-        }))
     {
         let legacy_config: LegacyManagedConfigToml =
             config.try_into().map_err(|err: toml::de::Error| {

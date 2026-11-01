@@ -2,7 +2,7 @@
 //!
 //! Caller-controlled measurements accepted here contain no strings, paths, byte buffers, or
 //! arbitrary metadata. This module adds only static metric names and closed, low-cardinality tag
-//! values, and never tags metrics with its opaque task identifier. This is a boundary on fields
+//! values, and never tags metrics with task identifiers. This is a boundary on fields
 //! supplied by this module, not a claim about the complete export envelope: `SessionTelemetry`
 //! may attach its standard session metadata.
 
@@ -22,7 +22,6 @@ use std::time::Duration;
 use std::time::Instant;
 
 const MAX_METRIC_ROWS: usize = 256;
-pub(super) const MAX_RECORDED_EVENTS: usize = 4_096;
 
 const TASK_DURATION_METRIC: &str = "codex.multi_agent.task.duration_ms";
 pub(super) const TASK_FIRST_MEANINGFUL_PROGRESS_DURATION_METRIC: &str =
@@ -56,15 +55,6 @@ const CAPABILITY_TAG: &str = "capability";
 const OUTCOME_TAG: &str = "outcome";
 const PHASE_TAG: &str = "phase";
 const DISPOSITION_TAG: &str = "disposition";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct OpaqueId(u128);
-
-impl OpaqueId {
-    pub(crate) const fn new(value: u128) -> Self {
-        Self(value)
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum RoleLabel {
@@ -285,7 +275,6 @@ impl From<AgentStatusClaim> for FinalOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TaskMetricInput {
-    pub task_id: OpaqueId,
     pub duration: Duration,
     /// Time with no active assignments anywhere in this coordinator, within this task's lifetime.
     pub coordinator_zero_active_time: Duration,
@@ -305,17 +294,12 @@ pub(crate) struct TaskMetricInput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TaskMetrics {
-    pub task_id: OpaqueId,
     pub duration: Duration,
     /// Coordinator occupancy only; this does not measure this task's required dependency path.
     pub coordinator_zero_active_time: Duration,
     pub coordinator_zero_active_basis_points: u16,
-    pub total_usage: UsageTotals,
     pub usage_by_role: BTreeMap<RoleCapability, UsageTotals>,
     pub concurrency_utilization_basis_points: u16,
-    pub acceptance_total: u32,
-    pub acceptance_first_pass_closed: Option<u32>,
-    pub acceptance_final_closed: u32,
     pub first_pass_acceptance_basis_points: Option<u16>,
     pub final_acceptance_basis_points: u16,
     pub duplicate_work: Option<u32>,
@@ -389,22 +373,17 @@ impl TaskMetrics {
         }
 
         Ok(Self {
-            task_id: input.task_id,
             duration: input.duration,
             coordinator_zero_active_time: input.coordinator_zero_active_time,
             coordinator_zero_active_basis_points: ratio(
                 input.coordinator_zero_active_time.as_nanos(),
                 input.duration.as_nanos(),
             ),
-            total_usage,
             usage_by_role,
             concurrency_utilization_basis_points: ratio(
                 active_time.as_nanos(),
                 capacity_time.as_nanos(),
             ),
-            acceptance_total: input.acceptance_total,
-            acceptance_first_pass_closed: input.acceptance_first_pass_closed,
-            acceptance_final_closed: input.acceptance_final_closed,
             first_pass_acceptance_basis_points: input
                 .acceptance_first_pass_closed
                 .map(|closed| ratio(u128::from(closed), u128::from(input.acceptance_total))),
@@ -522,7 +501,6 @@ impl TaskMetrics {
 /// dependencies or progress: unrelated active assignments can hide a stalled required task.
 #[derive(Debug)]
 pub(crate) struct TaskMetricRecorder {
-    task_id: OpaqueId,
     last_elapsed: Duration,
     active_turns: u32,
     capacity: u32,
@@ -530,19 +508,16 @@ pub(crate) struct TaskMetricRecorder {
     weighted_capacity_time: Duration,
     coordinator_zero_active_time: Duration,
     usage_by_role: BTreeMap<RoleCapability, UsageTotals>,
-    recorded_events: usize,
     finished: bool,
 }
 
 impl TaskMetricRecorder {
     pub(crate) fn new(
-        task_id: OpaqueId,
         active_turns: u32,
         capacity: u32,
     ) -> Result<Self, MetricsError> {
         validate_concurrency_state(active_turns, capacity)?;
         Ok(Self {
-            task_id,
             last_elapsed: Duration::ZERO,
             active_turns,
             capacity,
@@ -550,7 +525,6 @@ impl TaskMetricRecorder {
             weighted_capacity_time: Duration::ZERO,
             coordinator_zero_active_time: Duration::ZERO,
             usage_by_role: BTreeMap::new(),
-            recorded_events: 0,
             finished: false,
         })
     }
@@ -571,10 +545,6 @@ impl TaskMetricRecorder {
         }
         let mut next = self.usage_by_role.get(&key).copied().unwrap_or_default();
         add_usage(&mut next, tokens, calls)?;
-        self.recorded_events = self
-            .recorded_events
-            .saturating_add(1)
-            .min(MAX_RECORDED_EVENTS);
         self.usage_by_role.insert(key, next);
         Ok(())
     }
@@ -599,10 +569,6 @@ impl TaskMetricRecorder {
         validate_concurrency_state(active_turns, capacity)?;
         let (weighted_active_time, weighted_capacity_time, coordinator_zero_active_time) =
             self.integrated_until(elapsed)?;
-        self.recorded_events = self
-            .recorded_events
-            .saturating_add(1)
-            .min(MAX_RECORDED_EVENTS);
         self.last_elapsed = elapsed;
         self.active_turns = active_turns;
         self.capacity = capacity;
@@ -635,7 +601,6 @@ impl TaskMetricRecorder {
             .collect();
         let metrics = TaskMetrics::evaluate_with_concurrency_totals(
             TaskMetricInput {
-                task_id: self.task_id,
                 duration: elapsed,
                 coordinator_zero_active_time,
                 role_usage,
@@ -654,10 +619,6 @@ impl TaskMetricRecorder {
             weighted_active_time,
             weighted_capacity_time,
         )?;
-        self.recorded_events = self
-            .recorded_events
-            .saturating_add(1)
-            .min(MAX_RECORDED_EVENTS);
         self.last_elapsed = elapsed;
         self.weighted_active_time = weighted_active_time;
         self.weighted_capacity_time = weighted_capacity_time;
@@ -728,7 +689,6 @@ impl TaskMetricRuntime {
             role: assignment.role,
             capability: assignment.capability_profile,
             recorder: TaskMetricRecorder::new(
-                OpaqueId::new(assignment.assignment_id.as_uuid().as_u128()),
                 active_turns,
                 capacity,
             )?,

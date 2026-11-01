@@ -245,20 +245,8 @@ impl HttpClientBuilder {
     pub fn build_with_transport_default_proxy(
         self,
     ) -> Result<HttpClient, BuildCustomCaTransportError> {
-        self.build_with_transport_default_proxy_using(build_reqwest_client_with_custom_ca_policy)
-    }
-
-    fn build_with_transport_default_proxy_using(
-        self,
-        build_with_custom_ca: impl FnOnce(
-            reqwest::ClientBuilder,
-            CustomCaPolicy,
-        )
-            -> Result<reqwest::Client, BuildCustomCaTransportError>,
-    ) -> Result<HttpClient, BuildCustomCaTransportError> {
-        let request_logging = self.request_logging;
-        let custom_ca_policy = self.custom_ca_policy();
-        build_with_custom_ca(self.base_reqwest_builder(), custom_ca_policy)
+        let (builder, request_logging, custom_ca_policy) = self.into_reqwest_parts();
+        build_reqwest_client_with_custom_ca_policy(builder, custom_ca_policy)
             .map(|inner| HttpClient::from_parts(inner, request_logging))
     }
 

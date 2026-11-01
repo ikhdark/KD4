@@ -658,9 +658,6 @@ impl ModeKind {
         }
     }
 
-    pub const fn is_tui_visible(self) -> bool {
-        matches!(self, Self::Plan | Self::Default)
-    }
 
     pub const fn allows_request_user_input(self) -> bool {
         matches!(self, Self::Plan)
@@ -716,28 +713,6 @@ impl CollaborationMode {
         }
     }
 
-    /// Applies a mask to this collaboration mode, returning a new collaboration mode
-    /// with the mask values applied. Fields in the mask that are `Some` will override
-    /// the corresponding fields, while `None` values will preserve the original values.
-    ///
-    /// The `name` field in the mask is ignored as it's metadata for the mask itself.
-    pub fn apply_mask(&self, mask: &CollaborationModeMask) -> Self {
-        let settings = self.settings_ref();
-        CollaborationMode {
-            mode: mask.mode.unwrap_or(self.mode),
-            settings: Settings {
-                model: mask.model.clone().unwrap_or_else(|| settings.model.clone()),
-                reasoning_effort: mask
-                    .reasoning_effort
-                    .clone()
-                    .unwrap_or_else(|| settings.reasoning_effort.clone()),
-                developer_instructions: mask
-                    .developer_instructions
-                    .clone()
-                    .unwrap_or_else(|| settings.developer_instructions.clone()),
-            },
-        }
-    }
 }
 
 /// Settings for a collaboration mode.

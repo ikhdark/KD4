@@ -41,9 +41,6 @@ fn connector_auth(auth: Option<CodexAuth>) -> anyhow::Result<CodexAuth> {
     Ok(auth)
 }
 
-pub async fn list_all_connectors(config: &Config) -> anyhow::Result<Vec<AppInfo>> {
-    list_all_connectors_with_options(config, /*force_refetch*/ false, &[]).await
-}
 
 pub async fn list_cached_all_connectors(
     config: &Config,
@@ -148,12 +145,7 @@ pub fn connectors_for_plugin_apps(
     connectors: Vec<AppInfo>,
     plugin_apps: &[AppConnectorId],
 ) -> Vec<AppInfo> {
-    let connectors = merge_plugin_connectors(
-        connectors,
-        plugin_apps
-            .iter()
-            .map(|connector_id| connector_id.0.clone()),
-    );
+    let connectors = merge_directory_and_plugin_connectors(connectors, plugin_apps);
     let mut connectors_by_id = connectors
         .into_iter()
         .map(|connector| (connector.id.clone(), connector))

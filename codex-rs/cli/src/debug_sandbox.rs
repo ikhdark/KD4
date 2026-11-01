@@ -111,7 +111,6 @@ async fn run_command_under_sandbox(
             .parse_overrides()
             .map_err(anyhow::Error::msg)?,
         config_options,
-        /*strict_config*/ false,
     )
     .await?;
 
@@ -167,7 +166,6 @@ async fn run_command_under_sandbox(
                 cwd.to_path_buf(),
                 permission_profile.network_sandbox_policy(),
                 env,
-                |_| {},
             )
             .await?;
             handle_exit_status(child.wait().await?);
@@ -240,13 +238,11 @@ async fn spawn_debug_sandbox_child(
     args: Vec<String>,
     cwd: PathBuf,
     network_sandbox_policy: NetworkSandboxPolicy,
-    mut env: std::collections::HashMap<String, String>,
-    apply_env: impl FnOnce(&mut std::collections::HashMap<String, String>),
+    env: std::collections::HashMap<String, String>,
 ) -> std::io::Result<Child> {
     let mut cmd = TokioCommand::new(&program);
     cmd.args(args);
     cmd.current_dir(cwd);
-    apply_env(&mut env);
     cmd.env_clear();
     cmd.envs(env);
 
@@ -264,22 +260,6 @@ async fn spawn_debug_sandbox_child(
 async fn load_debug_sandbox_config(
     cli_overrides: Vec<(String, TomlValue)>,
     options: DebugSandboxConfigOptions,
-    strict_config: bool,
-) -> anyhow::Result<Config> {
-    load_debug_sandbox_config_with_codex_home(
-        cli_overrides,
-        options,
-        /*codex_home*/ None,
-        strict_config,
-    )
-    .await
-}
-
-async fn load_debug_sandbox_config_with_codex_home(
-    cli_overrides: Vec<(String, TomlValue)>,
-    options: DebugSandboxConfigOptions,
-    codex_home: Option<PathBuf>,
-    strict_config: bool,
 ) -> anyhow::Result<Config> {
     let DebugSandboxConfigOptions {
         sandbox_state: _,
@@ -308,10 +288,8 @@ async fn load_debug_sandbox_config_with_codex_home(
             cwd: cwd.clone(),
             ..Default::default()
         },
-        codex_home.clone(),
         managed_requirements_mode,
         loader_overrides.clone(),
-        strict_config,
     )
     .await?;
 
@@ -326,10 +304,8 @@ async fn load_debug_sandbox_config_with_codex_home(
             cwd,
             ..Default::default()
         },
-        codex_home,
         managed_requirements_mode,
         loader_overrides,
-        strict_config,
     )
     .await
     .map_err(Into::into)
@@ -338,24 +314,17 @@ async fn load_debug_sandbox_config_with_codex_home(
 async fn build_debug_sandbox_config_with_loader_overrides(
     cli_overrides: Vec<(String, TomlValue)>,
     harness_overrides: ConfigOverrides,
-    codex_home: Option<PathBuf>,
     managed_requirements_mode: ManagedRequirementsMode,
     mut loader_overrides: LoaderOverrides,
-    strict_config: bool,
 ) -> std::io::Result<Config> {
     let mut builder = ConfigBuilder::default()
         .cli_overrides(cli_overrides)
         .harness_overrides(harness_overrides)
-        .strict_config(strict_config);
+        .strict_config(false);
     if matches!(managed_requirements_mode, ManagedRequirementsMode::Ignore) {
         loader_overrides.ignore_managed_requirements = true;
     }
     builder = builder.loader_overrides(loader_overrides);
-    if let Some(codex_home) = codex_home {
-        builder = builder
-            .codex_home(codex_home.clone())
-            .fallback_cwd(Some(codex_home));
-    }
     builder.build().await
 }
 

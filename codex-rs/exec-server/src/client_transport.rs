@@ -236,27 +236,6 @@ impl ExecServerClient {
         Ok(connection)
     }
 
-    /// Connect to one exec-server through an authenticated rendezvous stream
-    /// using a caller-supplied single-use authorization bundle.
-    ///
-    /// The executor key is pinned before JSON-RPC starts; the websocket carries
-    /// only ciphertext after that. Environment-managed connections use a
-    /// retained [`NoiseRendezvousConnectProvider`] so recovery can fetch a fresh
-    /// bundle for each reconnect.
-    #[tracing::instrument(
-        name = "codex.exec_server.remote.harness.connect",
-        skip_all,
-        fields(
-            otel.kind = "client",
-            otel.name = "codex.exec_server.remote.harness.connect",
-        )
-    )]
-    pub async fn connect_noise_rendezvous(
-        args: NoiseRendezvousConnectArgs,
-    ) -> Result<Self, ExecServerError> {
-        let (connection, options) = Self::open_noise_rendezvous_connection(args).await?;
-        Self::connect(connection, options).await
-    }
 
     pub(crate) async fn open_noise_rendezvous_connection(
         args: NoiseRendezvousConnectArgs,

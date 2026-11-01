@@ -315,7 +315,7 @@ pub(crate) async fn begin_policy_attempt(ctx: &ToolCtx) -> Result<(), String> {
     if !budget.reserved_for(&owner) {
         return Ok(());
     }
-    budget.start(&owner, None)?;
+    budget.start(&owner)?;
     if let Err(error) = persist_policy_checkpoint(&ctx.session, &ctx.turn).await {
         budget.acknowledge_not_spawned(&owner);
         return Err(error);

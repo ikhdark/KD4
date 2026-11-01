@@ -43,8 +43,6 @@ class _GoalOperationState:
     status: ThreadGoalStatus | None = None
     started_turn: Turn | None = None
     completed_turn: Turn | None = None
-    interrupted: bool = False
-    interrupt_requested: bool = False
     cleared: bool = False
     _condition: threading.Condition = field(default_factory=threading.Condition)
     _notifications: _NotificationQueue = field(
@@ -134,66 +132,10 @@ class _GoalOperationState:
         with self._condition:
             return self._finished
 
-    def begin_interrupt(self) -> bool:
-        with self._condition:
-            if self._finished:
-                return False
-            self.interrupt_requested = True
-            return True
-
-    def confirm_interrupt(self) -> None:
-        with self._condition:
-            self.interrupted = True
-            self.interrupt_requested = False
-            self._condition.notify_all()
-
-    def cancel_interrupt(self) -> None:
-        with self._condition:
-            self.interrupt_requested = False
-            self._condition.notify_all()
-
-    def explicit_interrupt(self) -> bool:
-        with self._condition:
-            while self.interrupt_requested:
-                self._wait_for_change()
-            return self.interrupted
-
-    def active_turn(self, *, after: str | None = None) -> str | None:
-        """Wait for the current turn, or return None once the goal has ended."""
-        with self._condition:
-            while True:
-                if self._failure is not None:
-                    raise self._failure
-                if self._finished:
-                    return None
-                if self.current_turn_id is not None and self.current_turn_id != after:
-                    return self.current_turn_id
-                if self.cleared or _terminal_goal_status(self.status):
-                    return None
-                self._wait_for_change()
-
-    def _wait_for_change(self) -> None:
-        if self._failure is not None:
-            raise self._failure
-        deadline = self._notifications.deadline
-        remaining = (
-            self._notifications.timeout_s if deadline is None else deadline - time.monotonic()
-        )
-        if remaining <= 0:
-            raise TimeoutError("goal operation deadline exceeded")
-        self._condition.wait(remaining)
-
     def current_turn(self) -> str | None:
         """Return the current physical turn without waiting for rollover."""
         with self._condition:
             return self.current_turn_id
-
-    def resolve_active_turn(self, expected: str, active: str) -> None:
-        """Adopt a server-reported active id when routed state is still stale."""
-        with self._condition:
-            if self.current_turn_id in {None, expected}:
-                self.current_turn_id = active
-                self._condition.notify_all()
 
     def turn_for_interrupt(self) -> str | None:
         """Return an active or stale turn id that can resolve rollover races."""
@@ -245,7 +187,6 @@ def _logical_completion(
     *,
     logical_turn_id: str,
     started: Turn | None,
-    interrupted: bool,
 ) -> TurnCompletedNotification:
     """Coalesce the final physical completion into one logical completion."""
     final_turn = completed.turn
@@ -258,8 +199,6 @@ def _logical_completion(
         "started_at": started_at,
         "duration_ms": duration_ms,
     }
-    if interrupted:
-        updates["status"] = TurnStatus.interrupted
     return completed.model_copy(update={"turn": final_turn.model_copy(update=updates)})
 
 
@@ -357,7 +296,6 @@ class _GoalStreamCursor:
                 payload,
                 logical_turn_id=logical_turn_id,
                 started=self.started,
-                interrupted=self.state.explicit_interrupt(),
             ),
         )
 

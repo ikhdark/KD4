@@ -359,19 +359,6 @@ impl CodexAppsToolsCache {
         codex_home: PathBuf,
         auth_key: CodexAppsToolsCacheKey,
     ) -> CodexAppsToolsCacheContext {
-        self.context_blocking_with_seed(
-            codex_home,
-            auth_key,
-            load_cached_codex_apps_tools_for_identity,
-        )
-    }
-
-    fn context_blocking_with_seed(
-        &self,
-        codex_home: PathBuf,
-        auth_key: CodexAppsToolsCacheKey,
-        load: impl FnOnce(&CodexAppsToolsCacheIdentity) -> Option<Vec<ToolInfo>>,
-    ) -> CodexAppsToolsCacheContext {
         let identity = CodexAppsToolsCacheIdentity {
             codex_home,
             auth_key,
@@ -384,7 +371,7 @@ impl CodexAppsToolsCache {
             };
         }
         let entry = lock_unpoisoned(&self.entries).context_entry(identity);
-        entry.seed_with(|| load(&entry.identity));
+        entry.seed_with(|| load_cached_codex_apps_tools_for_identity(&entry.identity));
         CodexAppsToolsCacheContext { entry }
     }
 }

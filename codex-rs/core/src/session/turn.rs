@@ -80,7 +80,6 @@ use crate::session::turn_execution::AuthoritativeWaitResolution;
 use crate::session::turn_execution::ContinuationDisposition;
 use crate::session::turn_execution::GenerationRequestDisposition;
 use crate::session::turn_execution::SamplingConvergenceDecision;
-use crate::session::turn_execution::SamplingGenerationDisposition;
 use crate::session::turn_execution::SamplingRequestSettledState;
 use crate::session::turn_execution::SamplingRequestSignalCollector;
 use crate::session::turn_execution::TurnExecutionControl;
@@ -185,6 +184,7 @@ use codex_protocol::protocol::SurfacedToolResult;
 use codex_protocol::protocol::ToolLifecycleTimerWait;
 use codex_protocol::protocol::ToolLifecycleWakeReason;
 use codex_protocol::protocol::TurnDiffEvent;
+use codex_protocol::protocol::TurnTimingGenerationDisposition;
 use codex_protocol::protocol::TurnTimingGenerationPurpose;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
@@ -246,52 +246,7 @@ pub(crate) async fn prepare_sampling_prompt_for_client(
     turn_context: &TurnContext,
     git_workspace: &crate::git_workspace::GitWorkspaceCache,
 ) -> PreparedPromptInput {
-    with_sampling_workspace_identity(
-        history,
-        turn_context,
-        git_workspace,
-        |history, workspace_identity| {
-            prepare_sampling_prompt_with_workspace_identity(
-                history,
-                turn_context,
-                workspace_identity,
-                git_workspace,
-            )
-        },
-    )
-    .await
-}
-
-/// Capture once for synchronous planning of one request. The callback cannot
-/// await work or retain a borrowed identity for another request. Its history
-/// rewrites must preserve workspace evidence requirements (for example, trimming
-/// tool-search schemas); new evidence or a changed environment needs a new call.
-pub(crate) async fn with_sampling_workspace_identity<R>(
-    history: ContextManager,
-    turn_context: &TurnContext,
-    git_workspace: &crate::git_workspace::GitWorkspaceCache,
-    prepare: impl FnOnce(ContextManager, Option<&crate::git_workspace::WorkspaceEvidenceIdentity>) -> R,
-) -> R {
-    let workspace_identity = if history.requires_workspace_evidence_validation() {
-        if history.can_use_root_only_workspace_identity()
-            && !turn_context
-                .environments
-                .primary()
-                .is_some_and(|selected| selected.environment.is_remote())
-        {
-            git_workspace
-                .workspace_root_identity(turn_context.config.cwd.as_path())
-                .await
-        } else {
-            git_workspace
-                .workspace_evidence_for_turn(turn_context, turn_context.config.cwd.as_path())
-                .await
-                .identity
-        }
-    } else {
-        None
-    };
-    prepare(history, workspace_identity.as_ref())
+    prepare_sampling_prompt_with_workspace_identity(history, turn_context, None, git_workspace)
 }
 
 pub(crate) fn prepare_sampling_prompt_with_workspace_identity(
@@ -315,79 +270,6 @@ pub(crate) fn prepare_sampling_prompt_with_workspace_identity(
             git_workspace,
         )
     }
-}
-
-fn continuation_workspace_prefetch_is_current(
-    baseline_mutation_revision: u64,
-    current_mutation_revision: u64,
-    accepted_user_input: bool,
-) -> bool {
-    baseline_mutation_revision == current_mutation_revision && !accepted_user_input
-}
-
-type ContinuationWorkspacePrefetch = (
-    u64,
-    AbortOnDropHandle<Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
-);
-
-async fn start_continuation_workspace_prefetch(
-    history: &ContextManager,
-    turn_diff_tracker: &Arc<tokio::sync::Mutex<TurnDiffTracker>>,
-    git_workspace: Arc<crate::git_workspace::GitWorkspaceCache>,
-    cwd: codex_utils_absolute_path::AbsolutePathBuf,
-    environments: crate::environment_selection::TurnEnvironmentSnapshot,
-) -> Option<ContinuationWorkspacePrefetch> {
-    if !history.requires_workspace_evidence_validation() {
-        return None;
-    }
-    // Do not launch a full scan that the projection cannot use. Recheck the
-    // final history in prepare_sampling_prompt_for_client: later calls or
-    // recovered evidence may require a full identity after all.
-    if history.can_use_root_only_workspace_identity()
-        && !environments
-            .primary()
-            .is_some_and(|selected| selected.environment.is_remote())
-    {
-        return None;
-    }
-    let baseline_mutation_revision = turn_diff_tracker.lock().await.current_mutation_revision();
-    let handle = AbortOnDropHandle::new(tokio::spawn(async move {
-        git_workspace
-            .workspace_evidence_for_environment(&environments, cwd.as_path(), cwd.as_path())
-            .await
-            .identity
-    }));
-    Some((baseline_mutation_revision, handle))
-}
-
-async fn reuse_workspace_prefetch_for_local_compaction(
-    turn_context: &TurnContext,
-    turn_diff_tracker: &SharedTurnDiffTracker,
-    pending: &mut Option<ContinuationWorkspacePrefetch>,
-    identity: &mut Option<Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
-    cancellation_token: &CancellationToken,
-) -> CodexResult<()> {
-    // Remote compaction does not use workspace evidence. Leave its capture in
-    // flight for recovery rather than adding a dispatch barrier.
-    if identity.is_some()
-        || should_use_remote_compact_task(
-            turn_context.provider.info(),
-            turn_context.config.compact_prompt.as_deref(),
-        )
-    {
-        return Ok(());
-    }
-    if let Some((baseline, handle)) = pending.take() {
-        let revision = turn_diff_tracker.lock().await.current_mutation_revision();
-        if continuation_workspace_prefetch_is_current(baseline, revision, false) {
-            *identity = tokio::select! {
-                biased;
-                _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
-                result = handle => result.ok(),
-            };
-        }
-    }
-    Ok(())
 }
 
 async fn finish_stopped_session_start(
@@ -503,14 +385,6 @@ pub(crate) fn run_turn(
         let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(
             TurnDiffTracker::with_environment_display_roots([]),
         ));
-        let mut pending_workspace_prefetch = start_continuation_workspace_prefetch(
-            &sess.clone_history().await,
-            &turn_diff_tracker,
-            Arc::clone(&sess.services.git_workspace),
-            turn_context.config.cwd.clone(),
-            turn_context.environments.clone(),
-        )
-        .await;
         let mut preparation_timing_guard = None;
         let mut client_session =
             prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
@@ -657,9 +531,6 @@ pub(crate) fn run_turn(
         let mut pending_continuation_cause = None;
         let mut pending_generation_request: Option<GenerationRequestDisposition> = None;
         let mut missing_answer_terminal_repair_revision: Option<String> = None;
-        let mut prefetched_workspace_identity: Option<
-            Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
-        > = None;
         let mut has_started_generation = false;
         let mut logical_generation_ordinal = 0_u32;
         let mut generation_budget_error_reported = false;
@@ -754,8 +625,6 @@ pub(crate) fn run_turn(
 
             if recorded_input.accepted_context_input {
                 final_answer_soft_limit_waiver = None;
-                pending_workspace_prefetch = None;
-                prefetched_workspace_identity = None;
                 seen_stop_repairs.clear();
                 stop_hook_bookkeeping_revisions = 0;
                 completion_evidence = None;
@@ -831,7 +700,6 @@ pub(crate) fn run_turn(
                                 Some(TurnTimingGenerationPurpose::TerminalCompletionReasoning)
                             }
                         },
-                        sampling: SamplingGenerationDisposition::DecisionBearing,
                         relevant_state_fingerprint: request_baselines.relevant_state_fingerprint(),
                         failure_fingerprint: None,
                         terminal_completion_only: false,
@@ -950,8 +818,8 @@ pub(crate) fn run_turn(
                 )
                 .await?;
                 // Keep this future lazy: the finalized router must record its source
-                // notice before we snapshot and normalize history. Otherwise a source
-                // change discards this work and captures workspace evidence twice.
+                // notice before we snapshot and normalize history, so source changes
+                // cannot discard a prematurely prepared snapshot.
                 let sampling_request_input = Box::pin(async {
                     let history_snapshot_guard = turn_context
                         .turn_timing_state
@@ -961,38 +829,18 @@ pub(crate) fn run_turn(
                     let normalization_guard = turn_context
                         .turn_timing_state
                         .begin_local_phase(TurnLocalPhase::Normalization);
-                    if let Some((baseline, handle)) = pending_workspace_prefetch.take()
-                        && continuation_workspace_prefetch_is_current(
-                            baseline,
-                            turn_diff_tracker.lock().await.current_mutation_revision(),
-                            false,
-                        )
-                    {
-                        prefetched_workspace_identity = handle.await.ok();
-                    }
-                    let prepared = match prefetched_workspace_identity.take() {
-                        Some(workspace_identity) => prepare_sampling_prompt_with_workspace_identity(
-                            history,
-                            turn_context.as_ref(),
-                            workspace_identity.as_ref(),
-                            sess.services.git_workspace.as_ref(),
-                        ),
-                        None => {
-                            prepare_sampling_prompt_for_client(
-                                history,
-                                turn_context.as_ref(),
-                                sess.services.git_workspace.as_ref(),
-                            )
-                            .await
-                        }
-                    };
+                    let prepared = prepare_sampling_prompt_for_client(
+                        history,
+                        turn_context.as_ref(),
+                        sess.services.git_workspace.as_ref(),
+                    )
+                    .await;
                     drop(normalization_guard);
                     prepared
                 })
                 .instrument(trace_span!("run_turn.prepare_sampling_request_input"))
-                // This is read-only preparation, including an owned abort-on-drop
-                // workspace prefetch. A blocked capture must not delay interruption
-                // until the task owner's forced-abort timeout.
+                // A blocked history snapshot must not delay interruption until
+                // the task owner's forced-abort timeout.
                 .or_cancel(&cancellation_token)
                 .map_err(|_| CodexErr::TurnAborted);
 
@@ -1051,11 +899,7 @@ pub(crate) fn run_turn(
                         tool_result_continuation,
                         server_end_turn_false,
                         required_tool_terminal,
-                        prefetched_workspace_identity: next_workspace_identity,
-                        continuation_workspace_prefetch,
                     } = sampling_request_output;
-                    prefetched_workspace_identity = next_workspace_identity;
-                    pending_workspace_prefetch = continuation_workspace_prefetch;
                     turn_execution.refresh_plan(
                         if turn_context.collaboration_mode.mode == ModeKind::Plan {
                             None
@@ -1063,7 +907,7 @@ pub(crate) fn run_turn(
                             sess.services.plan_store.execution_snapshot().await
                         },
                     );
-                    turn_execution.settle(&request_baselines, &request_signals, &settled_state);
+                    turn_execution.settle(&request_signals);
                     let progress_kinds = turn_execution.observe_progress(
                         &request_baselines,
                         &request_signals,
@@ -1351,20 +1195,11 @@ pub(crate) fn run_turn(
                             convergence_decision.as_mut(),
                         )
                         .await?;
-                        reuse_workspace_prefetch_for_local_compaction(
-                            &turn_context,
-                            &turn_diff_tracker,
-                            &mut pending_workspace_prefetch,
-                            &mut prefetched_workspace_identity,
-                            &cancellation_token,
-                        )
-                        .await?;
                         let relief = match run_auto_compact(
                             &sess,
                             Arc::clone(&step_context),
                             /*fallback_step_context*/ None,
                             &mut client_session,
-                            prefetched_workspace_identity.as_ref(),
                             Some(Arc::clone(&world_state)),
                             CompactionReason::ContextLimit,
                             CompactionPhase::MidTurn,
@@ -1452,7 +1287,6 @@ pub(crate) fn run_turn(
                                     ).await?;
                                     pending_generation_request = Some(GenerationRequestDisposition {
                                         purpose: Some(TurnTimingGenerationPurpose::Repair),
-                                        sampling: SamplingGenerationDisposition::DecisionBearing,
                                         relevant_state_fingerprint: turn_execution
                                             .baselines_with_tool_exposure_revision(
                                                 settled_state.mutation_revision,
@@ -1505,7 +1339,6 @@ pub(crate) fn run_turn(
                                 missing_answer_terminal_repair_revision = Some(fingerprint.clone());
                                 pending_generation_request = Some(GenerationRequestDisposition {
                                     purpose: Some(TurnTimingGenerationPurpose::Repair),
-                                    sampling: SamplingGenerationDisposition::DecisionBearing,
                                     relevant_state_fingerprint: fingerprint,
                                     failure_fingerprint: None,
                                     terminal_completion_only: false,
@@ -1556,7 +1389,6 @@ pub(crate) fn run_turn(
                             last_agent_message = None;
                             pending_generation_request = Some(GenerationRequestDisposition {
                                 purpose: Some(TurnTimingGenerationPurpose::Repair),
-                                sampling: SamplingGenerationDisposition::DecisionBearing,
                                 relevant_state_fingerprint: turn_execution
                                     .baselines_with_tool_exposure_revision(
                                         settled_state.mutation_revision,
@@ -1589,9 +1421,7 @@ pub(crate) fn run_turn(
                             // (outside Git, the bounded workspace tree)
                             // unchanged did not change the finalized state.
                             if finalized_mutation_revision.is_some_and(|revision| {
-                                turn_execution.validation_revision_at(revision)
-                                    != turn_execution
-                                        .validation_revision_at(settled_state.mutation_revision)
+                                revision != settled_state.mutation_revision
                             }) {
                                 emit_status_affecting_turn_error(
                                     sess.as_ref(), turn_context.as_ref(),
@@ -1615,13 +1445,10 @@ pub(crate) fn run_turn(
                                 // Finalizers can partially mutate even when they fail.
                                 // Retire the shared pre-hook baseline before another
                                 // command can reuse it as its pre-execution snapshot.
-                                sess.services.git_workspace.note_host_workspace_mutation();
                                 let mut tracker = turn_diff_tracker.lock().await;
                                 tracker.record_unknown_mutation();
                                 finalized_mutation_revision =
                                     Some(tracker.current_mutation_revision());
-                                pending_workspace_prefetch = None;
-                                prefetched_workspace_identity = None;
                                 after_agent_outcome.aborted
                             } else {
                                 false
@@ -1659,7 +1486,6 @@ pub(crate) fn run_turn(
                                 }]).await?;
                                 pending_generation_request = Some(GenerationRequestDisposition {
                                     purpose: Some(TurnTimingGenerationPurpose::TerminalCompletionReasoning),
-                                    sampling: SamplingGenerationDisposition::DecisionBearing,
                                     relevant_state_fingerprint: turn_execution.baselines_with_tool_exposure_revision(
                                         turn_diff_tracker.lock().await.current_mutation_revision(),
                                         settled_state.tool_exposure_revision,
@@ -1684,15 +1510,11 @@ pub(crate) fn run_turn(
                             last_agent_message.clone(),
                             || async {
                                 let (
-                                    changed_paths,
-                                    has_untracked_changes,
                                     changed_existing,
                                     uncertain_contents,
                                 ) = {
                                     let tracker = turn_diff_tracker.lock().await;
                                     (
-                                        Some(tracker.changed_paths()),
-                                        tracker.has_untracked_changes(),
                                         tracker.changed_existing_contents(),
                                         tracker.uncertain_content_paths(),
                                     )
@@ -1713,17 +1535,7 @@ pub(crate) fn run_turn(
                                 changed_tests.incomplete.extend(uncertain_contents);
                                 changed_tests.incomplete.sort();
                                 changed_tests.incomplete.dedup();
-                                let runtime_inputs = step_context
-                                    .loaded_agents_md
-                                    .as_ref()
-                                    .map(|loaded| loaded.runtime_input_paths())
-                                    .unwrap_or_default();
-                                let mut assessment = turn_execution.completion_assessment_with_runtime_inputs(
-                                    settled_state.mutation_revision,
-                                    changed_paths.as_deref(),
-                                    has_untracked_changes,
-                                    &runtime_inputs,
-                                );
+                                let mut assessment = turn_execution.completion_assessment();
                                 if let Some(advisory) = changed_tests_advisory(&changed_tests.changed) {
                                     assessment.advisories.push(advisory);
                                 }
@@ -1731,9 +1543,7 @@ pub(crate) fn run_turn(
                                     assessment.advisories.push(advisory);
                                 }
                                 if finalized_mutation_revision.is_some_and(|revision| {
-                                    turn_execution.validation_revision_at(revision)
-                                        != turn_execution
-                                            .validation_revision_at(settled_state.mutation_revision)
+                                    revision != settled_state.mutation_revision
                                 }) {
                                     assessment.verification_gaps.push("A mutating finalizer ran after the last settled validation state. That validation does not cover the final workspace; the hook was not replayed because it has no repeat-safety contract.".to_string());
                                 }
@@ -1984,20 +1794,11 @@ pub(crate) fn run_turn(
                     {
                         break;
                     }
-                    reuse_workspace_prefetch_for_local_compaction(
-                        &turn_context,
-                        &turn_diff_tracker,
-                        &mut pending_workspace_prefetch,
-                        &mut prefetched_workspace_identity,
-                        &cancellation_token,
-                    )
-                    .await?;
                     let relief = match run_auto_compact(
                         &sess,
                         Arc::clone(&step_context),
                         None,
                         &mut client_session,
-                        prefetched_workspace_identity.as_ref(),
                         Some(Arc::clone(&world_state)),
                         CompactionReason::ContextLimit,
                         CompactionPhase::MidTurn,
@@ -2114,7 +1915,6 @@ fn rebase_generation_request_after_compaction(
     } else {
         TurnTimingGenerationPurpose::CompactionRecovery
     });
-    request.sampling = SamplingGenerationDisposition::DecisionBearing;
     request.relevant_state_fingerprint = relevant_state_fingerprint;
     request
 }
@@ -3139,27 +2939,6 @@ struct SamplingAttemptProgress {
 impl SamplingAttemptProgress {
     fn requires_authoritative_retry_input(&self) -> bool {
         self.accepted_output
-    }
-}
-
-struct AdvertisedDeferredToolLease {
-    turn_context: Arc<TurnContext>,
-    advertised: HashSet<ToolName>,
-}
-
-impl AdvertisedDeferredToolLease {
-    fn new(turn_context: Arc<TurnContext>, advertised: HashSet<ToolName>) -> Self {
-        Self {
-            turn_context,
-            advertised,
-        }
-    }
-}
-
-impl Drop for AdvertisedDeferredToolLease {
-    fn drop(&mut self) {
-        self.turn_context
-            .release_advertised_deferred_tools(&self.advertised);
     }
 }
 
@@ -4464,7 +4243,6 @@ async fn run_pending_input_pre_sampling_compact(
         step_context,
         /*fallback_step_context*/ None,
         client_session,
-        /*prefetched_workspace_identity*/ None,
         /*prefetched_world_state*/ None,
         CompactionReason::ContextLimit,
         CompactionPhase::PreTurn,
@@ -4584,7 +4362,6 @@ async fn maybe_run_previous_model_inline_compact(
             step_context,
             fallback_step_context,
             client_session,
-            /*prefetched_workspace_identity*/ None,
             /*prefetched_world_state*/ None,
             CompactionReason::CompHashChanged,
             CompactionPhase::PreTurn,
@@ -4654,7 +4431,6 @@ async fn maybe_run_previous_model_inline_compact(
             step_context,
             fallback_step_context,
             client_session,
-            /*prefetched_workspace_identity*/ None,
             /*prefetched_world_state*/ None,
             CompactionReason::ModelDownshift,
             CompactionPhase::PreTurn,
@@ -5016,7 +4792,7 @@ async fn retire_consumed_tool_outputs_for_context_pressure(
         &call_ids,
         crate::tool_history::PressureRetirementTrigger::ContextLimit,
     );
-    let Some(before) = candidate.estimate_token_count(turn_context) else {
+    let Some(before) = candidate.estimate_token_count(&turn_context.model_info.input_modalities, turn_context.base_instructions.as_ref()) else {
         observation.outcome = "estimate_unavailable";
         return false;
     };
@@ -5024,7 +4800,7 @@ async fn retire_consumed_tool_outputs_for_context_pressure(
         std::iter::once(&checkpoint),
         turn_context.model_info.truncation_policy.into(),
     );
-    let Some(after) = candidate.estimate_token_count(turn_context) else {
+    let Some(after) = candidate.estimate_token_count(&turn_context.model_info.input_modalities, turn_context.base_instructions.as_ref()) else {
         observation.outcome = "estimate_unavailable";
         return false;
     };
@@ -5069,7 +4845,7 @@ async fn retire_consumed_tool_outputs_for_context_pressure(
     let Some(committed) = sess
         .clone_history()
         .await
-        .estimate_token_count(turn_context)
+        .estimate_token_count(&turn_context.model_info.input_modalities, turn_context.base_instructions.as_ref())
     else {
         observation.outcome = "committed_estimate_unavailable";
         return false;
@@ -5158,9 +4934,6 @@ fn run_auto_compact<'a>(
     step_context: Arc<StepContext>,
     fallback_step_context: Option<Arc<StepContext>>,
     client_session: &'a mut ModelClientSession,
-    prefetched_workspace_identity: Option<
-        &'a Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
-    >,
     prefetched_world_state: Option<Arc<WorldState>>,
     reason: CompactionReason,
     phase: CompactionPhase,
@@ -5295,7 +5068,7 @@ fn run_auto_compact<'a>(
                 InlineAutoCompactReuse {
                     // Reuse the turn transport, matching the remote-compaction path above.
                     client_session,
-                    prefetched_workspace_identity,
+                    prefetched_workspace_identity: None,
                 },
                 initial_context_injection.clone(),
                 reason,
@@ -5338,7 +5111,7 @@ fn run_auto_compact<'a>(
                         Arc::clone(fallback_turn_context),
                         InlineAutoCompactReuse {
                             client_session,
-                            prefetched_workspace_identity,
+                            prefetched_workspace_identity: None,
                         },
                         initial_context_injection,
                         reason,
@@ -5887,12 +5660,6 @@ fn run_sampling_request<'a>(
     Box::pin(async move {
         let turn_context = Arc::clone(&step_context.turn);
         let terminal_completion_only = generation_request.terminal_completion_only;
-        // Record the deferred schemas advertised by this request. Settling the guard preserves them
-        // for later continuations in the same turn; capability refresh and turn teardown own expiry.
-        let _advertised_deferred_tool_lease = (!terminal_completion_only).then(|| {
-            let advertised_deferred_tools = turn_context.activated_deferred_tools();
-            AdvertisedDeferredToolLease::new(Arc::clone(&turn_context), advertised_deferred_tools)
-        });
         let router_preparation_guard = turn_context
             .turn_timing_state
             .begin_local_phase(TurnLocalPhase::RouterBuild);
@@ -6028,7 +5795,7 @@ fn run_sampling_request<'a>(
                 pending_continuation_cause,
                 &turn_context.session_source,
                 generation_request.purpose,
-                generation_request.timing_disposition(),
+                TurnTimingGenerationDisposition::DecisionBearing,
                 Some(generation_request.relevant_state_fingerprint.clone()),
                 generation_request.failure_fingerprint.clone(),
             );
@@ -6223,8 +5990,8 @@ fn run_sampling_request<'a>(
                 );
                 enforce_terminal_prompt_contract(&mut prompt, terminal_completion_only);
             } else {
-                // Even a stream with no completed output seals its evidence batch
-                // during cleanup. Reusing the prompt must not reuse that retired batch.
+                // Reuse the prompt and advertised capabilities, but refresh the
+                // physical attempt's output-context budget.
                 step_context = Arc::new(step_context.for_retry_attempt());
             }
             tool_runtime = ToolCallRuntime::new(
@@ -6872,8 +6639,6 @@ struct SamplingRequestResult {
     tool_result_continuation: bool,
     server_end_turn_false: bool,
     required_tool_terminal: Option<RequiredToolTerminal>,
-    prefetched_workspace_identity: Option<Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
-    continuation_workspace_prefetch: Option<ContinuationWorkspacePrefetch>,
 }
 
 #[derive(Debug)]
@@ -8399,8 +8164,6 @@ fn try_run_sampling_request<'a>(
         let mut completed_in_flight = VecDeque::new();
         let response_item_recorder = OrderedResponseItemRecorder::default();
         let mut earlier_tool_calls_eligible = true;
-        let mut all_tool_calls_eager_read_eligible = true;
-        let mut continuation_workspace_prefetch = None;
         let mut needs_follow_up = false;
         let mut tool_result_continuation = false;
         let mut server_end_turn_false = false;
@@ -8641,8 +8404,6 @@ fn try_run_sampling_request<'a>(
                         Err(err) => break Err(err),
                     };
                     if let Some(tool_future) = output_result.tool_future {
-                        all_tool_calls_eager_read_eligible &=
-                            output_result.read_only_prefetch_eligible;
                         // Poll every accepted call while the response is streaming. The
                         // runtime still owns repository gates, approvals and cancellation;
                         // FuturesOrdered preserves provider order when relaying results.
@@ -8857,20 +8618,6 @@ fn try_run_sampling_request<'a>(
                         needs_follow_up = true;
                         server_end_turn_false = true;
                     }
-                    if needs_follow_up
-                        && !in_flight.is_empty()
-                        && all_tool_calls_eager_read_eligible
-                    {
-                        let history = sess.clone_history().await;
-                        continuation_workspace_prefetch = start_continuation_workspace_prefetch(
-                            &history,
-                            &turn_diff_tracker,
-                            Arc::clone(&sess.services.git_workspace),
-                            turn_context.config.cwd.clone(),
-                            turn_context.environments.clone(),
-                        )
-                        .await;
-                    }
                     break Ok(UnsettledSamplingRequestResult {
                         needs_follow_up,
                         last_agent_message,
@@ -9068,7 +8815,6 @@ fn try_run_sampling_request<'a>(
         if was_steered {
             client_session.interrupt_response_for_steering();
             final_message_candidate = None;
-            needs_follow_up = true;
             if !context_baseline_committed {
                 sess.mark_context_baseline_unknown().await;
             }
@@ -9133,40 +8879,7 @@ fn try_run_sampling_request<'a>(
         )
         .await;
         drop(tool_blocking_timing_guard);
-        let generation_workspace_evidence =
-            tool_runtime.flush_workspace_evidence_generation().await?;
         let required_tool_terminal = required_tool_terminal?;
-
-        // Tool completion is the earliest safe boundary after mutations. Start a
-        // replacement capture here, overlapping terminal/event bookkeeping, instead
-        // of discovering a stale prefetch during the next prompt's preparation.
-        if needs_follow_up
-            && required_tool_terminal.is_none()
-            && generation_workspace_evidence
-                .prefetched_workspace_identity
-                .is_none()
-            && !cancellation_token.is_cancelled()
-        {
-            let revision = turn_diff_tracker.lock().await.current_mutation_revision();
-            if continuation_workspace_prefetch
-                .as_ref()
-                .is_none_or(|(baseline, _)| {
-                    !continuation_workspace_prefetch_is_current(*baseline, revision, false)
-                })
-            {
-                // Drop (and abort) the stale capture before starting its replacement.
-                drop(continuation_workspace_prefetch.take());
-                let history = sess.clone_history().await;
-                continuation_workspace_prefetch = start_continuation_workspace_prefetch(
-                    &history,
-                    &turn_diff_tracker,
-                    Arc::clone(&sess.services.git_workspace),
-                    turn_context.config.cwd.clone(),
-                    turn_context.environments.clone(),
-                )
-                .await;
-            }
-        }
 
         let terminal = {
             let active_turn = sess.active_turn.lock().await;
@@ -9219,19 +8932,6 @@ fn try_run_sampling_request<'a>(
                 tool_exposure_revision: turn_context.deferred_tool_activation_revision(),
             }
         };
-        let prefetched_workspace_identity =
-            generation_workspace_evidence.prefetched_workspace_identity;
-        // Keep the capture in flight across the continuation's step-context capture.
-        // The turn owns cancellation and rechecks its revision before prompt preparation.
-        let continuation_workspace_prefetch =
-            continuation_workspace_prefetch.filter(|(baseline, _)| {
-                prefetched_workspace_identity.is_none()
-                    && continuation_workspace_prefetch_is_current(
-                        *baseline,
-                        settled_state.mutation_revision,
-                        false,
-                    )
-            });
         let outcome = outcome.map(|result| SamplingRequestResult {
             needs_follow_up: result.needs_follow_up,
             last_agent_message: result.last_agent_message,
@@ -9245,8 +8945,6 @@ fn try_run_sampling_request<'a>(
             tool_result_continuation: result.tool_result_continuation,
             server_end_turn_false: result.server_end_turn_false,
             required_tool_terminal,
-            prefetched_workspace_identity,
-            continuation_workspace_prefetch,
         });
 
         if should_emit_turn_diff {

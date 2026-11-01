@@ -117,7 +117,7 @@ Or as an object directly in `plugin.json`:
 ### Path conventions and defaults
 
 - Path values should be relative and begin with `./`.
-- `skills` and string-valued `mcpServers` are supplemented on top of default component discovery; they do not replace defaults. The bundled validator rejects a `hooks` manifest field; omit it from `plugin.json`.
+- Nonempty `skills` paths replace default skill-root discovery. A string-valued `mcpServers` selects that file instead of the default `.mcp.json`; an object supplies inline servers. The bundled validator rejects a `hooks` manifest field; omit it from `plugin.json`.
 - For this scaffold's validator, `skills` must resolve to `skills`, `apps` to `.app.json`, and a string-valued `mcpServers` to `.mcp.json`. Native loader support for other component paths does not make those paths valid for this scaffold.
 - This repo’s scaffold writes `.codex-plugin/plugin.json`; treat that as the manifest location this skill generates.
 

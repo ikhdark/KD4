@@ -1,4 +1,6 @@
 pub(crate) mod api_bridge;
+mod attempt_identity;
+pub use attempt_identity::ResponseAttemptIdentity;
 pub(crate) mod auth;
 pub(crate) mod common;
 pub(crate) mod endpoint;

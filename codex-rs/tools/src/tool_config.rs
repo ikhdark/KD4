@@ -4,6 +4,10 @@ use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::TUI_VISIBLE_COLLABORATION_MODES;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ReasoningEffort;
+
+pub const DEFAULT_SPAWN_AGENT_MODEL: &str = "gpt-6.1-sol";
+pub const DEFAULT_SPAWN_AGENT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::XHigh;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum UnifiedExecFeatureMode {

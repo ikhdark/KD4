@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::codex_thread::BackgroundTerminalInfo;
 use crate::exec_env::CODEX_PERMISSION_PROFILE_ENV_VAR;
+use crate::exec_env::exec_env_policy_from_shell_policy;
 use crate::exec_env::CODEX_THREAD_ID_ENV_VAR;
 use crate::exec_env::create_env;
 use crate::exec_env::inject_permission_profile_env;
@@ -193,30 +194,6 @@ fn build_unified_exec_environment(
         ),
         local_policy_env,
     )
-}
-
-fn exec_env_policy_from_shell_policy(
-    policy: &ShellEnvironmentPolicy,
-) -> codex_exec_server::ExecEnvPolicy {
-    let mut exclude = policy
-        .exclude
-        .iter()
-        .map(std::string::ToString::to_string)
-        .collect::<Vec<_>>();
-    exclude.push(CODEX_PERMISSION_PROFILE_ENV_VAR.to_string());
-    let mut r#set = policy.r#set.clone();
-    r#set.retain(|key, _| !key.eq_ignore_ascii_case(CODEX_PERMISSION_PROFILE_ENV_VAR));
-    codex_exec_server::ExecEnvPolicy {
-        inherit: policy.inherit.clone(),
-        ignore_default_excludes: policy.ignore_default_excludes,
-        exclude,
-        r#set,
-        include_only: policy
-            .include_only
-            .iter()
-            .map(std::string::ToString::to_string)
-            .collect(),
-    }
 }
 
 fn env_overlay_for_exec_server(
@@ -3254,53 +3231,6 @@ impl UnifiedExecProcessManager {
                 cwd: entry.cwd.clone(),
             })
             .collect()
-    }
-
-    /// Return the published handle without draining output or moving ownership.
-    /// Execution identity prevents a recycled transport ID from being reused.
-    pub(crate) async fn reuse_running_validation(
-        &self,
-        process_id: u32,
-        execution_id: crate::tools::command_execution::CommandExecutionId,
-        truncation_policy: codex_utils_output_truncation::TruncationPolicy,
-        max_output_tokens: Option<usize>,
-    ) -> Option<ExecCommandToolOutput> {
-        let entry = {
-            let store = self.process_store.lock().await;
-            let entry = store.processes.get(&process_id)?;
-            if entry.command_execution_id != execution_id
-                || entry.process.has_exited()
-                || entry
-                    .initial_exec_command_active
-                    .load(std::sync::atomic::Ordering::Acquire)
-                || !entry
-                    .process
-                    .validation()
-                    .is_some_and(|validation| validation.is_validation())
-            {
-                return None;
-            }
-            entry.clone()
-        };
-        Some(ExecCommandToolOutput {
-            stream_chunks: None,
-            stream_ranges: None,
-            output_ranges: None,
-            process_output: None, error: None,
-            environment_receipt: entry.process.environment_receipt(),
-            validation: entry.process.validation(),
-            event_call_id: entry.call_id,
-            chunk_id: generate_chunk_id(), wall_time: Duration::ZERO,
-            raw_output: Vec::new(), truncation_policy, max_output_tokens,
-            quiet_on_success: false,
-            process_id: Some(process_id),
-            session_capabilities: Some(entry.process.session_capabilities(entry.tty)),
-            exit_code: None, process_exited: false, search_no_match: false,
-            original_token_count: Some(0), hook_command: Some(entry.hook_command),
-            raw_output_artifact: entry.process.raw_output_artifact().await,
-            repair_notice: Some("Reusing the identical validation already running at the same workspace identity. No new process was launched and no output was consumed; resume this session.".into()),
-            pending_deferred_completions: Vec::new(),
-        })
     }
 
     pub(crate) async fn terminate_process(&self, process_id: u32) -> bool {

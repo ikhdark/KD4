@@ -18,6 +18,9 @@ exposes the selected binary on PATH, and handles conflicts with existing npm,
 bun, or older standalone installs. Set `CODEX_RELEASE_REPOSITORY=owner/name` to
 use another explicitly selected fork release source.
 
+Uninstall retains the standalone root and its `install.lock` so a concurrent
+installer cannot acquire a different lock or lose its newly installed files.
+
 The standalone package layout is supported from Codex `0.133.0` onward. The
 installer rejects older releases before requesting release assets; the retired
 platform npm archive layout is not probed or installed.
@@ -30,7 +33,7 @@ The configured Cargo profiles and publisher `-Profile` values are `dev`,
 ## Final builds
 
 `release` uses optimization level 3, no debug info (`debug = 0`), Thin LTO,
-one codegen unit for workspace crates and runtime dependencies, and incremental
+four codegen units for workspace crates and runtime dependencies, and incremental
 compilation disabled. Build scripts, proc macros, and build-only dependencies
 retain Cargo's build defaults. `pgo` inherits these settings.
 Windows builds retain native CPU tuning,

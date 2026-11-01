@@ -1,0 +1,23 @@
+[package]
+name = "codex-app-server-protocol-schema"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "codex_app_server_protocol_schema"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+codex-app-server-protocol-types = { workspace = true }
+codex-protocol = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+ts-rs = { workspace = true }

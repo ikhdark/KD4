@@ -25,7 +25,6 @@ use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::ToolExecutionId;
 use codex_protocol::protocol::TurnTimingToolCallSource;
-use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_stream_parser::strip_proposed_plan_blocks;
 use futures::Future;
 use futures::FutureExt;
@@ -37,39 +36,8 @@ use tracing::debug;
 use tracing::instrument;
 use tracing::warn;
 
-const GENERATED_IMAGE_ARTIFACTS_DIR: &str = "generated_images";
-
 fn tool_call_arguments_length(call: &ToolCall) -> usize {
     call.payload.log_payload().len()
-}
-
-/// Returns the host-owned default artifact path for a generated image.
-pub fn image_generation_artifact_path(
-    codex_home: &AbsolutePathBuf,
-    session_id: &str,
-    call_id: &str,
-) -> AbsolutePathBuf {
-    let sanitize = |value: &str| {
-        let mut sanitized: String = value
-            .chars()
-            .map(|ch| {
-                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                    ch
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        if sanitized.is_empty() {
-            sanitized = "generated_image".to_string();
-        }
-        sanitized
-    };
-
-    codex_home
-        .join(GENERATED_IMAGE_ARTIFACTS_DIR)
-        .join(sanitize(session_id))
-        .join(format!("{}.png", sanitize(call_id)))
 }
 
 fn strip_hidden_assistant_markup(text: String, plan_mode: bool) -> String {
@@ -80,22 +48,7 @@ fn strip_hidden_assistant_markup(text: String, plan_mode: bool) -> String {
     }
 }
 
-pub(crate) fn raw_assistant_output_text_from_item(item: &ResponseItem) -> Option<String> {
-    if let ResponseItem::Message { role, content, .. } = item
-        && role == "assistant"
-    {
-        let combined = content
-            .iter()
-            .filter_map(|ci| match ci {
-                codex_protocol::models::ContentItem::OutputText { text }
-                | codex_protocol::models::ContentItem::Refusal { refusal: text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<String>();
-        return Some(combined);
-    }
-    None
-}
+pub(crate) use codex_turn_timing::raw_assistant_output_text_from_item;
 
 pub(crate) async fn record_completed_response_item_with_finalized_facts(
     sess: &Arc<Session>,
@@ -168,7 +121,6 @@ pub(crate) struct OutputItemResult {
     pub needs_follow_up: bool,
     pub tool_future: Option<InFlightToolCall>,
     pub eager_read_eligible: bool,
-    pub read_only_prefetch_eligible: bool,
 }
 
 /// Turn-local client publication only. Authored history and finalized facts
@@ -501,11 +453,19 @@ pub(crate) async fn handle_output_item_done(
                 )));
             }
             let mut next_earlier_tool_calls_eligible = *earlier_tool_calls_eligible;
+            let native_analysis_cwd = ctx
+                .tool_runtime
+                .native_workspace_analysis_cwd(&call.payload);
+            let analysis_cwd = native_analysis_cwd.as_ref().map_or_else(
+                || ctx.turn_context.config.cwd.to_path_buf(),
+                |cwd| cwd.to_path_buf(),
+            );
             let (admission, read_only) =
                 crate::tool_history::classify_workspace_tool_call_at_admission(
                     call.tool_name.name.to_string(),
                     call.payload.clone(),
-                    ctx.turn_context.config.cwd.to_path_buf(),
+                    analysis_cwd,
+                    native_analysis_cwd.is_some(),
                 )
                 .await
                 .map_err(|error| {
@@ -516,7 +476,6 @@ pub(crate) async fn handle_output_item_done(
                 &mut next_earlier_tool_calls_eligible,
                 read_only,
             );
-            output.read_only_prefetch_eligible = read_only || output.eager_read_eligible;
             let timing = ctx
                 .tool_runtime
                 .create_tool_dispatch_timing(item_accepted_at, output.eager_read_eligible);

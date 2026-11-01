@@ -2,8 +2,9 @@ use crate::acl::add_deny_write_ace;
 use crate::acl::ensure_allow_write_aces;
 use crate::allow::AllowDenyPaths;
 use crate::allow::compute_allow_paths_for_permissions;
+use crate::allow::compute_deny_write_paths_for_permissions;
 use crate::cap::load_or_create_cap_sids;
-use crate::cap::workspace_write_cap_sid_for_root_keys;
+use crate::cap::workspace_write_cap_sid_for_root;
 use crate::cap::workspace_write_root_contains_path;
 use crate::cap::workspace_write_root_overlaps_path;
 use crate::cap::workspace_write_root_specificity;
@@ -53,12 +54,6 @@ pub(crate) struct ElevatedSpawnContext {
     pub(crate) cap_sids: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct SpawnPrepOptions {
-    pub(crate) inherit_path: bool,
-    pub(crate) add_git_safe_directory: bool,
-}
-
 pub(crate) struct LegacySessionSecurity {
     pub(crate) h_token: HANDLE,
     pub(crate) readonly_sid: Option<LocalSid>,
@@ -78,14 +73,13 @@ pub(crate) struct LegacyAclSids<'a> {
     pub(crate) write_root_sids: &'a [RootCapabilitySid],
 }
 
-fn prepare_spawn_context_common(
+pub(crate) fn prepare_legacy_spawn_context(
     permission_profile: &PermissionProfile,
     workspace_roots: &[AbsolutePathBuf],
     codex_home: &Path,
     cwd: &Path,
     env_map: &mut HashMap<String, String>,
     command: &[String],
-    options: SpawnPrepOptions,
 ) -> Result<SpawnContext> {
     crate::env::normalize_environment(env_map)?;
     let permissions =
@@ -94,14 +88,9 @@ fn prepare_spawn_context_common(
             workspace_roots,
         )?;
 
+    permissions.ensure_read_policy_supported(cwd)?;
     normalize_null_device_env(env_map);
     ensure_non_interactive_pager(env_map);
-    if options.inherit_path {
-        inherit_path_env(env_map);
-    }
-    if options.add_git_safe_directory {
-        inject_git_safe_directory(env_map, cwd);
-    }
 
     ensure_codex_home_exists(codex_home)?;
     let sandbox_base = codex_home.join(".sandbox");
@@ -110,6 +99,9 @@ fn prepare_spawn_context_common(
     log_start(command, logs_base_dir.as_deref());
 
     let uses_write_capabilities = permissions.uses_write_capabilities_for_cwd(cwd, env_map);
+    if permissions.should_apply_network_block() {
+        apply_no_network_to_env(env_map)?;
+    }
 
     Ok(SpawnContext {
         permissions,
@@ -119,35 +111,12 @@ fn prepare_spawn_context_common(
     })
 }
 
-pub(crate) fn prepare_legacy_spawn_context(
-    permission_profile: &PermissionProfile,
-    workspace_roots: &[AbsolutePathBuf],
-    codex_home: &Path,
-    cwd: &Path,
-    env_map: &mut HashMap<String, String>,
-    command: &[String],
-    options: SpawnPrepOptions,
-) -> Result<SpawnContext> {
-    let common = prepare_spawn_context_common(
-        permission_profile,
-        workspace_roots,
-        codex_home,
-        cwd,
-        env_map,
-        command,
-        options,
-    )?;
-    if common.permissions.should_apply_network_block() {
-        apply_no_network_to_env(env_map)?;
-    }
-    Ok(common)
-}
-
 pub(crate) fn prepare_legacy_session_security(
     uses_write_capabilities: bool,
     codex_home: &Path,
     cwd: &Path,
     capability_roots: impl IntoIterator<Item = PathBuf>,
+    deny_write_paths: &[PathBuf],
 ) -> Result<LegacySessionSecurity> {
     let caps = load_or_create_cap_sids(codex_home)?;
     // SAFETY: LocalSid owners retain every capability SID through token construction. The base
@@ -155,7 +124,7 @@ pub(crate) fn prepare_legacy_session_security(
     // restricted token transfers to LegacySessionSecurity.
     let (h_token, readonly_sid, readonly_sid_str, write_root_sids) = unsafe {
         if uses_write_capabilities {
-            let write_root_sids = root_capability_sids(codex_home, cwd, capability_roots)?;
+            let write_root_sids = root_capability_sids(codex_home, cwd, capability_roots, deny_write_paths)?;
             if write_root_sids.is_empty() {
                 anyhow::bail!("workspace-write sandbox has no writable root capability SIDs");
             }
@@ -210,8 +179,8 @@ pub(crate) fn root_capability_sids(
     codex_home: &Path,
     cwd: &Path,
     allow_paths: impl IntoIterator<Item = PathBuf>,
+    deny_write_paths: &[PathBuf],
 ) -> Result<Vec<RootCapabilitySid>> {
-    let cwd_key = canonical_path_key(cwd);
     let mut roots = allow_paths
         .into_iter()
         .map(|root| (canonical_path_key(&root), root))
@@ -219,9 +188,10 @@ pub(crate) fn root_capability_sids(
     roots.sort_by(|left, right| left.0.cmp(&right.0));
     roots.dedup_by(|left, right| left.0 == right.0);
 
+    let policy_roots = roots.iter().map(|(_, root)| root.clone()).collect::<Vec<_>>();
     let mut out = Vec::with_capacity(roots.len());
-    for (root_key, root) in roots {
-        let sid_str = workspace_write_cap_sid_for_root_keys(codex_home, &cwd_key, root_key)?;
+    for (_, root) in roots {
+        let sid_str = workspace_write_cap_sid_for_root(codex_home, cwd, &root, &policy_roots, deny_write_paths)?;
         let sid = LocalSid::from_string(&sid_str)?;
         out.push(RootCapabilitySid { root, sid, sid_str });
     }
@@ -275,20 +245,22 @@ pub(crate) fn apply_legacy_session_acl_rules(
     additional_deny_write_paths: &[PathBuf],
     acl_sids: LegacyAclSids<'_>,
 ) -> Result<()> {
-    let AllowDenyPaths { allow, mut deny } =
+    let AllowDenyPaths { allow, .. } =
         compute_allow_paths_for_permissions(permissions, current_dir, env_map);
+    let deny = compute_deny_write_paths_for_permissions(
+        permissions, current_dir, env_map, additional_deny_write_paths,
+    );
     crate::setup::ensure_safe_write_roots(&allow, codex_home)?;
     // SAFETY: LegacyAclSids borrows LocalSid owners that outlive these synchronous ACL operations,
     // so the readonly and root-capability pointers remain valid throughout each call.
     unsafe {
-        for path in additional_deny_write_paths {
+        for path in &deny {
             // Explicit carveouts must exist before the command starts so the
             // sandbox cannot create them under a writable parent first.
             if !path.exists() {
                 std::fs::create_dir_all(path)
                     .with_context(|| format!("create deny-write path {}", path.display()))?;
             }
-            deny.insert(path.clone());
         }
         // Only write-root capabilities receive allow ACEs. A read-only token has no writable roots,
         // and a write-restricted token's reads never consult its capability SIDs.
@@ -370,7 +342,9 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
     cancellation: Option<&crate::WindowsSandboxCancellationToken>,
 ) -> Result<ElevatedSpawnContext> {
     crate::setup::check_setup_cancellation(cancellation)?;
+    anyhow::ensure!(read_roots_override.is_none(), "Windows sandbox cannot enforce a complete readable-root override with shared sandbox accounts; refusing to launch");
     crate::env::normalize_environment(env_map)?;
+    permissions.ensure_read_policy_supported(cwd)?;
     normalize_null_device_env(env_map);
     ensure_non_interactive_pager(env_map);
     inherit_path_env(env_map);
@@ -384,11 +358,13 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
 
     let uses_write_capabilities = permissions.uses_write_capabilities_for_cwd(cwd, env_map);
 
-    let AllowDenyPaths { allow, deny } =
+    let AllowDenyPaths { allow, .. } =
         compute_allow_paths_for_permissions(&permissions, cwd, env_map);
+    let deny_write_paths = compute_deny_write_paths_for_permissions(
+        &permissions, cwd, env_map, deny_write_paths_override,
+    );
     crate::setup::ensure_safe_write_roots(&allow, codex_home)?;
     let write_roots: Vec<PathBuf> = allow.into_iter().collect();
-    let deny_write_paths: Vec<PathBuf> = deny.into_iter().collect();
     let computed_write_roots_override = if uses_write_capabilities {
         Some(write_roots.as_slice())
     } else {
@@ -421,18 +397,14 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
         read_roots_include_platform_defaults,
         setup_write_roots_override,
         deny_read_paths_override,
-        if deny_write_paths_override.is_empty() {
-            &deny_write_paths
-        } else {
-            deny_write_paths_override
-        },
+        &deny_write_paths,
         proxy_enforced,
         proxy_settings_mode,
         cancellation,
     )?;
     let caps = load_or_create_cap_sids(codex_home)?;
     let write_root_sids = if uses_write_capabilities {
-        root_capability_sids(codex_home, cwd, effective_write_roots)?
+        root_capability_sids(codex_home, cwd, effective_write_roots, &deny_write_paths)?
             .into_iter()
             .map(|root_sid| root_sid.sid_str)
             .collect::<Vec<_>>()

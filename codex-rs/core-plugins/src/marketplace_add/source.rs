@@ -86,18 +86,14 @@ pub(crate) fn canonicalize_configured_git_source(
     Ok(MarketplaceSource::Git { url, ref_name })
 }
 
-pub(super) fn stage_marketplace_source<F>(
+pub(super) fn stage_marketplace_source(
     source: &MarketplaceSource,
     sparse_paths: &[String],
     staged_root: &Path,
-    clone_source: F,
-) -> Result<String, MarketplaceAddError>
-where
-    F: Fn(&str, Option<&str>, &[String], &Path) -> Result<String, MarketplaceAddError>,
-{
+) -> Result<String, MarketplaceAddError> {
     match source {
         MarketplaceSource::Git { url, ref_name } => {
-            clone_source(url, ref_name.as_deref(), sparse_paths, staged_root)
+            super::install::clone_git_source(url, ref_name.as_deref(), sparse_paths, staged_root)
         }
         MarketplaceSource::Local { .. } => unreachable!(
             "local marketplace sources are added without staging a copied install root"

@@ -15,7 +15,6 @@ use crate::session::turn::build_projected_prompt;
 use crate::session::turn::built_tools;
 use crate::session::turn::prepare_sampling_prompt_with_workspace_identity;
 use crate::session::turn::prompt_token_estimates;
-use crate::session::turn::with_sampling_workspace_identity;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TokenUsage;
@@ -60,23 +59,21 @@ pub(super) async fn run_remote_compact_v2_attempt(
         append_compaction_trigger(&mut prompt);
         prompt
     };
-    // Only tool-search schemas can be rewritten by this trimmer. Size those
-    // before observing the workspace: preliminary sizing does not authorize
-    // source-evidence reuse and must not freeze an early workspace identity.
-    // Without that intervening observation, the authoritative pass below is
-    // sufficient; do not build and size the same request twice.
-    let preliminary_deleted_tokens = if history.requires_workspace_evidence_validation()
-        && history.raw_items().iter()
-            .any(|item| matches!(item, ResponseItem::ToolSearchOutput { .. }))
-    {
-        let prepared = history
-            .clone()
-            .prepare_for_prompt(&turn_context.model_info.input_modalities);
-        let sizing_prompt = build_prompt(&prepared);
-        let measured_input = largest_compaction_request_input(&sizing_prompt);
+    let (mut prompt, estimated_deleted_tokens) = {
+        let project = |history| {
+            let prepared = prepare_sampling_prompt_with_workspace_identity(
+                history,
+                turn_context,
+                None,
+                sess.services.git_workspace.as_ref(),
+            );
+            build_prompt(&prepared)
+        };
+        let mut prompt = project(history.clone());
+        let measured_input = largest_compaction_request_input(&prompt);
         let tool_tokens =
-            i64::try_from(sizing_prompt.tools.serialized().len().div_ceil(4)).unwrap_or(i64::MAX);
-        let (rewritten_outputs, deleted_tokens) =
+            i64::try_from(prompt.tools.serialized().len().div_ceil(4)).unwrap_or(i64::MAX);
+        let (rewritten_outputs, estimated_deleted_tokens) =
             trim_function_call_history_to_fit_context_window_for_prompt(
                 &mut history,
                 turn_context.as_ref(),
@@ -88,55 +85,12 @@ pub(super) async fn run_remote_compact_v2_attempt(
             info!(
                 turn_id = %turn_context.sub_id,
                 rewritten_outputs,
-                "rewrote history outputs while sizing remote compaction v2"
+                "rewrote history outputs before remote compaction v2"
             );
+            prompt = project(history.clone());
         }
-        deleted_tokens
-    } else {
-        0
+        (prompt, estimated_deleted_tokens)
     };
-    let (history, mut prompt, final_deleted_tokens) = with_sampling_workspace_identity(
-        history,
-        turn_context,
-        sess.services.git_workspace.as_ref(),
-        |mut history, workspace_identity| {
-            let project = |history| {
-                let prepared = prepare_sampling_prompt_with_workspace_identity(
-                    history,
-                    turn_context,
-                    workspace_identity,
-                    sess.services.git_workspace.as_ref(),
-                );
-                build_prompt(&prepared)
-            };
-            let mut prompt = project(history.clone());
-            let measured_input = largest_compaction_request_input(&prompt);
-            let tool_tokens =
-                i64::try_from(prompt.tools.serialized().len().div_ceil(4)).unwrap_or(i64::MAX);
-            let (rewritten_outputs, estimated_deleted_tokens) =
-                trim_function_call_history_to_fit_context_window_for_prompt(
-                    &mut history,
-                    turn_context.as_ref(),
-                    &base_instructions,
-                    Some(&measured_input),
-                    tool_tokens,
-                );
-            if rewritten_outputs > 0 {
-                info!(
-                    turn_id = %turn_context.sub_id,
-                    rewritten_outputs,
-                    "rewrote history outputs before remote compaction v2"
-                );
-                // Freshness notices can make the authoritative request larger
-                // than the preliminary estimate. Recheck that exact projection;
-                // only tool-search schemas change, with no intervening await.
-                prompt = project(history.clone());
-            }
-            (history, prompt, estimated_deleted_tokens)
-        },
-    )
-    .await;
-    let estimated_deleted_tokens = preliminary_deleted_tokens.saturating_add(final_deleted_tokens);
     if estimated_deleted_tokens > 0 {
         let max_local_deleted_tokens = sess
             .estimated_tokens_after_last_model_generated_item()

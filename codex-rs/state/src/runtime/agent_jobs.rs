@@ -116,13 +116,6 @@ impl StateRuntime {
             .fetch_one(self.pool.as_ref()).await? != 0)
     }
 
-    pub async fn create_agent_job(
-        &self,
-        params: &AgentJobCreateParams,
-        items: &[AgentJobItemCreateParams],
-    ) -> anyhow::Result<AgentJob> {
-        self.create_agent_job_with_cancellation(params, items, || false).await
-    }
 
     /// Import atomically, observing cancellation before admitting another batch.
     /// A cancellation racing commit may leave a complete Pending job, never a
@@ -945,36 +938,7 @@ WHERE job_id = ? AND item_id = ? AND status = ?
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn report_agent_job_item_result(
-        &self,
-        job_id: &str,
-        item_id: &str,
-        reporting_thread_id: &str,
-        result_json: &Value,
-    ) -> anyhow::Result<bool> {
-        self.report_agent_job_item_result_and_maybe_cancel(
-            job_id,
-            item_id,
-            reporting_thread_id,
-            result_json,
-            /*cancel_job*/ false,
-            /*cancellation_reason*/ "",
-        )
-        .await
-    }
 
-    pub async fn report_agent_job_item_result_and_maybe_cancel(
-        &self,
-        job_id: &str,
-        item_id: &str,
-        reporting_thread_id: &str,
-        result_json: &Value,
-        cancel_job: bool,
-        cancellation_reason: &str,
-    ) -> anyhow::Result<bool> {
-        Ok(self.report_agent_job_item_result_with_receipt(job_id, item_id, reporting_thread_id,
-            result_json, cancel_job, cancellation_reason).await?.is_some())
-    }
 
     pub async fn report_agent_job_item_result_with_receipt(
         &self,

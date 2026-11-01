@@ -28,13 +28,10 @@ def fetch_rg(
     *,
     manifest_path: Path = RG_MANIFEST,
 ) -> Path:
-    rg_bin = fetch_dotslash_executable(
+    return fetch_dotslash_executable(
         spec,
         manifest_path=manifest_path,
         artifact_label="ripgrep",
         cache_key=f"{spec.target}-rg",
         dest_name=spec.rg_name,
     )
-    if rg_bin is None:
-        raise RuntimeError("ripgrep is required for all package targets")
-    return rg_bin

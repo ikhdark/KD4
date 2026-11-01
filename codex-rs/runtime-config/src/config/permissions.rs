@@ -1,0 +1,834 @@
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::io;
+use std::path::Component;
+use std::path::Path;
+use std::path::PathBuf;
+
+use codex_config::permissions_toml::FilesystemPermissionToml;
+use codex_config::permissions_toml::FilesystemPermissionsToml;
+use codex_config::permissions_toml::NetworkToml;
+use codex_config::permissions_toml::PermissionProfileToml;
+use codex_config::permissions_toml::PermissionsToml;
+use codex_config::permissions_toml::WorkspaceRootsToml;
+use codex_config::types::SandboxWorkspaceWrite;
+use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
+use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
+use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemPath;
+use codex_protocol::permissions::FileSystemSandboxEntry;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::FileSystemSpecialPath;
+use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::permissions::project_roots_glob_pattern;
+use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_absolute_path::is_windows_absolute_path;
+use codex_utils_absolute_path::normalize_windows_device_path;
+
+use super::ProjectConfig;
+
+pub(crate) const BUILT_IN_READ_ONLY_PROFILE: &str = BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
+pub(crate) const BUILT_IN_WORKSPACE_PROFILE: &str = BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
+pub(crate) const BUILT_IN_DANGER_FULL_ACCESS_PROFILE: &str =
+    BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BuiltInPermissionProfileId {
+    ReadOnly,
+    Workspace,
+    DangerFullAccess,
+}
+
+#[derive(Clone, Copy)]
+struct BuiltInPermissionProfileDescriptor {
+    id: &'static str,
+    kind: BuiltInPermissionProfileId,
+}
+
+const BUILT_IN_PERMISSION_PROFILES: [BuiltInPermissionProfileDescriptor; 3] = [
+    BuiltInPermissionProfileDescriptor {
+        id: BUILT_IN_READ_ONLY_PROFILE,
+        kind: BuiltInPermissionProfileId::ReadOnly,
+    },
+    BuiltInPermissionProfileDescriptor {
+        id: BUILT_IN_WORKSPACE_PROFILE,
+        kind: BuiltInPermissionProfileId::Workspace,
+    },
+    BuiltInPermissionProfileDescriptor {
+        id: BUILT_IN_DANGER_FULL_ACCESS_PROFILE,
+        kind: BuiltInPermissionProfileId::DangerFullAccess,
+    },
+];
+
+fn builtin_permission_profile_descriptor(
+    profile_name: &str,
+) -> Option<BuiltInPermissionProfileDescriptor> {
+    BUILT_IN_PERMISSION_PROFILES
+        .iter()
+        .copied()
+        .find(|descriptor| descriptor.id == profile_name)
+}
+
+impl BuiltInPermissionProfileId {
+    pub(crate) fn from_str(id: &str) -> Option<Self> {
+        builtin_permission_profile_descriptor(id).map(|descriptor| descriptor.kind)
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => BUILT_IN_READ_ONLY_PROFILE,
+            Self::Workspace => BUILT_IN_WORKSPACE_PROFILE,
+            Self::DangerFullAccess => BUILT_IN_DANGER_FULL_ACCESS_PROFILE,
+        }
+    }
+}
+
+pub(super) fn builtin_permission_profiles()
+-> impl Iterator<Item = (&'static str, PermissionProfile)> {
+    BUILT_IN_PERMISSION_PROFILES.into_iter().map(|descriptor| {
+        (
+            descriptor.id,
+            descriptor.permission_profile(/*workspace_write*/ None),
+        )
+    })
+}
+
+impl BuiltInPermissionProfileDescriptor {
+    fn permission_profile(
+        self,
+        workspace_write: Option<&SandboxWorkspaceWrite>,
+    ) -> PermissionProfile {
+        match self.kind {
+            BuiltInPermissionProfileId::ReadOnly => PermissionProfile::read_only(),
+            BuiltInPermissionProfileId::Workspace => match workspace_write {
+                Some(SandboxWorkspaceWrite {
+                    writable_roots: _,
+                    network_access,
+                    exclude_tmpdir_env_var,
+                    exclude_slash_tmp,
+                }) => PermissionProfile::workspace_write_with(
+                    &[],
+                    if *network_access {
+                        NetworkSandboxPolicy::Enabled
+                    } else {
+                        NetworkSandboxPolicy::Restricted
+                    },
+                    *exclude_tmpdir_env_var,
+                    *exclude_slash_tmp,
+                ),
+                None => PermissionProfile::workspace_write(),
+            },
+            BuiltInPermissionProfileId::DangerFullAccess => PermissionProfile::Disabled,
+        }
+    }
+
+    fn extensible_parent_profile(self) -> Option<PermissionProfileToml> {
+        let file_system = match self.kind {
+            BuiltInPermissionProfileId::ReadOnly => FileSystemSandboxPolicy::read_only(),
+            BuiltInPermissionProfileId::Workspace => FileSystemSandboxPolicy::workspace_write(
+                &[],
+                /*exclude_tmpdir_env_var*/ false,
+                /*exclude_slash_tmp*/ false,
+            ),
+            BuiltInPermissionProfileId::DangerFullAccess => return None,
+        };
+        Some(permission_profile_toml_from_file_system_policy(file_system))
+    }
+}
+
+pub(crate) fn default_builtin_permission_profile_name(
+    active_project: &ProjectConfig,
+    windows_sandbox_level: WindowsSandboxLevel,
+) -> &'static str {
+    default_builtin_permission_profile_name_for_platform(
+        active_project,
+        windows_sandbox_level,
+        true,
+    )
+}
+
+fn default_builtin_permission_profile_name_for_platform(
+    active_project: &ProjectConfig,
+    windows_sandbox_level: WindowsSandboxLevel,
+    is_windows: bool,
+) -> &'static str {
+    if (active_project.is_trusted() || active_project.is_untrusted())
+        && (!is_windows || windows_sandbox_level != WindowsSandboxLevel::Disabled)
+    {
+        BUILT_IN_WORKSPACE_PROFILE
+    } else {
+        BUILT_IN_READ_ONLY_PROFILE
+    }
+}
+
+pub(crate) fn is_builtin_permission_profile_name(profile_name: &str) -> bool {
+    builtin_permission_profile_descriptor(profile_name).is_some()
+}
+
+pub(crate) fn builtin_permission_profile(
+    profile_name: &str,
+    workspace_write: Option<&SandboxWorkspaceWrite>,
+) -> Option<PermissionProfile> {
+    builtin_permission_profile_descriptor(profile_name)
+        .map(|descriptor| descriptor.permission_profile(workspace_write))
+}
+
+pub(crate) fn validate_user_permission_profile_names(
+    permissions: Option<&PermissionsToml>,
+) -> io::Result<()> {
+    let Some(permissions) = permissions else {
+        return Ok(());
+    };
+
+    for profile_name in permissions.entries.keys() {
+        if profile_name.starts_with(':') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "permissions profile `{profile_name}` uses a reserved built-in profile prefix"
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+
+
+pub(crate) fn resolve_permission_profile(
+    permissions: &PermissionsToml,
+    profile_name: &str,
+) -> io::Result<PermissionProfileToml> {
+    permissions
+        .resolve_profile(profile_name, extensible_builtin_parent_profile)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))
+}
+
+fn extensible_builtin_parent_profile(profile_name: &str) -> Option<PermissionProfileToml> {
+    builtin_permission_profile_descriptor(profile_name)
+        .and_then(BuiltInPermissionProfileDescriptor::extensible_parent_profile)
+}
+
+fn permission_profile_toml_from_file_system_policy(
+    file_system: FileSystemSandboxPolicy,
+) -> PermissionProfileToml {
+    let mut filesystem = FilesystemPermissionsToml {
+        glob_scan_max_depth: file_system.glob_scan_max_depth,
+        entries: BTreeMap::new(),
+    };
+    for entry in file_system.entries {
+        insert_filesystem_permission_toml(&mut filesystem.entries, entry);
+    }
+    PermissionProfileToml {
+        description: None,
+        extends: None,
+        workspace_roots: None,
+        filesystem: Some(filesystem),
+        network: None,
+    }
+}
+
+fn insert_filesystem_permission_toml(
+    entries: &mut BTreeMap<String, FilesystemPermissionToml>,
+    entry: FileSystemSandboxEntry,
+) {
+    match entry.path {
+        FileSystemPath::Path { path } => {
+            entries.insert(
+                path.into_path_buf().to_string_lossy().into_owned(),
+                FilesystemPermissionToml::Access(entry.access),
+            );
+        }
+        FileSystemPath::GlobPattern { pattern } => {
+            entries.insert(pattern, FilesystemPermissionToml::Access(entry.access));
+        }
+        FileSystemPath::Special { value } => {
+            insert_special_filesystem_permission_toml(entries, value, entry.access);
+        }
+    }
+}
+
+fn insert_special_filesystem_permission_toml(
+    entries: &mut BTreeMap<String, FilesystemPermissionToml>,
+    value: FileSystemSpecialPath,
+    access: FileSystemAccessMode,
+) {
+    match value {
+        FileSystemSpecialPath::Root => {
+            entries.insert(
+                ":root".to_string(),
+                FilesystemPermissionToml::Access(access),
+            );
+        }
+        FileSystemSpecialPath::Minimal => {
+            entries.insert(
+                ":minimal".to_string(),
+                FilesystemPermissionToml::Access(access),
+            );
+        }
+        FileSystemSpecialPath::ProjectRoots { subpath } => {
+            insert_scoped_filesystem_permission_toml(
+                entries,
+                ":workspace_roots".to_string(),
+                subpath.unwrap_or_else(|| PathBuf::from(".")),
+                access,
+            );
+        }
+        FileSystemSpecialPath::Tmpdir => {
+            entries.insert(
+                ":tmpdir".to_string(),
+                FilesystemPermissionToml::Access(access),
+            );
+        }
+        FileSystemSpecialPath::SlashTmp => {
+            entries.insert(
+                ":slash_tmp".to_string(),
+                FilesystemPermissionToml::Access(access),
+            );
+        }
+        FileSystemSpecialPath::Unknown { path, subpath } => {
+            if let Some(subpath) = subpath {
+                insert_scoped_filesystem_permission_toml(entries, path, subpath, access);
+            } else {
+                entries.insert(path, FilesystemPermissionToml::Access(access));
+            }
+        }
+    };
+}
+
+fn insert_scoped_filesystem_permission_toml(
+    entries: &mut BTreeMap<String, FilesystemPermissionToml>,
+    path: String,
+    subpath: PathBuf,
+    access: FileSystemAccessMode,
+) {
+    let permission = entries
+        .entry(path)
+        .or_insert_with(|| FilesystemPermissionToml::Scoped(BTreeMap::new()));
+    match permission {
+        FilesystemPermissionToml::Scoped(scoped_entries) => {
+            scoped_entries.insert(subpath.to_string_lossy().into_owned(), access);
+        }
+        FilesystemPermissionToml::Access(_) => {
+            *permission = FilesystemPermissionToml::Scoped(BTreeMap::from([(
+                subpath.to_string_lossy().into_owned(),
+                access,
+            )]));
+        }
+    }
+}
+
+
+pub(crate) fn compile_permission_profile(
+    permissions: &PermissionsToml,
+    profile_name: &str,
+    startup_warnings: &mut Vec<String>,
+) -> io::Result<(FileSystemSandboxPolicy, NetworkSandboxPolicy)> {
+    let profile = resolve_permission_profile(permissions, profile_name)?;
+    let mut file_system_sandbox_policy = FileSystemSandboxPolicy::restricted(Vec::new());
+    let base_network_sandbox_policy = NetworkSandboxPolicy::Restricted;
+    if let Some(filesystem) = profile.filesystem.as_ref() {
+        if filesystem.is_empty() && file_system_sandbox_policy.entries.is_empty() {
+            push_warning(
+                startup_warnings,
+                missing_filesystem_entries_warning(profile_name),
+            );
+        } else {
+            {
+                for pattern in unsupported_read_write_glob_paths(filesystem) {
+                    push_warning(
+                        startup_warnings,
+                        format!(
+                            "Filesystem glob `{pattern}` uses `read` or `write` access, which is not fully supported by this platform's sandboxing. Use an exact path or trailing `/**` subtree rule instead. `deny` globs are supported."
+                        ),
+                    );
+                }
+                for pattern in unbounded_unreadable_globstar_paths(filesystem) {
+                    push_warning(
+                        startup_warnings,
+                        format!(
+                            "Filesystem deny-read glob `{pattern}` uses `**`. Windows sandboxing does not support unbounded `**` natively; set `glob_scan_max_depth` in this filesystem profile to cap glob expansion and silence this warning, or enumerate explicit depths such as `*.env`, `*/*.env`, and `*/*/*.env`."
+                        ),
+                    );
+                }
+            }
+            for (path, permission) in &filesystem.entries {
+                file_system_sandbox_policy
+                    .entries
+                    .extend(compile_filesystem_permission(
+                        path,
+                        permission,
+                        startup_warnings,
+                    )?);
+            }
+        }
+    } else if file_system_sandbox_policy.entries.is_empty() {
+        push_warning(
+            startup_warnings,
+            missing_filesystem_entries_warning(profile_name),
+        );
+    }
+    let glob_scan_max_depth = validate_glob_scan_max_depth(
+        profile
+            .filesystem
+            .as_ref()
+            .and_then(|filesystem| filesystem.glob_scan_max_depth),
+    )?;
+    if let Some(glob_scan_max_depth) = glob_scan_max_depth {
+        file_system_sandbox_policy.glob_scan_max_depth = Some(glob_scan_max_depth);
+    }
+    let network_sandbox_policy =
+        compile_network_sandbox_policy(profile.network.as_ref(), base_network_sandbox_policy);
+    Ok((file_system_sandbox_policy, network_sandbox_policy))
+}
+
+pub(crate) fn compile_permission_profile_selection(
+    permissions: Option<&PermissionsToml>,
+    profile_name: &str,
+    workspace_write: Option<&SandboxWorkspaceWrite>,
+    startup_warnings: &mut Vec<String>,
+) -> io::Result<(FileSystemSandboxPolicy, NetworkSandboxPolicy)> {
+    if let Some(permission_profile) = builtin_permission_profile(profile_name, workspace_write) {
+        return Ok(permission_profile.to_runtime_permissions());
+    }
+    reject_unknown_builtin_permission_profile(profile_name)?;
+
+    let permissions = permissions.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "default_permissions requires a `[permissions]` table",
+        )
+    })?;
+    compile_permission_profile(permissions, profile_name, startup_warnings)
+}
+
+pub(crate) fn compile_permission_profile_workspace_roots(
+    permissions: Option<&PermissionsToml>,
+    profile_name: &str,
+    policy_cwd: &Path,
+) -> io::Result<Vec<AbsolutePathBuf>> {
+    if is_builtin_permission_profile_name(profile_name) {
+        return Ok(Vec::new());
+    }
+    reject_unknown_builtin_permission_profile(profile_name)?;
+
+    let permissions = permissions.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "default_permissions requires a `[permissions]` table",
+        )
+    })?;
+    let profile = resolve_permission_profile(permissions, profile_name)?;
+    Ok(compile_workspace_roots(
+        profile.workspace_roots.as_ref(),
+        policy_cwd,
+    ))
+}
+
+fn compile_workspace_roots(
+    workspace_roots: Option<&WorkspaceRootsToml>,
+    policy_cwd: &Path,
+) -> Vec<AbsolutePathBuf> {
+    workspace_roots.map_or_else(Vec::new, |workspace_roots| {
+        workspace_roots
+            .enabled_roots()
+            .map(|path| AbsolutePathBuf::resolve_path_against_base(path, policy_cwd))
+            .collect()
+    })
+}
+
+pub(crate) fn reject_unknown_builtin_permission_profile(profile_name: &str) -> io::Result<()> {
+    if profile_name.starts_with(':') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("default_permissions refers to unknown built-in profile `{profile_name}`"),
+        ));
+    }
+
+    Ok(())
+}
+
+fn compile_network_sandbox_policy(
+    network: Option<&NetworkToml>,
+    base_network_sandbox_policy: NetworkSandboxPolicy,
+) -> NetworkSandboxPolicy {
+    let Some(network) = network else {
+        return base_network_sandbox_policy;
+    };
+
+    match network.enabled {
+        Some(true) => NetworkSandboxPolicy::Enabled,
+        Some(false) => NetworkSandboxPolicy::Restricted,
+        None => base_network_sandbox_policy,
+    }
+}
+
+fn compile_filesystem_permission(
+    path: &str,
+    permission: &FilesystemPermissionToml,
+    startup_warnings: &mut Vec<String>,
+) -> io::Result<Vec<FileSystemSandboxEntry>> {
+    let mut entries = Vec::new();
+    match permission {
+        FilesystemPermissionToml::Access(access) => {
+            entries.push(FileSystemSandboxEntry {
+                path: compile_filesystem_access_path(path, *access, startup_warnings)?,
+                access: *access,
+            });
+        }
+        FilesystemPermissionToml::Scoped(scoped_entries) => {
+            for (subpath, access) in scoped_entries {
+                let has_glob = contains_glob_chars(subpath);
+                let can_compile_as_pattern = match parse_special_path(path) {
+                    Some(FileSystemSpecialPath::ProjectRoots { .. }) | None => true,
+                    Some(_) => false,
+                };
+                if has_glob && *access == FileSystemAccessMode::Deny && can_compile_as_pattern {
+                    // Scoped glob syntax is a first-class filesystem policy
+                    // pattern entry. Literal scoped paths continue through the
+                    // exact-path parser so existing path semantics stay intact.
+                    let entry = FileSystemSandboxEntry {
+                        path: FileSystemPath::GlobPattern {
+                            pattern: compile_scoped_filesystem_pattern(path, subpath, *access)?,
+                        },
+                        access: *access,
+                    };
+                    entries.push(entry);
+                } else {
+                    let subpath = compile_read_write_glob_path(subpath, *access)?;
+                    entries.push(FileSystemSandboxEntry {
+                        path: compile_scoped_filesystem_path(path, subpath, startup_warnings)?,
+                        access: *access,
+                    });
+                }
+            }
+        }
+    }
+    Ok(entries)
+}
+
+fn compile_filesystem_access_path(
+    path: &str,
+    access: FileSystemAccessMode,
+    startup_warnings: &mut Vec<String>,
+) -> io::Result<FileSystemPath> {
+    if !contains_glob_chars(path) {
+        return compile_filesystem_path(path, startup_warnings);
+    }
+
+    if access == FileSystemAccessMode::Deny {
+        // At this point `path` is an unscoped filesystem table key. Top-level
+        // glob deny entries still go through the absolute-path parser before
+        // becoming policy patterns; relative project-root glob syntax is
+        // handled by `compile_scoped_filesystem_pattern`.
+        return Ok(FileSystemPath::GlobPattern {
+            pattern: parse_absolute_path(path)?.to_string_lossy().into_owned(),
+        });
+    }
+
+    let path = compile_read_write_glob_path(path, access)?;
+    compile_filesystem_path(path, startup_warnings)
+}
+
+fn compile_filesystem_path(
+    path: &str,
+    startup_warnings: &mut Vec<String>,
+) -> io::Result<FileSystemPath> {
+    if let Some(special) = parse_special_path(path) {
+        maybe_push_unknown_special_path_warning(&special, startup_warnings);
+        return Ok(FileSystemPath::Special { value: special });
+    }
+
+    let path = parse_absolute_path(path)?;
+    Ok(FileSystemPath::Path { path })
+}
+
+fn compile_scoped_filesystem_path(
+    path: &str,
+    subpath: &str,
+    startup_warnings: &mut Vec<String>,
+) -> io::Result<FileSystemPath> {
+    if subpath == "." {
+        return compile_filesystem_path(path, startup_warnings);
+    }
+
+    if let Some(special) = parse_special_path(path) {
+        let subpath = parse_relative_subpath(subpath)?;
+        let special = match special {
+            FileSystemSpecialPath::ProjectRoots { .. } => Ok(FileSystemPath::Special {
+                value: FileSystemSpecialPath::project_roots(Some(subpath)),
+            }),
+            FileSystemSpecialPath::Unknown { path, .. } => Ok(FileSystemPath::Special {
+                value: FileSystemSpecialPath::unknown(path, Some(subpath)),
+            }),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("filesystem path `{path}` does not support nested entries"),
+            )),
+        }?;
+        if let FileSystemPath::Special { value } = &special {
+            maybe_push_unknown_special_path_warning(value, startup_warnings);
+        }
+        return Ok(special);
+    }
+
+    let subpath = parse_relative_subpath(subpath)?;
+    let base = parse_absolute_path(path)?;
+    let path = AbsolutePathBuf::resolve_path_against_base(&subpath, base.as_path());
+    Ok(FileSystemPath::Path { path })
+}
+
+fn compile_scoped_filesystem_pattern(
+    path: &str,
+    subpath: &str,
+    access: FileSystemAccessMode,
+) -> io::Result<String> {
+    // Pattern entries currently mean deny-read only. Supporting broader access
+    // modes here would imply glob-based read/write allow semantics that the
+    // sandbox policy does not express yet.
+    if access != FileSystemAccessMode::Deny {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("filesystem glob subpath `{subpath}` only supports `deny` access"),
+        ));
+    }
+    let subpath = parse_relative_subpath(subpath)?;
+
+    match parse_special_path(path) {
+        Some(FileSystemSpecialPath::ProjectRoots { .. }) => {
+            // Keep `:workspace_roots` glob patterns symbolic until the active
+            // workspace roots are known, then materialize them for cwd and any
+            // runtime/profile-added workspace roots together.
+            Ok(project_roots_glob_pattern(&subpath))
+        }
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("filesystem path `{path}` does not support nested entries"),
+        )),
+        None => {
+            let base = parse_absolute_path(path)?;
+            Ok(base.join(&subpath).to_string_lossy().into_owned())
+        }
+    }
+}
+
+fn compile_read_write_glob_path(path: &str, access: FileSystemAccessMode) -> io::Result<&str> {
+    if !contains_glob_chars(path) {
+        return Ok(path);
+    }
+
+    let path_without_trailing_glob = remove_trailing_glob_suffix(path);
+    if !contains_glob_chars(path_without_trailing_glob) {
+        return Ok(path_without_trailing_glob);
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "filesystem glob path `{path}` only supports `deny` access; use an exact path or trailing `/**` for `{access}` subtree access"
+        ),
+    ))
+}
+
+fn unsupported_read_write_glob_paths(filesystem: &FilesystemPermissionsToml) -> Vec<String> {
+    let mut patterns = Vec::new();
+    for (path, permission) in &filesystem.entries {
+        match permission {
+            FilesystemPermissionToml::Access(access) => {
+                if *access != FileSystemAccessMode::Deny
+                    && contains_glob_chars(remove_trailing_glob_suffix(path))
+                {
+                    patterns.push(path.clone());
+                }
+            }
+            FilesystemPermissionToml::Scoped(scoped_entries) => {
+                for (subpath, access) in scoped_entries {
+                    if *access != FileSystemAccessMode::Deny
+                        && contains_glob_chars(remove_trailing_glob_suffix(subpath))
+                    {
+                        patterns.push(format!("{path}/{subpath}"));
+                    }
+                }
+            }
+        }
+    }
+    patterns
+}
+
+fn unbounded_unreadable_globstar_paths(filesystem: &FilesystemPermissionsToml) -> Vec<String> {
+    if filesystem.glob_scan_max_depth.is_some() {
+        return Vec::new();
+    }
+
+    let mut patterns = Vec::new();
+    for (path, permission) in &filesystem.entries {
+        match permission {
+            FilesystemPermissionToml::Access(FileSystemAccessMode::Deny) => {
+                if path.contains("**") {
+                    patterns.push(path.clone());
+                }
+            }
+            FilesystemPermissionToml::Access(_) => {}
+            FilesystemPermissionToml::Scoped(scoped_entries) => {
+                for (subpath, access) in scoped_entries {
+                    if *access == FileSystemAccessMode::Deny && subpath.contains("**") {
+                        patterns.push(format!("{path}/{subpath}"));
+                    }
+                }
+            }
+        }
+    }
+    patterns
+}
+
+fn validate_glob_scan_max_depth(max_depth: Option<usize>) -> io::Result<Option<usize>> {
+    match max_depth {
+        Some(0) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "glob_scan_max_depth must be at least 1",
+        )),
+        _ => Ok(max_depth),
+    }
+}
+
+fn contains_glob_chars(path: &str) -> bool {
+    contains_glob_chars_for_platform(path, true)
+}
+
+fn contains_glob_chars_for_platform(path: &str, is_windows: bool) -> bool {
+    // Namespace punctuation is not glob syntax, even when the device spelling
+    // must be retained to preserve an exact filename's identity.
+    let path = if is_windows {
+        path.strip_prefix(r"\\?\")
+            .or_else(|| path.strip_prefix(r"\\.\"))
+            .filter(|tail| {
+                let bytes = tail.as_bytes();
+                tail.starts_with(r"UNC\")
+                    || (bytes.len() >= 3
+                        && bytes[0].is_ascii_alphabetic()
+                        && bytes[1] == b':'
+                        && matches!(bytes[2], b'\\' | b'/'))
+            })
+            .unwrap_or(path)
+    } else {
+        path
+    };
+    path.chars().any(|ch| matches!(ch, '*' | '?' | '[' | ']'))
+}
+
+fn remove_trailing_glob_suffix(path: &str) -> &str {
+    path.strip_suffix("/**").unwrap_or(path)
+}
+
+// WARNING: keep this parser forward-compatible.
+// Adding a new `:special_path` must not make older Codex versions reject the
+// config. Unknown values intentionally round-trip through
+// `FileSystemSpecialPath::Unknown` so they can be surfaced as warnings and
+// ignored, rather than aborting config load.
+fn parse_special_path(path: &str) -> Option<FileSystemSpecialPath> {
+    match path {
+        ":root" => Some(FileSystemSpecialPath::Root),
+        ":minimal" => Some(FileSystemSpecialPath::Minimal),
+        ":workspace_roots" => Some(FileSystemSpecialPath::project_roots(/*subpath*/ None)),
+        ":tmpdir" => Some(FileSystemSpecialPath::Tmpdir),
+        ":slash_tmp" => Some(FileSystemSpecialPath::SlashTmp),
+        _ if path.starts_with(':') => {
+            Some(FileSystemSpecialPath::unknown(path, /*subpath*/ None))
+        }
+        _ => None,
+    }
+}
+
+fn parse_absolute_path(path: &str) -> io::Result<AbsolutePathBuf> {
+    parse_absolute_path_for_platform(path, true)
+}
+
+fn parse_absolute_path_for_platform(path: &str, is_windows: bool) -> io::Result<AbsolutePathBuf> {
+    let path_ref = normalize_absolute_path_for_platform(path, is_windows);
+    if !is_absolute_path_for_platform(path, path_ref.as_ref(), is_windows)
+        && path != "~"
+        && !path.starts_with("~/")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("filesystem path `{path}` must be absolute, use `~/...`, or start with `:`"),
+        ));
+    }
+    AbsolutePathBuf::from_absolute_path(path_ref.as_ref())
+}
+
+fn is_absolute_path_for_platform(path: &str, normalized_path: &Path, is_windows: bool) -> bool {
+    if is_windows {
+        is_windows_absolute_path(path)
+            || is_windows_absolute_path(&normalized_path.to_string_lossy())
+    } else {
+        normalized_path.is_absolute()
+    }
+}
+
+fn normalize_absolute_path_for_platform(path: &str, is_windows: bool) -> Cow<'_, Path> {
+    if !is_windows {
+        return Cow::Borrowed(Path::new(path));
+    }
+
+    match normalize_windows_device_path(path) {
+        Some(normalized) => Cow::Owned(PathBuf::from(normalized)),
+        None => Cow::Borrowed(Path::new(path)),
+    }
+}
+
+fn parse_relative_subpath(subpath: &str) -> io::Result<PathBuf> {
+    let path = Path::new(subpath);
+    if !subpath.is_empty()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Ok(path.to_path_buf());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "filesystem subpath `{}` must be a descendant path without `.` or `..` components",
+            path.display()
+        ),
+    ))
+}
+
+fn push_warning(startup_warnings: &mut Vec<String>, message: String) {
+    tracing::warn!(target: "codex_core::config::permissions", "{message}");
+    startup_warnings.push(message);
+}
+
+fn missing_filesystem_entries_warning(profile_name: &str) -> String {
+    format!(
+        "Permissions profile `{profile_name}` does not define any recognized filesystem entries for this version of Codex. Filesystem access will remain restricted. Upgrade Codex if this profile expects filesystem permissions."
+    )
+}
+
+fn maybe_push_unknown_special_path_warning(
+    special: &FileSystemSpecialPath,
+    startup_warnings: &mut Vec<String>,
+) {
+    let FileSystemSpecialPath::Unknown { path, subpath } = special else {
+        return;
+    };
+    push_warning(
+        startup_warnings,
+        match subpath.as_deref() {
+            Some(subpath) => format!(
+                "Configured filesystem path `{path}` with nested entry `{}` is not recognized by this version of Codex and will be ignored. Upgrade Codex if this path is required.",
+                subpath.display()
+            ),
+            None => format!(
+                "Configured filesystem path `{path}` is not recognized by this version of Codex and will be ignored. Upgrade Codex if this path is required."
+            ),
+        },
+    );
+}
+

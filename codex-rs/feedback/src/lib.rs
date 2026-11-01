@@ -30,6 +30,8 @@ use tracing_subscriber::fmt::writer::MakeWriter;
 use tracing_subscriber::registry::LookupSpan;
 
 pub(crate) mod feedback_diagnostics;
+mod auth_recovery;
+pub use auth_recovery::emit_feedback_auth_recovery_tags;
 pub use feedback_diagnostics::FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME;
 pub use feedback_diagnostics::FeedbackDiagnostic;
 pub use feedback_diagnostics::FeedbackDiagnostics;
@@ -182,12 +184,8 @@ impl Default for CodexFeedback {
 
 impl CodexFeedback {
     pub fn new() -> Self {
-        Self::with_capacity(DEFAULT_MAX_BYTES)
-    }
-
-    pub(crate) fn with_capacity(max_bytes: usize) -> Self {
         Self {
-            inner: Arc::new(FeedbackInner::new(max_bytes)),
+            inner: Arc::new(FeedbackInner::new(DEFAULT_MAX_BYTES)),
         }
     }
 
@@ -502,18 +500,9 @@ impl FeedbackSnapshot {
         let client = BlockingHttpClientBuilder::new()
             .build_with_transport_default_proxy()
             .map_err(|err| anyhow!("failed to build feedback upload client: {err}"))?;
-        self.upload_feedback_with_client(options, &client, &dsn)
-    }
-
-    fn upload_feedback_with_client(
-        &self,
-        options: FeedbackUploadOptions<'_>,
-        client: &BlockingHttpClient,
-        dsn: &Dsn,
-    ) -> Result<()> {
         let body = self.encode_envelope(options)?;
         let deadline = upload_deadline(body.len());
-        send_envelope(client, dsn, body, deadline)
+        send_envelope(&client, &dsn, body, deadline)
     }
 
     fn encode_envelope(&self, options: FeedbackUploadOptions<'_>) -> Result<Vec<u8>> {

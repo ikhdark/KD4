@@ -382,7 +382,6 @@ async fn build_evaluation_context(
                 attempt_id: target.current_attempt.attempt_id,
                 applicable_instructions,
                 attempt_specific_diff: "Automatic change snapshots are disabled. Inspect the declared changes independently; task receipts do not establish current workspace freshness.".to_string(),
-                observed_writes: Vec::new(),
                 relevant_contracts,
                 nearest_tests,
             },
@@ -685,7 +684,6 @@ async fn handle_abandon_agent_task(
                 .services
                 .agent_control
                 .resolve_agent_reference(
-                    session.thread_id,
                     &turn.session_source,
                     &binding.agent_path,
                 )

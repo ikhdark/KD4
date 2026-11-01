@@ -4,6 +4,7 @@ use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxKind;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashMap;
@@ -46,6 +47,7 @@ pub fn token_mode_for_permission_profile(
             permission_profile,
             workspace_roots,
         )?;
+    permissions.ensure_read_policy_supported(cwd)?;
     if permissions.file_system.has_full_disk_write_access() {
         anyhow::bail!(
             "permission profile requests full-disk filesystem writes, which cannot be enforced by the Windows sandbox"
@@ -88,6 +90,10 @@ impl ResolvedWindowsSandboxPermissions {
             .file_system
             .materialize_project_roots_with_workspace_roots(workspace_roots);
         Ok(permissions)
+    }
+
+    pub(crate) fn ensure_read_policy_supported(&self, cwd: &Path) -> Result<()> {
+        validate_windows_read_policy(&self.file_system, cwd)
     }
 
     pub(crate) fn should_apply_network_block(&self) -> bool {
@@ -157,6 +163,24 @@ impl ResolvedWindowsSandboxPermissions {
             })
             .collect::<Vec<_>>()
     }
+}
+
+/// Shared accounts retain additive read grants, and WRITE_RESTRICTED capability
+/// SIDs do not restrict reads. Require the unrestricted-read baseline, allowing
+/// separately enforced explicit denies, rather than a single readable volume.
+pub fn validate_windows_read_policy(file_system: &FileSystemSandboxPolicy, cwd: &Path) -> Result<()> {
+    let has_root_baseline = file_system.entries.iter().any(|entry| {
+        matches!(
+            &entry.path,
+            FileSystemPath::Special { value: FileSystemSpecialPath::Root }
+        ) && entry.access.can_read()
+    });
+    let root_readable = cwd.ancestors().last().is_some_and(|root| {
+        file_system.can_read_path_with_cwd(root, cwd)
+    });
+    anyhow::ensure!(has_root_baseline && root_readable,
+        "Windows sandbox cannot enforce a complete readable-root allowlist with shared sandbox accounts; refusing to launch");
+    Ok(())
 }
 
 fn windows_temp_env_roots(env_map: &HashMap<String, String>) -> Vec<PathBuf> {

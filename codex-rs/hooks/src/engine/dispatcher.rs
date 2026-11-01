@@ -55,31 +55,22 @@ pub(crate) fn matching_handlers_for_matcher_inputs<'a>(
     handlers
         .iter()
         .filter(move |handler| handler.event_name == event_name)
-        .filter(move |handler| match event_name {
-            HookEventName::PreToolUse
-            | HookEventName::PermissionRequest
-            | HookEventName::PostToolUse
-            | HookEventName::SessionStart
-            | HookEventName::SubagentStart
-            | HookEventName::SubagentStop
-            | HookEventName::PreCompact
-            | HookEventName::PostCompact => {
-                if matcher_inputs.is_empty() {
+        .filter(move |handler| {
+            if !crate::hook_event_supports_matcher(event_name) {
+                return true;
+            }
+            if matcher_inputs.is_empty() {
+                handler
+                    .matcher
+                    .as_ref()
+                    .is_none_or(|matcher| matcher.matches(None))
+            } else {
+                matcher_inputs.iter().any(|input| {
                     handler
                         .matcher
                         .as_ref()
-                        .is_none_or(|matcher| matcher.matches(None))
-                } else {
-                    matcher_inputs.iter().any(|input| {
-                        handler
-                            .matcher
-                            .as_ref()
-                            .is_none_or(|matcher| matcher.matches(Some(input)))
-                    })
-                }
-            }
-            HookEventName::UserPromptSubmit | HookEventName::Stop | HookEventName::Interrupt => {
-                true
+                        .is_none_or(|matcher| matcher.matches(Some(input)))
+                })
             }
         })
 }

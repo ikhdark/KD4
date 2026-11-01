@@ -1,5 +1,5 @@
 use codex_connectors_extension::load_executor_plugin_connectors;
-use codex_core::config::Config;
+use codex_runtime_config::Config;
 use codex_core_plugins::ExecutorPluginProvider;
 use codex_exec_server::EnvironmentManager;
 use codex_extension_api::ExtensionFuture;

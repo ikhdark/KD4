@@ -8,7 +8,6 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
 use codex_utils_path_uri::PathUri;
 use std::io;
-use std::path::Path;
 use std::path::PathBuf;
 use toml::Value as TomlValue;
 
@@ -20,22 +19,13 @@ pub(super) struct MangedConfigFromFile {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct ManagedConfigFromMdm {
-    pub managed_config: TomlValue,
-    pub raw_toml: String,
-}
-
-#[derive(Debug, Clone)]
 pub(super) struct LoadedConfigLayers {
     /// If present, data read from the Windows managed-config file.
     pub managed_config: Option<MangedConfigFromFile>,
-    /// Reserved compatibility field; managed preferences are not loaded on Windows.
-    pub managed_config_from_mdm: Option<ManagedConfigFromMdm>,
 }
 
 pub(super) async fn load_config_layers_internal(
     fs: &dyn ExecutorFileSystem,
-    _codex_home: &Path,
     overrides: LoaderOverrides,
     strict_config: bool,
 ) -> io::Result<LoadedConfigLayers> {
@@ -61,12 +51,7 @@ pub(super) async fn load_config_layers_internal(
         file: managed_config_path.clone(),
     });
 
-    let managed_preferences = None;
-
-    Ok(LoadedConfigLayers {
-        managed_config,
-        managed_config_from_mdm: managed_preferences,
-    })
+    Ok(LoadedConfigLayers { managed_config })
 }
 
 pub(super) async fn read_config_from_path(

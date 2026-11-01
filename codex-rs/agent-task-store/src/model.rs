@@ -2,8 +2,6 @@ use chrono::DateTime;
 use chrono::Utc;
 use serde::Deserialize;
 use serde::Serialize;
-use sha2::Digest;
-use sha2::Sha256;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::path::Path;
@@ -280,18 +278,6 @@ pub struct AssignmentDraft {
     pub architecture_contract_ref: Option<ArchitectureContractRef>,
 }
 
-/// Stable, bounded identity for an Explorer's declared primary question and surface.
-/// Supporting-read history is deliberately excluded.
-#[doc(hidden)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PrimaryInvestigationIdentity(String);
-
-impl PrimaryInvestigationIdentity {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 #[doc(hidden)]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AdmissionOverlapSummary {
@@ -525,51 +511,6 @@ pub struct Assignment {
 }
 
 impl Assignment {
-    pub fn primary_investigation_identity(&self) -> Option<PrimaryInvestigationIdentity> {
-        // Dependency IDs alone cannot prove that two producers admitted the
-        // same dependency receipt/version. Until those inputs are in the key,
-        // dependent investigations must not suppress fresh work.
-        if self.role != AgentRole::Explorer || !self.dependencies.is_empty() {
-            return None;
-        }
-        let mut scopes = self.read_scope.clone();
-        scopes.sort_by(|left, right| {
-            left.path
-                .cmp(&right.path)
-                .then_with(|| left.recursive.cmp(&right.recursive))
-        });
-        let mut claims = self.contract_claims.clone();
-        claims.sort();
-        let mut criteria = self.acceptance_criteria.clone();
-        criteria.sort_by(|left, right| {
-            left.id
-                .cmp(&right.id)
-                .then_with(|| left.text.cmp(&right.text))
-        });
-        let mut dependencies = self.dependencies.clone();
-        dependencies.sort();
-        let mut prohibited = self.prohibited_changes.clone();
-        prohibited.sort();
-        let mut risks = self.risk_hints.clone();
-        risks.sort();
-        let canonical = serde_json::to_vec(&(
-            scopes,
-            claims,
-            self.objective.trim(),
-            criteria,
-            dependencies,
-            self.stop_condition.trim(),
-            prohibited,
-            risks,
-            &self.relation,
-            &self.architecture_contract_ref,
-        ))
-        .ok()?;
-        Some(PrimaryInvestigationIdentity(hex::encode(Sha256::digest(
-            &canonical,
-        ))))
-    }
-
     pub(crate) fn validate_selective_role_contract(&self) -> StoreResult<()> {
         let invalid = |detail: &str| Err(StoreError::InvalidAssignment(detail.to_string()));
         match self.role {

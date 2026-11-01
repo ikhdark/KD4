@@ -738,13 +738,7 @@ pub(crate) fn is_retryable_http_status(status: StatusCode) -> bool {
 
 fn retry_after(headers: &[HttpHeader], now: SystemTime) -> Option<Duration> {
     let value = response_header(headers, "retry-after")?;
-    let value = value.trim();
-    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return value.parse::<u64>().ok().map(Duration::from_secs);
-    }
-    httpdate::parse_http_date(value)
-        .ok()
-        .map(|date| date.duration_since(now).unwrap_or_default())
+    codex_network_types::parse_retry_after_delay(&value, now)
 }
 
 fn unexpected_http_status_error(

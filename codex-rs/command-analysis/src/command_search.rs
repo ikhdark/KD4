@@ -187,11 +187,6 @@ pub fn rg_search_path_indices(argv: &[String]) -> Option<Vec<usize>> {
     roles.searches.then_some(roles.path_indices)
 }
 
-/// Bounded advisory candidates only; no search results are inferred from this
-/// directory walk. The caller excludes Git-ignored candidates separately.
-pub fn skipped_hidden_rg_directories(script: &str, cwd: &Path) -> Vec<PathBuf> {
-    skipped_hidden_rg_directories_with_cancellation(script, cwd, CancellationToken::new())
-}
 
 pub fn skipped_hidden_rg_directories_with_cancellation(
     script: &str,

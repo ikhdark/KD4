@@ -72,15 +72,6 @@ fn is_apply_patch_executable(name: &str) -> bool {
     }
 }
 
-pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
-    arg0_dispatch_helper();
-
-    // This modifies the environment, which is not thread-safe, so do this
-    // before creating any threads/the Tokio runtime.
-    load_dotenv();
-
-    prepare_path_aliases()
-}
 
 fn prepare_path_aliases() -> Option<Arg0PathEntryGuard> {
     let (path_entry_guard, updated_path_env_var) = prepare_path_env_var_with_aliases(
@@ -183,7 +174,12 @@ where
             // that outcome before runtime teardown, which can wait on blocking
             // work, so panic and success share the same retirement deadline.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                runtime.block_on(run_main_with_arg0_guard(None, current_exe, main_fn))
+                runtime.block_on(async move {
+                    main_fn(Arg0DispatchPaths {
+                        codex_self_exe: current_exe,
+                    })
+                    .await
+                })
             }));
             let _ = main_result_tx.send(result);
             // Keep real runtime custody on this thread. In particular, do not
@@ -215,26 +211,6 @@ where
         },
         Err(payload) => std::panic::resume_unwind(payload),
     }
-}
-
-async fn run_main_with_arg0_guard<F, Fut>(
-    path_entry_guard: Option<Arg0PathEntryGuard>,
-    current_exe: Option<PathBuf>,
-    main_fn: F,
-) -> anyhow::Result<()>
-where
-    F: FnOnce(Arg0DispatchPaths) -> Fut,
-    Fut: Future<Output = anyhow::Result<()>>,
-{
-    let paths = Arg0DispatchPaths {
-        codex_self_exe: current_exe.clone(),
-    };
-
-    let result = main_fn(paths).await;
-    // Keep the arg0 tempdir guard alive until the async entry point finishes;
-    // runtime paths above can point at aliases inside that directory.
-    drop(path_entry_guard);
-    result
 }
 
 fn build_runtime() -> anyhow::Result<tokio::runtime::Runtime> {

@@ -625,25 +625,13 @@ fn spawn_input_loop(
     job: Arc<JobObject>,
     process: OwnedWinHandle,
     log_dir: Option<PathBuf>,
-    flow: Option<RunnerFlow>,
+    flow: RunnerFlow,
 ) -> std::thread::JoinHandle<()> {
+    let mut reader = reader;
     let termination_log_dir = log_dir.clone();
-    spawn_input_loop_with_terminator(reader, stdin_handle, hpc_handle, log_dir, flow, move || {
+    let terminate_process_tree = move || {
         terminate_job_or_process(&job, process.raw(), termination_log_dir.as_deref())
-    })
-}
-
-fn spawn_input_loop_with_terminator<F>(
-    mut reader: File,
-    stdin_handle: Option<HANDLE>,
-    hpc_handle: Arc<StdMutex<Option<isize>>>,
-    log_dir: Option<PathBuf>,
-    flow: Option<RunnerFlow>,
-    terminate_process_tree: F,
-) -> std::thread::JoinHandle<()>
-where
-    F: Fn() + Send + 'static,
-{
+    };
     let outstanding = Arc::new(AtomicUsize::new(0));
     let mut stdin_tx = stdin_handle.map(|handle| {
         spawn_stdin_writer(
@@ -714,7 +702,7 @@ where
                                 break;
                             }
                         }
-                    } else if let Some(flow) = &flow {
+                    } else {
                         let _ = flow.send(Message::StdinClosed {
                             payload: EmptyPayload::default(),
                         });
@@ -726,10 +714,7 @@ where
                     }
                 }
                 Message::OutputAck { payload } => {
-                    if !flow
-                        .as_ref()
-                        .is_some_and(|flow| flow.output.acknowledge(payload.stream, payload.chunks))
-                    {
+                    if !flow.output.acknowledge(payload.stream, payload.chunks) {
                         terminate_process_tree();
                         break;
                     }
@@ -778,16 +763,14 @@ where
                 }
             }
         }
-        if let Some(flow) = flow {
-            flow.output.stop();
-        }
+        flow.output.stop();
     })
 }
 
 fn spawn_stdin_writer(
     handle: HANDLE,
     log_dir: Option<PathBuf>,
-    flow: Option<RunnerFlow>,
+    flow: RunnerFlow,
     outstanding: Arc<AtomicUsize>,
 ) -> mpsc::SyncSender<Option<Vec<u8>>> {
     // One reserved EOF slot; the parser never blocks on this queue. The byte
@@ -834,11 +817,9 @@ fn spawn_stdin_writer(
                 offset += written as usize;
             }
             outstanding.fetch_sub(1, Ordering::AcqRel);
-            if let Some(flow) = &flow
-                && !flow.send(Message::StdinAck {
-                    payload: EmptyPayload::default(),
-                })
-            {
+            if !flow.send(Message::StdinAck {
+                payload: EmptyPayload::default(),
+            }) {
                 break;
             }
         }
@@ -847,11 +828,9 @@ fn spawn_stdin_writer(
         unsafe {
             CloseHandle(handle);
         }
-        if let Some(flow) = &flow {
-            let _ = flow.send(Message::StdinClosed {
-                payload: EmptyPayload::default(),
-            });
-        }
+        let _ = flow.send(Message::StdinClosed {
+            payload: EmptyPayload::default(),
+        });
     });
     stdin_tx
 }
@@ -975,10 +954,10 @@ pub fn main() -> Result<()> {
         Arc::clone(&job),
         control_process_handle,
         log_dir_owned,
-        Some(RunnerFlow {
+        RunnerFlow {
             writer: Arc::clone(&pipe_write),
             output: output_window,
-        }),
+        },
     );
 
     let timeout = windows_wait_timeout(req.timeout_ms);

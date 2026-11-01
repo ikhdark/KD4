@@ -36,7 +36,6 @@ use crate::mcp::ToolPluginProvenance;
 use crate::runtime::McpRuntimeContext;
 use crate::runtime::emit_duration;
 use crate::server::EffectiveMcpServer;
-use crate::server::McpServerLaunch;
 use crate::tools::ToolFilter;
 use crate::tools::ToolInfo;
 use crate::tools::filter_tools;
@@ -434,10 +433,6 @@ fn codex_apps_reconnect_backoff(consecutive_failures: u32) -> Duration {
         .min(CODEX_APPS_RECONNECT_MAX_BACKOFF)
 }
 
-fn reconnect_failed_startup_enabled(_server_name: &str) -> bool {
-    true
-}
-
 #[derive(Clone)]
 struct ManagedClientStartup {
     server_name: String,
@@ -603,7 +598,7 @@ pub(crate) struct AsyncManagedClient {
     catalog_invalidated: Arc<AtomicBool>,
     pub(crate) startup_complete: Arc<AtomicBool>,
     pub(crate) connection_generation: Arc<AtomicU64>,
-    pub(crate) startup_reconnect: Option<Arc<CodexAppsStartupReconnect>>,
+    pub(crate) startup_reconnect: Arc<CodexAppsStartupReconnect>,
     pub(crate) tool_plugin_provenance: Arc<ToolPluginProvenance>,
     pub(crate) cancel_token: CancellationToken,
     pub(crate) manager_owners: Arc<AtomicUsize>,
@@ -685,24 +680,23 @@ impl AsyncManagedClient {
             discover_tools,
         });
         let client = startup.start();
-        let startup_reconnect =
-            reconnect_failed_startup_enabled(&reconnect_server_name).then(|| {
-                let startup = Arc::clone(&startup);
-                Arc::new(
-                    CodexAppsStartupReconnect::new(
-                        Arc::new(move || startup.start_for_reconnect()),
-                        codex_apps_tools_cache_context.clone(),
-                        tool_filter.clone(),
-                        tool_catalog_revision,
-                        Arc::clone(&connection_generation),
-                    )
-                    .with_startup_status_context(
-                        startup_submit_id,
-                        reconnect_server_name,
-                        reconnect_tx_event,
-                    ),
+        let startup_reconnect = {
+            let startup = Arc::clone(&startup);
+            Arc::new(
+                CodexAppsStartupReconnect::new(
+                    Arc::new(move || startup.start_for_reconnect()),
+                    codex_apps_tools_cache_context.clone(),
+                    tool_filter.clone(),
+                    tool_catalog_revision,
+                    Arc::clone(&connection_generation),
                 )
-            });
+                .with_startup_status_context(
+                    startup_submit_id,
+                    reconnect_server_name,
+                    reconnect_tx_event,
+                ),
+            )
+        };
         if codex_apps_tools_cache_context
             .as_ref()
             .is_some_and(CodexAppsToolsCacheContext::has_current_tools)
@@ -762,8 +756,7 @@ impl AsyncManagedClient {
     pub(crate) async fn client(&self) -> Result<ManagedClient, StartupOutcomeError> {
         let client = if let Some(client) = self
             .startup_reconnect
-            .as_ref()
-            .and_then(|reconnect| reconnect.current_client())
+            .current_client()
         {
             client
         } else {
@@ -777,8 +770,7 @@ impl AsyncManagedClient {
         self.catalog_invalidated.store(true, Ordering::Release);
         let client = self
             .startup_reconnect
-            .as_ref()
-            .and_then(|reconnect| reconnect.current_client())
+            .current_client()
             .or_else(|| {
                 self.client
                     .peek()
@@ -800,9 +792,7 @@ impl AsyncManagedClient {
     }
 
     pub(crate) async fn reconnect_failed_startup(&self) {
-        let Some(startup_reconnect) = self.startup_reconnect.as_ref() else {
-            return;
-        };
+        let startup_reconnect = &self.startup_reconnect;
         if !self.startup_complete.load(Ordering::Acquire)
             || self.cancel_token.is_cancelled()
             || !self.managed_auth_scope_is_current()
@@ -836,8 +826,7 @@ impl AsyncManagedClient {
         self.reconnect_failed_startup().await;
         if let Some(pending_client) = self
             .startup_reconnect
-            .as_ref()
-            .and_then(|reconnect| reconnect.pending_client())
+            .pending_client()
         {
             return pending_client.await;
         }
@@ -959,8 +948,7 @@ impl AsyncManagedClient {
     }
 
     pub(crate) fn managed_auth_scope_is_current(&self) -> bool {
-        if let Some(client) = self.startup_reconnect.as_ref()
-            .and_then(|reconnect| reconnect.current_client())
+        if let Some(client) = self.startup_reconnect.current_client()
         {
             return client.client.managed_auth_scope_is_current();
         }
@@ -1697,9 +1685,7 @@ async fn make_rmcp_client(
     runtime_context: McpRuntimeContext,
     runtime_auth_provider: Option<SharedAuthProvider>,
 ) -> Result<RmcpClient, StartupOutcomeError> {
-    let config = match server.launch() {
-        McpServerLaunch::Configured(config) => config.as_ref().clone(),
-    };
+    let config = server.config().clone();
     let resolved_environment = runtime_context
         .resolve_server_environment(server_name, &config)
         .map_err(|err| StartupOutcomeError::from(anyhow!(err)))?;

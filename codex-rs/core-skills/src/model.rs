@@ -111,6 +111,7 @@ pub struct SkillLoadOutcome {
     pub(crate) skill_roots: Vec<AbsolutePathBuf>,
     pub(crate) skill_root_by_path: Arc<HashMap<AbsolutePathBuf, AbsolutePathBuf>>,
     pub(crate) file_systems_by_skill_path: SkillFileSystemsByPath,
+    pub(crate) plugin_installations: Option<crate::PluginSkillSnapshots>,
     pub(crate) implicit_skills_by_scripts_dir: Arc<HashMap<AbsolutePathBuf, SkillMetadata>>,
     pub(crate) implicit_skills_by_doc_path: Arc<HashMap<AbsolutePathBuf, SkillMetadata>>,
 }
@@ -137,6 +138,23 @@ impl SkillLoadOutcome {
         self.skills
             .iter()
             .map(|skill| (skill, self.is_skill_enabled(skill)))
+    }
+
+    pub(crate) fn acquire_skill_read_lease(
+        &self,
+        skill: &SkillMetadata,
+    ) -> io::Result<Option<Box<dyn Send + Sync>>> {
+        match (&self.plugin_installations, skill.plugin_id.as_deref()) {
+            (Some(installations), Some(plugin_id)) => installations.read_guard_for_plugin(plugin_id),
+            _ => Ok(None),
+        }
+    }
+
+    pub(crate) async fn read_skill_text(&self, skill: &SkillMetadata) -> io::Result<String> {
+        let _installation_read = self.acquire_skill_read_lease(skill)?;
+        let fs = self.file_system_for_skill(skill).unwrap_or_else(|| Arc::clone(&LOCAL_FS));
+        let path = PathUri::from_abs_path(&skill.path_to_skills_md);
+        fs.read_file_text(&path, /*sandbox*/ None).await
     }
 
     pub(crate) fn file_system_for_skill(
@@ -184,12 +202,7 @@ impl HostSkillsSnapshot {
     }
 
     pub async fn read_skill_text(&self, skill: &SkillMetadata) -> io::Result<String> {
-        let fs = self
-            .outcome
-            .file_system_for_skill(skill)
-            .unwrap_or_else(|| Arc::clone(&LOCAL_FS));
-        let path = PathUri::from_abs_path(&skill.path_to_skills_md);
-        fs.read_file_text(&path, /*sandbox*/ None).await
+        self.outcome.read_skill_text(skill).await
     }
 
     /// Reads a skill's `SKILL.md` through the provider that discovered it,
@@ -203,6 +216,7 @@ impl HostSkillsSnapshot {
         skill: &SkillMetadata,
         max_bytes: usize,
     ) -> io::Result<(String, AbsolutePathBuf)> {
+        let _installation_read = self.outcome.acquire_skill_read_lease(skill)?;
         let fs = self
             .outcome
             .file_system_for_skill(skill)
@@ -232,15 +246,6 @@ impl HostSkillsSnapshot {
             .filter(|skill| self.outcome.is_skill_enabled(skill))
     }
 
-    pub async fn read_skill_text_by_catalog_locator(&self, locator: &str) -> io::Result<String> {
-        let skill = self.resolve_catalog_locator(locator).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("unknown skill catalog locator `{locator}`"),
-            )
-        })?;
-        self.read_skill_text(skill).await
-    }
 }
 
 pub fn skill_catalog_id(skill: &SkillMetadata) -> String {

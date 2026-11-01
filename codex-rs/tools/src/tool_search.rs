@@ -46,9 +46,6 @@ impl ToolSearchEntry {
         parts
     }
 
-    pub fn to_loadable_spec(&self) -> LoadableToolSpec {
-        self.normalize_output(self.output.as_ref().clone())
-    }
 
     /// Normalize a selected callable without cloning unrelated namespace children.
     pub fn normalize_output(&self, mut output: LoadableToolSpec) -> LoadableToolSpec {

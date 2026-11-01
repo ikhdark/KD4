@@ -11,6 +11,7 @@ The [root README](../README.md) indexes the active product and development guide
 | [config.toml](config.toml) | Repository-local Codex configuration; kept at its runtime path. |
 | [test-runners.json](test-runners.json) | Validation runner registration; kept at its runtime path. |
 | [audits/](audits/README.md) | Reports, captured artifacts, and per-run evidence bundles. |
+| [fix-evidence/](fix-evidence/index.json) | Shared fix-to-receipt index and task-grouped standalone evidence; existing audit receipts stay in their audit task folders. |
 | `gitdiff/` (when present) | Runtime output path for named patch receipts from the diff-saving tool. |
 | `benchmark-runs/` (when present) | Benchmark cases and their captured results. |
 | [locks/](locks/) | Tool-managed coordination files; not disposable audit clutter. |

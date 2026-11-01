@@ -211,17 +211,7 @@ Constraints: no logos or trademarks; no watermark
 ```
 
 ### Game assets example: environment concept art
-```
-Use case: stylized-concept
-Asset type: game environment concept art
-Primary request: cavernous hangar interior with tall support beams and drifting fog
-Scene/backdrop: industrial hangar interior, deep scale, light haze
-Subject: compact shuttle parked near the center
-Style/medium: cinematic concept art, industrial realism
-Composition/framing: wide-angle, low-angle
-Lighting/mood: volumetric light rays cutting through fog
-Constraints: no logos or trademarks; no watermark
-```
+Use the [stylized-concept example](#stylized-concept) above, adding `Asset type: game environment concept art`.
 
 ### Game assets example: character concept
 ```

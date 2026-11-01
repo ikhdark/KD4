@@ -88,25 +88,7 @@ impl BlockingHttpClientBuilder {
     }
 
     fn build_inner(self, direct: bool) -> Result<BlockingHttpClient, BuildCustomCaTransportError> {
-        self.build_inner_using(
-            direct,
-            reqwest::blocking::Client::builder(),
-            build_blocking_reqwest_client_with_custom_ca_policy,
-        )
-    }
-
-    fn build_inner_using(
-        self,
-        direct: bool,
-        mut builder: reqwest::blocking::ClientBuilder,
-        build_with_custom_ca: impl FnOnce(
-            reqwest::blocking::ClientBuilder,
-            CustomCaPolicy,
-        ) -> Result<
-            reqwest::blocking::Client,
-            BuildCustomCaTransportError,
-        >,
-    ) -> Result<BlockingHttpClient, BuildCustomCaTransportError> {
+        let mut builder = reqwest::blocking::Client::builder();
         let custom_ca_policy = if self.tls_certs_only.is_some() {
             CustomCaPolicy::ExplicitRootSet
         } else {
@@ -131,7 +113,8 @@ impl BlockingHttpClientBuilder {
             builder = builder.identity(identity);
         }
         builder = builder.https_only(self.https_only);
-        build_with_custom_ca(builder, custom_ca_policy).map(|inner| BlockingHttpClient { inner })
+        build_blocking_reqwest_client_with_custom_ca_policy(builder, custom_ca_policy)
+            .map(|inner| BlockingHttpClient { inner })
     }
 }
 

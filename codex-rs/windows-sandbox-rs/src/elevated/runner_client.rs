@@ -17,7 +17,6 @@ use crate::winutil::quote_windows_arg;
 use crate::winutil::to_wide;
 use anyhow::Context;
 use anyhow::Result;
-use std::ffi::c_void;
 use std::fs::File;
 use std::io::Read;
 use std::os::windows::io::AsRawHandle;
@@ -333,7 +332,6 @@ pub(crate) fn spawn_runner_transport_with_admission(
     // SAFETY: PROCESS_INFORMATION is an output structure containing nullable handles and integer
     // IDs, so zero is a valid initial representation.
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-    let env_block: Option<Vec<u16>> = None;
     // Serialize policy validation plus suspended-root assignment with setup.
     // Only this short launch transaction holds the mutex, never pipe readiness.
     let policy_launch = sandbox_creds.offline_proxy_settings.as_ref().map(|settings| -> Result<_> {
@@ -361,10 +359,7 @@ pub(crate) fn spawn_runner_transport_with_admission(
             windows_sys::Win32::System::Threading::CREATE_NO_WINDOW
                 | windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT
                 | if policy_launch.is_some() { windows_sys::Win32::System::Threading::CREATE_SUSPENDED } else { 0 },
-            env_block
-                .as_ref()
-                .map(|block| block.as_ptr() as *const c_void)
-                .unwrap_or(ptr::null()),
+            ptr::null(),
             cwd_w.as_ptr(),
             &si,
             &mut pi,

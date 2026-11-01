@@ -222,7 +222,6 @@ pub(crate) fn start_streaming_output(
         }
         flush_pending(
             &mut pending,
-            &transcript,
             &call_id,
             &session_ref,
             &turn_ref,
@@ -693,7 +692,6 @@ async fn handle_lagged_output(
     // a later received chunk.
     flush_pending(
         pending,
-        transcript,
         call_id,
         session_ref,
         turn_ref,
@@ -749,7 +747,6 @@ async fn process_chunk(
 
 async fn flush_pending(
     pending: &mut PendingOutput,
-    _transcript: &Arc<Mutex<HeadTailBuffer>>,
     call_id: &str,
     session_ref: &Arc<Session>,
     turn_ref: &Arc<TurnContext>,

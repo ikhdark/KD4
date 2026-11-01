@@ -25,7 +25,6 @@ use codex_shell_command::parse_command::parse_command;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use codex_utils_string::truncate_middle_with_token_budget;
-use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -130,25 +129,6 @@ fn tracker_update_for_known_delta<'a>(
             delta,
         }
     }
-}
-
-fn apply_patch_local_cwd(
-    ctx: ToolEventCtx<'_>,
-    environment_id: Option<&str>,
-) -> Option<AbsolutePathBuf> {
-    let environment = ctx.patch_environment.or_else(|| match environment_id {
-        Some(environment_id) => ctx
-            .turn
-            .environments
-            .turn_environments
-            .iter()
-            .find(|environment| environment.environment_id == environment_id),
-        None => ctx.turn.environments.primary(),
-    })?;
-    if environment.environment.is_remote() {
-        return None;
-    }
-    environment.cwd().to_abs_path().ok()
 }
 
 pub(crate) async fn emit_exec_command_begin(
@@ -405,14 +385,12 @@ impl ToolEmitter {
                     output.stderr.text.clone(),
                     status,
                     tracker_update,
-                    environment_id.as_deref(),
                 )
                 .await?;
             }
             (
                 Self::ApplyPatch {
                     changes,
-                    environment_id,
                     ..
                 },
                 ToolEventStage::Failure(ToolEventFailure::Output { output, .. }),
@@ -428,14 +406,12 @@ impl ToolEmitter {
                         PatchApplyStatus::Failed
                     },
                     TurnDiffTrackerUpdate::Invalidate,
-                    environment_id.as_deref(),
                 )
                 .await?;
             }
             (
                 Self::ApplyPatch {
                     changes,
-                    environment_id,
                     ..
                 },
                 ToolEventStage::Failure(ToolEventFailure::Message(message)),
@@ -447,7 +423,6 @@ impl ToolEmitter {
                     (*message).to_string(),
                     PatchApplyStatus::Failed,
                     TurnDiffTrackerUpdate::None,
-                    environment_id.as_deref(),
                 )
                 .await?;
             }
@@ -473,7 +448,6 @@ impl ToolEmitter {
                             tracker_update_for_known_delta(environment_id.as_deref(), delta)
                         })
                         .unwrap_or(TurnDiffTrackerUpdate::None),
-                    environment_id.as_deref(),
                 )
                 .await?;
             }
@@ -795,13 +769,9 @@ async fn emit_exec_end(
     exec_input: ExecCommandInput<'_>,
     exec_result: ExecCommandResult,
 ) -> CodexResult<()> {
-    let mut persistence_result = Ok(());
     // Command outputs are not a file-change inventory. Keep caches conservative
     // without parsing commands, taking workspace baselines, or changing patch diffs.
     if exec_result.status != ExecCommandStatus::Declined {
-        ctx.session.services.git_workspace.note_host_workspace_mutation();
-        persistence_result = ctx.session
-            .invalidate_tool_history_source_dependencies(None, None).await;
         if let Some(tracker) = ctx.turn_diff_tracker {
             let revision = {
                 let mut tracker = tracker.lock().await;
@@ -843,9 +813,7 @@ async fn emit_exec_end(
             }),
         )
         .await;
-    // The external command already ran. Publish its terminal item and account for
-    // its mutation before propagating the durability barrier failure.
-    persistence_result
+    Ok(())
 }
 
 
@@ -890,85 +858,7 @@ async fn emit_patch_end(
     stderr: String,
     status: PatchApplyStatus,
     tracker_update: TurnDiffTrackerUpdate<'_>,
-    environment_id: Option<&str>,
 ) -> CodexResult<()> {
-    let mut persistence_result = Ok(());
-    let evidence_cwd = match &tracker_update {
-        TurnDiffTrackerUpdate::Track { environment_id, .. } => {
-            apply_patch_local_cwd(ctx, environment_id.as_deref())
-        }
-        TurnDiffTrackerUpdate::Invalidate | TurnDiffTrackerUpdate::None => {
-            apply_patch_local_cwd(ctx, environment_id)
-        }
-    };
-    // Remote source observations have no host-watcher freshness proof. Do not
-    // invent a host mutation (or broad legacy invalidation) for their writes.
-    if status != PatchApplyStatus::Declined && evidence_cwd.is_some()
-        && !matches!(&tracker_update, TurnDiffTrackerUpdate::None)
-    {
-        let affected_paths = match &tracker_update {
-            TurnDiffTrackerUpdate::Track { delta, .. } if delta.is_exact() => evidence_cwd.as_ref().map(|cwd| {
-            delta.changes().iter().flat_map(|change| {
-                let destination = match &change.change {
-                    codex_apply_patch::AppliedPatchFileChange::Update { move_path, .. } => move_path.as_ref(),
-                    _ => None,
-                };
-                std::iter::once(change.path.clone()).chain(destination.cloned())
-            })
-                .map(|path| {
-                    if path.is_absolute() {
-                        path
-                    } else {
-                        cwd.as_path().join(path)
-                    }
-                })
-                .collect::<BTreeSet<_>>()
-            }),
-            _ => None,
-        };
-        let generation_batch = match ctx.turn_diff_tracker {
-            Some(tracker) => tracker
-                .lock()
-                .await
-                .workspace_evidence_generation_batch_for_call(ctx.call_id),
-            None => None,
-        };
-        let mutation_deferred = generation_batch.is_some_and(|batch| {
-            batch.record_mutation(
-                ctx.call_id,
-                evidence_cwd.as_ref().map_or_else(
-                    || ctx.turn.config.cwd.clone().to_path_buf(),
-                    codex_utils_absolute_path::AbsolutePathBuf::to_path_buf,
-                ),
-                affected_paths.clone(),
-                /*observe_command_ledger*/ false,
-            )
-        });
-        let current_workspace_identity = if affected_paths.is_some() && !mutation_deferred {
-            match evidence_cwd.as_ref() {
-                Some(cwd) => {
-                    ctx.session
-                        .services
-                        .git_workspace
-                        .workspace_evidence_for_turn(ctx.turn, cwd.as_path())
-                        .await
-                        .identity
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
-        if !mutation_deferred {
-            persistence_result = ctx
-                .session
-                .invalidate_tool_history_source_dependencies(
-                    affected_paths.as_ref(),
-                    current_workspace_identity.as_ref(),
-                )
-                .await;
-        }
-    }
     let effects = patch_effects(&tracker_update);
     if effects.exact {
         let changed_paths = effects.changes.iter().filter(|change| change.before != change.after)
@@ -1009,22 +899,13 @@ async fn emit_patch_end(
         _ => {}
     }
     if let Some(tracker) = ctx.turn_diff_tracker {
-        let patch_modes = match &tracker_update {
-            TurnDiffTrackerUpdate::Track { delta, .. } => delta.preimage_modes().clone(),
-            _ => HashMap::new(),
-        };
-        let (unified_diff, invalidation_warning, after_capture) = {
+        let (unified_diff, invalidation_warning) = {
             let mut guard = tracker.lock().await;
-            let before_revision = guard.current_mutation_revision();
             let unified_diff = match tracker_update {
                 TurnDiffTrackerUpdate::Track {
                     environment_id,
                     delta,
                 } => {
-                    guard.set_patch_modes(
-                        environment_id.as_deref().unwrap_or_default(),
-                        patch_modes,
-                    );
                     guard.track_delta_for_call(
                         environment_id.as_deref().unwrap_or_default(),
                         delta,
@@ -1043,22 +924,11 @@ async fn emit_patch_end(
                 }
                 TurnDiffTrackerUpdate::None => None,
             };
-            let revision = guard.current_mutation_revision();
-            let after_capture = (revision != before_revision)
-                .then(|| guard.workspace_evidence_generation_batch_for_call(ctx.call_id))
-                .flatten()
-                .map(|batch| (batch, revision));
             (
                 unified_diff,
                 guard.take_invalidation_warning(),
-                after_capture,
             )
         };
-        if let (Some((batch, revision)), Some(cwd)) = (after_capture, evidence_cwd.as_ref()) {
-            batch
-                .prefetch_identity_after_mutation(ctx.session, ctx.turn, cwd.as_path(), revision)
-                .await;
-        }
         if let Some(message) = invalidation_warning {
             ctx.session
                 .send_event(
@@ -1075,9 +945,7 @@ async fn emit_patch_end(
                 .await;
         }
     }
-    // Preserve the committed delta and completion event even when its evidence
-    // invalidation could not be made durable.
-    persistence_result
+    Ok(())
 }
 
 

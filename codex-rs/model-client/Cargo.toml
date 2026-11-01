@@ -1,0 +1,49 @@
+[package]
+name = "codex-model-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+codex-analytics = { workspace = true }
+codex-api = { workspace = true }
+codex-client = { workspace = true }
+codex-conversation = { workspace = true }
+codex-feedback = { workspace = true }
+codex-git-utils = { workspace = true }
+codex-http-client = { workspace = true }
+codex-login = { workspace = true }
+codex-model-provider = { workspace = true }
+codex-model-provider-info = { workspace = true }
+codex-otel = { workspace = true }
+codex-protocol = { workspace = true }
+codex-response-debug-context = { workspace = true }
+codex-tools = { workspace = true }
+codex-turn-timing = { workspace = true }
+codex-utils-image = { workspace = true }
+codex-utils-output-truncation = { workspace = true }
+codex-utils-string = { workspace = true }
+eventsource-stream = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+http = { workspace = true }
+lru = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = [
+    "io-std",
+    "macros",
+    "process",
+    "rt-multi-thread",
+    "signal",
+] }
+tokio-tungstenite = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
+tracing = { workspace = true, features = ["log"] }
+uuid = { workspace = true, features = ["serde", "v4", "v5", "v7"] }

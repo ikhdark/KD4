@@ -2,6 +2,7 @@ mod activation;
 pub(crate) mod git;
 
 use self::activation::activate_marketplace_root;
+pub(crate) use self::activation::installed_marketplace_source_identity;
 use self::activation::installed_marketplace_metadata_matches;
 use self::activation::write_installed_marketplace_metadata;
 use self::git::clone_git_source;
@@ -183,6 +184,16 @@ fn load_configured_git_marketplaces(
     outcome
 }
 
+pub(crate) fn configured_git_marketplace_source_identity(
+    name: &str,
+    marketplace: &toml::Value,
+) -> Result<String, String> {
+    let marketplace = parse_configured_git_marketplace(name, marketplace)?
+        .ok_or_else(|| "marketplace is not configured as a Git source".to_string())?;
+    let (source, ref_name) = marketplace.git_source();
+    activation::git_source_identity(source, ref_name, &marketplace.sparse_paths)
+}
+
 fn parse_configured_git_marketplace(
     name: &str,
     marketplace: &toml::Value,
@@ -229,8 +240,16 @@ fn upgrade_configured_git_marketplace(
         .map_err(|err| format!("marketplace operation is busy or unavailable: {err}"))?;
     ensure_configured_git_marketplace_unchanged(reload_config, marketplace)?;
     let (source, ref_name) = marketplace.git_source();
-    let remote_revision = git_remote_revision(source, ref_name, MARKETPLACE_UPGRADE_GIT_TIMEOUT)?;
     let destination = install_root.join(&marketplace.name);
+    if let Some(installed_source) = installed_marketplace_source_identity(&destination)?
+        && installed_source != activation::git_source_identity(source, ref_name, &marketplace.sparse_paths)?
+    {
+        return Err(format!(
+            "marketplace `{}` is installed from a different source/ref; remove it before changing its source",
+            marketplace.name
+        ));
+    }
+    let remote_revision = git_remote_revision(source, ref_name, MARKETPLACE_UPGRADE_GIT_TIMEOUT)?;
     if validate_marketplace_root(&destination)
         .is_ok_and(|marketplace_name| marketplace_name == marketplace.name)
         && installed_marketplace_metadata_matches(&destination, marketplace, &remote_revision)

@@ -15,12 +15,10 @@ use codex_otel::MetricsClient;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use futures::StreamExt;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tracing::warn;
 use crate::environment_selection::TurnEnvironmentSnapshot;
-pub(crate) use codex_command_analysis::git_dirs::resolve_git_dirs;
 const RETAINED_REPOSITORY_CAPACITY: usize = 64;
 const PROJECT_DISCOVERY_REUSE_METRIC: &str = "codex.project_discovery_reuse";
 const ROOT_DISCOVERY_CONCURRENCY: usize = 4;
@@ -56,7 +54,6 @@ pub(crate) struct GitWorkspaceSnapshot {
     environment_generation: u64,
     primary_environment_id: Option<String>,
     entries: Vec<GitWorkspaceEntry>,
-    cache: Arc<GitWorkspaceCache>,
 }
 
 impl std::fmt::Debug for GitWorkspaceSnapshot {
@@ -95,7 +92,6 @@ impl GitWorkspaceSnapshot {
         Some(GitWorkspaceMetadataSource {
             cwd: entry.cwd.clone(),
             repo_root,
-            cache: Arc::clone(&self.cache),
         })
     }
 
@@ -111,7 +107,6 @@ impl GitWorkspaceSnapshot {
 pub(crate) struct GitWorkspaceMetadataSource {
     cwd: AbsolutePathBuf,
     repo_root: AbsolutePathBuf,
-    cache: Arc<GitWorkspaceCache>,
 }
 
 impl std::fmt::Debug for GitWorkspaceMetadataSource {
@@ -124,67 +119,10 @@ impl std::fmt::Debug for GitWorkspaceMetadataSource {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
-pub(crate) struct GitWorkspaceMetadata {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) associated_remote_urls: Option<BTreeMap<String, String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) latest_git_commit_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) has_changes: Option<bool>,
-}
+pub(crate) use codex_git_utils::GitWorkspaceMetadata;
 
-impl GitWorkspaceMetadata {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.associated_remote_urls.is_none()
-            && self.latest_git_commit_hash.is_none()
-            && self.has_changes.is_none()
-    }
-}
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct WorkspaceEvidenceIdentity {
-    // These fingerprints combine independent observations. Equality is useful
-    // for invalidation, but never proves current bytes or one coherent snapshot
-    // against arbitrary external writers. Consumers must retain that scope.
-    /// Repository discovery or capture failed. Unlike a proven non-Git `None`, this
-    /// value never authorizes reuse, even when two failed captures are equal.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) unavailable: bool,
-    #[serde(default)]
-    pub(crate) repository_root: Option<String>,
-    pub(crate) head_identity: Option<String>,
-    pub(crate) index_identity: Option<String>,
-    pub(crate) worktree_identity: Option<String>,
-}
-
-impl PartialEq for WorkspaceEvidenceIdentity {
-    fn eq(&self, other: &Self) -> bool {
-        self.unavailable == other.unavailable
-            && self.repository_root == other.repository_root
-            && self.head_identity == other.head_identity
-            && self.index_identity == other.index_identity
-            && self.worktree_identity == other.worktree_identity
-    }
-}
-
-impl Eq for WorkspaceEvidenceIdentity {}
-
-/// Git dependencies are no longer captured, so none can time out.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum WorkspaceEvidenceGitDependency {}
-
-impl WorkspaceEvidenceGitDependency {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {}
-    }
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct WorkspaceEvidenceCapture {
-    pub(crate) identity: Option<WorkspaceEvidenceIdentity>,
-    pub(crate) timed_out_git_dependencies: Vec<WorkspaceEvidenceGitDependency>,
-}
+pub(crate) use codex_conversation::workspace::WorkspaceEvidenceIdentity;
 
 type WorkspaceRootCacheEntry = (Option<PathBuf>, Vec<DependencyFingerprint>);
 
@@ -213,7 +151,7 @@ impl WorkspaceRootCache {
                 Err(error) => return Err(error),
             };
             let dependency = if exists {
-                dependency_fingerprint(path, true)
+                dependency_fingerprint(path)
                     .filter(|dependency| !matches!(dependency.state, DependencyState::Missing))
                     .ok_or_else(|| std::io::Error::other("cannot inspect repository marker"))?
             } else {
@@ -256,13 +194,24 @@ impl GitWorkspaceMetadataSource {
 
     pub(crate) async fn metadata(&self) -> GitWorkspaceMetadata {
         let (stable, has_changes) = tokio::join!(
-            self.cache.stable_metadata(self),
+            self.stable_metadata(),
             get_has_changes(self.cwd.as_path()),
         );
         GitWorkspaceMetadata {
             associated_remote_urls: stable.associated_remote_urls,
             latest_git_commit_hash: stable.latest_git_commit_hash,
             has_changes,
+        }
+    }
+
+    async fn stable_metadata(&self) -> StableGitMetadata {
+        let (head, remotes) = tokio::join!(
+            get_head_commit_hash_result(self.cwd.as_path()),
+            get_git_remote_urls_result(self.cwd.as_path()),
+        );
+        StableGitMetadata {
+            associated_remote_urls: remotes.ok().flatten(),
+            latest_git_commit_hash: head.ok().flatten().map(|sha| sha.0),
         }
     }
 }
@@ -273,32 +222,7 @@ struct StableGitMetadata {
     latest_git_commit_hash: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct SourcePathChangeObservation {
-    watcher_epoch: u64,
-    // Numeric epochs can repeat after PID reuse. Legacy observations remain
-    // recoverable, but cannot prove continuity with a newly created watcher.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    watcher_incarnation: Option<uuid::Uuid>,
-    watcher_generation: u64,
-    #[serde(default)]
-    registration_generation: u64,
-    repo_root: PathBuf,
-    path: PathBuf,
-    #[serde(default)]
-    recursive: bool,
-    // The pathname used by the caller is a dependency too: replacing a link
-    // changes the read without touching its previously resolved target.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    alias: Option<Box<SourcePathChangeObservation>>,
-}
 
-impl SourcePathChangeObservation {
-    pub(crate) fn source_dependency(&self) -> crate::tool_history::SourceDependencyV1 {
-        let path = self.alias.as_ref().map_or(&self.path, |alias| &alias.path);
-        crate::tool_history::SourceDependencyV1::new(path, self.recursive)
-    }
-}
 
 #[derive(Default)]
 pub(crate) struct GitWorkspaceCache {
@@ -386,14 +310,12 @@ impl GitWorkspaceCache {
                     environment_generation: key.environment_generation,
                     primary_environment_id,
                     entries: entry.entries.clone(),
-                    cache: Arc::clone(self),
                 };
             }
         }
 
         let mut root_resolutions = Vec::with_capacity(environment_candidates.len());
         for (environment_index, key_environment) in environment_candidates.iter().cloned() {
-            let _cache = Arc::clone(self);
             let environment = environments.turn_environments[environment_index].clone();
             let project_discovery = project_discovery.cloned();
             let metrics = metrics.cloned();
@@ -437,31 +359,9 @@ impl GitWorkspaceCache {
             environment_generation: key.environment_generation,
             primary_environment_id,
             entries,
-            cache: Arc::clone(self),
         }
     }
 
-    async fn stable_metadata(&self, source: &GitWorkspaceMetadataSource) -> StableGitMetadata {
-        let (head, remotes) = tokio::join!(
-            get_head_commit_hash_result(source.cwd.as_path()),
-            get_git_remote_urls_result(source.cwd.as_path()),
-        );
-        StableGitMetadata {
-            associated_remote_urls: remotes.ok().flatten(),
-            latest_git_commit_hash: head.ok().flatten().map(|sha| sha.0),
-        }
-    }
-
-    // Compatibility boundaries for historical consumers during reconstruction.
-    // These never certify source freshness. The command-receipt helper only
-    // discovers repository identity; it does not capture mutable source evidence.
-    pub(crate) async fn workspace_evidence_for_environment(
-        &self, _environments: &TurnEnvironmentSnapshot, _host_cwd: &Path, _cwd: &Path,
-    ) -> WorkspaceEvidenceCapture { WorkspaceEvidenceCapture::default() }
-    pub(crate) async fn workspace_evidence_for_turn(
-        &self, _turn: &crate::session::turn_context::TurnContext, _cwd: &Path,
-    ) -> WorkspaceEvidenceCapture { WorkspaceEvidenceCapture::default() }
-    pub(crate) async fn workspace_root_identity(&self, _cwd: &Path) -> Option<WorkspaceEvidenceIdentity> { None }
     /// Root identity for closed input-determined receipts, not source freshness
     /// or authority to reuse execution results.
     pub(crate) async fn command_receipt_workspace_identity(&self, cwd: &Path) -> Option<WorkspaceEvidenceIdentity> {
@@ -474,13 +374,7 @@ impl GitWorkspaceCache {
             worktree_identity: None,
         })
     }
-    pub(crate) fn begin_host_workspace_mutation(self: &Arc<Self>) -> PendingSourceMutation { PendingSourceMutation }
-    pub(crate) fn note_host_workspace_mutation(&self) {}
-    pub(crate) async fn note_host_workspace_mutation_paths(self: &Arc<Self>, _root: &Path, _paths: &[String]) {}
 }
-pub(crate) struct PendingSourceMutation;
-impl PendingSourceMutation { pub(crate) fn settle(self) {} }
-pub(crate) async fn git_ignored_paths(_root: &Path, _paths: &[PathBuf]) -> BTreeSet<PathBuf> { BTreeSet::new() }
 async fn collect_workspace_work_in_order<T>(
     work: impl IntoIterator<Item = impl Future<Output = T> + Send>,
     concurrency: usize,
@@ -604,7 +498,7 @@ fn root_dependencies(
             let exists = if let Some(exists) = observed.get(&path) {
                 *exists
             } else {
-                let dependency = dependency_fingerprint(path.clone(), true)?;
+                let dependency = dependency_fingerprint(path.clone())?;
                 let exists = !matches!(dependency.state, DependencyState::Missing);
                 observed.insert(path, exists);
                 dependencies.push(dependency);
@@ -641,11 +535,11 @@ enum DependencyState {
         modified: Option<SystemTime>,
         created: Option<SystemTime>,
         stable_id: Option<StableFileIdentity>,
-        digest: Option<[u8; 32]>,
+        digest: [u8; 32],
     },
 }
 
-fn dependency_fingerprint(path: PathBuf, hash_contents: bool) -> Option<DependencyFingerprint> {
+fn dependency_fingerprint(path: PathBuf) -> Option<DependencyFingerprint> {
     match std::fs::metadata(&path) {
         Ok(metadata) if metadata.is_dir() => Some(DependencyFingerprint {
             path,
@@ -655,7 +549,7 @@ fn dependency_fingerprint(path: PathBuf, hash_contents: bool) -> Option<Dependen
             },
         }),
         Ok(metadata) if metadata.is_file() => {
-            let state = file_dependency_state(File::open(&path).ok()?, hash_contents, None, None)?;
+            let state = file_dependency_state(File::open(&path).ok()?, None, None)?;
             Some(DependencyFingerprint { path, state })
         }
         Ok(_) => None,
@@ -668,12 +562,12 @@ fn dependency_fingerprint(path: PathBuf, hash_contents: bool) -> Option<Dependen
 }
 
 fn file_dependency_state(
-    mut file: File, hash_contents: bool, max_bytes: Option<u64>, mut read_budget: Option<&mut u64>,
+    mut file: File, max_bytes: Option<u64>, mut read_budget: Option<&mut u64>,
 ) -> Option<DependencyState> {
     let metadata = file.metadata().ok()?;
     if max_bytes.is_some_and(|limit| metadata.len() > limit) { return None; }
     let stable_id = stable_file_identity(&file);
-    let digest = if hash_contents {
+    let digest = {
         let mut hasher = Sha256::new();
         let mut buffer = [0u8; 8192];
         let mut read_bytes = 0u64;
@@ -699,9 +593,7 @@ fn file_dependency_state(
             if after.len() != metadata.len() || after.modified().ok() != metadata.modified().ok()
                 || stable_file_identity(&file) != stable_id { return None; }
         }
-        Some(hasher.finalize().into())
-    } else {
-        None
+        hasher.finalize().into()
     };
     Some(DependencyState::File {
         len: metadata.len(),
@@ -720,13 +612,13 @@ pub(crate) fn compilation_input_fingerprints(paths: Vec<PathBuf>) -> BTreeMap<Pa
     for path in paths.into_iter().take(256) {
         let limit = remaining.min(8 * 1024 * 1024);
         let state = match File::open(&path) {
-            Ok(file) => file_dependency_state(file, true, Some(limit), Some(&mut remaining)),
+            Ok(file) => file_dependency_state(file, Some(limit), Some(&mut remaining)),
             Err(error) if error.kind() == ErrorKind::NotFound => Some(DependencyState::Missing),
             Err(_) => None,
         };
         let fingerprint = match state {
             Some(DependencyState::Missing) => "missing".to_owned(),
-            Some(DependencyState::File { digest: Some(digest), .. }) => hex::encode(digest),
+            Some(DependencyState::File { digest, .. }) => hex::encode(digest),
             _ => continue,
         };
         result.insert(path, fingerprint);

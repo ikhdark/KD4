@@ -4,6 +4,7 @@ mod confined_file;
 mod copy_failure;
 mod directory_guard;
 mod find_up;
+mod persist_synced;
 mod text_diagnostics;
 mod walk_gitignore;
 
@@ -22,6 +23,7 @@ pub use directory_guard::lock_directory_chain;
 pub use find_up::FindUpErrorPolicy;
 pub use find_up::find_nearest_ancestor_with_markers;
 pub use find_up::find_nearest_native_ancestor_with_markers;
+pub use persist_synced::persist_synced_file;
 pub use text_diagnostics::DecodingError;
 pub use text_diagnostics::DecodingErrorKind;
 pub use text_diagnostics::EncodingDetection;
@@ -1306,10 +1308,18 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
         let ignore_rules = match &mut gitignore {
             Some(gitignore) => {
                 // A nested repository's own listing names its `.git` marker.
-                let repository_root = batch
+                let marker = batch
                     .entries
                     .iter()
-                    .any(|entry| entry.sort_name().eq_ignore_ascii_case(".git"));
+                    .find(|entry| entry.sort_name().eq_ignore_ascii_case(".git"))
+                    .map(WalkDirectoryEntry::sort_name);
+                let repository_root = match marker {
+                    Some(".git") => true,
+                    Some(_) => walk_gitignore::WalkGitignore::is_repository_root(
+                        file_system, &directory, sandbox,
+                    ).await?,
+                    None => false,
+                };
                 // A complete listing without `.gitignore` needs no read; an
                 // entry that failed enumeration may be that file.
                 let ignore_file_possible = batch.limit_reached

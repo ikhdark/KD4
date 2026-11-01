@@ -171,7 +171,6 @@ pub(crate) async fn handle_mcp_tool_call(
             format!(
                 "MCP tool `{sampled_server}/{sampled_tool_name}` is no longer available to the model"
             ),
-            /*already_started*/ false,
         )
         .await;
         let status = if result.is_ok() { "ok" } else { "error" };
@@ -225,7 +224,6 @@ pub(crate) async fn handle_mcp_tool_call(
             invocation,
             item_metadata,
             changed_mcp_contract_message(&live_tool_info),
-            false,
         )
         .await;
         return HandledMcpToolCall {
@@ -250,7 +248,6 @@ pub(crate) async fn handle_mcp_tool_call(
                     invocation,
                     item_metadata.clone(),
                     format!("MCP tool call blocked: {error}"),
-                    false,
                 )
                 .await;
                 emit_mcp_call_metrics(
@@ -291,7 +288,6 @@ pub(crate) async fn handle_mcp_tool_call(
             invocation,
             item_metadata.clone(),
             "MCP tool call blocked by app configuration".to_string(),
-            /*already_started*/ false,
         )
         .await;
         let status = if result.is_ok() { "ok" } else { "error" };
@@ -606,25 +602,21 @@ async fn execute_approved_mcp_tool_call(
             connector_name,
         },
     );
-    let execution = async {
-        async {
-            let rewritten_arguments = rewrite?;
-            execute_mcp_tool_call(
-                sess,
-                step_context,
-                call_id,
-                &invocation,
-                rewritten_arguments,
-                metadata,
-                dispatched,
-            )
-            .await
-        }
+    let result = async {
+        let rewritten_arguments = rewrite?;
+        execute_mcp_tool_call(
+            sess,
+            step_context,
+            call_id,
+            &invocation,
+            rewritten_arguments,
+            metadata,
+            dispatched,
+        )
         .await
     }
     .instrument(span.clone())
     .await;
-    let result = execution.map(|execution| execution.model_result);
     record_mcp_result_span_telemetry(&span, &result);
     if let Err(error) = &result {
         tracing::warn!("MCP tool call error: {error:?}");
@@ -751,10 +743,6 @@ fn truncate_str_to_char_boundary(value: &str, max_chars: usize) -> &str {
     }
 }
 
-struct ExecutedMcpToolCall {
-    model_result: CallToolResult,
-}
-
 async fn execute_mcp_tool_call(
     sess: &Session,
     step_context: &StepContext,
@@ -763,7 +751,7 @@ async fn execute_mcp_tool_call(
     rewritten_arguments: crate::mcp_openai_file::PreparedOpenAiArguments,
     metadata: Option<&McpToolApprovalMetadata>,
     dispatched: &std::sync::atomic::AtomicBool,
-) -> Result<ExecutedMcpToolCall, String> {
+) -> Result<CallToolResult, String> {
     let turn_context = step_context.turn.as_ref();
     let tool_execution_timing_guard = turn_context.turn_timing_state.begin_tool_execution();
     let request_meta =
@@ -808,7 +796,7 @@ async fn execute_mcp_tool_call(
         model_result,
     )
     .await;
-    Ok(ExecutedMcpToolCall { model_result })
+    Ok(model_result)
 }
 
 async fn maybe_request_codex_apps_auth_elicitation(
@@ -1387,11 +1375,6 @@ async fn maybe_request_mcp_tool_approval(
         return None;
     }
 
-    let annotations = metadata.and_then(|metadata| metadata.annotations.as_ref());
-    if !requires_mcp_tool_approval_for_mode(annotations, approval_mode) {
-        return None;
-    }
-
     let session_approval_key = session_mcp_tool_approval_key(invocation, metadata, approval_mode);
     let persistent_approval_key = if manager.is_selected_plugin_mcp_server(&invocation.server) {
         None
@@ -1479,7 +1462,7 @@ async fn maybe_request_mcp_tool_approval(
                 question,
                 message_override: rendered_template
                     .as_ref()
-                    .map(|rendered_template| rendered_template.elicitation_message.as_str()),
+                    .map(|rendered_template| rendered_template.question.as_str()),
                 prompt_options,
             });
         let decision = parse_mcp_tool_approval_elicitation_response(
@@ -2229,18 +2212,6 @@ fn project_mcp_tool_approval_config_folder(
         })
 }
 
-fn requires_mcp_tool_approval_for_mode(
-    _annotations: Option<&ToolAnnotations>,
-    approval_mode: AppToolApproval,
-) -> bool {
-    match approval_mode {
-        // Provider hints do not establish read-only behavior. Explicit configured
-        // approval and the existing authority-bound remembered consent still apply.
-        AppToolApproval::Auto | AppToolApproval::Prompt | AppToolApproval::Writes => true,
-        AppToolApproval::Approve => false,
-    }
-}
-
 async fn notify_mcp_tool_call_skip(
     sess: &Session,
     turn_context: &TurnContext,
@@ -2248,18 +2219,15 @@ async fn notify_mcp_tool_call_skip(
     invocation: McpInvocation,
     item_metadata: McpToolCallItemMetadata,
     message: String,
-    already_started: bool,
 ) -> Result<CallToolResult, String> {
-    if !already_started {
-        notify_mcp_tool_call_started(
-            sess,
-            turn_context,
-            call_id,
-            invocation.clone(),
-            item_metadata.clone(),
-        )
-        .await;
-    }
+    notify_mcp_tool_call_started(
+        sess,
+        turn_context,
+        call_id,
+        invocation.clone(),
+        item_metadata.clone(),
+    )
+    .await;
 
     notify_mcp_tool_call_completed(
         sess,

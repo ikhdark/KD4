@@ -614,19 +614,6 @@ impl FeatureToggles {
         Ok(CliConfigOverrides { raw_overrides })
     }
 
-    fn to_overrides(&self) -> anyhow::Result<Vec<String>> {
-        let mut v = Vec::new();
-        for feature in &self.enable {
-            Self::validate_feature(feature)?;
-            v.push(format!("features.{feature}=true"));
-        }
-        for feature in &self.disable {
-            Self::validate_feature(feature)?;
-            v.push(format!("features.{feature}=false"));
-        }
-        Ok(v)
-    }
-
     fn validate_feature(feature: &str) -> anyhow::Result<()> {
         if user_settable_feature_for_key(feature).is_some() {
             return Ok(());
@@ -816,16 +803,13 @@ async fn cli_main(
     remote_control_disabled: bool,
 ) -> anyhow::Result<()> {
     let MultitoolCli {
-        config_overrides: mut root_config_overrides,
-        feature_toggles,
+        config_overrides: root_config_overrides,
+        feature_toggles: _,
         root,
         subcommand,
     } = cli;
     validate_root_shared_options(&root.shared)?;
 
-    // Fold --enable/--disable into config overrides so they flow to all subcommands.
-    let toggle_overrides = feature_toggles.to_overrides()?;
-    root_config_overrides.raw_overrides.extend(toggle_overrides);
     let root_strict_config = root.strict_config;
     reject_root_strict_config_for_subcommand(root_strict_config, &subcommand)?;
     if let Some(subcommand) = subcommand.as_ref() {

@@ -1638,9 +1638,12 @@ impl Session {
         if let Some(state_runtime) = state_db_ctx.as_ref() {
             // One shared owner performs historical recovery/export off session
             // startup. New jobs are fenced by their current runner identity.
-            crate::tools::handlers::agent_jobs::start_orphaned_agent_job_reconciler(Arc::clone(
-                state_runtime,
-            ));
+            crate::tools::handlers::agent_jobs::start_orphaned_agent_job_reconciler(
+                Arc::clone(state_runtime),
+                crate::tools::handlers::agent_jobs::native_csv_filesystem_supported(
+                    &session_configuration.file_system_sandbox_policy(),
+                ),
+            );
         }
         let mut runtime_init = SessionRuntimeInitGuard::default();
         let session_result: anyhow::Result<Arc<Self>> = async {
@@ -1865,7 +1868,7 @@ impl Session {
                 otel.name = "session_init.plugin_skill_warmup",
             ));
             let ((), plugin_skill_errors) = tokio::join!(
-                agents_md_manager.refresh(config.as_ref(), &resolved_environments),
+                agents_md_manager.refresh(&config, &resolved_environments),
                 plugin_skill_warmup,
             );
             for err in &plugin_skill_errors {
@@ -2220,8 +2223,7 @@ impl Session {
                     mcp_connection_manager,
                 )
                 .await?;
-            sess.schedule_startup_prewarm(session_configuration.base_instructions.clone())
-                .await;
+            sess.schedule_startup_prewarm().await;
             let session_start_source = match &initial_history {
                 InitialHistory::Resumed(_) => codex_hooks::SessionStartSource::Resume,
                 InitialHistory::New | InitialHistory::Forked(_) => {

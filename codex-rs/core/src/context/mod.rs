@@ -1,93 +1,35 @@
-//! Context fragments injected into model input.
-
-mod approved_command_prefix_saved;
-mod apps_instructions;
-mod available_plugins_instructions;
-mod available_skills_instructions;
-mod collaboration_mode_instructions;
-mod contextual_user_message;
-mod current_time_reminder;
-pub(crate) mod desktop_instructions;
-mod environment_context;
-mod hook_additional_context;
-mod image_generation_instructions;
-mod inter_agent_completion_message;
-mod internal_model_context;
-mod model_switch_instructions;
-mod multi_agent_mode_instructions;
-mod personality_spec_instructions;
-mod plugin_instructions;
-mod prompt_provenance;
-mod recommended_plugins_instructions;
-mod subagent_notification;
-mod task_capsule;
-mod turn_aborted;
-mod user_instructions;
-mod user_shell_command;
-mod workflow_checkpoint;
-pub(crate) mod world_state;
-
-pub(crate) use approved_command_prefix_saved::ApprovedCommandPrefixSaved;
-pub(crate) use apps_instructions::AppsInstructions;
-pub(crate) use apps_instructions::AppsInstructionsUnavailable;
-pub(crate) use available_plugins_instructions::AvailablePluginsInstructions;
-pub(crate) use available_plugins_instructions::PluginsInstructionsUnavailable;
-pub use available_skills_instructions::AvailableSkillsInstructions;
-pub(crate) use available_skills_instructions::SKILLS_USAGE_INSTRUCTIONS_OPEN_TAG;
-pub(crate) use available_skills_instructions::SkillsUsageInstructions;
+pub(crate) use codex_conversation::context::ApprovedCommandPrefixSaved;
+pub use codex_conversation::context::AvailableSkillsInstructions;
+pub(crate) use codex_conversation::context::SkillsUsageInstructions;
 pub(crate) use codex_context_fragments::AdditionalContextDeveloperFragment;
 pub(crate) use codex_context_fragments::AdditionalContextUserFragment;
 pub use codex_context_fragments::ContextualUserFragment;
-pub(crate) use codex_context_fragments::FragmentRegistration;
-pub(crate) use codex_context_fragments::FragmentRegistrationProxy;
 pub(crate) use codex_core_skills::injection::SkillInjection;
 pub use codex_prompts::ApprovalPromptContext;
 pub use codex_prompts::PermissionsInstructions;
-pub(crate) use collaboration_mode_instructions::CollaborationModeInstructions;
-pub(crate) use contextual_user_message::is_contextual_user_fragment;
-pub(crate) use contextual_user_message::is_legacy_compaction_warning_fragment;
-pub(crate) use contextual_user_message::is_startup_contextual_user_fragment;
-pub(crate) use contextual_user_message::parse_visible_hook_prompt_message;
-pub(crate) use current_time_reminder::CurrentTimeReminder;
-pub(crate) use environment_context::is_session_visualization_directory;
-pub(crate) use hook_additional_context::HookAdditionalContext;
-pub use image_generation_instructions::extension_image_generation_output_hint;
-pub(crate) use inter_agent_completion_message::InterAgentCompletionMessage;
-pub use internal_model_context::InternalContextSource;
-pub use internal_model_context::InternalModelContextFragment;
-pub use internal_model_context::InvalidInternalContextSource;
-pub(crate) use model_switch_instructions::ModelSwitchInstructions;
-pub(crate) use multi_agent_mode_instructions::EffectiveMultiAgentMode;
-pub(crate) use multi_agent_mode_instructions::MultiAgentModeInstructions;
-pub(crate) use personality_spec_instructions::PersonalitySpecInstructions;
-pub(crate) use plugin_instructions::PluginInstructions;
-pub(crate) use prompt_provenance::PromptContextBreakdown;
-pub(crate) use prompt_provenance::PromptContextCategory;
-pub(crate) use prompt_provenance::PromptContextMeasurement;
-pub(crate) use prompt_provenance::PromptProvenanceSidecar;
-pub(crate) use prompt_provenance::content_aware_serialized_tokens;
-pub(crate) use recommended_plugins_instructions::RecommendedPluginsInstructions;
-pub(crate) use subagent_notification::SubagentNotification;
-pub(crate) use task_capsule::TaskCapsuleFragment;
-pub(crate) use turn_aborted::TurnAborted;
-pub(crate) use turn_aborted::lost_turn_recovery;
-pub(crate) use user_instructions::UserInstructions;
-pub(crate) use user_shell_command::UserShellCommand;
-pub(crate) use workflow_checkpoint::WorkflowCheckpoint;
-
-/// Preserve source syntax in model-facing prose while keeping embedded copies of
-/// the fragment's own delimiters from closing or reopening its sections.
-fn escape_fragment_delimiters(text: &str, delimiters: &[&str]) -> String {
-    delimiters.iter().fold(text.to_string(), |text, delimiter| {
-        // Most source text contains none of its wrapper's delimiters. Keep the
-        // existing allocation instead of copying the entire body for every tag.
-        if !text.contains(delimiter) {
-            return text;
-        }
-        text.replace(
-            delimiter,
-            &delimiter.replace('<', "&lt;").replace('>', "&gt;"),
-        )
-    })
-}
-
+pub(crate) use codex_conversation::context::CollaborationModeInstructions;
+pub(crate) use codex_conversation::context::is_legacy_compaction_warning_fragment;
+pub(crate) use codex_conversation::context::is_startup_contextual_user_fragment;
+pub(crate) use codex_conversation::context::CurrentTimeReminder;
+pub(crate) use codex_conversation::context::is_session_visualization_directory;
+pub(crate) use codex_conversation::context::HookAdditionalContext;
+pub use codex_conversation::context::extension_image_generation_output_hint;
+pub(crate) use codex_conversation::context::InterAgentCompletionMessage;
+pub use codex_conversation::context::InternalContextSource;
+pub use codex_conversation::context::InternalModelContextFragment;
+pub use codex_conversation::context::InvalidInternalContextSource;
+pub(crate) use codex_conversation::context::ModelSwitchInstructions;
+pub(crate) use codex_conversation::context::EffectiveMultiAgentMode;
+pub(crate) use codex_conversation::context::MultiAgentModeInstructions;
+pub(crate) use codex_conversation::context::PersonalitySpecInstructions;
+pub(crate) use codex_conversation::context::PluginInstructions;
+pub(crate) use codex_conversation::context::PromptContextCategory;
+pub(crate) use codex_conversation::context::RecommendedPluginsInstructions;
+pub(crate) use codex_conversation::context::SubagentNotification;
+pub(crate) use codex_conversation::context::TaskCapsuleFragment;
+pub(crate) use codex_conversation::context::UserInstructions;
+pub(crate) use codex_conversation::context::UserShellCommand;
+pub(crate) use codex_conversation::context::WorkflowCheckpoint;
+pub(crate) use codex_conversation::context::{desktop_instructions, world_state};
+mod turn_aborted;
+pub(crate) use turn_aborted::{TurnAborted, lost_turn_recovery};

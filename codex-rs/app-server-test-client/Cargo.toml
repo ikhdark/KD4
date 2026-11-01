@@ -10,7 +10,7 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
-codex-app-server-protocol = { workspace = true }
+codex-app-server-protocol-types = { workspace = true }
 codex-core = { workspace = true }
 codex-otel = { workspace = true }
 codex-protocol = { workspace = true }

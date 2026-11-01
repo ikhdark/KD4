@@ -299,36 +299,6 @@ impl ApplyPatchAction {
     pub fn destination_preimage(&self, path: &PathUri) -> Option<&str> {
         self.destination_preimages.get(path).and_then(Option::as_deref)
     }
-
-    /// Should be used exclusively for testing. (Not worth the overhead of
-    /// creating a feature flag for this.)
-    pub fn new_add_for_test(path: &PathUri, content: String) -> Self {
-        #[expect(clippy::expect_used)]
-        let filename = path.basename().expect("path should not be empty");
-        // Add hunks terminate every logical line with a newline.
-        let mut content = content;
-        if !content.is_empty() && !content.ends_with('\n') {
-            content.push('\n');
-        }
-        let mut patch = format!("*** Begin Patch\n*** Add File: {filename}\n");
-        for line in content.split_terminator('\n') {
-            patch.push('+');
-            patch.push_str(line);
-            if line.ends_with('\r') {
-                patch.push('\r');
-            }
-            patch.push('\n');
-        }
-        patch.push_str("*** End Patch");
-        let changes = HashMap::from([(path.clone(), ApplyPatchFileChange::Add { content })]);
-        #[expect(clippy::expect_used)]
-        Self {
-            changes,
-            destination_preimages: HashMap::from([(path.clone(), None)]),
-            cwd: path.parent().expect("path should have parent"),
-            patch,
-        }
-    }
 }
 
 /// Textual file changes that were actually committed while applying a patch.
@@ -610,29 +580,7 @@ pub async fn apply_patch_with_cancellation(
     ).await
 }
 
-/// Applies hunks and continues to update stdout/stderr
-pub async fn apply_hunks(
-    hunks: &[Hunk],
-    cwd: &PathUri,
-    stdout: &mut impl std::io::Write,
-    stderr: &mut impl std::io::Write,
-    fs: &dyn ExecutorFileSystem,
-    sandbox: Option<&FileSystemSandboxContext>,
-) -> Result<AppliedPatchDelta, ApplyPatchFailure> {
-    apply_hunks_with_cancellation(hunks, cwd, stdout, stderr, fs, sandbox, &|| false).await
-}
 
-async fn apply_hunks_with_cancellation(
-    hunks: &[Hunk],
-    cwd: &PathUri,
-    stdout: &mut impl std::io::Write,
-    stderr: &mut impl std::io::Write,
-    fs: &dyn ExecutorFileSystem,
-    sandbox: Option<&FileSystemSandboxContext>,
-    is_cancelled: &(dyn Fn() -> bool + Sync),
-) -> Result<AppliedPatchDelta, ApplyPatchFailure> {
-    apply_hunks_with_verified_action(hunks, &[], cwd, stdout, stderr, fs, sandbox, is_cancelled, None).await
-}
 
 /// Execute the verified destructive preimages, rather than selecting a newer
 /// delete/destination baseline when approval or scheduling took time.
@@ -2251,7 +2199,7 @@ impl<'a> ChunkMatcher<'a> {
             chunks: self.chunks,
             path: self.path_uri,
             hunk_ordinal: self.hunk_ordinal,
-            source_hash: Some(self.source_hash),
+            source_hash: self.source_hash,
         }
     }
 
@@ -2991,7 +2939,7 @@ struct PatchMismatchSource<'a> {
     chunks: &'a [UpdateFileChunk],
     path: &'a PathUri,
     hunk_ordinal: Option<usize>,
-    source_hash: Option<&'a std::cell::OnceCell<String>>,
+    source_hash: &'a std::cell::OnceCell<String>,
 }
 
 fn patch_context_mismatch(
@@ -3019,7 +2967,7 @@ fn located_patch_mismatch(
     let hash = || {
         hex::encode(Sha256::digest(source.original_contents.as_bytes()))
     };
-    let current_content_sha256 = source.source_hash.map_or_else(hash, |cache| cache.get_or_init(hash).clone());
+    let current_content_sha256 = source.source_hash.get_or_init(hash).clone();
     let chunk = source.chunks.get(chunk_ordinal.saturating_sub(1));
     let expected_excerpt = chunk.map(|chunk| {
         if chunk.old_lines.is_empty() {
@@ -3511,31 +3459,10 @@ fn apply_replacements(
 #[derive(Debug, Eq, PartialEq)]
 pub struct ApplyPatchFileUpdate {
     unified_diff: String,
-    original_content: String,
     content: String,
 }
 
-pub async fn unified_diff_from_chunks(
-    path: &PathUri,
-    chunks: &[UpdateFileChunk],
-    fs: &dyn ExecutorFileSystem,
-    sandbox: Option<&FileSystemSandboxContext>,
-) -> std::result::Result<ApplyPatchFileUpdate, ApplyPatchError> {
-    unified_diff_from_chunks_with_context(path, chunks, /*context*/ 1, fs, sandbox).await
-}
 
-pub async fn unified_diff_from_chunks_with_context(
-    path: &PathUri,
-    chunks: &[UpdateFileChunk],
-    context: usize,
-    fs: &dyn ExecutorFileSystem,
-    sandbox: Option<&FileSystemSandboxContext>,
-) -> std::result::Result<ApplyPatchFileUpdate, ApplyPatchError> {
-    derive_new_contents_from_chunks(path, chunks, /*hunk_ordinal*/ None, fs, sandbox)
-        .await?
-        .into_file_update(context)
-        .await
-}
 
 impl AppliedPatch {
     /// Renders an already derived update without reading its source again.
@@ -3587,7 +3514,6 @@ impl AppliedPatch {
             .to_string();
         ApplyPatchFileUpdate {
             unified_diff,
-            original_content: self.original_contents,
             content: self.new_contents,
         }
     }

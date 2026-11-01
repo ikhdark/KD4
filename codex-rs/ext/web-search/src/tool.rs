@@ -4,7 +4,7 @@ use codex_api::SearchCommands;
 use codex_api::SearchQuery;
 use codex_api::SearchRequest;
 use codex_api::SearchSettings;
-use codex_core::web_search_action_detail;
+use codex_protocol::models::web_search_action_detail;
 use codex_extension_api::ExtensionTurnItem;
 use codex_extension_api::FunctionCallError;
 use codex_extension_api::ResponsesApiTool;

@@ -14,11 +14,9 @@ if __package__ in (None, ""):
 from concurrent.futures import as_completed
 from scripts.common.process_owner import (
     OwnedThreadPoolExecutor as ThreadPoolExecutor,
-    run_owned,
     check_operation,
 )
-from contextlib import contextmanager
-import errno
+from scripts.common.generated_output_lock import exclusive_file_lock
 import hashlib
 import os
 from pathlib import Path
@@ -27,127 +25,17 @@ import stat
 import sys
 import tarfile
 import threading
-import time
 from typing import Sequence
-from typing import TYPE_CHECKING
 import uuid
 
-from scripts.codex_package.targets import BINARY_TARGETS
-from scripts.codex_package.archive import is_relative_to
 from scripts.codex_package.layout import sha256_file as file_sha256
 
-if TYPE_CHECKING:
-    from scripts.codex_package.stage_npm_packages import BinaryComponent
-
-
 COMPLETE_MARKER = ".complete"
-LOCK_POLL_SECONDS = 0.1
-DEFAULT_LOCK_TIMEOUT_SECONDS = 60 * 60
 DEFAULT_GHA_DOWNLOAD_WORKERS = 8
-
-
-def _runtime():
-    from scripts.codex_package import stage_npm_packages
-
-    return stage_npm_packages
 
 
 def _gha_enabled() -> bool:
     return os.environ.get("GITHUB_ACTIONS") == "true"
-
-
-@contextmanager
-def exclusive_file_lock(
-    lock_path: Path,
-    *,
-    timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
-    poll_seconds: float = LOCK_POLL_SECONDS,
-):
-    if timeout_seconds < 0:
-        raise ValueError("lock timeout must be non-negative")
-    if poll_seconds <= 0:
-        raise ValueError("lock poll interval must be positive")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-    acquired = False
-    deadline = time.monotonic() + timeout_seconds
-    try:
-        if os.fstat(fd).st_size == 0:
-            os.write(fd, b"\0")
-            os.fsync(fd)
-        while not acquired:
-            check_operation()
-            os.lseek(fd, 0, os.SEEK_SET)
-            try:
-                _acquire_file_lock(fd)
-                acquired = True
-            except OSError as error:
-                if not _lock_error_is_contention(error):
-                    raise
-                if time.monotonic() >= deadline:
-                    owner = lock_owner_pid(lock_path)
-                    owner_detail = f" (reported owner pid {owner})" if owner else ""
-                    raise TimeoutError(
-                        f"timed out acquiring lock {lock_path}{owner_detail}"
-                    ) from error
-                time.sleep(poll_seconds)
-
-        payload = f"pid={os.getpid()} thread={threading.get_ident()}\n".encode("utf-8")
-        os.ftruncate(fd, 0)
-        os.lseek(fd, 0, os.SEEK_SET)
-        if os.write(fd, payload) != len(payload):
-            raise OSError(f"short write while initializing lock {lock_path}")
-        os.fsync(fd)
-        yield
-    finally:
-        if acquired:
-            os.lseek(fd, 0, os.SEEK_SET)
-            try:
-                _release_file_lock(fd)
-            except OSError:
-                pass
-        os.close(fd)
-
-
-def _acquire_file_lock(fd: int) -> None:
-    import msvcrt
-
-    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-
-
-def _release_file_lock(fd: int) -> None:
-    import msvcrt
-
-    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-
-
-def _lock_error_is_contention(error: OSError) -> bool:
-    if getattr(error, "winerror", None) in {33, 36}:
-        return True
-    return error.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}
-
-
-def lock_owner_pid(lock_path: Path) -> int | None:
-    try:
-        fields = lock_path.read_text(encoding="utf-8").split()
-    except (OSError, UnicodeError):
-        return None
-    for field in fields:
-        if field.startswith("pid="):
-            try:
-                return int(field.removeprefix("pid="))
-            except ValueError:
-                return None
-    return None
-
-
-def process_is_running(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    # Python's Windows os.kill implementation does not offer a harmless
-    # signal-0 probe. The open lock handle denies deletion on Windows, so
-    # let the unlink attempt itself distinguish a live owner.
-    return False
 
 
 def worker_count_for(item_count: int, requested: int | None = None) -> int:
@@ -416,7 +304,7 @@ def validate_tar_members_for_legacy_python(
     dest_root = dest_dir.resolve()
     for member in archive.getmembers():
         member_path = (dest_dir / member.name).resolve()
-        if not is_relative_to(member_path, dest_root):
+        if not member_path.is_relative_to(dest_root):
             raise RuntimeError(f"unsafe archive member path: {member.name}")
         if member.issym() or member.islnk():
             raise RuntimeError(
@@ -429,109 +317,15 @@ def validate_tar_members_for_legacy_python(
             )
 
 
-def install_binary_components(
-    artifacts_dir: Path,
-    vendor_dir: Path,
-    selected_components: Sequence[BinaryComponent],
-    targets: Sequence[str] = BINARY_TARGETS,
-) -> None:
-    for component in selected_components:
-        component_targets = list(targets)
-
-        print(
-            f"Installing {component.binary_basename} binaries for targets: "
-            + ", ".join(component_targets),
-            flush=True,
-        )
-        max_workers = min(len(component_targets), max(1, (os.cpu_count() or 1)))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(
-                    install_single_binary,
-                    artifacts_dir,
-                    vendor_dir,
-                    target,
-                    component,
-                ): target
-                for target in component_targets
-            }
-            for future in as_completed(futures):
-                installed_path = future.result()
-                print(f"  installed {installed_path}", flush=True)
-
-
-def install_single_binary(
-    artifacts_dir: Path,
-    vendor_dir: Path,
-    target: str,
-    component: BinaryComponent,
-) -> Path:
-    if "windows" not in target:
-        raise RuntimeError(f"Unsupported non-Windows native target: {target}")
-
-    expected_names = [archive_name_for_target(component.artifact_prefix, target)]
-    fallback_expected_names = [
-        *expected_names,
-        archive_name_for_target(component.artifact_prefix, f"{target}-unsigned"),
-    ]
-    artifact_subdir = artifact_dir_for_target(
-        artifacts_dir,
-        target,
-        expected_names=expected_names,
-        fallback_expected_names=fallback_expected_names,
-    )
-    archive_path = _runtime().binary_archive_path(
-        artifact_subdir, component.artifact_prefix, target
-    )
-
-    dest_dir = vendor_dir / target / component.dest_dir
-    dest_dir.mkdir(parents=True, exist_ok=True)
-
-    binary_name = f"{component.binary_basename}.exe"
-    dest = dest_dir / binary_name
-    _runtime().extract_zstd_archive(archive_path, dest)
-    return dest
-
-
-def binary_archive_path(artifact_dir: Path, artifact_prefix: str, target: str) -> Path:
-    archive_names = [archive_name_for_target(artifact_prefix, target)]
-    if artifact_dir.name == f"{target}-unsigned":
-        archive_names.append(
-            archive_name_for_target(artifact_prefix, f"{target}-unsigned")
-        )
-
-    checked = [artifact_dir / archive_name for archive_name in archive_names]
-    matches = [archive_path for archive_path in checked if archive_path.is_file()]
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
-        raise RuntimeError(
-            "Ambiguous duplicate artifacts: " + ", ".join(str(path) for path in matches)
-        )
-
-    raise FileNotFoundError(
-        "Expected artifact not found; checked: "
-        + ", ".join(str(path) for path in checked)
-    )
-
-
-def archive_name_for_target(artifact_prefix: str, target: str) -> str:
-    if "windows" in target:
-        return f"{artifact_prefix}-{target}.exe.zst"
-    return f"{artifact_prefix}-{target}.zst"
-
-
 def artifact_dir_for_target(
     artifacts_dir: Path,
     target: str,
     *,
     expected_names: Sequence[str],
-    fallback_expected_names: Sequence[str] | None = None,
 ) -> Path:
-    fallback_names = fallback_expected_names or expected_names
     candidates = [
         (artifacts_dir / target, expected_names),
-        (artifacts_dir / f"{target}-unsigned", fallback_names),
+        (artifacts_dir / f"{target}-unsigned", expected_names),
     ]
     checked = [directory / name for directory, names in candidates for name in names]
     matches = [
@@ -552,20 +346,3 @@ def artifact_dir_for_target(
     )
 
 
-def extract_zstd_archive(archive_path: Path, dest: Path) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-
-    temp_path = dest.parent / f".{dest.name}.{uuid.uuid4().hex}.tmp"
-    try:
-        try:
-            run_owned(
-                ["zstd", "-f", "-d", str(archive_path), "-o", str(temp_path)],
-                check=True,
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                "zstd is required to extract native npm artifacts; install it and retry"
-            ) from exc
-        temp_path.replace(dest)
-    finally:
-        temp_path.unlink(missing_ok=True)

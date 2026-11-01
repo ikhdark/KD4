@@ -48,7 +48,7 @@ struct V2EvictionClaim {
 
 enum UnloadOneResult {
     Reserved(V2ResidencySlot),
-    WaitingForLateShutdown(oneshot::Receiver<CompletedUnloadResult>),
+    WaitingForLateShutdown,
     Retry,
     Unavailable,
 }
@@ -122,22 +122,6 @@ impl V2Residency {
         capacity: usize,
         protected_thread_id: Option<ThreadId>,
     ) -> CodexResult<V2ResidencySlot> {
-        self.reserve_slot_with_shutdown_timeout(
-            manager,
-            capacity,
-            protected_thread_id,
-            RESIDENCY_SHUTDOWN_TIMEOUT,
-        )
-        .await
-    }
-
-    async fn reserve_slot_with_shutdown_timeout(
-        self: Arc<Self>,
-        manager: &Arc<ThreadManagerState>,
-        capacity: usize,
-        protected_thread_id: Option<ThreadId>,
-        shutdown_timeout: Duration,
-    ) -> CodexResult<V2ResidencySlot> {
         if capacity == 0 {
             return Err(CodexErr::AgentLimitReached {
                 max_threads: capacity,
@@ -153,10 +137,9 @@ impl V2Residency {
                 });
             }
             match self
-                .try_unload_one_resident_with_shutdown_timeout(
+                .try_unload_one_resident(
                     manager,
                     protected_thread_id,
-                    shutdown_timeout,
                     &mut attempted,
                 )
                 .await
@@ -172,9 +155,8 @@ impl V2Residency {
                     drop(slot);
                     return Err(CodexErr::AgentLimitReached { max_threads: capacity });
                 }
-                UnloadOneResult::WaitingForLateShutdown(completion) => {
+                UnloadOneResult::WaitingForLateShutdown => {
                     // Cleanup retains occupancy. An undelivered slot releases itself on drop.
-                    drop(completion);
                     return Err(CodexErr::AgentLimitReached {
                         max_threads: capacity,
                     });
@@ -210,11 +192,10 @@ impl V2Residency {
         true
     }
 
-    async fn try_unload_one_resident_with_shutdown_timeout(
+    async fn try_unload_one_resident(
         self: &Arc<Self>,
         manager: &Arc<ThreadManagerState>,
         protected_thread_id: Option<ThreadId>,
-        shutdown_timeout: Duration,
         attempted: &mut HashSet<ThreadId>,
     ) -> UnloadOneResult {
         let candidates_to_scan = self.resident_count();
@@ -295,14 +276,14 @@ impl V2Residency {
                 .await;
                 let _ = completion_tx.send(result);
             });
-            return match timeout(shutdown_timeout, &mut completion_rx).await {
+            return match timeout(RESIDENCY_SHUTDOWN_TIMEOUT, &mut completion_rx).await {
                 Ok(Ok(CompletedUnloadResult::Reserved(slot))) => UnloadOneResult::Reserved(slot),
                 Ok(Ok(CompletedUnloadResult::Retry)) | Ok(Err(_)) => UnloadOneResult::Retry,
                 Err(_) => {
                     warn!(
                         "timed out shutting down v2 resident thread {candidate_thread_id}; cleanup retains occupancy"
                     );
-                    UnloadOneResult::WaitingForLateShutdown(completion_rx)
+                    UnloadOneResult::WaitingForLateShutdown
                 }
             };
         }

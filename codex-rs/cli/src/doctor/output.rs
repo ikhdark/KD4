@@ -51,10 +51,6 @@ const GROUPS: &[OutputGroup] = &[
         title: "Connectivity",
         keys: &["network", "websocket", "reachability"],
     },
-    OutputGroup {
-        title: "Background Server",
-        keys: &["app-server"],
-    },
 ];
 
 struct OutputGroup {
@@ -282,7 +278,6 @@ enum DisplayStatus {
     Note,
     Warning,
     Fail,
-    Idle,
 }
 
 struct DoctorNote {
@@ -292,16 +287,6 @@ struct DoctorNote {
 }
 
 fn display_status(check: &DoctorCheck) -> DisplayStatus {
-    if check.category == "app-server"
-        && check.status == CheckStatus::Ok
-        && check
-            .details
-            .iter()
-            .any(|detail| detail == "status: not running")
-    {
-        return DisplayStatus::Idle;
-    }
-
     match check.status {
         CheckStatus::Ok => DisplayStatus::Ok,
         CheckStatus::Warning => DisplayStatus::Warning,
@@ -316,7 +301,6 @@ fn status_marker(status: DisplayStatus, options: HumanOutputOptions) -> String {
             DisplayStatus::Update => "[up]",
             DisplayStatus::Note | DisplayStatus::Warning => "[!!]",
             DisplayStatus::Fail => "[XX]",
-            DisplayStatus::Idle => "[--]",
         }
     } else {
         match status {
@@ -324,7 +308,6 @@ fn status_marker(status: DisplayStatus, options: HumanOutputOptions) -> String {
             DisplayStatus::Update => "↑",
             DisplayStatus::Note | DisplayStatus::Warning => "⚠",
             DisplayStatus::Fail => "✗",
-            DisplayStatus::Idle => "○",
         }
     };
 
@@ -333,7 +316,6 @@ fn status_marker(status: DisplayStatus, options: HumanOutputOptions) -> String {
         DisplayStatus::Update => amber(marker, options),
         DisplayStatus::Note | DisplayStatus::Warning => orange(marker, options),
         DisplayStatus::Fail => red(marker, options),
-        DisplayStatus::Idle => dim(marker, options),
     }
 }
 
@@ -349,7 +331,7 @@ fn style_description(
 ) -> String {
     let highlighted = highlight_actions(description, options);
     match status {
-        DisplayStatus::Ok | DisplayStatus::Idle => dim(&highlighted, options),
+        DisplayStatus::Ok => dim(&highlighted, options),
         DisplayStatus::Update => amber(&highlighted, options),
         DisplayStatus::Note | DisplayStatus::Warning | DisplayStatus::Fail => highlighted,
     }
@@ -397,14 +379,6 @@ fn summary_line(report: &DoctorReport, note_count: usize, options: HumanOutputOp
     let separator = dim(if options.ascii { " | " } else { " · " }, options);
     let status = overall_status_label(report.overall_status);
     let mut parts = vec![count_label(counts.ok, "ok", DisplayStatus::Ok, options)];
-    if counts.idle > 0 {
-        parts.push(count_label(
-            counts.idle,
-            "idle",
-            DisplayStatus::Idle,
-            options,
-        ));
-    }
     if counts.notes > 0 {
         parts.push(count_label(
             counts.notes,
@@ -444,7 +418,6 @@ fn count_label(
         DisplayStatus::Update => amber(label, options),
         DisplayStatus::Note | DisplayStatus::Warning => orange(label, options),
         DisplayStatus::Fail => red(label, options),
-        DisplayStatus::Idle => dim(label, options),
     };
     format!("{count} {label}")
 }
@@ -661,7 +634,6 @@ fn display_summary(check: &DoctorCheck, options: HumanOutputOptions) -> String {
         "sandbox" => sandbox_summary(check, options),
         "network" => network_summary(check),
         "websocket" => websocket_summary(check, options),
-        "app-server" => app_server_summary(check),
         _ => check.summary.clone(),
     }
 }
@@ -799,15 +771,6 @@ fn websocket_summary(check: &DoctorCheck, options: HumanOutputOptions) -> String
         .map(|value| value.replace("000 ms", "s").replace(" ms", "ms"));
     match (status, timeout) {
         (Some(status), Some(timeout)) => format!("connected ({status}){sep}{timeout} timeout"),
-        _ => check.summary.clone(),
-    }
-}
-
-fn app_server_summary(check: &DoctorCheck) -> String {
-    let status = detail::detail_value(check, "status");
-    let mode = detail::detail_value(check, "mode");
-    match (status, mode) {
-        (Some(status), Some(mode)) => format!("{status} ({mode} mode)"),
         _ => check.summary.clone(),
     }
 }
@@ -973,7 +936,6 @@ fn redact_url_path(path: &str) -> String {
 #[derive(Default)]
 struct StatusCounts {
     ok: usize,
-    idle: usize,
     notes: usize,
     warning: usize,
     fail: usize,
@@ -988,7 +950,6 @@ impl StatusCounts {
         for check in &report.checks {
             match display_status(check) {
                 DisplayStatus::Ok => counts.ok += 1,
-                DisplayStatus::Idle => counts.idle += 1,
                 DisplayStatus::Warning => counts.warning += 1,
                 DisplayStatus::Fail => counts.fail += 1,
                 DisplayStatus::Update | DisplayStatus::Note => {}

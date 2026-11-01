@@ -220,7 +220,6 @@ trait RolloutFileVisitor {
 struct FilesByCreatedAtVisitor<'a> {
     items: &'a mut Vec<ThreadItem>,
     page_size: usize,
-    anchor_state: AnchorState,
     more_matches_available: bool,
     allowed_sources: &'a [SessionSource],
     provider_matcher: Option<&'a ProviderMatcher<'a>>,
@@ -230,10 +229,7 @@ struct FilesByCreatedAtVisitor<'a> {
 }
 
 impl<'a> RolloutFileVisitor for FilesByCreatedAtVisitor<'a> {
-    async fn visit(&mut self, ts: OffsetDateTime, id: Uuid, path: PathBuf) -> ControlFlow<()> {
-        if self.anchor_state.should_skip(ts, id) {
-            return ControlFlow::Continue(());
-        }
+    async fn visit(&mut self, _ts: OffsetDateTime, _id: Uuid, path: PathBuf) -> ControlFlow<()> {
         if self.items.len() == self.page_size {
             self.more_matches_available = true;
             return ControlFlow::Break(());
@@ -760,7 +756,6 @@ async fn traverse_directories_for_paths_created(
     let mut visitor = FilesByCreatedAtVisitor {
         items: &mut items,
         page_size,
-        anchor_state: AnchorState::new(None),
         more_matches_available,
         allowed_sources,
         provider_matcher,

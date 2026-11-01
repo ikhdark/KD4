@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::collections::hash_map::Entry;
 
 use codex_config::ConfigEditsBuilder;
 use codex_config::McpServerConfig;
@@ -725,19 +724,7 @@ fn collect_missing_mcp_dependencies(
             continue;
         }
 
-        match missing.entry(name.clone()) {
-            Entry::Vacant(entry) => {
-                entry.insert(declaration.config);
-            }
-            Entry::Occupied(entry) => {
-                let existing_transport = format_mcp_dependency_transport(entry.get());
-                let requested_transport = format_mcp_dependency_transport(&declaration.config);
-                warnings.push(format!(
-                    "Unable to auto-install MCP dependency {name:?}: the same name has conflicting configurations ({existing_transport}; {requested_transport})"
-                ));
-                entry.remove();
-            }
-        }
+        missing.insert(name, declaration.config);
     }
 
     warnings.sort();

@@ -21,22 +21,6 @@ pub(crate) fn materialize_npm_plugin_source(
     version: Option<&str>,
     registry: Option<&str>,
 ) -> Result<(AbsolutePathBuf, TempDir), String> {
-    materialize_npm_plugin_source_with_command(
-        codex_home,
-        package,
-        version,
-        registry,
-        OsStr::new(npm_command()),
-    )
-}
-
-fn materialize_npm_plugin_source_with_command(
-    codex_home: &Path,
-    package: &str,
-    version: Option<&str>,
-    registry: Option<&str>,
-    npm_command: &OsStr,
-) -> Result<(AbsolutePathBuf, TempDir), String> {
     let staging_root = codex_home.join(NPM_PLUGIN_SOURCE_STAGING_DIR);
     fs::create_dir_all(&staging_root).map_err(|err| {
         format!(
@@ -54,7 +38,7 @@ fn materialize_npm_plugin_source_with_command(
             )
         })?;
 
-    pack_npm_package(tempdir.path(), package, version, registry, npm_command)?;
+    pack_npm_package(tempdir.path(), package, version, registry)?;
     let archive_path = find_npm_package_archive(tempdir.path())?;
     let archive_bytes = read_npm_package_archive(&archive_path)?;
 
@@ -83,13 +67,12 @@ fn pack_npm_package(
     package: &str,
     version: Option<&str>,
     registry: Option<&str>,
-    npm_command: &OsStr,
 ) -> Result<(), String> {
     let package_spec = version.map_or_else(
         || package.to_string(),
         |version| format!("{package}@{version}"),
     );
-    let mut command = Command::new(npm_command);
+    let mut command = Command::new(npm_command());
     command
         .current_dir(destination)
         .arg("pack")

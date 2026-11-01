@@ -111,8 +111,6 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
             matches!(history_mode, ThreadHistoryMode::Paginated)
                 || matches!(&event.item, TurnItem::Extension(_))
                 || matches!(event.item, TurnItem::Plan(_) | TurnItem::Sleep(_) | TurnItem::AgentMessage(_) | TurnItem::CommandExecution(_) | TurnItem::ContextCompaction(_) | TurnItem::UserMessage(_) | TurnItem::DynamicToolCall(_) | TurnItem::CollabAgentToolCall(_) | TurnItem::ImageView(_))
-                || matches!(&event.item, TurnItem::DynamicToolCall(item)
-                    if item.namespace.as_deref() == Some("codex.internal") && item.tool == "code_mode_cell")
         }
         EventMsg::ItemStarted(event) => matches!(&event.item, TurnItem::CommandExecution(item)
             if item.process_id.is_some()) || matches!(&event.item,

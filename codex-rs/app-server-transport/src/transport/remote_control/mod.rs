@@ -32,16 +32,16 @@ use super::CHANNEL_CAPACITY;
 use super::TransportEvent;
 use super::next_connection_id;
 pub(super) use codex_api::X_CODEX_INSTALLATION_ID_HEADER as REMOTE_CONTROL_INSTALLATION_ID_HEADER;
-use codex_app_server_protocol::RemoteControlClientsListParams;
-use codex_app_server_protocol::RemoteControlClientsListResponse;
-use codex_app_server_protocol::RemoteControlClientsRevokeParams;
-use codex_app_server_protocol::RemoteControlClientsRevokeResponse;
-use codex_app_server_protocol::RemoteControlConnectionStatus;
-use codex_app_server_protocol::RemoteControlPairingStartParams;
-use codex_app_server_protocol::RemoteControlPairingStartResponse;
-use codex_app_server_protocol::RemoteControlPairingStatusParams;
-use codex_app_server_protocol::RemoteControlPairingStatusResponse;
-use codex_app_server_protocol::RemoteControlStatusChangedNotification;
+use codex_app_server_protocol_types::RemoteControlClientsListParams;
+use codex_app_server_protocol_types::RemoteControlClientsListResponse;
+use codex_app_server_protocol_types::RemoteControlClientsRevokeParams;
+use codex_app_server_protocol_types::RemoteControlClientsRevokeResponse;
+use codex_app_server_protocol_types::RemoteControlConnectionStatus;
+use codex_app_server_protocol_types::RemoteControlPairingStartParams;
+use codex_app_server_protocol_types::RemoteControlPairingStartResponse;
+use codex_app_server_protocol_types::RemoteControlPairingStatusParams;
+use codex_app_server_protocol_types::RemoteControlPairingStatusResponse;
+use codex_app_server_protocol_types::RemoteControlStatusChangedNotification;
 use codex_http_client::ClientRouteClass;
 use codex_http_client::HttpClient;
 use codex_http_client::HttpClientFactory;
@@ -725,12 +725,9 @@ impl RemoteControlHandle {
         // ownership and validate the exact identity/token when admitting its result.
         drop(current_enrollment);
         let response = start_pairing_request(http_clients, &enrollment, pairing_request()).await;
-        let mut current_enrollment = self.current_enrollment.lock().await;
-        let current = current_enrollment.as_ref()
-            .filter(|current| same_remote_control_enrollment(current, &enrollment))
-            .ok_or_else(pairing_unavailable_error)?;
-        let mut token_changed = current.remote_control_token != enrollment.remote_control_token;
-        enrollment = current.clone();
+        let (mut current_enrollment, refreshed_enrollment, mut token_changed) =
+            self.pairing_response_enrollment(&enrollment).await?;
+        enrollment = refreshed_enrollment;
         let pairing_response =
             match response {
                 Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
@@ -1008,12 +1005,9 @@ impl RemoteControlHandle {
             pairing_status_request(),
         )
         .await;
-        let mut current_enrollment = self.current_enrollment.lock().await;
-        let current = current_enrollment.as_ref()
-            .filter(|current| same_remote_control_enrollment(current, &enrollment))
-            .ok_or_else(pairing_unavailable_error)?;
-        let mut token_changed = current.remote_control_token != enrollment.remote_control_token;
-        enrollment = current.clone();
+        let (mut current_enrollment, refreshed_enrollment, mut token_changed) =
+            self.pairing_response_enrollment(&enrollment).await?;
+        enrollment = refreshed_enrollment;
         let pairing_status_response = match response {
             Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
                 if !token_changed {
@@ -1497,11 +1491,11 @@ pub async fn start_remote_control(
                 current_enrollment: websocket_current_enrollment,
                 pairing_persistence_key: websocket_pairing_persistence_key,
                 desired_state_persistence_lock: websocket_desired_state_persistence_lock,
+                policy_rx: websocket_policy,
             },
             shutdown_token,
             websocket_desired_state_tx,
         )
-        .with_policy(websocket_policy)
         .run(app_server_client_name_rx);
         let websocket_task = AssertUnwindSafe(websocket_task).catch_unwind();
         tokio::pin!(websocket_task);

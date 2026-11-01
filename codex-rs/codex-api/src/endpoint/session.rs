@@ -21,18 +21,11 @@ use std::sync::atomic::Ordering;
 use tracing::instrument;
 
 async fn prepare_request(request: Request) -> Result<Request, TransportError> {
-    prepare_request_with(request, Request::into_prepared).await
-}
-
-async fn prepare_request_with<F>(request: Request, prepare: F) -> Result<Request, TransportError>
-where
-    F: FnOnce(Request) -> Result<Request, String> + Send + 'static,
-{
     if request.compression == RequestCompression::None {
-        return prepare(request).map_err(TransportError::Build);
+        return request.into_prepared().map_err(TransportError::Build);
     }
 
-    tokio::task::spawn_blocking(move || prepare(request))
+    tokio::task::spawn_blocking(move || request.into_prepared())
         .await
         .map_err(|error| {
             TransportError::Build(format!("request preparation task failed: {error}"))

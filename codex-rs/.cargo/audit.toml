@@ -5,8 +5,6 @@ ignore = [
     "RUSTSEC-2025-0057", # fxhash 0.2.1 via starlark_map/bm25; upstream crate is unmaintained
     "RUSTSEC-2024-0436", # paste 1.0.15 via rmcp/starlark/v8; upstream crate is unmaintained
     "RUSTSEC-2023-0089", # atomic-polyfill 1.0.3 lockfile-only via pagable/postcard/heapless (embedded targets); upstream crate is unmaintained
-    "RUSTSEC-2026-0118", # hickory-proto via rama-dns/rama-tcp; remove when rama updates to hickory 0.26.1 or hickory-net
-    "RUSTSEC-2026-0119", # hickory-proto via rama-dns/rama-tcp; remove when rama updates to hickory 0.26.1 or hickory-net
 ]
 
 [output]

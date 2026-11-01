@@ -4,8 +4,6 @@ use std::io::Write;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use super::CheckStatus;
-
 /// Receives check lifecycle events while doctor builds the final report.
 ///
 /// Progress implementations must not write to stdout. The final report owns
@@ -13,7 +11,6 @@ use super::CheckStatus;
 pub(super) trait DoctorProgress: Send + Sync {
     fn begin(&self, label: &'static str);
     fn heartbeat(&self, label: &'static str, elapsed: Duration);
-    fn finish(&self, label: &'static str, status: CheckStatus);
     fn settle(&self);
 }
 
@@ -44,8 +41,6 @@ impl DoctorProgress for QuietProgress {
     fn begin(&self, _label: &'static str) {}
 
     fn heartbeat(&self, _label: &'static str, _elapsed: Duration) {}
-
-    fn finish(&self, _label: &'static str, _status: CheckStatus) {}
 
     fn settle(&self) {}
 }
@@ -80,8 +75,6 @@ impl DoctorProgress for StderrProgress {
     fn heartbeat(&self, label: &'static str, elapsed: Duration) {
         self.render(format!("Still checking {label}... {}s", elapsed.as_secs()));
     }
-
-    fn finish(&self, _label: &'static str, _status: CheckStatus) {}
 
     fn settle(&self) {
         let Ok(mut state) = self.state.lock() else {

@@ -88,9 +88,7 @@ fmt-check *args:
 fix *args:
     $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo clippy --keep-going --fix --allow-dirty @forwarded_args; exit $LASTEXITCODE
 
-[windows]
-fix-workspace *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\build\rust_build_status.py" run-lane --lane auto --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- cargo clippy --keep-going --fix --allow-dirty @forwarded_args; exit $LASTEXITCODE
+alias fix-workspace := fix
 
 # Keep checking independent crates after an error, without hiding diagnostics.
 [windows]

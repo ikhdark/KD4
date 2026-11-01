@@ -75,6 +75,10 @@ fn request_digest(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+// Request compatibility is separate from the installed-account/credential
+// version: a policy-identity upgrade needs new helpers, not reprovisioned users.
+pub const SETUP_REQUEST_VERSION: u32 = 8;
+
 /// Versioned payload exchanged between the sandbox setup orchestrator and helper.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SetupPayload {

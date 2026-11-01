@@ -18,30 +18,19 @@ use std::sync::OnceLock;
 pub struct CapSids {
     pub workspace: String,
     pub readonly: String,
-    /// Per-workspace capability SIDs keyed by canonicalized CWD string.
-    ///
-    /// This is used to isolate workspaces from other workspace sandbox writes and to
-    /// apply per-workspace denies (e.g. protect `CWD/.codex`)
-    /// without permanently affecting other workspaces.
+    /// Legacy CWD identities retained for old processes and durable ACLs.
+    /// New write tokens use policy-scoped derived SIDs instead.
     #[serde(default)]
     pub workspace_by_cwd: HashMap<String, String>,
-    /// Per-write-root capability SIDs keyed by canonicalized write-root path.
-    ///
-    /// These are included in a workspace-write token only when the root is
-    /// currently allowed, so stale ACLs from earlier extra roots do not expand
-    /// later workspace sandboxes.
+    /// Legacy root identities retained without relaxing their existing denies.
+    /// These entries never enter newly prepared sandbox tokens.
     #[serde(default)]
     pub writable_root_by_path: HashMap<String, String>,
 }
 
-#[derive(Clone)]
-struct CachedCapSids {
-    caps: CapSids,
-}
+static CAP_SIDS_CACHE: OnceLock<Mutex<HashMap<String, CapSids>>> = OnceLock::new();
 
-static CAP_SIDS_CACHE: OnceLock<Mutex<HashMap<String, CachedCapSids>>> = OnceLock::new();
-
-fn cap_sids_cache() -> &'static Mutex<HashMap<String, CachedCapSids>> {
+fn cap_sids_cache() -> &'static Mutex<HashMap<String, CapSids>> {
     CAP_SIDS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -157,13 +146,13 @@ fn validate_cap_sid(sid: &str) -> Result<()> {
 
 fn cached_cap_sids<'a>(
     codex_home: &Path,
-    cache: &'a mut HashMap<String, CachedCapSids>,
-) -> Result<&'a mut CachedCapSids> {
+    cache: &'a mut HashMap<String, CapSids>,
+) -> Result<&'a mut CapSids> {
     let key = canonical_path_key(&cap_sid_file(codex_home));
     if !cache.contains_key(&key) {
         let _lock = lock_cap_sid_file(codex_home)?;
         let caps = load_or_create_cap_sids_from_disk(codex_home)?;
-        cache.insert(key.clone(), CachedCapSids { caps });
+        cache.insert(key.clone(), caps);
     }
     cache
         .get_mut(&key)
@@ -179,10 +168,10 @@ pub fn load_or_create_cap_sids(codex_home: &Path) -> Result<CapSids> {
     let mut cache = cap_sids_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    Ok(cached_cap_sids(codex_home, &mut cache)?.caps.clone())
+    Ok(cached_cap_sids(codex_home, &mut cache)?.clone())
 }
 
-/// Returns the workspace-specific capability SID for `cwd`, creating and persisting it if missing.
+/// Returns a legacy workspace SID. New write tokens must use the policy-scoped root API.
 pub fn workspace_cap_sid_for_cwd(codex_home: &Path, cwd: &Path) -> Result<String> {
     workspace_cap_sid_for_key(codex_home, canonical_path_key(cwd))
 }
@@ -192,9 +181,6 @@ fn workspace_cap_sid_for_key(codex_home: &Path, key: String) -> Result<String> {
 }
 
 
-fn writable_root_cap_sid_for_key(codex_home: &Path, key: String) -> Result<String> {
-    keyed_cap_sid(codex_home, key, |caps| &mut caps.writable_root_by_path)
-}
 
 fn keyed_cap_sid(
     codex_home: &Path,
@@ -206,7 +192,7 @@ fn keyed_cap_sid(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let cached = cached_cap_sids(codex_home, &mut cache)?;
-    if let Some(sid) = entries(&mut cached.caps).get(&key) {
+    if let Some(sid) = entries(cached).get(&key) {
         return Ok(sid.clone());
     }
     // The elevated setup refresh persists SIDs for new write roots and grants their ACLs before
@@ -223,32 +209,61 @@ fn keyed_cap_sid(
             sid
         }
     };
-    cached.caps = latest;
+    *cached = latest;
     Ok(sid)
 }
 
+/// Returns a capability scoped to the complete immutable write policy, not
+/// merely its root. Never revoke old denies: an older token may still be live.
 pub fn workspace_write_cap_sid_for_root(
     codex_home: &Path,
     cwd: &Path,
     root: &Path,
+    write_roots: &[PathBuf],
+    deny_write_paths: &[PathBuf],
 ) -> Result<String> {
-    workspace_write_cap_sid_for_root_keys(
-        codex_home,
-        &canonical_path_key(cwd),
-        canonical_path_key(root),
-    )
-}
+    use sha2::Digest;
+    use sha2::Sha256;
+    use std::os::windows::ffi::OsStrExt;
 
-pub(crate) fn workspace_write_cap_sid_for_root_keys(
-    codex_home: &Path,
-    cwd_key: &str,
-    root_key: String,
-) -> Result<String> {
-    if root_key == cwd_key {
-        workspace_cap_sid_for_key(codex_home, cwd_key.to_string())
-    } else {
-        writable_root_cap_sid_for_key(codex_home, root_key)
+    let mut roots = write_roots
+        .iter()
+        .map(|path| canonical_path_key(path))
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+    // Keep deny spellings lexical. Setup can materialize missing carveouts;
+    // resolving them again after that must not change the granted identity.
+    let mut denies = deny_write_paths
+        .iter()
+        .map(|path| {
+            path.as_os_str()
+                .encode_wide()
+                .map(|unit| format!("{unit:04x}"))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    denies.sort();
+    denies.dedup();
+    // The existing home seed is stable across legacy upgrades and processes.
+    // Derive instead of persisting another map: an older running binary can
+    // rewrite cap_sid without knowing newer fields, but cannot drop this identity.
+    let seed = load_or_create_cap_sids(codex_home)?.workspace;
+    let key = serde_json::to_string(&(
+        "write-policy-v1",
+        seed,
+        canonical_path_key(codex_home),
+        canonical_path_key(cwd),
+        canonical_path_key(root),
+        roots,
+        denies,
+    ))?;
+    let digest = Sha256::digest(key.as_bytes());
+    let mut parts = [0u32; 4];
+    for (part, bytes) in parts.iter_mut().zip(digest[..16].chunks_exact(4)) {
+        *part = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     }
+    Ok(format!("S-1-5-21-{}-{}-{}-{}", parts[0], parts[1], parts[2], parts[3]))
 }
 
 pub fn workspace_write_root_contains_path(root: &Path, path: &Path) -> bool {

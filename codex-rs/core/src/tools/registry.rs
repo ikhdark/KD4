@@ -468,7 +468,6 @@ enum BoundedModelProjection {
         rendered: String,
     },
     Fallback {
-        value: Value,
         rendered: String,
     },
 }
@@ -490,14 +489,7 @@ impl BoundedModelProjection {
 
     fn into_rendered(self) -> String {
         match self {
-            Self::Envelope { rendered, .. } => rendered,
-            Self::Fallback { value, rendered } => {
-                debug_assert_eq!(
-                    serde_json::to_string(&value).ok().as_deref(),
-                    Some(rendered.as_str()),
-                );
-                rendered
-            }
+            Self::Envelope { rendered, .. } | Self::Fallback { rendered } => rendered,
         }
     }
 }
@@ -761,11 +753,11 @@ pub(crate) async fn install_synthetic_terminal_projection(
     if result.operation_history.is_none() && result.result.tool_failure().is_some_and(|failure|
         matches!(failure.code, codex_protocol::tool_failure::ToolFailureCode::Cancelled
             | codex_protocol::tool_failure::ToolFailureCode::TimedOut)) {
-        let mut attempt = crate::tools::operation_history::OperationAttempt::capture(invocation, None, None).await;
+        let mut attempt = crate::tools::operation_history::capture(invocation, None, None).await;
         // Cancellation may have interrupted a rewriting hook. Preserve the
         // requested parameters, but never certify them as the executed input.
         attempt.mark_requested_input();
-        attempt.settle_output(result);
+        crate::tools::operation_history::settle_output(&mut attempt, result);
         result.operation_history = Some(invocation.session.record_operation_attempt(attempt).await);
     }
     let parsed_function_arguments = ParsedFunctionArguments::from_payload(&invocation.payload);
@@ -1790,7 +1782,7 @@ impl ToolRegistry {
         if attempt.recovery_deferred {
             return result;
         }
-        attempt.settle(&result);
+        crate::tools::operation_history::settle(&mut attempt, &result);
         let advisory = session.record_operation_attempt(attempt).await;
         match &mut result {
             Ok(output) => {
@@ -1817,7 +1809,7 @@ impl ToolRegistry {
         &self, invocation: &ToolInvocation,
     ) -> crate::tools::operation_history::OperationAttempt {
         let registered = self.tools.get(&invocation.tool_name);
-        crate::tools::operation_history::OperationAttempt::capture(
+        crate::tools::operation_history::capture(
             invocation, registered.map(RegisteredTool::effective_contract_revision),
             registered.and_then(RegisteredTool::provider_authority),
         ).await
@@ -2046,6 +2038,9 @@ impl ToolRegistry {
         if hook_rewrote_input {
             parsed_function_arguments = ParsedFunctionArguments::from_payload(&invocation.payload);
             let name = flat_tool_name(&invocation.tool_name);
+            let native_cwd = crate::tools::parallel::native_workspace_analysis_cwd(
+                &invocation.step_context, &invocation.payload,
+            );
             rewritten_source_dependencies =
                 crate::tool_history::tool_observes_workspace(name.as_ref()).then(|| {
                     crate::tool_history::source_dependencies_for_tool_call_with_parsed_arguments(
@@ -2054,7 +2049,9 @@ impl ToolRegistry {
                         parsed_function_arguments
                             .as_ref()
                             .and_then(|parsed| parsed.value().ok()),
-                        invocation.step_context.turn.config.cwd.as_path(),
+                        native_cwd.as_ref()
+                            .unwrap_or(&invocation.step_context.turn.config.cwd).as_path(),
+                        native_cwd.is_some(),
                     )
                 });
         }
@@ -2691,7 +2688,6 @@ struct ModelProjectionInput {
     invocation_sha256: Option<String>,
     semantic_class: String,
     source_dependencies: std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
-    projection_eligible: bool,
     projection_truncated: bool,
     /// The producer or truncation needs a durable canonical artifact.
     canonical_artifact_required: bool,
@@ -3050,6 +3046,9 @@ async fn prepare_model_projection(
             | ToolOutputOutcome::Skipped => "tool_output",
         }
     };
+    let native_cwd = crate::tools::parallel::native_workspace_analysis_cwd(
+        &invocation.step_context, &invocation.payload,
+    );
     let source_dependencies = resolve_projection_source_dependencies(
         &invocation.step_context.turn.turn_timing_state,
         source_dependencies_override.cloned(),
@@ -3059,7 +3058,9 @@ async fn prepare_model_projection(
                 flat_tool_name(&invocation.tool_name).as_ref(),
                 &invocation.payload,
                 parsed_function_arguments.and_then(|parsed| parsed.value().ok()),
-                invocation.step_context.turn.config.cwd.as_path(),
+                native_cwd.as_ref()
+                    .unwrap_or(&invocation.step_context.turn.config.cwd).as_path(),
+                native_cwd.is_some(),
             )
         },
     )
@@ -3098,7 +3099,6 @@ async fn prepare_model_projection(
         invocation_sha256,
         semantic_class: semantic_class.to_string(),
         source_dependencies,
-        projection_eligible: true,
         projection_truncated,
         canonical_artifact_required: needs_canonical_artifact,
         predetermined_ranges: metadata.predetermined_ranges,
@@ -3837,7 +3837,6 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         invocation_sha256,
         semantic_class,
         source_dependencies,
-        projection_eligible,
         projection_truncated,
         canonical_artifact_required,
         predetermined_ranges,
@@ -3846,9 +3845,6 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         materialization,
     } = input;
     let successful = matches!(&outcome, ToolOutputOutcome::Success);
-    if !projection_eligible {
-        return None;
-    }
     let total_applied_token_limit = applied_token_limit;
     // Make the canonical artifact durable before spending time on the inline
     // projection. If projection later fails or is cancelled, recovery still
@@ -4009,7 +4005,6 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             original_response.clone()
         };
         let bounded = BoundedModelProjection::Fallback {
-            value: serde_json::from_str(&text).unwrap_or_else(|_| Value::String(text.clone())),
             rendered: text.clone(),
         };
         ModelToolProjection {
@@ -4111,8 +4106,6 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             (original_response, original_output_text)
         };
         let bounded = BoundedModelProjection::Fallback {
-            value: serde_json::from_str(&original_output_text)
-                .unwrap_or_else(|_| Value::String(original_output_text.clone())),
             rendered: original_output_text.clone(),
         };
         return Some(ModelToolProjection {
@@ -4135,7 +4128,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
                 preserved_non_text_tokens: Some(non_text_tokens as u64),
                 bounded_model_output: original_output_text.clone(),
                 complete: canonical.complete,
-                projection_eligible,
+                projection_eligible: true,
                 proof_identity: None,
                 supersession_identity,
                 consumed_by_generation: None,
@@ -4292,7 +4285,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             preserved_non_text_tokens: Some(retained_non_text_tokens as u64),
             bounded_model_output: rendered,
             complete: canonical.complete,
-            projection_eligible,
+            projection_eligible: true,
             proof_identity: None,
             supersession_identity,
             consumed_by_generation: None,

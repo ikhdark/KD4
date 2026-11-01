@@ -8,11 +8,8 @@ use codex_protocol::protocol::McpInvocation;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 
-use rmcp::model::ListResourceTemplatesResult;
-
 use super::ListResourceTemplatesArgs;
 use super::ListResourceTemplatesPayload;
-use super::McpServerCollection;
 use super::canonical_all_list_resource_templates;
 use super::canonical_single_list_resource_templates;
 use super::ensure_cursor_has_server;
@@ -26,12 +23,6 @@ use super::serialize_function_output;
 use super::take_server_result;
 
 pub struct ListMcpResourceTemplatesHandler;
-
-fn exhaustive_resource_template_pages(
-    collection: McpServerCollection<ListResourceTemplatesResult>,
-) -> McpServerCollection<ListResourceTemplatesResult> {
-    collection
-}
 
 impl ToolExecutor<ToolInvocation> for ListMcpResourceTemplatesHandler {
     fn tool_name(&self) -> ToolName {
@@ -105,7 +96,7 @@ impl ListMcpResourceTemplatesHandler {
                                 .list_all_resource_templates(|candidate| candidate == server_name)
                                 .await;
                             take_server_result(
-                                exhaustive_resource_template_pages(collection),
+                                collection,
                                 &server_name,
                                 "resources/templates/list",
                             )
@@ -136,10 +127,11 @@ impl ListMcpResourceTemplatesHandler {
                             model_can_access_mcp_server(turn.as_ref(), server_name)
                         })
                         .await;
-                    let pages = exhaustive_resource_template_pages(collection);
-                    let canonical = canonical_all_list_resource_templates(&pages)?;
-                    let payload =
-                        ListResourceTemplatesPayload::from_all_servers(pages, truncation_policy)?;
+                    let canonical = canonical_all_list_resource_templates(&collection)?;
+                    let payload = ListResourceTemplatesPayload::from_all_servers(
+                        collection,
+                        truncation_policy,
+                    )?;
                     (payload, canonical)
                 };
                 serialize_function_output(payload, canonical, truncation_policy)

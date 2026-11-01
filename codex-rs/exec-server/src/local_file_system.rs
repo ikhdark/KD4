@@ -72,16 +72,6 @@ impl LocalFileSystem {
         }
     }
 
-    /// Override the helper's inherited environment without changing process-global state.
-    pub fn with_runtime_paths_and_env(
-        runtime_paths: ExecServerRuntimePaths,
-        env: std::collections::HashMap<String, String>,
-    ) -> Self {
-        Self {
-            unsandboxed: UnsandboxedFileSystem::default(),
-            sandboxed: Some(SandboxedFileSystem::new(runtime_paths).with_env(env)),
-        }
-    }
 
     fn sandboxed(&self) -> io::Result<&SandboxedFileSystem> {
         self.sandboxed.as_ref().ok_or_else(|| {
@@ -1590,7 +1580,7 @@ fn file_range_revision(file: &std::fs::File, metadata: &std::fs::Metadata) -> io
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
     };
-    let identity = native_file_identity(file, metadata)?;
+    let identity = native_file_identity(file)?;
     let mut basic = std::mem::MaybeUninit::<FILE_BASIC_INFO>::uninit();
     // SAFETY: the live file handle and correctly sized output remain valid.
     if unsafe {
@@ -1687,7 +1677,7 @@ fn read_bounded_file_sync(
         check_file_system_cancelled(cancel)?;
         let (file, metadata) = open()?;
         let final_state = NativeFileState {
-            identity: native_file_identity(&file, &metadata)?,
+            identity: native_file_identity(&file)?,
             metadata,
         };
         Ok(matches
@@ -1712,7 +1702,7 @@ fn read_bounded_file_snapshot(
     cancel: &CancellationToken,
     consume: impl FnMut(&[u8]),
 ) -> io::Result<Option<NativeFileState>> {
-    let identity_before = native_file_identity(&file, &metadata_before)?;
+    let identity_before = native_file_identity(&file)?;
     let expected_len = usize::try_from(metadata_before.len()).unwrap_or(usize::MAX);
     if expected_len > max_bytes {
         return Ok(None);
@@ -1725,7 +1715,7 @@ fn read_bounded_file_snapshot(
     };
 
     let metadata_after = file.metadata()?;
-    let identity_after = native_file_identity(&file, &metadata_after)?;
+    let identity_after = native_file_identity(&file)?;
     if bytes_read != expected_len
         || native_file_metadata_changed(&metadata_before, &metadata_after)
         || identity_before != identity_after
@@ -1793,7 +1783,6 @@ struct NativeFileIdentity {
 
 fn native_file_identity(
     file: &std::fs::File,
-    _metadata: &std::fs::Metadata,
 ) -> io::Result<NativeFileIdentity> {
     use std::mem::MaybeUninit;
     use std::os::windows::io::AsRawHandle;

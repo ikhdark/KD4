@@ -1,0 +1,23 @@
+[package]
+name = "codex-app-server-protocol-projection"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "codex_app_server_protocol_projection"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+codex-app-server-protocol-types = { workspace = true }
+codex-context-fragments = { workspace = true }
+codex-extension-items = { workspace = true }
+codex-protocol = { workspace = true }
+indexmap = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }

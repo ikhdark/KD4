@@ -15,7 +15,10 @@ workspace = true
 [dependencies]
 base64 = { workspace = true }
 codex-api = { workspace = true }
-codex-core = { workspace = true }
+codex-conversation = { workspace = true }
+codex-prompts = { workspace = true }
+codex-runtime-config = { workspace = true }
+codex-tool-artifacts = { workspace = true }
 codex-exec-server = { workspace = true }
 codex-extension-api = { workspace = true }
 codex-extension-items = { workspace = true }

@@ -18,7 +18,6 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
   const NativeError = Error;
   const displayReplacer = (_key, item) =>
     typeof item === 'bigint' ? {$bigint: item.toString()} : item;
-  const displayStringify = value => stringify(value, displayReplacer);
   const toBigInt = BigInt;
   const isSafeInteger = Number.isSafeInteger;
   // Unsafe integer JSON lexemes require at least 16 decimal digits. A cheap
@@ -1105,8 +1104,7 @@ pub(super) fn extract_result_callback(
 ) {
     let function = scope
         .get_slot::<RuntimeState>()
-        .and_then(|state| state.output_projector.as_ref())
-        .map(|function| v8::Local::new(scope, function));
+        .map(|state| v8::Local::new(scope, &state.output_projector));
     let Some(function) = function else {
         super::value::throw_type_error(scope, "result extractor unavailable");
         return;
@@ -1170,20 +1168,6 @@ pub(super) fn prepare(
     Ok(v8::Global::new(scope, function))
 }
 
-pub(super) fn install(scope: &mut v8::PinScope<'_, '_>) -> Result<(), String> {
-    if scope
-        .get_slot::<RuntimeState>()
-        .is_some_and(|state| state.output_projector.is_some())
-    {
-        return Ok(());
-    }
-    let function = prepare(scope)?;
-    if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
-        state.output_projector = Some(function);
-    }
-    Ok(())
-}
-
 pub(super) fn tool_result_to_v8<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     raw: &Value,
@@ -1218,8 +1202,7 @@ pub(super) fn tool_result_to_v8<'s>(
     let fragments = v8::Boolean::new(scope, tool.namespace.is_none()
         && matches!(tool.name.as_str(), "read_file" | "read_tool_output"));
     let function = scope.get_slot::<RuntimeState>()
-        .and_then(|state| state.output_projector.as_ref())
-        .map(|function| v8::Local::new(scope, function))
+        .map(|state| v8::Local::new(scope, &state.output_projector))
         .ok_or_else(|| "output projector unavailable".to_string())?;
     let receiver = v8::undefined(scope).into();
     function.call(scope, receiver, &[value, json.into(), namespace, name.into(), fragments.into(), native])
@@ -1240,8 +1223,7 @@ pub(super) fn register(
         .ok_or_else(|| "failed to serialize output projection".to_string())?;
     let function = scope
         .get_slot::<RuntimeState>()
-        .and_then(|state| state.output_projector.as_ref())
-        .map(|function| v8::Local::new(scope, function))
+        .map(|state| v8::Local::new(scope, &state.output_projector))
         .ok_or_else(|| "output projector unavailable".to_string())?;
     let receiver = v8::undefined(scope).into();
     let source_fragments = v8::Boolean::new(scope, source_fragments).into();
@@ -1261,8 +1243,7 @@ pub(super) fn stringify<'s>(
 ) -> Option<v8::Local<'s, v8::String>> {
     let function = scope
         .get_slot::<RuntimeState>()
-        .and_then(|state| state.output_projector.as_ref())
-        .map(|function| v8::Local::new(scope, function))?;
+        .map(|state| v8::Local::new(scope, &state.output_projector))?;
     let receiver = v8::undefined(scope).into();
     function
         .call(scope, receiver, &[value])
@@ -1288,8 +1269,7 @@ pub(super) fn json_codec<'s>(
 ) -> Option<v8::Local<'s, v8::Value>> {
     let function = scope
         .get_slot::<RuntimeState>()
-        .and_then(|state| state.output_projector.as_ref())
-        .map(|function| v8::Local::new(scope, function))?;
+        .map(|state| v8::Local::new(scope, &state.output_projector))?;
     let receiver = v8::undefined(scope).into();
     let mode = v8::String::new(scope, mode)?;
     function.call(scope, receiver, &[value, mode.into()])
@@ -1319,8 +1299,7 @@ fn bounded_json_codec_mode<'s>(
 ) -> Option<v8::Local<'s, v8::Value>> {
     let function = scope
         .get_slot::<RuntimeState>()
-        .and_then(|state| state.output_projector.as_ref())
-        .map(|function| v8::Local::new(scope, function))?;
+        .map(|state| v8::Local::new(scope, &state.output_projector))?;
     let receiver = v8::undefined(scope).into();
     let mode = v8::String::new(scope, mode)?;
     let limit = v8::Number::new(scope, max_bytes as f64);
@@ -1345,10 +1324,8 @@ pub(super) fn restore_stored_presentation(
 ) -> Option<()> {
     let metadata = json_to_v8(scope, metadata)?;
     let function = scope
-        .get_slot::<RuntimeState>()?
-        .output_projector
-        .as_ref()
-        .map(|function| v8::Local::new(scope, function))?;
+        .get_slot::<RuntimeState>()
+        .map(|state| v8::Local::new(scope, &state.output_projector))?;
     let receiver = v8::undefined(scope).into();
     let mode = v8::String::new(scope, "restore_presentation")?;
     function.call(scope, receiver, &[value, mode.into(), metadata])?;

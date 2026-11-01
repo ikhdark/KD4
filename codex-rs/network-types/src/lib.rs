@@ -3,6 +3,7 @@
 mod retry_after;
 
 pub use retry_after::RetryAfter;
+pub use retry_after::parse_retry_after_delay;
 
 #[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]

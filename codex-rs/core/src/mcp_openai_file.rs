@@ -185,6 +185,10 @@ pub(crate) async fn prepare_mcp_tool_arguments_for_openai_files(
     let Some(auth) = auth.as_ref().filter(|auth| auth.uses_codex_backend()) else {
         return Err("ChatGPT auth is required to upload files for Codex Apps tools".to_string());
     };
+    let auth = codex_model_provider::auth_provider_from_auth_manager(
+        std::sync::Arc::clone(&sess.services.auth_manager),
+        auth,
+    );
     let mut staged_arguments = Vec::new();
     let mut staging_budget = OpenAiFileStagingBudget::default();
     for field_name in params {
@@ -203,7 +207,7 @@ pub(crate) async fn prepare_mcp_tool_arguments_for_openai_files(
     let mut owner = OpenAiUploadCleanup {
         tasks: sess.terminal_tasks.clone(),
         base_url: step_context.turn.config.chatgpt_base_url.clone(),
-        auth: codex_model_provider::auth_provider_from_auth(auth),
+        auth,
         clients: openai_file_http_client_pool(&step_context.turn.config.http_client_factory()),
         file_ids: Vec::new(),
     };

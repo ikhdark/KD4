@@ -63,12 +63,6 @@ pub(crate) struct StopOutput {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct StatelessHookOutput {
-    pub universal: UniversalOutput,
-    pub invalid_reason: Option<String>,
-}
-
-#[derive(Debug, Clone)]
 pub(crate) struct InterruptOutput {
     pub system_message: Option<String>,
 }
@@ -285,22 +279,14 @@ pub(crate) fn parse_post_tool_use(stdout: &str) -> Option<PostToolUseOutput> {
     })
 }
 
-pub(crate) fn parse_pre_compact(stdout: &str) -> Option<StatelessHookOutput> {
+pub(crate) fn parse_pre_compact(stdout: &str) -> Option<UniversalOutput> {
     let wire: PreCompactCommandOutputWire = parse_json(stdout)?;
-    let universal = UniversalOutput::from(wire.universal);
-    Some(StatelessHookOutput {
-        universal,
-        invalid_reason: None,
-    })
+    Some(UniversalOutput::from(wire.universal))
 }
 
-pub(crate) fn parse_post_compact(stdout: &str) -> Option<StatelessHookOutput> {
+pub(crate) fn parse_post_compact(stdout: &str) -> Option<UniversalOutput> {
     let wire: PostCompactCommandOutputWire = parse_json(stdout)?;
-    let universal = UniversalOutput::from(wire.universal);
-    Some(StatelessHookOutput {
-        universal,
-        invalid_reason: None,
-    })
+    Some(UniversalOutput::from(wire.universal))
 }
 
 pub(crate) fn parse_interrupt(stdout: &str) -> Option<InterruptOutput> {

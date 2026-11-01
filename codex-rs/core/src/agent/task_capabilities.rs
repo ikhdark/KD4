@@ -1,14 +1,10 @@
 use codex_agent_task_store::Assignment;
 use codex_agent_task_store::AssignmentId;
 use codex_agent_task_store::AttemptId;
-use codex_agent_task_store::AttributionConfidence;
 use codex_agent_task_store::CapabilityProfile;
-use codex_agent_task_store::MutationEvidence;
 use codex_agent_task_store::repository_lineage_id;
 use codex_agent_task_store::repository_workspace_id;
 use serde::Serialize;
-use std::cmp::Ordering;
-use std::collections::BTreeSet;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -52,20 +48,6 @@ pub(crate) enum CapabilityPolicyError {
         expected: AttemptId,
         actual: AttemptId,
     },
-    #[error("cold-review mutation evidence contains duplicate path {0:?}")]
-    DuplicateColdReviewWritePath(String),
-}
-
-/// The only mutation evidence exposed to a cold reviewer. Event chronology and worker-authored
-/// prose are deliberately absent; the assignment and attempt bind each path/hash tuple.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub(crate) struct ColdReviewWriteEvidence {
-    pub path: String,
-    pub pre_write_hash: Option<String>,
-    pub pre_write_existed: bool,
-    pub final_hash: Option<String>,
-    pub final_write_existed: Option<bool>,
-    pub attribution_confidence: AttributionConfidence,
 }
 
 /// Closed cold-review payload. This type intentionally has no worker-reasoning or conversation-
@@ -80,7 +62,9 @@ pub(crate) struct ColdReviewContext {
     pub target_receipt_scope: Option<ColdReviewReceiptScope>,
     pub applicable_instructions: Vec<String>,
     pub attempt_specific_diff: String,
-    pub observed_writes: Vec<ColdReviewWriteEvidence>,
+    /// Compatibility projection: automatic mutation snapshots are disabled.
+    /// An empty array is not evidence that the worker changed no paths.
+    pub observed_writes: [(); 0],
     pub relevant_contracts: Vec<String>,
     pub nearest_tests: Vec<String>,
 }
@@ -139,7 +123,6 @@ pub(crate) struct ColdReviewContextInput {
     pub attempt_id: AttemptId,
     pub applicable_instructions: Vec<String>,
     pub attempt_specific_diff: String,
-    pub observed_writes: Vec<MutationEvidence>,
     pub relevant_contracts: Vec<String>,
     pub nearest_tests: Vec<String>,
 }
@@ -149,36 +132,7 @@ pub(crate) fn build_cold_review_context(
     input: ColdReviewContextInput,
 ) -> Result<ColdReviewContext, CapabilityPolicyError> {
     verify_assignment_authority(&input.assignment, repo_root)?;
-    let canonical_root = canonical_repository_root(repo_root)?;
-    let mut seen_paths = BTreeSet::new();
-    let mut observed_writes = Vec::with_capacity(input.observed_writes.len());
-    for evidence in input.observed_writes {
-        if evidence.assignment_id != input.assignment.assignment_id {
-            return Err(CapabilityPolicyError::ColdReviewAssignmentMismatch {
-                expected: input.assignment.assignment_id,
-                actual: evidence.assignment_id,
-            });
-        }
-        if evidence.attempt_id != input.attempt_id {
-            return Err(CapabilityPolicyError::ColdReviewAttemptMismatch {
-                expected: input.attempt_id,
-                actual: evidence.attempt_id,
-            });
-        }
-        let path = normalize_repo_relative_path(&canonical_root, &evidence.path)?;
-        if !seen_paths.insert(normalized_comparison_path(&path)) {
-            return Err(CapabilityPolicyError::DuplicateColdReviewWritePath(path));
-        }
-        observed_writes.push(ColdReviewWriteEvidence {
-            path,
-            pre_write_hash: evidence.pre_write_hash,
-            pre_write_existed: evidence.pre_write_existed,
-            final_hash: evidence.final_hash,
-            final_write_existed: evidence.final_write_existed,
-            attribution_confidence: evidence.attribution_confidence,
-        });
-    }
-    observed_writes.sort_by(|left, right| compare_repo_paths(&left.path, &right.path));
+    canonical_repository_root(repo_root)?;
 
     Ok(ColdReviewContext {
         effective_contract: input
@@ -189,51 +143,10 @@ pub(crate) fn build_cold_review_context(
         target_receipt_scope: None,
         applicable_instructions: input.applicable_instructions,
         attempt_specific_diff: input.attempt_specific_diff,
-        observed_writes,
+        observed_writes: [],
         relevant_contracts: input.relevant_contracts,
         nearest_tests: input.nearest_tests,
     })
-}
-
-// The caller canonicalizes the root once for this operation.
-fn normalize_repo_relative_path(
-    canonical_root: &Path,
-    path: &str,
-) -> Result<String, CapabilityPolicyError> {
-    let normalized = normalize_repo_path_lexically(path)?;
-    ensure_canonical_containment(canonical_root, &canonical_root.join(&normalized), path)?;
-    Ok(normalized)
-}
-
-/// Converts one absolute local path into the repository-relative identity used by typed-task
-/// scopes. Resolve existing ancestors through the filesystem before comparing native path
-/// components, so case aliases and symlinks cannot redirect evidence to a different repository.
-pub(crate) fn normalize_absolute_repo_path(
-    repo_root: &Path,
-    path: &Path,
-) -> Result<String, CapabilityPolicyError> {
-    if !repo_root.is_absolute() || !path.is_absolute() {
-        return Err(invalid_path(
-            &path.to_string_lossy(),
-            "repository root and target must both be absolute",
-        ));
-    }
-
-    let canonical_root = canonical_repository_root(repo_root)?;
-    let target = ensure_canonical_containment(&canonical_root, path, &path.to_string_lossy())?;
-    let relative = target.strip_prefix(&canonical_root).map_err(|_| {
-        invalid_path(
-            &path.to_string_lossy(),
-            "absolute path is outside the assignment repository",
-        )
-    })?;
-    let relative = relative.to_str().ok_or_else(|| {
-        invalid_path(
-            &path.to_string_lossy(),
-            "path cannot be represented losslessly as UTF-8",
-        )
-    })?;
-    normalize_repo_path_lexically(relative)
 }
 
 fn normalize_repo_path_lexically(path: &str) -> Result<String, CapabilityPolicyError> {
@@ -313,60 +226,6 @@ fn canonical_repository_root(repo_root: &Path) -> Result<PathBuf, CapabilityPoli
         path: repo_root.to_string_lossy().into_owned(),
         reason: error.to_string(),
     })
-}
-
-fn ensure_canonical_containment(
-    canonical_root: &Path,
-    target: &Path,
-    original_path: &str,
-) -> Result<PathBuf, CapabilityPolicyError> {
-    let mut existing = target;
-    loop {
-        match std::fs::symlink_metadata(existing) {
-            Ok(_) => break,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                existing = existing.parent().ok_or_else(|| {
-                    invalid_path(original_path, "path has no existing repository ancestor")
-                })?;
-            }
-            Err(error) => {
-                return Err(invalid_path(
-                    original_path,
-                    format!("path ancestor cannot be inspected: {error}"),
-                ));
-            }
-        }
-    }
-    let canonical_existing = std::fs::canonicalize(existing).map_err(|error| {
-        invalid_path(
-            original_path,
-            format!("existing ancestor cannot be canonicalized: {error}"),
-        )
-    })?;
-    if !canonical_existing.starts_with(canonical_root) {
-        return Err(invalid_path(
-            original_path,
-            "path resolves outside the repository through a symlink",
-        ));
-    }
-    let suffix = target
-        .strip_prefix(existing)
-        .map_err(|_| invalid_path(original_path, "invalid path ancestor"))?;
-    Ok(canonical_existing.join(suffix))
-}
-
-fn compare_repo_paths(left: &str, right: &str) -> Ordering {
-    normalized_comparison_path(left)
-        .cmp(&normalized_comparison_path(right))
-        .then_with(|| left.cmp(right))
-}
-
-fn normalized_comparison_path(path: &str) -> String {
-    if cfg!(windows) {
-        path.to_lowercase()
-    } else {
-        path.to_owned()
-    }
 }
 
 fn invalid_path(path: &str, reason: impl Into<String>) -> CapabilityPolicyError {

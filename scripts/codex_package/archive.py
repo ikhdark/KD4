@@ -48,7 +48,6 @@ def write_archive(
             write_tar_archive(
                 package_dir,
                 temp_path,
-                mode="w:gz",
                 entries=entries,
                 compression=compression,
             )
@@ -99,7 +98,7 @@ def validate_archive_output(
 ) -> tuple[Path, Path, str]:
     package_dir = package_dir.resolve()
     archive_path = archive_path.resolve()
-    if is_relative_to(archive_path, package_dir):
+    if archive_path.is_relative_to(package_dir):
         raise RuntimeError(
             f"Archive output must be outside the package directory: {archive_path}"
         )
@@ -115,14 +114,6 @@ def validate_archive_output(
             "use a .zip output or select compression."
         )
     return package_dir, archive_path, archive_format
-
-
-def is_relative_to(path: Path, parent: Path) -> bool:
-    try:
-        path.relative_to(parent)
-        return True
-    except ValueError:
-        return False
 
 
 def archive_format_for_path(path: Path) -> str:
@@ -142,36 +133,30 @@ def write_tar_archive(
     package_dir: Path,
     archive_path: Path,
     *,
-    mode: str,
     entries: list[Path] | None = None,
     compression: str = "default",
 ) -> None:
-    if mode.endswith(":gz"):
-        compresslevel = 9
-        if compression == "fast":
-            compresslevel = 1
-        elif compression == "none":
-            # Silently dropping ":gz" would produce an uncompressed tar under
-            # a gzip filename that gzip-expecting consumers reject.
-            raise RuntimeError(
-                "compression 'none' conflicts with a .tar.gz/.tgz output; "
-                "use a .zip output or select compression."
-            )
+    compresslevel = 9
+    if compression == "fast":
+        compresslevel = 1
+    elif compression == "none":
+        # Silently dropping ":gz" would produce an uncompressed tar under
+        # a gzip filename that gzip-expecting consumers reject.
+        raise RuntimeError(
+            "compression 'none' conflicts with a .tar.gz/.tgz output; "
+            "use a .zip output or select compression."
+        )
 
-        with archive_path.open("wb") as raw:
-            with gzip.GzipFile(
-                filename="",
-                fileobj=raw,
-                mode="wb",
-                compresslevel=compresslevel,
-                mtime=0,
-            ) as compressed:
-                with tarfile.open(fileobj=compressed, mode="w") as archive:
-                    write_tar_entries(archive, package_dir, entries=entries)
-        return
-
-    with tarfile.open(archive_path, mode) as archive:
-        write_tar_entries(archive, package_dir, entries=entries)
+    with archive_path.open("wb") as raw:
+        with gzip.GzipFile(
+            filename="",
+            fileobj=raw,
+            mode="wb",
+            compresslevel=compresslevel,
+            mtime=0,
+        ) as compressed:
+            with tarfile.open(fileobj=compressed, mode="w") as archive:
+                write_tar_entries(archive, package_dir, entries=entries)
 
 
 def write_tar_zst_archive(

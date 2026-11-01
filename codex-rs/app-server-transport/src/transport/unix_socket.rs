@@ -49,7 +49,6 @@ pub async fn start_control_socket_acceptor(
         socket_path,
         endpoint: Some(endpoint),
     };
-    set_control_socket_permissions(socket_guard.socket_path.as_path()).await?;
     info!(
         socket_path = %socket_guard.socket_path.display(),
         "app-server control socket listening"
@@ -226,10 +225,6 @@ pub async fn acquire_app_server_startup_lock(
             Err(std::fs::TryLockError::Error(err)) => return Err(err),
         }
     }
-}
-
-async fn set_control_socket_permissions(_socket_path: &Path) -> IoResult<()> {
-    Ok(())
 }
 
 struct ControlSocketFileGuard {

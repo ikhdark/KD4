@@ -313,24 +313,18 @@ fn canonical_relative_identity(canonical_root: &Path, relative: &str) -> StoreRe
 }
 
 fn is_descendant(parent: &str, child: &str) -> bool {
-    let parent = comparison_key(parent);
-    let child = comparison_key(child);
     if parent == "." {
         return child != ".";
     }
     child
-        .strip_prefix(&parent)
+        .strip_prefix(parent)
         .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn paths_equal(left: &str, right: &str) -> bool {
-    comparison_key(left) == comparison_key(right)
-}
-
-fn comparison_key(path: &str) -> String {
     // Normalization resolves existing aliases to canonical filesystem spelling.
     // Windows alone is not proof that a directory is case-insensitive.
-    path.to_owned()
+    left == right
 }
 
 pub(crate) fn filesystem_paths_equal(left: &str, right: &str) -> bool {

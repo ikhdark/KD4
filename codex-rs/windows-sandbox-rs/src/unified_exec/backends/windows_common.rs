@@ -86,7 +86,7 @@ pub(crate) fn start_runner_stdout_reader(
     stdout_tx: mpsc::Sender<Vec<u8>>,
     stderr_tx: Option<mpsc::Sender<Vec<u8>>>,
     exit_tx: oneshot::Sender<i32>,
-    outbound: Option<RunnerOutbound>,
+    outbound: RunnerOutbound,
     shutdown_tx: std::sync::mpsc::SyncSender<bool>,
 ) {
     // Independent bounded stream consumers never hold up the frame parser.
@@ -149,9 +149,7 @@ pub(crate) fn start_runner_stdout_reader(
                     }
                 }
                 Message::StdinAck { .. } => {
-                    if let Some(outbound) = &outbound
-                        && outbound.acknowledge_input().is_err()
-                    {
+                    if outbound.acknowledge_input().is_err() {
                         send_runner_error(
                             "runner sent invalid stdin acknowledgement",
                             &stdout_tx,
@@ -161,9 +159,7 @@ pub(crate) fn start_runner_stdout_reader(
                     }
                 }
                 Message::StdinClosed { .. } => {
-                    if let Some(outbound) = &outbound {
-                        outbound.close_input();
-                    }
+                    outbound.close_input();
                 }
                 Message::Exit { payload } => {
                     let _ = shutdown_tx.send(payload.shutdown_confirmed);
@@ -184,16 +180,14 @@ pub(crate) fn start_runner_stdout_reader(
                 }
             }
         }
-        if let Some(outbound) = outbound {
-            outbound.stop();
-        }
+        outbound.stop();
     });
 }
 
 fn start_output_delivery(
     sender: mpsc::Sender<Vec<u8>>,
     stream: OutputStream,
-    outbound: Option<RunnerOutbound>,
+    outbound: RunnerOutbound,
 ) -> std::sync::mpsc::SyncSender<Vec<u8>> {
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(IO_WINDOW_CHUNKS);
     std::thread::spawn(move || {
@@ -201,14 +195,12 @@ fn start_output_delivery(
             if sender.blocking_send(bytes).is_err() {
                 break;
             }
-            if let Some(outbound) = &outbound {
-                let _ = outbound.send(FramedMessage {
-                    version: IPC_PROTOCOL_VERSION,
-                    message: Message::OutputAck {
-                        payload: OutputCredit { stream, chunks: 1 },
-                    },
-                });
-            }
+            let _ = outbound.send(FramedMessage {
+                version: IPC_PROTOCOL_VERSION,
+                message: Message::OutputAck {
+                    payload: OutputCredit { stream, chunks: 1 },
+                },
+            });
         }
     });
     tx

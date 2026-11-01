@@ -36,8 +36,8 @@ use crate::transport::remote_control::server_api::enroll_remote_control_server_w
 use crate::transport::remote_control::server_api::refresh_remote_control_server_with_client;
 use axum::http::HeaderValue;
 use base64::Engine;
-use codex_app_server_protocol::RemoteControlConnectionStatus;
-use codex_app_server_protocol::RemoteControlStatusChangedNotification;
+use codex_app_server_protocol_types::RemoteControlConnectionStatus;
+use codex_app_server_protocol_types::RemoteControlStatusChangedNotification;
 use codex_client::capped_backoff;
 use codex_http_client::RouteAwareClientPool;
 use codex_websocket_client::WebSocketConnection;
@@ -506,7 +506,7 @@ pub(crate) struct RemoteControlWebsocket {
     desired_state_rx: watch::Receiver<RemoteControlDesiredState>,
     desired_state_persistence_lock: Arc<Semaphore>,
     http_clients: RouteAwareClientPool,
-    policy_rx: Option<watch::Receiver<RemoteControlPolicyDecision>>,
+    policy_rx: watch::Receiver<RemoteControlPolicyDecision>,
 }
 
 pub(crate) struct RemoteControlWebsocketConfig {
@@ -572,6 +572,7 @@ pub(super) struct RemoteControlChannels {
     pub(super) current_enrollment: CurrentRemoteControlEnrollment,
     pub(super) pairing_persistence_key: RemoteControlPairingPersistenceKey,
     pub(super) desired_state_persistence_lock: Arc<Semaphore>,
+    pub(super) policy_rx: watch::Receiver<RemoteControlPolicyDecision>,
 }
 
 #[derive(Clone)]
@@ -674,7 +675,7 @@ pub(super) struct RemoteControlConnectOptions<'a> {
     request_state: &'a super::RemoteControlEnrollmentState,
     /// Managed-requirements decision that must admit the current identity before any backend
     /// contact for its account.
-    policy: Option<&'a watch::Receiver<RemoteControlPolicyDecision>>,
+    policy: &'a watch::Receiver<RemoteControlPolicyDecision>,
 }
 
 impl RemoteControlWebsocket {
@@ -728,18 +729,8 @@ impl RemoteControlWebsocket {
             desired_state_rx,
             desired_state_persistence_lock: channels.desired_state_persistence_lock,
             http_clients: config.http_clients,
-            policy_rx: None,
+            policy_rx: channels.policy_rx,
         }
-    }
-
-    /// Holds backend contact until the managed-requirements decision on `policy_rx` admits the
-    /// current identity, and retries a held connection attempt when that decision changes.
-    pub(crate) fn with_policy(
-        mut self,
-        policy_rx: watch::Receiver<RemoteControlPolicyDecision>,
-    ) -> Self {
-        self.policy_rx = Some(policy_rx);
-        self
     }
 
     #[expect(
@@ -1070,9 +1061,7 @@ impl RemoteControlWebsocket {
         loop {
             // Mark the decision seen before this attempt checks it, so a decision recorded later
             // wakes an attempt held for managed requirements.
-            if let Some(policy_rx) = self.policy_rx.as_mut() {
-                policy_rx.mark_unchanged();
-            }
+            self.policy_rx.mark_unchanged();
             let subscribe_cursor = self.state.lock().await.subscribe_cursor.clone();
             let enrollment = self.current_enrollment.snapshot();
             info!(
@@ -1099,7 +1088,7 @@ impl RemoteControlWebsocket {
                 desired_state_persistence_lock: &self.desired_state_persistence_lock,
                 http_clients: &self.http_clients,
                 request_state: &self.current_enrollment,
-                policy: self.policy_rx.as_ref(),
+                policy: &self.policy_rx,
             };
             let auth_context = RemoteControlAuthContext {
                 auth_manager: &self.auth_manager,
@@ -1753,14 +1742,10 @@ fn reconnect_delay_after_connection_end(
     .then(|| next_reconnect_delay(reconnect_attempt))
 }
 
-/// Resolves when the managed-requirements decision changes. A websocket driven without a policy
-/// never wakes here.
+/// Resolves when the managed-requirements decision changes.
 async fn wait_for_policy_change(
-    policy_rx: &mut Option<watch::Receiver<RemoteControlPolicyDecision>>,
+    policy_rx: &mut watch::Receiver<RemoteControlPolicyDecision>,
 ) {
-    let Some(policy_rx) = policy_rx else {
-        return std::future::pending().await;
-    };
     if policy_rx.changed().await.is_err() {
         // The handle and its monitor own the sender for as long as this websocket runs.
         std::future::pending::<()>().await;
@@ -1942,10 +1927,7 @@ async fn prepare_remote_control_enrollment(
             return Err(err);
         }
     };
-    if connect_options
-        .policy
-        .is_some_and(|policy| !policy_admits_current_identity(policy, auth_context.auth_manager))
-    {
+    if !policy_admits_current_identity(connect_options.policy, auth_context.auth_manager) {
         // The managed-requirements decision predates this account id (or denies remote
         // control). Contact no backend for the account until a decision for the current policy
         // epoch admits it; the connect loop retries when the decision changes.

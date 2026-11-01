@@ -1,13 +1,6 @@
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 
-pub fn collect_plugin_enabled_candidates<'a>(
-    edits: impl Iterator<Item = (&'a String, &'a JsonValue)>,
-) -> BTreeMap<String, bool> {
-    collect_plugin_enabled_candidates_from_segments(edits.map(|(key_path, value)| {
-        (key_path.split('.').map(str::to_string).collect::<Vec<_>>(), value)
-    }))
-}
 
 pub fn collect_plugin_enabled_candidates_from_segments<'a>(
     edits: impl Iterator<Item = (Vec<String>, &'a JsonValue)>,

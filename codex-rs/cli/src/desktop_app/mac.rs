@@ -83,7 +83,7 @@ async fn open_codex_app(app_path: &Path, workspace: &Path) -> anyhow::Result<()>
         "Opening workspace {workspace}...",
         workspace = workspace.display()
     );
-    let url = codex_new_thread_url(workspace);
+    let url = super::codex_new_thread_url(workspace);
     let status = Command::new("open")
         .arg("-a")
         .arg(app_path)
@@ -103,13 +103,6 @@ async fn open_codex_app(app_path: &Path, workspace: &Path) -> anyhow::Result<()>
     );
 }
 
-fn codex_new_thread_url(workspace: &Path) -> String {
-    let workspace = workspace.as_os_str().to_string_lossy();
-    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-    serializer.append_pair("path", workspace.as_ref());
-    let query = serializer.finish();
-    format!("codex://threads/new?{query}")
-}
 
 async fn download_and_install_codex_to_user_applications(dmg_url: &str) -> anyhow::Result<PathBuf> {
     let temp_dir = Builder::new()

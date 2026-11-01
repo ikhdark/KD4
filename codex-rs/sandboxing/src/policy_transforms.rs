@@ -118,47 +118,14 @@ pub fn merge_permission_profiles(
     };
 
     match base {
-        Some(base) => {
-            let network = match (base.network.as_ref(), permissions.network.as_ref()) {
-                (
-                    Some(NetworkPermissions {
-                        enabled: Some(true),
-                    }),
-                    _,
-                )
-                | (
-                    _,
-                    Some(NetworkPermissions {
-                        enabled: Some(true),
-                    }),
-                ) => Some(NetworkPermissions {
-                    enabled: Some(true),
-                }),
-                _ => None,
-            };
-            let file_system = match (base.file_system.as_ref(), permissions.file_system.as_ref()) {
-                (Some(base), Some(permissions)) => Some(FileSystemPermissions {
-                    entries: merge_permission_entries(&base.entries, &permissions.entries),
-                    glob_scan_max_depth: merge_glob_scan_max_depth(
-                        &base.entries,
-                        base.glob_scan_max_depth.map(usize::from),
-                        &permissions.entries,
-                        permissions.glob_scan_max_depth.map(usize::from),
-                    )
-                    .and_then(NonZeroUsize::new),
-                })
-                .filter(|file_system| !file_system.is_empty()),
-                (Some(base), None) => Some(base.clone()),
-                (None, Some(permissions)) => Some(permissions.clone()),
-                (None, None) => None,
-            };
-
-            Some(AdditionalPermissionProfile {
-                network,
-                file_system,
-            })
-            .filter(|permissions| !permissions.is_empty())
-        }
+        Some(base) => Some(AdditionalPermissionProfile {
+            network: merge_network_permissions(base.network.as_ref(), permissions.network.as_ref()),
+            file_system: merge_file_system_permissions(
+                base.file_system.as_ref(),
+                permissions.file_system.as_ref(),
+            ),
+        })
+        .filter(|permissions| !permissions.is_empty()),
         None => Some(permissions.clone()).filter(|permissions| !permissions.is_empty()),
     }
 }
@@ -172,47 +139,50 @@ pub fn merge_uri_permission_profiles(
     };
 
     match base {
-        Some(base) => {
-            let network = match (base.network.as_ref(), permissions.network.as_ref()) {
-                (
-                    Some(NetworkPermissions {
-                        enabled: Some(true),
-                    }),
-                    _,
-                )
-                | (
-                    _,
-                    Some(NetworkPermissions {
-                        enabled: Some(true),
-                    }),
-                ) => Some(NetworkPermissions {
-                    enabled: Some(true),
-                }),
-                _ => None,
-            };
-            let file_system = match (base.file_system.as_ref(), permissions.file_system.as_ref()) {
-                (Some(base), Some(permissions)) => Some(FileSystemPermissions {
-                    entries: merge_permission_entries(&base.entries, &permissions.entries),
-                    glob_scan_max_depth: merge_glob_scan_max_depth(
-                        &base.entries,
-                        base.glob_scan_max_depth.map(usize::from),
-                        &permissions.entries,
-                        permissions.glob_scan_max_depth.map(usize::from),
-                    )
-                    .and_then(NonZeroUsize::new),
-                })
-                .filter(|file_system| !file_system.is_empty()),
-                (Some(base), None) => Some(base.clone()),
-                (None, Some(permissions)) => Some(permissions.clone()),
-                (None, None) => None,
-            };
-            Some(UriAdditionalPermissionProfile {
-                network,
-                file_system,
-            })
-            .filter(|permissions| !permissions.is_empty())
-        }
+        Some(base) => Some(UriAdditionalPermissionProfile {
+            network: merge_network_permissions(base.network.as_ref(), permissions.network.as_ref()),
+            file_system: merge_file_system_permissions(
+                base.file_system.as_ref(),
+                permissions.file_system.as_ref(),
+            ),
+        })
+        .filter(|permissions| !permissions.is_empty()),
         None => Some(permissions.clone()).filter(|permissions| !permissions.is_empty()),
+    }
+}
+
+fn merge_network_permissions(
+    base: Option<&NetworkPermissions>,
+    permissions: Option<&NetworkPermissions>,
+) -> Option<NetworkPermissions> {
+    match (base, permissions) {
+        (Some(NetworkPermissions { enabled: Some(true) }), _)
+        | (_, Some(NetworkPermissions { enabled: Some(true) })) => {
+            Some(NetworkPermissions { enabled: Some(true) })
+        }
+        _ => None,
+    }
+}
+
+fn merge_file_system_permissions<PathType: Clone + PartialEq>(
+    base: Option<&FileSystemPermissions<PathType>>,
+    permissions: Option<&FileSystemPermissions<PathType>>,
+) -> Option<FileSystemPermissions<PathType>> {
+    match (base, permissions) {
+        (Some(base), Some(permissions)) => Some(FileSystemPermissions {
+            entries: merge_permission_entries(&base.entries, &permissions.entries),
+            glob_scan_max_depth: merge_glob_scan_max_depth(
+                &base.entries,
+                base.glob_scan_max_depth.map(usize::from),
+                &permissions.entries,
+                permissions.glob_scan_max_depth.map(usize::from),
+            )
+            .and_then(NonZeroUsize::new),
+        })
+        .filter(|file_system| !file_system.is_empty()),
+        (Some(base), None) => Some(base.clone()),
+        (None, Some(permissions)) => Some(permissions.clone()),
+        (None, None) => None,
     }
 }
 

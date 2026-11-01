@@ -1,4 +1,3 @@
-use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -8,8 +7,6 @@ use axum::extract::ws::Message as AxumWebSocketMessage;
 use axum::extract::ws::WebSocket as AxumWebSocket;
 use codex_exec_server_protocol::JSONRPCMessage;
 use codex_utils_pty::ManagedRootProcess;
-use codex_utils_pty::WINDOWS_PROCESS_OPERATION_TIMEOUT;
-use codex_utils_pty::run_windows_process_operation;
 use futures::Sink;
 use futures::SinkExt;
 use futures::Stream;
@@ -92,7 +89,7 @@ impl JsonRpcTransport {
         managed_root: Arc<ManagedRootProcess>,
     ) -> Self {
         Self::Stdio {
-            transport: StdioTransport::spawn(child_process, Some(managed_root)),
+            transport: StdioTransport::spawn(child_process, managed_root),
         }
     }
 
@@ -125,7 +122,7 @@ struct StdioTransportHandle {
 }
 
 impl StdioTransport {
-    fn spawn(child_process: Child, managed_root: Option<Arc<ManagedRootProcess>>) -> Self {
+    fn spawn(child_process: Child, managed_root: Arc<ManagedRootProcess>) -> Self {
         let (terminate_tx, terminate_rx) = watch::channel(false);
         let (terminated_tx, terminated_rx) = watch::channel(false);
         let handle = Arc::new(StdioTransportHandle {
@@ -185,11 +182,10 @@ impl Drop for StdioTransportHandle {
 
 fn spawn_stdio_child_supervisor(
     mut child_process: Child,
-    managed_root: Option<Arc<ManagedRootProcess>>,
+    managed_root: Arc<ManagedRootProcess>,
     mut terminate_rx: watch::Receiver<bool>,
     terminated_tx: watch::Sender<bool>,
 ) {
-    let process_group_id = child_process.id();
     tokio::spawn(async move {
         tokio::select! {
             result = child_process.wait() => {
@@ -197,20 +193,18 @@ fn spawn_stdio_child_supervisor(
                     Ok(_) => {
                         // wait() released the root handle: its numeric PID is no
                         // longer a safe cleanup identity. The Job still owns descendants.
-                        if let Some(root) = managed_root.as_ref()
-                            && let Err(err) = root.terminate()
-                        {
+                        if let Err(err) = managed_root.terminate() {
                             debug!("failed to terminate exec-server stdio descendants: {err}");
                         }
                     }
                     Err(err) => {
                         debug!("failed to wait for exec-server stdio child: {err}");
-                        terminate_stdio_child(&mut child_process, managed_root.as_deref(), process_group_id).await;
+                        terminate_stdio_child(&mut child_process, &managed_root).await;
                     }
                 }
             }
             () = wait_for_stdio_termination(&mut terminate_rx) => {
-                terminate_stdio_child(&mut child_process, managed_root.as_deref(), process_group_id).await;
+                terminate_stdio_child(&mut child_process, &managed_root).await;
             }
         }
         drop(managed_root);
@@ -231,18 +225,13 @@ async fn wait_for_stdio_termination(terminate_rx: &mut watch::Receiver<bool>) {
 
 async fn terminate_stdio_child(
     child_process: &mut Child,
-    managed_root: Option<&ManagedRootProcess>,
-    process_group_id: Option<u32>,
+    managed_root: &ManagedRootProcess,
 ) {
     let mut wait_timeout = STDIO_TERMINATION_GRACE_PERIOD;
     loop {
-        if let Some(root) = managed_root {
-            if let Err(err) = root.terminate() {
-                debug!("failed to terminate managed exec-server stdio process tree: {err}");
-                kill_direct_child(child_process, "kill");
-            }
-        } else {
-            kill_process_tree(child_process, process_group_id).await;
+        if let Err(err) = managed_root.terminate() {
+            debug!("failed to terminate managed exec-server stdio process tree: {err}");
+            kill_direct_child(child_process, "kill");
         }
         match timeout(wait_timeout, child_process.wait()).await {
             Ok(Ok(_)) => return,
@@ -259,41 +248,9 @@ async fn terminate_stdio_child(
     }
 }
 
-async fn kill_process_tree(child_process: &mut Child, process_group_id: Option<u32>) {
-    let Some(process_group_id) = process_group_id else {
-        kill_direct_child(child_process, "terminate");
-        return;
-    };
-
-    if !kill_windows_process_tree(process_group_id).await {
-        kill_direct_child(child_process, "terminate");
-    }
-}
-
 fn kill_direct_child(child_process: &mut Child, action: &str) {
     if let Err(err) = child_process.start_kill() {
         debug!("failed to {action} exec-server stdio child: {err}");
-    }
-}
-
-async fn kill_windows_process_tree(pid: u32) -> bool {
-    let pid = pid.to_string();
-    let pid_for_task = pid.clone();
-    match run_windows_process_operation(WINDOWS_PROCESS_OPERATION_TIMEOUT, move || {
-        std::process::Command::new("taskkill")
-            .args(["/PID", pid_for_task.as_str(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-    })
-    .await
-    {
-        Ok(status) => status.success(),
-        Err(err) => {
-            warn!("failed to run taskkill for exec-server stdio process tree {pid}: {err}");
-            false
-        }
     }
 }
 

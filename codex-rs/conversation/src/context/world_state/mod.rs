@@ -1,0 +1,903 @@
+mod agents_md;
+mod apps_instructions;
+mod environment;
+mod plugins_instructions;
+mod subagents;
+mod task_state;
+
+use crate::context::ContextualUserFragment;
+use codex_context_fragments::ModelContextBudget;
+use codex_context_fragments::RenderedContextFragment;
+use codex_extension_api::PreviousWorldStateSection;
+use codex_extension_api::RenderedWorldStateFragment;
+use codex_extension_api::WorldStateSectionContribution;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
+use indexmap::IndexMap;
+use serde::Deserialize;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use serde_json::Map;
+use serde_json::Value;
+use sha2::Digest;
+use sha2::Sha256;
+use std::collections::BTreeMap;
+use std::fmt;
+
+pub use agents_md::AgentsMdState;
+pub use apps_instructions::AppsInstructionsState;
+pub use environment::EnvironmentsState;
+pub use plugins_instructions::PluginsInstructionsState;
+pub use subagents::SubagentsState;
+pub use task_state::TaskState;
+
+trait ErasedWorldStateSection: Send + Sync {
+    fn retains_rendered_fragment(&self) -> bool {
+        false
+    }
+    fn retained_rendering(&self) -> Option<Value> {
+        None
+    }
+    fn snapshot(&self) -> Option<Value>;
+
+    fn budget_fallback(&self) -> Option<(Value, Box<dyn ContextualUserFragment>)> {
+        None
+    }
+
+    fn matches_legacy_fragment(&self, role: &str, text: &str) -> bool;
+
+    fn has_retained_fragment_matcher(&self) -> bool;
+
+    fn matches_retained_fragment(&self, role: &str, text: &str) -> bool;
+
+    fn required(&self) -> bool;
+
+    fn records_delivery(&self) -> bool {
+        false
+    }
+
+    fn retained_state_supported(&self, previous: &Value, items: &[ResponseItem]) -> bool;
+
+    fn render_diff(
+        &self,
+        previous: PreviousSectionState<'_, Value>,
+    ) -> Option<Box<dyn ContextualUserFragment>>;
+
+    fn render_fragments(
+        &self,
+        previous: PreviousSectionState<'_, Value>,
+    ) -> Vec<Box<dyn ContextualUserFragment>> {
+        self.render_diff(previous).into_iter().collect()
+    }
+}
+
+impl<S: WorldStateSection> ErasedWorldStateSection for S {
+    fn snapshot(&self) -> Option<Value> {
+        let mut snapshot = match serde_json::to_value(WorldStateSection::snapshot(self)) {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                tracing::error!(target: "codex_core::context::world_state",
+                    section_id = S::ID,
+                    %err,
+                    "failed to serialize world-state section snapshot"
+                );
+                return None;
+            }
+        };
+        remove_null_object_fields(&mut snapshot);
+        if snapshot.is_null() {
+            tracing::error!(target: "codex_core::context::world_state",
+                section_id = S::ID,
+                "world-state section snapshot cannot be null"
+            );
+            return None;
+        }
+        Some(snapshot)
+    }
+
+    fn matches_legacy_fragment(&self, role: &str, text: &str) -> bool {
+        S::matches_legacy_fragment(role, text)
+    }
+
+    fn has_retained_fragment_matcher(&self) -> bool {
+        S::has_retained_fragment_matcher()
+    }
+
+    fn matches_retained_fragment(&self, role: &str, text: &str) -> bool {
+        S::matches_retained_fragment(role, text)
+    }
+
+    fn required(&self) -> bool {
+        S::required()
+    }
+
+    fn records_delivery(&self) -> bool {
+        S::records_delivery()
+    }
+
+    fn retained_state_supported(&self, previous: &Value, items: &[ResponseItem]) -> bool {
+        if S::records_delivery() {
+            let Some(expected) = previous.get("_retained_delivery").and_then(Value::as_str) else {
+                return false;
+            };
+            let latest = items.iter().rev().find_map(|item| {
+                let ResponseItem::Message { role, content, .. } = item else {
+                    return None;
+                };
+                content.iter().rev().find_map(|part| match part {
+                    ContentItem::InputText { text } if S::matches_legacy_fragment(role, text) => {
+                        Some(text)
+                    }
+                    _ => None,
+                })
+            });
+            if !latest.is_some_and(|text| delivery_digest(text) == expected) {
+                return false;
+            }
+        }
+        S::Snapshot::deserialize(previous)
+            .is_ok_and(|previous| S::retained_state_supported(&previous, items))
+    }
+
+    fn render_diff(
+        &self,
+        previous: PreviousSectionState<'_, Value>,
+    ) -> Option<Box<dyn ContextualUserFragment>> {
+        let typed_snapshot;
+        let previous = match previous {
+            PreviousSectionState::Known(previous) => match S::Snapshot::deserialize(previous) {
+                Ok(previous) => {
+                    typed_snapshot = previous;
+                    PreviousSectionState::Known(&typed_snapshot)
+                }
+                Err(err) => {
+                    tracing::warn!(target: "codex_core::context::world_state",
+                        section_id = S::ID,
+                        %err,
+                        "failed to restore world-state section snapshot"
+                    );
+                    PreviousSectionState::Unknown
+                }
+            },
+            PreviousSectionState::Absent => PreviousSectionState::Absent,
+            PreviousSectionState::Unknown => PreviousSectionState::Unknown,
+        };
+        WorldStateSection::render_diff(self, previous)
+    }
+
+    fn render_fragments(
+        &self,
+        previous: PreviousSectionState<'_, Value>,
+    ) -> Vec<Box<dyn ContextualUserFragment>> {
+        let typed = match previous {
+            PreviousSectionState::Known(value) => S::Snapshot::deserialize(value).ok(),
+            _ => None,
+        };
+        let previous = match previous {
+            PreviousSectionState::Known(_) => typed
+                .as_ref()
+                .map_or(PreviousSectionState::Unknown, PreviousSectionState::Known),
+            PreviousSectionState::Absent => PreviousSectionState::Absent,
+            PreviousSectionState::Unknown => PreviousSectionState::Unknown,
+        };
+        WorldStateSection::render_fragments(self, previous)
+    }
+}
+
+struct ExtensionWorldStateSection(WorldStateSectionContribution, bool, Option<Value>);
+
+impl ErasedWorldStateSection for ExtensionWorldStateSection {
+    fn budget_fallback(&self) -> Option<(Value, Box<dyn ContextualUserFragment>)> {
+        self.0.budget_fallback().map(|(snapshot, fragment)| {
+            let mut snapshot = snapshot.clone();
+            remove_null_object_fields(&mut snapshot);
+            (
+                snapshot,
+                Box::new(WorldStateContextFragment(fragment.clone())) as _,
+            )
+        })
+    }
+
+    fn retains_rendered_fragment(&self) -> bool {
+        true
+    }
+    fn retained_rendering(&self) -> Option<Value> {
+        self.2.clone()
+    }
+    fn snapshot(&self) -> Option<Value> {
+        let mut snapshot = self.0.snapshot().clone();
+        remove_null_object_fields(&mut snapshot);
+        (!snapshot.is_null()).then_some(snapshot)
+    }
+
+    fn matches_legacy_fragment(&self, role: &str, text: &str) -> bool {
+        self.0.matches_legacy_fragment(role, text)
+    }
+
+    fn has_retained_fragment_matcher(&self) -> bool {
+        self.0.has_retained_fragment_matcher()
+    }
+
+    fn matches_retained_fragment(&self, role: &str, text: &str) -> bool {
+        self.0.matches_retained_fragment(role, text)
+    }
+
+    fn required(&self) -> bool {
+        self.1
+    }
+
+    fn retained_state_supported(&self, _previous: &Value, _items: &[ResponseItem]) -> bool {
+        true
+    }
+
+    fn render_diff(
+        &self,
+        previous: PreviousSectionState<'_, Value>,
+    ) -> Option<Box<dyn ContextualUserFragment>> {
+        let previous = match previous {
+            PreviousSectionState::Absent => PreviousWorldStateSection::Absent,
+            PreviousSectionState::Unknown => PreviousWorldStateSection::Unknown,
+            PreviousSectionState::Known(previous) => PreviousWorldStateSection::Known(previous),
+        };
+        self.0
+            .render_diff(previous)
+            .map(|fragment| Box::new(WorldStateContextFragment(fragment)) as _)
+    }
+}
+
+/// A last accepted extension snapshot retained while its current observation is unavailable.
+/// The accepted rendering travels with the existing snapshot, not a new poll/cache.
+struct PreservedWorldStateSection(Value, Option<Value>);
+
+impl ErasedWorldStateSection for PreservedWorldStateSection {
+    fn retains_rendered_fragment(&self) -> bool {
+        true
+    }
+    fn retained_rendering(&self) -> Option<Value> {
+        self.1.clone()
+    }
+    fn snapshot(&self) -> Option<Value> {
+        Some(self.0.clone())
+    }
+
+    fn matches_legacy_fragment(&self, _role: &str, _text: &str) -> bool {
+        false
+    }
+
+    fn has_retained_fragment_matcher(&self) -> bool {
+        false
+    }
+
+    fn matches_retained_fragment(&self, _role: &str, _text: &str) -> bool {
+        false
+    }
+
+    fn required(&self) -> bool {
+        // A timeout is not authority to withdraw already accepted instructions.
+        self.1.is_some()
+    }
+
+    fn retained_state_supported(&self, _previous: &Value, items: &[ResponseItem]) -> bool {
+        self.1.as_ref().is_some_and(|fragment| {
+            fragment["role"]
+                .as_str()
+                .zip(fragment["text"].as_str())
+                .is_some_and(|(role, text)| {
+                    retained_texts(items, role).any(|retained| retained == text)
+                })
+        })
+    }
+
+    fn render_diff(
+        &self,
+        previous: PreviousSectionState<'_, Value>,
+    ) -> Option<Box<dyn ContextualUserFragment>> {
+        if matches!(previous, PreviousSectionState::Known(_)) {
+            return None;
+        }
+        let fragment = self.1.as_ref()?;
+        let role = match fragment["role"].as_str()? {
+            "developer" => "developer",
+            "user" => "user",
+            _ => return None,
+        };
+        Some(Box::new(RenderedContextFragment::new(
+            role,
+            fragment["text"].as_str()?.to_string(),
+        )))
+    }
+}
+
+struct WorldStateContextFragment(RenderedWorldStateFragment);
+
+impl ContextualUserFragment for WorldStateContextFragment {
+    fn role(&self) -> &'static str {
+        self.0.role()
+    }
+
+    fn markers(&self) -> (&'static str, &'static str) {
+        self.0.markers()
+    }
+
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(self.0.body())
+    }
+
+    fn type_markers() -> (&'static str, &'static str) {
+        ("", "")
+    }
+}
+
+/// What is known about a section's previously model-visible state.
+pub enum PreviousSectionState<'a, T> {
+    /// No persisted snapshot or matching fragment exists in retained history.
+    Absent,
+    /// Retained history contains the section, but its typed snapshot is unavailable.
+    Unknown,
+    /// The exact persisted snapshot is available.
+    Known(&'a T),
+}
+
+/// A typed portion of the state visible to the model.
+///
+/// Implementations own how their current state is rendered relative to an
+/// earlier snapshot of the same section. `ID` is persisted in rollouts and
+/// must remain stable. `Snapshot` should contain only the comparison data
+/// needed to decide what the model must be told next, and must not serialize
+/// to null because merge-patch nulls represent deletion. Sections migrated
+/// from older context can recognize their previous fragments through
+/// `matches_legacy_fragment`.
+pub trait WorldStateSection: Send + Sync + 'static {
+    const ID: &'static str;
+    type Snapshot: DeserializeOwned + Serialize;
+
+    fn snapshot(&self) -> Self::Snapshot;
+
+    fn matches_legacy_fragment(_role: &str, _text: &str) -> bool {
+        false
+    }
+
+    /// Whether retained history must still contain this section's rendered fragment.
+    fn has_retained_fragment_matcher() -> bool {
+        false
+    }
+
+    /// Recognizes this section's rendered fragment in retained model history.
+    fn matches_retained_fragment(_role: &str, _text: &str) -> bool {
+        false
+    }
+
+    /// Required state uses the request's context limit, never a lossy local excerpt.
+    fn required() -> bool {
+        false
+    }
+
+    /// Bind the persisted state to its exact most recent delivered fragment.
+    fn records_delivery() -> bool {
+        false
+    }
+
+    fn retained_state_supported(_previous: &Self::Snapshot, _items: &[ResponseItem]) -> bool {
+        true
+    }
+
+    fn render_diff(
+        &self,
+        previous: PreviousSectionState<'_, Self::Snapshot>,
+    ) -> Option<Box<dyn ContextualUserFragment>>;
+
+    /// Ordered, role-preserving fragments accepted atomically with this snapshot.
+    fn render_fragments(
+        &self,
+        previous: PreviousSectionState<'_, Self::Snapshot>,
+    ) -> Vec<Box<dyn ContextualUserFragment>> {
+        self.render_diff(previous).into_iter().collect()
+    }
+}
+
+/// Live model-visible state, keyed by the same stable section IDs used in rollouts.
+#[derive(Default)]
+pub struct WorldState {
+    sections: IndexMap<&'static str, std::sync::Arc<dyn ErasedWorldStateSection>>,
+}
+
+/// Compact comparison state for each model-visible world-state section.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct WorldStateSnapshot {
+    sections: BTreeMap<String, Value>,
+}
+
+impl WorldStateSnapshot {
+    pub fn rendered_extension(&self, id: &str) -> Option<&Value> {
+        self.sections.get("_codex_extension_delivery")?.get(id)
+    }
+    pub fn section(&self, id: &str) -> Option<&Value> {
+        self.sections.get(id)
+    }
+
+    pub fn into_value(self) -> Value {
+        Value::Object(self.sections.into_iter().collect())
+    }
+
+    /// Returns the RFC 7386 merge patch that advances `previous` to `self`.
+    pub fn merge_patch_from(&self, previous: &Self) -> Option<Value> {
+        let mut patch = Map::new();
+        for key in previous.sections.keys() {
+            if !self.sections.contains_key(key) {
+                patch.insert(key.clone(), Value::Null);
+            }
+        }
+        for (key, current) in &self.sections {
+            let change = match previous.sections.get(key) {
+                Some(previous) => create_merge_patch(previous, current),
+                None => Some(current.clone()),
+            };
+            if let Some(change) = change {
+                patch.insert(key.clone(), change);
+            }
+        }
+        (!patch.is_empty()).then_some(Value::Object(patch))
+    }
+
+    pub fn apply_merge_patch(&mut self, patch: &Value) -> serde_json::Result<()> {
+        let Value::Object(patch) = patch else {
+            // Preserve deserialization errors and leave the snapshot untouched for
+            // invalid top-level replacements, as the previous round trip did.
+            *self = serde_json::from_value(patch.clone())?;
+            return Ok(());
+        };
+        for (key, value) in patch {
+            if value.is_null() {
+                self.sections.remove(key);
+            } else {
+                apply_merge_patch_value(
+                    self.sections.entry(key.clone()).or_insert(Value::Null),
+                    value,
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for WorldState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorldState")
+            .field("section_count", &self.sections.len())
+            .finish()
+    }
+}
+
+impl WorldState {
+    /// Refresh one section while retaining the immutable owners of every other section.
+    pub fn replacing_section<S: WorldStateSection>(&self, section: S) -> Self {
+        let mut sections = self.sections.clone();
+        sections.insert(S::ID, std::sync::Arc::new(section));
+        Self { sections }
+    }
+
+    pub fn add_section<S: WorldStateSection>(&mut self, section: S) {
+        let id = S::ID;
+        assert!(
+            !self.sections.contains_key(id),
+            "duplicate world-state section ID: {id}"
+        );
+        self.sections.insert(id, std::sync::Arc::new(section));
+    }
+
+
+    pub fn add_extension_section_with_previous(
+        &mut self,
+        section: WorldStateSectionContribution,
+        previous_rendering: Option<&Value>,
+    ) {
+        let id = section.id();
+        assert!(
+            !self.sections.contains_key(id),
+            "duplicate world-state section ID: {id}"
+        );
+        self.sections.insert(
+            id,
+            std::sync::Arc::new(ExtensionWorldStateSection(section, false, previous_rendering.cloned())),
+        );
+    }
+
+    /// A successful omission withdraws only this producer's accepted delivery.
+    /// Keep the original role and quote the receipt rather than matching history
+    /// by text, which could also belong to another producer or a user quotation.
+    pub fn add_removed_extension_section(&mut self, id: &'static str, rendering: &Value) {
+        let Some(fragment) = removed_extension_fragment(id, rendering) else {
+            return;
+        };
+        let section = WorldStateSectionContribution::new(id, Value::Null, move |_| Some(fragment.clone()));
+        assert!(
+            !self.sections.contains_key(id),
+            "duplicate world-state section ID: {id}"
+        );
+        // A budget omission cannot stand in for withdrawal. The accepted snapshot
+        // drops the old body and receipt only together with this required fragment.
+        self.sections.insert(
+            id,
+            std::sync::Arc::new(ExtensionWorldStateSection(section, true, None)),
+        );
+    }
+
+    pub fn add_preserved_extension_section(
+        &mut self,
+        id: &'static str,
+        snapshot: Value,
+        rendering: Option<Value>,
+    ) {
+        assert!(
+            !self.sections.contains_key(id),
+            "duplicate world-state section ID: {id}"
+        );
+        self.sections.insert(
+            id,
+            std::sync::Arc::new(PreservedWorldStateSection(snapshot, rendering)),
+        );
+    }
+
+    pub fn snapshot(&self) -> WorldStateSnapshot {
+        WorldStateSnapshot {
+            sections: self
+                .sections
+                .iter()
+                .filter_map(|(id, section)| {
+                    section
+                        .snapshot()
+                        .map(|snapshot| ((*id).to_string(), snapshot))
+                })
+                .collect(),
+        }
+    }
+
+
+    pub fn render_full_with_snapshot(
+        &self,
+    ) -> (Vec<Box<dyn ContextualUserFragment>>, WorldStateSnapshot) {
+        self.render_with(None, |_, _| PreviousSectionState::Absent)
+    }
+
+
+
+
+    pub fn render_history_diff_with_snapshot(
+        &self,
+        previous: Option<&WorldStateSnapshot>,
+        items: &[ResponseItem],
+    ) -> (Vec<Box<dyn ContextualUserFragment>>, WorldStateSnapshot) {
+        self.render_with(previous, |id, section| {
+            if let Some(previous) = previous.and_then(|previous| previous.sections.get(id)) {
+                if section.records_delivery()
+                    && previous.get("_retained_delivery").is_none()
+                    && !has_legacy_fragment(items, section)
+                {
+                    // An empty section can advance its snapshot without ever
+                    // delivering a fragment. It is absent, not lost history.
+                    PreviousSectionState::Absent
+                } else if !section.retained_state_supported(previous, items) {
+                    PreviousSectionState::Unknown
+                } else if section.has_retained_fragment_matcher()
+                    && !has_retained_fragment(items, section)
+                {
+                    PreviousSectionState::Absent
+                } else {
+                    PreviousSectionState::Known(previous)
+                }
+            } else if has_legacy_fragment(items, section) {
+                PreviousSectionState::Unknown
+            } else {
+                PreviousSectionState::Absent
+            }
+        })
+    }
+
+    fn render_with<'a>(
+        &self,
+        previous_snapshot: Option<&WorldStateSnapshot>,
+        mut previous: impl FnMut(&str, &dyn ErasedWorldStateSection) -> PreviousSectionState<'a, Value>,
+    ) -> (Vec<Box<dyn ContextualUserFragment>>, WorldStateSnapshot) {
+        let mut budget = ModelContextBudget::default();
+        let mut fragments: Vec<Box<dyn ContextualUserFragment>> = Vec::new();
+        let mut sections = BTreeMap::new();
+        let mut extension_renderings = Map::new();
+        let mut ordered = self.sections.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|(_, section)| !section.required());
+        for (id, section) in ordered {
+            let _render_span =
+                tracing::trace_span!(target: "codex_core::context::world_state", "world_state.render_section", section_id = *id).entered();
+            let previous = previous(id, section.as_ref());
+            let rejected_snapshot = match &previous {
+                PreviousSectionState::Known(previous) => Some(*previous),
+                PreviousSectionState::Absent | PreviousSectionState::Unknown => None,
+            };
+            let mut accepted_rendering = previous_snapshot
+                .and_then(|snapshot| snapshot.rendered_extension(id))
+                .cloned()
+                .or_else(|| section.retained_rendering());
+            let previously_observed = !matches!(&previous, PreviousSectionState::Absent)
+                || accepted_rendering.is_some();
+            let mut delivery = section.render_fragments(previous);
+            let mut admitted_snapshot = section.snapshot();
+            let mut required = section.required();
+            let mut rendered = delivery
+                .iter()
+                .map(|fragment| fragment.render())
+                .collect::<Vec<_>>();
+            let mut candidate_budget = budget.clone();
+            let mut fits = rendered.iter().all(|text| candidate_budget.try_take(text));
+            if !fits
+                && !required
+                && previously_observed
+                && delivery
+                    .iter()
+                    .all(|fragment| matches!(fragment.role(), "developer" | "user"))
+                && let Some((snapshot, fragment)) = section.budget_fallback()
+            {
+                let text = fragment.render();
+                if !snapshot.is_null()
+                    && text.len() <= 1024
+                    && matches!(fragment.role(), "developer" | "user")
+                {
+                    // Only this bounded invalidation may overflow the optional allowance.
+                    // Never advance to the full catalog's snapshot on fallback delivery.
+                    let already_delivered = rejected_snapshot == Some(&snapshot)
+                        && accepted_rendering.as_ref()
+                            == Some(&serde_json::json!({
+                                "role": fragment.role(), "text": text,
+                            }));
+                    admitted_snapshot = Some(snapshot);
+                    delivery = if already_delivered {
+                        Vec::new()
+                    } else {
+                        vec![fragment]
+                    };
+                    rendered = if already_delivered {
+                        Vec::new()
+                    } else {
+                        vec![text]
+                    };
+                    required = true;
+                    candidate_budget = budget.clone();
+                    fits = rendered.iter().all(|text| candidate_budget.try_take(text));
+                }
+            }
+            let mut delivered_digest = None;
+            let snapshot_advanced = if delivery
+                .iter()
+                .any(|fragment| !matches!(fragment.role(), "developer" | "user"))
+            {
+                tracing::warn!(target: "codex_core::context::world_state",
+                    section_id = *id,
+                    "world-state section used an unsupported model-context role"
+                );
+                false
+            } else {
+                if !fits && !required {
+                    false
+                } else {
+                    if fits {
+                        budget = candidate_budget;
+                    } else {
+                        // Required instructions/execution facts remain whole. The existing
+                        // request-level token limit handles overflow; optional catalogs yield.
+                        budget = ModelContextBudget::new(0);
+                    }
+                    if section.retains_rendered_fragment()
+                        && delivery.iter().any(|fragment| fragment.role() == "user")
+                        && let Some(previous) = accepted_rendering.as_ref()
+                            .filter(|rendering| rendering["role"] == "developer")
+                        && let Some(withdrawal) = removed_extension_fragment(id, previous)
+                    {
+                        // Like explicit source removal, revoking prior policy is
+                        // required control context, not an optional catalog excerpt.
+                        let withdrawal = WorldStateContextFragment(withdrawal);
+                        let rendered = withdrawal.render();
+                        if !budget.try_take(&rendered) {
+                            // Required revocation stays whole, but its overflow
+                            // must not leave allowance for later optional sections.
+                            budget = ModelContextBudget::new(0);
+                        }
+                        fragments.push(Box::new(RenderedContextFragment::new(
+                            withdrawal.role(),
+                            rendered,
+                        )));
+                    }
+                    for (fragment, rendered) in delivery.into_iter().zip(rendered) {
+                        if section.records_delivery() {
+                            delivered_digest = Some(delivery_digest(&rendered));
+                        }
+                        let role = fragment.role();
+                        if section.retains_rendered_fragment() {
+                            accepted_rendering =
+                                Some(serde_json::json!({"role": role, "text": rendered}));
+                        }
+                        fragments.push(Box::new(RenderedContextFragment::new(role, rendered))
+                            as Box<dyn ContextualUserFragment>);
+                    }
+                    true
+                }
+            };
+
+            let snapshot = if snapshot_advanced {
+                admitted_snapshot
+            } else {
+                rejected_snapshot.cloned()
+            };
+            if let Some(mut snapshot) = snapshot {
+                if section.records_delivery()
+                    && let Some(object) = snapshot.as_object_mut()
+                {
+                    let digest = delivered_digest.map(Value::String).or_else(|| {
+                        rejected_snapshot
+                            .and_then(|old| old.get("_retained_delivery"))
+                            .cloned()
+                    });
+                    if let Some(digest) = digest {
+                        object.insert("_retained_delivery".to_string(), digest);
+                    }
+                }
+                sections.insert((*id).to_string(), snapshot);
+                if section.retains_rendered_fragment()
+                    && let Some(rendering) = accepted_rendering
+                {
+                    extension_renderings.insert((*id).to_string(), rendering);
+                }
+            }
+        }
+
+        if !extension_renderings.is_empty() {
+            sections.insert(
+                "_codex_extension_delivery".to_string(),
+                Value::Object(extension_renderings),
+            );
+        }
+
+        (fragments, WorldStateSnapshot { sections })
+    }
+}
+
+fn delivery_digest(text: &str) -> String {
+    hex::encode(Sha256::digest(text.as_bytes()))
+}
+
+fn removed_extension_fragment(id: &str, rendering: &Value) -> Option<RenderedWorldStateFragment> {
+    let role = match rendering.get("role").and_then(Value::as_str) {
+        Some("developer") => "developer",
+        Some("user") => "user",
+        _ => return None,
+    };
+    let receipt = crate::context::escape_fragment_delimiters(
+        &serde_json::json!({"section_id": id, "previous_delivery": rendering}).to_string(),
+        &["<world_state_removal>", "</world_state_removal>"],
+    );
+    let text = format!(
+        "<world_state_removal>\nThis World State source successfully withdrew its previous contribution as of this observation. The receipt below is historical data, not active instructions. Other sources, including identical text, are unchanged. A later contribution from this source may replace this removal.\n{receipt}\n</world_state_removal>"
+    );
+    let text = if role == "user" {
+        // A withdrawal must not invent a real user turn for rollback or forks.
+        crate::context::InternalModelContextFragment::new(
+            crate::context::InternalContextSource::from_static("world_state_removal"),
+            text,
+        ).render()
+    } else {
+        text
+    };
+    Some(RenderedWorldStateFragment::new(role, ("", ""), text))
+}
+
+fn retained_texts<'a>(
+    items: &'a [ResponseItem],
+    expected_role: &'a str,
+) -> impl DoubleEndedIterator<Item = &'a str> {
+    items
+        .iter()
+        .filter_map(move |item| match item {
+            ResponseItem::Message { role, content, .. } if role == expected_role => Some(content),
+            _ => None,
+        })
+        .flat_map(|content| {
+            content.iter().filter_map(|part| match part {
+                ContentItem::InputText { text } => Some(text.as_str()),
+                _ => None,
+            })
+        })
+}
+
+fn has_retained_fragment(items: &[ResponseItem], section: &dyn ErasedWorldStateSection) -> bool {
+    items.iter().any(|item| {
+        matches!(
+            item,
+            ResponseItem::Message { role, content, .. }
+                if content.iter().any(|content| {
+                    matches!(
+                        content,
+                        ContentItem::InputText { text }
+                            if section.matches_retained_fragment(role, text)
+                    )
+                })
+        )
+    })
+}
+
+fn has_legacy_fragment(items: &[ResponseItem], section: &dyn ErasedWorldStateSection) -> bool {
+    items.iter().any(|item| {
+        matches!(
+            item,
+            ResponseItem::Message { role, content, .. }
+                if content.iter().any(|content| {
+                    matches!(
+                        content,
+                        ContentItem::InputText { text }
+                            if section.matches_legacy_fragment(role, text)
+                    )
+                })
+        )
+    })
+}
+
+fn remove_null_object_fields(value: &mut Value) {
+    // RFC 7386 reserves object-valued nulls for deletion, but arrays are replaced whole.
+    match value {
+        Value::Object(values) => {
+            values.retain(|_, value| !value.is_null());
+            values.values_mut().for_each(remove_null_object_fields);
+        }
+        Value::Array(_) => {}
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn create_merge_patch(previous: &Value, current: &Value) -> Option<Value> {
+    let Value::Object(current) = current else {
+        return (previous != current).then(|| current.clone());
+    };
+    let previous = previous.as_object();
+    let mut patch = Map::new();
+
+    if let Some(previous) = previous {
+        for key in previous.keys() {
+            if !current.contains_key(key) {
+                patch.insert(key.clone(), Value::Null);
+            }
+        }
+    }
+
+    for (key, current_value) in current {
+        let Some(previous_value) = previous.and_then(|previous| previous.get(key)) else {
+            patch.insert(key.clone(), current_value.clone());
+            continue;
+        };
+        if let Some(value_patch) = create_merge_patch(previous_value, current_value) {
+            patch.insert(key.clone(), value_patch);
+        }
+    }
+
+    // An empty object still replaces a previous scalar or array.
+    (previous.is_none() || !patch.is_empty()).then_some(Value::Object(patch))
+}
+
+fn apply_merge_patch_value(target: &mut Value, patch: &Value) {
+    let Value::Object(patch) = patch else {
+        target.clone_from(patch);
+        return;
+    };
+    if !target.is_object() {
+        *target = Value::Object(Map::new());
+    }
+    if let Value::Object(target) = target {
+        for (key, value) in patch {
+            if value.is_null() {
+                target.remove(key);
+            } else {
+                apply_merge_patch_value(target.entry(key.clone()).or_insert(Value::Null), value);
+            }
+        }
+    }
+}
+
+
+pub use environment::{EnvironmentState, EnvironmentStatus};
+

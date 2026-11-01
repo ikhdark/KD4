@@ -71,6 +71,15 @@ pub(super) const RESPONSES_API_ENGINE_IAPI_TBT_FIELD: &str =
 pub(super) const RESPONSES_API_ENGINE_SERVICE_TBT_FIELD: &str =
     "engine_service_tbt_across_engine_calls_ms";
 
+pub(super) const RESPONSES_API_TIMING_METRICS: [(&str, &str); 6] = [
+    (RESPONSES_API_OVERHEAD_FIELD, RESPONSES_API_OVERHEAD_DURATION_METRIC),
+    (RESPONSES_API_INFERENCE_FIELD, RESPONSES_API_INFERENCE_TIME_DURATION_METRIC),
+    (RESPONSES_API_ENGINE_IAPI_TTFT_FIELD, RESPONSES_API_ENGINE_IAPI_TTFT_DURATION_METRIC),
+    (RESPONSES_API_ENGINE_SERVICE_TTFT_FIELD, RESPONSES_API_ENGINE_SERVICE_TTFT_DURATION_METRIC),
+    (RESPONSES_API_ENGINE_IAPI_TBT_FIELD, RESPONSES_API_ENGINE_IAPI_TBT_DURATION_METRIC),
+    (RESPONSES_API_ENGINE_SERVICE_TBT_FIELD, RESPONSES_API_ENGINE_SERVICE_TBT_DURATION_METRIC),
+];
+
 /// Output dimensions recorded by tool-result events; the body is not retained.
 #[derive(Clone, Copy, Debug)]
 pub struct ToolResultOutputStats {
@@ -1368,21 +1377,6 @@ impl SessionTelemetry {
         );
     }
 
-    pub fn record_websocket_event(
-        &self,
-        result: &Result<
-            Option<
-                Result<
-                    tokio_tungstenite::tungstenite::Message,
-                    tokio_tungstenite::tungstenite::Error,
-                >,
-            >,
-            ApiError,
-        >,
-        duration: Duration,
-    ) {
-        self.record_websocket_event_with_transport(result, duration, None);
-    }
 
     /// Connection-correlated provider observations do not establish the
     /// generating attempt of a timing frame without provider identity.
@@ -2105,53 +2099,11 @@ impl SessionTelemetry {
 
     fn record_responses_websocket_timing_metrics(&self, value: &serde_json::Value) {
         let timing_metrics = value.get(RESPONSES_WEBSOCKET_TIMING_METRICS_FIELD);
-
-        let overhead_value =
-            timing_metrics.and_then(|value| value.get(RESPONSES_API_OVERHEAD_FIELD));
-        if let Some(duration) = duration_from_ms_value(overhead_value) {
-            self.record_duration(RESPONSES_API_OVERHEAD_DURATION_METRIC, duration, &[]);
-        }
-
-        let inference_value =
-            timing_metrics.and_then(|value| value.get(RESPONSES_API_INFERENCE_FIELD));
-        if let Some(duration) = duration_from_ms_value(inference_value) {
-            self.record_duration(RESPONSES_API_INFERENCE_TIME_DURATION_METRIC, duration, &[]);
-        }
-
-        let engine_iapi_ttft_value =
-            timing_metrics.and_then(|value| value.get(RESPONSES_API_ENGINE_IAPI_TTFT_FIELD));
-        if let Some(duration) = duration_from_ms_value(engine_iapi_ttft_value) {
-            self.record_duration(
-                RESPONSES_API_ENGINE_IAPI_TTFT_DURATION_METRIC,
-                duration,
-                &[],
-            );
-        }
-
-        let engine_service_ttft_value =
-            timing_metrics.and_then(|value| value.get(RESPONSES_API_ENGINE_SERVICE_TTFT_FIELD));
-        if let Some(duration) = duration_from_ms_value(engine_service_ttft_value) {
-            self.record_duration(
-                RESPONSES_API_ENGINE_SERVICE_TTFT_DURATION_METRIC,
-                duration,
-                &[],
-            );
-        }
-
-        let engine_iapi_tbt_value =
-            timing_metrics.and_then(|value| value.get(RESPONSES_API_ENGINE_IAPI_TBT_FIELD));
-        if let Some(duration) = duration_from_ms_value(engine_iapi_tbt_value) {
-            self.record_duration(RESPONSES_API_ENGINE_IAPI_TBT_DURATION_METRIC, duration, &[]);
-        }
-
-        let engine_service_tbt_value =
-            timing_metrics.and_then(|value| value.get(RESPONSES_API_ENGINE_SERVICE_TBT_FIELD));
-        if let Some(duration) = duration_from_ms_value(engine_service_tbt_value) {
-            self.record_duration(
-                RESPONSES_API_ENGINE_SERVICE_TBT_DURATION_METRIC,
-                duration,
-                &[],
-            );
+        for &(field, metric) in &RESPONSES_API_TIMING_METRICS {
+            let value = timing_metrics.and_then(|timing| timing.get(field));
+            if let Some(duration) = duration_from_ms_value(value) {
+                self.record_duration(metric, duration, &[]);
+            }
         }
     }
 

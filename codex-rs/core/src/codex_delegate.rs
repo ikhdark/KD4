@@ -213,7 +213,6 @@ pub(crate) async fn run_codex_thread_one_shot(
 pub(crate) struct PreparedCodexOneShot {
     io: Codex,
     child_cancel: CancellationToken,
-    submitted: bool,
 }
 
 impl PreparedCodexOneShot {
@@ -243,19 +242,14 @@ impl PreparedCodexOneShot {
         Ok(Self {
             io,
             child_cancel,
-            submitted: false,
         })
     }
 
     pub(crate) async fn submit_once(
-        mut self,
+        self,
         input: Vec<UserInput>,
         final_output_json_schema: Option<Value>,
     ) -> Result<Codex, CodexErr> {
-        debug_assert!(
-            !self.submitted,
-            "prepared one-shot submitted more than once"
-        );
         let turn_id = self.io.reserve_turn_id();
         let admitted = self
             .io
@@ -284,8 +278,6 @@ impl PreparedCodexOneShot {
             let _ = self.io.shutdown_and_wait().await;
             return Err(error);
         }
-        self.submitted = true;
-
         // Bridge events so we can observe completion and shut down automatically.
         let (tx_bridge, rx_bridge) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let agent_status = self.io.agent_status.clone();

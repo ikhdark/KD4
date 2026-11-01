@@ -3,30 +3,6 @@
 # CODEX_SCCACHE_CACHE_SIZE.
 $script:CodexRustSccacheCacheSizeDefault = "80G"
 
-function Get-CodexCargoPackageSpecs {
-    param([string[]]$CommandArgs)
-
-    for ($index = 0; $index -lt $CommandArgs.Count; $index++) {
-        $token = $CommandArgs[$index]
-        if ($token -ceq "--") { break }
-        $spec = $null
-        if ($token -cin @("-p", "--package")) {
-            $index++
-            if ($index -lt $CommandArgs.Count) { $spec = $CommandArgs[$index] }
-            if ($spec -ceq "--") { break }
-        }
-        elseif ($token.StartsWith("--package=", [StringComparison]::Ordinal)) {
-            $spec = $token.Substring(10)
-        }
-        elseif ($token.StartsWith("-p", [StringComparison]::Ordinal)) {
-            $spec = $token.Substring(2)
-            if ($spec.StartsWith("=")) { $spec = $spec.Substring(1) }
-        }
-        if (-not [string]::IsNullOrEmpty($spec) -and -not $spec.StartsWith("-")) {
-            $spec
-        }
-    }
-}
 
 function Get-CodexRustSccacheBaseDir {
     param(
@@ -147,18 +123,10 @@ function Ensure-CodexRustSccacheServer {
             return
         }
 
-        sccache --stop-server 2>$null | Out-Null
-        sccache --start-server 2>$null | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            return
-        }
-        $restartedStats = @(sccache --show-stats 2>$null)
-        if (
-            $LASTEXITCODE -ne 0 -or
-            -not (Test-CodexRustSccacheStatsCacheSize -Stats $restartedStats)
-        ) {
-            return
-        }
+        # A cache-size mismatch does not establish that the shared server is
+        # idle. Leave other lanes' compilations alone; only the explicit
+        # sccache-restart maintenance command may stop the server.
+        Write-Warning ('the running sccache server reports max cache size {0}, but the configured size is {1}; run "just sccache-restart" when builds are idle to apply it.' -f (Get-CodexRustSccacheStatsMaxCacheSize -Stats $stats), (Get-CodexRustSccacheCacheSize))
     }
     finally {
         $ErrorActionPreference = $oldErrorActionPreference

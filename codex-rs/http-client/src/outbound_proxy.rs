@@ -220,10 +220,8 @@ impl HttpClientFactory {
     /// to a direct route.
     pub fn resolve_proxy_route(&self, request_url: &str) -> OutboundProxyRoute {
         resolve_proxy_route(
-            &ProcessEnv,
             request_url,
             self.outbound_proxy_policy,
-            resolve_system_proxy,
         )
     }
 
@@ -274,7 +272,7 @@ impl HttpClientFactory {
             return Some(OutboundProxyRoute::Direct);
         }
         cached_system_proxy_decision(&request_url)
-            .map(|decision| route_from_system_decision(&ProcessEnv, env_proxy_kind, decision))
+            .map(|decision| route_from_system_decision(env_proxy_kind, decision))
     }
 
     /// Discard a failed pre-dispatch route so the next lookup consults the OS.
@@ -325,10 +323,8 @@ impl HttpClientFactory {
 }
 
 fn resolve_proxy_route(
-    env: &dyn EnvSource,
     request_url: &str,
     outbound_proxy_policy: OutboundProxyPolicy,
-    resolve_system_proxy: impl FnOnce(&str, &RequestOrigin) -> SystemProxyDecision,
 ) -> OutboundProxyRoute {
     if matches!(outbound_proxy_policy, OutboundProxyPolicy::ReqwestDefault) {
         return OutboundProxyRoute::TransportDefault;
@@ -341,14 +337,12 @@ fn resolve_proxy_route(
     };
 
     route_from_system_decision(
-        env,
         env_proxy_kind,
         resolve_system_proxy(&request_url, &origin),
     )
 }
 
 fn route_from_system_decision(
-    env: &dyn EnvSource,
     env_proxy_kind: EnvProxyKind,
     decision: SystemProxyDecision,
 ) -> OutboundProxyRoute {
@@ -358,32 +352,31 @@ fn route_from_system_decision(
             url,
             no_proxy: None,
         },
-        SystemProxyDecision::Unavailable { .. } => resolve_env_proxy_route(env, env_proxy_kind),
+        SystemProxyDecision::Unavailable { .. } => resolve_env_proxy_route(env_proxy_kind),
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         SystemProxyDecision::Fallback { routes } => OutboundProxyRoute::Fallback { routes },
     }
 }
 
 fn resolve_env_proxy_route(
-    env: &dyn EnvSource,
     env_proxy_kind: EnvProxyKind,
 ) -> OutboundProxyRoute {
     let proxy_url = match env_proxy_kind {
         EnvProxyKind::Https => {
-            proxy_env_value(env, "HTTPS_PROXY").or_else(|| proxy_env_value(env, "ALL_PROXY"))
+            proxy_env_value("HTTPS_PROXY").or_else(|| proxy_env_value("ALL_PROXY"))
         }
-        EnvProxyKind::SecureWebSocket => proxy_env_value(env, "HTTPS_PROXY")
-            .or_else(|| proxy_env_value(env, "HTTP_PROXY"))
-            .or_else(|| proxy_env_value(env, "ALL_PROXY")),
+        EnvProxyKind::SecureWebSocket => proxy_env_value("HTTPS_PROXY")
+            .or_else(|| proxy_env_value("HTTP_PROXY"))
+            .or_else(|| proxy_env_value("ALL_PROXY")),
         EnvProxyKind::Http => {
-            proxy_env_value(env, "HTTP_PROXY").or_else(|| proxy_env_value(env, "ALL_PROXY"))
+            proxy_env_value("HTTP_PROXY").or_else(|| proxy_env_value("ALL_PROXY"))
         }
-        EnvProxyKind::Other => proxy_env_value(env, "ALL_PROXY"),
+        EnvProxyKind::Other => proxy_env_value("ALL_PROXY"),
     };
     match proxy_url {
         Some(url) => OutboundProxyRoute::Proxy {
             url,
-            no_proxy: proxy_env_value(env, "NO_PROXY"),
+            no_proxy: proxy_env_value("NO_PROXY"),
         },
         None => OutboundProxyRoute::Direct,
     }
@@ -391,7 +384,7 @@ fn resolve_env_proxy_route(
 
 /// Environment route for WebSockets, shared by default and system-resolver fallback.
 pub fn websocket_environment_proxy_route(request_url: &str) -> OutboundProxyRoute {
-    resolve_env_proxy_route(&ProcessEnv, EnvProxyKind::from_request_url(request_url))
+    resolve_env_proxy_route(EnvProxyKind::from_request_url(request_url))
 }
 
 /// Destination bypass policy shared by HTTP system proxies and WebSockets.
@@ -468,29 +461,23 @@ fn build_reqwest_client_for_route(
     custom_ca_policy: CustomCaPolicy,
 ) -> Result<reqwest::Client, BuildRouteAwareHttpClientError> {
     let builder = configure_proxy_for_route(
-        &ProcessEnv,
         builder,
         request_url,
         route_class,
         outbound_proxy_policy,
-        resolve_system_proxy,
     )?;
     build_reqwest_client_with_custom_ca_policy(builder, custom_ca_policy).map_err(Into::into)
 }
 
 fn configure_proxy_for_route(
-    env: &dyn EnvSource,
     builder: reqwest::ClientBuilder,
     request_url: &str,
     route_class: ClientRouteClass,
     outbound_proxy_policy: OutboundProxyPolicy,
-    resolve_system_proxy: impl FnOnce(&str, &RequestOrigin) -> SystemProxyDecision,
 ) -> Result<reqwest::ClientBuilder, BuildRouteAwareHttpClientError> {
     let route = resolve_proxy_route(
-        env,
         request_url,
         outbound_proxy_policy,
-        resolve_system_proxy,
     );
     configure_builder_for_resolved_route(builder, route_class, &route)
 }
@@ -559,22 +546,6 @@ enum SystemProxyDecision {
 
 fn resolve_system_proxy(request_url: &str, origin: &RequestOrigin) -> SystemProxyDecision {
     let cache = SYSTEM_PROXY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    resolve_system_proxy_with(
-        cache,
-        &SYSTEM_PROXY_RESOLUTION_LOCK,
-        request_url,
-        origin,
-        resolve_platform_system_proxy,
-    )
-}
-
-fn resolve_system_proxy_with(
-    cache: &Mutex<HashMap<[u8; 32], CachedSystemProxyDecision>>,
-    resolution_lock: &Mutex<()>,
-    request_url: &str,
-    origin: &RequestOrigin,
-    resolve_platform_system_proxy: impl FnOnce(&str, &RequestOrigin) -> SystemProxyDecision,
-) -> SystemProxyDecision {
     let cache_key = system_proxy_cache_key(request_url);
     {
         // Entries are self-contained; interrupted eviction or insertion leaves the
@@ -592,7 +563,7 @@ fn resolve_system_proxy_with(
     // Serialize misses, not cache hits. Keep ownership through publication, and recheck
     // after waiting so competing callers still share a single platform lookup.
     // This lock carries no state: a panicking resolver can safely be retried.
-    let _resolution = resolution_lock
+    let _resolution = SYSTEM_PROXY_RESOLUTION_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut decisions = cache
@@ -939,22 +910,10 @@ fn proxy_url_from_hostport(proxy_scheme: &str, hostport: &str) -> ParsedProxyLis
     ParsedProxyListDecision::Proxy(format!("{proxy_scheme}://{hostport}"))
 }
 
-trait EnvSource {
-    fn var(&self, key: &str) -> Option<String>;
-}
-
-struct ProcessEnv;
-
-impl EnvSource for ProcessEnv {
-    fn var(&self, key: &str) -> Option<String> {
-        std::env::var(key).ok()
-    }
-}
-
-fn proxy_env_value(env: &dyn EnvSource, upper: &str) -> Option<String> {
+fn proxy_env_value(upper: &str) -> Option<String> {
     let lower = upper.to_ascii_lowercase();
-    env.var(upper)
-        .or_else(|| env.var(&lower))
+    std::env::var(upper).ok()
+        .or_else(|| std::env::var(&lower).ok())
         .filter(|value| !value.is_empty())
 }
 

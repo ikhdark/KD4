@@ -48,6 +48,7 @@ struct CommandPreflightIssue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandPreflightOutcome {
     pub invocation: CommandInvocation,
+    /// Authority keeps each complete invocation, not flattened script stages.
     pub validation_invocations: Vec<CommandInvocation>,
     pub repair_notice: Option<String>,
     /// Explains a likely mistake in a script that still runs unchanged. It
@@ -169,7 +170,7 @@ impl CommandPreflightRetry {
 fn preflight_command_issue(
     command: &[String],
     shell_type: Option<ShellType>,
-) -> Result<Vec<Vec<String>>, CommandPreflightIssue> {
+) -> Result<(), CommandPreflightIssue> {
     preflight_command_issues(command, shell_type, /*literal_glob_advisories*/ None)
 }
 
@@ -180,7 +181,7 @@ fn preflight_command_issues(
     command: &[String],
     shell_type: Option<ShellType>,
     mut literal_glob_advisories: Option<&mut Vec<CommandPreflightIssue>>,
-) -> Result<Vec<Vec<String>>, CommandPreflightIssue> {
+) -> Result<(), CommandPreflightIssue> {
     let preflight_shell_type = shell_type.or_else(|| infer_direct_shell_type(command));
     if preflight_shell_type == Some(ShellType::PowerShell)
         && let Some(diagnostic) = codex_shell_command::powershell_command_syntax_error(command)
@@ -198,7 +199,7 @@ fn preflight_command_issues(
             None,
         ));
     }
-    // Parsing here extracts validation metadata; the target shell owns script
+    // Parsing here locates commands for preflight; the target shell owns script
     // syntax and expansion. Heuristic quote/name/path checks can reject valid scripts.
     let argv_commands = argv_commands(command, preflight_shell_type).unwrap_or_default();
 
@@ -218,7 +219,7 @@ fn preflight_command_issues(
         }
     }
 
-    Ok(argv_commands)
+    Ok(())
 }
 
 
@@ -455,13 +456,13 @@ fn repair_rg_leaf_glob(
         return None;
     }
     // Do not chain a typo fix with this expansion.
-    let stages = preflight_command_issue(&repaired_argv, None).ok()?;
+    preflight_command_issue(&repaired_argv, None).ok()?;
     let repaired = CommandInvocation::Argv {
         program: repaired_argv[0].clone(),
         args: repaired_argv[1..].to_vec(),
     };
     Some(CommandPreflightOutcome {
-        validation_invocations: validation_invocations(stages, &repaired),
+        validation_invocations: vec![repaired.clone()],
         repair_notice: Some(read_only_repair_notice(
             CommandPreflightIssueCode::RgLiteralGlobPath,
             invocation,
@@ -551,27 +552,23 @@ fn preflight_invocation_with_equivalent_repair_detailed(
         shell_type,
         (!invocation.is_argv()).then_some(&mut literal_glob_advisories),
     ) {
-        Ok(argv_commands) => {
+        Ok(()) => {
             if let Some(repaired) = git_status_read_only_equivalent(invocation) {
                 let Some(repaired_command) = repaired.to_direct_argv() else {
                     return Ok(CommandPreflightOutcome {
                         invocation: invocation.clone(),
-                        validation_invocations: validation_invocations(argv_commands, invocation),
+                        validation_invocations: vec![invocation.clone()],
                         repair_notice: None,
                         advisory: None,
                     });
                 };
-                let repaired_argv_commands =
-                    preflight_command_issue(&repaired_command, /*shell_type*/ None)?;
+                preflight_command_issue(&repaired_command, /*shell_type*/ None)?;
                 return Ok(CommandPreflightOutcome {
                     // Status is already valid. Disabling optional locks and
                     // fsmonitor is normalization, not a retry-admission bypass.
                     repair_notice: None,
                     advisory: None,
-                    validation_invocations: validation_invocations(
-                        repaired_argv_commands,
-                        &repaired,
-                    ),
+                    validation_invocations: vec![repaired.clone()],
                     invocation: repaired,
                 });
             }
@@ -584,7 +581,7 @@ fn preflight_invocation_with_equivalent_repair_detailed(
             });
             return Ok(CommandPreflightOutcome {
                 invocation: invocation.clone(),
-                validation_invocations: validation_invocations(argv_commands, invocation),
+                validation_invocations: vec![invocation.clone()],
                 repair_notice: None,
                 advisory,
             });
@@ -642,25 +639,15 @@ fn preflight_invocation_with_equivalent_repair_detailed(
     }
     // One repair is the hard limit. If the repaired command has another issue,
     // reject it rather than chaining mechanical transformations.
-    let repaired_argv_commands =
-        preflight_command_issue(&repaired_command, /*shell_type*/ None)?;
+    preflight_command_issue(&repaired_command, /*shell_type*/ None)?;
 
     let repair_notice = read_only_repair_notice(issue.code, invocation, &repaired);
     Ok(CommandPreflightOutcome {
-        validation_invocations: validation_invocations(repaired_argv_commands, &repaired),
+        validation_invocations: vec![repaired.clone()],
         invocation: repaired,
         repair_notice: Some(repair_notice),
         advisory: None,
     })
-}
-
-fn validation_invocations(
-    _argv_commands: Vec<Vec<String>>,
-    fallback: &CommandInvocation,
-) -> Vec<CommandInvocation> {
-    // Both handlers consume this for authority, not display. Preserve source
-    // operators, expansions, host modes and exit guards with their leaves.
-    vec![fallback.clone()]
 }
 
 fn git_status_read_only_equivalent(invocation: &CommandInvocation) -> Option<CommandInvocation> {

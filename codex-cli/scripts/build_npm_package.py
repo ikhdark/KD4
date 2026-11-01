@@ -124,78 +124,72 @@ def main() -> int:
         raise RuntimeError("Must specify --version or --release-version.")
 
     validate_notice_inputs()
-    staging_dir, created_temp = prepare_staging_dir(args.staging_dir)
+    staging_dir = prepare_staging_dir(args.staging_dir)
 
-    try:
-        stage_sources(staging_dir, version, package)
+    stage_sources(staging_dir, version, package)
 
-        vendor_src = args.vendor_src.resolve() if args.vendor_src else None
-        native_components = PACKAGE_NATIVE_COMPONENTS.get(package, [])
-        target_filter = PACKAGE_TARGET_FILTERS.get(package)
+    vendor_src = args.vendor_src.resolve() if args.vendor_src else None
+    native_components = PACKAGE_NATIVE_COMPONENTS.get(package, [])
+    target_filter = PACKAGE_TARGET_FILTERS.get(package)
 
-        if native_components:
-            if vendor_src is None:
-                components_str = ", ".join(native_components)
-                raise RuntimeError(
-                    "Native components "
-                    f"({components_str}) required for package '{package}'. Provide --vendor-src "
-                    "pointing to a directory containing pre-installed binaries."
-                )
-
-            copy_native_binaries(
-                vendor_src,
-                staging_dir,
-                native_components,
-                target_filter={target_filter} if target_filter else None,
-                expected_version=version,
+    if native_components:
+        if vendor_src is None:
+            components_str = ", ".join(native_components)
+            raise RuntimeError(
+                "Native components "
+                f"({components_str}) required for package '{package}'. Provide --vendor-src "
+                "pointing to a directory containing pre-installed binaries."
             )
 
-        if release_version:
-            staging_dir_str = str(staging_dir)
-            if package == "codex":
-                print(
-                    f"Staged version {version} for release in {staging_dir_str}\n\n"
-                    "Verify the CLI:\n"
-                    f"    node {staging_dir_str}/bin/codex.js --version\n"
-                    f"    node {staging_dir_str}/bin/codex.js --help\n\n"
-                )
-            elif package in CODEX_PLATFORM_PACKAGES:
-                print(
-                    f"Staged version {version} for release in {staging_dir_str}\n\n"
-                    "Verify native payload contents:\n"
-                    f"    ls {staging_dir_str}/vendor\n\n"
-                )
-            else:
-                print(
-                    f"Staged version {version} for release in {staging_dir_str}\n\n"
-                    "Verify the SDK contents:\n"
-                    f"    ls {staging_dir_str}/dist\n"
-                    "    node -e \"import('./dist/index.js').then(() => console.log('ok'))\"\n\n"
-                )
+        copy_native_binaries(
+            vendor_src,
+            staging_dir,
+            native_components,
+            target_filter={target_filter} if target_filter else None,
+            expected_version=version,
+        )
+
+    if release_version:
+        staging_dir_str = str(staging_dir)
+        if package == "codex":
+            print(
+                f"Staged version {version} for release in {staging_dir_str}\n\n"
+                "Verify the CLI:\n"
+                f"    node {staging_dir_str}/bin/codex.js --version\n"
+                f"    node {staging_dir_str}/bin/codex.js --help\n\n"
+            )
+        elif package in CODEX_PLATFORM_PACKAGES:
+            print(
+                f"Staged version {version} for release in {staging_dir_str}\n\n"
+                "Verify native payload contents:\n"
+                f"    ls {staging_dir_str}/vendor\n\n"
+            )
         else:
-            print(f"Staged package in {staging_dir}")
+            print(
+                f"Staged version {version} for release in {staging_dir_str}\n\n"
+                "Verify the SDK contents:\n"
+                f"    ls {staging_dir_str}/dist\n"
+                "    node -e \"import('./dist/index.js').then(() => console.log('ok'))\"\n\n"
+            )
+    else:
+        print(f"Staged package in {staging_dir}")
 
-        if args.pack_output is not None:
-            output_path = run_npm_pack(staging_dir, args.pack_output)
-            print(f"npm pack output written to {output_path}")
-    finally:
-        if created_temp:
-            # Preserve the staging directory for further inspection.
-            pass
-
+    if args.pack_output is not None:
+        output_path = run_npm_pack(staging_dir, args.pack_output)
+        print(f"npm pack output written to {output_path}")
     return 0
 
 
-def prepare_staging_dir(staging_dir: Path | None) -> tuple[Path, bool]:
+def prepare_staging_dir(staging_dir: Path | None) -> Path:
     if staging_dir is not None:
         staging_dir = staging_dir.resolve()
         staging_dir.mkdir(parents=True, exist_ok=True)
         if any(staging_dir.iterdir()):
             raise RuntimeError(f"Staging directory {staging_dir} is not empty.")
-        return staging_dir, False
+        return staging_dir
 
-    temp_dir = Path(tempfile.mkdtemp(prefix="codex-npm-stage-"))
-    return temp_dir, True
+    # Retain temporary staging for inspection, including after failures.
+    return Path(tempfile.mkdtemp(prefix="codex-npm-stage-"))
 
 
 def validate_notice_inputs() -> None:

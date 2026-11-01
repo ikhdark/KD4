@@ -5,7 +5,6 @@ $CargoLanesRootMarkerName = ".codex-cargo-lanes-root"
 $CargoLanesRootMarkerContent = "codex-kd cargo lanes root v1"
 
 . (Join-Path $PSScriptRoot "common-rust-env.ps1")
-. (Join-Path $PSScriptRoot "cargo-lane-patterns.ps1")
 
 function Test-CargoLaneCommandToken {
     param(
@@ -301,21 +300,6 @@ function ConvertTo-SafeLaneName {
     return $safe
 }
 
-function Get-StableCommandHash {
-    param(
-        [string]$Value
-    )
-
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Value)
-    $sha1 = [System.Security.Cryptography.SHA1]::Create()
-    try {
-        $hash = $sha1.ComputeHash($bytes)
-    }
-    finally {
-        $sha1.Dispose()
-    }
-    return ([System.BitConverter]::ToString($hash) -replace "-", "").Substring(0, 8).ToLowerInvariant()
-}
 
 function Get-AffinityLaneBase {
     param(
@@ -727,7 +711,6 @@ function Try-AcquireCargoLaneReservation {
     param(
         [string]$LaneRoot,
         [string]$BaseLane,
-        [switch]$PreferWarm,
         [switch]$AllowColdOverflow,
         [string[]]$ActiveNames = @(),
         [double]$CoordinationWaitSeconds = 0
@@ -845,7 +828,6 @@ function Acquire-CargoLaneReservation {
     param(
         [string]$LaneRoot,
         [string]$BaseLane,
-        [switch]$PreferWarm,
         [string[]]$ActiveNames = @(),
         [switch]$AllowColdOverflow,
         [double]$WarmWaitSeconds = 0
@@ -859,7 +841,7 @@ function Acquire-CargoLaneReservation {
         # grace, not a zero-wait failure or a fresh budget on every retry.
         $remaining = [Math]::Max(0, [Math]::Max(1, $WarmWaitSeconds) - $watch.Elapsed.TotalSeconds)
         $remaining = [Math]::Min(1, $remaining)
-        $reservation = Try-AcquireCargoLaneReservation -LaneRoot $LaneRoot -BaseLane $BaseLane -PreferWarm:$PreferWarm -ActiveNames $ActiveNames -AllowColdOverflow:($AllowColdOverflow -and $expired) -CoordinationWaitSeconds $remaining
+        $reservation = Try-AcquireCargoLaneReservation -LaneRoot $LaneRoot -BaseLane $BaseLane -ActiveNames $ActiveNames -AllowColdOverflow:($AllowColdOverflow -and $expired) -CoordinationWaitSeconds $remaining
         if ($null -ne $reservation) { return $reservation }
         if ($watch.Elapsed.TotalSeconds -ge $WarmWaitSeconds) {
             return $null
@@ -1093,7 +1075,7 @@ $previousLaneTargetDir = $env:CODEX_CARGO_LANE_TARGET_DIR
 $didPushLocation = $false
 # OS observations may become idle while waiting for coordination. Reservation
 # rechecks their locks; only explicit administrative exclusions stay excluded.
-$reservation = Acquire-CargoLaneReservation -LaneRoot $cargoLanesRoot -BaseLane $candidateLane -ActiveNames $excludedLaneNames -PreferWarm:($requestedLane -ceq "auto") -AllowColdOverflow:$parsedArgs.AllowColdOverflow -WarmWaitSeconds $parsedArgs.WarmWaitSeconds
+$reservation = Acquire-CargoLaneReservation -LaneRoot $cargoLanesRoot -BaseLane $candidateLane -ActiveNames $excludedLaneNames -AllowColdOverflow:$parsedArgs.AllowColdOverflow -WarmWaitSeconds $parsedArgs.WarmWaitSeconds
 if ($null -eq $reservation) {
     [Console]::Error.WriteLine("Cargo lane '$candidateLane' is busy; no cold overflow was started. Required validation remains pending.")
     $status = @{

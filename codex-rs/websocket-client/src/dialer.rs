@@ -14,7 +14,6 @@ use tokio::net::TcpStream;
 use tokio::time::Instant;
 use tokio::time::sleep_until;
 use tokio_rustls::TlsConnector;
-use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::client_async_with_config;
 use tokio_tungstenite::proxy::connect_via_proxy;
 use tokio_tungstenite::tungstenite::Error as WebSocketError;
@@ -101,10 +100,10 @@ async fn connect_route(
     // an authorization/policy rejection or an ambiguous upgrade write.
     let (stream, response) = client_async_with_config(
         request,
-        MaybeTlsStream::Plain(stream),
+        stream,
         Some(config),
     ).await?;
-    Ok((ConnectionInner::Routed(stream), response))
+    Ok((stream, response))
 }
 
 async fn connect_routed_stream(

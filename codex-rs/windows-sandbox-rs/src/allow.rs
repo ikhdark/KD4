@@ -1,5 +1,6 @@
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
 use dunce::canonicalize;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
@@ -25,9 +26,9 @@ pub(crate) fn compute_allow_paths_for_permissions(
         }
     };
     let mut add_deny_path = |p: PathBuf| {
-        if p.exists() {
-            deny.insert(p);
-        }
+        // Missing carveouts still belong to the policy and must be prepared
+        // before allowing writes to their parent.
+        deny.insert(p);
     };
 
     for writable_root in permissions.writable_roots_for_cwd(command_cwd, env_map) {
@@ -39,5 +40,21 @@ pub(crate) fn compute_allow_paths_for_permissions(
     }
 
     AllowDenyPaths { allow, deny }
+}
+
+/// One desired deny-write set for capability identity, setup and ACL application.
+pub(crate) fn compute_deny_write_paths_for_permissions(
+    permissions: &ResolvedWindowsSandboxPermissions,
+    command_cwd: &Path,
+    env_map: &HashMap<String, String>,
+    additional_deny_write_paths: &[PathBuf],
+) -> Vec<PathBuf> {
+    compute_allow_paths_for_permissions(permissions, command_cwd, env_map)
+        .deny
+        .into_iter()
+        .chain(additional_deny_write_paths.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 

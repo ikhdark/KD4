@@ -223,13 +223,6 @@ pub struct PluginListBackgroundTaskOptions {
 #[derive(Clone, PartialEq, Eq)]
 struct NonCuratedCacheRefreshRequest {
     scopes: Vec<(ConfigLayerStackIdentity, Vec<AbsolutePathBuf>)>,
-    mode: NonCuratedCacheRefreshMode,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum NonCuratedCacheRefreshMode {
-    IfVersionChanged,
-    ForceReinstall,
 }
 
 #[derive(Default)]
@@ -463,7 +456,7 @@ struct CachedPluginSkillRoots {
     auth_mode: Option<AuthMode>,
     snapshot_generation: u64,
     roots: Vec<PluginSkillRoot>,
-    plugin_roots: Vec<(String, AbsolutePathBuf)>,
+    plugin_roots: Vec<(String, AbsolutePathBuf, Option<String>)>,
     snapshots: PluginSkillSnapshots,
 }
 
@@ -651,14 +644,18 @@ impl PluginsManager {
         }
         let key =
             PluginLoadCacheKey::from_config(config, self.remote_global_catalog_active(config));
-        self.loaded_plugins_cache
+        let cached = self.loaded_plugins_cache
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entries
             .iter()
             .find(|cached| cached.key == key
                 && cached.retry_after.is_none_or(|deadline| std::time::Instant::now() < deadline))
-            .map(|cached| cached.plugin_skill_snapshots.clone())
+            .cloned()?;
+        // Even a retained clone rejects stale roots when SkillsService consumes it.
+        // Returning None here would lose that fence and let old roots be reparsed
+        // under their previous namespace after a publication raced this lookup.
+        Some(cached.plugin_skill_snapshots)
     }
 
     #[instrument(
@@ -682,23 +679,25 @@ impl PluginsManager {
 
         let remote_global_catalog_active = self.remote_global_catalog_active(config);
         let cache_key = PluginLoadCacheKey::from_config(config, remote_global_catalog_active);
-        if !force_reload {
-            self.invalidate_changed_plugin_roots(&cache_key).await;
-        }
+        let _read_leases = if !force_reload {
+            self.invalidate_changed_plugin_roots(&cache_key).await
+        } else { Vec::new() };
         if !force_reload && let Some(outcome) = self.cached_plugin_outcome(&cache_key) {
             return outcome;
         }
+        drop(_read_leases);
 
         let Ok(_load_permit) = self.loaded_plugins_load_semaphore.acquire().await else {
             warn!("plugin load semaphore closed");
             return PluginLoadOutcome::default();
         };
-        if !force_reload {
-            self.invalidate_changed_plugin_roots(&cache_key).await;
-        }
+        let _read_leases = if !force_reload {
+            self.invalidate_changed_plugin_roots(&cache_key).await
+        } else { Vec::new() };
         if !force_reload && let Some(outcome) = self.cached_plugin_outcome(&cache_key) {
             return outcome;
         }
+        drop(_read_leases);
         let cache_generation = self.loaded_plugins_cache_generation();
         let plugin_skill_snapshots = PluginSkillSnapshots::for_plugin_load();
         let plugins = load_plugins_from_layer_stack(
@@ -893,18 +892,20 @@ impl PluginsManager {
             config_layer_stack: ConfigLayerStackIdentity(Arc::new(config_layer_stack.clone())),
             remote_global_catalog_active,
         };
-        self.invalidate_changed_plugin_roots(&key).await;
+        let _read_leases = self.invalidate_changed_plugin_roots(&key).await;
         if let Some(cached) = self.cached_skill_roots(&key, snapshot_generation) {
             return cached;
         }
+        drop(_read_leases);
         let Ok(_permit) = self.loaded_plugins_load_semaphore.acquire().await else {
             warn!("plugin load semaphore closed");
             return (Vec::new(), None);
         };
-        self.invalidate_changed_plugin_roots(&key).await;
+        let _read_leases = self.invalidate_changed_plugin_roots(&key).await;
         if let Some(cached) = self.cached_skill_roots(&key, snapshot_generation) {
             return cached;
         }
+        drop(_read_leases);
         let generation = self.loaded_plugins_cache_generation();
         let snapshots = PluginSkillSnapshots::for_plugin_load();
         let plugins = match load_plugins_from_layer_stack(
@@ -920,7 +921,7 @@ impl PluginsManager {
         };
         let auth_mode = self.auth_mode();
         let plugin_roots = plugins.iter()
-            .map(|plugin| (plugin.config_name.clone(), plugin.root.clone()))
+            .map(|plugin| (plugin.config_name.clone(), plugin.root.clone(), plugin.installation_id.clone()))
             .collect();
         let roots = resolve_loaded_plugins_for_auth_mode(plugins, auth_mode)
             .effective_plugin_skill_roots();
@@ -942,31 +943,40 @@ impl PluginsManager {
         (roots, Some(snapshots))
     }
 
-    async fn invalidate_changed_plugin_roots(&self, key: &PluginLoadCacheKey) {
+    async fn invalidate_changed_plugin_roots(&self, key: &PluginLoadCacheKey) -> Vec<crate::store::PluginReadLease> {
         let plugin_roots = {
             let cache = self.loaded_plugins_cache.read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             cache.entries.iter().filter(|entry| entry.key == *key)
                 .flat_map(|entry| entry.plugins.iter()
-                    .map(|plugin| (plugin.config_name.clone(), plugin.root.clone())))
+                    .map(|plugin| (plugin.config_name.clone(), plugin.root.clone(), plugin.installation_id.clone())))
                 .chain(cache.skill_roots.iter().filter(|entry| entry.key == *key)
                     .flat_map(|entry| entry.plugin_roots.iter().cloned()))
                 .collect::<Vec<_>>()
         };
         if plugin_roots.is_empty() {
-            return;
+            return Vec::new();
         }
-        // A second process can activate a different version without publishing an
-        // invalidation here. Do filesystem work off-runtime and outside cache locks.
+        // Reobserve the committed publication, not merely version/path. Leases
+        // survive until the caller has cloned the matching cached capabilities.
         let store = self.store.clone();
-        let changed = tokio::task::spawn_blocking(move || plugin_roots.into_iter()
-            .any(|(name, root)| {
-                let Ok(id) = PluginId::parse(&name) else { return false; };
-                store.active_plugin_root(&id)
-                    .unwrap_or_else(|| store.plugin_base_root(&id)) != root
-            })).await.unwrap_or(true);
-        if changed {
-            self.clear_loaded_plugins_cache();
+        let leases = tokio::task::spawn_blocking(move || {
+            plugin_roots.into_iter().filter_map(|(name, root, identity)| {
+                let id = match PluginId::parse(&name) {
+                    Ok(id) => id,
+                    Err(_) => return None,
+                };
+                Some(store.read_plugin(&id).ok().filter(|current|
+                    current.root.clone().unwrap_or_else(|| store.plugin_base_root(&id)) == root
+                        && current.installation_id == identity))
+            }).collect::<Option<Vec<_>>>()
+        }).await.ok().flatten();
+        match leases {
+            Some(leases) => leases,
+            None => {
+                self.clear_loaded_plugins_cache();
+                Vec::new()
+            }
         }
     }
 
@@ -1832,11 +1842,11 @@ impl PluginsManager {
         config_layer_stack: &ConfigLayerStack,
         request: PluginInstallRequest,
     ) -> Result<PluginInstallOutcome, PluginInstallError> {
-        let (resolved, curated_snapshot) = self
+        let (resolved, curated_snapshot, marketplace_snapshot) = self
             .resolve_installable_plugin(config_layer_stack, &request)
             .await?;
         let plugin_id = resolved.plugin_id.clone();
-        match self.install_resolved_plugin(resolved, curated_snapshot).await {
+        match self.install_resolved_plugin(resolved, curated_snapshot, marketplace_snapshot).await {
             Ok(outcome) => Ok(outcome),
             Err(err) => {
                 self.track_plugin_install_failed(
@@ -1854,7 +1864,7 @@ impl PluginsManager {
         &self,
         config_layer_stack: &ConfigLayerStack,
         request: &PluginInstallRequest,
-    ) -> Result<(ResolvedMarketplacePlugin, Option<(std::fs::File, String)>), PluginInstallError> {
+    ) -> Result<(ResolvedMarketplacePlugin, Option<(std::fs::File, String)>, Option<(std::fs::File, String)>), PluginInstallError> {
         let config_layer_stack = config_layer_stack.clone();
         let request = request.clone();
         let codex_home = self.codex_home.clone();
@@ -1890,6 +1900,31 @@ impl PluginsManager {
                     restriction_product,
                 )?;
             }
+            let marketplace_snapshot = if !is_openai_curated_marketplace_name(resolved.plugin_id.marketplace_name()) {
+                let marketplace_name = resolved.plugin_id.marketplace_name().to_string();
+                let lease = crate::installed_marketplaces::try_lock_marketplace_operation(&codex_home, &marketplace_name)
+                    .map_err(|err| MarketplaceError::InvalidMarketplaceFile {
+                        path: request.marketplace_path.to_path_buf(),
+                        message: format!("marketplace operation is busy or unavailable: {err}"),
+                    })?;
+                resolved = find_installable_marketplace_plugin(
+                    &request.marketplace_path, &request.plugin_name, restriction_product,
+                )?;
+                if resolved.plugin_id.marketplace_name() != marketplace_name {
+                    return Err(MarketplaceError::InvalidMarketplaceFile {
+                        path: request.marketplace_path.to_path_buf(),
+                        message: "marketplace name changed during install; retry".to_string(),
+                    });
+                }
+                let root = crate::marketplace::marketplace_root_dir(&request.marketplace_path)?;
+                let identity = crate::installed_marketplaces::marketplace_source_identity(root.as_path())
+                    .map_err(|message| MarketplaceError::InvalidMarketplaceFile {
+                        path: request.marketplace_path.to_path_buf(), message,
+                    })?;
+                Some((lease, identity))
+            } else {
+                None
+            };
             MarketplacePolicy::from_requirements(config_layer_stack.requirements())
                 .validate_install(
                     &config_layer_stack,
@@ -1916,7 +1951,7 @@ impl PluginsManager {
                 drop(snapshot);
                 None
             };
-            Ok::<_, MarketplaceError>((resolved, curated_snapshot))
+            Ok::<_, MarketplaceError>((resolved, curated_snapshot, marketplace_snapshot))
         })
         .await
         .map_err(PluginInstallError::join)?;
@@ -1989,6 +2024,7 @@ impl PluginsManager {
         &self,
         resolved: ResolvedMarketplacePlugin,
         curated_snapshot: Option<(std::fs::File, String)>,
+        marketplace_snapshot: Option<(std::fs::File, String)>,
     ) -> Result<PluginInstallOutcome, PluginInstallError> {
         let auth_policy = resolved.policy.authentication;
         let store = self.store.clone();
@@ -2008,7 +2044,7 @@ impl PluginsManager {
                 materialize_marketplace_plugin_source(codex_home.as_path(), &resolved.source)
                     .map_err(PluginStoreError::Invalid)?;
             let source_path = materialized.path;
-            let pending_install = match (plugin_version, manifest_fallback_contents.as_deref()) {
+            let mut pending_install = match (plugin_version, manifest_fallback_contents.as_deref()) {
                 (Some(plugin_version), Some(manifest_contents)) => store
                     .begin_install_with_version_and_fallback_manifest(
                         source_path,
@@ -2028,9 +2064,13 @@ impl PluginsManager {
                 ),
                 (None, None) => store.begin_install(source_path, resolved.plugin_id),
             }?;
-            // begin_install has synchronously copied the source into its owned
-            // transaction. Release snapshot authority before config locking.
+            if let Some((_, identity)) = marketplace_snapshot.as_ref() {
+                pending_install.bind_marketplace_source(identity)?;
+            }
+            // begin_install has synchronously copied and bound the source into
+            // its owned transaction. Release source leases before config locking.
             drop(snapshot);
+            drop(marketplace_snapshot);
             apply_user_plugin_config_edits_blocking(
                 codex_home.as_path(),
                 vec![PluginConfigEdit::SetEnabled {
@@ -2039,7 +2079,7 @@ impl PluginsManager {
                 }],
             )
             .map_err(anyhow::Error::from)?;
-            Ok(pending_install.commit())
+            Ok(pending_install.commit()?)
         })
         .await
         .map_err(PluginInstallError::join)??;
@@ -2396,8 +2436,14 @@ impl PluginsManager {
             let configured_plugins =
                 configured_plugins_from_stack(&config_for_read.config_layer_stack, &codex_home);
             let configured = configured_plugins.get(&plugin_key);
-            let installed_version =
-                configured.and_then(|_| store.active_plugin_version(&plugin.plugin_id));
+            let source_root = crate::marketplace::marketplace_root_dir(&request_for_read.marketplace_path)?;
+            let source_identity = crate::installed_marketplaces::marketplace_source_identity(source_root.as_path())
+                .map_err(MarketplaceError::InvalidPlugin)?;
+            let installation = store.read_plugin(&plugin.plugin_id).ok().filter(|installation|
+                is_openai_curated_marketplace_name(&marketplace_name)
+                    || installation.marketplace_source.as_ref() == Some(&source_identity));
+            let installed_version = configured.and_then(|_| installation.as_ref()?.root.as_ref()?
+                .as_path().file_name()?.to_str().map(str::to_string));
             let installed = installed_version.is_some();
             let enabled = configured.is_some_and(|plugin| plugin.enabled);
             Ok::<_, MarketplaceError>((
@@ -2492,15 +2538,41 @@ impl PluginsManager {
         let plugin_id_for_read = plugin_id.clone();
         let plugin_key_for_read = plugin_key.clone();
         let fallback = plugin.manifest_fallback.clone();
-        let (source_path, manifest) = tokio::task::spawn_blocking(move || {
-            let source_path = if source.is_install_materialized() && installed {
-                store
-                    .active_plugin_root(&plugin_id_for_read)
-                    .ok_or_else(|| {
-                        MarketplaceError::InvalidPlugin(format!(
-                            "installed plugin cache entry is missing for {plugin_key_for_read}"
-                        ))
-                    })?
+        let effective_config = config.config_layer_stack.effective_config();
+        let marketplace_name = marketplace_name.to_string();
+        let (source_path, manifest, _installation, _marketplace_lease) = tokio::task::spawn_blocking(move || {
+            let marketplace_lease = if is_openai_curated_marketplace_name(&marketplace_name) {
+                None
+            } else {
+                Some(crate::installed_marketplaces::try_lock_marketplace_operation(&codex_home, &marketplace_name)
+                    .map_err(|err| MarketplaceError::InvalidPlugin(format!("marketplace operation is busy or unavailable: {err}")))?)
+            };
+            let expected_source = effective_config.get("marketplaces")
+                .and_then(|marketplaces| marketplaces.get(&marketplace_name))
+                .filter(|_| !is_openai_curated_marketplace_name(&marketplace_name))
+                .map(|marketplace| {
+                    crate::installed_marketplaces::resolve_configured_marketplace_root(
+                        &marketplace_name, marketplace, &crate::installed_marketplaces::marketplace_install_root(&codex_home),
+                    ).ok_or_else(|| MarketplaceError::InvalidPlugin("marketplace source/ref no longer matches configuration".to_string()))?;
+                    let identity = crate::installed_marketplaces::configured_marketplace_source_identity(
+                        &marketplace_name, marketplace,
+                    ).map_err(MarketplaceError::InvalidPlugin)?;
+                    Ok(identity)
+                }).transpose()?;
+            let installation = if source.is_install_materialized() && installed {
+                let installation = store.read_plugin(&plugin_id_for_read)
+                    .map_err(|err| MarketplaceError::InvalidPlugin(err.to_string()))?;
+                if expected_source.as_ref().is_some_and(|expected|
+                    installation.marketplace_source.as_ref() != Some(expected))
+                {
+                    return Err(MarketplaceError::InvalidPlugin("installed plugin marketplace source changed; reload the listing".to_string()));
+                }
+                Some(installation)
+            } else { None };
+            let source_path = if let Some(installation) = installation.as_ref() {
+                installation.root.clone().ok_or_else(|| MarketplaceError::InvalidPlugin(format!(
+                    "installed plugin cache entry is missing for {plugin_key_for_read}"
+                )))?
             } else {
                 materialize_marketplace_plugin_source(&codex_home, &source)
                     .map_err(MarketplaceError::InvalidPlugin)?
@@ -2522,7 +2594,7 @@ impl PluginsManager {
                 .ok_or_else(|| {
                     MarketplaceError::InvalidPlugin("missing or invalid plugin.json".to_string())
                 })?;
-            Ok::<_, MarketplaceError>((source_path, manifest))
+            Ok::<_, MarketplaceError>((source_path, manifest, installation, marketplace_lease))
         })
         .await
         .map_err(|err| {
@@ -2808,7 +2880,6 @@ impl PluginsManager {
     ) {
         self.schedule_non_curated_plugin_cache_refresh(
             &[PluginMarketplaceScope { config: config.clone(), roots: roots.to_vec() }],
-            NonCuratedCacheRefreshMode::IfVersionChanged,
             on_effective_plugins_changed,
         );
     }
@@ -2819,7 +2890,7 @@ impl PluginsManager {
         on_effective_plugins_changed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     ) {
         self.schedule_non_curated_plugin_cache_refresh(
-            scopes, NonCuratedCacheRefreshMode::IfVersionChanged, on_effective_plugins_changed,
+            scopes, on_effective_plugins_changed,
         );
     }
 
@@ -2905,7 +2976,6 @@ impl PluginsManager {
     fn schedule_non_curated_plugin_cache_refresh(
         self: &Arc<Self>,
         scopes: &[PluginMarketplaceScope],
-        mode: NonCuratedCacheRefreshMode,
         on_effective_plugins_changed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     ) {
         let scopes = scopes.iter().filter(|scope| scope.config.plugins_enabled)
@@ -2916,10 +2986,7 @@ impl PluginsManager {
                 (ConfigLayerStackIdentity(Arc::clone(&scope.config.config_layer_stack)), roots)
             }).collect::<Vec<_>>();
         if scopes.is_empty() { return; }
-        let mut request = NonCuratedCacheRefreshRequest {
-            scopes,
-            mode,
-        };
+        let request = NonCuratedCacheRefreshRequest { scopes };
         let on_effective_plugins_changed =
             EffectivePluginsChangedNotifier::capture(on_effective_plugins_changed);
 
@@ -2928,22 +2995,11 @@ impl PluginsManager {
                 Ok(state) => state,
                 Err(err) => err.into_inner(),
             };
-            if request.mode == NonCuratedCacheRefreshMode::IfVersionChanged
-                && state.requested.as_ref().is_some_and(|requested| {
-                    requested.mode == NonCuratedCacheRefreshMode::ForceReinstall
-                        && requested.scopes == request.scopes
-                })
-            {
-                request.mode = NonCuratedCacheRefreshMode::ForceReinstall;
-            }
             // Collapse repeated plugin/list requests onto one worker and only queue another pass
-            // when the roots or configured plugin set changes. Forced reinstall requests are not
-            // deduped against the last completed pass because the same marketplace root path can
-            // point at newly activated files after an auto-upgrade.
+            // when the roots or configured plugin set changes. Auto-upgrades run
+            // their forced reinstall directly rather than using this scheduler.
             let deduped = state.requested.as_ref() == Some(&request)
-                || (request.mode == NonCuratedCacheRefreshMode::IfVersionChanged
-                    && !state.in_flight
-                    && state.last_refreshed.as_ref() == Some(&request));
+                || (!state.in_flight && state.last_refreshed.as_ref() == Some(&request));
             // A pending pass reports to the latest host callback. The worker drops it on exit,
             // because the callback may own the thread manager that owns this manager.
             if on_effective_plugins_changed.is_some() && (state.in_flight || !deduped) {
@@ -3191,7 +3247,6 @@ impl PluginsManager {
                     self.codex_home.as_path(),
                     &keys,
                     outcome,
-                    matches!(request.mode, NonCuratedCacheRefreshMode::ForceReinstall),
                 )?;
                 Ok::<_, String>(refreshed)
             })();
@@ -3248,12 +3303,23 @@ impl PluginsManager {
     ) -> (HashMap<String, String>, HashSet<String>) {
         let configured_plugins =
             configured_plugins_from_stack(&config.config_layer_stack, codex_home);
+        let effective_config = config.config_layer_stack.effective_config();
         let installed_versions = configured_plugins
             .keys()
             .filter_map(|plugin_key| {
                 let plugin_id = PluginId::parse(plugin_key).ok()?;
-                store.active_plugin_version(&plugin_id)
-                    .map(|version| (plugin_key.clone(), version))
+                let installation = store.read_plugin(&plugin_id).ok()?;
+                if !is_openai_curated_marketplace_name(plugin_id.marketplace_name())
+                    && let Some(marketplace) = effective_config.get("marketplaces")
+                        .and_then(|marketplaces| marketplaces.get(plugin_id.marketplace_name()))
+                {
+                    let expected = crate::installed_marketplaces::configured_marketplace_source_identity(
+                        plugin_id.marketplace_name(), marketplace,
+                    ).ok()?;
+                    if installation.marketplace_source.as_ref() != Some(&expected) { return None; }
+                }
+                installation.root.as_ref()?.as_path().file_name()?.to_str()
+                    .map(|version| (plugin_key.clone(), version.to_string()))
             })
             .collect::<HashMap<_, _>>();
         let enabled_plugins = configured_plugins
@@ -3331,9 +3397,6 @@ impl PluginsManager {
     ) -> Result<MarketplaceListOutcome, MarketplaceError> {
         let mut outcome = list_marketplaces_with_home(roots, home_dir().as_deref())?;
         let policy = MarketplacePolicy::from_requirements(config.config_layer_stack.requirements());
-        if !policy.is_restricted() {
-            return Ok(outcome);
-        }
         let user_config = config.config_layer_stack.effective_config();
         outcome.marketplaces.retain(|marketplace| {
             policy

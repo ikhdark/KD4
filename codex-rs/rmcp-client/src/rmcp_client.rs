@@ -808,23 +808,7 @@ impl RmcpClient {
         Ok(initialize_result)
     }
 
-    pub async fn list_tools(
-        &self,
-        params: Option<PaginatedRequestParams>,
-        timeout: Option<Duration>,
-    ) -> Result<ListToolsResult> {
-        self.request_tools_page(params, timeout).await
-    }
 
-    async fn request_tools_page(
-        &self,
-        params: Option<PaginatedRequestParams>,
-        timeout: Option<Duration>,
-    ) -> Result<ListToolsResult> {
-        self.request_tools_page_with_timing(params, timeout)
-            .await
-            .map(|(result, _)| result)
-    }
 
     async fn request_tools_page_with_timing(
         &self,
@@ -858,15 +842,6 @@ impl RmcpClient {
         result.map(|(result, active_time)| (result, active_time + persist_start.elapsed()))
     }
 
-    #[instrument(level = "trace", skip_all)]
-    pub async fn list_tools_with_connector_ids(
-        &self,
-        params: Option<PaginatedRequestParams>,
-        timeout: Option<Duration>,
-    ) -> Result<ListToolsWithConnectorIdResult> {
-        let result = self.request_tools_page(params, timeout).await?;
-        Ok(Self::tools_with_connector_ids(result))
-    }
 
     /// Reports active time so a multi-page catalog can share one timeout budget
     /// without charging interactive elicitation waits to that budget.

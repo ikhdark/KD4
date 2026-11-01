@@ -1276,19 +1276,18 @@ async fn finish_output_stream(process_id: ProcessId, stream: ExecOutputStream, i
                 .events
                 .publish(ExecProcessEvent::OutputGap { through_seq });
             let _ = process.wake_tx.send(through_seq);
-            gap = Some((through_seq, Arc::clone(&process.output_notify)));
+            gap = Some(Arc::clone(&process.output_notify));
         }
         if process.open_streams > 0 {
             process.open_streams -= 1;
         }
         gap
     };
-    if let Some((through_seq, output_notify)) = gap {
+    if let Some(output_notify) = gap {
         // Remote sessions publish strictly in sequence order. Without this
         // notification every later event, including close, waits forever
         // behind a sequence that was never sent.
         output_notify.notify_waiters();
-        let _ = through_seq;
     }
 
     maybe_emit_closed(process_id, inner).await;

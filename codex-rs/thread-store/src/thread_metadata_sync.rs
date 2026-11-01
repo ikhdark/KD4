@@ -37,7 +37,6 @@ pub(crate) struct ThreadMetadataSync {
     // metadata projection remaining stale until its recovery barrier.
     pub(crate) append_ordering_uncertain: bool,
     thread_id: ThreadId,
-    cwd_seen: bool,
     preview_seen: bool,
     first_user_message_seen: bool,
     title_seen: bool,
@@ -90,7 +89,6 @@ impl ThreadMetadataSync {
             thread_id: params.thread_id,
             history_observation_uncertain: false,
             append_ordering_uncertain: false,
-            cwd_seen: !cwd.as_os_str().is_empty(),
             preview_seen: false,
             first_user_message_seen: false,
             title_seen: false,
@@ -108,11 +106,6 @@ impl ThreadMetadataSync {
             thread_id: params.thread_id,
             history_observation_uncertain: false,
             append_ordering_uncertain: false,
-            cwd_seen: params
-                .metadata
-                .cwd
-                .as_ref()
-                .is_some_and(|cwd| !cwd.as_os_str().is_empty()),
             preview_seen: false,
             first_user_message_seen: false,
             title_seen: false,
@@ -244,7 +237,6 @@ impl ThreadMetadataSync {
                     &previous_settings,
                     self.settings_reducer.settings(),
                     &mut update,
-                    &mut self.cwd_seen,
                 );
             }
             match item {
@@ -401,7 +393,6 @@ fn apply_persisted_settings_delta(
     previous: &PersistedThreadSettings,
     current: &PersistedThreadSettings,
     update: &mut ThreadMetadataPatch,
-    cwd_seen: &mut bool,
 ) {
     if previous.model_provider_id != current.model_provider_id
         && let Some(model_provider_id) = current.model_provider_id.clone()
@@ -421,7 +412,6 @@ fn apply_persisted_settings_delta(
     if previous.environments != current.environments
         && let Some(environments) = current.environments.as_ref()
     {
-        *cwd_seen = true;
         update.cwd = Some(environments.legacy_fallback_cwd.to_path_buf());
     }
     if previous.approval_policy != current.approval_policy

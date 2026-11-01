@@ -294,7 +294,7 @@ impl StreamingPatchParser {
                     line_number: self.line_number,
                 })
             }
-            StreamingParserMode::UpdateFile { hunk_line_number } => {
+            StreamingParserMode::UpdateFile { .. } => {
                 let update_line = line.trim_end();
                 if self.handle_hunk_headers_and_end_patch(update_line)? {
                     return Ok(());
@@ -325,7 +325,6 @@ impl StreamingPatchParser {
                         && let Some(move_to_path) = update_line.strip_prefix(MOVE_TO_MARKER)
                     {
                         *move_path = Some(PathBuf::from(move_to_path));
-                        self.state.mode = StreamingParserMode::UpdateFile { hunk_line_number };
                         return Ok(());
                     }
 
@@ -351,7 +350,6 @@ impl StreamingPatchParser {
                             is_end_of_file: false,
                             line_kinds: Vec::new(),
                         });
-                        self.state.mode = StreamingParserMode::UpdateFile { hunk_line_number };
                         return Ok(());
                     }
 
@@ -363,7 +361,6 @@ impl StreamingPatchParser {
                             is_end_of_file: false,
                             line_kinds: Vec::new(),
                         });
-                        self.state.mode = StreamingParserMode::UpdateFile { hunk_line_number };
                         return Ok(());
                     }
 
@@ -379,7 +376,6 @@ impl StreamingPatchParser {
                         if let Some(chunk) = chunks.last_mut() {
                             chunk.is_end_of_file = true;
                         }
-                        self.state.mode = StreamingParserMode::UpdateFile { hunk_line_number };
                         return Ok(());
                     }
 
@@ -398,7 +394,6 @@ impl StreamingPatchParser {
                             chunk.old_lines.push(String::new());
                             chunk.new_lines.push(String::new());
                         }
-                        self.state.mode = StreamingParserMode::UpdateFile { hunk_line_number };
                         return Ok(());
                     }
 
@@ -417,7 +412,6 @@ impl StreamingPatchParser {
                             chunk.old_lines.push(line_to_add.to_string());
                             chunk.new_lines.push(line_to_add.to_string());
                         }
-                        self.state.mode = StreamingParserMode::UpdateFile { hunk_line_number };
                         return Ok(());
                     }
 
@@ -435,7 +429,6 @@ impl StreamingPatchParser {
                             chunk.line_kinds.push(crate::parser::UpdateLineKind::Add);
                             chunk.new_lines.push(line_to_add.to_string());
                         }
-                        self.state.mode = StreamingParserMode::UpdateFile { hunk_line_number };
                         return Ok(());
                     }
 
@@ -453,7 +446,6 @@ impl StreamingPatchParser {
                             chunk.line_kinds.push(crate::parser::UpdateLineKind::Remove);
                             chunk.old_lines.push(line_to_remove.to_string());
                         }
-                        self.state.mode = StreamingParserMode::UpdateFile { hunk_line_number };
                         return Ok(());
                     }
 

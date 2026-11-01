@@ -116,7 +116,7 @@ fn bounded_remote_compacted_history(
     items: Vec<ResponseItem>,
     authenticates_receipt: impl Fn(&ResponseItem) -> bool,
 ) -> Vec<ResponseItem> {
-    let receipt_index = tool_receipt_index(&items);
+    let receipt_index = crate::tool_occurrence::pairs(&items);
     let mut retained_indices = HashSet::new();
     let mut replacements = HashMap::new();
     let mut remaining_tokens = REMOTE_COMPACTION_TOOL_RECEIPT_MAX_TOKENS;
@@ -193,31 +193,14 @@ fn bounded_remote_compacted_history(
         .collect()
 }
 
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
-enum ToolReceiptKind {
-    Function,
-    Custom,
-    Search,
-}
-
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
-enum ToolReceiptSide {
-    Call,
-    Output,
-}
-
 type ToolReceiptIndex = Vec<Option<usize>>;
-
-fn tool_receipt_index(items: &[ResponseItem]) -> ToolReceiptIndex {
-    crate::tool_occurrence::pairs(items)
-}
 
 fn complete_tool_receipt_indices(
     items: &[ResponseItem],
     receipt_index: &ToolReceiptIndex,
     index: usize,
 ) -> Option<Vec<usize>> {
-    tool_receipt_identity(&items[index])?;
+    crate::tool_occurrence::identity(&items[index])?;
     let counterpart = receipt_index.get(index).copied().flatten()?;
     let mut group = vec![index, counterpart];
     group.sort_unstable();
@@ -273,7 +256,7 @@ fn remote_tool_search_receipt_group(
         && tools[0].get("type").and_then(serde_json::Value::as_str)
             == Some(TOOL_SEARCH_RECEIPT_KIND)
         && !prior_receipt.as_ref().is_some_and(|receipt| {
-            remote_tool_search_receipt_is_valid(receipt, call_id, status, execution)
+            receipt.is_valid(call_id, status, execution)
         })
     {
         return None;
@@ -411,15 +394,6 @@ fn parse_remote_tool_search_receipt(
         .flatten()
 }
 
-fn remote_tool_search_receipt_is_valid(
-    receipt: &RemoteToolSearchReceiptV1,
-    call_id: &str,
-    status: &str,
-    execution: &str,
-) -> bool {
-    receipt.is_valid(call_id, status, execution)
-}
-
 fn compact_tool_search_arguments(arguments: &serde_json::Value) -> serde_json::Value {
     let mut compact = serde_json::Map::new();
     for key in ["query", "namespace", "limit", "cursor"] {
@@ -441,36 +415,6 @@ fn compact_tool_search_arguments(arguments: &serde_json::Value) -> serde_json::V
         })
     } else {
         serde_json::Value::Object(compact)
-    }
-}
-
-fn tool_receipt_identity(item: &ResponseItem) -> Option<(ToolReceiptKind, ToolReceiptSide, &str)> {
-    match item {
-        ResponseItem::LocalShellCall {
-            call_id: Some(call_id),
-            ..
-        }
-        | ResponseItem::FunctionCall { call_id, .. } => {
-            Some((ToolReceiptKind::Function, ToolReceiptSide::Call, call_id))
-        }
-        ResponseItem::FunctionCallOutput { call_id, .. } => {
-            Some((ToolReceiptKind::Function, ToolReceiptSide::Output, call_id))
-        }
-        ResponseItem::CustomToolCall { call_id, .. } => {
-            Some((ToolReceiptKind::Custom, ToolReceiptSide::Call, call_id))
-        }
-        ResponseItem::CustomToolCallOutput { call_id, .. } => {
-            Some((ToolReceiptKind::Custom, ToolReceiptSide::Output, call_id))
-        }
-        ResponseItem::ToolSearchCall {
-            call_id: Some(call_id),
-            ..
-        } => Some((ToolReceiptKind::Search, ToolReceiptSide::Call, call_id)),
-        ResponseItem::ToolSearchOutput {
-            call_id: Some(call_id),
-            ..
-        } => Some((ToolReceiptKind::Search, ToolReceiptSide::Output, call_id)),
-        _ => None,
     }
 }
 
@@ -497,14 +441,14 @@ pub(crate) fn trim_function_call_history_to_fit_context_window_for_prompt(
     if estimated_tokens <= context_window {
         return (0, 0);
     }
-    let receipt_index = tool_receipt_index(history.raw_items());
+    let receipt_index = crate::tool_occurrence::pairs(history.raw_items());
     let reused = crate::tool_occurrence::reused_call_ids(history.raw_items());
     let prepared_outputs = prepared_items.map(|items| {
         items
             .iter()
             .filter_map(|item| {
-                let (kind, side, call_id) = tool_receipt_identity(item)?;
-                (side == ToolReceiptSide::Output).then_some(((kind, call_id), item))
+                let (kind, is_call, call_id) = crate::tool_occurrence::identity(item)?;
+                (!is_call).then_some(((kind, call_id), item))
             })
             .collect::<HashMap<_, _>>()
     });
@@ -520,10 +464,10 @@ pub(crate) fn trim_function_call_history_to_fit_context_window_for_prompt(
             continue;
         }
         let current_model_item = if let Some(prepared_outputs) = prepared_outputs.as_ref() {
-            let Some((kind, side, call_id)) = tool_receipt_identity(raw_item) else {
+            let Some((kind, is_call, call_id)) = crate::tool_occurrence::identity(raw_item) else {
                 continue;
             };
-            if side != ToolReceiptSide::Output {
+            if is_call {
                 continue;
             }
             let Some(item) = prepared_outputs.get(&(kind, call_id)) else {

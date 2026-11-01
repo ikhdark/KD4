@@ -86,43 +86,7 @@ pub(crate) struct ProjectInstructionsLoad {
     pub(crate) retained_sources: Vec<RetainedProjectDoc>,
 }
 
-/// Freshness of the AGENTS.md observation attached to one sampling request.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum AgentsMdFreshness {
-    Refreshed,
-    IncompleteRead,
-    #[default]
-    CachedFallback,
-}
-
-impl AgentsMdFreshness {
-    pub(crate) const fn model_visible_description(self) -> &'static str {
-        match self {
-            Self::Refreshed => {
-                "Result provenance: active_instruction_snapshot; freshness: global_snapshot_retained_project_files_refreshed_for_this_sampling_step."
-            }
-            Self::IncompleteRead => {
-                "Result provenance: direct_file_read; freshness: incomplete_read_may_omit_instructions."
-            }
-            Self::CachedFallback => {
-                "Result provenance: cached_observation; freshness: cached_may_be_stale."
-            }
-        }
-    }
-
-    /// Strip only known persisted provenance prefixes, including the former
-    /// session-snapshot claim. Older rollouts must not turn that metadata into rules.
-    pub(crate) fn strip_model_visible_description(self, text: &str) -> Option<&str> {
-        text.strip_prefix(self.model_visible_description())
-            .or_else(|| {
-                (self == Self::Refreshed)
-                    .then(|| text.strip_prefix("Result provenance: active_instruction_snapshot; freshness: complete_session_snapshot_for_current_scope; project_files_not_rechecked_each_sampling_step."))
-                    .flatten()
-            })
-            .and_then(|text| text.strip_prefix("\n\n"))
-    }
-}
+pub(crate) use codex_conversation::instruction_snapshot::AgentsMdFreshness;
 
 struct EnvironmentProjectInstructions {
     loaded: Option<LoadedAgentsMd>,
@@ -219,7 +183,7 @@ impl ProjectDocOmissionRecovery {
         {
             return receipt.notice.clone();
         }
-        let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
+        let artifact = crate::tools::command_output_artifact::create_durable_receipt_artifact(
             config.codex_home.as_path(),
             &self.thread_id,
             &canonical,
@@ -1213,14 +1177,7 @@ pub struct LoadedAgentsMd {
     entries: Vec<InstructionEntry>,
 }
 
-#[derive(Clone)]
-pub(crate) struct RepositoryStableContextBundle {
-    pub(crate) identity: [u8; 32],
-    pub(crate) rendered: Arc<str>,
-    pub(crate) reused: bool,
-    pub(crate) semantic_replacement: bool,
-    pub(crate) source_snapshot: Option<Arc<serde_json::Value>>,
-}
+pub(crate) use codex_conversation::instruction_snapshot::RepositoryStableContextBundle;
 
 #[derive(Serialize, Deserialize)]
 struct AcceptedProjectSources {
@@ -1281,41 +1238,7 @@ impl StableContextRenderer {
     }
 }
 
-impl RepositoryStableContextBundle {
-    pub(crate) fn metadata(&self) -> ([u8; 32], bool, bool) {
-        (self.identity, self.reused, self.semantic_replacement)
-    }
-
-    pub(crate) fn as_cached(&self) -> Self {
-        Self {
-            identity: self.identity,
-            rendered: Arc::clone(&self.rendered),
-            reused: true,
-            semantic_replacement: false,
-            source_snapshot: self.source_snapshot.clone(),
-        }
-    }
-}
-
 impl LoadedAgentsMd {
-    /// Exact instruction sources accepted for this sampling step, including
-    /// configured fallback filenames. A filename alone does not imply loading.
-    pub(crate) fn runtime_input_paths(&self) -> Vec<(String, std::path::PathBuf)> {
-        self.entries
-            .iter()
-            .filter_map(|entry| match &entry.provenance {
-                InstructionProvenance::Project {
-                    source_path,
-                    environment_id,
-                    ..
-                } => Some((
-                    environment_id.clone(),
-                    std::path::PathBuf::from(source_path.inferred_native_path_string()),
-                )),
-                InstructionProvenance::Internal => None,
-            })
-            .collect()
-    }
 
     pub(crate) fn accepted_project_sources(
         &self,

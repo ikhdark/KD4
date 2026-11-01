@@ -13,7 +13,6 @@ mod install;
 mod metadata;
 mod source;
 
-use install::clone_git_source;
 use install::ensure_marketplace_destination_is_inside_install_root;
 use install::marketplace_staging_root;
 use install::replace_marketplace_root;
@@ -80,18 +79,6 @@ fn add_marketplace_sync(
     requirements: &ConfigRequirements,
     request: MarketplaceAddRequest,
 ) -> Result<MarketplaceAddOutcome, MarketplaceAddError> {
-    add_marketplace_sync_with_cloner(codex_home, requirements, request, clone_git_source)
-}
-
-fn add_marketplace_sync_with_cloner<F>(
-    codex_home: &Path,
-    requirements: &ConfigRequirements,
-    request: MarketplaceAddRequest,
-    clone_source: F,
-) -> Result<MarketplaceAddOutcome, MarketplaceAddError>
-where
-    F: Fn(&str, Option<&str>, &[String], &Path) -> Result<String, MarketplaceAddError>,
-{
     let MarketplaceAddRequest {
         source,
         ref_name,
@@ -199,7 +186,7 @@ where
         })?;
     let staged_root = staged_dir.path().to_path_buf();
 
-    let revision = stage_marketplace_source(&source, &sparse_paths, &staged_root, clone_source)?;
+    let revision = stage_marketplace_source(&source, &sparse_paths, &staged_root)?;
 
     let marketplace_name = validate_marketplace_source_root(&staged_root)?;
     validate_marketplace_name_for_add(managed_marketplace_name, &marketplace_name)

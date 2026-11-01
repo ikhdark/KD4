@@ -26,6 +26,22 @@ const REMOTE_PLUGIN_INSTALL_METADATA_SCHEMA_VERSION: u8 = 1;
 // Transactions stage beside the plugin root so activation stays a same-volume rename. The
 // leading dot keeps them out of the plugin-name namespace, which never admits `.`.
 const INSTALL_TRANSACTION_PREFIX: &str = ".plugin-install-";
+const PLUGIN_INSTALL_METADATA_FILE: &str = ".codex-plugin-install.json";
+
+/// Stored in the same publication as the plugin files, not a parallel cache registry.
+#[derive(Debug, Serialize, Deserialize)]
+struct PluginInstallMetadata {
+    publication_id: String,
+    #[serde(default)]
+    marketplace_source: Option<String>,
+}
+
+pub(crate) struct PluginReadLease {
+    pub(crate) root: Option<AbsolutePathBuf>,
+    pub(crate) installation_id: Option<String>,
+    pub(crate) marketplace_source: Option<String>,
+    _entry_lock: fs::File,
+}
 const UNINSTALL_TRANSACTION_PREFIX: &str = ".plugin-uninstall-";
 
 /// Whether an entry beside plugin cache roots is reserved store state (a live transaction, or
@@ -69,12 +85,22 @@ impl<G> PendingPluginInstall<G> {
         &self.result
     }
 
-    pub(crate) fn commit(mut self) -> PluginInstallResult {
-        if let Err(error) = fs::remove_file(self.target_root.join(".codex-install-owner")) {
-            warn!("failed to remove committed plugin publication marker: {error}");
-        }
+    pub(crate) fn bind_marketplace_source(&mut self, source: &str) -> Result<(), PluginStoreError> {
+        let metadata = serde_json::to_vec(&PluginInstallMetadata {
+            publication_id: self.publication_id.clone(),
+            marketplace_source: Some(source.to_string()),
+        }).map_err(|err| PluginStoreError::Invalid(format!("failed to serialize plugin source identity: {err}")))?;
+        write_bytes_atomically(&self.target_root.join(PLUGIN_INSTALL_METADATA_FILE), &metadata)
+            .map_err(|err| PluginStoreError::io("failed to bind plugin marketplace source", err))
+    }
+
+    pub(crate) fn commit(mut self) -> Result<PluginInstallResult, PluginStoreError> {
+        // Removing the pending marker is the durable commit boundary. On failure,
+        // retain rollback ownership instead of reporting an unreadable install as success.
+        fs::remove_file(self.target_root.join(".codex-install-owner"))
+            .map_err(|err| PluginStoreError::io("failed to commit plugin publication", err))?;
         self.committed = true;
-        self.result.clone()
+        Ok(self.result.clone())
     }
 
     fn rollback(&mut self) -> io::Result<()> {
@@ -317,6 +343,44 @@ impl PluginStore {
             .map(|plugin_version| self.plugin_root(plugin_id, &plugin_version))
     }
 
+    /// Hold the existing entry owner's shared lease across all capability reads.
+    /// A pending/failed commit is never a committed installation.
+    pub(crate) fn read_plugin(&self, plugin_id: &PluginId) -> Result<PluginReadLease, PluginStoreError> {
+        let base = self.plugin_base_root(plugin_id);
+        let entry_lock = try_read_plugin_cache_entry(base.as_path())
+            .map_err(|err| PluginStoreError::io("plugin cache entry is busy or unavailable", err))?;
+        if base.join(".codex-install-owner").as_path().try_exists()
+            .map_err(|err| PluginStoreError::io("failed to inspect plugin publication state", err))? {
+            return Err(PluginStoreError::Invalid("plugin installation is not committed; reinstall the plugin".to_string()));
+        }
+        let root = self.active_plugin_root(plugin_id);
+        let metadata_path = base.join(PLUGIN_INSTALL_METADATA_FILE);
+        let installation_id = match fs::File::open(metadata_path.as_path()) {
+            Ok(file) => {
+                use std::io::Read;
+                let mut contents = String::new();
+                file.take(65537).read_to_string(&mut contents)
+                    .map_err(|err| PluginStoreError::io("failed to read plugin installation identity", err))?;
+                if contents.len() > 65536 {
+                    return Err(PluginStoreError::Invalid("plugin installation identity is too large".to_string()));
+                }
+                Some(contents)
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+            Err(err) => return Err(PluginStoreError::io("failed to read plugin installation identity", err)),
+        };
+        let metadata = installation_id.as_deref().map(serde_json::from_str::<PluginInstallMetadata>)
+            .transpose().map_err(|err| PluginStoreError::Invalid(format!("invalid plugin installation identity: {err}")))?;
+        if metadata.as_ref().is_some_and(|metadata| metadata.publication_id.is_empty()) {
+            return Err(PluginStoreError::Invalid("empty plugin installation identity".to_string()));
+        }
+        Ok(PluginReadLease {
+            root, installation_id,
+            marketplace_source: metadata.and_then(|metadata| metadata.marketplace_source),
+            _entry_lock: entry_lock,
+        })
+    }
+
     pub fn is_installed(&self, plugin_id: &PluginId) -> bool {
         self.active_plugin_version(plugin_id).is_some()
     }
@@ -402,7 +466,7 @@ impl PluginStore {
         plugin_id: PluginId,
     ) -> Result<PluginInstallResult, PluginStoreError> {
         self.begin_install(source_path, plugin_id)
-            .map(PendingPluginInstall::commit)
+            .and_then(PendingPluginInstall::commit)
     }
 
     pub(crate) fn begin_install(
@@ -433,7 +497,7 @@ impl PluginStore {
         plugin_version: String,
     ) -> Result<PluginInstallResult, PluginStoreError> {
         self.begin_install_with_version(source_path, plugin_id, plugin_version)
-            .map(PendingPluginInstall::commit)
+            .and_then(PendingPluginInstall::commit)
     }
 
     pub(crate) fn begin_install_with_version(
@@ -466,21 +530,6 @@ impl PluginStore {
         )
     }
 
-    pub(crate) fn install_with_version_and_fallback_manifest(
-        &self,
-        source_path: AbsolutePathBuf,
-        plugin_id: PluginId,
-        plugin_version: String,
-        manifest_contents: &str,
-    ) -> Result<PluginInstallResult, PluginStoreError> {
-        self.begin_install_with_version_and_fallback_manifest(
-            source_path,
-            plugin_id,
-            plugin_version,
-            manifest_contents,
-        )
-        .map(PendingPluginInstall::commit)
-    }
 
     pub(crate) fn begin_install_with_version_and_fallback_manifest(
         &self,
@@ -640,9 +689,10 @@ fn plugin_version_for_install_manifest(
 }
 
 pub fn validate_plugin_version_segment(plugin_version: &str) -> Result<(), String> {
-    if plugin_version.eq_ignore_ascii_case(REMOTE_PLUGIN_INSTALL_METADATA_FILE) {
+    if [REMOTE_PLUGIN_INSTALL_METADATA_FILE, PLUGIN_INSTALL_METADATA_FILE, ".codex-install-owner"]
+        .iter().any(|reserved| plugin_version.eq_ignore_ascii_case(reserved)) {
         return Err(
-            "invalid plugin version: reserved remote install metadata filename".to_string(),
+            "invalid plugin version: reserved install metadata filename".to_string(),
         );
     }
     if plugin_version.is_empty() {
@@ -734,6 +784,18 @@ fn plugin_name_for_source(
 /// still have its inode open. Nonblocking acquisition also avoids config/cache
 /// lock-order waits and leaves unrelated plugin keys independent.
 pub(crate) fn try_lock_plugin_cache_entry(target_root: &Path) -> io::Result<fs::File> {
+    let file = open_plugin_cache_entry_lock(target_root)?;
+    file.try_lock().map_err(io::Error::from)?;
+    Ok(file)
+}
+
+fn try_read_plugin_cache_entry(target_root: &Path) -> io::Result<fs::File> {
+    let file = open_plugin_cache_entry_lock(target_root)?;
+    file.try_lock_shared().map_err(io::Error::from)?;
+    Ok(file)
+}
+
+fn open_plugin_cache_entry_lock(target_root: &Path) -> io::Result<fs::File> {
     let parent = target_root
         .parent()
         .ok_or_else(|| io::Error::other("plugin cache entry has no parent"))?;
@@ -750,7 +812,6 @@ pub(crate) fn try_lock_plugin_cache_entry(target_root: &Path) -> io::Result<fs::
         .read(true)
         .write(true)
         .open(parent.join(lock_name))?;
-    file.try_lock().map_err(io::Error::from)?;
     Ok(file)
 }
 
@@ -816,6 +877,12 @@ fn replace_plugin_root_atomically<G>(
     let publication_id = publication_id.to_string_lossy().into_owned();
     fs::write(staged_root.join(".codex-install-owner"), &publication_id)
         .map_err(|err| PluginStoreError::io("failed to identify staged plugin publication", err))?;
+    let metadata = serde_json::to_vec(&PluginInstallMetadata {
+        publication_id: publication_id.clone(),
+        marketplace_source: None,
+    }).map_err(|err| PluginStoreError::Invalid(format!("failed to serialize plugin installation identity: {err}")))?;
+    fs::write(staged_root.join(PLUGIN_INSTALL_METADATA_FILE), metadata)
+        .map_err(|err| PluginStoreError::io("failed to write plugin installation identity", err))?;
     // Downloads, extraction and source copying do not hold snapshot authority.
     // Revalidate only after staging, while the per-entry lock is still owned.
     let publication_guard = before_publication()?;

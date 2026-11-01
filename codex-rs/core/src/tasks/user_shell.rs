@@ -5,7 +5,6 @@ use std::time::Instant;
 
 use codex_async_utils::CancelErr;
 use codex_async_utils::OrCancelExt;
-use codex_exec_server::ExecEnvPolicy;
 use codex_exec_server::ExecOutputStream as ServerExecOutputStream;
 use codex_exec_server::ExecParams;
 use codex_exec_server::ExecProcess;
@@ -18,7 +17,7 @@ use uuid::Uuid;
 use crate::exec::ExecCapturePolicy;
 use crate::exec::StdoutStream;
 use crate::exec::execute_exec_request;
-use crate::exec_env::CODEX_PERMISSION_PROFILE_ENV_VAR;
+use crate::exec_env::exec_env_policy_from_shell_policy;
 use crate::exec_env::CODEX_THREAD_ID_ENV_VAR;
 use crate::exec_env::create_env;
 use crate::sandboxing::ExecRequest;
@@ -470,25 +469,7 @@ async fn execute_remote_user_shell_command(
     cancellation_token: &CancellationToken,
 ) -> Result<ExecToolCallOutput, UserShellExecError> {
     let policy = &turn_context.config.permissions.shell_environment_policy;
-    let mut exclude = policy
-        .exclude
-        .iter()
-        .map(std::string::ToString::to_string)
-        .collect::<Vec<_>>();
-    exclude.push(CODEX_PERMISSION_PROFILE_ENV_VAR.to_string());
-    let mut r#set = policy.r#set.clone();
-    r#set.retain(|key, _| !key.eq_ignore_ascii_case(CODEX_PERMISSION_PROFILE_ENV_VAR));
-    let env_policy = ExecEnvPolicy {
-        inherit: policy.inherit.clone(),
-        ignore_default_excludes: policy.ignore_default_excludes,
-        exclude,
-        r#set,
-        include_only: policy
-            .include_only
-            .iter()
-            .map(std::string::ToString::to_string)
-            .collect(),
-    };
+    let env_policy = exec_env_policy_from_shell_policy(policy);
     let shell_snapshot = turn_environment
         .shell_snapshot_for_config(turn_environment.cwd(), &turn_context.config)
         .await;

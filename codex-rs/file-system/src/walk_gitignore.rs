@@ -70,6 +70,23 @@ fn probe_error(path: &PathUri, error: io::Error) -> io::Error {
 }
 
 impl WalkGitignore {
+    /// Probe the literal marker on the selected filesystem. Case-folding a
+    /// listed name cannot establish a repository on a case-sensitive directory.
+    pub(super) async fn is_repository_root<F: ExecutorFileSystem + ?Sized>(
+        file_system: &F,
+        directory: &PathUri,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> io::Result<bool> {
+        let marker = directory
+            .join(".git")
+            .map_err(|error| ignore_error(directory, error))?;
+        match file_system.get_metadata(&marker, sandbox).await {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(probe_error(&marker, error)),
+        }
+    }
+
     pub(super) async fn new<F: ExecutorFileSystem + ?Sized>(
         file_system: &F,
         root: &PathUri,
@@ -81,17 +98,12 @@ impl WalkGitignore {
             if ancestors.len() == MAX_ANCESTORS {
                 return Err(ignore_error(root, "ancestor limit exceeded"));
             }
-            let marker = directory
-                .join(".git")
-                .map_err(|error| ignore_error(&directory, error))?;
+            let repository_root =
+                Self::is_repository_root(file_system, &directory, sandbox).await?;
             ancestors.push(directory);
-            match file_system.get_metadata(&marker, sandbox).await {
-                Ok(_) => {
-                    in_repository = true;
-                    break;
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(probe_error(&marker, error)),
+            if repository_root {
+                in_repository = true;
+                break;
             }
         }
         let mut state = Self {

@@ -5,7 +5,6 @@
   - Installs Rust toolchain (via winget rustup) and required components
   - Installs Visual Studio 2022 Build Tools (MSVC + Windows SDK)
   - Installs helpful CLIs used by the repo: git, ripgrep (rg), just, cmake
-  - Installs cargo-insta (for snapshot tests) via cargo
   - Ensures PATH contains Cargo bin for the current session
   - Builds the workspace (cargo build)
 
@@ -148,7 +147,6 @@ $vsOverride = @(
 winget install @WingetArgs --id Microsoft.VisualStudio.2022.BuildTools --override $vsOverride | Out-Host
 
 # Ensure required VC components even if winget doesn't modify the instance
-$isArm64 = ($env:PROCESSOR_ARCHITEW6432 -eq 'ARM64' -or $env:PROCESSOR_ARCHITECTURE -eq 'ARM64')
 $components = @(
   'Microsoft.VisualStudio.Workload.VCTools',
   'Microsoft.VisualStudio.Component.VC.Tools.ARM64',
@@ -203,7 +201,7 @@ function Read-WorkspaceRustToolchain([string]$ManifestPath) {
     $line = $line.Trim()
     if (-not $line -or $line.StartsWith('#')) { continue }
     if ($line -match '^\[([A-Za-z_-]+)\]$') { $section = $Matches[1]; continue }
-    if ($section -ne 'toolchain' -or $line -notmatch '^(channel|components)\s*=\s*(.+)$') {
+    if ($section -ne 'toolchain' -or $line -notmatch '^(channel|profile|components)\s*=\s*(.+)$') {
       throw "Unsupported Rust toolchain declaration: $line"
     }
     $key, $value = $Matches[1], $Matches[2]
@@ -216,6 +214,7 @@ function Read-WorkspaceRustToolchain([string]$ManifestPath) {
     else { $values[$key] = ConvertFrom-Json -InputObject $value -ErrorAction Stop }
   }
   if ($values['channel'] -isnot [string] -or $values['channel'] -notmatch '^[A-Za-z0-9_.-]+$' -or
+      $values['profile'] -isnot [string] -or $values['profile'] -notin @('minimal', 'default', 'complete') -or
       $values['components'] -isnot [array] -or $values['components'].Count -eq 0) {
     throw "Invalid workspace Rust toolchain manifest: $ManifestPath"
   }
@@ -226,8 +225,9 @@ function Read-WorkspaceRustToolchain([string]$ManifestPath) {
 }
 $workspaceToolchain = Read-WorkspaceRustToolchain (Join-Path $PSScriptRoot '..\rust-toolchain.toml')
 $toolchain = $workspaceToolchain['channel']
+$toolchainProfile = $workspaceToolchain['profile']
 $toolchainComponents = $workspaceToolchain['components']
-& rustup toolchain install $toolchain --profile minimal | Out-Host
+& rustup toolchain install $toolchain --profile $toolchainProfile | Out-Host
 Assert-LastExitCode "rustup toolchain install $toolchain"
 & rustup default $toolchain | Out-Host
 Assert-LastExitCode "rustup default $toolchain"
@@ -260,21 +260,8 @@ Write-Host "-- Installing LLVM/Clang" -ForegroundColor DarkCyan
 winget install @WingetArgs --id LLVM.LLVM | Out-Host
 Add-LLVMToPath
 
-# 7) cargo-insta (used by snapshot tests)
-# Ensure MSVC linker is available before building/cargo-install by entering VS dev shell
+# Ensure the MSVC environment is available for the workspace build.
 Enter-VsDevShell
-$hasLink = $false
-# where.exe reports a miss through its exit code; it does not throw. Windows PowerShell may
-# still surface its redirected stderr as an error, which also means the linker is missing.
-try { & where.exe link *> $null; $hasLink = $LASTEXITCODE -eq 0 } catch {}
-if ($hasLink) {
-  Write-Host "-- Installing cargo-insta" -ForegroundColor DarkCyan
-  # An already-current install exits 0, so a nonzero exit is a real failure.
-  & cargo install cargo-insta | Out-Host
-  Assert-LastExitCode "cargo install cargo-insta"
-} else {
-  Write-Host "-- Skipping cargo-insta for now (MSVC linker not found yet)" -ForegroundColor Yellow
-}
 
 if ($SkipBuild) {
   Write-Host "==> Skipping cargo build (SkipBuild specified)" -ForegroundColor Yellow

@@ -13,11 +13,15 @@ Header sensitivity cannot sanitize the upstream raw-byte string diagnostic, and
 upstream provides no request-log sanitizer hook. A new handshake implementation
 or stream-rewriting layer would duplicate security-critical protocol machinery.
 
-All production modules and runtime feature/dependency declarations come from
-that exact fork revision. The original handshake/client.rs SHA256 before the
+All production modules and runtime features come from that exact fork revision.
+Dependency requirements track the latest compatible releases without changing
+its fork-specific APIs. The original handshake/client.rs SHA256 before the
 repair is 9b7b6180e5203e44b58efcb66c8540e2599b305eb9a924c21c240ab2e7a28dfd.
 RFC response verification, extension negotiation, leftover-byte handoff, masking,
 frame/status validation, proxy support and compression are unchanged.
+
+Private-only maintenance removes infallible error wrappers and unused
+array-formatting implementations; public APIs and protocol behavior are unchanged.
 
 This repository intentionally includes no upstream tests, doctests, benchmarks,
 examples, fuzzers, dev dependencies or test helpers. Eighteen complete test-only

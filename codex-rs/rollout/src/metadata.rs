@@ -221,9 +221,14 @@ struct ExtractionCacheKey {
 
 #[derive(Default)]
 struct ExtractionCache {
-    entries: HashMap<ExtractionCacheKey, (ExtractionOutcome, Vec<PayloadDependencyVersion>)>,
-    summaries: HashMap<ExtractionCacheKey, crate::list::HeadTailSummary>,
+    entries: HashMap<ExtractionCacheKey, ExtractionCacheEntry>,
     order: VecDeque<ExtractionCacheKey>,
+}
+
+struct ExtractionCacheEntry {
+    outcome: ExtractionOutcome,
+    payload_versions: Vec<PayloadDependencyVersion>,
+    summary: Option<crate::list::HeadTailSummary>,
 }
 
 fn extraction_cache() -> &'static Mutex<ExtractionCache> {
@@ -237,10 +242,10 @@ pub(crate) fn cached_summary_paths(default_provider: &str) -> HashSet<PathBuf> {
     extraction_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .summaries
-        .keys()
-        .filter(|key| key.default_provider == default_provider)
-        .map(|key| key.path.clone())
+        .entries
+        .iter()
+        .filter(|(key, entry)| key.default_provider == default_provider && entry.summary.is_some())
+        .map(|(key, _)| key.path.clone())
         .collect()
 }
 
@@ -297,9 +302,6 @@ pub(crate) async fn cache_extraction_outcome(
     cache.entries.retain(|candidate, _| {
         candidate.path != key.path || candidate.default_provider != key.default_provider
     });
-    cache.summaries.retain(|candidate, _| {
-        candidate.path != key.path || candidate.default_provider != key.default_provider
-    });
     cache.order.retain(|candidate| {
         candidate.path != key.path || candidate.default_provider != key.default_provider
     });
@@ -309,14 +311,17 @@ pub(crate) async fn cache_extraction_outcome(
         return;
     }
     cache.order.push_back(key.clone());
-    if let Some(summary) = summary {
-        cache.summaries.insert(key.clone(), summary);
-    }
-    cache.entries.insert(key, (outcome, payload_versions));
+    cache.entries.insert(
+        key,
+        ExtractionCacheEntry {
+            outcome,
+            payload_versions,
+            summary,
+        },
+    );
     while cache.order.len() > EXTRACTION_CACHE_CAPACITY {
         if let Some(evicted) = cache.order.pop_front() {
             cache.entries.remove(&evicted);
-            cache.summaries.remove(&evicted);
         }
     }
 }
@@ -328,7 +333,8 @@ pub(crate) async fn cached_head_summary(
     let key = extraction_cache_key(rollout_path, default_provider).await?;
     let (summary, dependencies) = {
         let cache = extraction_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        (cache.summaries.get(&key)?.clone(), cache.entries.get(&key)?.1.clone())
+        let entry = cache.entries.get(&key)?;
+        (entry.summary.clone()?, entry.payload_versions.clone())
     };
     (dependencies.is_empty() || crate::payload_artifact::payload_versions_match(&dependencies).await)
         .then_some(summary)
@@ -341,7 +347,8 @@ async fn cached_extraction_outcome(
     let key = extraction_cache_key(rollout_path, default_provider).await?;
     let (outcome, dependencies) = {
         let cache = extraction_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.entries.get(&key)?.clone()
+        let entry = cache.entries.get(&key)?;
+        (entry.outcome.clone(), entry.payload_versions.clone())
     };
     (dependencies.is_empty() || crate::payload_artifact::payload_versions_match(&dependencies).await)
         .then_some(outcome)

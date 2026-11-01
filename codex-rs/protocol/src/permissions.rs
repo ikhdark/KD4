@@ -31,15 +31,7 @@ pub const PROTECTED_METADATA_PATH_NAMES: &[&str] = &[
     PROTECTED_METADATA_CODEX_PATH_NAME,
 ];
 
-/// Returns true when a path basename is one of the protected workspace metadata names.
-pub fn is_protected_metadata_name(name: &OsStr) -> bool {
-    metadata_path_name(name).is_some()
-}
 
-pub fn is_protected_metadata_directory_name(name: &OsStr) -> bool {
-    path_component_matches(name, OsStr::new(PROTECTED_METADATA_AGENTS_PATH_NAME))
-        || path_component_matches(name, OsStr::new(PROTECTED_METADATA_CODEX_PATH_NAME))
-}
 
 pub(crate) fn path_component_matches(left: &OsStr, right: &OsStr) -> bool {
     if cfg!(windows) {
@@ -61,38 +53,6 @@ pub(crate) fn path_is_within_denied_root(path: &Path, root: &Path) -> bool {
     })
 }
 
-/// Returns the protected workspace metadata name when an agent write to `path`
-/// should be blocked before execution.
-pub fn forbidden_agent_metadata_write(
-    path: &Path,
-    cwd: &Path,
-    file_system_sandbox_policy: &FileSystemSandboxPolicy,
-) -> Option<&'static str> {
-    if !matches!(
-        file_system_sandbox_policy.kind,
-        FileSystemSandboxKind::Restricted
-    ) {
-        return None;
-    }
-
-    let target = resolve_candidate_path(path, cwd)?;
-    let (protected_metadata_path, metadata_name) =
-        metadata_child_of_writable_root(file_system_sandbox_policy, target.as_path(), cwd)?;
-    if has_explicit_write_entry_for_metadata_path(
-        file_system_sandbox_policy,
-        &protected_metadata_path,
-        target.as_path(),
-        cwd,
-    ) {
-        return None;
-    }
-
-    if !file_system_sandbox_policy.can_write_path_with_cwd(target.as_path(), cwd) {
-        return Some(metadata_name);
-    }
-
-    None
-}
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Display, Default, JsonSchema, TS,
@@ -773,37 +733,6 @@ impl FileSystemSandboxPolicy {
         )
     }
 
-    /// Replaces symbolic `:workspace_roots` entries with absolute paths resolved
-    /// against `cwd`.
-    ///
-    /// Use this when a durable permission profile must survive a cwd-only
-    /// update without rebinding its project-root authority to the new cwd.
-    pub fn materialize_project_roots_with_cwd(mut self, cwd: &Path) -> Self {
-        let cwd = AbsolutePathBuf::from_absolute_path(cwd).ok();
-        for entry in &mut self.entries {
-            match &entry.path {
-                FileSystemPath::Special {
-                    value: FileSystemSpecialPath::ProjectRoots { .. },
-                } => {
-                    if let Some(path) = resolve_file_system_path(&entry.path, cwd.as_ref()) {
-                        entry.path = FileSystemPath::Path { path };
-                    }
-                }
-                FileSystemPath::GlobPattern { pattern } => {
-                    if let (Some(cwd), Some(subpath)) =
-                        (cwd.as_ref(), parse_project_roots_glob_pattern(pattern))
-                    {
-                        entry.path = FileSystemPath::GlobPattern {
-                            pattern: resolve_project_roots_glob_pattern(subpath, cwd),
-                        };
-                    }
-                }
-                FileSystemPath::Special { value: _ } => {}
-                FileSystemPath::Path { .. } => {}
-            }
-        }
-        self
-    }
 
     /// Replaces symbolic `:workspace_roots` entries with concrete entries for
     /// each workspace root.
@@ -903,62 +832,7 @@ impl FileSystemSandboxPolicy {
         self
     }
 
-    pub fn with_additional_writable_roots(
-        mut self,
-        cwd: &Path,
-        additional_writable_roots: &[AbsolutePathBuf],
-    ) -> Self {
-        for path in additional_writable_roots {
-            if self.can_write_path_with_cwd(path.as_path(), cwd) {
-                continue;
-            }
 
-            self.entries.push(FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: path.clone() },
-                access: FileSystemAccessMode::Write,
-            });
-        }
-
-        self
-    }
-
-    /// Add roots using legacy `WorkspaceWrite` behavior.
-    ///
-    /// Unlike [`Self::with_additional_writable_roots`], this mirrors legacy
-    /// writable-roots semantics by adding exact roots even when they are
-    /// already writable through `:workspace_roots`, and by adding the default
-    /// read-only protected subpaths for each new root.
-    pub fn with_additional_legacy_workspace_writable_roots(
-        mut self,
-        additional_writable_roots: &[AbsolutePathBuf],
-    ) -> Self {
-        if !matches!(self.kind, FileSystemSandboxKind::Restricted) {
-            return self;
-        }
-
-        for path in additional_writable_roots {
-            if !self.entries.iter().any(|entry| {
-                entry.access.can_write()
-                    && matches!(&entry.path, FileSystemPath::Path { path: existing } if existing == path)
-            }) {
-                self.entries.push(FileSystemSandboxEntry {
-                    path: FileSystemPath::Path { path: path.clone() },
-                    access: FileSystemAccessMode::Write,
-                });
-            }
-
-            for protected_path in default_read_only_subpaths_for_writable_root(
-                path, /*protect_missing_dot_codex*/ false,
-            ) {
-                append_default_read_only_path_if_no_explicit_rule(
-                    &mut self.entries,
-                    protected_path,
-                );
-            }
-        }
-
-        self
-    }
 
     pub fn needs_direct_runtime_enforcement(
         &self,

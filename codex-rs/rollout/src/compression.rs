@@ -1318,13 +1318,6 @@ mod worker {
     }
 
     fn compress_rollout_if_cold_blocking(path: &Path) -> io::Result<CompressionMeasurement> {
-        compress_rollout_if_cold_blocking_with_hook(path, || Ok(()))
-    }
-
-    fn compress_rollout_if_cold_blocking_with_hook(
-        path: &Path,
-        after_final_check: impl FnOnce() -> io::Result<()>,
-    ) -> io::Result<CompressionMeasurement> {
         // A known-hot/missing/non-file candidate needs no physical lock. This
         // observation only skips work; eligible files are rechecked under the
         // lock below, and errors retain the original fenced diagnostic path.
@@ -1404,7 +1397,6 @@ mod worker {
                 /*compressed_bytes*/ None,
             ));
         }
-        after_final_check()?;
         if let Err(error) = std::fs::remove_file(path) {
             if error.kind() == io::ErrorKind::NotFound {
                 super::remove_owned_rollout_file(&compressed_path, &published).map_err(|cleanup| {

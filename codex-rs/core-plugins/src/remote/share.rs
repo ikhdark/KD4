@@ -344,7 +344,7 @@ pub async fn delete_remote_plugin_share(
         &["public", "plugins", "workspace", remote_plugin_id],
     )?;
     let client = &config.http_clients;
-    let request = authenticated_request(client.delete(&url), auth)?;
+    let request = authenticated_request(client.delete(&url), auth);
     send_and_expect_status(request, &url, &[StatusCode::NO_CONTENT]).await?;
     let home = codex_home.to_path_buf();
     let remote_id = remote_plugin_id.to_string();
@@ -382,7 +382,7 @@ pub async fn update_remote_plugin_share_targets(
             .unwrap_or_default();
     let url = remote_plugin_service_url(config, &["ps", "plugins", remote_plugin_id, "shares"])?;
     let client = &config.http_clients;
-    let request = authenticated_request(client.request(Method::PUT, &url), auth)?.json(
+    let request = authenticated_request(client.request(Method::PUT, &url), auth).json(
         &RemotePluginShareUpdateTargetsRequest {
             discoverability,
             targets,
@@ -454,7 +454,7 @@ async fn get_created_workspace_plugins_page(
     page_token: Option<&str>,
 ) -> Result<RemotePluginListResponse, RemotePluginCatalogError> {
     let url = remote_plugin_service_url(config, &["ps", "plugins", "workspace", "created"])?;
-    let mut request = authenticated_request(client.get(&url), auth)?;
+    let mut request = authenticated_request(client.get(&url), auth);
     request = request.query(&[("limit", REMOTE_PLUGIN_LIST_PAGE_LIMIT)]);
     if let Some(page_token) = page_token {
         request = request.query(&[("pageToken", page_token)]);
@@ -471,7 +471,7 @@ async fn create_workspace_plugin_upload(
     remote_plugin_id: Option<&str>,
 ) -> Result<RemoteWorkspacePluginUploadUrlResponse, RemotePluginCatalogError> {
     let url = remote_plugin_service_url(config, &["public", "plugins", "workspace", "upload-url"])?;
-    let request = authenticated_request(client.post(&url), auth)?.json(
+    let request = authenticated_request(client.post(&url), auth).json(
         &RemoteWorkspacePluginUploadUrlRequest {
             filename,
             mime_type: "application/gzip",
@@ -507,7 +507,7 @@ async fn finalize_workspace_plugin_upload(
     url: &str,
     body: RemoteWorkspacePluginCreateRequest,
 ) -> Result<RemoteWorkspacePluginCreateResponse, RemotePluginCatalogError> {
-    let request = authenticated_request(client.post(url), auth)?.json(&body);
+    let request = authenticated_request(client.post(url), auth).json(&body);
     send_and_decode(request, url).await
 }
 
@@ -523,14 +523,7 @@ fn archive_filename(plugin_path: &Path) -> Result<String, RemotePluginCatalogErr
 }
 
 fn archive_plugin_for_upload(plugin_path: &Path) -> Result<Vec<u8>, RemotePluginCatalogError> {
-    archive_plugin_for_upload_with_limit(plugin_path, REMOTE_PLUGIN_SHARE_MAX_ARCHIVE_BYTES)
-}
-
-fn archive_plugin_for_upload_with_limit(
-    plugin_path: &Path,
-    max_bytes: usize,
-) -> Result<Vec<u8>, RemotePluginCatalogError> {
-    pack_plugin_bundle_tar_gz(plugin_path, max_bytes).map_err(|err| match err {
+    pack_plugin_bundle_tar_gz(plugin_path, REMOTE_PLUGIN_SHARE_MAX_ARCHIVE_BYTES).map_err(|err| match err {
         PluginBundlePackError::InvalidPluginPath { path, reason } => {
             RemotePluginCatalogError::InvalidPluginPath { path, reason }
         }
@@ -558,7 +551,9 @@ async fn send_and_expect_status(
         })?;
     let status = response.status();
     if !expected_statuses.contains(&status) {
-        let body = response.text().await.unwrap_or_default();
+        let body = codex_http_client::collect_error_body(response.bytes_stream())
+            .await
+            .unwrap_or_default();
         return Err(RemotePluginCatalogError::UnexpectedStatus {
             url: url_for_error.to_string(),
             status,

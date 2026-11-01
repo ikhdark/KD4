@@ -46,11 +46,7 @@ PYTHON_RECIPE_ACTIONS = {
     ),
     "lanes": ("lanes",),
 }
-STDERR_NULL_TOKEN = "{stderr-null}"
 POWERSHELL_ARGS = "@($args | Select-Object -Skip 1)"
-# This placeholder must be the final token in a recipe snippet because the
-# PowerShell expansion also exits with the command's last exit code.
-POWERSHELL_STDERR_NULL = "2>$null; exit $LASTEXITCODE"
 PROBE_CACHE_TTL_SECONDS = 60 * 60
 PYTHON_CPU_COUNT_ENV_VAR = "PYTHON_CPU_COUNT"
 MAX_DEFAULT_PYTHON_CPU_COUNT = 30
@@ -78,10 +74,8 @@ def main() -> int:
                 [*action, *recipe_args],
                 program=command.removeprefix(PYTHON_RECIPE_MARKER).strip(),
             )
-        which, cache_dir = prepare_recipe_environment(command)
-        return run_powershell(
-            command, recipe_name, recipe_args, which=which, cache_dir=cache_dir
-        )
+        which = prepare_recipe_environment(command)
+        return run_powershell(command, recipe_name, recipe_args, which=which)
     except ValueError as exc:
         print(f"just shell adapter: {exc}", file=sys.stderr)
         return 1
@@ -89,7 +83,7 @@ def main() -> int:
 
 def prepare_recipe_environment(
     command: str,
-) -> tuple[Callable[[str], str | None], Path]:
+) -> Callable[[str], str | None]:
     """Apply the same defaults to shell and explicitly structured recipes."""
     repo_root = Path(__file__).resolve().parents[2]
     cache_dir = probe_cache_dir(repo_root)
@@ -105,15 +99,14 @@ def prepare_recipe_environment(
     which = memoized_which(shutil.which)
     if command_needs_rust_tooling(command):
         os.environ.update(
-            rust_tool_env(
+            shared_rust_tool_env.local_rust_env(
                 os.environ,
                 which=which,
-                cache_dir=cache_dir,
                 repo_root=repo_root,
             )
         )
 
-    return which, cache_dir
+    return which
 
 
 def run_python(script: str, arguments: list[str], *, program: str = "python") -> int:
@@ -123,7 +116,7 @@ def run_python(script: str, arguments: list[str], *, program: str = "python") ->
     caller's active venv must be used just as it is by the PowerShell adapter.
     Inherit streams and process ownership; do not buffer, retry, or detach.
     """
-    which, cache_dir = prepare_recipe_environment(f"{program} {script}")
+    which = prepare_recipe_environment(f"{program} {script}")
     if program != "python":
         # The Just `python` variable historically accepts a shell expression
         # (for example `python -I`). Preserve explicit overrides unchanged;
@@ -134,7 +127,6 @@ def run_python(script: str, arguments: list[str], *, program: str = "python") ->
             "python-recipe",
             arguments,
             which=which,
-            cache_dir=cache_dir,
         )
     try:
         return subprocess.run(
@@ -153,16 +145,6 @@ def command_needs_rust_tooling(command: str) -> bool:
         or "rust_build_status.py" in command
         or "cargo-lane" in command
     )
-
-
-def rust_tool_env(
-    env: Mapping[str, str],
-    *,
-    which: Callable[[str], str | None],
-    cache_dir: Path | None = None,
-    repo_root: Path | None = None,
-) -> dict[str, str]:
-    return shared_rust_tool_env.local_rust_env(env, which=which, repo_root=repo_root)
 
 
 def python_tool_env(
@@ -283,7 +265,6 @@ def run_powershell(
     recipe_args: list[str],
     *,
     which: Callable[[str], str | None] = shutil.which,
-    cache_dir: Path | None = None,
     stderr=sys.stderr,
 ) -> int:
     pwsh = which("pwsh.exe") or which("pwsh")
@@ -294,9 +275,7 @@ def run_powershell(
             file=stderr,
         )
         return 1
-    command = render_command(
-        command, args=POWERSHELL_ARGS, stderr_null=POWERSHELL_STDERR_NULL
-    )
+    command = command.replace(ARGS_TOKEN, POWERSHELL_ARGS)
     try:
         return subprocess.run(
             [
@@ -314,16 +293,6 @@ def run_powershell(
     except OSError as exc:
         print(f"Failed to launch PowerShell ('pwsh'): {exc}", file=stderr)
         return 1
-
-
-def render_command(command: str, *, args: str, stderr_null: str) -> str:
-    if STDERR_NULL_TOKEN in command:
-        stripped = command.rstrip()
-        if command.count(STDERR_NULL_TOKEN) > 1 or not stripped.endswith(
-            STDERR_NULL_TOKEN
-        ):
-            raise ValueError(f"{STDERR_NULL_TOKEN} must be the final token")
-    return command.replace(ARGS_TOKEN, args).replace(STDERR_NULL_TOKEN, stderr_null)
 
 
 if __name__ == "__main__":

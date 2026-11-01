@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fmt;
-use std::future::Future;
 use std::io;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -526,57 +525,17 @@ impl RouteAwareClientPool {
     pub async fn client_for_url(&self, url: &str) -> Result<HttpClient, RouteAwareRequestError> {
         validate_request_url(&into_reqwest_url(url)?)?;
         Ok(self
-            .client_for_url_with_resolver(url, |request_url| {
-                let http_client_factory = self.http_client_factory.clone();
-                async move {
-                    http_client_factory
-                        .resolve_proxy_route_async(request_url)
-                        .await
-                }
-            })
+            .resolved_client_for_url(url)
             .await?
             .1)
     }
 
-    /// Returns the number of distinct resolved routes currently cached by this pool.
-    pub fn cached_route_count(&self) -> usize {
-        self.clients
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clients
-            .len()
-    }
 
-    /// Returns whether two pool handles share the same route-client cache.
-    pub fn shares_cache_with(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.clients, &other.clients)
-    }
 
     async fn send(
         &self,
-        request: reqwest::Request,
-    ) -> Result<reqwest::Response, RouteAwareRequestError> {
-        let http_client_factory = self.http_client_factory.clone();
-        self.send_with_resolver(request, move |request_url| {
-            let http_client_factory = http_client_factory.clone();
-            async move {
-                http_client_factory
-                    .resolve_proxy_route_async(request_url)
-                    .await
-            }
-        })
-        .await
-    }
-
-    async fn send_with_resolver<F, Fut>(
-        &self,
         mut request: reqwest::Request,
-        resolve_route: F,
-    ) -> Result<reqwest::Response, RouteAwareRequestError>
-    where
-        F: Fn(String) -> Fut,
-        Fut: Future<Output = io::Result<OutboundProxyRoute>>,
-    {
+    ) -> Result<reqwest::Response, RouteAwareRequestError> {
         let request_method = request.method().clone();
         self.client_builder
             .apply_default_headers(request.headers_mut());
@@ -596,12 +555,12 @@ impl RouteAwareClientPool {
             let (current_route, client) = match timeout_deadline {
                 Some(timeout_deadline) => tokio::time::timeout_at(
                     timeout_deadline,
-                    self.client_for_url_with_resolver(current_url.as_str(), &resolve_route),
+                    self.resolved_client_for_url(current_url.as_str()),
                 )
                 .await
                 .map_err(|_| RouteAwareRequestError::Timeout)??,
                 None => {
-                    self.client_for_url_with_resolver(current_url.as_str(), &resolve_route)
+                    self.resolved_client_for_url(current_url.as_str())
                         .await?
                 }
             };
@@ -656,9 +615,9 @@ impl RouteAwareClientPool {
                         self.http_client_factory.invalidate_cached_proxy_route(current_url.as_str());
                         if let Some(replay) = route_replay {
                             let fresh = match timeout_deadline {
-                                Some(deadline) => tokio::time::timeout_at(deadline, resolve_route(current_url.to_string()))
+                                Some(deadline) => tokio::time::timeout_at(deadline, self.http_client_factory.resolve_proxy_route_async(current_url.to_string()))
                                     .await.map_err(|_| RouteAwareRequestError::Timeout)?,
-                                None => resolve_route(current_url.to_string()).await,
+                                None => self.http_client_factory.resolve_proxy_route_async(current_url.to_string()).await,
                             }.map_err(RouteAwareClientPoolError::Resolve)?;
                             if fresh != current_route {
                                 request = replay;
@@ -712,20 +671,15 @@ impl RouteAwareClientPool {
         }
     }
 
-    async fn client_for_url_with_resolver<F, Fut>(
+    async fn resolved_client_for_url(
         &self,
         request_url: &str,
-        resolve_route: F,
-    ) -> Result<(OutboundProxyRoute, HttpClient), RouteAwareClientPoolError>
-    where
-        F: FnOnce(String) -> Fut,
-        Fut: Future<Output = io::Result<OutboundProxyRoute>>,
-    {
+    ) -> Result<(OutboundProxyRoute, HttpClient), RouteAwareClientPoolError> {
         let route_start = std::time::Instant::now();
         let route = if self.force_direct {
             OutboundProxyRoute::Direct
         } else {
-            resolve_route(request_url.to_string())
+            self.http_client_factory.resolve_proxy_route_async(request_url.to_string())
                 .await
                 .map_err(RouteAwareClientPoolError::Resolve)?
         };

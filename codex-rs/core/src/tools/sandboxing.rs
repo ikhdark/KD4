@@ -2,7 +2,7 @@
 //!
 //! Consolidates the approval flow primitives (`ApprovalDecision`, `ApprovalStore`,
 //! `ApprovalCtx`, `Approvable`) together with the sandbox orchestration traits
-//! and helpers (`Sandboxable`, `ToolRuntime`, `SandboxAttempt`, etc.).
+//! and helpers (`ToolRuntime`, `SandboxAttempt`, etc.).
 
 use crate::sandboxing::ExecOptions;
 use crate::sandboxing::SandboxPermissions;
@@ -22,7 +22,6 @@ use codex_protocol::request_permissions::UriAdditionalPermissionProfile;
 use codex_sandboxing::SandboxCommand;
 use codex_sandboxing::SandboxTransformRequest;
 use codex_sandboxing::SandboxType;
-use codex_sandboxing::SandboxablePreference;
 use codex_sandboxing::policy_transforms::effective_permission_profile_uri;
 use codex_sandboxing::transform;
 use codex_tools::ToolName;
@@ -325,14 +324,6 @@ pub(crate) trait Approvable<Req> {
         SandboxPermissions::UseDefault
     }
 
-    fn should_bypass_approval(&self, policy: AskForApproval, already_approved: bool) -> bool {
-        if already_approved {
-            // We do not ask one more time
-            return true;
-        }
-        matches!(policy, AskForApproval::Never)
-    }
-
     /// Return `Some(_)` to specify a custom exec approval requirement, or `None`
     /// to fall back to policy-based default.
     fn exec_approval_requirement(&self, _req: &Req) -> Option<ExecApprovalRequirement> {
@@ -345,37 +336,11 @@ pub(crate) trait Approvable<Req> {
         None
     }
 
-    /// Decide we can request an approval for no-sandbox execution.
-    fn wants_no_sandbox_approval(&self, policy: AskForApproval) -> bool {
-        match policy {
-            AskForApproval::UnlessTrusted => true,
-            AskForApproval::Never => false,
-            AskForApproval::OnRequest => false,
-            AskForApproval::Granular(granular_config) => granular_config.sandbox_approval,
-        }
-    }
-
     fn start_approval_async<'a>(
         &'a mut self,
         req: &'a Req,
         ctx: ApprovalCtx<'a>,
     ) -> BoxFuture<'a, ReviewDecision>;
-}
-
-pub(crate) trait Sandboxable {
-    fn sandbox_preference(&self) -> SandboxablePreference;
-    fn escalate_on_failure(&self) -> bool {
-        true
-    }
-
-    /// Whether a completed sandbox-denial result is proven safe to replay.
-    ///
-    /// Sandbox denials can be inferred from output after a process or patch has
-    /// already produced side effects. Runtimes must opt in only when they can
-    /// prove the denied attempt was not dispatched.
-    fn sandbox_denial_replay_is_safe(&self) -> bool {
-        false
-    }
 }
 
 pub(crate) struct ToolCtx {
@@ -394,7 +359,7 @@ pub(crate) enum ToolError {
     Codex(CodexErr),
 }
 
-pub(crate) trait ToolRuntime<Req, Out>: Approvable<Req> + Sandboxable {
+pub(crate) trait ToolRuntime<Req, Out>: Approvable<Req> {
 
     fn sandbox_cwd<'a>(&self, _req: &'a Req) -> Option<&'a PathUri> {
         None

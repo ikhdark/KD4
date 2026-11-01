@@ -1,5 +1,5 @@
 use codex_api::SearchInput;
-use codex_core::parse_turn_item;
+use codex_conversation::event_mapping::parse_turn_item;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::ContentItem;

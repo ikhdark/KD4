@@ -21,7 +21,6 @@ use crate::tools::sandboxing::ApprovalCtx;
 use crate::tools::sandboxing::ExecApprovalRequirement;
 use crate::tools::sandboxing::PermissionRequestPayload;
 use crate::tools::sandboxing::SandboxAttempt;
-use crate::tools::sandboxing::Sandboxable;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::ToolRuntime;
@@ -31,7 +30,6 @@ use codex_protocol::error::SandboxErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::ReviewDecision;
-use codex_sandboxing::SandboxablePreference;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
@@ -66,11 +64,8 @@ pub struct ShellRequest {
 }
 
 pub struct ShellRuntime {
-    last_validation_attempt_output: Option<ExecToolCallOutput>,
     last_validation_attempt_started: bool,
     raw_output: Option<crate::tools::command_output_artifact::capture::CapturedShellOutput>,
-    validation_raw_output:
-        Option<crate::tools::command_output_artifact::capture::CapturedShellOutput>,
 }
 
 #[derive(serde::Serialize, Clone, Debug, Eq, PartialEq, Hash)]
@@ -86,15 +81,9 @@ pub(crate) struct ApprovalKey {
 impl ShellRuntime {
     pub(crate) fn for_shell_command() -> Self {
         Self {
-            last_validation_attempt_output: None,
             last_validation_attempt_started: false,
             raw_output: None,
-            validation_raw_output: None,
         }
-    }
-
-    pub(crate) fn take_last_validation_attempt_output(&mut self) -> Option<ExecToolCallOutput> {
-        self.last_validation_attempt_output.take()
     }
 
     pub(crate) fn take_last_validation_attempt_started(&mut self) -> bool {
@@ -103,32 +92,8 @@ impl ShellRuntime {
 
     pub(crate) fn take_raw_output(
         &mut self,
-        restored_validation: bool,
     ) -> Option<crate::tools::command_output_artifact::capture::CapturedShellOutput> {
-        if restored_validation {
-            self.validation_raw_output.take()
-        } else {
-            self.raw_output.take()
-        }
-    }
-
-    fn remember_validation_attempt_error(
-        &mut self,
-        is_validation: bool,
-        attempt_started: bool,
-        error: &CodexErr,
-    ) {
-        if !is_validation {
-            return;
-        }
-        self.last_validation_attempt_started |= attempt_started;
-        let output = match error {
-            CodexErr::Sandbox(SandboxErr::Denied { output, .. })
-            | CodexErr::Sandbox(SandboxErr::Timeout { output }) => output.as_ref(),
-            _ => return,
-        };
-        self.last_validation_attempt_output = Some(output.clone());
-        self.validation_raw_output = self.raw_output.clone();
+        self.raw_output.take()
     }
 
     fn stdout_stream(
@@ -177,15 +142,6 @@ fn mark_command_stalled(output: &mut ExecToolCallOutput, stall_timeout_ms: u64) 
     output.stderr.text.push_str(&notice);
     output.exit_code = crate::exec::EXEC_TIMEOUT_EXIT_CODE;
     output.timed_out = true;
-}
-
-impl Sandboxable for ShellRuntime {
-    fn sandbox_preference(&self) -> SandboxablePreference {
-        SandboxablePreference::Auto
-    }
-    fn escalate_on_failure(&self) -> bool {
-        true
-    }
 }
 
 impl Approvable<ShellRequest> for ShellRuntime {
@@ -341,6 +297,7 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
                 &req.command_for_approval,
                 req.cwd.as_path(),
                 &env,
+                ctx.turn.file_system_sandbox_policy().has_full_disk_read_access(),
             )
             .await
             .map_err(ToolError::Rejected)?;
@@ -476,11 +433,7 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
                 {
                     crate::validation_task::policy_attempt_not_started(ctx).await;
                 }
-                self.remember_validation_attempt_error(
-                    req.validation_launch,
-                    attempt_started,
-                    &err,
-                );
+                self.last_validation_attempt_started |= req.validation_launch && attempt_started;
                 return Err(ToolError::Codex(err));
             }
         };

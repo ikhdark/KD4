@@ -362,7 +362,6 @@ impl Handler {
             let mut folded_admission_events = 0_usize;
             let mut folded_completion_events = 0_usize;
             let mut maintenance_deadline = Some(wait_started + maintenance_interval);
-            let mut unchanged_store_polls = 0_u32;
             let mut drained_event_pages = 0_u32;
             let (outcome, wake_read, hydrated_assignments, settled_revision) = 'wait_owner: loop {
                 if let Some(outcome) = input.current().await {
@@ -483,9 +482,7 @@ impl Handler {
                                     error,
                                 )
                             })?;
-                            if wake_read.updated_agents.is_empty() {
-                                unchanged_store_polls = unchanged_store_polls.saturating_add(1);
-                            } else {
+                            if !wake_read.updated_agents.is_empty() {
                                 outcome = WaitOutcome::DurableActivity;
                             }
                             // A nudge is maintenance, not a deliverable update. A caller
@@ -934,7 +931,9 @@ impl Handler {
                     // It is a bounded receipt, not an embedded result, and preserves
                     // recovery across multiple interrupted responses.
                     let retained = serde_json::to_value(&result).map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
-                    let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
+                    // The cursor outlives tool-response delivery and history pruning.
+                    // Retain its recovery chain under that durable owner before CAS.
+                    let artifact = crate::tools::command_output_artifact::create_durable_receipt_artifact(
                         &turn.config.codex_home, &session.thread_id.to_string(),
                         &codex_tools::CanonicalToolResult::json(retained),
                     ).await;
@@ -946,6 +945,23 @@ impl Handler {
                     let published = store.publish_automatic_wake_delivery(root.to_string(), consuming_agent_path.clone(), cursor, next, receipt.to_string())
                         .await.map_err(|error| task_store_context_error("wait_agent", "wait_agent could not publish its retained delivery", error))?;
                     if !published {
+                        let home = turn.config.codex_home.clone();
+                        let thread_id = session.thread_id.to_string();
+                        if let Some(id) = artifact.id {
+                            // No await before transferring this confirmed loser's cleanup.
+                            // Errors/unknown CAS outcomes above deliberately retain custody.
+                            session.terminal_tasks.spawn(async move {
+                                crate::tools::command_output_artifact::release_unpublished_durable_receipt_artifact(
+                                    &home, &thread_id, id,
+                                ).await
+                            }).await
+                                .map_err(|error| FunctionCallError::RespondToModel(format!(
+                                    "wait_agent unpublished delivery cleanup owner failed: {error}"
+                                )))?
+                                .map_err(|error| FunctionCallError::RespondToModel(format!(
+                                    "wait_agent unpublished delivery cleanup failed: {error}"
+                                )))?;
+                        }
                         return Err(FunctionCallError::RespondToModel("wait_agent concurrent consumer advanced the cursor; call wait_agent again to recover its retained delivery".to_string()));
                     }
                 }
@@ -1441,6 +1457,12 @@ fn input_only_result(
 
 
 impl CoreToolRuntime for Handler {
+    fn delegates_workspace_admission(&self) -> bool {
+        // AgentControl and the task store own event waiting and cursor commits.
+        // A checkout lease here blocks the control calls that can end the wait.
+        true
+    }
+
     fn waits_for_runtime_cancellation(&self) -> bool {
         true
     }
@@ -2186,8 +2208,6 @@ async fn wait_wake_events(
     }
 }
 
-// The explicit activity, deadline, durable-store, and cursor inputs document
-// every wake source participating in this private wait state machine.
 // The explicit input, deadline, durable-store, and cursor owners document
 // every wake source participating in this private wait state machine.
 async fn wait_for_activity(

@@ -1,4 +1,4 @@
-use codex_core::config::Config;
+use codex_runtime_config::config::Config;
 use codex_http_client::HttpClient;
 use codex_http_client::HttpClientBuilder;
 use codex_http_client::HttpResponse;

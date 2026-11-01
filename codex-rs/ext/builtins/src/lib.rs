@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use codex_core::config::Config;
+use codex_runtime_config::Config;
 use codex_exec_server::EnvironmentManager;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_protocol::protocol::SessionSource;

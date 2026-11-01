@@ -250,7 +250,7 @@ struct StdioServerProcessHandleInner {
 }
 
 enum StdioServerProcessKind {
-    Local(Option<LocalProcessTerminator>),
+    Local(LocalProcessTerminator),
     Executor(Arc<dyn ExecProcess>),
 }
 
@@ -305,7 +305,7 @@ impl LocalStdioServerLauncher {
         managed.attach_and_resume(process_id)?;
         let process = StdioServerProcessHandle::local(
             program_name.clone(),
-            Some(LocalProcessTerminator::new(process_id, managed)),
+            LocalProcessTerminator::new(managed),
         );
 
         if let Some(stderr) = stderr {
@@ -335,12 +335,9 @@ impl LocalStdioServerLauncher {
 }
 
 impl LocalProcessTerminator {
-    fn new(process_group_id: u32, managed: Arc<ManagedRootProcess>) -> Self {
-        {
-            let _ = process_group_id;
-            Self {
-                managed: Mutex::new(Some(managed)),
-            }
+    fn new(managed: Arc<ManagedRootProcess>) -> Self {
+        Self {
+            managed: Mutex::new(Some(managed)),
         }
     }
 
@@ -367,7 +364,7 @@ impl LocalProcessTerminator {
 }
 
 impl StdioServerProcessHandle {
-    fn local(program_name: String, terminator: Option<LocalProcessTerminator>) -> Self {
+    fn local(program_name: String, terminator: LocalProcessTerminator) -> Self {
         Self {
             inner: Arc::new(StdioServerProcessHandleInner {
                 program_name,
@@ -400,8 +397,7 @@ impl StdioServerProcessHandle {
         }
 
         let result = match &self.inner.kind {
-            StdioServerProcessKind::Local(Some(terminator)) => terminator.terminate(),
-            StdioServerProcessKind::Local(None) => Ok(()),
+            StdioServerProcessKind::Local(terminator) => terminator.terminate(),
             StdioServerProcessKind::Executor(process) => {
                 process.terminate().await.map_err(io::Error::other)
             }
@@ -418,7 +414,7 @@ impl StdioServerProcessHandle {
 
     pub(crate) fn reaped(&self) {
         self.inner.terminated.store(true, Ordering::Release);
-        if let StdioServerProcessKind::Local(Some(terminator)) = &self.inner.kind {
+        if let StdioServerProcessKind::Local(terminator) = &self.inner.kind {
             terminator.reaped();
         }
     }
@@ -431,7 +427,7 @@ impl Drop for StdioServerProcessHandleInner {
         }
 
         match &self.kind {
-            StdioServerProcessKind::Local(Some(terminator)) => {
+            StdioServerProcessKind::Local(terminator) => {
                 if let Err(error) = terminator.terminate() {
                     warn!(
                         "Failed to terminate local MCP server process on drop ({}): {error}",
@@ -439,7 +435,6 @@ impl Drop for StdioServerProcessHandleInner {
                     );
                 }
             }
-            StdioServerProcessKind::Local(None) => {}
             StdioServerProcessKind::Executor(process) => {
                 let process = Arc::clone(process);
                 let program_name = self.program_name.clone();

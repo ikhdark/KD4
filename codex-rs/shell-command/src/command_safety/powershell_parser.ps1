@@ -271,8 +271,9 @@ function Test-NativeExitGuard {
 }
 
 # Value-only ASTs may be emitted, indexed or assigned to local variables.
-# Calls, method invocation, static members, casts, redirections, scoped writes
-# and executable subexpressions are deliberately not represented here.
+# Explicit exceptions are [pscustomobject] casts and [Math]::Round on allowed data.
+# Other calls/static members/casts, redirections, scoped writes and executable
+# subexpressions are deliberately not represented here.
 function Test-PureLocalExpression {
     param($expression)
     if ($expression -is [System.Management.Automation.Language.ConvertExpressionAst]) {

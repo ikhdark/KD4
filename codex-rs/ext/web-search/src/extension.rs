@@ -8,7 +8,7 @@ use codex_api::LocationType;
 use codex_api::SearchContextSize;
 use codex_api::SearchFilters;
 use codex_api::SearchSettings;
-use codex_core::config::Config;
+use codex_runtime_config::Config;
 use codex_extension_api::ConfigContributor;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionFuture;

@@ -100,13 +100,7 @@ pub struct ResponseEventReceiver<E> {
 pub fn response_event_channel<E>(
     capacity: usize,
 ) -> (ResponseEventSender<E>, ResponseEventReceiver<E>) {
-    channel_with_limit(capacity, RESPONSE_EVENT_QUEUE_BYTES)
-}
-
-pub(crate) fn channel_with_limit<E>(
-    capacity: usize,
-    limit: usize,
-) -> (ResponseEventSender<E>, ResponseEventReceiver<E>) {
+    let limit = RESPONSE_EVENT_QUEUE_BYTES;
     assert!(limit > 0 && limit <= u32::MAX as usize);
     let (tx, rx) = mpsc::channel(capacity);
     let bytes = Arc::new(Semaphore::new(limit));

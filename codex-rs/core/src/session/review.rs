@@ -60,13 +60,6 @@ pub(super) async fn spawn_review_thread(
                 .or_else(|| review_model_info.default_reasoning_level.clone());
         }
     }
-    per_turn_config.permissions.shell_environment_policy = parent_turn_context
-        .config
-        .permissions
-        .shell_environment_policy
-        .clone();
-    per_turn_config.compact_prompt = parent_turn_context.config.compact_prompt.clone();
-
     let session_telemetry = parent_turn_context
         .session_telemetry
         .clone()

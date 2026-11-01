@@ -9,8 +9,6 @@ use std::hash::Hash;
 use std::hash::Hasher;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::Weak;
 use std::time::Duration;
 
 use sha1::digest::Output;
@@ -18,17 +16,13 @@ use sha1::digest::Output;
 use codex_apply_patch::AppliedPatchChange;
 use codex_apply_patch::AppliedPatchDelta;
 use codex_apply_patch::AppliedPatchFileChange;
-pub(crate) use codex_command_analysis::command_mutation::CommandMutation;
-pub(crate) use codex_command_analysis::command_mutation::command_is_read_only_git;
-pub(crate) use codex_command_analysis::command_mutation::command_mutation;
-pub(crate) use codex_command_analysis::command_mutation::command_reads_repository_history;
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 const DEV_NULL: &str = "/dev/null";
 // Normal edits finish well within 100 ms; pathological inputs fall back to a coarse,
 // content-exact diff without stalling tool completion.
 const DIFF_TIMEOUT: Duration = Duration::from_millis(100);
-pub(crate) const TURN_DIFF_LOCATOR: &str = "context:turn-diff";
+pub(crate) use codex_conversation::TURN_DIFF_LOCATOR;
 struct TrackedContent {
     content: String,
     mode: Option<String>,
@@ -39,26 +33,25 @@ struct TrackedContent {
 struct TrackedPath {
     environment_id: String,
     path: PathBuf,
-    comparison_key: String,
 }
 
 impl TrackedPath {
     fn new(environment_id: &str, path: &Path) -> Self {
         // Endpoint spelling comes from the executor. Host Windows case and
         // separator rules cannot define identity for remote POSIX filenames.
-        let comparison_key = hex::encode(path.as_os_str().as_encoded_bytes());
         let path = path.to_path_buf();
         Self {
             environment_id: environment_id.to_string(),
             path,
-            comparison_key,
         }
     }
 }
 
 impl PartialEq for TrackedPath {
     fn eq(&self, other: &Self) -> bool {
-        self.environment_id == other.environment_id && self.comparison_key == other.comparison_key
+        self.environment_id == other.environment_id
+            && self.path.as_os_str().as_encoded_bytes()
+                == other.path.as_os_str().as_encoded_bytes()
     }
 }
 
@@ -67,7 +60,7 @@ impl Eq for TrackedPath {}
 impl Hash for TrackedPath {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.environment_id.hash(state);
-        self.comparison_key.hash(state);
+        self.path.as_os_str().as_encoded_bytes().hash(state);
     }
 }
 
@@ -79,8 +72,8 @@ impl PartialOrd for TrackedPath {
 
 impl Ord for TrackedPath {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (&self.environment_id, &self.comparison_key)
-            .cmp(&(&other.environment_id, &other.comparison_key))
+        (&self.environment_id, self.path.as_os_str().as_encoded_bytes())
+            .cmp(&(&other.environment_id, other.path.as_os_str().as_encoded_bytes()))
     }
 }
 
@@ -133,8 +126,6 @@ pub struct TurnDiffTracker {
     patch_modes: HashMap<TrackedPath, String>,
     unified_diff: Option<String>,
     last_emitted_unified_diff: Option<String>,
-    workspace_evidence_generation_batch:
-        Option<Weak<crate::tools::parallel::WorkspaceEvidenceGenerationBatch>>,
 }
 
 impl Default for TurnDiffTracker {
@@ -169,7 +160,6 @@ impl Default for TurnDiffTracker {
             patch_modes: HashMap::new(),
             unified_diff: None,
             last_emitted_unified_diff: None,
-            workspace_evidence_generation_batch: None,
         }
     }
 }
@@ -177,23 +167,6 @@ impl Default for TurnDiffTracker {
 impl TurnDiffTracker {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub(crate) fn activate_workspace_evidence_generation_batch(
-        &mut self,
-        batch: &Arc<crate::tools::parallel::WorkspaceEvidenceGenerationBatch>,
-    ) {
-        self.workspace_evidence_generation_batch = Some(Arc::downgrade(batch));
-    }
-
-    pub(crate) fn workspace_evidence_generation_batch_for_call(
-        &self,
-        call_id: &str,
-    ) -> Option<Arc<crate::tools::parallel::WorkspaceEvidenceGenerationBatch>> {
-        self.workspace_evidence_generation_batch
-            .as_ref()
-            .and_then(Weak::upgrade)
-            .filter(|batch| batch.accepts_call(call_id))
     }
 
     pub fn with_environment_display_roots(
@@ -294,9 +267,7 @@ impl TurnDiffTracker {
             return;
         }
 
-        if !self.remote_environments.contains(environment_id) {
-            self.set_patch_modes(environment_id, delta.preimage_modes().clone());
-        }
+        self.set_patch_modes(environment_id, delta.preimage_modes().clone());
 
         let mut changed = HashSet::new();
         for original in delta.changes() {
@@ -366,7 +337,7 @@ impl TurnDiffTracker {
     }
 
     /// Keeps the known endpoints of a patch that cannot join the exact diff,
-    /// so `changed_paths` still names them. Nothing is rendered.
+    /// so unavailable paths still qualify later diff recovery. Nothing is rendered.
     fn record_unavailable_delta_paths(&mut self, environment_id: &str, delta: &AppliedPatchDelta) {
         for original in delta.changes() {
             let change = delta.endpoint_change(original);
@@ -383,7 +354,7 @@ impl TurnDiffTracker {
         }
     }
 
-    pub(crate) fn set_patch_modes(
+    fn set_patch_modes(
         &mut self,
         environment_id: &str,
         modes: HashMap<PathBuf, String>,
@@ -517,36 +488,6 @@ impl TurnDiffTracker {
         self.unproven_command_revision
     }
 
-    pub(crate) fn has_untracked_changes(&self) -> bool {
-        !self.valid || !self.unavailable_paths.is_empty()
-    }
-
-    /// Known patch paths remain useful for validation attribution even when
-    /// their exact diff is unavailable. This is not the entire workspace delta.
-    pub(crate) fn changed_paths(&self) -> Vec<(String, PathBuf)> {
-        self.baseline_by_path
-            .keys()
-            .chain(self.current_by_path.keys())
-            .chain(self.unavailable_paths.iter())
-            .filter(|path| {
-                !self.valid
-                    || self.unavailable_paths.contains(*path)
-                    || match (
-                        self.baseline_by_path.get(*path),
-                        self.current_by_path.get(*path),
-                    ) {
-                        (Some(before), Some(after)) => {
-                            before.content != after.content || before.mode != after.mode
-                        }
-                        (None, None) => false,
-                        _ => true,
-                    }
-            })
-            .map(|path| (path.environment_id.clone(), path.path.clone()))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
-    }
 
     fn retain_owned_operation(
         &mut self,

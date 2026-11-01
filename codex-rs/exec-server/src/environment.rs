@@ -79,18 +79,6 @@ impl EnvironmentManager {
     }
 
 
-    /// Builds a manager from `CODEX_HOME` and local runtime paths used when
-    /// creating local filesystem helpers.
-    ///
-    /// If `CODEX_HOME/environments.toml` is present, it defines the configured
-    /// environments. Otherwise this preserves the legacy
-    /// `CODEX_EXEC_SERVER_URL` behavior.
-    pub async fn from_codex_home(
-        codex_home: impl AsRef<std::path::Path>,
-        local_runtime_paths: Option<ExecServerRuntimePaths>,
-    ) -> Result<Self, ExecServerError> {
-        Self::from_codex_home_with_http_client_factory(codex_home, local_runtime_paths, default_http_client_factory()).await
-    }
 
     pub async fn from_codex_home_with_http_client_factory(
         codex_home: impl AsRef<std::path::Path>,
@@ -260,11 +248,6 @@ impl EnvironmentManager {
         self.local_environment.as_ref().map(Arc::clone)
     }
 
-    /// Returns the default environment or local environment when either exists.
-    pub fn default_or_local_environment(&self) -> Option<Arc<Environment>> {
-        self.default_environment()
-            .or_else(|| self.try_local_environment())
-    }
 
     /// Returns a named environment instance.
     pub fn get_environment(&self, environment_id: &str) -> Option<Arc<Environment>> {
@@ -275,50 +258,6 @@ impl EnvironmentManager {
             .cloned()
     }
 
-    /// Adds or replaces a named remote environment without changing the
-    /// manager's default environment selection. Uses the default WebSocket
-    /// connection timeout when none is provided.
-    pub fn upsert_environment(
-        &self,
-        environment_id: String,
-        exec_server_url: String,
-        connect_timeout: Option<std::time::Duration>,
-    ) -> Result<(), ExecServerError> {
-        if environment_id == LOCAL_ENVIRONMENT_ID {
-            return Err(ExecServerError::Protocol(format!(
-                "environment id `{LOCAL_ENVIRONMENT_ID}` is reserved for EnvironmentManager"
-            )));
-        }
-        if environment_id.is_empty() {
-            return Err(ExecServerError::Protocol(
-                "environment id cannot be empty".to_string(),
-            ));
-        }
-        let (exec_server_url, disabled) = normalize_exec_server_url(Some(exec_server_url));
-        if disabled {
-            return Err(ExecServerError::Protocol(
-                "remote environment cannot use disabled exec-server url".to_string(),
-            ));
-        }
-        let Some(exec_server_url) = exec_server_url else {
-            return Err(ExecServerError::Protocol(
-                "remote environment requires an exec-server url".to_string(),
-            ));
-        };
-        let environment = Arc::new(Environment::remote_with_transport(
-            ExecServerTransportParams::websocket_url(
-                exec_server_url,
-                connect_timeout.unwrap_or(DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT),
-            ),
-            self.local_runtime_paths.clone(),
-        ).with_http_client_factory(self.http_client_factory.clone()));
-        environment.start_connecting();
-        self.environments
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(environment_id, environment);
-        Ok(())
-    }
 
     /// Adds or replaces a named remote environment that connects through an
     /// authenticated, end-to-end encrypted rendezvous stream.
@@ -783,12 +722,5 @@ impl Environment {
         Arc::clone(&self.filesystem)
     }
 
-    /// Returns a filesystem view that fails instead of starting or waiting for a connection.
-    pub fn get_filesystem_without_reconnect(&self) -> Arc<dyn ExecutorFileSystem> {
-        match &self.remote_client {
-            Some(client) => Arc::new(RemoteFileSystem::new(client.fail_fast())),
-            None => Arc::clone(&self.filesystem),
-        }
-    }
 }
 

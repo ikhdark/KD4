@@ -350,7 +350,11 @@ pub use resolved_permissions::WindowsSandboxTokenMode;
 
 pub use resolved_permissions::token_mode_for_permission_profile;
 
+pub use resolved_permissions::validate_windows_read_policy;
+
 pub use setup::SETUP_VERSION;
+
+pub use setup_protocol::SETUP_REQUEST_VERSION;
 
 pub use setup::SandboxSetupRequest;
 
@@ -461,8 +465,8 @@ mod windows_impl {
     use super::process::create_process_as_user;
     use super::sandbox_utils::ensure_codex_home_exists;
     use super::spawn_prep::LegacyAclSids;
-    use super::spawn_prep::SpawnPrepOptions;
     use super::spawn_prep::apply_legacy_session_acl_rules;
+    use super::allow::compute_deny_write_paths_for_permissions;
     use super::spawn_prep::legacy_session_capability_roots;
     use super::spawn_prep::prepare_legacy_session_security;
     use super::spawn_prep::prepare_legacy_spawn_context;
@@ -861,10 +865,6 @@ mod windows_impl {
             cwd,
             &mut env_map,
             &command,
-            SpawnPrepOptions {
-                inherit_path: false,
-                add_git_safe_directory: false,
-            },
         )?;
         let permissions = common.permissions;
         let current_dir = common.current_dir;
@@ -882,11 +882,15 @@ mod windows_impl {
         }
         let capability_roots =
             legacy_session_capability_roots(&permissions, &current_dir, &env_map, codex_home);
+        let deny_write_paths = compute_deny_write_paths_for_permissions(
+            &permissions, &current_dir, &env_map, &additional_deny_write_paths,
+        );
         let security = prepare_legacy_session_security(
             uses_write_capabilities,
             codex_home,
             cwd,
             capability_roots,
+            &deny_write_paths,
         )?;
         // SAFETY: successful preparation transfers one valid owned token to this capture. Retain
         // it through ACL and pipe setup errors until this function returns.
@@ -1081,6 +1085,7 @@ mod windows_impl {
         ) else {
             return Ok(());
         };
+        permissions.ensure_read_policy_supported(cwd)?;
         super::ensure_legacy_delete_child_safety(legacy_restricted_token_enforces_delete_child())?;
         if !permissions.uses_write_capabilities_for_cwd(cwd, env_map) {
             return Ok(());
@@ -1090,7 +1095,10 @@ mod windows_impl {
         let current_dir = cwd.to_path_buf();
         let capability_roots =
             legacy_session_capability_roots(&permissions, &current_dir, env_map, codex_home);
-        let write_root_sids = root_capability_sids(codex_home, cwd, capability_roots)?;
+        let deny_write_paths = compute_deny_write_paths_for_permissions(
+            &permissions, &current_dir, env_map, &[],
+        );
+        let write_root_sids = root_capability_sids(codex_home, cwd, capability_roots, &deny_write_paths)?;
         apply_legacy_session_acl_rules(
             &permissions,
             codex_home,

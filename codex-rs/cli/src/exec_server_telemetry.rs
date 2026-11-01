@@ -51,22 +51,14 @@ where
     Fut: Future<Output = Result<(), E>> + Send + 'static,
     E: From<std::io::Error> + Send + 'static,
 {
-    let shutdown_signal = match shutdown_signal() {
-        Ok(signal) => Some(signal),
-        Err(error) => {
-            eprintln!("Could not listen for exec-server shutdown signal: {error}");
-            None
-        }
-    };
     let shutdown = codex_exec_server::ExecServerShutdown::new();
     // Service custody survives cancellation of the signal observer. A timeout
     // reports incomplete shutdown, never successful future-drop cleanup.
     let mut run = tokio::spawn(run(shutdown.clone()));
 
-    if let Some(shutdown_signal) = shutdown_signal {
-        tokio::select! {
+    tokio::select! {
             result = &mut run => result.map_err(|error| E::from(std::io::Error::other(error)))?,
-            signal = wait_for_shutdown_signal(shutdown_signal) => {
+            signal = tokio::signal::ctrl_c() => {
                 match signal {
                     Ok(()) => {
                         shutdown.cancel();
@@ -84,21 +76,7 @@ where
                     }
                 }
             }
-        }
-    } else {
-        run.await
-            .map_err(|error| E::from(std::io::Error::other(error)))?
     }
-}
-
-struct ShutdownSignal;
-
-fn shutdown_signal() -> std::io::Result<ShutdownSignal> {
-    Ok(ShutdownSignal)
-}
-
-async fn wait_for_shutdown_signal(_: ShutdownSignal) -> std::io::Result<()> {
-    tokio::signal::ctrl_c().await
 }
 
 fn stderr_env_filter() -> EnvFilter {

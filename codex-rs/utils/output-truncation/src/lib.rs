@@ -190,9 +190,6 @@ pub fn truncate_text_with_line_markers(content: &str, max_tokens: usize) -> Stri
     truncate_over_budget_text_with_markers(content, max_tokens, true).0
 }
 
-pub fn omitted_line_marker(content: &str, start: usize, end: usize) -> String {
-    omitted_line_marker_at_lines(content, start, end, 0, content.lines().count())
-}
 
 fn omitted_line_marker_at_lines(
     content: &str,
@@ -947,103 +944,6 @@ pub fn truncate_text(content: &str, policy: TruncationPolicy) -> String {
     policy.truncate_text(content)
 }
 
-/// Formats truncation warnings and shares the budget across contiguous text
-/// runs, preserving their positions relative to images and encrypted content.
-/// Unlike `truncate_function_output_items_with_policy`, this retains a share
-/// of each text run instead of spending the budget on the earliest items.
-pub fn formatted_truncate_text_content_items_with_policy(
-    items: &[FunctionCallOutputContentItem],
-    policy: TruncationPolicy,
-) -> (Vec<FunctionCallOutputContentItem>, Option<usize>) {
-    let mut text_segments = items.iter().filter_map(|item| match item {
-        FunctionCallOutputContentItem::InputText { text } => Some(text.as_str()),
-        FunctionCallOutputContentItem::InputImage { .. }
-        | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
-    });
-
-    let Some(first) = text_segments.next() else {
-        return (items.to_vec(), None);
-    };
-
-    // Allocated text and separators always fit usize; saturation is unreachable.
-    let combined_bytes = text_segments.fold(first.len(), |bytes, text| {
-        bytes.saturating_add(usize::from(bytes != 0)).saturating_add(text.len())
-    });
-
-    let estimate_token_count = || {
-        usize::try_from(approx_tokens_from_byte_count(combined_bytes)).unwrap_or(usize::MAX)
-    };
-    let mut original_token_count = None;
-    let within_budget = match policy {
-        TruncationPolicy::Bytes(max_bytes) => combined_bytes <= max_bytes,
-        TruncationPolicy::Tokens(max_tokens) => {
-            let count = estimate_token_count();
-            original_token_count = Some(count);
-            count <= max_tokens
-        }
-    };
-    if within_budget {
-        return (items.to_vec(), None);
-    }
-
-    let original_token_count = original_token_count.unwrap_or_else(estimate_token_count);
-    let runs = items
-        .chunk_by(|left, right| {
-            matches!(
-                (left, right),
-                (
-                    FunctionCallOutputContentItem::InputText { .. },
-                    FunctionCallOutputContentItem::InputText { .. }
-                )
-            )
-        })
-        .map(|run| {
-            let mut text = Cow::Borrowed("");
-            for item in run {
-                if let FunctionCallOutputContentItem::InputText { text: part } = item {
-                    if text.is_empty() {
-                        text = Cow::Borrowed(part.as_str());
-                    } else {
-                        text.to_mut().push('\n');
-                        text.to_mut().push_str(part);
-                    }
-                }
-            }
-            let cost = match policy {
-                TruncationPolicy::Bytes(_) => text.len(),
-                TruncationPolicy::Tokens(_) => approx_token_count(&text),
-            };
-            (run, text, cost)
-        })
-        .collect::<Vec<_>>();
-    let mut remaining_cost = runs.iter().map(|(_, _, cost)| cost).sum::<usize>();
-    let mut remaining_budget = match policy {
-        TruncationPolicy::Bytes(limit) | TruncationPolicy::Tokens(limit) => limit,
-    };
-    let mut out = Vec::with_capacity(items.len());
-    for (run, text, cost) in runs {
-        if !matches!(run[0], FunctionCallOutputContentItem::InputText { .. }) {
-            out.extend_from_slice(run);
-            continue;
-        }
-        let budget = if remaining_cost == 0 {
-            0
-        } else {
-            ((remaining_budget as u128 * cost as u128) / remaining_cost as u128) as usize
-        };
-        remaining_budget -= budget;
-        remaining_cost -= cost;
-        let run_policy = match policy {
-            TruncationPolicy::Bytes(_) => TruncationPolicy::Bytes(budget),
-            TruncationPolicy::Tokens(_) => TruncationPolicy::Tokens(budget),
-        };
-        out.push(FunctionCallOutputContentItem::InputText {
-            text: formatted_truncate_text(&text, run_policy),
-        });
-    }
-
-    (out, Some(original_token_count))
-}
 
 /// Spends the budget in source order and reports how many later text items
 /// were omitted. Non-text items keep their original relative order.

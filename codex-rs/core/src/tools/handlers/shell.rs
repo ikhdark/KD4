@@ -125,7 +125,6 @@ pub(super) struct RunExecLikeArgs {
     pub(super) tracker: crate::tools::context::SharedTurnDiffTracker,
     pub(super) call_id: String,
     pub(super) tool_call_source: ToolCallSource,
-    pub(super) track_command_mutations: bool,
     pub(super) attempt_key: Option<CommandAttemptKey>,
     pub(super) repair_notice: Option<String>,
     pub(super) command_repaired: bool,
@@ -571,18 +570,6 @@ pub(crate) fn validation_environment_hash(env: &HashMap<String, String>) -> Stri
     hex::encode(digest.finalize())
 }
 
-fn restore_retained_validation_attempt(
-    out: Result<ExecToolCallOutput, ToolError>,
-    retained_validation_attempt: Option<&ExecToolCallOutput>,
-) -> Result<ExecToolCallOutput, ToolError> {
-    match (&out, retained_validation_attempt) {
-        (Err(ToolError::Denied(_)), Some(retained_validation_attempt)) => {
-            Ok(retained_validation_attempt.clone())
-        }
-        _ => out,
-    }
-}
-
 async fn run_exec_like_with_exit_code_inner(
     args: RunExecLikeArgs,
     is_validation: bool,
@@ -608,7 +595,6 @@ async fn run_exec_like_with_exit_code_inner(
         tracker,
         call_id,
         tool_call_source,
-        track_command_mutations,
         attempt_key,
         repair_notice,
         command_repaired,
@@ -653,7 +639,6 @@ async fn run_exec_like_with_exit_code_inner(
                     .additional_permissions
                     .clone(),
                 effective_additional_permissions.permissions_preapproved,
-                &exec_params.cwd,
             )
         },
         |permissions| Ok(Some(permissions)),
@@ -755,7 +740,7 @@ async fn run_exec_like_with_exit_code_inner(
     .with_model_command_text(hook_command.clone())
     .with_captured_environment(&turn_environment)
     .with_max_output_tokens(max_output_tokens);
-    let event_tracker = track_command_mutations.then_some(&tracker);
+    let event_tracker = Some(&tracker);
     let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker)
         .with_call_source(&tool_call_source);
     emitter
@@ -885,18 +870,12 @@ async fn run_exec_like_with_exit_code_inner(
         )
         .await
         .map(|result| result.output);
-    let retained_validation_attempt = runtime.take_last_validation_attempt_output();
-    let raw_capture = runtime.take_raw_output(
-        matches!(&out, Err(ToolError::Denied(_))) && retained_validation_attempt.is_some(),
-    );
+    let raw_capture = runtime.take_raw_output();
     let runtime_validation_attempt_started = runtime.take_last_validation_attempt_started();
     let validation_attempt_started = is_validation
-        && (retained_validation_attempt.is_some()
-            || runtime_validation_attempt_started
-            || shell_validation_execution_output(&out, None).is_some());
-    let out = restore_retained_validation_attempt(out, retained_validation_attempt.as_ref());
+        && (runtime_validation_attempt_started || shell_execution_output(&out).is_some());
     if validation_attempt_started {
-        let duration = shell_validation_execution_output(&out, None)
+        let duration = shell_execution_output(&out)
             .map(|output| output.duration)
             .unwrap_or_else(|| {
                 validation_execution_wall_started_at
@@ -933,7 +912,7 @@ async fn run_exec_like_with_exit_code_inner(
             .record_exit(attempt_key, retry_exit_code)
             .await;
     }
-    let execution_output = shell_validation_execution_output(&out, None);
+    let execution_output = shell_execution_output(&out);
     let model_projection = execution_output.map(|output| {
         crate::tools::project_exec_output_text_with_budget(
             output,
@@ -1194,17 +1173,16 @@ fn retry_exit_code(out: &Result<ExecToolCallOutput, ToolError>) -> Option<i32> {
     }
 }
 
-fn shell_validation_execution_output<'a>(
-    out: &'a Result<ExecToolCallOutput, ToolError>,
-    retained_validation_attempt: Option<&'a ExecToolCallOutput>,
-) -> Option<&'a ExecToolCallOutput> {
+fn shell_execution_output(
+    out: &Result<ExecToolCallOutput, ToolError>,
+) -> Option<&ExecToolCallOutput> {
     match out {
         Ok(output) => Some(output),
         Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Timeout { output })))
         | Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied { output, .. }))) => {
             Some(output.as_ref())
         }
-        Err(_) => retained_validation_attempt,
+        Err(_) => None,
     }
 }
 

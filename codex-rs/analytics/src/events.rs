@@ -70,10 +70,7 @@ pub(crate) enum TrackEventRequest {
     ReviewEvent(CodexReviewEventRequest),
     PluginUsed(CodexPluginUsedEventRequest),
     PluginInstallRequested(CodexPluginInstallRequestedEventRequest),
-    PluginInstalled(CodexPluginEventRequest),
-    PluginUninstalled(CodexPluginEventRequest),
-    PluginEnabled(CodexPluginEventRequest),
-    PluginDisabled(CodexPluginEventRequest),
+    PluginStateChanged(CodexPluginEventRequest),
     PluginInstallFailed(CodexPluginInstallFailedEventRequest),
 }
 

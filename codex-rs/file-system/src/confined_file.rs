@@ -19,17 +19,17 @@ pub fn open_confined_file_with_metadata(
     path: &Path,
 ) -> io::Result<(File, std::fs::Metadata)> {
     let relative = path.strip_prefix(root).map_err(|_| outside_root_error())?;
-    let components = relative
-        .components()
-        .map(|component| match component {
-            Component::Normal(component) => Ok(component),
-            _ => Err(io::Error::new(
+    let mut has_components = false;
+    for component in relative.components() {
+        if !matches!(component, Component::Normal(_)) {
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "confined file path must contain only normal relative components",
-            )),
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-    if components.is_empty() {
+            ));
+        }
+        has_components = true;
+    }
+    if !has_components {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "confined file path must name a file below the root",
@@ -37,7 +37,7 @@ pub fn open_confined_file_with_metadata(
     }
 
     let _capture = crate::guard_patch_read(path)?;
-    open_confined_file_impl(root, path, &components)
+    open_confined_file_impl(root, path)
 }
 
 fn outside_root_error() -> io::Error {
@@ -111,7 +111,6 @@ fn ensure_regular_file(file: File, path: &Path) -> io::Result<(File, std::fs::Me
 fn open_confined_file_impl(
     root: &Path,
     path: &Path,
-    _components: &[&std::ffi::OsStr],
 ) -> io::Result<(File, std::fs::Metadata)> {
     use std::fs::OpenOptions;
     use std::os::windows::fs::OpenOptionsExt;

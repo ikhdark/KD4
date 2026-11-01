@@ -21,7 +21,6 @@ use owo_colors::Style;
 use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
 use crate::event_processor::bounded_progress_text;
-use crate::event_processor::final_message_from_turn;
 use crate::event_processor::handle_last_message;
 
 pub(crate) struct EventProcessorWithHumanOutput {
@@ -533,21 +532,12 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                             self.final_message_rendered && self.final_message == message;
                         self.final_message = message;
                     } else {
-                        let timing = notification
-                            .timing
-                            .as_ref()
-                            .or(notification.turn.timing.as_ref());
                         for item in &notification.turn.items {
                             self.streamed_final_message.observe(item);
                         }
-                        let final_message =
-                            if timing.is_some_and(|timing| timing.final_answer.is_some()) {
-                                final_message_from_turn(notification.turn.items.as_slice(), timing)
-                            } else {
-                                self.streamed_final_message
-                                    .message()
-                                    .or_else(|| self.final_message.clone())
-                            };
+                        let final_message = self.streamed_final_message
+                            .message()
+                            .or_else(|| self.final_message.clone());
                         self.final_message_rendered =
                             self.final_message_rendered && self.final_message == final_message;
                         self.final_message = final_message;

@@ -5,7 +5,6 @@ use std::env;
 use std::fs::File;
 use std::fs::{self};
 use std::io::Write;
-use std::path::Path;
 use std::path::PathBuf;
 
 /// Windows variable names use ordinal, case-insensitive identity. Normalize
@@ -130,22 +129,9 @@ fn reorder_pathext_for_stubs(env_map: &mut HashMap<String, String>) {
     env_map.insert("PATHEXT".into(), combined.join(";"));
 }
 
-fn ensure_denybin(tools: &[&str], denybin_dir: Option<&Path>) -> Result<PathBuf> {
-    ensure_denybin_with_home(tools, denybin_dir, dirs::home_dir)
-}
-
-fn ensure_denybin_with_home(
-    tools: &[&str],
-    denybin_dir: Option<&Path>,
-    home_dir: impl FnOnce() -> Option<PathBuf>,
-) -> Result<PathBuf> {
-    let base = match denybin_dir {
-        Some(p) => p.to_path_buf(),
-        None => {
-            let home = home_dir().ok_or_else(|| anyhow!("no home dir"))?;
-            home.join(".sbx-denybin")
-        }
-    };
+fn ensure_denybin(tools: &[&str]) -> Result<PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("no home dir"))?;
+    let base = home.join(".sbx-denybin");
     fs::create_dir_all(&base)?;
     for tool in tools {
         for ext in [".bat", ".cmd"] {
@@ -202,7 +188,7 @@ pub fn apply_no_network_to_env(env_map: &mut HashMap<String, String>) -> Result<
         .or_insert_with(|| "cmd /c exit 1".into());
     env_map.insert("GIT_ALLOW_PROTOCOL".into(), String::new());
 
-    let base = ensure_denybin(&["ssh", "scp"], /*denybin_dir*/ None)?;
+    let base = ensure_denybin(&["ssh", "scp"])?;
     for tool in ["curl", "wget"] {
         for ext in [".bat", ".cmd"] {
             let p = base.join(format!("{tool}{ext}"));

@@ -105,32 +105,11 @@ pub fn sync_openai_plugins_repo(
     codex_home: &Path,
     http_client_factory: HttpClientFactory,
 ) -> Result<String, String> {
-    let git_binary = Some(PathBuf::from("git"));
     let http_clients =
         create_client_pool_without_request_logging(http_client_factory, ClientRouteClass::Api);
-
-    sync_openai_plugins_repo_with_transport_overrides(
-        codex_home,
-        git_binary.as_deref(),
-        GITHUB_API_BASE_URL,
-        CURATED_PLUGINS_BACKUP_ARCHIVE_API_URL,
-        &http_clients,
-    )
-}
-
-fn sync_openai_plugins_repo_with_transport_overrides(
-    codex_home: &Path,
-    git_binary: Option<&Path>,
-    api_base_url: &str,
-    backup_archive_api_url: &str,
-    http_clients: &RouteAwareClientPool,
-) -> Result<String, String> {
     let _file_guard = lock_curated_plugins_startup_sync(codex_home)?;
 
-    let git_sync_result = match git_binary {
-        Some(git_binary) => sync_openai_plugins_repo_via_git(codex_home, git_binary),
-        None => Err("git executable is unavailable".to_string()),
-    };
+    let git_sync_result = sync_openai_plugins_repo_via_git(codex_home, Path::new("git"));
 
     match git_sync_result {
         Ok(remote_sha) => {
@@ -144,7 +123,7 @@ fn sync_openai_plugins_repo_with_transport_overrides(
                 error = %err,
                 "git sync failed for curated plugin sync; falling back to GitHub HTTP"
             );
-            match sync_openai_plugins_repo_via_http(codex_home, api_base_url, http_clients) {
+            match sync_openai_plugins_repo_via_http(codex_home, GITHUB_API_BASE_URL, &http_clients) {
                 Ok(remote_sha) => {
                     emit_curated_plugins_startup_sync_metric("http", "success");
                     emit_curated_plugins_startup_sync_final_metric("http", "success");
@@ -166,13 +145,13 @@ fn sync_openai_plugins_repo_with_transport_overrides(
                         // missing local curated snapshot, never to refresh an existing one.
                         warn!(
                             error = %http_err,
-                            backup_archive_api_url,
+                            backup_archive_api_url = CURATED_PLUGINS_BACKUP_ARCHIVE_API_URL,
                             "GitHub HTTP sync failed for curated plugin sync; falling back to export archive"
                         );
                         let result = sync_openai_plugins_repo_via_backup_archive(
                             codex_home,
-                            backup_archive_api_url,
-                            http_clients,
+                            CURATED_PLUGINS_BACKUP_ARCHIVE_API_URL,
+                            &http_clients,
                         );
                         let status = if result.is_ok() { "success" } else { "failure" };
                         emit_curated_plugins_startup_sync_metric("export_archive", status);
@@ -335,14 +314,6 @@ fn run_git_in_repo(
 }
 
 fn sync_openai_plugins_repo_via_http(
-    codex_home: &Path,
-    api_base_url: &str,
-    http_clients: &RouteAwareClientPool,
-) -> Result<String, String> {
-    sync_openai_plugins_repo_via_http_with_clients(codex_home, api_base_url, http_clients)
-}
-
-fn sync_openai_plugins_repo_via_http_with_clients(
     codex_home: &Path,
     api_base_url: &str,
     http_clients: &RouteAwareClientPool,

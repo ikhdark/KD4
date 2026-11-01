@@ -9,14 +9,13 @@ use crate::line_buffer::LineBuffer;
 use crate::parser::pull_events_from_value;
 use crate::pull::CliProgressReporter;
 use crate::pull::PullEvent;
-use crate::url::base_url_to_host_root;
-use crate::url::is_openai_compatible_base_url;
-use codex_core::config::Config;
+use codex_runtime_config::config::Config;
 use codex_http_client::HttpClient;
 use codex_http_client::HttpClientBuilder;
 use codex_http_client::HttpResponse;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
+use codex_model_provider_info::local::ollama_host_root;
 
 const OLLAMA_CONNECTION_ERROR: &str = "No running Ollama server detected. Start it with: `ollama serve` (after installing). Install instructions: https://github.com/ollama/ollama?tab=readme-ov-file#ollama";
 /// Bounds each metadata request made during setup, so a server that accepts the connection but
@@ -34,12 +33,6 @@ pub struct OllamaClient {
 }
 
 impl OllamaClient {
-    /// Construct a client for the built‑in open‑source ("oss") model provider
-    /// and verify that a local Ollama server is reachable. If no server is
-    /// detected, returns an error with helpful installation/run instructions.
-    pub async fn try_from_oss_provider(config: &Config) -> io::Result<Self> {
-        Self::try_from_provider(Self::oss_provider(config)?).await
-    }
 
     /// Reuse the native health response as the initial listing, without caching later listings.
     pub(crate) async fn try_from_oss_provider_with_models(
@@ -64,14 +57,6 @@ impl OllamaClient {
     }
 
 
-    /// Build a client from a provider definition and verify the server is reachable.
-    pub(crate) async fn try_from_provider(provider: &ModelProviderInfo) -> io::Result<Self> {
-        let client = Self::from_provider(provider)?;
-        // Consume the health body so the connection can return to the pool.
-        let _ = client.probe_server().await?.bytes().await;
-        Ok(client)
-    }
-
     async fn try_from_provider_with_models(
         provider: &ModelProviderInfo,
     ) -> io::Result<(Self, io::Result<Vec<String>>)> {
@@ -93,8 +78,8 @@ impl OllamaClient {
                 "Ollama provider must have a base_url",
             )
         })?;
-        let uses_openai_compat = is_openai_compatible_base_url(base_url);
-        let host_root = base_url_to_host_root(base_url);
+        let uses_openai_compat = base_url.trim_end_matches('/').ends_with("/v1");
+        let host_root = ollama_host_root(base_url).to_owned();
         let client = HttpClientBuilder::new()
             .connect_timeout(Duration::from_secs(5))
             .build_with_transport_default_proxy()

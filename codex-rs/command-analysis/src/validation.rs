@@ -496,15 +496,6 @@ pub async fn resolve_command_launch_analysis_with_shell(
     .unwrap_or_default()
 }
 
-/// Policy classification shares the trusted runner declarations and analysis
-/// worker with validation evidence, but never upgrades it into receipt proof.
-pub async fn classify_validation_policy_with_shell(
-    invocation: &CommandInvocation,
-    shell_type: Option<codex_shell_command::shell_detect::ShellType>,
-    cwd: Option<&std::path::Path>,
-) -> ValidationPolicyClassification {
-    analyze_validation_policy_with_shell(invocation, shell_type, cwd).await.0
-}
 
 pub async fn analyze_validation_policy_with_shell(
     invocation: &CommandInvocation,

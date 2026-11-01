@@ -275,7 +275,6 @@ fn compute_delta(
                         }),
                 );
             }
-            (None, None) if base_value == target_value => {}
             _ => return None,
         }
     }

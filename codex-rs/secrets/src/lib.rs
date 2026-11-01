@@ -96,18 +96,12 @@ pub trait SecretsBackend: Send + Sync {
 
 #[derive(Clone)]
 pub struct SecretsManager {
-    backend: Arc<dyn SecretsBackend>,
+    backend: Arc<LocalSecretsBackend>,
 }
 
 impl SecretsManager {
     pub fn new(codex_home: PathBuf, backend_kind: SecretsBackendKind) -> Self {
-        let backend: Arc<dyn SecretsBackend> = match backend_kind {
-            SecretsBackendKind::Local => {
-                let keyring_store: Arc<dyn KeyringStore> = Arc::new(DefaultKeyringStore);
-                Arc::new(LocalSecretsBackend::new(codex_home, keyring_store))
-            }
-        };
-        Self { backend }
+        Self::new_with_keyring_store(codex_home, backend_kind, Arc::new(DefaultKeyringStore))
     }
 
     pub fn new_with_keyring_store(
@@ -115,12 +109,12 @@ impl SecretsManager {
         backend_kind: SecretsBackendKind,
         keyring_store: Arc<dyn KeyringStore>,
     ) -> Self {
-        let backend: Arc<dyn SecretsBackend> = match backend_kind {
-            SecretsBackendKind::Local => {
-                Arc::new(LocalSecretsBackend::new(codex_home, keyring_store))
-            }
-        };
-        Self { backend }
+        Self::new_with_keyring_store_and_namespace(
+            codex_home,
+            backend_kind,
+            keyring_store,
+            LocalSecretsNamespace::ManagedSecrets,
+        )
     }
 
     pub fn new_with_keyring_store_and_namespace(
@@ -129,7 +123,7 @@ impl SecretsManager {
         keyring_store: Arc<dyn KeyringStore>,
         namespace: LocalSecretsNamespace,
     ) -> Self {
-        let backend: Arc<dyn SecretsBackend> = match backend_kind {
+        let backend = match backend_kind {
             SecretsBackendKind::Local => Arc::new(LocalSecretsBackend::new_with_namespace(
                 codex_home,
                 keyring_store,

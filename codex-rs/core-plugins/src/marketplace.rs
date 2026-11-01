@@ -39,6 +39,7 @@ pub struct ResolvedMarketplacePlugin {
 pub struct Marketplace {
     pub name: String,
     pub path: AbsolutePathBuf,
+    pub(crate) source_identity: String,
     pub interface: Option<MarketplaceInterface>,
     pub plugins: Vec<MarketplacePlugin>,
 }
@@ -294,11 +295,6 @@ pub fn find_installable_marketplace_plugin(
     Ok(resolved)
 }
 
-pub fn list_marketplaces(
-    additional_roots: &[AbsolutePathBuf],
-) -> Result<MarketplaceListOutcome, MarketplaceError> {
-    list_marketplaces_with_home(additional_roots, home_dir().as_deref())
-}
 
 pub(crate) fn home_dir() -> Option<PathBuf> {
     ["HOME", "USERPROFILE"]
@@ -377,6 +373,9 @@ pub fn load_marketplace(path: &AbsolutePathBuf) -> Result<Marketplace, Marketpla
 pub(crate) fn load_marketplace_with_declared_names(
     path: &AbsolutePathBuf,
 ) -> Result<(Marketplace, Vec<String>), MarketplaceError> {
+    let root = marketplace_root_dir(path)?;
+    let source_identity = crate::installed_marketplaces::marketplace_source_identity(root.as_path())
+        .map_err(|message| MarketplaceError::InvalidMarketplaceFile { path: path.to_path_buf(), message })?;
     let marketplace = load_raw_marketplace_manifest(path)?;
     // Refresh deletion decisions require the declared inventory, including unusable sources.
     let declared_names = marketplace
@@ -428,10 +427,19 @@ pub(crate) fn load_marketplace_with_declared_names(
         });
     }
 
+    if crate::installed_marketplaces::marketplace_source_identity(root.as_path())
+        .map_err(|message| MarketplaceError::InvalidMarketplaceFile { path: path.to_path_buf(), message })? != source_identity
+    {
+        return Err(MarketplaceError::InvalidMarketplaceFile {
+            path: path.to_path_buf(),
+            message: "marketplace source changed during discovery; retry".to_string(),
+        });
+    }
     Ok((
         Marketplace {
             name: marketplace.name,
             path: path.clone(),
+            source_identity,
             interface: resolve_marketplace_interface(marketplace.interface),
             plugins,
         },

@@ -315,7 +315,7 @@ pub(super) fn permission_profile_to_metadata_value(
 }
 
 pub(super) fn distinct_thread_metadata_title(metadata: &ThreadMetadata) -> Option<String> {
-    distinct_thread_title(&metadata.title, metadata.first_user_message.as_deref())
+    metadata.thread_name().map(str::to_owned)
 }
 
 pub(super) fn distinct_thread_title(
@@ -349,7 +349,7 @@ pub(super) fn thread_item_titles<'a>(
 }
 
 pub(super) fn set_thread_name_from_title(thread: &mut StoredThread, title: String) {
-    if title.trim().is_empty() || thread.preview.trim() == title.trim() {
+    if title.trim().is_empty() {
         return;
     }
     thread.name = Some(title);

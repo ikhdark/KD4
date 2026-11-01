@@ -65,15 +65,9 @@ impl<'de> Visitor<'de> for Projection {
                 (Self::Root, "type") => Self::EventType,
                 (Self::Root, "timing_metrics") => Self::Timing,
                 (Self::Timing, key)
-                    if [
-                        super::session_telemetry::RESPONSES_API_OVERHEAD_FIELD,
-                        super::session_telemetry::RESPONSES_API_INFERENCE_FIELD,
-                        super::session_telemetry::RESPONSES_API_ENGINE_IAPI_TTFT_FIELD,
-                        super::session_telemetry::RESPONSES_API_ENGINE_SERVICE_TTFT_FIELD,
-                        super::session_telemetry::RESPONSES_API_ENGINE_IAPI_TBT_FIELD,
-                        super::session_telemetry::RESPONSES_API_ENGINE_SERVICE_TBT_FIELD,
-                    ]
-                    .contains(&key) =>
+                    if super::session_telemetry::RESPONSES_API_TIMING_METRICS
+                        .iter()
+                        .any(|(field, _)| *field == key) =>
                 {
                     Self::Number
                 }

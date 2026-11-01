@@ -105,27 +105,8 @@ async fn poll_for_token(
     user_code: &str,
     interval: u64,
 ) -> std::io::Result<CodeSuccessResp> {
-    poll_for_token_with_timeout(
-        client,
-        auth_base_url,
-        device_auth_id,
-        user_code,
-        interval,
-        Duration::from_secs(15 * 60),
-    )
-    .await
-}
-
-async fn poll_for_token_with_timeout(
-    client: &HttpClient,
-    auth_base_url: &str,
-    device_auth_id: &str,
-    user_code: &str,
-    interval: u64,
-    max_wait: Duration,
-) -> std::io::Result<CodeSuccessResp> {
     let url = format!("{auth_base_url}/deviceauth/token");
-    let deadline = Instant::now() + max_wait;
+    let deadline = Instant::now() + Duration::from_secs(15 * 60);
     let timed_out = || {
         io::Error::new(io::ErrorKind::TimedOut, "device auth timed out after 15 minutes")
     };

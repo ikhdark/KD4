@@ -145,7 +145,7 @@ impl PolicyBuilder {
                 Vec::new(),
                 self.host_executables_by_name.clone(),
             );
-            validate_not_match_examples(&policy, &validation.rules, &validation.not_matches)
+            validate_not_match_examples(&policy, &validation.not_matches)
                 .map_err(|error| attach_validation_location(error, validation.location.clone()))?;
             validate_match_examples(&policy, &validation.rules, &validation.matches)
                 .map_err(|error| attach_validation_location(error, validation.location.clone()))?;

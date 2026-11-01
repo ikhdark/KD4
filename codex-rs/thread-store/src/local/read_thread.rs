@@ -111,7 +111,7 @@ async fn visible_sqlite_metadata(
     thread_id: codex_protocol::ThreadId,
     include_archived: bool,
 ) -> ThreadStoreResult<Option<(ThreadMetadata, Option<SessionMetaLine>)>> {
-    let Some(mut metadata) = read_sqlite_metadata(store, thread_id).await else {
+    let Some(mut metadata) = read_sqlite_metadata(store, thread_id).await? else {
         return Ok(None);
     };
     let header = resolve_sqlite_rollout_location(store, &mut metadata).await?;
@@ -141,6 +141,9 @@ async fn read_thread_from_resolved_rollout(
     .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
 
     let mut thread = read_thread_from_rollout_path(store, path).await?;
+    if let Some(metadata) = read_sqlite_metadata(store, thread_id).await? {
+        thread.name = sqlite_metadata_name(store, &metadata).await;
+    }
     if thread.thread_id != thread_id {
         return Err(ThreadStoreError::InvalidRequest {
             message: format!(
@@ -217,7 +220,7 @@ pub(super) async fn read_thread_by_rollout_path_with_payload_versions(
             message: format!("thread {} is archived", thread.thread_id),
         });
     }
-    if let Some(mut metadata) = read_sqlite_metadata(store, thread.thread_id).await {
+    if let Some(mut metadata) = read_sqlite_metadata(store, thread.thread_id).await? {
         // The requested, verified physical location owns archive/path state;
         // the current row owns explicit metadata (including Git null clears).
         metadata.rollout_path = thread.rollout_path.clone().unwrap_or(metadata.rollout_path);
@@ -391,9 +394,15 @@ pub(super) async fn resolve_sqlite_rollout_location(
 async fn read_sqlite_metadata(
     store: &LocalThreadStore,
     thread_id: codex_protocol::ThreadId,
-) -> Option<ThreadMetadata> {
-    let runtime = store.state_db().await?;
-    runtime.get_thread(thread_id).await.ok().flatten()
+) -> ThreadStoreResult<Option<ThreadMetadata>> {
+    let Some(runtime) = store.state_db().await else {
+        return Ok(None);
+    };
+    // Missing SQLite is a supported legacy mode. A failed canonical read is not
+    // absence: falling back in that case could resurrect a revoked index name.
+    runtime.get_thread(thread_id).await.map_err(|error| ThreadStoreError::Internal {
+        message: format!("failed to read thread metadata for {thread_id}: {error}"),
+    })
 }
 
 pub(super) async fn stored_thread_from_sqlite_metadata(
@@ -405,6 +414,9 @@ pub(super) async fn stored_thread_from_sqlite_metadata(
 }
 
 async fn sqlite_metadata_name(store: &LocalThreadStore, metadata: &ThreadMetadata) -> Option<String> {
+    if metadata.title_is_explicit {
+        return distinct_thread_metadata_title(metadata);
+    }
     match distinct_thread_metadata_title(metadata) {
         Some(title) => Some(title),
         None => find_thread_name_by_id(store.config.codex_home.as_path(), &metadata.id)
@@ -430,6 +442,11 @@ fn stored_thread_from_resolved_sqlite_metadata(
     name: Option<String>,
     header: Option<SessionMetaLine>,
 ) -> StoredThread {
+    let name = if metadata.title_is_explicit {
+        distinct_thread_metadata_title(&metadata)
+    } else {
+        name
+    };
     // SQLite owns the persisted projection. Session metadata only supplements fields that are
     // not stored in the row, so an unavailable or malformed rollout must not discard the row.
     let header = header.map(|meta_line| meta_line.meta);

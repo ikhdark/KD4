@@ -43,7 +43,6 @@ use crate::models::ImageDetail;
 use crate::models::InternalChatMessageMetadataPassthrough;
 use crate::models::MessagePhase;
 use crate::models::PermissionProfile;
-use crate::models::ResponseInputItem;
 use crate::models::ResponseItem;
 use crate::models::SandboxEnforcement;
 use crate::models::WebSearchAction;
@@ -96,10 +95,6 @@ use crate::permissions::default_read_only_subpaths_for_writable_root;
 pub use crate::request_permissions::RequestPermissionsArgs;
 pub use crate::request_user_input::RequestUserInputEvent;
 
-/// Open/close tags for special context blocks. Used across crates to avoid duplicated hardcoded
-/// strings.
-pub const USER_INSTRUCTIONS_OPEN_TAG: &str = "<user_instructions>";
-pub const USER_INSTRUCTIONS_CLOSE_TAG: &str = "</user_instructions>";
 pub const ENVIRONMENT_CONTEXT_OPEN_TAG: &str = "<environment_context>";
 pub const ENVIRONMENT_CONTEXT_CLOSE_TAG: &str = "</environment_context>";
 pub const APPS_INSTRUCTIONS_OPEN_TAG: &str = "<apps_instructions>";
@@ -579,18 +574,6 @@ impl InterAgentCommunication {
         );
     }
 
-    pub fn to_response_input_item(&self) -> ResponseInputItem {
-        let mut communication = self.clone();
-        communication.id = None;
-        communication.internal_chat_message_metadata_passthrough = None;
-        ResponseInputItem::Message {
-            role: "assistant".to_string(),
-            content: vec![ContentItem::OutputText {
-                text: serde_json::to_string(&communication).unwrap_or_default(),
-            }],
-            phase: Some(MessagePhase::Commentary),
-        }
-    }
 
     pub fn to_model_input_item(&self) -> ResponseItem {
         let content = match &self.encrypted_content {
@@ -627,9 +610,6 @@ impl InterAgentCommunication {
         }
     }
 
-    pub fn is_message_content(content: &[ContentItem]) -> bool {
-        Self::from_message_content(content).is_some()
-    }
 
     pub fn from_message_content(content: &[ContentItem]) -> Option<Self> {
         match content {
@@ -3745,18 +3725,6 @@ pub struct TokenUsageCoverage {
 }
 
 impl TokenUsageCoverage {
-    pub fn fully_reported() -> Self {
-        Self {
-            receipts: 1,
-            reported_receipts: Some(1),
-            input_tokens: 1,
-            cached_input_tokens: 1,
-            output_tokens: 1,
-            reasoning_output_tokens: 1,
-            total_tokens: 1,
-            ..Default::default()
-        }
-    }
 
     pub fn add_assign(&mut self, other: &Self) {
         macro_rules! add { ($($field:ident),*) => { $(
@@ -3883,13 +3851,6 @@ impl TokenUsageInfo {
             .unwrap_or(self.last_token_usage.total_tokens)
     }
 
-    /// Compatibility projection for context bars only, never a consumption ledger.
-    pub fn context_usage(&self) -> TokenUsage {
-        TokenUsage {
-            total_tokens: self.context_tokens(),
-            ..TokenUsage::default()
-        }
-    }
 
     pub fn full_context_window(context_window: i64) -> Self {
         let mut info = Self {
@@ -3986,9 +3947,6 @@ pub struct SpendControlLimitSnapshot {
     pub resets_at: i64,
 }
 
-// Includes prompts, tools and space to call compact.
-const BASELINE_TOKENS: i64 = 12000;
-
 impl TokenUsage {
     pub fn empty_ledger() -> Self {
         Self {
@@ -4053,16 +4011,6 @@ impl TokenUsage {
         })
     }
 
-    /// Only valid for providers whose input classes are disjoint read/write/ordinary.
-    /// No provider convention is inferred from an absent cache-write field.
-    pub fn known_ordinary_input(&self) -> Option<i64> {
-        if self.coverage.as_ref()?.invalid_receipts != 0 {
-            return None;
-        }
-        self.known_non_cached_input()?
-            .checked_sub(self.known_cache_write_input()?)
-            .filter(|tokens| *tokens >= 0)
-    }
 
     fn known(&self, value: i64, reported: impl FnOnce(&TokenUsageCoverage) -> u64) -> Option<i64> {
         let coverage = self.coverage.as_ref()?;
@@ -4114,41 +4062,8 @@ impl TokenUsage {
         self.input_tokens.saturating_sub(self.cached_input()).max(0)
     }
 
-    /// Derived uncached input + output, not the provider's total token count.
-    pub fn blended_total(&self) -> i64 {
-        self.non_cached_input()
-            .saturating_add(self.output_tokens.max(0))
-    }
 
-    pub fn tokens_in_context_window(&self) -> i64 {
-        self.total_tokens
-    }
 
-    /// Estimate the remaining user-controllable percentage of the model's context window.
-    ///
-    /// `context_window` is the total size of the model's context window.
-    /// `BASELINE_TOKENS` should capture tokens that are always present in
-    /// the context (e.g., system prompt and fixed tool instructions) so that
-    /// the percentage reflects the portion the user can influence.
-    ///
-    /// This normalizes both the numerator and denominator by subtracting the
-    /// baseline, so immediately after the first prompt the UI shows 100% left
-    /// and trends toward 0% as the user fills the effective window.
-    pub fn percent_of_context_window_remaining(&self, context_window: i64) -> i64 {
-        if context_window <= BASELINE_TOKENS {
-            return 0;
-        }
-
-        let effective_window = context_window - BASELINE_TOKENS;
-        let used = self
-            .tokens_in_context_window()
-            .saturating_sub(BASELINE_TOKENS)
-            .max(0);
-        let remaining = (effective_window - used).max(0);
-        ((remaining as f64 / effective_window as f64) * 100.0)
-            .clamp(0.0, 100.0)
-            .round() as i64
-    }
 
     /// In-place nonnegative, saturating element-wise sum, including restored DTOs.
     pub fn add_assign(&mut self, other: &TokenUsage) {
@@ -4483,13 +4398,6 @@ pub enum InitialHistory {
 }
 
 impl InitialHistory {
-    pub fn scan_rollout_items(&self, mut predicate: impl FnMut(&RolloutItem) -> bool) -> bool {
-        match self {
-            InitialHistory::New | InitialHistory::Cleared => false,
-            InitialHistory::Resumed(resumed) => resumed.history.iter().any(&mut predicate),
-            InitialHistory::Forked(items) => items.iter().any(predicate),
-        }
-    }
 
     pub fn forked_from_id(&self) -> Option<ThreadId> {
         match self {
@@ -4508,11 +4416,7 @@ impl InitialHistory {
     }
 
     pub fn session_cwd(&self) -> Option<PathBuf> {
-        match self {
-            InitialHistory::New | InitialHistory::Cleared => None,
-            InitialHistory::Resumed(resumed) => session_cwd_from_items(&resumed.history),
-            InitialHistory::Forked(items) => session_cwd_from_items(items),
-        }
+        self.get_session_meta().map(|meta| meta.cwd.clone())
     }
 
     pub fn get_rollout_items(&self) -> &[RolloutItem] {
@@ -4523,62 +4427,20 @@ impl InitialHistory {
         }
     }
 
-    pub fn get_event_msgs(&self) -> Option<Vec<EventMsg>> {
-        match self {
-            InitialHistory::New | InitialHistory::Cleared => None,
-            InitialHistory::Resumed(resumed) => Some(
-                resumed
-                    .history
-                    .iter()
-                    .filter_map(|ri| match ri {
-                        RolloutItem::EventMsg(ev) => Some(ev.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-            ),
-            InitialHistory::Forked(items) => Some(
-                items
-                    .iter()
-                    .filter_map(|ri| match ri {
-                        RolloutItem::EventMsg(ev) => Some(ev.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-            ),
-        }
-    }
 
     pub fn get_base_instructions(&self) -> Option<BaseInstructions> {
-        // TODO: SessionMeta should (in theory) always be first in the history, so we can probably only check the first item?
-        match self {
-            InitialHistory::New | InitialHistory::Cleared => None,
-            InitialHistory::Resumed(resumed) => {
-                resumed.history.iter().find_map(|item| match item {
-                    RolloutItem::SessionMeta(meta_line) => meta_line.meta.base_instructions.clone(),
-                    _ => None,
-                })
-            }
-            InitialHistory::Forked(items) => items.iter().find_map(|item| match item {
-                RolloutItem::SessionMeta(meta_line) => meta_line.meta.base_instructions.clone(),
-                _ => None,
-            }),
-        }
+        // Keep first-present semantics when historical metadata omits this field.
+        self.get_rollout_items().iter().find_map(|item| match item {
+            RolloutItem::SessionMeta(meta_line) => meta_line.meta.base_instructions.clone(),
+            _ => None,
+        })
     }
 
     pub fn get_dynamic_tools(&self) -> Option<Vec<DynamicToolSpec>> {
-        match self {
-            InitialHistory::New | InitialHistory::Cleared => None,
-            InitialHistory::Resumed(resumed) => {
-                resumed.history.iter().find_map(|item| match item {
-                    RolloutItem::SessionMeta(meta_line) => meta_line.meta.dynamic_tools.clone(),
-                    _ => None,
-                })
-            }
-            InitialHistory::Forked(items) => items.iter().find_map(|item| match item {
-                RolloutItem::SessionMeta(meta_line) => meta_line.meta.dynamic_tools.clone(),
-                _ => None,
-            }),
-        }
+        self.get_rollout_items().iter().find_map(|item| match item {
+            RolloutItem::SessionMeta(meta_line) => meta_line.meta.dynamic_tools.clone(),
+            _ => None,
+        })
     }
 
     pub fn get_selected_capability_roots(&self) -> Vec<SelectedCapabilityRoot> {
@@ -4611,30 +4473,6 @@ impl InitialHistory {
         }
     }
 
-    pub fn get_latest_effective_multi_agent_mode(&self) -> Option<MultiAgentMode> {
-        let items = match self {
-            InitialHistory::New | InitialHistory::Cleared => return None,
-            InitialHistory::Resumed(resumed) => &resumed.history,
-            InitialHistory::Forked(items) => items,
-        };
-        items
-            .iter()
-            .rev()
-            .find_map(|item| match item {
-                RolloutItem::TurnContext(turn_context) => Some(turn_context),
-                RolloutItem::SessionMeta(_)
-                | RolloutItem::ToolManifest(_)
-                | RolloutItem::SamplingBoundary(_)
-                | RolloutItem::ResponseItem(_)
-                | RolloutItem::InterAgentCommunication(_)
-                | RolloutItem::InterAgentCommunicationMetadata { .. }
-                | RolloutItem::Compacted(_)
-                | RolloutItem::WorldState(_)
-                | RolloutItem::AdditionalContextState { .. }
-                | RolloutItem::EventMsg(_) => None,
-            })
-            .and_then(|turn_context| turn_context.multi_agent_mode.clone())
-    }
 
     pub fn get_resumed_session_sources(&self) -> Option<(SessionSource, Option<ThreadSource>)> {
         let meta = self.get_resumed_session_meta()?;
@@ -4658,19 +4496,10 @@ impl InitialHistory {
     }
 
     fn get_session_meta(&self) -> Option<&SessionMeta> {
-        match self {
-            InitialHistory::New | InitialHistory::Cleared => None,
-            InitialHistory::Resumed(resumed) => {
-                resumed.history.iter().find_map(|item| match item {
-                    RolloutItem::SessionMeta(meta_line) => Some(&meta_line.meta),
-                    _ => None,
-                })
-            }
-            InitialHistory::Forked(items) => items.iter().find_map(|item| match item {
-                RolloutItem::SessionMeta(meta_line) => Some(&meta_line.meta),
-                _ => None,
-            }),
-        }
+        self.get_rollout_items().iter().find_map(|item| match item {
+            RolloutItem::SessionMeta(meta_line) => Some(&meta_line.meta),
+            _ => None,
+        })
     }
 
     fn get_resumed_session_meta(&self) -> Option<&SessionMeta> {
@@ -4684,13 +4513,6 @@ impl InitialHistory {
             }
         }
     }
-}
-
-fn session_cwd_from_items(items: &[RolloutItem]) -> Option<PathBuf> {
-    items.iter().find_map(|item| match item {
-        RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.cwd.clone()),
-        _ => None,
-    })
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS, Default)]
@@ -5748,12 +5570,6 @@ pub struct GitInfo {
     pub repository_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "snake_case")]
-pub enum ReviewDelivery {
-    Inline,
-    Detached,
-}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "camelCase")]

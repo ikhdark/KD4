@@ -24,6 +24,7 @@ MACHINE_ALIASES: dict[str, str] = {
 class TargetSpec:
     target: str
     dotslash_platform: str
+    pe_machine: int
     rg_name: str = field(init=False)
     code_mode_host_name: str = field(init=False)
 
@@ -42,10 +43,6 @@ class ReleaseTarget:
     platform_label: str
     host_system: str
     host_machine: str
-
-    @property
-    def package_asset_prefix(self) -> str:
-        return f"codex-package-{self.target}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,10 +102,12 @@ TARGET_SPECS: dict[str, TargetSpec] = {
     "x86_64-pc-windows-msvc": TargetSpec(
         target="x86_64-pc-windows-msvc",
         dotslash_platform="windows-x86_64",
+        pe_machine=0x8664,
     ),
     "aarch64-pc-windows-msvc": TargetSpec(
         target="aarch64-pc-windows-msvc",
         dotslash_platform="windows-aarch64",
+        pe_machine=0xAA64,
     ),
 }
 

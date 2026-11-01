@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
@@ -311,18 +312,6 @@ def _fields_from_args(args: argparse.Namespace) -> Dict[str, Optional[str]]:
 
 def _print_request(payload: dict) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
-
-
-def _decode_and_write(images: List[str], outputs: List[Path], force: bool) -> None:
-    for idx, image_b64 in enumerate(images):
-        if idx >= len(outputs):
-            break
-        out_path = outputs[idx]
-        if out_path.exists() and not force:
-            _die(f"Output already exists: {out_path} (use --force to overwrite)")
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_bytes(base64.b64decode(image_b64))
-        print(f"Wrote {out_path}")
 
 
 def _derive_downscale_path(path: Path, suffix: str) -> Path:
@@ -912,16 +901,8 @@ def _open_files(paths: List[Path]):
 
 def _open_mask(mask_path: Optional[Path]):
     if mask_path is None:
-        return _NullContext()
+        return nullcontext()
     return _SingleFile(mask_path)
-
-
-class _NullContext:
-    def __enter__(self):
-        return None
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
 
 
 class _SingleFile:

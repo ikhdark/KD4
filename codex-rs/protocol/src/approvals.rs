@@ -235,51 +235,6 @@ impl ElicitationRequest {
         }
     }
 
-    /// Canonical parameters for the MCP `elicitation/create` request. Keeping
-    /// this projection in protocol ensures every bridge preserves extension
-    /// modes and metadata identically.
-    pub fn to_mcp_create_params(&self) -> JsonValue {
-        let mut params = match self {
-            Self::Form {
-                meta,
-                message,
-                requested_schema,
-            } => serde_json::json!({
-                "mode": "form",
-                "message": message,
-                "requestedSchema": requested_schema,
-                "_meta": meta,
-            }),
-            Self::OpenAiForm {
-                meta,
-                message,
-                requested_schema,
-            } => serde_json::json!({
-                "mode": "openai/form",
-                "message": message,
-                "requestedSchema": requested_schema,
-                "_meta": meta,
-            }),
-            Self::Url {
-                meta,
-                message,
-                url,
-                elicitation_id,
-            } => serde_json::json!({
-                "mode": "url",
-                "message": message,
-                "url": url,
-                "elicitationId": elicitation_id,
-                "_meta": meta,
-            }),
-        };
-        if let Some(object) = params.as_object_mut()
-            && object.get("_meta").is_some_and(JsonValue::is_null)
-        {
-            object.remove("_meta");
-        }
-        params
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]

@@ -134,32 +134,13 @@ fn get_powershell_shell(path: Option<&PathBuf>) -> Option<DetectedShell> {
             shell_path,
         });
     }
-    let shell_path = select_powershell_host(
-        || None,
-        || find_binary_or_fallback("pwsh", PWSH_FALLBACK_PATHS),
-        || find_binary_or_fallback("powershell", POWERSHELL_FALLBACK_PATHS),
-    );
+    let shell_path = get_shell_path(None, "pwsh", PWSH_FALLBACK_PATHS)
+        .or_else(|| get_shell_path(None, "powershell", POWERSHELL_FALLBACK_PATHS));
 
     shell_path.map(|shell_path| DetectedShell {
         shell_type: ShellType::PowerShell,
         shell_path,
     })
-}
-
-fn find_binary_or_fallback(binary_name: &str, fallback_paths: &[&str]) -> Option<PathBuf> {
-    which::which(binary_name).ok().or_else(|| {
-        fallback_paths
-            .iter()
-            .find_map(|path| file_exists(std::path::Path::new(path)))
-    })
-}
-
-fn select_powershell_host(
-    provided: impl FnOnce() -> Option<PathBuf>,
-    pwsh: impl FnOnce() -> Option<PathBuf>,
-    windows_powershell: impl FnOnce() -> Option<PathBuf>,
-) -> Option<PathBuf> {
-    provided().or_else(pwsh).or_else(windows_powershell)
 }
 
 fn get_cmd_shell(path: Option<&PathBuf>) -> Option<DetectedShell> {

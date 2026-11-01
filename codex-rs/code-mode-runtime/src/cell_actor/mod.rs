@@ -156,11 +156,7 @@ async fn run_cell<H: CellHost>(
                 termination = true;
                 yield_timer = None;
                 drop(command_rx.take());
-                begin_termination(
-                    &runtime_tx,
-                    &runtime_terminate_handle,
-                    &tool_cancellation,
-                );
+                begin_termination(&runtime_terminate_handle, &tool_cancellation);
                 if runtime_closed {
                     finish_callbacks(
                         &notification_cancellation_token,
@@ -511,7 +507,7 @@ async fn run_cell<H: CellHost>(
     // Reject requests that arrive while asynchronous terminal cleanup runs.
     cell_state.tombstone();
     drop(command_rx.take());
-    begin_termination(&runtime_tx, &runtime_terminate_handle, &tool_cancellation);
+    begin_termination(&runtime_terminate_handle, &tool_cancellation);
     finish_callbacks(
         &notification_cancellation_token,
         &tool_cancellation,
@@ -602,11 +598,9 @@ fn observer_timer(
 }
 
 fn begin_termination(
-    runtime_tx: &std::sync::mpsc::Sender<RuntimeCommand>,
     runtime_terminate_handle: &crate::runtime::RuntimeTerminationHandle,
     cancellation: &NestedCancellation,
 ) {
     cancellation.cancel_with(codex_code_mode_protocol::CancellationCause::RuntimeShutdown);
-    let _ = runtime_tx.send(RuntimeCommand::Terminate);
     let _ = runtime_terminate_handle.terminate_execution();
 }

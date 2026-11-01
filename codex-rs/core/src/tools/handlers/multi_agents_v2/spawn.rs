@@ -2,7 +2,6 @@ use super::*;
 use crate::agent::control::SpawnAgentForkMode;
 use crate::agent::control::SpawnAgentOptions;
 use crate::agent::next_thread_spawn_depth;
-use crate::agent::role::AgentRoleLocks;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
@@ -22,7 +21,6 @@ use codex_agent_task_store::AssignmentDraft;
 use codex_agent_task_store::AssignmentId;
 use codex_agent_task_store::AssignmentRelation;
 use codex_agent_task_store::Attempt;
-use codex_agent_task_store::AttemptState;
 use codex_agent_task_store::IntegrationPlan;
 use codex_agent_task_store::LocalAgentTaskStore;
 use codex_agent_task_store::RelevantHandle;
@@ -33,7 +31,6 @@ use codex_agent_task_store::TaskCapsuleHandle;
 use codex_agent_task_store::TaskCapsuleV1;
 use codex_agent_task_store::WorkspaceStrategy;
 use codex_agent_task_store::normalize_repo_path;
-use codex_agent_task_store::normalize_repo_scopes;
 use codex_agent_task_store::repo_path_identity_keys;
 use codex_context_fragments::ModelContextBudget;
 use codex_git_utils::get_git_repo_root;
@@ -47,7 +44,6 @@ use codex_tools::ToolSpec;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use sha2::Digest;
 use sha2::Sha256;
-use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -187,7 +183,7 @@ async fn handle_spawn_agent(
     // History forks do not attach a capsule, but still need the task's explicit
     // file/symbol pointers. They are hints, not authority beyond the task scopes.
     let history_relevant_handles = args.assignment.as_ref()
-        .filter(|_| !matches!(fork_mode, Some(SpawnAgentForkMode::TaskCapsule)))
+        .filter(|_| !matches!(fork_mode, SpawnAgentForkMode::TaskCapsule))
         .map(|assignment| assignment.relevant_handles.clone())
         .unwrap_or_default();
 
@@ -257,23 +253,14 @@ async fn handle_spawn_agent(
     if let Some(service_tier) = args.service_tier.as_ref() {
         config.service_tier = Some(service_tier.clone());
     }
-    if matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory)) {
-        reject_full_fork_spawn_overrides(
-            None,
-            args.model.as_deref(),
-            args.reasoning_effort.clone(),
-        )?;
-    }
     // Generic subagents inherit runtime authority; configured role profiles cannot
     // replace their model, effort, instructions, or permissions.
-    let role_locks = AgentRoleLocks::default();
     apply_spawn_agent_model_defaults_and_overrides(
         &session,
         turn.as_ref(),
         &mut config,
         args.model.as_deref(),
         args.reasoning_effort.clone(),
-        role_locks,
     )
     .await?;
     apply_spawn_agent_service_tier(
@@ -284,7 +271,6 @@ async fn handle_spawn_agent(
         args.service_tier.as_deref(),
     )
     .await?;
-    apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref(), role_locks)?;
     config.cwd = admission_cwd.clone();
     worker_startup_preflight(&session, &turn, &config, &primary, &cancellation_token).await?;
 
@@ -312,7 +298,7 @@ async fn handle_spawn_agent(
         1,
         &[("outcome", "attempted"), ("role", typed_role_metric)],
     );
-    let mut prepared_typed_spawn = match session
+    let prepared_typed_spawn = match session
         .services
         .agent_control
         .prepare_typed_spawn(&config, spawn_source.clone(), Some(session.thread_id))
@@ -324,7 +310,7 @@ async fn handle_spawn_agent(
                 1,
                 &[("outcome", "reserved"), ("role", typed_role_metric)],
             );
-            Some(prepared)
+            prepared
         }
         Err(error) => {
             turn.session_telemetry.counter(
@@ -338,14 +324,14 @@ async fn handle_spawn_agent(
             return Err(collab_spawn_error(error));
         }
     };
-    let mut typed_reservation_metric = Some(TypedSpawnReservationMetric::new(
+    let mut typed_reservation_metric = TypedSpawnReservationMetric::new(
         turn.session_telemetry.clone(),
         typed_role_metric,
-    ));
-    let mut consumed_typed_spawn = None;
-    let mut admitted_launch_guard = None;
-    let mut overlap_warnings = Vec::new();
-    let typed_task = if args.assignment.is_some() || legacy_message.is_some() {
+    );
+    let mut consumed_typed_spawn;
+    let mut admitted_launch_guard;
+    let overlap_warnings;
+    let typed_task = {
         let role = typed_role;
         let coordinator = session.services.agent_control.task_coordinator();
         if coordinator.store().is_none() {
@@ -457,15 +443,10 @@ async fn handle_spawn_agent(
                 "spawn_agent cancelled".to_string(),
             ));
         }
-        let prepared = prepared_typed_spawn.take().ok_or_else(|| {
-            FunctionCallError::RespondToModel(
-                "spawn_agent: typed spawn reservation became unavailable".to_string(),
-            )
-        })?;
         consumed_typed_spawn = match session
             .services
             .agent_control
-            .consume_prepared_typed_spawn(prepared, &config, &spawn_source, Some(session.thread_id))
+            .consume_prepared_typed_spawn(prepared_typed_spawn, &config, &spawn_source, Some(session.thread_id))
             .await
         {
             Ok(consumed) => Some(consumed),
@@ -482,9 +463,6 @@ async fn handle_spawn_agent(
                 return Err(collab_spawn_error(error));
             }
         };
-        // A duplicate rejection can offer reuse, whose handles must validate
-        // against these requested scopes exactly as this fresh launch would.
-        let requested_scopes = (draft.read_scope.clone(), draft.write_scope.clone());
         let admitted = match coordinator
             .create_admitted_assignment(
                 &repo_root,
@@ -497,38 +475,6 @@ async fn handle_spawn_agent(
         {
             Ok(task) => task,
             Err(error) => {
-                if let StoreError::AdmissionRejected {
-                    reason: AdmissionRejectionReason::DuplicateExplorerInvestigation,
-                    reusable_assignment_id: Some(assignment_id),
-                } = &error
-                {
-                    if let Some(workspace) = isolated_workspace.take()
-                        && let Err(cleanup_error) = cleanup_isolated_worktree(&workspace).await
-                    {
-                        tracing::warn!(
-                            path = %workspace.path.display(),
-                            %cleanup_error,
-                            "failed to clean isolated worktree after assignment reuse"
-                        );
-                    }
-                    let (read_scope, write_scope) = &requested_scopes;
-                    let requested_handles = reuse_request_handles(
-                        matches!(fork_mode, Some(SpawnAgentForkMode::TaskCapsule)),
-                        &repo_root,
-                        read_scope,
-                        write_scope,
-                        relevant_handles,
-                    )
-                    .await?;
-                    let result = reusable_spawn_result(
-                        &session.services.agent_control,
-                        *assignment_id,
-                        requested_handles.as_deref(),
-                    )
-                    .await?;
-                    emit_admission_reuse_metric(&turn.session_telemetry);
-                    return Ok(result);
-                }
                 emit_admission_rejection_metric(&turn.session_telemetry, &error);
                 if let Some(workspace) = isolated_workspace.take()
                     && let Err(cleanup_error) = cleanup_isolated_worktree(&workspace).await
@@ -546,13 +492,13 @@ async fn handle_spawn_agent(
         overlap_warnings = admitted.overlaps.warnings;
         let assignment = admitted.assignment;
         let attempt = admitted.attempt;
-        admitted_launch_guard = Some(AdmittedLaunchGuard {
+        admitted_launch_guard = AdmittedLaunchGuard {
             session: Arc::clone(&session),
             telemetry: turn.session_telemetry.clone(),
             assignment_id: assignment.assignment_id,
             armed: true,
-        });
-        let task_capsule = if matches!(fork_mode, Some(SpawnAgentForkMode::TaskCapsule)) {
+        };
+        let task_capsule = if matches!(fork_mode, SpawnAgentForkMode::TaskCapsule) {
             match construct_and_attach_task_capsule(
                 store.as_ref(),
                 &repo_root,
@@ -599,13 +545,9 @@ async fn handle_spawn_agent(
         } else {
             None
         };
-        Some((assignment, attempt, task_capsule))
-    } else {
-        None
+        (assignment, attempt, task_capsule)
     };
-    if let Some((assignment, _, _)) = typed_task.as_ref()
-        && assignment.admission_origin == AssignmentAdmissionOrigin::Typed
-    {
+    if typed_task.0.admission_origin == AssignmentAdmissionOrigin::Typed {
         // Capsule and history forks share the same receipt lifecycle. Keep it in the
         // child configuration so the canonical capsule payload remains unchanged.
         let instructions = config.developer_instructions.get_or_insert_default();
@@ -615,13 +557,14 @@ async fn handle_spawn_agent(
         instructions.push_str(TYPED_RECEIPT_LIFECYCLE);
     }
     let options = SpawnAgentOptions {
-        fork_parent_spawn_call_id: fork_mode.as_ref().map(|_| call_id.clone()),
-        fork_mode,
+        fork_parent_spawn_call_id: Some(call_id.clone()),
+        fork_mode: Some(fork_mode),
         parent_thread_id: Some(session.thread_id),
         parent_turn_id: Some(turn.sub_id.clone()),
         environments: spawn_environments,
         captured_environments: Some(step_context.environments.clone()),
-        typed_task_binding: typed_task.as_ref().map(|(assignment, attempt, _)| {
+        typed_task_binding: Some({
+            let (assignment, attempt, _) = &typed_task;
             AgentTaskBindingDraft {
                 assignment_id: assignment.assignment_id,
                 attempt_id: attempt.attempt_id,
@@ -644,8 +587,7 @@ async fn handle_spawn_agent(
         &session, &turn, &config, &launch_environment, &cancellation_token,
     ).await.map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
     if let Some(canonical_payload) = typed_task
-        .as_ref()
-        .and_then(|(_, _, capsule)| capsule.as_ref())
+        .2.as_ref()
     {
         let prepared = consumed_typed_spawn.take().ok_or_else(|| {
             CodexErr::InvalidRequest(
@@ -673,23 +615,20 @@ async fn handle_spawn_agent(
             .session_source
             .get_agent_path()
             .unwrap_or_else(AgentPath::root);
-        let communication = match typed_task.as_ref() {
-            Some((assignment, attempt, _)) => communication_from_plaintext_message(
-                author,
-                new_agent_path.clone(),
-                typed_assignment_message(assignment, attempt, &history_relevant_handles),
-            ),
-            None => unreachable!("all MultiAgentV2 spawns are durably admitted"),
-        };
+        let (assignment, attempt, _) = &typed_task;
+        let communication = communication_from_plaintext_message(
+            author,
+            new_agent_path.clone(),
+            typed_assignment_message(assignment, attempt, &history_relevant_handles),
+        );
         let context =
             AgentCommunicationContext::new(AgentCommunicationKind::Spawn, session.thread_id);
-        if typed_task.is_some() {
-            let prepared = consumed_typed_spawn.take().ok_or_else(|| {
-                CodexErr::InvalidRequest(
-                    "spawn_agent: typed spawn reservation became unavailable".to_string(),
-                )
-            })?;
-            await_spawn_or_cancel(
+        let prepared = consumed_typed_spawn.take().ok_or_else(|| {
+            CodexErr::InvalidRequest(
+                "spawn_agent: typed spawn reservation became unavailable".to_string(),
+            )
+        })?;
+        await_spawn_or_cancel(
                 &cancellation_token,
                 Box::pin(
                     session
@@ -706,35 +645,14 @@ async fn handle_spawn_agent(
                 ),
             )
             .await
-        } else {
-            await_spawn_or_cancel(
-                &cancellation_token,
-                Box::pin(
-                    session
-                        .services
-                        .agent_control
-                        .spawn_agent_with_communication(
-                            config,
-                            communication,
-                            context,
-                            Some(spawn_source),
-                            options,
-                        ),
-                ),
-            )
-            .await
-        }
     }
     }.await;
     let spawned_agent = match spawned_agent {
         Ok(spawned_agent) => spawned_agent,
         Err(error) => {
-            let assignment_id = typed_task
-                .as_ref()
-                .map(|(assignment, _, _)| assignment.assignment_id);
+            let assignment_id = typed_task.0.assignment_id;
             let control = session.services.agent_control.clone();
-            let child_thread_id = assignment_id
-                .and_then(|id| control.task_coordinator().binding_for_assignment(id))
+            let child_thread_id = control.task_coordinator().binding_for_assignment(assignment_id)
                 .and_then(|binding| binding.thread_id)
                 .and_then(|id| ThreadId::from_string(&id).ok());
             let telemetry = turn.session_telemetry.clone();
@@ -746,7 +664,7 @@ async fn handle_spawn_agent(
                     tracing::warn!(%child_thread_id, %error, "could not observe failed spawned child termination");
                     return;
                 }
-                if let Some(assignment_id) = assignment_id {
+                {
                     let coordinator = control.task_coordinator();
                     if let Some(store) = coordinator.store() {
                         if let Err(rollback_error) = store
@@ -805,16 +723,13 @@ async fn handle_spawn_agent(
             return Err(collab_spawn_error(error));
         }
     };
-    if let Some(guard) = admitted_launch_guard.as_mut() {
-        guard.armed = false;
-    }
+    admitted_launch_guard.armed = false;
+    drop(admitted_launch_guard);
     if let Some(workspace) = &isolated_workspace {
         // The successfully started agent now owns the worktree lifetime.
         workspace.cleanup_required.store(false, Ordering::Release);
     }
-    if let Some(metric) = typed_reservation_metric.as_mut() {
-        metric.mark_retained();
-    }
+    typed_reservation_metric.mark_retained();
     let new_thread_id = spawned_agent.thread_id;
     let agent_snapshot = session
         .services
@@ -843,22 +758,8 @@ async fn handle_spawn_agent(
         &[("role", role_tag), ("version", "v2")],
     );
     let task_name = String::from(new_agent_path);
-    let assignment_id = typed_task
-        .as_ref()
-        .map(|(assignment, _, _)| assignment.assignment_id.to_string())
-        .ok_or_else(|| {
-            FunctionCallError::RespondToModel(
-                "spawn_agent: durable admission completed without an assignment".to_string(),
-            )
-        })?;
-    let integration_plan = typed_task
-        .as_ref()
-        .map(|(assignment, _, _)| assignment.integration_plan)
-        .ok_or_else(|| {
-            FunctionCallError::RespondToModel(
-                "spawn_agent: durable admission completed without an integration plan".to_string(),
-            )
-        })?;
+    let assignment_id = typed_task.0.assignment_id.to_string();
+    let integration_plan = typed_task.0.integration_plan;
 
     let hide_agent_metadata = turn.config.multi_agent_v2.hide_spawn_agent_metadata;
     if hide_agent_metadata {
@@ -978,85 +879,6 @@ fn emit_admission_rejection_metric(session_telemetry: &SessionTelemetry, error: 
     }
 }
 
-fn emit_admission_reuse_metric(session_telemetry: &SessionTelemetry) {
-    session_telemetry.counter(
-        "codex.multi_agent.admission",
-        1,
-        &[
-            ("outcome", "reused"),
-            ("reason", "duplicate_explorer_investigation"),
-        ],
-    );
-    session_telemetry.counter(
-        "codex.multi_agent.admission_overlap",
-        1,
-        &[
-            ("kind", "duplicated_primary_investigation"),
-            ("outcome", "reused"),
-        ],
-    );
-}
-
-/// `requested_handles` are the canonical capsule handles a fresh launch of the
-/// request would attach; `None` for history forks, which deliver unverified hints.
-async fn reusable_spawn_result(
-    control: &crate::agent::AgentControl,
-    assignment_id: AssignmentId,
-    requested_handles: Option<&[TaskCapsuleHandle]>,
-) -> Result<SpawnAgentResult, FunctionCallError> {
-    let coordinator = control.task_coordinator();
-    let binding = coordinator
-        .get_agent_task_binding(assignment_id)
-        .await
-        .map_err(typed_task_store_error)?;
-    let producer = binding
-        .as_ref()
-        .and_then(|binding| binding.thread_id.as_deref())
-        .and_then(|thread| ThreadId::from_string(thread).ok());
-    let producer_running = match producer {
-        Some(thread) => control.has_running_agent(thread).await,
-        None => false,
-    };
-    // Recheck durable authority after the asynchronous liveness observation,
-    // never return an earlier Active snapshot for a superseded attempt.
-    let task = coordinator
-        .get_agent_task(assignment_id, None)
-        .await
-        .map_err(typed_task_store_error)?;
-    if !producer_running
-        || binding
-            .as_ref()
-            .is_none_or(|binding| binding.attempt_id != task.current_attempt.attempt_id)
-        || task.current_attempt.state != codex_agent_task_store::AttemptState::Active
-        || task.receipt.is_some()
-    {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "spawn_agent: matching assignment {assignment_id} has no verified running producer. Resume or reconcile/abandon that assignment before requesting a replacement. No investigation was reused and no duplicate was started."
-        )));
-    }
-    if let Some(requested) = requested_handles
-        && !capsule_handles_match(task.assignment.task_capsule.as_deref(), requested)
-    {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "spawn_agent: matching assignment {assignment_id} was launched with different relevant_handles. Wait for that assignment or request a distinct investigation. No investigation was reused and no duplicate was started."
-        )));
-    }
-    let task_name = binding
-        .as_ref()
-        .map(|binding| binding.agent_path.clone())
-        .unwrap_or_else(|| assignment_id.to_string());
-    Ok(SpawnAgentResult::Reused {
-        task_name,
-        assignment_id: assignment_id.to_string(),
-        attempt_id: task.current_attempt.attempt_id.to_string(),
-        agent_path: binding.as_ref().map(|binding| binding.agent_path.clone()),
-        thread_id: binding.and_then(|binding| binding.thread_id),
-        status: task.current_attempt.state,
-        receipt_available: task.receipt.is_some(),
-        integration_plan: task.assignment.integration_plan,
-        reused: true,
-    })
-}
 
 #[derive(Debug)]
 struct IsolatedWorkspace {
@@ -1708,7 +1530,7 @@ impl SpawnAgentArgs {
     fn fork_mode(
         &self,
         allow_full_history_forks: bool,
-    ) -> Result<Option<SpawnAgentForkMode>, FunctionCallError> {
+    ) -> Result<SpawnAgentForkMode, FunctionCallError> {
         if self.fork_context.is_some() {
             return Err(FunctionCallError::RespondToModel(
                 "fork_context is not supported in MultiAgentV2; use fork_turns instead".to_string(),
@@ -1722,15 +1544,15 @@ impl SpawnAgentArgs {
             .filter(|fork_turns| !fork_turns.is_empty());
 
         let Some(fork_turns) = explicit_fork_turns else {
-            return Ok(Some(SpawnAgentForkMode::TaskCapsule));
+            return Ok(SpawnAgentForkMode::TaskCapsule);
         };
 
         if fork_turns.eq_ignore_ascii_case("none") {
-            return Ok(Some(SpawnAgentForkMode::TaskCapsule));
+            return Ok(SpawnAgentForkMode::TaskCapsule);
         }
         if fork_turns.eq_ignore_ascii_case("all") {
             if allow_full_history_forks {
-                return Ok(Some(SpawnAgentForkMode::FullHistory));
+                return Ok(SpawnAgentForkMode::FullHistory);
             }
             return Err(FunctionCallError::RespondToModel(
                 "fork_turns=\"all\" is disabled. Use `none` or an integer from 1 through 5."
@@ -1754,7 +1576,7 @@ impl SpawnAgentArgs {
             )));
         }
 
-        Ok(Some(SpawnAgentForkMode::LastNTurns(last_n_turns)))
+        Ok(SpawnAgentForkMode::LastNTurns(last_n_turns))
     }
 }
 
@@ -2014,70 +1836,6 @@ async fn normalize_relevant_handles(
     Ok(normalized_handles)
 }
 
-/// Validate a reuse request's handles before any reuse, exactly as its fresh
-/// launch would, and return them for the equivalence check. `None` when the
-/// launch forks history instead of attaching canonical TaskCapsule handles.
-async fn reuse_request_handles(
-    uses_task_capsule: bool,
-    repo_root: &Path,
-    read_scope: &[RepoScope],
-    write_scope: &[RepoScope],
-    handles: Vec<RelevantHandle>,
-) -> Result<Option<Vec<TaskCapsuleHandle>>, FunctionCallError> {
-    if !uses_task_capsule {
-        return Ok(None);
-    }
-    let root = repo_root.to_path_buf();
-    let read_scope = read_scope.to_vec();
-    let write_scope = write_scope.to_vec();
-    // Read and write scopes normalize separately, as admission normalizes them.
-    let scopes = tokio::task::spawn_blocking(move || {
-        let mut scopes = normalize_repo_scopes(&root, &read_scope)?;
-        scopes.extend(normalize_repo_scopes(&root, &write_scope)?);
-        Ok::<_, StoreError>(scopes)
-    })
-    .await
-    .map_err(|error| {
-        typed_task_store_error(StoreError::CorruptData(format!(
-            "task capsule scope normalization failed: {error}"
-        )))
-    })?
-    .map_err(typed_task_store_error)?;
-    normalize_relevant_handles(repo_root, &scopes, handles)
-        .await
-        .map(Some)
-        .map_err(typed_task_store_error)
-}
-
-/// Reuse equivalence includes the canonical handle set (file, or symbol
-/// locator, per path). Existence and content observations are launch-time
-/// state, not identity. A producer launched without a capsule has no canonical handles;
-/// an unreadable capsule never matches.
-fn capsule_handles_match(existing_capsule: Option<&str>, requested: &[TaskCapsuleHandle]) -> bool {
-    let existing = match existing_capsule {
-        None => Vec::new(),
-        Some(payload) => match serde_json::from_str::<TaskCapsuleV1>(payload) {
-            Ok(capsule) => capsule.relevant_handles,
-            Err(_) => return false,
-        },
-    };
-    capsule_handle_identities(&existing) == capsule_handle_identities(requested)
-}
-
-fn capsule_handle_identities(handles: &[TaskCapsuleHandle]) -> BTreeSet<(&str, Option<&str>)> {
-    handles
-        .iter()
-        .map(|handle| match handle {
-            TaskCapsuleHandle::File { path, .. } => (path.as_str(), None),
-            TaskCapsuleHandle::Symbol { path, symbol, .. } => {
-                (path.as_str(), Some(symbol.as_str()))
-            }
-        })
-        .collect()
-}
-
-
-
 const TYPED_RECEIPT_LIFECYCLE: &str = "This is an explicit typed assignment. Before acting on a follow-up, use get_agent_task with your own assignment_id to recover the current attempt and effective contract; the immutable bootstrap may describe an earlier attempt. Otherwise use get_agent_task only when contract details or captured validation call IDs are missing from the current context. Before your final response, call submit_agent_receipt with the actual outcome and available evidence; report missing validation honestly. A final response alone does not seal this typed assignment.";
 
 fn typed_assignment_message(
@@ -2163,17 +1921,6 @@ pub(crate) enum SpawnAgentResult {
         assignment_id: String,
         integration_plan: IntegrationPlan,
         overlap_warnings: Vec<codex_agent_task_store::TaskOverlapWarning>,
-    },
-    Reused {
-        task_name: String,
-        assignment_id: String,
-        attempt_id: String,
-        agent_path: Option<String>,
-        thread_id: Option<String>,
-        status: AttemptState,
-        receipt_available: bool,
-        integration_plan: IntegrationPlan,
-        reused: bool,
     },
 }
 

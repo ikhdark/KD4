@@ -13,9 +13,9 @@ from openai_codex import (
     Codex,
     JsonRpcError,
     ServerBusyError,
+    TurnRunError,
     retry_on_overload,
 )
-from openai_codex.types import TurnStatus
 
 with Codex(config=runtime_config()) as codex:
     thread = codex.thread_start(model="gpt-5.4", config={"model_reasoning_effort": "high"})
@@ -31,8 +31,7 @@ with Codex(config=runtime_config()) as codex:
         print("Server overloaded after retries:", exc.message)
     except JsonRpcError as exc:
         print(f"JSON-RPC error {exc.code}: {exc.message}")
+    except TurnRunError as exc:
+        print("Turn failed or incomplete:", exc)
     else:
-        if result.status == TurnStatus.failed:
-            print("Turn failed:", result.error)
-        else:
-            print("Text:", result.final_response)
+        print("Text:", result.final_response)

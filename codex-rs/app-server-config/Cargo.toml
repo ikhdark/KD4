@@ -1,0 +1,37 @@
+[package]
+name = "codex-app-server-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "codex_app_server_config"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+codex-app-server-protocol-types = { workspace = true }
+codex-app-server-transport = { workspace = true }
+codex-arg0 = { workspace = true }
+codex-cloud-config = { workspace = true }
+codex-config = { workspace = true }
+codex-core = { workspace = true }
+codex-core-plugins = { workspace = true }
+codex-exec-server = { workspace = true }
+codex-features = { workspace = true }
+codex-file-system = { workspace = true }
+codex-http-client = { workspace = true }
+codex-login = { workspace = true }
+codex-protocol = { workspace = true }
+codex-utils-absolute-path = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "macros", "rt", "sync"] }
+tokio-util = { workspace = true, features = ["rt"] }
+toml = { workspace = true }
+toml_edit = { workspace = true }
+tracing = { workspace = true }

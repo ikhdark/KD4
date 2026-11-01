@@ -30,8 +30,8 @@ pub fn cloud_config_bundle_loader(
     retryable_service_loader(service)
 }
 
-pub(crate) fn retryable_service_loader<C: crate::backend::BundleClient + 'static>(
-    service: CloudConfigBundleService<C>,
+pub(crate) fn retryable_service_loader(
+    service: CloudConfigBundleService,
 ) -> CloudConfigBundleLoader {
     let validity_service = service.clone();
     CloudConfigBundleLoader::retryable(move || {

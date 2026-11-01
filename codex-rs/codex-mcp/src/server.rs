@@ -4,45 +4,33 @@ use codex_config::AppToolApproval;
 use codex_config::McpServerConfig;
 use codex_config::McpServerTransportConfig;
 
-/// The runtime launch strategy for an effective MCP server.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum McpServerLaunch {
-    Configured(Box<McpServerConfig>),
-}
-
 /// MCP server after runtime additions have been applied.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EffectiveMcpServer {
-    launch: McpServerLaunch,
+    config: Box<McpServerConfig>,
 }
 
 impl EffectiveMcpServer {
     pub fn configured(config: McpServerConfig) -> Self {
         Self {
-            launch: McpServerLaunch::Configured(Box::new(config)),
+            config: Box::new(config),
         }
     }
 
-    pub(crate) fn launch(&self) -> &McpServerLaunch {
-        &self.launch
+    pub(crate) fn config(&self) -> &McpServerConfig {
+        &self.config
     }
 
     pub fn configured_config(&self) -> Option<&McpServerConfig> {
-        match &self.launch {
-            McpServerLaunch::Configured(config) => Some(config.as_ref()),
-        }
+        Some(self.config())
     }
 
     pub fn enabled(&self) -> bool {
-        match &self.launch {
-            McpServerLaunch::Configured(config) => config.enabled,
-        }
+        self.config.enabled
     }
 
     pub fn required(&self) -> bool {
-        match &self.launch {
-            McpServerLaunch::Configured(config) => config.required,
-        }
+        self.config.required
     }
 }
 
@@ -94,22 +82,21 @@ impl McpServerMetadata {
 
 impl From<&EffectiveMcpServer> for McpServerMetadata {
     fn from(server: &EffectiveMcpServer) -> Self {
-        match server.launch() {
-            McpServerLaunch::Configured(config) => Self {
-                environment_id: config.environment_id.clone(),
-                origin: McpServerOrigin::from_transport(&config.transport),
-                supports_parallel_tool_calls: config.supports_parallel_tool_calls,
-                default_tools_approval_mode: config.default_tools_approval_mode,
-                tool_approval_modes: config
-                    .tools
-                    .iter()
-                    .filter_map(|(name, config)| {
-                        config
-                            .approval_mode
-                            .map(|approval_mode| (name.clone(), approval_mode))
-                    })
-                    .collect(),
-            },
+        let config = server.config();
+        Self {
+            environment_id: config.environment_id.clone(),
+            origin: McpServerOrigin::from_transport(&config.transport),
+            supports_parallel_tool_calls: config.supports_parallel_tool_calls,
+            default_tools_approval_mode: config.default_tools_approval_mode,
+            tool_approval_modes: config
+                .tools
+                .iter()
+                .filter_map(|(name, config)| {
+                    config
+                        .approval_mode
+                        .map(|approval_mode| (name.clone(), approval_mode))
+                })
+                .collect(),
         }
     }
 }

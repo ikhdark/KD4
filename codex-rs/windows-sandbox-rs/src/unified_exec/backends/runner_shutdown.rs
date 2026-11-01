@@ -17,16 +17,25 @@ impl RunnerShutdown {
 
     pub(crate) fn confirm(&mut self, send: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
         if self.confirmed { return Ok(()); }
-        if !self.requested {
-            send()?;
-            self.requested = true;
-        }
-        match self.receipt.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-            .recv_timeout(Duration::from_secs(5)) {
-            Ok(true) => { self.confirmed = true; Ok(()) }
-            Ok(false) => Err(io::Error::other("runner reported root exit without process-tree shutdown confirmation")),
-            Err(error) => Err(io::Error::new(io::ErrorKind::TimedOut,
-                format!("runner shutdown uncertain; confirmation receipt unavailable: {error}"))),
+        let admission = if self.requested { Ok(()) } else { send() };
+        let receipt = self.receipt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let confirmed = match admission {
+            Ok(()) => {
+                self.requested = true;
+                receipt.recv_timeout(Duration::from_secs(5)).map_err(|error| {
+                    io::Error::new(io::ErrorKind::TimedOut,
+                        format!("runner shutdown uncertain; confirmation receipt unavailable: {error}"))
+                })
+            }
+            // The reader publishes its receipt before closing outbound control.
+            // A runner-side timeout may already have stopped the tree, or a
+            // confirmation may race this send. Reuse that proof rather than
+            // losing it behind a now-closed control pipe.
+            Err(error) => receipt.try_recv().map_err(|_| error),
+        }?;
+        match confirmed {
+            true => { self.confirmed = true; Ok(()) }
+            false => Err(io::Error::other("runner reported root exit without process-tree shutdown confirmation")),
         }
     }
 }

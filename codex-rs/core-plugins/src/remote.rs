@@ -795,16 +795,6 @@ pub struct RemotePluginInstallResult {
     pub app_ids_needing_auth: Option<Vec<String>>,
 }
 
-pub async fn fetch_remote_marketplaces(
-    config: &RemotePluginServiceConfig,
-    auth: Option<&CodexAuth>,
-    sources: &[RemoteMarketplaceSource],
-    global_catalog_cache_path: Option<&Path>,
-) -> Result<Vec<RemoteMarketplace>, RemotePluginCatalogError> {
-    fetch_remote_marketplaces_with_global_cache_observation(
-        config, auth, sources, global_catalog_cache_path, None,
-    ).await
-}
 
 pub async fn fetch_remote_marketplaces_with_global_cache_observation(
     config: &RemotePluginServiceConfig,
@@ -1024,7 +1014,7 @@ pub async fn fetch_recommended_plugins(
     let auth = ensure_chatgpt_auth(auth)?;
     let url = remote_plugin_service_url(config, &["ps", "plugins", "suggested"])?;
     let client = &config.http_clients;
-    let request = authenticated_request(client.get(&url), auth)?
+    let request = authenticated_request(client.get(&url), auth)
         .timeout(RECOMMENDED_PLUGINS_TIMEOUT)
         .query(&[("scope", "GLOBAL")]);
     let response: RecommendedPluginsResponse = send_and_decode(request, &url).await?;
@@ -1096,14 +1086,6 @@ fn recommended_plugins_mode(response: RecommendedPluginsResponse) -> Recommended
     }
 }
 
-pub async fn has_cached_global_remote_plugin_catalog(
-    codex_home: &Path,
-    config: &RemotePluginServiceConfig,
-    auth: Option<&CodexAuth>,
-) -> bool {
-    observe_cached_global_remote_plugin_catalog(codex_home, config, auth)
-        .await.is_some_and(|observed| observed.is_cached_for(codex_home, config, auth))
-}
 
 pub async fn observe_cached_global_remote_plugin_catalog(
     codex_home: &Path,
@@ -1356,7 +1338,7 @@ pub async fn fetch_remote_plugin_skill_detail(
     let url =
         remote_plugin_service_url(config, &["ps", "plugins", plugin_id, "skills", skill_name])?;
     let client = &config.http_clients;
-    let request = authenticated_request(client.get(&url), auth)?;
+    let request = authenticated_request(client.get(&url), auth);
     let response: RemotePluginSkillDetailResponse = send_and_decode(request, &url).await?;
     if response.plugin_id != plugin_id {
         return Err(RemotePluginCatalogError::UnexpectedPluginId {
@@ -1517,7 +1499,7 @@ pub async fn install_remote_plugin(
             .post(&url)
             .query(&[("includeAppsNeedingAuth", "true")]),
         auth,
-    )?;
+    );
     let response: RemotePluginMutationResponse = send_and_decode(request, &url).await?;
     if response.id != plugin_id {
         return Err(RemotePluginCatalogError::UnexpectedPluginId {
@@ -1605,7 +1587,7 @@ pub async fn uninstall_remote_plugin(
     let url =
         remote_plugin_service_url(config, &["ps", "plugins", &remote_plugin_id, "uninstall"])?;
     let client = &config.http_clients;
-    let request = authenticated_request(client.post(&url), auth)?;
+    let request = authenticated_request(client.post(&url), auth);
     let response: RemotePluginMutationResponse = send_and_decode(request, &url).await?;
     if response.id != remote_plugin_id {
         return Err(RemotePluginCatalogError::UnexpectedPluginId {
@@ -2083,7 +2065,7 @@ async fn get_remote_plugin_list_page(
     collection: Option<&str>,
 ) -> Result<RemotePluginListResponse, RemotePluginCatalogError> {
     let url = remote_plugin_service_url(config, &["ps", "plugins", "list"])?;
-    let mut request = authenticated_request(client.get(&url), auth)?;
+    let mut request = authenticated_request(client.get(&url), auth);
     request = request.query(&[("scope", scope.api_value())]);
     request = request.query(&[("limit", REMOTE_PLUGIN_LIST_PAGE_LIMIT)]);
     if let Some(collection) = collection {
@@ -2102,7 +2084,7 @@ async fn get_remote_shared_workspace_plugins_page(
     page_token: Option<&str>,
 ) -> Result<RemotePluginListResponse, RemotePluginCatalogError> {
     let url = remote_plugin_service_url(config, &["ps", "plugins", "workspace", "shared"])?;
-    let mut request = authenticated_request(client.get(&url), auth)?;
+    let mut request = authenticated_request(client.get(&url), auth);
     request = request.query(&[("limit", REMOTE_PLUGIN_LIST_PAGE_LIMIT)]);
     if let Some(page_token) = page_token {
         request = request.query(&[("pageToken", page_token)]);
@@ -2119,7 +2101,7 @@ async fn get_remote_plugin_installed_page(
     include_download_urls: bool,
 ) -> Result<RemotePluginInstalledResponse, RemotePluginCatalogError> {
     let url = remote_plugin_service_url(config, &["ps", "plugins", "installed"])?;
-    let mut request = authenticated_request(client.get(&url), auth)?;
+    let mut request = authenticated_request(client.get(&url), auth);
     request = request.query(&[("scope", scope.api_value())]);
     if include_download_urls {
         request = request.query(&[("includeDownloadUrls", true)]);
@@ -2138,7 +2120,7 @@ async fn fetch_plugin_detail(
 ) -> Result<RemotePluginDirectoryItem, RemotePluginCatalogError> {
     let url = remote_plugin_service_url(config, &["ps", "plugins", plugin_id])?;
     let client = &config.http_clients;
-    let mut request = authenticated_request(client.get(&url), auth)?;
+    let mut request = authenticated_request(client.get(&url), auth);
     if include_download_urls {
         request = request.query(&[("includeDownloadUrls", true)]);
     }
@@ -2189,12 +2171,12 @@ fn ensure_chatgpt_auth(auth: Option<&CodexAuth>) -> Result<&CodexAuth, RemotePlu
 fn authenticated_request(
     request: RouteAwareRequestBuilder,
     auth: &CodexAuth,
-) -> Result<RouteAwareRequestBuilder, RemotePluginCatalogError> {
-    Ok(request
+) -> RouteAwareRequestBuilder {
+    request
         .timeout(REMOTE_PLUGIN_CATALOG_TIMEOUT)
         .headers(default_headers())
         .headers(codex_model_provider::auth_provider_from_auth(auth).to_auth_headers())
-        .header(OAI_PRODUCT_SKU_HEADER, CODEX_PRODUCT_SKU))
+        .header(OAI_PRODUCT_SKU_HEADER, CODEX_PRODUCT_SKU)
 }
 
 async fn send_and_decode<T: for<'de> Deserialize<'de>>(

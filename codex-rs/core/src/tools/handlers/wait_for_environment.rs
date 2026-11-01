@@ -125,5 +125,11 @@ impl ToolExecutor<ToolInvocation> for WaitForEnvironmentHandler {
     }
 }
 
-impl CoreToolRuntime for WaitForEnvironmentHandler {}
+impl CoreToolRuntime for WaitForEnvironmentHandler {
+    fn delegates_workspace_admission(&self) -> bool {
+        // The already-started environment owns readiness and startup admission.
+        // Do not retain a checkout lease while only observing that owner.
+        true
+    }
+}
 

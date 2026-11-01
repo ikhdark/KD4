@@ -8,5 +8,14 @@ per-directory watch bookkeeping in `src/paths.rs` to the platforms that compile
 the inotify or kqueue backends (a path dependency reports the dead code that
 Cargo hides for registry dependencies).
 
+Backported the 9.0.0-rc.6/rc.7 Windows missing-watch and pending-completion
+shutdown fixes. The wakeup semaphore uses shared standard-library handle
+ownership rather than rc.7's wake-before-stop ordering: KD4 waits indefinitely
+for actions, so it must keep send-before-wake without racing handle closure.
+
 Native coverage reconciliation and requested-namespace ownership remain in
 codex-file-watcher, which stages replacement backends after coverage loss.
+
+Private FSEvents cleanup removes the unused collecting translator and imprecise
+translation mode. Unsupported runtime configuration uses the unchanged Watcher
+trait default instead of a no-op forwarding layer.

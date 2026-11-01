@@ -7,7 +7,6 @@ use crate::agents_md::RepositoryStableContextBundle;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::session::McpRuntimeSnapshot;
 use crate::session::turn_context::TurnContext;
-use crate::tools::parallel::WorkspaceEvidenceGenerationBatch;
 use crate::tools::router::ToolRouter;
 use codex_exec_server::ResolvedSelectedCapabilityRoot;
 use codex_mcp::ToolInfo;
@@ -76,9 +75,6 @@ pub(crate) struct StepContext {
     output_context_tokens: Arc<OnceCell<Option<usize>>>,
     /// The finalized tool plan advertised and executed for this exact sampling request.
     tool_router: OnceLock<Arc<ToolRouter>>,
-    /// Workspace evidence shared by every direct and nested call accepted in
-    /// this exact sampling request.
-    pub(crate) workspace_evidence_generation_batch: Arc<WorkspaceEvidenceGenerationBatch>,
     /// The canonical AGENTS.md value observed with this environment snapshot.
     pub(crate) loaded_agents_md: Option<Arc<LoadedAgentsMd>>,
     /// The repository-instruction rendering and identity derived for this exact step.
@@ -88,10 +84,9 @@ pub(crate) struct StepContext {
 }
 
 impl StepContext {
-    /// Keep the advertised capabilities but retire the previous attempt's ledger.
+    /// Keep advertised capabilities while refreshing the attempt's output budget.
     pub(crate) fn for_retry_attempt(&self) -> Self {
         Self {
-            workspace_evidence_generation_batch: Arc::new(WorkspaceEvidenceGenerationBatch::new()),
             output_context_tokens: Arc::new(OnceCell::new()),
             ..self.clone()
         }
@@ -118,7 +113,6 @@ impl StepContext {
             mcp_tool_snapshot,
             output_context_tokens: Arc::new(OnceCell::new()),
             tool_router: OnceLock::new(),
-            workspace_evidence_generation_batch: Arc::new(WorkspaceEvidenceGenerationBatch::new()),
             loaded_agents_md,
             agents_md_stable_context,
             agents_md_freshness,

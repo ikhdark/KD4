@@ -35,22 +35,22 @@ pub use codex_app_server::in_process::InProcessServerEvent;
 use codex_app_server::in_process::InProcessStartArgs;
 use codex_app_server::in_process::LogDbLayer;
 pub use codex_app_server::in_process::StateDbHandle;
-use codex_app_server_protocol::ClientInfo;
-use codex_app_server_protocol::ClientNotification;
-use codex_app_server_protocol::ClientRequest;
-use codex_app_server_protocol::ConfigWarningNotification;
-use codex_app_server_protocol::InitializeCapabilities;
-use codex_app_server_protocol::InitializeParams;
-use codex_app_server_protocol::JSONRPCErrorError;
-use codex_app_server_protocol::RequestId;
-use codex_app_server_protocol::Result as JsonRpcResult;
-use codex_app_server_protocol::ServerBuildInfo;
-use codex_app_server_protocol::ServerCapabilities;
-use codex_app_server_protocol::ServerLocalWatermark;
-use codex_app_server_protocol::ServerNotification;
-use codex_app_server_protocol::ServerRequest;
-use codex_app_server_protocol::ServerRuntimeWarning;
-use codex_app_server_protocol::server_notification_requires_delivery;
+use codex_app_server_protocol_types::ClientInfo;
+use codex_app_server_protocol_types::ClientNotification;
+use codex_app_server_protocol_types::ClientRequest;
+use codex_app_server_protocol_types::ConfigWarningNotification;
+use codex_app_server_protocol_types::InitializeCapabilities;
+use codex_app_server_protocol_types::InitializeParams;
+use codex_app_server_protocol_types::JSONRPCErrorError;
+use codex_app_server_protocol_types::RequestId;
+use codex_app_server_protocol_types::Result as JsonRpcResult;
+use codex_app_server_protocol_types::ServerBuildInfo;
+use codex_app_server_protocol_types::ServerCapabilities;
+use codex_app_server_protocol_types::ServerLocalWatermark;
+use codex_app_server_protocol_types::ServerNotification;
+use codex_app_server_protocol_types::ServerRequest;
+use codex_app_server_protocol_types::ServerRuntimeWarning;
+use codex_app_server_protocol_types::server_notification_requires_delivery;
 use codex_arg0::Arg0DispatchPaths;
 use codex_config::CloudConfigBundleLoader;
 use codex_config::LoaderOverrides;
@@ -437,15 +437,6 @@ impl Error for TypedRequestError {
     }
 }
 
-impl TypedRequestError {
-    /// Returns the structured JSON-RPC error, including local pre-dispatch overloads.
-    pub fn server_error(&self) -> Option<&JSONRPCErrorError> {
-        match self {
-            Self::Server { source, .. } => Some(source),
-            Self::Transport { .. } | Self::Deserialize { .. } => None,
-        }
-    }
-}
 
 #[derive(Clone)]
 pub struct InProcessClientStartArgs {
@@ -765,8 +756,8 @@ impl InProcessAppServerClient {
                             |request| {
                                 let _ = request_sender.fail_server_request(
                                     request.id().clone(),
-                                    codex_app_server_protocol::overloaded_error(
-                                        codex_app_server_protocol::OverloadReason::InProcessAppServerEventQueue,
+                                    codex_app_server_protocol_types::overloaded_error(
+                                        codex_app_server_protocol_types::OverloadReason::InProcessAppServerEventQueue,
                                         "in-process app-server event queue is full",
                                     ),
                                 );
@@ -1001,20 +992,27 @@ impl InProcessAppServerRequestHandle {
         T: DeserializeOwned,
     {
         let method = request.method_name().to_string();
-        let response =
-            self.request(request)
-                .await
-                .map_err(|source| TypedRequestError::Transport {
-                    method: method.clone(),
-                    source,
-                })?;
-        let result = response.map_err(|source| TypedRequestError::Server {
-            method: method.clone(),
-            source,
-        })?;
-        serde_json::from_value(result)
-            .map_err(|source| TypedRequestError::Deserialize { method, source })
+        decode_typed_response(method, self.request(request).await)
     }
+}
+
+fn decode_typed_response<T>(
+    method: String,
+    response: IoResult<RequestResult>,
+) -> Result<T, TypedRequestError>
+where
+    T: DeserializeOwned,
+{
+    let response = response.map_err(|source| TypedRequestError::Transport {
+        method: method.clone(),
+        source,
+    })?;
+    let result = response.map_err(|source| TypedRequestError::Server {
+        method: method.clone(),
+        source,
+    })?;
+    serde_json::from_value(result)
+        .map_err(|source| TypedRequestError::Deserialize { method, source })
 }
 
 impl AppServerRequestHandle {

@@ -107,9 +107,6 @@ impl MarketplacePolicy {
         marketplace_path: &AbsolutePathBuf,
         marketplace_name: &str,
     ) -> Result<(), String> {
-        if !self.is_restricted() {
-            return Ok(());
-        }
         self.validate_install_with_user_config(
             Some(&config_layer_stack.effective_config()),
             codex_home,
@@ -125,39 +122,28 @@ impl MarketplacePolicy {
         marketplace_path: &AbsolutePathBuf,
         marketplace_name: &str,
     ) -> Result<(), String> {
-        if !self.is_restricted() {
-            return Ok(());
-        }
-
         let root = marketplace_root_dir(marketplace_path).map_err(|err| err.to_string())?;
         if let Some(expected_name) = managed_marketplace_name(codex_home, marketplace_path, &root) {
             return validate_expected_marketplace_name(expected_name, marketplace_name);
         }
 
-        let user_config = user_config.ok_or_else(|| {
-            format!(
-                "marketplace `{marketplace_name}` must be added to config before plugins can be installed while marketplace source restrictions are enabled"
-            )
-        })?;
         let marketplace = user_config
-            .get("marketplaces")
+            .and_then(|config| config.get("marketplaces"))
             .and_then(toml::Value::as_table)
-            .and_then(|marketplaces| marketplaces.get(marketplace_name))
-            .ok_or_else(|| {
-                format!(
-                    "marketplace `{marketplace_name}` must be added to config before plugins can be installed while marketplace source restrictions are enabled"
-                )
-            })?;
+            .and_then(|marketplaces| marketplaces.get(marketplace_name));
+        let Some(marketplace) = marketplace else {
+            return if self.is_restricted() {
+                Err(format!("marketplace `{marketplace_name}` must be added to config before plugins can be installed while marketplace source restrictions are enabled"))
+            } else {
+                Ok(())
+            };
+        };
         self.validate_configured_marketplace(marketplace_name, marketplace)?;
-
         let configured_root = resolve_configured_marketplace_root(
-            marketplace_name,
-            marketplace,
-            &marketplace_install_root(codex_home),
-        )
-        .ok_or_else(|| {
-            format!("configured marketplace `{marketplace_name}` does not have a usable root")
-        })?;
+            marketplace_name, marketplace, &marketplace_install_root(codex_home),
+        ).ok_or_else(|| format!(
+            "configured marketplace `{marketplace_name}` does not match its installed source/ref; add or upgrade it again"
+        ))?;
         if !paths_match_after_normalization(&configured_root, root.as_path()) {
             return Err(format!(
                 "marketplace path `{}` does not match configured marketplace `{marketplace_name}`",
@@ -207,11 +193,11 @@ impl AllowedMarketplaceSource {
 pub(crate) fn project_effective_user_config(
     config_layer_stack: &ConfigLayerStack,
     codex_home: &Path,
-) -> Option<toml::Value> {
+) -> toml::Value {
     let mut user_config = config_layer_stack.effective_config();
     let policy = MarketplacePolicy::from_requirements(config_layer_stack.requirements());
     if !policy.is_restricted() {
-        return Some(user_config);
+        return user_config;
     }
     let allowed_marketplace_names =
         allowed_configured_marketplace_names_with_policy(&user_config, &policy, codex_home);
@@ -241,7 +227,7 @@ pub(crate) fn project_effective_user_config(
                 || allowed_marketplace_names.contains(plugin_id.marketplace_name())
         });
     }
-    Some(user_config)
+    user_config
 }
 
 pub fn allowed_configured_marketplace_names(
@@ -285,9 +271,7 @@ pub(crate) fn configured_plugins_from_stack(
     config_layer_stack: &ConfigLayerStack,
     codex_home: &Path,
 ) -> HashMap<String, PluginConfig> {
-    let Some(user_config) = project_effective_user_config(config_layer_stack, codex_home) else {
-        return HashMap::new();
-    };
+    let user_config = project_effective_user_config(config_layer_stack, codex_home);
     let Some(plugins_value) = user_config.get("plugins") else {
         return HashMap::new();
     };
@@ -416,7 +400,7 @@ fn configured_marketplace_source(
             path: PathBuf::from(source),
         }),
         MarketplaceSourceType::Git => {
-            let parsed = parse_marketplace_source(&source, ref_name).map_err(|err| {
+            let parsed = crate::marketplace_add::canonicalize_configured_git_source(&source, ref_name).map_err(|err| {
                 format!("invalid source for marketplace `{marketplace_name}`: {err}")
             })?;
             if matches!(parsed, MarketplaceSource::Git { .. }) {

@@ -27,7 +27,7 @@ pub struct JobObject {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JobState {
-    Active,
+    Active { allow_breakaway: bool },
     PreserveDescendants,
     TerminationRequested,
     Terminated,
@@ -70,7 +70,7 @@ impl JobObject {
 
         Ok(Self {
             handle,
-            state: Mutex::new(JobState::Active),
+            state: Mutex::new(JobState::Active { allow_breakaway: true }),
         })
     }
 
@@ -116,38 +116,41 @@ impl JobObject {
     /// Keep descendants in this job even when a launcher requests breakaway.
     /// Call before assigning the root process.
     pub fn require_descendant_containment(&self) -> io::Result<()> {
-        let state = self
+        let mut state = self
             .state
             .lock()
             .map_err(|_| io::Error::other("job state lock poisoned"))?;
-        if *state != JobState::Active {
+        if !matches!(*state, JobState::Active { .. }) {
             return Err(io::Error::other("job containment is no longer active"));
         }
         Self::set_limit_flags(&self.handle, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)?;
+        *state = JobState::Active { allow_breakaway: false };
         self.custody_diagnostic("contained", JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
         Ok(())
     }
 
     /// Allows contained descendants to keep running after the root exits normally.
     ///
-    /// This disables both explicit job termination and kill-on-close for this
-    /// object. Calls race safely with [`Self::terminate`]: whichever operation
-    /// acquires the state lock first determines normal-exit preservation. An
-    /// explicit later cancellation still owns and terminates the retained job.
+    /// This disables kill-on-close but retains any required descendant containment,
+    /// so a live descendant cannot escape later explicit cancellation. Jobs that
+    /// allowed breakaway at creation retain that behavior. Calls race safely with
+    /// [`Self::terminate`] under the same state lock; explicit cancellation still
+    /// owns and terminates the retained job.
     pub fn preserve_descendants(&self) -> io::Result<()> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| io::Error::other("job state lock poisoned"))?;
-        match *state {
-            JobState::Active => {}
+        let flags = match *state {
+            JobState::Active { allow_breakaway: true } => JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+            JobState::Active { allow_breakaway: false } => 0,
             JobState::PreserveDescendants
             | JobState::TerminationRequested
             | JobState::Terminated => return Ok(()),
-        }
+        };
 
-        Self::set_limit_flags(&self.handle, JOB_OBJECT_LIMIT_BREAKAWAY_OK)?;
-        self.custody_diagnostic("preserved", JOB_OBJECT_LIMIT_BREAKAWAY_OK);
+        Self::set_limit_flags(&self.handle, flags)?;
+        self.custody_diagnostic("preserved", flags);
         *state = JobState::PreserveDescendants;
         Ok(())
     }
@@ -191,7 +194,7 @@ impl JobObject {
                 Self::set_limit_flags(&self.handle, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)?;
                 *state = JobState::TerminationRequested;
             }
-            JobState::Active => *state = JobState::TerminationRequested,
+            JobState::Active { .. } => *state = JobState::TerminationRequested,
             JobState::TerminationRequested => {}
         }
 

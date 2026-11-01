@@ -34,14 +34,8 @@ const PLAN_UNCHANGED_MESSAGE: &str = "Plan unchanged";
 impl PlanToolOutput {
     fn response_result(&self) -> JsonValue {
         let mut response = self.response_with_lineage(false);
-        if let Some(lineage) = response.get_mut("lineage").and_then(JsonValue::as_object_mut) {
-            lineage.remove("requirements");
-            lineage.remove("step_requirements");
-        }
         if let Some(fields) = response.as_object_mut() {
-            fields.remove("lineage");
             // This is a display projection, not a full replay authority.
-            fields.insert("lineage_complete".into(), JsonValue::Bool(false));
             fields.insert("pinned_requirements".into(), serde_json::json!(self.lineage.pinned_requirements()));
             let remaining = self.lineage.remaining_requirements(&self.current_plan);
             if !remaining.is_empty() {
@@ -62,7 +56,7 @@ impl PlanToolOutput {
             lineage: if lineage_complete {
                 self.lineage.compact_for_plan(&self.current_plan)
             } else {
-                self.lineage.checklist_metadata()
+                crate::plan_store::PlanLineage::default()
             },
             lineage_complete,
             revision: crate::plan_store::plan_revision_with_lineage(

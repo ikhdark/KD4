@@ -383,10 +383,6 @@ pub async fn plan_skill_injections_with_resolved(
     let mut reads = futures::stream::iter(0..mentioned_skills.len())
         .map(|index: usize| async move {
         let skill = &mentioned_skills[index];
-        let fs = loaded_skills
-            .and_then(|outcome| outcome.file_system_for_skill(skill))
-            .unwrap_or_else(|| Arc::clone(&LOCAL_FS));
-        let path = PathUri::from_abs_path(&skill.path_to_skills_md);
         let contents = if let Some(resolved) = resolved {
             resolved
                 .resolved
@@ -397,8 +393,11 @@ pub async fn plan_skill_injections_with_resolved(
                 .unwrap_or_else(|| {
                     Err("Selected host skill was not admitted by its owner".to_string())
                 })
+        } else if let Some(outcome) = loaded_skills {
+            outcome.read_skill_text(skill).await.map_err(|error| error.to_string())
         } else {
-            fs.read_file_text(&path, /*sandbox*/ None)
+            let path = PathUri::from_abs_path(&skill.path_to_skills_md);
+            LOCAL_FS.read_file_text(&path, /*sandbox*/ None)
                 .await
                 .map_err(|error| error.to_string())
         };

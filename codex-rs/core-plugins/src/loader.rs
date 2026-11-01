@@ -177,6 +177,7 @@ async fn load_plugins_from_layer_stack_with_scope(
     remote_global_catalog_active: bool,
     scope: PluginLoadScope<'_>,
 ) -> Result<Vec<LoadedPlugin<McpServerConfig>>, String> {
+    let marketplace_config = config_layer_stack.effective_config();
     let config_layer_stack = config_layer_stack.clone();
     let store_for_config = store.clone();
     let configured_plugins = tokio::task::spawn_blocking(move || {
@@ -204,7 +205,11 @@ async fn load_plugins_from_layer_stack_with_scope(
 
     let mut plugins = Vec::with_capacity(configured_plugins.len());
     for (configured_name, plugin) in configured_plugins {
-        let loaded_plugin = load_plugin(configured_name.clone(), &plugin, store, &scope).await;
+        let expected_source = PluginId::parse(&configured_name).ok()
+            .filter(|id| !is_openai_curated_marketplace_name(id.marketplace_name())).and_then(|id|
+            marketplace_config.get("marketplaces").and_then(|marketplaces| marketplaces.get(id.marketplace_name()))
+                .map(|marketplace| crate::installed_marketplaces::configured_marketplace_source_identity(id.marketplace_name(), marketplace)));
+        let loaded_plugin = load_plugin(configured_name.clone(), &plugin, store, &scope, expected_source).await;
         plugins.push(loaded_plugin);
     }
 
@@ -513,18 +518,15 @@ pub(crate) fn refresh_non_curated_plugin_cache_from_marketplaces(
     codex_home: &Path,
     configured_plugin_keys: &[String],
     mut marketplaces: MarketplaceListOutcome,
-    force_reinstall: bool,
 ) -> Result<NonCuratedCacheRefreshOutcome, String> {
-    let mode = if force_reinstall {
-        NonCuratedCacheRefreshMode::ForceReinstall
-    } else {
-        NonCuratedCacheRefreshMode::IfVersionChanged
-    };
     // Discovery errors were historically appended even when no configured
     // non-curated IDs required refresh. Keep them outside the lazy discovery.
     let discovery_errors = std::mem::take(&mut marketplaces.errors);
     let mut outcome = refresh_non_curated_plugin_cache_with_discovery(
-        codex_home, configured_plugin_keys, mode, || Ok(marketplaces),
+        codex_home,
+        configured_plugin_keys,
+        NonCuratedCacheRefreshMode::IfVersionChanged,
+        || Ok(marketplaces),
     )?;
     outcome.errors.extend(discovery_errors.into_iter().map(|error| NonCuratedCacheRefreshError {
         marketplace_name: error.path.display().to_string(),
@@ -570,7 +572,7 @@ fn refresh_non_curated_plugin_cache_with_discovery(
 
     let store = PluginStore::try_new(codex_home.to_path_buf()).map_err(|err| err.to_string())?;
     let marketplace_outcome = discover()?;
-    let mut plugin_sources = HashMap::<String, (MarketplacePluginSource, Option<String>)>::new();
+    let mut plugin_sources = HashMap::<String, (MarketplacePluginSource, Option<String>, String, AbsolutePathBuf)>::new();
 
     for marketplace in marketplace_outcome.marketplaces {
         if is_openai_curated_marketplace_name(&marketplace.name) {
@@ -608,7 +610,9 @@ fn refresh_non_curated_plugin_cache_with_discovery(
                 .as_ref()
                 .and_then(|fallback| fallback.contents_if_has_metadata())
                 .map(str::to_string);
-            plugin_sources.insert(plugin_key, (plugin.source, manifest_fallback));
+            plugin_sources.insert(plugin_key, (
+                plugin.source, manifest_fallback, marketplace.source_identity.clone(), marketplace.path.clone(),
+            ));
         }
     }
 
@@ -627,7 +631,7 @@ fn refresh_non_curated_plugin_cache_with_discovery(
         .collect::<Vec<_>>();
     for plugin_id in configured_non_curated_plugin_ids {
         let plugin_key = plugin_id.as_key();
-        let Some((source, manifest_fallback_contents)) = plugin_sources.get(&plugin_key).cloned()
+        let Some((source, manifest_fallback_contents, source_identity, marketplace_path)) = plugin_sources.get(&plugin_key).cloned()
         else {
             warn!(
                 plugin = plugin_key,
@@ -636,6 +640,20 @@ fn refresh_non_curated_plugin_cache_with_discovery(
             continue;
         };
         let refresh_result = (|| -> Result<bool, String> {
+            // Re-read the selected declaration under its publication owner's lease.
+            // Discovery/config admission alone cannot authorize later name-only bytes.
+            let _marketplace_lease = crate::installed_marketplaces::try_lock_marketplace_operation(codex_home, plugin_id.marketplace_name())
+                .map_err(|err| format!("marketplace operation is busy or unavailable: {err}"))?;
+            let current = crate::marketplace::load_marketplace(&marketplace_path).map_err(|err| err.to_string())?;
+            let current_plugin = current.plugins.iter().find(|plugin| plugin.name == plugin_id.plugin_name())
+                .ok_or_else(|| format!("marketplace plugin `{plugin_key}` changed during refresh; retry"))?;
+            if current.name != plugin_id.marketplace_name()
+                || current.source_identity != source_identity || current_plugin.source != source
+                || current_plugin.manifest_fallback.as_ref()
+                    .and_then(|fallback| fallback.contents_if_has_metadata()) != manifest_fallback_contents.as_deref()
+            {
+                return Err(format!("marketplace source for `{plugin_key}` changed during refresh; retry"));
+            }
             let materialized =
                 materialize_marketplace_plugin_source(codex_home, &source).map_err(|err| {
                     format!("failed to materialize plugin source for {plugin_key}: {err}")
@@ -650,23 +668,27 @@ fn refresh_non_curated_plugin_cache_with_discovery(
             }
             .map_err(|err| format!("failed to read plugin version for {plugin_key}: {err}"))?;
 
-            if mode == NonCuratedCacheRefreshMode::IfVersionChanged
-                && store.active_plugin_version(&plugin_id).as_deref()
-                    == Some(plugin_version.as_str())
-            {
-                return Ok(false);
+            if mode == NonCuratedCacheRefreshMode::IfVersionChanged {
+                let current = store.read_plugin(&plugin_id).map_err(|err| err.to_string())?;
+                if current.marketplace_source.as_ref() == Some(&source_identity)
+                    && current.root.as_ref() == Some(&store.plugin_root(&plugin_id, &plugin_version))
+                {
+                    return Ok(false);
+                }
             }
 
-            match manifest_fallback_contents.as_deref() {
-                Some(manifest_contents) => store.install_with_version_and_fallback_manifest(
+            let mut pending = match manifest_fallback_contents.as_deref() {
+                Some(manifest_contents) => store.begin_install_with_version_and_fallback_manifest(
                     source_path,
                     plugin_id.clone(),
                     plugin_version,
                     manifest_contents,
                 ),
-                None => store.install_with_version(source_path, plugin_id.clone(), plugin_version),
+                None => store.begin_install_with_version(source_path, plugin_id.clone(), plugin_version),
             }
             .map_err(|err| format!("failed to refresh plugin cache for {plugin_key}: {err}"))?;
+            pending.bind_marketplace_source(&source_identity).map_err(|err| err.to_string())?;
+            pending.commit().map_err(|err| format!("failed to commit plugin cache for {plugin_key}: {err}"))?;
             Ok(true)
         })();
         match refresh_result {
@@ -780,19 +802,22 @@ async fn load_plugin(
     plugin: &PluginConfig,
     store: &PluginStore,
     scope: &PluginLoadScope<'_>,
+    expected_source: Option<Result<String, String>>,
 ) -> LoadedPlugin<McpServerConfig> {
     let plugin_id = PluginId::parse(&config_name);
-    let active_plugin_root = if let Ok(plugin_id) = &plugin_id {
+    let installation = if let Ok(plugin_id) = &plugin_id {
         let plugin_id = plugin_id.clone();
         let store = store.clone();
-        tokio::task::spawn_blocking(move || store.active_plugin_root(&plugin_id)).await
+        tokio::task::spawn_blocking(move || store.read_plugin(&plugin_id)).await
+            .map_err(|err| format!("failed to resolve plugin root: {err}"))
+            .and_then(|result| result.map_err(|err| err.to_string()))
     } else {
-        Ok(None)
+        Err("invalid plugin id".to_string())
     };
-    let root = active_plugin_root
+    let root = installation
         .as_ref()
         .ok()
-        .and_then(Clone::clone)
+        .and_then(|installation| installation.root.clone())
         .unwrap_or_else(|| match &plugin_id {
             Ok(plugin_id) => store.plugin_base_root(plugin_id),
             Err(_) => store.root().clone(),
@@ -804,6 +829,7 @@ async fn load_plugin(
         manifest_description: None,
         tool_exposure: None,
         root,
+        installation_id: installation.as_ref().ok().and_then(|installation| installation.installation_id.clone()),
         enabled: plugin.enabled,
         skill_roots: Vec::new(),
         disabled_skill_paths: HashSet::new(),
@@ -820,13 +846,29 @@ async fn load_plugin(
         return loaded_plugin;
     }
 
-    let active_plugin_root = match active_plugin_root {
-        Ok(root) => root,
+    // Keep this shared lease through manifest, MCP, hook and skill parsing.
+    // Publishers fail busy rather than replacing files midway through a read.
+    let installation = match installation {
+        Ok(installation) => installation,
         Err(err) => {
-            loaded_plugin.error = Some(format!("failed to resolve plugin root: {err}"));
+            loaded_plugin.error = Some(err);
             return loaded_plugin;
         }
     };
+    if let Some(expected_source) = expected_source {
+        match expected_source {
+            Ok(expected) if installation.marketplace_source.as_ref() == Some(&expected) => {}
+            Ok(_) => {
+                loaded_plugin.error = Some("installed plugin belongs to a different or unverified marketplace source; reinstall it from the configured marketplace".to_string());
+                return loaded_plugin;
+            }
+            Err(err) => {
+                loaded_plugin.error = Some(err);
+                return loaded_plugin;
+            }
+        }
+    }
+    let active_plugin_root = installation.root.clone();
     let (loaded_plugin_id, plugin_root) = match plugin_id {
         Ok(plugin_id) => {
             let Some(plugin_root) = active_plugin_root else {
@@ -840,6 +882,18 @@ async fn load_plugin(
             return loaded_plugin;
         }
     };
+
+    if let PluginLoadScope::AllCapabilities { plugin_skill_snapshots: Some(snapshots), .. } = scope {
+        let store = store.clone();
+        let id = loaded_plugin_id.clone();
+        let root = plugin_root.clone();
+        let installation_id = installation.installation_id.clone();
+        snapshots.bind_installation(plugin_root.clone(), loaded_plugin_id.as_key(), Arc::new(move || {
+            store.read_plugin(&id).ok().filter(|current|
+                current.root.as_ref() == Some(&root) && current.installation_id == installation_id)
+                .map(|lease| Box::new(lease) as Box<dyn Send + Sync>)
+        }));
+    }
 
     let root_for_manifest = plugin_root.clone();
     let load_skill_roots = matches!(scope, PluginLoadScope::AllCapabilities { .. });

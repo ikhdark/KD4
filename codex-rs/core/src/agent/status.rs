@@ -7,6 +7,11 @@ use codex_agent_task_store::AssignmentAdmissionOrigin;
 
 pub(crate) const NO_COMPLETION_DIAGNOSTICS: &str = "Host terminal boundary: no completion diagnostics recorded; this is not verification evidence.";
 
+/// Delivery failures are not a newer execution terminal, including old retention keys.
+fn is_delivery_recovery_origin(origin: &str) -> bool {
+    origin.ends_with(":parent-delivery") || origin.ends_with(":result-retention")
+}
+
 /// Derive the next agent status from a single emitted event.
 /// Returns `None` when the event does not affect status tracking.
 pub(crate) fn agent_status_from_event(msg: &EventMsg) -> Option<AgentStatus> {
@@ -82,7 +87,7 @@ pub(crate) fn agent_status_from_task(
                     && observation
                         .call_id
                         .as_deref()
-                        .is_some_and(|origin| !origin.ends_with(":parent-delivery"))
+                        .is_some_and(|origin| !is_delivery_recovery_origin(origin))
             })
             .and_then(|observation| observation.execution_stop_cause.as_ref())
             .and_then(|code| serde_json::from_value(serde_json::Value::String(code.clone())).ok()),
@@ -122,7 +127,7 @@ pub(crate) fn completion_diagnostics_from_task(task: &AgentTask) -> Option<Strin
         observation
             .call_id
             .as_deref()
-            .is_some_and(|origin| !origin.ends_with(":parent-delivery"))
+            .is_some_and(|origin| !is_delivery_recovery_origin(origin))
     });
     let Some(terminal) = terminal else {
         return observations().next_back().map(|observation| {
@@ -133,13 +138,17 @@ pub(crate) fn completion_diagnostics_from_task(task: &AgentTask) -> Option<Strin
         });
     };
     let delivery_origin = format!("{}:parent-delivery", terminal.call_id.as_deref()?);
+    let legacy_retention_origin = format!("{}:result-retention", terminal.call_id.as_deref()?);
     let mut summaries = Vec::new();
     if terminal.summary != NO_COMPLETION_DIAGNOSTICS {
         summaries.push(terminal.summary.as_str());
     }
     if let Some(delivery) = observations()
         .rev()
-        .find(|observation| observation.call_id.as_deref() == Some(delivery_origin.as_str()))
+        .find(|observation| {
+            observation.call_id.as_deref() == Some(delivery_origin.as_str())
+                || observation.call_id.as_deref() == Some(legacy_retention_origin.as_str())
+        })
     {
         summaries.push(&delivery.summary);
     }
@@ -159,7 +168,7 @@ fn terminal_host_observation_summary(task: &AgentTask) -> Option<&str> {
                 && observation
                     .call_id
                     .as_deref()
-                    .is_some_and(|origin| !origin.ends_with(":parent-delivery"))
+                    .is_some_and(|origin| !is_delivery_recovery_origin(origin))
         })
         .map(|observation| observation.summary.as_str())
         .filter(|summary| !summary.is_empty() && *summary != NO_COMPLETION_DIAGNOSTICS)

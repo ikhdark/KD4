@@ -1,10 +1,10 @@
 use std::fmt;
 
-use codex_app_server_protocol::JSONRPCErrorError;
-use codex_app_server_protocol::RequestId;
-use codex_app_server_protocol::Result;
-use codex_app_server_protocol::ServerNotification;
-use codex_app_server_protocol::ServerRequest;
+use codex_app_server_protocol_types::JSONRPCErrorError;
+use codex_app_server_protocol_types::RequestId;
+use codex_app_server_protocol_types::Result;
+use codex_app_server_protocol_types::ServerNotification;
+use codex_app_server_protocol_types::ServerRequest;
 use serde::Serialize;
 use tokio::sync::oneshot;
 
@@ -95,23 +95,13 @@ impl QueuedOutgoingMessage {
         }
     }
 
-    /// Retain the same encoding used for exact byte admission and the wire write.
-    pub fn encode_json(&mut self, limit: usize) -> serde_json::Result<usize> {
-        self.prepare_json(limit, false)
-    }
-
     /// Preserve large legal frames without retaining an unbounded encoded copy.
     /// Finish validation/counting before the writer can emit any part of the frame.
     pub fn prepare_stdio_json(&mut self, limit: usize) -> serde_json::Result<usize> {
-        self.prepare_json(limit, true)
-    }
-
-    fn prepare_json(&mut self, limit: usize, allow_streaming: bool) -> serde_json::Result<usize> {
         struct BoundedBuffer {
             bytes: Vec<u8>,
             limit: usize,
             len: usize,
-            allow_streaming: bool,
         }
         impl std::io::Write for BoundedBuffer {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -119,9 +109,6 @@ impl QueuedOutgoingMessage {
                     std::io::Error::other("stdio message length overflow")
                 })?;
                 if len > self.limit {
-                    if !self.allow_streaming {
-                        return Err(std::io::Error::other("stdio delivery byte budget exceeded"));
-                    }
                     // Once the frame exceeds the staging budget, keep only its
                     // exact length. The physical writer will stream the value.
                     self.bytes = Vec::new();
@@ -140,7 +127,6 @@ impl QueuedOutgoingMessage {
             bytes: Vec::with_capacity(limit.min(16 * 1024)),
             limit,
             len: 0,
-            allow_streaming,
         };
         serde_json::to_writer(&mut buffer, &self.message)?;
         let len = buffer.len;

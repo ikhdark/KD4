@@ -93,8 +93,11 @@ pub struct ThreadMetadata {
     pub cwd: PathBuf,
     /// Version of the CLI that created the thread.
     pub cli_version: String,
-    /// A best-effort thread title.
+    /// An explicit thread name or a best-effort title derived from history.
     pub title: String,
+    /// Whether `title` is an explicit name, including an explicit empty-name clear.
+    /// False preserves legacy fallback to the compatibility name index.
+    pub title_is_explicit: bool,
     /// Best available user-facing preview for discovery and list display.
     pub preview: Option<String>,
     /// The sandbox policy (stringified enum).
@@ -239,6 +242,7 @@ impl ThreadMetadataBuilder {
             cwd: self.cwd.clone(),
             cli_version: self.cli_version.clone().unwrap_or_default(),
             title: String::new(),
+            title_is_explicit: false,
             preview: None,
             sandbox_policy,
             approval_mode,
@@ -255,6 +259,15 @@ impl ThreadMetadataBuilder {
 }
 
 impl ThreadMetadata {
+    /// Resolve a canonical name without confusing a derived first-message title with one.
+    pub fn thread_name(&self) -> Option<&str> {
+        let title = self.title.trim();
+        (!title.is_empty()
+            && (self.title_is_explicit
+                || self.first_user_message.as_deref().map(str::trim) != Some(title)))
+            .then_some(title)
+    }
+
     /// Preserve existing non-null Git fields when rollout-derived metadata is reconciled.
     pub fn prefer_existing_git_info(&mut self, existing: &Self) {
         if existing.git_sha.is_some() {
@@ -268,9 +281,14 @@ impl ThreadMetadata {
         }
     }
 
-    /// Best-effort preservation of an existing title that differs from its fallback message.
-    /// Text equality does not establish whether the title was explicitly chosen.
+    /// Preserve explicit names and clears; retain the best-effort legacy title heuristic
+    /// only for rows whose explicit-name authority predates the persisted marker.
     pub fn prefer_existing_explicit_title(&mut self, existing: &Self) {
+        if existing.title_is_explicit {
+            self.title = existing.title.clone();
+            self.title_is_explicit = true;
+            return;
+        }
         let existing_title = existing.title.trim();
         if existing_title.is_empty()
             || existing.first_user_message.as_deref().map(str::trim) == Some(existing_title)
@@ -311,6 +329,7 @@ pub(crate) struct ThreadRow {
     cwd: String,
     cli_version: String,
     title: String,
+    title_is_explicit: bool,
     preview: String,
     sandbox_policy: String,
     approval_mode: String,
@@ -344,6 +363,7 @@ impl ThreadRow {
             cwd: row.try_get("cwd")?,
             cli_version: row.try_get("cli_version")?,
             title: row.try_get("title")?,
+            title_is_explicit: row.try_get("title_is_explicit")?,
             preview: row.try_get("preview")?,
             sandbox_policy: row.try_get("sandbox_policy")?,
             approval_mode: row.try_get("approval_mode")?,
@@ -382,6 +402,7 @@ impl TryFrom<ThreadRow> for ThreadMetadata {
             cwd,
             cli_version,
             title,
+            title_is_explicit,
             preview,
             sandbox_policy,
             approval_mode,
@@ -421,6 +442,7 @@ impl TryFrom<ThreadRow> for ThreadMetadata {
             cwd: PathBuf::from(cwd),
             cli_version,
             title,
+            title_is_explicit,
             preview: (!preview.is_empty()).then_some(preview),
             sandbox_policy,
             approval_mode,

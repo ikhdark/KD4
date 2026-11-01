@@ -12,9 +12,6 @@ impl AppServerPath {
         Self(path.into())
     }
 
-    pub fn from_absolute_str(raw: &str) -> Option<Self> {
-        (raw.starts_with('/') || is_windows_absolute_path(raw)).then(|| Self(raw.to_string()))
-    }
 
     pub fn as_str(&self) -> &str {
         &self.0

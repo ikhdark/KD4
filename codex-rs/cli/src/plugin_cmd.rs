@@ -5,34 +5,25 @@ use clap::Parser;
 use codex_core::config::Config;
 use codex_core::config::find_codex_home;
 use codex_core_plugins::ConfiguredMarketplace;
-use codex_core_plugins::OPENAI_BUNDLED_MARKETPLACE_NAME;
 use codex_core_plugins::PluginInstallOutcome;
 use codex_core_plugins::PluginInstallRequest;
 use codex_core_plugins::PluginsConfigInput;
 use codex_core_plugins::PluginsManager;
-use codex_core_plugins::allowed_configured_marketplace_names;
-use codex_core_plugins::installed_marketplaces::marketplace_install_root;
-use codex_core_plugins::installed_marketplaces::resolve_configured_marketplace_root;
 use codex_core_plugins::marketplace::MarketplaceListError;
 use codex_core_plugins::marketplace::MarketplacePluginAuthPolicy;
 use codex_core_plugins::marketplace::MarketplacePluginInstallPolicy;
 use codex_core_plugins::marketplace::MarketplacePluginSource;
-use codex_core_plugins::marketplace::find_marketplace_manifest_path;
-use codex_login::CodexAuth;
-use codex_login::auth::read_codex_api_key_from_env;
 use codex_plugin::PluginId;
-use codex_plugin::validate_plugin_segment;
-use codex_protocol::auth::AuthMode;
 use codex_utils_cli::CliConfigOverrides;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::Path;
 use std::path::PathBuf;
 
+use crate::marketplace_cmd::JsonMarketplaceSource;
 use crate::marketplace_cmd::MarketplaceCli;
-
-const OPENAI_BUNDLED_ALPHA_MARKETPLACE_NAME: &str = "openai-bundled-alpha";
-const OPENAI_PRIMARY_RUNTIME_MARKETPLACE_NAME: &str = "openai-primary-runtime";
+use crate::marketplace_cmd::configured_marketplace_snapshot_issues;
+use crate::marketplace_cmd::configured_marketplace_sources;
+use crate::marketplace_cmd::load_cli_auth_mode;
 
 #[derive(Debug, Parser)]
 #[command(bin_name = "codex plugin")]
@@ -475,45 +466,6 @@ impl JsonPluginSource {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct JsonMarketplaceSource {
-    source_type: String,
-    source: String,
-}
-
-pub(crate) fn configured_marketplace_sources(
-    plugins_input: &PluginsConfigInput,
-    codex_home: &Path,
-) -> HashMap<String, JsonMarketplaceSource> {
-    let user_config = plugins_input.config_layer_stack.effective_config();
-    let Some(marketplaces) = user_config
-        .get("marketplaces")
-        .and_then(toml::Value::as_table)
-    else {
-        return HashMap::new();
-    };
-    let allowed_marketplace_names =
-        allowed_configured_marketplace_names(&plugins_input.config_layer_stack, codex_home);
-
-    marketplaces
-        .iter()
-        .filter(|(marketplace_name, _)| allowed_marketplace_names.contains(*marketplace_name))
-        .filter_map(|(marketplace_name, marketplace)| {
-            let source_type = marketplace
-                .get("source_type")
-                .and_then(toml::Value::as_str)?;
-            let source = marketplace.get("source").and_then(toml::Value::as_str)?;
-            Some((
-                marketplace_name.clone(),
-                JsonMarketplaceSource {
-                    source_type: source_type.to_string(),
-                    source: source.to_string(),
-                },
-            ))
-        })
-        .collect()
-}
 
 fn install_policy_label(policy: MarketplacePluginInstallPolicy) -> &'static str {
     match policy {
@@ -600,24 +552,6 @@ async fn load_plugin_command_context(
     })
 }
 
-pub(crate) async fn load_cli_auth_mode(config: &Config) -> Option<AuthMode> {
-    if let Some(api_key) = read_codex_api_key_from_env() {
-        return Some(CodexAuth::from_api_key(&api_key).api_auth_mode());
-    }
-
-    let auth_route_config = config.auth_route_config();
-    CodexAuth::from_auth_storage(
-        &config.codex_home,
-        config.cli_auth_credentials_store_mode,
-        Some(&config.chatgpt_base_url),
-        config.auth_keyring_backend_kind(),
-        &auth_route_config,
-    )
-    .await
-    .ok()
-    .flatten()
-    .map(|auth| auth.api_auth_mode())
-}
 
 struct PluginSelection {
     plugin_name: String,
@@ -701,11 +635,6 @@ fn find_marketplace_for_plugin(
     }
 }
 
-pub(crate) struct ConfiguredMarketplaceSnapshotIssue {
-    pub(crate) marketplace_name: String,
-    pub(crate) path: PathBuf,
-    pub(crate) message: String,
-}
 
 fn ensure_configured_marketplace_snapshots_loaded(
     codex_home: &std::path::Path,
@@ -725,145 +654,9 @@ fn ensure_configured_marketplace_snapshots_loaded(
 
     let issue_lines = issues
         .iter()
-        .map(|issue| {
-            format!(
-                "- `{}` at {}: {}",
-                issue.marketplace_name,
-                issue.path.display(),
-                issue.message
-            )
-        })
+        .map(std::string::ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
     bail!("failed to load configured marketplace snapshot(s):\n{issue_lines}");
 }
 
-pub(crate) fn configured_marketplace_snapshot_issues(
-    codex_home: &std::path::Path,
-    plugins_input: &PluginsConfigInput,
-    load_errors: &[MarketplaceListError],
-    marketplace_name: Option<&str>,
-) -> Vec<ConfiguredMarketplaceSnapshotIssue> {
-    let user_config = plugins_input.config_layer_stack.effective_config();
-    let Some(configured_marketplaces) = user_config
-        .get("marketplaces")
-        .and_then(toml::Value::as_table)
-    else {
-        return Vec::new();
-    };
-    let allowed_marketplace_names =
-        allowed_configured_marketplace_names(&plugins_input.config_layer_stack, codex_home);
-
-    let default_install_root = marketplace_install_root(codex_home);
-    let mut manifest_paths = Vec::new();
-    let mut issues = Vec::new();
-    for (configured_name, marketplace) in configured_marketplaces {
-        if !allowed_marketplace_names.contains(configured_name) {
-            continue;
-        }
-        if marketplace_name.is_some_and(|name| configured_name != name) {
-            continue;
-        }
-        if !marketplace.is_table() {
-            issues.push(ConfiguredMarketplaceSnapshotIssue {
-                marketplace_name: configured_name.clone(),
-                path: PathBuf::from("<invalid config>"),
-                message: "configured marketplace entry must be a table".to_string(),
-            });
-            continue;
-        }
-        if let Err(err) = validate_plugin_segment(configured_name, "marketplace name") {
-            issues.push(ConfiguredMarketplaceSnapshotIssue {
-                marketplace_name: configured_name.clone(),
-                path: PathBuf::from("<invalid config>"),
-                message: err.to_string(),
-            });
-            continue;
-        }
-        if marketplace.get("source_type").and_then(toml::Value::as_str) == Some("local")
-            && marketplace
-                .get("source")
-                .and_then(toml::Value::as_str)
-                .is_none_or(str::is_empty)
-        {
-            issues.push(ConfiguredMarketplaceSnapshotIssue {
-                marketplace_name: configured_name.clone(),
-                path: PathBuf::from("<invalid source>"),
-                message: "configured local marketplace source is missing or empty".to_string(),
-            });
-            continue;
-        }
-        let Some(root) = resolve_configured_marketplace_root(
-            configured_name,
-            marketplace,
-            &default_install_root,
-        ) else {
-            continue;
-        };
-        match find_marketplace_manifest_path(&root) {
-            Some(path) => manifest_paths.push((configured_name.clone(), path)),
-            None => {
-                if is_implicit_system_marketplace_root(configured_name, codex_home, &root) {
-                    continue;
-                }
-                issues.push(ConfiguredMarketplaceSnapshotIssue {
-                    marketplace_name: configured_name.clone(),
-                    path: root,
-                    message: "marketplace root does not contain a supported manifest".to_string(),
-                });
-            }
-        }
-    }
-
-    for error in load_errors {
-        if let Some((configured_name, _)) = manifest_paths
-            .iter()
-            .find(|(_, path)| path.as_path() == error.path.as_path())
-        {
-            issues.push(ConfiguredMarketplaceSnapshotIssue {
-                marketplace_name: configured_name.clone(),
-                path: error.path.to_path_buf(),
-                message: error.message.clone(),
-            });
-        }
-    }
-    issues
-}
-
-fn is_implicit_system_marketplace_root(
-    marketplace_name: &str,
-    _codex_home: &Path,
-    root: &Path,
-) -> bool {
-    if matches!(
-        marketplace_name,
-        OPENAI_BUNDLED_MARKETPLACE_NAME | OPENAI_BUNDLED_ALPHA_MARKETPLACE_NAME
-    ) && path_ends_with(root, &[".tmp", "bundled-marketplaces", marketplace_name])
-    {
-        return true;
-    }
-
-    marketplace_name == OPENAI_PRIMARY_RUNTIME_MARKETPLACE_NAME
-        && path_ends_with(
-            root,
-            &[
-                "codex-runtimes",
-                "codex-primary-runtime",
-                "plugins",
-                marketplace_name,
-            ],
-        )
-}
-
-fn path_ends_with(path: &Path, suffix: &[&str]) -> bool {
-    let path_components = path
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    path_components.as_slice().ends_with(
-        &suffix
-            .iter()
-            .map(std::string::ToString::to_string)
-            .collect::<Vec<_>>(),
-    )
-}

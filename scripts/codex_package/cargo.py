@@ -9,18 +9,14 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 import time
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-try:
-    from scripts.build import rust_tool_env as shared_rust_tool_env
-    from scripts.common.generated_output_lock import repository_lock
-except ImportError:
-    import scripts.build.rust_tool_env as shared_rust_tool_env
-    from scripts.common.generated_output_lock import repository_lock
+from scripts.build import rust_tool_env as shared_rust_tool_env
+from scripts.common.atomic_json import write_json_atomic
+from scripts.common.generated_output_lock import repository_lock
 
 from scripts.common.process_owner import run_owned
 from .layout import pe_machine
@@ -370,12 +366,7 @@ def validate_prebuilt_executable_targets(
     codex_command_runner_bin: Path | None,
     codex_windows_sandbox_setup_bin: Path | None,
 ) -> None:
-    expected_machine = {
-        "x86_64-pc-windows-msvc": 0x8664,
-        "aarch64-pc-windows-msvc": 0xAA64,
-    }.get(spec.target)
-    if expected_machine is None:
-        return
+    expected_machine = spec.pe_machine
     for role, path in (
         ("entrypoint", entrypoint_bin),
         ("code-mode-host", code_mode_host_bin),
@@ -509,8 +500,6 @@ def _target_for_tools(base, identity, external_inputs=None):
 
 
 def effective_tool_contents(spec, env):
-    import tomllib
-
     build_tools = {}
     linkers = {}
     unavailable = {}
@@ -723,10 +712,6 @@ def set_sccache_env(env: dict[str, str]) -> None:
 
 def is_sccache_wrapper(value: str) -> bool:
     return shared_rust_tool_env.is_sccache_wrapper(value)
-
-
-def cargo_target_rustflags_env_name(target: str) -> str:
-    return f"CARGO_TARGET_{target.upper().replace('-', '_')}_RUSTFLAGS"
 
 
 def cargo_target_linker_env_name(target: str) -> str:
@@ -1006,23 +991,7 @@ def write_source_build_stamp(
     if stamp["outputs"].get("entrypoint_bin") is not None:
         entrypoints[variant.name] = stamp["outputs"]["entrypoint_bin"]
     stamp["entrypoints"] = entrypoints
-    path.parent.mkdir(parents=True, exist_ok=True)
-    contents = json.dumps(stamp, sort_keys=True, indent=2) + "\n"
-    file_descriptor, temporary_name = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-    )
-    temporary_path = Path(temporary_name)
-    try:
-        with os.fdopen(file_descriptor, "w", encoding="utf-8", newline="\n") as file:
-            file.write(contents)
-            file.flush()
-            os.fsync(file.fileno())
-        os.replace(temporary_path, path)
-    except BaseException:
-        temporary_path.unlink(missing_ok=True)
-        raise
+    write_json_atomic(path, stamp)
 
 
 def source_build_stamp_matches(

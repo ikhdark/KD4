@@ -1,0 +1,809 @@
+use crate::config_layer::config_layer_metadata_to_api;
+use crate::config_layer::config_layer_to_api;
+use crate::config_manager::ConfigManager;
+use codex_app_server_protocol_types::Config as ApiConfig;
+use codex_app_server_protocol_types::ConfigBatchWriteParams;
+use codex_app_server_protocol_types::ConfigReadParams;
+use codex_app_server_protocol_types::ConfigReadResponse;
+use codex_app_server_protocol_types::ConfigValueWriteParams;
+use codex_app_server_protocol_types::ConfigWriteErrorCode;
+use codex_app_server_protocol_types::ConfigWriteResponse;
+use codex_app_server_protocol_types::MergeStrategy;
+use codex_app_server_protocol_types::OverriddenMetadata;
+use codex_app_server_protocol_types::WriteStatus;
+use codex_config::CONFIG_TOML_FILE;
+use codex_config::ConfigLayerEntry;
+use codex_config::ConfigLayerMetadata;
+use codex_config::ConfigLayerSource;
+use codex_config::ConfigLayerStack;
+use codex_config::ConfigLayerStackOrdering;
+use codex_config::ConfigRequirementsToml;
+use codex_config::config_toml::ConfigToml;
+use codex_config::is_multi_agent_v2_feature_path;
+use codex_config::merge_owned_config_values;
+use codex_config::normalize_multi_agent_v2_feature_value;
+use codex_core::config::deserialize_config_toml_with_base;
+use codex_core::config::edit::ConfigApplyOutcome;
+use codex_core::config::edit::ConfigEdit;
+use codex_core::config::edit::ConfigEditsBuilder;
+use codex_core::config::resolve_configured_features;
+use codex_core::config::validate_feature_requirements_for_config_toml;
+use codex_features::Features;
+use codex_file_system::SymlinkWritePaths;
+use codex_file_system::resolve_symlink_write_paths;
+use codex_utils_absolute_path as path_utils;
+use codex_utils_absolute_path::AbsolutePathBuf;
+use serde_json::Value as JsonValue;
+use std::borrow::Cow;
+use std::path::PathBuf;
+use thiserror::Error;
+use toml::Value as TomlValue;
+use toml_edit::Item as TomlItem;
+
+#[derive(Debug, Error)]
+pub enum ConfigManagerError {
+    #[error("{message}")]
+    Write {
+        code: ConfigWriteErrorCode,
+        message: String,
+    },
+
+    #[error("{context}: {source}")]
+    Io {
+        context: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("{context}: {source}")]
+    Json {
+        context: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error("{context}: {source}")]
+    Toml {
+        context: &'static str,
+        #[source]
+        source: toml::de::Error,
+    },
+
+    #[error("{context}: {source}")]
+    Anyhow {
+        context: &'static str,
+        #[source]
+        source: anyhow::Error,
+    },
+}
+
+impl ConfigManagerError {
+    fn write(code: ConfigWriteErrorCode, message: impl Into<String>) -> Self {
+        Self::Write {
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn io(context: &'static str, source: std::io::Error) -> Self {
+        Self::Io { context, source }
+    }
+
+    fn json(context: &'static str, source: serde_json::Error) -> Self {
+        Self::Json { context, source }
+    }
+
+    fn toml(context: &'static str, source: toml::de::Error) -> Self {
+        Self::Toml { context, source }
+    }
+
+    fn anyhow(context: &'static str, source: anyhow::Error) -> Self {
+        Self::Anyhow { context, source }
+    }
+
+    pub fn write_error_code(&self) -> Option<ConfigWriteErrorCode> {
+        match self {
+            Self::Write { code, .. } => Some(code.clone()),
+            _ => None,
+        }
+    }
+}
+
+impl ConfigManager {
+    pub async fn read(
+        &self,
+        params: ConfigReadParams,
+    ) -> Result<(ConfigReadResponse, Features), ConfigManagerError> {
+        let layers = match params.cwd.as_deref() {
+            Some(cwd) => {
+                let cwd = AbsolutePathBuf::try_from(PathBuf::from(cwd)).map_err(|err| {
+                    ConfigManagerError::io("failed to resolve config cwd to an absolute path", err)
+                })?;
+                self.load_config_layers(Some(cwd)).await.map_err(|err| {
+                    ConfigManagerError::io("failed to read configuration layers", err)
+                })?
+            }
+            None => self.load_thread_agnostic_config().await.map_err(|err| {
+                ConfigManagerError::io("failed to read configuration layers", err)
+            })?,
+        };
+
+        let effective = layers.effective_config();
+        let effective_config_toml: ConfigToml = effective
+            .try_into()
+            .map_err(|err| ConfigManagerError::toml("invalid configuration", err))?;
+
+        let mut features = resolve_configured_features(
+            &effective_config_toml,
+            layers.requirements().feature_requirements.as_ref(),
+        )
+        .map_err(|err| ConfigManagerError::io("failed to resolve configuration features", err))?;
+        self.apply_runtime_feature_enablement_to_features(&mut features, &layers);
+
+        let json_value = serde_json::to_value(&effective_config_toml)
+            .map_err(|err| ConfigManagerError::json("failed to serialize configuration", err))?;
+        let config: ApiConfig = serde_json::from_value(json_value)
+            .map_err(|err| ConfigManagerError::json("failed to deserialize configuration", err))?;
+
+        let response = ConfigReadResponse {
+            config,
+            origins: layers
+                .origins()
+                .into_iter()
+                .map(|(path, metadata)| (path, config_layer_metadata_to_api(metadata)))
+                .collect(),
+            layers: params.include_layers.then(|| {
+                layers
+                    .get_layers(
+                        ConfigLayerStackOrdering::HighestPrecedenceFirst,
+                        /*include_disabled*/ true,
+                    )
+                    .iter()
+                    .map(|layer| config_layer_to_api(layer.as_layer()))
+                    .collect()
+            }),
+        };
+
+        Ok((response, features))
+    }
+
+    pub async fn read_requirements(
+        &self,
+    ) -> Result<Option<ConfigRequirementsToml>, ConfigManagerError> {
+        let layers = self
+            .load_thread_agnostic_config()
+            .await
+            .map_err(|err| ConfigManagerError::io("failed to read configuration layers", err))?;
+
+        let requirements = layers.requirements_toml().clone();
+        if requirements.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(requirements))
+        }
+    }
+
+    pub async fn write_value(
+        &self,
+        params: ConfigValueWriteParams,
+    ) -> Result<ConfigWriteResponse, ConfigManagerError> {
+        let edits = vec![(params.key_path, params.value, params.merge_strategy)];
+        self.apply_edits(params.file_path, params.expected_version, edits)
+            .await
+    }
+
+    pub async fn batch_write(
+        &self,
+        params: ConfigBatchWriteParams,
+    ) -> Result<ConfigWriteResponse, ConfigManagerError> {
+        let edits = params
+            .edits
+            .into_iter()
+            .map(|edit| (edit.key_path, edit.value, edit.merge_strategy))
+            .collect();
+
+        self.apply_edits(params.file_path, params.expected_version, edits)
+            .await
+    }
+
+    async fn apply_edits(
+        &self,
+        file_path: Option<String>,
+        expected_version: Option<String>,
+        edits: Vec<(String, JsonValue, MergeStrategy)>,
+    ) -> Result<ConfigWriteResponse, ConfigManagerError> {
+        let allowed_path = self
+            .user_config_path()
+            .map_err(|err| ConfigManagerError::io("failed to resolve user config path", err))?;
+        let provided_path = match file_path {
+            Some(path) => AbsolutePathBuf::from_absolute_path(PathBuf::from(path))
+                .map_err(|err| ConfigManagerError::io("failed to resolve user config path", err))?,
+            None => allowed_path.clone(),
+        };
+
+        if !path_utils::paths_match_after_normalization(&allowed_path, &provided_path) {
+            return Err(ConfigManagerError::write(
+                ConfigWriteErrorCode::ConfigLayerReadonly,
+                "Only writes to the user config are allowed",
+            ));
+        }
+
+        // Capture the exact on-disk representation before loading the migrated
+        // config layer. The client version fingerprints the migrated layer,
+        // while the atomic writer compares the raw TOML under its file lock.
+        // Feature normalization preserves intent against the latest document.
+        // Reject an intervening write rather than validate/report an older view.
+        let preserves_feature_intent = edits.iter().any(|(key_path, value, _)| {
+            parse_key_path(key_path).is_ok_and(|segments| match segments.as_slice() {
+                [features, feature, ..] => {
+                    features == "features" && feature == "multi_agent_v2"
+                }
+                [features] if features == "features" => value
+                    .as_object()
+                    .is_some_and(|features| features.contains_key("multi_agent_v2")),
+                _ => false,
+            })
+        });
+        let writer_expected_version = if expected_version.is_some() || preserves_feature_intent {
+            Some(codex_config::version_for_toml(
+                &read_raw_user_config(&provided_path).await?,
+            ))
+        } else {
+            None
+        };
+        let layers = self
+            .load_thread_agnostic_config()
+            .await
+            .map_err(|err| ConfigManagerError::io("failed to load configuration", err))?;
+        let user_layer = match layers.get_active_user_layer() {
+            Some(layer) => Cow::Borrowed(layer),
+            None => Cow::Owned(create_empty_user_layer(&allowed_path).await?),
+        };
+
+        if let Some(expected) = expected_version.as_deref()
+            && expected != user_layer.version
+        {
+            return Err(ConfigManagerError::write(
+                ConfigWriteErrorCode::ConfigVersionConflict,
+                "Configuration was modified since last read. Fetch latest version and retry.",
+            ));
+        }
+
+        let mut user_config = user_layer.config.clone();
+        let mut parsed_segments = Vec::new();
+        let mut config_edits = Vec::new();
+
+        for (key_path, value, strategy) in edits.into_iter() {
+            let segments = parse_key_path(&key_path).map_err(|message| {
+                ConfigManagerError::write(ConfigWriteErrorCode::ConfigValidationError, message)
+            })?;
+            if !value.is_null() {
+                match segments.as_slice() {
+                    [segment] if segment == "profile" => {
+                        return Err(ConfigManagerError::write(
+                            ConfigWriteErrorCode::ConfigValidationError,
+                            "`profile` is a legacy config selector and can no longer be written; use `--profile <name>` with `<name>.config.toml` instead",
+                        ));
+                    }
+                    [segment, ..] if segment == "profiles" => {
+                        return Err(ConfigManagerError::write(
+                            ConfigWriteErrorCode::ConfigValidationError,
+                            "`profiles` contains legacy config profile tables and can no longer be written; use `--profile <name>` with `<name>.config.toml` instead",
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            let original_value = value_at_semantic_path(&user_config, &segments).cloned();
+            let parsed_value = parse_value(value).map_err(|message| {
+                ConfigManagerError::write(ConfigWriteErrorCode::ConfigValidationError, message)
+            })?;
+
+            apply_merge(&mut user_config, &segments, parsed_value.as_ref(), strategy).map_err(
+                |err| match err {
+                    MergeError::Validation(message) => ConfigManagerError::write(
+                        ConfigWriteErrorCode::ConfigValidationError,
+                        message,
+                    ),
+                },
+            )?;
+
+            let updated_value = value_at_semantic_path(&user_config, &segments).cloned();
+            if original_value != updated_value {
+                let edit = match updated_value {
+                    Some(value) => {
+                        // Preserve mixed-form intent for the writer's current document,
+                        // rather than persisting settings copied from this earlier view.
+                        let value = match (&parsed_value, &original_value) {
+                            (Some(parsed @ TomlValue::Boolean(_)), _)
+                                if is_multi_agent_v2_feature_path(&segments) => parsed,
+                            (Some(parsed @ TomlValue::Table(_)), Some(TomlValue::Boolean(_)))
+                                if is_multi_agent_v2_feature_path(&segments) => parsed,
+                            _ => &value,
+                        };
+                        ConfigEdit::SetPath {
+                            segments: segments.clone(),
+                            value: toml_value_to_item(value).map_err(|err| {
+                                ConfigManagerError::anyhow("failed to build config edits", err)
+                            })?,
+                        }
+                    }
+                    None => ConfigEdit::ClearPath {
+                        segments: segments.clone(),
+                    },
+                };
+                config_edits.push(edit);
+            }
+
+            let mut semantic_segments = segments;
+            if is_multi_agent_v2_feature_path(&semantic_segments)
+                && parsed_value.as_ref().is_some_and(|value| value.as_bool().is_some())
+            {
+                semantic_segments.push("enabled".to_string());
+            }
+            parsed_segments.push(semantic_segments);
+        }
+
+        validate_config(&user_config).map_err(|err| {
+            ConfigManagerError::write(
+                ConfigWriteErrorCode::ConfigValidationError,
+                format!("Invalid configuration: {err}"),
+            )
+        })?;
+        let user_config_toml =
+            deserialize_config_toml_with_base(user_config.clone(), self.codex_home()).map_err(
+                |err| {
+                    ConfigManagerError::write(
+                        ConfigWriteErrorCode::ConfigValidationError,
+                        format!("Invalid configuration: {err}"),
+                    )
+                },
+            )?;
+        validate_feature_requirements_for_config_toml(
+            &user_config_toml,
+            layers.requirements().feature_requirements.as_ref(),
+        )
+        .map_err(|err| {
+            ConfigManagerError::write(
+                ConfigWriteErrorCode::ConfigValidationError,
+                format!("Invalid configuration: {err}"),
+            )
+        })?;
+        let updated_layers = layers.with_user_config(&provided_path, user_config.clone());
+        let effective = updated_layers.effective_config();
+        validate_config(&effective).map_err(|err| {
+            ConfigManagerError::write(
+                ConfigWriteErrorCode::ConfigValidationError,
+                format!("Invalid configuration: {err}"),
+            )
+        })?;
+
+        let apply_outcome = ConfigEditsBuilder::for_config_path(provided_path.as_path())
+            .with_edits(config_edits)
+            .with_expected_version(writer_expected_version)
+            .apply_with_outcome()
+            .await
+            .map_err(|err| ConfigManagerError::anyhow("failed to persist config.toml", err))?;
+        if apply_outcome == ConfigApplyOutcome::VersionConflict {
+            return Err(ConfigManagerError::write(
+                ConfigWriteErrorCode::ConfigVersionConflict,
+                "Configuration was modified since last read. Fetch latest version and retry.",
+            ));
+        }
+
+        // Successful writes must be visible to the next per-cwd read, even
+        // when no live thread exists to receive a runtime config refresh.
+        self.invalidate_load_cache();
+
+        // Report the persisted effective layer, not a projection that may differ
+        // after migration or an intervening writer's independent changes.
+        let updated_layers = self
+            .load_thread_agnostic_config()
+            .await
+            .map_err(|err| ConfigManagerError::io("failed to reload written configuration", err))?;
+        let effective = updated_layers.effective_config();
+        let overridden = first_overridden_edit(&updated_layers, &effective, &parsed_segments);
+        let status = overridden
+            .as_ref()
+            .map(|_| WriteStatus::OkOverridden)
+            .unwrap_or(WriteStatus::Ok);
+
+        Ok(ConfigWriteResponse {
+            status,
+            version: updated_layers
+                .get_active_user_layer()
+                .ok_or_else(|| {
+                    ConfigManagerError::write(
+                        ConfigWriteErrorCode::UserLayerNotFound,
+                        "user layer not found in updated layers",
+                    )
+                })?
+                .version
+                .clone(),
+            file_path: provided_path,
+            overridden_metadata: overridden,
+        })
+    }
+
+    /// Loads a "thread-agnostic" config, which means the config layers do not
+    /// include any in-repo .codex/ folders because there is no cwd/project root
+    /// associated with this query.
+    async fn load_thread_agnostic_config(&self) -> std::io::Result<ConfigLayerStack> {
+        self.load_config_layers(/*cwd*/ None).await
+    }
+}
+
+async fn read_raw_user_config(
+    config_toml: &AbsolutePathBuf,
+) -> Result<TomlValue, ConfigManagerError> {
+    let SymlinkWritePaths {
+        read_path,
+        write_path: _,
+    } = resolve_symlink_write_paths(config_toml.as_path())
+        .map_err(|err| ConfigManagerError::io("failed to resolve user config path", err))?;
+    let toml_value = match read_path {
+        Some(path) => match tokio::fs::read_to_string(&path).await {
+            Ok(contents) => toml::from_str(&contents).map_err(|err| {
+                ConfigManagerError::toml("failed to parse existing user config.toml", err)
+            })?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                TomlValue::Table(toml::map::Map::new())
+            }
+            Err(err) => {
+                return Err(ConfigManagerError::io(
+                    "failed to read user config.toml",
+                    err,
+                ));
+            }
+        },
+        None => TomlValue::Table(toml::map::Map::new()),
+    };
+    Ok(toml_value)
+}
+
+async fn create_empty_user_layer(
+    config_toml: &AbsolutePathBuf,
+) -> Result<ConfigLayerEntry, ConfigManagerError> {
+    let toml_value = read_raw_user_config(config_toml).await?;
+    Ok(ConfigLayerEntry::new(
+        ConfigLayerSource::User {
+            file: config_toml.clone(),
+            profile: None,
+        },
+        toml_value,
+    ))
+}
+
+fn parse_value(value: JsonValue) -> Result<Option<TomlValue>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+
+    serde_json::from_value::<TomlValue>(value)
+        .map(Some)
+        .map_err(|err| format!("invalid value: {err}"))
+}
+
+pub fn parse_key_path(path: &str) -> Result<Vec<String>, String> {
+    if path.trim().is_empty() {
+        return Err("keyPath must not be empty".to_string());
+    }
+
+    let mut segments = Vec::new();
+    let mut segment = String::new();
+    let mut chars = path.chars();
+    let mut quoted = false;
+
+    // Split on dots unless they appear inside a quoted segment. Bare segments
+    // intentionally stay permissive so existing paths like `sample@catalog`
+    // remain valid.
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if segment.is_empty() && !quoted => quoted = true,
+            '"' if quoted => quoted = false,
+            '\\' if quoted => {
+                // Quoted segments may escape punctuation that would otherwise
+                // participate in parsing, such as `.` or `"`.
+                let Some(escaped) = chars.next() else {
+                    return Err("unterminated escape in keyPath".to_string());
+                };
+                segment.push(escaped);
+            }
+            '.' if !quoted => {
+                if segment.is_empty() {
+                    return Err("keyPath segments must not be empty".to_string());
+                }
+                segments.push(std::mem::take(&mut segment));
+            }
+            '"' => return Err("invalid quoted keyPath segment".to_string()),
+            _ => segment.push(ch),
+        }
+    }
+
+    if quoted {
+        return Err("unterminated quoted keyPath segment".to_string());
+    }
+    if segment.is_empty() {
+        return Err("keyPath segments must not be empty".to_string());
+    }
+
+    segments.push(segment);
+    Ok(segments)
+}
+
+#[derive(Debug)]
+enum MergeError {
+    Validation(String),
+}
+
+fn apply_merge(
+    root: &mut TomlValue,
+    segments: &[String],
+    value: Option<&TomlValue>,
+    strategy: MergeStrategy,
+) -> Result<bool, MergeError> {
+    let Some(value) = value else {
+        return clear_path(root, segments);
+    };
+
+    let Some((last, parents)) = segments.split_last() else {
+        return Err(MergeError::Validation(
+            "keyPath must not be empty".to_string(),
+        ));
+    };
+
+    if last == "enabled"
+        && is_multi_agent_v2_feature_path(parents)
+        && value.as_bool().is_some()
+        && value_at_path(root, parents).is_some_and(|feature| feature.as_bool().is_some())
+    {
+        return apply_merge(root, parents, Some(value), strategy);
+    }
+
+    let existing = value_at_path(root, segments);
+    let preserves_feature_shape = is_multi_agent_v2_feature_path(segments)
+        && matches!(
+            (existing, value),
+            (Some(TomlValue::Table(_)), TomlValue::Boolean(_))
+                | (Some(TomlValue::Boolean(_)), TomlValue::Table(_))
+        );
+    if preserves_feature_shape
+        || matches!(strategy, MergeStrategy::Upsert)
+            && matches!(existing, Some(TomlValue::Table(_)))
+            && matches!(value, TomlValue::Table(_))
+    {
+        // Merge at the real config root, not at an opaque subtree that happens
+        // to contain keys named features.multi_agent_v2.
+        merge_owned_config_values(root, sparse_overlay(segments, value));
+        return Ok(true);
+    }
+
+    let mut current = root;
+
+    for (index, segment) in parents.iter().enumerate() {
+        normalize_multi_agent_v2_feature_value(&parents[..index], current);
+        match current {
+            TomlValue::Table(table) => {
+                current = table
+                    .entry(segment.clone())
+                    .or_insert_with(|| TomlValue::Table(toml::map::Map::new()));
+            }
+            _ => {
+                *current = TomlValue::Table(toml::map::Map::new());
+                if let TomlValue::Table(table) = current {
+                    current = table
+                        .entry(segment.clone())
+                        .or_insert_with(|| TomlValue::Table(toml::map::Map::new()));
+                }
+            }
+        }
+    }
+
+    normalize_multi_agent_v2_feature_value(parents, current);
+    let table = current.as_table_mut().ok_or_else(|| {
+        MergeError::Validation("cannot set value on non-table parent".to_string())
+    })?;
+
+    let changed = table.get(last) != Some(value);
+    table.insert(last.clone(), value.clone());
+    Ok(changed)
+}
+
+fn sparse_overlay(segments: &[String], value: &TomlValue) -> TomlValue {
+    segments.iter().rev().fold(value.clone(), |value, segment| {
+        TomlValue::Table(toml::map::Map::from_iter([(segment.clone(), value)]))
+    })
+}
+
+fn clear_path(root: &mut TomlValue, segments: &[String]) -> Result<bool, MergeError> {
+    let Some((last, parents)) = segments.split_last() else {
+        return Err(MergeError::Validation(
+            "keyPath must not be empty".to_string(),
+        ));
+    };
+
+    if last == "enabled"
+        && is_multi_agent_v2_feature_path(parents)
+        && value_at_path(root, parents).is_some_and(|value| value.as_bool().is_some())
+    {
+        return clear_path(root, parents);
+    }
+
+    let mut current = root;
+    for segment in parents {
+        match current {
+            TomlValue::Table(table) => {
+                let Some(next) = table.get_mut(segment) else {
+                    return Ok(false);
+                };
+                current = next;
+            }
+            _ => return Ok(false),
+        }
+    }
+
+    let Some(parent) = current.as_table_mut() else {
+        return Ok(false);
+    };
+
+    Ok(parent.remove(last).is_some())
+}
+
+fn toml_value_to_item(value: &TomlValue) -> anyhow::Result<TomlItem> {
+    match value {
+        TomlValue::Table(table) => {
+            let mut table_item = toml_edit::Table::new();
+            table_item.set_implicit(false);
+            for (key, val) in table {
+                table_item.insert(key, toml_value_to_item(val)?);
+            }
+            Ok(TomlItem::Table(table_item))
+        }
+        other => Ok(TomlItem::Value(toml_value_to_value(other)?)),
+    }
+}
+
+fn toml_value_to_value(value: &TomlValue) -> anyhow::Result<toml_edit::Value> {
+    match value {
+        TomlValue::String(val) => Ok(toml_edit::Value::from(val.clone())),
+        TomlValue::Integer(val) => Ok(toml_edit::Value::from(*val)),
+        TomlValue::Float(val) => Ok(toml_edit::Value::from(*val)),
+        TomlValue::Boolean(val) => Ok(toml_edit::Value::from(*val)),
+        TomlValue::Datetime(val) => Ok(toml_edit::Value::from(*val)),
+        TomlValue::Array(items) => {
+            let mut array = toml_edit::Array::new();
+            for item in items {
+                array.push(toml_value_to_value(item)?);
+            }
+            Ok(toml_edit::Value::Array(array))
+        }
+        TomlValue::Table(table) => {
+            let mut inline = toml_edit::InlineTable::new();
+            for (key, val) in table {
+                inline.insert(key, toml_value_to_value(val)?);
+            }
+            Ok(toml_edit::Value::InlineTable(inline))
+        }
+    }
+}
+
+fn validate_config(value: &TomlValue) -> Result<(), toml::de::Error> {
+    let _: ConfigToml = value.clone().try_into()?;
+    Ok(())
+}
+
+fn value_at_path<'a>(root: &'a TomlValue, segments: &[String]) -> Option<&'a TomlValue> {
+    let mut current = root;
+    for segment in segments {
+        match current {
+            TomlValue::Table(table) => {
+                current = table.get(segment)?;
+            }
+            TomlValue::Array(items) => {
+                let idx = segment.parse::<i64>().ok()?;
+                let idx = usize::try_from(idx).ok()?;
+                current = items.get(idx)?;
+            }
+            _ => return None,
+        }
+    }
+    Some(current)
+}
+
+fn value_at_semantic_path<'a>(root: &'a TomlValue, segments: &[String]) -> Option<&'a TomlValue> {
+    value_at_path(root, segments).or_else(|| {
+        let (field, parents) = segments.split_last()?;
+        if field != "enabled" || !is_multi_agent_v2_feature_path(parents) {
+            return None;
+        }
+        let feature = value_at_path(root, parents)?;
+        feature.as_bool().is_some().then_some(feature)
+    })
+}
+
+fn override_message(layer: &ConfigLayerSource) -> String {
+    match layer {
+        ConfigLayerSource::Mdm { domain, key: _ } => {
+            format!("Overridden by managed policy (MDM): {domain}")
+        }
+        ConfigLayerSource::System { file } => {
+            format!("Overridden by managed config (system): {}", file.display())
+        }
+        ConfigLayerSource::EnterpriseManaged { id: _, name } => {
+            format!("Overridden by enterprise-managed config: {name}")
+        }
+        ConfigLayerSource::Project { dot_codex_folder } => format!(
+            "Overridden by project config: {}/{CONFIG_TOML_FILE}",
+            dot_codex_folder.display(),
+        ),
+        ConfigLayerSource::SessionFlags => "Overridden by session flags".to_string(),
+        ConfigLayerSource::User { file, .. } => {
+            format!("Overridden by user config: {}", file.display())
+        }
+        ConfigLayerSource::LegacyManagedConfigTomlFromFile { file } => {
+            format!(
+                "Overridden by legacy managed_config.toml: {}",
+                file.display()
+            )
+        }
+        ConfigLayerSource::LegacyManagedConfigTomlFromMdm => {
+            "Overridden by legacy managed configuration from MDM".to_string()
+        }
+    }
+}
+
+fn compute_override_metadata(
+    layers: &ConfigLayerStack,
+    effective: &TomlValue,
+    segments: &[String],
+) -> Option<OverriddenMetadata> {
+    let user_layer = layers.get_active_user_layer()?;
+    let user_value = value_at_semantic_path(&user_layer.config, segments);
+    let effective_value = value_at_semantic_path(effective, segments);
+
+    if user_value.is_some() && user_value == effective_value {
+        return None;
+    }
+
+    if user_value.is_none() && effective_value.is_none() {
+        return None;
+    }
+
+    let overriding_layer = find_effective_layer(layers, segments)?;
+    let message = override_message(&overriding_layer.name);
+
+    Some(OverriddenMetadata {
+        message,
+        overriding_layer: config_layer_metadata_to_api(overriding_layer),
+        effective_value: effective_value
+            .and_then(|value| serde_json::to_value(value).ok())
+            .unwrap_or(JsonValue::Null),
+    })
+}
+
+fn first_overridden_edit(
+    layers: &ConfigLayerStack,
+    effective: &TomlValue,
+    edits: &[Vec<String>],
+) -> Option<OverriddenMetadata> {
+    for segments in edits {
+        if let Some(meta) = compute_override_metadata(layers, effective, segments) {
+            return Some(meta);
+        }
+    }
+    None
+}
+
+fn find_effective_layer(
+    layers: &ConfigLayerStack,
+    segments: &[String],
+) -> Option<ConfigLayerMetadata> {
+    for layer in layers.layers_high_to_low() {
+        if let Some(meta) = value_at_semantic_path(&layer.config, segments).map(|_| layer.metadata()) {
+            return Some(meta);
+        }
+    }
+
+    None
+}
+

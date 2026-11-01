@@ -525,13 +525,6 @@ pub fn load_data_url_for_prompt(
             .map_err(|source| ImageProcessingError::InvalidDataUrl {
                 reason: format!("invalid base64 payload: {source}"),
             })?;
-    if file_bytes.len() > MAX_PROMPT_IMAGE_INPUT_BYTES {
-        return Err(ImageProcessingError::ImageTooLarge {
-            representation: "decoded input",
-            size: file_bytes.len(),
-            max: MAX_PROMPT_IMAGE_INPUT_BYTES,
-        });
-    }
 
     load_for_prompt_bytes(Path::new("<data-url-image>"), file_bytes, mode)
 }

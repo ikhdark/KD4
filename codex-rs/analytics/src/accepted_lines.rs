@@ -56,9 +56,9 @@ pub fn fingerprint_hash(domain: &str, value: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-pub(crate) fn accepted_line_fingerprint_event_requests(
+pub(crate) fn accepted_line_fingerprint_event_request(
     input: AcceptedLineFingerprintEventInput,
-) -> Vec<TrackEventRequest> {
+) -> TrackEventRequest {
     let AcceptedLineFingerprintEventInput {
         event_type,
         turn_id,
@@ -71,7 +71,7 @@ pub(crate) fn accepted_line_fingerprint_event_requests(
         accepted_deleted_lines,
     } = input;
 
-    vec![TrackEventRequest::AcceptedLineFingerprints(Box::new(
+    TrackEventRequest::AcceptedLineFingerprints(Box::new(
         CodexAcceptedLineFingerprintsEventRequest {
             event_type: "codex_accepted_line_fingerprints",
             event_params: CodexAcceptedLineFingerprintsEventParams {
@@ -87,7 +87,7 @@ pub(crate) fn accepted_line_fingerprint_event_requests(
                 line_fingerprints: Vec::new(),
             },
         },
-    ))]
+    ))
 }
 
 pub async fn accepted_line_repo_hash_for_cwd(cwd: &Path) -> Option<String> {

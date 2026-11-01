@@ -17,7 +17,6 @@ static CONSEQUENTIAL_TOOL_MESSAGE_TEMPLATES: LazyLock<
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RenderedMcpToolApprovalTemplate {
     pub(crate) question: String,
-    pub(crate) elicitation_message: String,
     pub(crate) tool_params: Option<Value>,
     pub(crate) tool_params_display: Vec<RenderedMcpToolApprovalParam>,
 }
@@ -106,7 +105,7 @@ fn render_mcp_tool_approval_template_from_templates(
             && template.connector_id == connector_id
             && template.tool_title == tool_title
     })?;
-    let elicitation_message = render_question_template(&template.template, connector_name)?;
+    let question = render_question_template(&template.template, connector_name)?;
     let (tool_params, tool_params_display) = match tool_params {
         Some(Value::Object(tool_params)) => {
             render_tool_params(tool_params, &template.template_params)?
@@ -116,8 +115,7 @@ fn render_mcp_tool_approval_template_from_templates(
     };
 
     Some(RenderedMcpToolApprovalTemplate {
-        question: elicitation_message.clone(),
-        elicitation_message,
+        question,
         tool_params,
         tool_params_display,
     })
@@ -173,9 +171,6 @@ fn render_tool_params(
     remaining_params.sort_by_key(|(name, _)| *name);
 
     for (name, value) in remaining_params {
-        if handled_names.contains(name.as_str()) {
-            continue;
-        }
         if !display_names.insert(name.clone()) {
             return None;
         }

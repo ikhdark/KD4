@@ -234,35 +234,12 @@ impl AgentsMdManager {
         markers
     }
 
-    pub(crate) async fn refresh(&self, config: &Config, environments: &TurnEnvironmentSnapshot) {
-        let _ = self.refresh_and_get_loaded(config, environments).await;
-    }
-
-    pub(crate) async fn refresh_and_get_loaded(
+    pub(crate) async fn refresh(
         &self,
-        config: &Config,
+        config: &Arc<Config>,
         environments: &TurnEnvironmentSnapshot,
-    ) -> Option<Arc<LoadedAgentsMd>> {
-        self.refresh_and_observe(config, environments).await.loaded
-    }
-
-    pub(crate) async fn refresh_and_observe(
-        &self,
-        config: &Config,
-        environments: &TurnEnvironmentSnapshot,
-    ) -> AgentsMdObservation {
-        let config = Arc::new(config.clone());
-        let refresh = async {
-            let _permit = self.refresh_gate.acquire().await.ok()?;
-            Some(
-                self.refresh_with_gate_held(Arc::clone(&config), environments)
-                    .await,
-            )
-        };
-        match tokio::time::timeout(REFRESH_TIMEOUT, refresh).await {
-            Ok(Some(observation)) => observation,
-            _ => self.scoped_fallback(&config, environments),
-        }
+    ) {
+        let _ = self.refresh_and_observe_shared(config, environments).await;
     }
 
     pub(crate) async fn refresh_and_observe_shared(

@@ -353,9 +353,6 @@ impl ExecCapturePolicy {
         }
     }
 
-    fn io_drain_timeout(self) -> Duration {
-        Duration::from_millis(IO_DRAIN_TIMEOUT_MS)
-    }
 }
 
 #[derive(Clone)]
@@ -903,8 +900,7 @@ fn finalize_exec_result(
 ) -> Result<ExecToolCallOutput> {
     match raw_output_result {
         Ok(raw_output) => {
-            #[allow(unused_mut)]
-            let mut timed_out = raw_output.timed_out;
+            let timed_out = raw_output.timed_out;
 
             let mut exit_code = raw_output.exit_status.code().unwrap_or(-1);
             if timed_out {
@@ -1170,13 +1166,6 @@ async fn exec(
     result
 }
 
-async fn terminate_and_reap_child_process_tree(
-    child: Child,
-    managed_root: ManagedRootProcess,
-) -> io::Result<()> {
-    managed_root.terminate_and_reap(child).await
-}
-
 /// Consumes the output of a child process according to the configured capture
 /// policy.
 async fn consume_output(
@@ -1211,7 +1200,7 @@ async fn consume_output(
         stdout_stream.clone(),
         /*is_stderr*/ false,
         Arc::clone(&stdout_capture),
-        Some(Arc::clone(&aggregate_capture)),
+        Arc::clone(&aggregate_capture),
         output_delta_limiter.clone(),
     ));
     let stderr_handle = tokio::spawn(read_output_into_capture(
@@ -1219,7 +1208,7 @@ async fn consume_output(
         stdout_stream.clone(),
         /*is_stderr*/ true,
         Arc::clone(&stderr_capture),
-        Some(Arc::clone(&aggregate_capture)),
+        Arc::clone(&aggregate_capture),
         output_delta_limiter,
     ));
 
@@ -1240,10 +1229,7 @@ async fn consume_output(
         outcome = &mut expiration_wait => {
             match outcome {
                 ExecExpirationOutcome::TimedOut => {
-                    terminate_and_reap_child_process_tree(
-                        child,
-                        managed_root,
-                    ).await?;
+                    managed_root.terminate_and_reap(child).await?;
                     (
                         synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + TIMEOUT_CODE),
                         true,
@@ -1251,14 +1237,14 @@ async fn consume_output(
                     )
                 }
                 ExecExpirationOutcome::Cancelled => {
-                    terminate_and_reap_child_process_tree(child, managed_root).await?;
-                    (synthetic_exit_status_for_code(/*code*/ 130), false, true)
+                    managed_root.terminate_and_reap(child).await?;
+                    (synthetic_exit_status(/*code*/ 130), false, true)
                 }
             }
         }
     };
 
-    let drain_deadline = tokio::time::Instant::now() + capture_policy.io_drain_timeout();
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(IO_DRAIN_TIMEOUT_MS);
     let (stdout, mut stderr) = await_captured_output_until_deadline(
         stdout_handle.detach(),
         stderr_handle.detach(),
@@ -1267,7 +1253,7 @@ async fn consume_output(
         Arc::clone(&aggregate_capture),
         drain_deadline,
     )
-    .await?;
+    .await;
     if cancelled {
         const CANCELLATION_NOTICE: &[u8] = b"\nCommand cancelled.\n";
         let mut capture = stderr_capture
@@ -1301,7 +1287,7 @@ async fn await_captured_output_until_deadline(
     stderr_capture: SharedOutputCapture,
     aggregate_capture: SharedOutputCapture,
     deadline: tokio::time::Instant,
-) -> io::Result<(StreamOutput<Vec<u8>>, StreamOutput<Vec<u8>>)> {
+) -> (StreamOutput<Vec<u8>>, StreamOutput<Vec<u8>>) {
     let mut stdout_handle = tokio_util::task::AbortOnDropHandle::new(stdout_handle);
     let mut stderr_handle = tokio_util::task::AbortOnDropHandle::new(stderr_handle);
     async fn await_output(
@@ -1309,7 +1295,7 @@ async fn await_captured_output_until_deadline(
         capture: &SharedOutputCapture,
         aggregate_capture: &SharedOutputCapture,
         deadline: tokio::time::Instant,
-    ) -> io::Result<StreamOutput<Vec<u8>>> {
+    ) -> StreamOutput<Vec<u8>> {
         match tokio::time::timeout_at(deadline, &mut *handle).await {
             Ok(join_result) => {
                 let failure = match join_result {
@@ -1342,10 +1328,10 @@ async fn await_captured_output_until_deadline(
                     .mark_drain_timeout();
             }
         }
-        Ok(capture
+        capture
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .snapshot())
+            .snapshot()
     }
 
     let (stdout, stderr) = tokio::join!(
@@ -1362,7 +1348,7 @@ async fn await_captured_output_until_deadline(
             deadline,
         ),
     );
-    Ok((stdout?, stderr?))
+    (stdout, stderr)
 }
 
 async fn read_output_into_capture<R: AsyncRead + Unpin + Send + 'static>(
@@ -1370,7 +1356,7 @@ async fn read_output_into_capture<R: AsyncRead + Unpin + Send + 'static>(
     stream: Option<StdoutStream>,
     is_stderr: bool,
     capture: SharedOutputCapture,
-    aggregate_capture: Option<SharedOutputCapture>,
+    aggregate_capture: SharedOutputCapture,
     output_delta_limiter: Arc<OutputDeltaLimiter>,
 ) -> io::Result<()> {
     let mut tmp = [0u8; READ_CHUNK_SIZE];
@@ -1387,12 +1373,10 @@ async fn read_output_into_capture<R: AsyncRead + Unpin + Send + 'static>(
             progress.record_output();
         }
 
-        if let Some(aggregate_capture) = &aggregate_capture {
-            aggregate_capture
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .append_process_bytes(&tmp[..n]);
-        }
+        aggregate_capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .append_process_bytes(&tmp[..n]);
         capture
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1530,6 +1514,3 @@ fn synthetic_exit_status(code: i32) -> ExitStatus {
     std::process::ExitStatus::from_raw(code as u32)
 }
 
-fn synthetic_exit_status_for_code(code: i32) -> ExitStatus {
-    synthetic_exit_status(code)
-}

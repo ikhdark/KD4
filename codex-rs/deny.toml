@@ -73,8 +73,6 @@ ignore = [
     { id = "RUSTSEC-2025-0057", reason = "fxhash is unmaintained; pulled in via starlark_map under starlark v0.14.2 used by execpolicy/cli/core and bm25 used by core; remove when upstream dependencies drop fxhash" },
     { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained; pulled in via rmcp/starlark/v8 used by rmcp-client/execpolicy/code-mode; no fixed release yet" },
     { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill is unmaintained; Cargo.lock retains it via starlark v0.14.2 -> pagable -> postcard -> heapless, but heapless selects it only for embedded targets, so this Windows graph does not encounter it; kept for cargo audit's lockfile-wide scan until starlark drops pagable/postcard" },
-    { id = "RUSTSEC-2026-0118", reason = "hickory-proto v0.25.2 is pulled in via rama-dns/rama-tcp used by codex-network-proxy; DNSSEC features are not enabled; remove when rama updates to hickory 0.26.1 or hickory-net" },
-    { id = "RUSTSEC-2026-0119", reason = "hickory-proto v0.25.2 is pulled in via rama-dns/rama-tcp used by codex-network-proxy; no fixed rama release is available yet; remove when rama updates to hickory 0.26.1 or hickory-net" },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.

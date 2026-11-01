@@ -27,14 +27,6 @@ impl StateRuntime {
         crate::BackfillState::try_from_row(&row)
     }
 
-    /// Attempt to claim ownership of rollout metadata backfill.
-    ///
-    /// Returns `true` when this runtime claimed the backfill worker slot.
-    /// Returns `false` if backfill is already complete or currently owned by a
-    /// non-expired worker.
-    pub async fn try_claim_backfill(&self, lease_seconds: i64) -> anyhow::Result<bool> {
-        Ok(self.claim_backfill(lease_seconds).await?.is_some())
-    }
 
     pub async fn claim_backfill(&self, lease_seconds: i64) -> anyhow::Result<Option<crate::BackfillClaim>> {
         self.ensure_backfill_state_row().await?;
@@ -84,86 +76,9 @@ RETURNING last_watermark
         Ok(())
     }
 
-    /// Mark rollout metadata backfill as running.
-    pub async fn mark_backfill_running(&self) -> anyhow::Result<()> {
-        self.ensure_backfill_state_row().await?;
-        let result = sqlx::query(
-            r#"
-UPDATE backfill_state
-SET status = ?, updated_at = ?
-WHERE id = 1 AND claim_token IS NULL
-            "#,
-        )
-        .bind(crate::BackfillStatus::Running.as_str())
-        .bind(Utc::now().timestamp())
-        .execute(self.pool.as_ref())
-        .await?;
-        anyhow::ensure!(result.rows_affected() == 1, "backfill has an active claim; an explicit claim is required");
-        Ok(())
-    }
 
-    /// Persist rollout metadata backfill progress.
-    pub async fn checkpoint_backfill(&self, watermark: &str) -> anyhow::Result<()> {
-        self.ensure_backfill_state_row().await?;
-        let result = sqlx::query(
-            r#"
-UPDATE backfill_state
-SET status = ?, last_watermark = ?, updated_at = ?
-WHERE id = 1 AND claim_token IS NULL
-            "#,
-        )
-        .bind(crate::BackfillStatus::Running.as_str())
-        .bind(watermark)
-        .bind(Utc::now().timestamp())
-        .execute(self.pool.as_ref())
-        .await?;
-        anyhow::ensure!(result.rows_affected() == 1, "backfill has an active claim; an explicit claim is required");
-        Ok(())
-    }
 
-    /// Release rollout metadata backfill ownership while preserving its last
-    /// contiguous successful watermark so a later worker can retry.
-    pub async fn mark_backfill_pending(&self) -> anyhow::Result<()> {
-        self.ensure_backfill_state_row().await?;
-        let result = sqlx::query(
-            r#"
-UPDATE backfill_state
-SET status = ?, updated_at = ?
-WHERE id = 1 AND claim_token IS NULL
-            "#,
-        )
-        .bind(crate::BackfillStatus::Pending.as_str())
-        .bind(Utc::now().timestamp())
-        .execute(self.pool.as_ref())
-        .await?;
-        anyhow::ensure!(result.rows_affected() == 1, "backfill has an active claim; an explicit claim is required");
-        Ok(())
-    }
 
-    /// Mark rollout metadata backfill as complete.
-    pub async fn mark_backfill_complete(&self, last_watermark: Option<&str>) -> anyhow::Result<()> {
-        self.ensure_backfill_state_row().await?;
-        let now = Utc::now().timestamp();
-        let result = sqlx::query(
-            r#"
-UPDATE backfill_state
-SET
-    status = ?,
-    last_watermark = COALESCE(?, last_watermark),
-    last_success_at = ?,
-    updated_at = ?
-WHERE id = 1 AND claim_token IS NULL
-            "#,
-        )
-        .bind(crate::BackfillStatus::Complete.as_str())
-        .bind(last_watermark)
-        .bind(now)
-        .bind(now)
-        .execute(self.pool.as_ref())
-        .await?;
-        anyhow::ensure!(result.rows_affected() == 1, "backfill has an active claim; an explicit claim is required");
-        Ok(())
-    }
 
     async fn ensure_backfill_state_row(&self) -> anyhow::Result<()> {
         ensure_backfill_state_row_in_pool(self.pool.as_ref()).await

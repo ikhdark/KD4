@@ -1,0 +1,938 @@
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::sync::Arc;
+use std::time::Duration;
+
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use codex_app_server_protocol_types::ClientResponsePayload;
+use codex_app_server_protocol_types::JSONRPCErrorError;
+use codex_app_server_protocol_types::ProcessExitedNotification;
+use codex_app_server_protocol_types::ProcessKillParams;
+use codex_app_server_protocol_types::ProcessKillResponse;
+use codex_app_server_protocol_types::ProcessOutputDeltaNotification;
+use codex_app_server_protocol_types::ProcessOutputStream;
+use codex_app_server_protocol_types::ProcessResizePtyParams;
+use codex_app_server_protocol_types::ProcessResizePtyResponse;
+use codex_app_server_protocol_types::ProcessSpawnParams;
+use codex_app_server_protocol_types::ProcessSpawnResponse;
+use codex_app_server_protocol_types::ProcessWriteStdinParams;
+use codex_app_server_protocol_types::ProcessWriteStdinResponse;
+use codex_app_server_protocol_types::ServerNotification;
+use codex_core::exec::ExecExpiration;
+use codex_core::exec::ExecExpirationOutcome;
+use codex_core::exec::IO_DRAIN_TIMEOUT_MS;
+use codex_exec_server::EnvironmentManager;
+use codex_protocol::exec_output::bytes_to_string_smart;
+use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_pty::DEFAULT_OUTPUT_BYTES_CAP;
+use codex_utils_pty::ProcessHandle;
+use codex_utils_pty::SpawnedProcess;
+use codex_utils_pty::TerminalSize;
+use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
+
+use crate::command_exec::OutputByteCap;
+use crate::command_exec::StdinWriteRequest;
+use crate::command_exec::spawn_stdin_writer;
+use crate::command_exec::terminal_size_from_protocol;
+use crate::command_exec::validate_command_argv;
+use codex_app_server_rpc::connection_rpc_gate::ConnectionRpcGate;
+use codex_app_server_rpc::error_code::internal_error;
+use codex_app_server_rpc::error_code::invalid_params;
+use codex_app_server_rpc::error_code::invalid_request;
+use codex_app_server_rpc::outgoing_message::ConnectionId;
+use codex_app_server_rpc::outgoing_message::ConnectionRequestId;
+use codex_app_server_rpc::outgoing_message::OutgoingEnvelope;
+use codex_app_server_rpc::outgoing_message::OutgoingMessage;
+use codex_app_server_rpc::outgoing_message::OutgoingMessageSender;
+
+const EXEC_TIMEOUT_EXIT_CODE: i32 = 124;
+const MAX_PENDING_STDIN_WRITES: usize = 32;
+const OUTPUT_CHUNK_SIZE_HINT: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcessSpawnLogMetadata {
+    argv_count: usize,
+    env_key_count: usize,
+    tty: bool,
+    stream_stdin: bool,
+    stream_stdout_stderr: bool,
+    output_cap_present: bool,
+    timeout_present: bool,
+    size_present: bool,
+}
+
+fn process_spawn_log_metadata(params: &ProcessSpawnParams) -> ProcessSpawnLogMetadata {
+    ProcessSpawnLogMetadata {
+        argv_count: params.command.len(),
+        env_key_count: params.env.as_ref().map_or(0, HashMap::len),
+        tty: params.tty,
+        stream_stdin: params.stream_stdin,
+        stream_stdout_stderr: params.stream_stdout_stderr,
+        output_cap_present: params.output_bytes_cap.is_some(),
+        timeout_present: params.timeout_ms.is_some(),
+        size_present: params.size.is_some(),
+    }
+}
+
+fn log_process_spawn_request(params: &ProcessSpawnParams) {
+    let metadata = process_spawn_log_metadata(params);
+    tracing::debug!(
+        rpc.method = "process/spawn",
+        argv_count = metadata.argv_count,
+        env_key_count = metadata.env_key_count,
+        tty = metadata.tty,
+        stream_stdin = metadata.stream_stdin,
+        stream_stdout_stderr = metadata.stream_stdout_stderr,
+        output_cap_present = metadata.output_cap_present,
+        timeout_present = metadata.timeout_present,
+        size_present = metadata.size_present,
+        "command request"
+    );
+}
+
+#[derive(Clone)]
+pub struct ProcessExecRequestProcessor {
+    outgoing: Arc<OutgoingMessageSender>,
+    environment_manager: Arc<EnvironmentManager>,
+    sessions: Arc<Mutex<HashMap<ConnectionProcessHandle, ProcessSession>>>,
+    run_tasks: tokio_util::task::TaskTracker,
+}
+
+impl ProcessExecRequestProcessor {
+    pub fn new(
+        outgoing: Arc<OutgoingMessageSender>,
+        environment_manager: Arc<EnvironmentManager>,
+    ) -> Self {
+        Self {
+            outgoing,
+            environment_manager,
+            sessions: Arc::default(),
+            run_tasks: tokio_util::task::TaskTracker::new(),
+        }
+    }
+
+    pub async fn process_spawn(
+        &self,
+        request_id: ConnectionRequestId,
+        params: ProcessSpawnParams,
+        rpc_gate: &ConnectionRpcGate,
+    ) -> Result<(), JSONRPCErrorError> {
+        self.require_local_environment()?;
+        log_process_spawn_request(&params);
+        let ProcessSpawnParams {
+            command,
+            process_handle,
+            cwd,
+            tty,
+            stream_stdin,
+            stream_stdout_stderr,
+            output_bytes_cap,
+            timeout_ms,
+            env: env_overrides,
+            size,
+        } = params;
+        let method_name = "process/spawn";
+        validate_command_argv(&command)?;
+        if process_handle.is_empty() {
+            return Err(invalid_request("processHandle must not be empty"));
+        }
+        if size.is_some() && !tty {
+            return Err(invalid_params("process/spawn size requires tty: true"));
+        }
+        let mut env = std::env::vars().collect::<HashMap<_, _>>();
+        if let Some(env_overrides) = env_overrides {
+            #[cfg(windows)]
+            validate_environment_override_keys(&env_overrides, method_name)?;
+            for (key, value) in env_overrides {
+                // Windows treats environment names as case-insensitive. Remove
+                // the inherited spelling before applying either an unset or a
+                // replacement, so duplicate spellings cannot win during spawn.
+                #[cfg(windows)]
+                env.retain(|inherited_key, _| !inherited_key.eq_ignore_ascii_case(&key));
+                match value {
+                    Some(value) => {
+                        env.insert(key, value);
+                    }
+                    None => {
+                        env.remove(&key);
+                    }
+                }
+            }
+        }
+        let expiration = match timeout_ms {
+            Some(Some(timeout_ms)) => match u64::try_from(timeout_ms) {
+                Ok(timeout_ms) => timeout_ms.into(),
+                Err(_) => {
+                    return Err(invalid_params(format!(
+                        "{method_name} timeoutMs must be non-negative, got {timeout_ms}"
+                    )));
+                }
+            },
+            Some(None) => ExecExpiration::Cancellation(CancellationToken::new()),
+            None => ExecExpiration::DefaultTimeout,
+        };
+        let output_bytes_cap = output_bytes_cap.unwrap_or(Some(DEFAULT_OUTPUT_BYTES_CAP));
+        let size = size
+            .map(|size| terminal_size_from_protocol(size.into_inner(), "process"))
+            .transpose()?;
+
+        self.start(
+            StartProcessParams {
+                outgoing: self.outgoing.clone(),
+                request_id,
+                process_handle,
+                command,
+                cwd,
+                env,
+                expiration,
+                tty,
+                stream_stdin,
+                stream_stdout_stderr,
+                output_bytes_cap,
+                size,
+            },
+            rpc_gate,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn process_write_stdin(
+        &self,
+        request_id: ConnectionRequestId,
+        params: ProcessWriteStdinParams,
+        rpc_gate: &ConnectionRpcGate,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        self.write_stdin(request_id, params, rpc_gate)
+            .await
+            .map(|()| None)
+    }
+
+    pub async fn process_resize_pty(
+        &self,
+        request_id: ConnectionRequestId,
+        params: ProcessResizePtyParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        self.resize_pty(request_id, params)
+            .await
+            .map(|response| Some(response.into()))
+    }
+
+    pub async fn process_kill(
+        &self,
+        request_id: ConnectionRequestId,
+        params: ProcessKillParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        self.kill(request_id, params)
+            .await
+            .map(|response| Some(response.into()))
+    }
+
+    pub async fn connection_closed(&self, connection_id: ConnectionId) {
+        self.close_connection_processes(connection_id).await;
+    }
+
+    pub async fn drain_run_tasks(&self) {
+        self.run_tasks.close();
+        self.run_tasks.wait().await;
+    }
+
+    fn require_local_environment(&self) -> Result<(), JSONRPCErrorError> {
+        self.environment_manager
+            .try_local_environment()
+            .is_some()
+            .then_some(())
+            .ok_or_else(|| internal_error("local environment is not configured"))
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ConnectionProcessHandle {
+    connection_id: ConnectionId,
+    process_handle: String,
+}
+
+#[derive(Clone)]
+struct ProcessSession {
+    control_tx: mpsc::Sender<ProcessControlRequest>,
+    write_tx: mpsc::Sender<StdinWriteRequest>,
+    write_slots: Arc<Semaphore>,
+}
+
+enum ProcessControl {
+    Resize { size: TerminalSize },
+    Kill,
+}
+
+struct ProcessControlRequest {
+    control: ProcessControl,
+    response_tx: Option<oneshot::Sender<Result<(), JSONRPCErrorError>>>,
+}
+
+struct StartProcessParams {
+    outgoing: Arc<OutgoingMessageSender>,
+    request_id: ConnectionRequestId,
+    process_handle: String,
+    command: Vec<String>,
+    cwd: AbsolutePathBuf,
+    env: HashMap<String, String>,
+    expiration: ExecExpiration,
+    tty: bool,
+    stream_stdin: bool,
+    stream_stdout_stderr: bool,
+    output_bytes_cap: Option<usize>,
+    size: Option<TerminalSize>,
+}
+
+struct RunProcessParams {
+    outgoing: Arc<OutgoingMessageSender>,
+    request_id: ConnectionRequestId,
+    process_handle: String,
+    spawned: SpawnedProcess,
+    control_rx: mpsc::Receiver<ProcessControlRequest>,
+    write_rx: mpsc::Receiver<StdinWriteRequest>,
+    stream_stdin: bool,
+    stream_stdout_stderr: bool,
+    expiration: ExecExpiration,
+    output_bytes_cap: Option<usize>,
+    connection_cancellation: CancellationToken,
+    terminal_cleanup: ProcessTerminalCleanup,
+    response_enqueued: oneshot::Receiver<()>,
+}
+
+struct ProcessTerminalCleanup {
+    sessions: Arc<Mutex<HashMap<ConnectionProcessHandle, ProcessSession>>>,
+    process_key: ConnectionProcessHandle,
+}
+
+struct SpawnProcessOutputParams {
+    connection_id: ConnectionId,
+    process_handle: String,
+    output_rx: mpsc::Receiver<Vec<u8>>,
+    stdio_timeout_rx: watch::Receiver<bool>,
+    outgoing: Arc<OutgoingMessageSender>,
+    stream: ProcessOutputStream,
+    stream_output: bool,
+    output_bytes_cap: Option<usize>,
+    connection_cancellation: CancellationToken,
+    response_ready: CancellationToken,
+}
+
+#[derive(Default)]
+struct ProcessOutputCapture {
+    text: String,
+    cap_reached: bool,
+    base64: Option<String>,
+    drain_timed_out: bool,
+    reached_eof: bool,
+}
+
+impl ProcessExecRequestProcessor {
+    async fn start(
+        &self,
+        params: StartProcessParams,
+        rpc_gate: &ConnectionRpcGate,
+    ) -> Result<(), JSONRPCErrorError> {
+        let StartProcessParams {
+            outgoing,
+            request_id,
+            process_handle,
+            command,
+            cwd,
+            env,
+            expiration,
+            tty,
+            stream_stdin,
+            stream_stdout_stderr,
+            output_bytes_cap,
+            size,
+        } = params;
+        let connection_cancellation = rpc_gate.cancellation_token().child_token();
+        let run_owner = rpc_gate
+            .try_commit(|| self.run_tasks.token())
+            .ok_or_else(|| invalid_request("connection is closed"))?;
+
+        let Some((program, args)) = command.split_first() else {
+            return Err(internal_error(
+                "validated process command unexpectedly empty",
+            ));
+        };
+        let stream_stdin = tty || stream_stdin;
+        let stream_stdout_stderr = tty || stream_stdout_stderr;
+        let arg0 = None;
+        let (control_tx, control_rx) = mpsc::channel(32);
+        // Stdin writes preserve ordered backpressure on a dedicated worker so a
+        // slow child cannot block kill, resize, expiration, or exit handling.
+        let (write_tx, write_rx) = mpsc::channel(MAX_PENDING_STDIN_WRITES);
+        let write_slots = Arc::new(Semaphore::new(MAX_PENDING_STDIN_WRITES));
+        let process_key = ConnectionProcessHandle {
+            connection_id: request_id.connection_id,
+            process_handle: process_handle.clone(),
+        };
+
+        {
+            let mut sessions = self.sessions.lock().await;
+            rpc_gate
+                .try_commit(|| match sessions.entry(process_key.clone()) {
+                    Entry::Occupied(_) => Err(invalid_request(format!(
+                        "duplicate active process handle: {process_handle:?}",
+                    ))),
+                    Entry::Vacant(entry) => {
+                        entry.insert(ProcessSession {
+                            control_tx,
+                            write_tx,
+                            write_slots,
+                        });
+                        Ok(())
+                    }
+                })
+                .ok_or_else(|| invalid_request("connection is closed"))??;
+        }
+
+        let spawned = if tty {
+            codex_utils_pty::spawn_pty_process(
+                program,
+                args,
+                cwd.as_path(),
+                &env,
+                &arg0,
+                size.unwrap_or_default(),
+            )
+            .await
+        } else if stream_stdin {
+            codex_utils_pty::spawn_pipe_process(program, args, cwd.as_path(), &env, &arg0).await
+        } else {
+            codex_utils_pty::spawn_pipe_process_no_stdin(program, args, cwd.as_path(), &env, &arg0)
+                .await
+        };
+        let spawned = match spawned {
+            Ok(spawned) => spawned,
+            Err(err) => {
+                self.sessions.lock().await.remove(&process_key);
+                return Err(internal_error(format!("failed to spawn process: {err}")));
+            }
+        };
+
+        let sessions = Arc::clone(&self.sessions);
+        let response_outgoing = Arc::clone(&outgoing);
+        let response_request_id = request_id.clone();
+        let (response_enqueued_tx, response_enqueued_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let _run_owner = run_owner;
+            run_process(RunProcessParams {
+                outgoing,
+                request_id,
+                process_handle,
+                spawned,
+                control_rx,
+                write_rx,
+                stream_stdin,
+                stream_stdout_stderr,
+                expiration,
+                output_bytes_cap,
+                connection_cancellation,
+                terminal_cleanup: ProcessTerminalCleanup {
+                    sessions,
+                    process_key,
+                },
+                response_enqueued: response_enqueued_rx,
+            })
+            .await;
+        });
+
+        response_outgoing
+            .send_response(response_request_id, ProcessSpawnResponse {})
+            .await;
+        let _ = response_enqueued_tx.send(());
+
+        Ok(())
+    }
+
+    async fn write_stdin(
+        &self,
+        request_id: ConnectionRequestId,
+        params: ProcessWriteStdinParams,
+        rpc_gate: &ConnectionRpcGate,
+    ) -> Result<(), JSONRPCErrorError> {
+        if params.delta_base64.is_none() && !params.close_stdin {
+            return Err(invalid_params(
+                "process/writeStdin requires deltaBase64 or closeStdin",
+            ));
+        }
+
+        let delta = match params.delta_base64 {
+            Some(delta_base64) => crate::command_exec::decode_stdin_delta(&delta_base64)?,
+            None => Vec::new(),
+        };
+
+        let process_key = ConnectionProcessHandle {
+            connection_id: request_id.connection_id,
+            process_handle: params.process_handle,
+        };
+        let session = self
+            .sessions
+            .lock()
+            .await
+            .get(&process_key)
+            .cloned()
+            .ok_or_else(|| no_active_process_error(&process_key.process_handle))?;
+        let outgoing = Arc::clone(&self.outgoing);
+        let cancellation = rpc_gate.cancellation_token();
+        // Keep FIFO admission in the process lane, then transfer the potentially
+        // backpressured acknowledgement to the existing connection task owner.
+        drop(rpc_gate.spawn_with_commit(|| {
+            let busy = || invalid_request("process stdin write queue is full; retry after a pending write completes");
+            let slot = session.write_slots.try_acquire_owned().map_err(|_| busy())?;
+            let (response_tx, response_rx) = oneshot::channel();
+            session.write_tx.try_send(StdinWriteRequest {
+                delta,
+                close_stdin: params.close_stdin,
+                response_tx: Some(response_tx),
+            }).map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => busy(),
+                mpsc::error::TrySendError::Closed(_) => process_no_longer_running_error(&process_key.process_handle),
+            })?;
+            Ok::<_, JSONRPCErrorError>(async move {
+                // Waiting response deliveries count against the same finite limit.
+                let _slot = slot;
+                let result = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return,
+                    result = response_rx => result.unwrap_or_else(|_| {
+                        Err(process_no_longer_running_error(&process_key.process_handle))
+                    }),
+                };
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {},
+                    _ = async {
+                        match result {
+                            Ok(()) => outgoing.send_response(request_id, ProcessWriteStdinResponse {}).await,
+                            Err(error) => outgoing.send_error(request_id, error).await,
+                        }
+                    } => {},
+                }
+            })
+        })?.ok_or_else(|| invalid_request("connection is closed"))?);
+        Ok(())
+    }
+
+    async fn kill(
+        &self,
+        request_id: ConnectionRequestId,
+        params: ProcessKillParams,
+    ) -> Result<ProcessKillResponse, JSONRPCErrorError> {
+        self.send_control(
+            request_id.connection_id,
+            params.process_handle,
+            ProcessControl::Kill,
+        )
+        .await?;
+        Ok(ProcessKillResponse {})
+    }
+
+    async fn resize_pty(
+        &self,
+        request_id: ConnectionRequestId,
+        params: ProcessResizePtyParams,
+    ) -> Result<ProcessResizePtyResponse, JSONRPCErrorError> {
+        self.send_control(
+            request_id.connection_id,
+            params.process_handle,
+            ProcessControl::Resize {
+                size: terminal_size_from_protocol(params.size.into_inner(), "process")?,
+            },
+        )
+        .await?;
+        Ok(ProcessResizePtyResponse {})
+    }
+
+    async fn close_connection_processes(&self, connection_id: ConnectionId) {
+        let controls = {
+            let mut sessions = self.sessions.lock().await;
+            let process_handles = sessions
+                .keys()
+                .filter(|process_handle| process_handle.connection_id == connection_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut controls = Vec::with_capacity(process_handles.len());
+            for process_handle in process_handles {
+                if let Some(control) = sessions.remove(&process_handle) {
+                    controls.push(control);
+                }
+            }
+            controls
+        };
+
+        futures::future::join_all(controls.into_iter().map(|control| async move {
+            let _ = control
+                .control_tx
+                .send(ProcessControlRequest {
+                    control: ProcessControl::Kill,
+                    response_tx: None,
+                })
+                .await;
+        })).await;
+    }
+
+    async fn send_control(
+        &self,
+        connection_id: ConnectionId,
+        process_handle: String,
+        control: ProcessControl,
+    ) -> Result<(), JSONRPCErrorError> {
+        let process_key = ConnectionProcessHandle {
+            connection_id,
+            process_handle,
+        };
+        let session = self
+            .sessions
+            .lock()
+            .await
+            .get(&process_key)
+            .cloned()
+            .ok_or_else(|| no_active_process_error(&process_key.process_handle))?;
+        let (response_tx, response_rx) = oneshot::channel();
+        session
+            .control_tx
+            .send(ProcessControlRequest {
+                control,
+                response_tx: Some(response_tx),
+            })
+            .await
+            .map_err(|_| process_no_longer_running_error(&process_key.process_handle))?;
+        response_rx
+            .await
+            .map_err(|_| process_no_longer_running_error(&process_key.process_handle))?
+    }
+}
+
+async fn run_process(params: RunProcessParams) {
+    let RunProcessParams {
+        outgoing,
+        request_id,
+        process_handle,
+        spawned,
+        control_rx,
+        write_rx,
+        stream_stdin,
+        stream_stdout_stderr,
+        expiration,
+        output_bytes_cap,
+        connection_cancellation,
+        terminal_cleanup,
+        response_enqueued,
+    } = params;
+    let response_ready = CancellationToken::new();
+    let response_barrier = async { response_enqueued.await.is_ok() };
+    tokio::pin!(response_barrier);
+    let mut response_processed = false;
+    let mut control_rx = control_rx;
+    let mut control_open = true;
+    let mut connection_cancelled = false;
+    let expiration = expiration.wait_with_outcome();
+    tokio::pin!(expiration);
+    let SpawnedProcess {
+        session,
+        stdout_rx,
+        stderr_rx,
+        exit_rx,
+    } = spawned;
+    let session = Arc::new(session);
+    tokio::pin!(exit_rx);
+    let mut expiration_outcome = None;
+    let (stdio_timeout_tx, stdio_timeout_rx) = watch::channel(false);
+    let stdin_writer_handle = spawn_stdin_writer(
+        Arc::clone(&session),
+        write_rx,
+        stream_stdin,
+        "stdin streaming is not enabled for this process",
+    );
+
+    let stdout_handle = collect_spawn_process_output(SpawnProcessOutputParams {
+        connection_id: request_id.connection_id,
+        process_handle: process_handle.clone(),
+        output_rx: stdout_rx,
+        stdio_timeout_rx: stdio_timeout_rx.clone(),
+        outgoing: Arc::clone(&outgoing),
+        stream: ProcessOutputStream::Stdout,
+        stream_output: stream_stdout_stderr,
+        output_bytes_cap,
+        connection_cancellation: connection_cancellation.clone(),
+        response_ready: response_ready.clone(),
+    });
+    let stderr_handle = collect_spawn_process_output(SpawnProcessOutputParams {
+        connection_id: request_id.connection_id,
+        process_handle: process_handle.clone(),
+        output_rx: stderr_rx,
+        stdio_timeout_rx,
+        outgoing: Arc::clone(&outgoing),
+        stream: ProcessOutputStream::Stderr,
+        stream_output: stream_stdout_stderr,
+        output_bytes_cap,
+        connection_cancellation: connection_cancellation.clone(),
+        response_ready: response_ready.clone(),
+    });
+
+    let exit_code = loop {
+        tokio::select! {
+            delivered = &mut response_barrier, if !response_processed => {
+                response_processed = true;
+                if delivered {
+                    response_ready.cancel();
+                } else {
+                    connection_cancellation.cancel();
+                }
+            }
+            _ = connection_cancellation.cancelled(), if !connection_cancelled => {
+                connection_cancelled = true;
+                if let Err(error) = session.request_terminate() {
+                    tracing::warn!(
+                        process_handle = %process_handle,
+                        %error,
+                        "failed to terminate process after connection cancellation"
+                    );
+                }
+            }
+            control = control_rx.recv(), if control_open => {
+                match control {
+                    Some(ProcessControlRequest { control, response_tx }) => {
+                        let result = match control {
+                            ProcessControl::Resize { size } => {
+                                handle_process_resize(&session, size)
+                            }
+                            ProcessControl::Kill => session
+                                .request_terminate()
+                                .map_err(|error| internal_error(error.to_string())),
+                        };
+                        if let Some(response_tx) = response_tx
+                            && response_tx.send(result).is_err()
+                        {
+                            tracing::debug!(
+                                process_handle = %process_handle,
+                                "process control response receiver dropped"
+                            );
+                        }
+                    },
+                    None => {
+                        control_open = false;
+                        let _ = session.request_terminate();
+                    }
+                }
+            }
+            outcome = &mut expiration, if expiration_outcome.is_none() => {
+                expiration_outcome = Some(outcome);
+                let _ = session.request_terminate();
+            }
+            exit = &mut exit_rx => {
+                if matches!(expiration_outcome, Some(ExecExpirationOutcome::TimedOut)) {
+                    break EXEC_TIMEOUT_EXIT_CODE;
+                } else {
+                    break exit.unwrap_or(-1);
+                }
+            }
+        }
+    };
+    stdin_writer_handle.abort();
+    let _ = stdin_writer_handle.await;
+
+    // Give stdout/stderr readers a bounded grace period to drain after process exit.
+    let timeout_handle = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(IO_DRAIN_TIMEOUT_MS)).await;
+        let _ = stdio_timeout_tx.send(true);
+    });
+
+    let stdout = stdout_handle.await.unwrap_or_default();
+    let stderr = stderr_handle.await.unwrap_or_default();
+    timeout_handle.abort();
+
+    // Supervision and capped pipe draining must not wait for response delivery.
+    // Only notification publication is ordered behind the spawn response.
+    if !response_processed {
+        let delivered = tokio::select! {
+            delivered = &mut response_barrier => delivered,
+            _ = connection_cancellation.cancelled() => false,
+        };
+        if !delivered {
+            connection_cancellation.cancel();
+        }
+    }
+
+    // Keep the client handle reserved until the terminal is accepted or its
+    // connection explicitly fails; a successor must not overtake this result.
+    let delivered = outgoing
+        .send_server_notification_to_connection_bounded(
+            request_id.connection_id,
+            ServerNotification::ProcessExited(ProcessExitedNotification {
+                process_handle,
+                exit_code,
+                stdout_base64: stdout.base64,
+                stderr_base64: stderr.base64,
+                stdout_capture: Some(codex_app_server_protocol_types::ProcessOutputCaptureState {
+                    reached_eof: stdout.reached_eof && session.output_capture().stdout_complete(),
+                    cap_reached: stdout.cap_reached,
+                    drain_timed_out: stdout.drain_timed_out,
+                }),
+                stderr_capture: Some(codex_app_server_protocol_types::ProcessOutputCaptureState {
+                    reached_eof: stderr.reached_eof && session.output_capture().stderr_complete(),
+                    cap_reached: stderr.cap_reached,
+                    drain_timed_out: stderr.drain_timed_out,
+                }),
+                stdout: stdout.text,
+                stdout_cap_reached: stdout.cap_reached,
+                stderr: stderr.text,
+                stderr_cap_reached: stderr.cap_reached,
+            }),
+            &connection_cancellation,
+        )
+        .await;
+    if !delivered {
+        outgoing
+            .fail_connection_delivery(request_id.connection_id)
+            .await;
+    }
+    terminal_cleanup
+        .sessions
+        .lock()
+        .await
+        .remove(&terminal_cleanup.process_key);
+}
+
+fn collect_spawn_process_output(
+    params: SpawnProcessOutputParams,
+) -> tokio::task::JoinHandle<ProcessOutputCapture> {
+    let SpawnProcessOutputParams {
+        connection_id,
+        process_handle,
+        mut output_rx,
+        mut stdio_timeout_rx,
+        outgoing,
+        stream,
+        mut stream_output,
+        output_bytes_cap,
+        connection_cancellation,
+        response_ready,
+    } = params;
+    tokio::spawn(async move {
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut cap = OutputByteCap::new(output_bytes_cap);
+        let streaming_requested = stream_output;
+        let mut response_processed = response_ready.is_cancelled();
+        let mut pending_cap_signal = false;
+        let capacity = outgoing.reserve_server_notification_capacity(&connection_cancellation);
+        tokio::pin!(capacity);
+        let mut drain_timed_out = false;
+        // Every loop exit decides whether the pipe reached EOF.
+        let reached_eof;
+        loop {
+            if *stdio_timeout_rx.borrow() {
+                reached_eof = output_rx.is_closed() && output_rx.is_empty();
+                drain_timed_out = !reached_eof;
+                break;
+            }
+            let mut chunk = tokio::select! {
+                permit = &mut capacity, if stream_output && response_processed
+                    && (!buffer.is_empty() || pending_cap_signal) => {
+                    if let Some(permit) = permit {
+                        permit.send(OutgoingEnvelope::ToConnection {
+                            connection_id,
+                            message: OutgoingMessage::AppServerNotification(
+                                ServerNotification::ProcessOutputDelta(ProcessOutputDeltaNotification {
+                                    process_handle: process_handle.clone(),
+                                    stream,
+                                    delta_base64: STANDARD.encode(&buffer),
+                                    cap_reached: pending_cap_signal,
+                                }),
+                            ),
+                            write_complete_tx: None,
+                        });
+                        // Admission and suffix retirement have no intervening await.
+                        buffer.clear();
+                        pending_cap_signal = false;
+                        capacity.set(outgoing.reserve_server_notification_capacity(&connection_cancellation));
+                    } else {
+                        // Cancellation/shutdown/queue closure is terminal. Temporary
+                        // saturation only keeps this reservation pending while pipes drain.
+                        stream_output = false;
+                    }
+                    continue;
+                },
+                // Flush a buffered prompt as soon as the spawn response is
+                // enqueued, even if the child is now waiting for stdin.
+                _ = response_ready.cancelled(), if stream_output && !response_processed => {
+                    response_processed = true;
+                    continue;
+                },
+                chunk = output_rx.recv() => match chunk {
+                    Some(chunk) => chunk,
+                    None => { reached_eof = true; break; },
+                },
+                _ = stdio_timeout_rx.wait_for(|&v| v) => {
+                    reached_eof = output_rx.is_closed() && output_rx.is_empty();
+                    drain_timed_out = !reached_eof;
+                    break;
+                },
+            };
+            while chunk.len() < OUTPUT_CHUNK_SIZE_HINT
+                && let Ok(next_chunk) = output_rx.try_recv()
+            {
+                chunk.extend_from_slice(&next_chunk);
+            }
+            let (capped_chunk, cap_reached) = cap.accept(&chunk);
+            buffer.extend_from_slice(capped_chunk);
+            pending_cap_signal |= cap_reached;
+        }
+        ProcessOutputCapture {
+            reached_eof,
+            base64: (streaming_requested && !buffer.is_empty()).then(|| STANDARD.encode(&buffer)),
+            drain_timed_out,
+            text: bytes_to_string_smart(&buffer),
+            cap_reached: cap.truncated(),
+        }
+    })
+}
+
+fn handle_process_resize(
+    session: &ProcessHandle,
+    size: TerminalSize,
+) -> Result<(), JSONRPCErrorError> {
+    session
+        .resize(size)
+        .map_err(|err| invalid_request(format!("failed to resize PTY: {err}")))
+}
+
+#[cfg(windows)]
+pub(super) fn validate_environment_override_keys(
+    overrides: &HashMap<String, Option<String>>,
+    method_name: &str,
+) -> Result<(), JSONRPCErrorError> {
+    let mut keys = overrides.keys().collect::<Vec<_>>();
+    keys.sort_unstable();
+    let mut names = std::collections::HashSet::new();
+    for key in keys {
+        if !names.insert(key.to_ascii_lowercase()) {
+            return Err(invalid_params(format!(
+                "{method_name} env contains conflicting case-insensitive key {key:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn no_active_process_error(process_handle: &str) -> JSONRPCErrorError {
+    invalid_request(format!(
+        "no active process for process handle {process_handle:?}"
+    ))
+}
+
+fn process_no_longer_running_error(process_handle: &str) -> JSONRPCErrorError {
+    invalid_request(format!("process {process_handle:?} is no longer running"))
+}
+

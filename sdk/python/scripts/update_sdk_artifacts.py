@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import argparse
-import importlib
 import importlib.util
 import json
 import os
@@ -16,7 +15,7 @@ import typing
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Sequence, get_args, get_origin
+from typing import Any, Sequence, get_args, get_origin
 
 SDK_DISTRIBUTION_NAME = "openai-codex"
 RUNTIME_DISTRIBUTION_NAME = "openai-codex-cli-bin"
@@ -95,22 +94,9 @@ def python_runtime_root() -> Path:
     return repo_root() / "sdk" / "python-runtime"
 
 
-def sdk_pyproject_path() -> Path:
-    """Return the SDK pyproject file that owns package pins and versions."""
-    return sdk_root() / "pyproject.toml"
-
-
 def schema_bundle_path(schema_dir: Path) -> Path:
     """Return the aggregate v2 schema bundle emitted by the app-server generator."""
     return schema_dir / "codex_app_server_protocol.v2.schemas.json"
-
-
-def runtime_binary_name() -> str:
-    return "codex.exe"
-
-
-def runtime_code_mode_host_name() -> str:
-    return "codex-code-mode-host.exe"
 
 
 def staged_runtime_package_root(root: Path) -> Path:
@@ -123,36 +109,6 @@ def run(cmd: list[str], cwd: Path) -> None:
 
 def run_python_module(module: str, args: list[str], cwd: Path) -> None:
     run([sys.executable, "-m", module, *args], cwd)
-
-
-def current_sdk_version() -> str:
-    match = re.search(
-        r'^version = "([^"]+)"$',
-        sdk_pyproject_path().read_text(),
-        flags=re.MULTILINE,
-    )
-    if match is None:
-        raise RuntimeError("Could not determine Python SDK version from pyproject.toml")
-    return match.group(1)
-
-
-def pinned_runtime_version() -> str:
-    """Read the exact runtime package pin used to launch Codex from the SDK."""
-    pyproject_text = sdk_pyproject_path().read_text()
-    match = re.search(r"(?ms)^dependencies = \[(.*?)\]$", pyproject_text)
-    if match is None:
-        raise RuntimeError("Could not find dependencies array in sdk/python/pyproject.toml")
-
-    pins = re.findall(
-        rf'"{re.escape(RUNTIME_DISTRIBUTION_NAME)}==([^"]+)"',
-        match.group(1),
-    )
-    if len(pins) != 1:
-        raise RuntimeError(
-            f"Expected exactly one {RUNTIME_DISTRIBUTION_NAME} dependency pin "
-            "in sdk/python/pyproject.toml"
-        )
-    return normalize_codex_version(pins[0])
 
 
 def normalize_codex_version(version: str) -> str:
@@ -1091,14 +1047,6 @@ class PublicFieldSpec:
     required: bool
 
 
-@dataclass(frozen=True)
-class CliOps:
-    generate_types: Callable[[], None]
-    stage_python_sdk_package: Callable[[Path, str, str], Path]
-    stage_python_runtime_package: Callable[[Path, str, Path, str | None], Path]
-    current_sdk_version: Callable[[], str]
-
-
 def _annotation_to_source(annotation: Any) -> str:
     origin = get_origin(annotation)
     if origin is typing.Annotated:
@@ -1124,26 +1072,14 @@ def _annotation_to_source(annotation: Any) -> str:
     if annotation is None or annotation is type(None):
         return "None"
     if isinstance(annotation, type):
-        if annotation.__module__ == "builtins":
-            return annotation.__name__
         return annotation.__name__
     return repr(annotation)
 
 
-def _camel_to_snake(name: str) -> str:
-    head = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", name)
-    return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", head).lower()
-
-
-def _load_public_fields(
-    module_name: str, class_name: str, *, exclude: set[str] | None = None
-) -> list[PublicFieldSpec]:
+def _load_public_fields(class_name: str, *, exclude: set[str] | None = None) -> list[PublicFieldSpec]:
     """Load generated model fields used to render the ergonomic public methods."""
     exclude = exclude or set()
-    if module_name == "openai_codex.generated.v2_all":
-        module = _load_generated_v2_all_module()
-    else:
-        module = importlib.import_module(module_name)
+    module = _load_generated_v2_all_module()
     model = getattr(module, class_name)
     fields: list[PublicFieldSpec] = []
     for name, field in model.model_fields.items():
@@ -1509,29 +1445,22 @@ def generate_public_api_flat_methods() -> None:
 
     approval_fields = {"approval_policy"}
     thread_start_fields = _load_public_fields(
-        "openai_codex.generated.v2_all",
         "ThreadStartParams",
         exclude=approval_fields,
     )
     thread_start_fields = _replace_public_sandbox_field(thread_start_fields, wire_name="sandbox")
-    thread_list_fields = _load_public_fields(
-        "openai_codex.generated.v2_all",
-        "ThreadListParams",
-    )
+    thread_list_fields = _load_public_fields("ThreadListParams")
     thread_resume_fields = _load_public_fields(
-        "openai_codex.generated.v2_all",
         "ThreadResumeParams",
         exclude={"thread_id", *approval_fields},
     )
     thread_resume_fields = _replace_public_sandbox_field(thread_resume_fields, wire_name="sandbox")
     thread_fork_fields = _load_public_fields(
-        "openai_codex.generated.v2_all",
         "ThreadForkParams",
         exclude={"thread_id", *approval_fields},
     )
     thread_fork_fields = _replace_public_sandbox_field(thread_fork_fields, wire_name="sandbox")
     turn_start_fields = _load_public_fields(
-        "openai_codex.generated.v2_all",
         "TurnStartParams",
         # Keep the wire model current without exposing this app-server field
         # through the ergonomic Python API yet.
@@ -1705,29 +1634,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return build_parser().parse_args(list(argv) if argv is not None else None)
 
 
-def default_cli_ops() -> CliOps:
-    return CliOps(
-        generate_types=generate_types,
-        stage_python_sdk_package=stage_python_sdk_package,
-        stage_python_runtime_package=stage_python_runtime_package,
-        current_sdk_version=current_sdk_version,
-    )
-
-
-def run_command(args: argparse.Namespace, ops: CliOps) -> None:
+def run_command(args: argparse.Namespace) -> None:
     if args.command == "generate-types":
-        ops.generate_types()
+        generate_types()
     elif args.command == "stage-sdk":
         _validate_staging_destination(sdk_root(), args.staging_dir)
-        ops.generate_types()
-        ops.stage_python_sdk_package(
+        generate_types()
+        stage_python_sdk_package(
             args.staging_dir,
             normalize_codex_version(args.sdk_version),
             normalize_codex_version(args.codex_version),
         )
     elif args.command == "stage-runtime":
         _validate_staging_destination(python_runtime_root(), args.staging_dir)
-        ops.stage_python_runtime_package(
+        stage_python_runtime_package(
             args.staging_dir,
             normalize_codex_version(args.codex_version),
             args.package_archive.resolve(),
@@ -1735,9 +1655,9 @@ def run_command(args: argparse.Namespace, ops: CliOps) -> None:
         )
 
 
-def main(argv: Sequence[str] | None = None, ops: CliOps | None = None) -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
-    run_command(args, ops or default_cli_ops())
+    run_command(args)
     print("Done.")
 
 

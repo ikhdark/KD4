@@ -12,6 +12,7 @@ from collections.abc import Iterator
 from contextvars import ContextVar
 from scripts.common.process_owner import OwnedThreadPoolExecutor as ThreadPoolExecutor
 from scripts.common.atomic_json import write_json_atomic
+from scripts.common.generated_output_lock import exclusive_file_lock
 from contextlib import contextmanager, ExitStack
 from pathlib import Path
 from time import perf_counter
@@ -21,7 +22,6 @@ from .archive import package_entries
 from .archive import resolve_zstd_command
 from .archive import validate_archive_output
 from .archive import write_archive
-from scripts.codex_package.stage_npm_archives import exclusive_file_lock
 from .cargo import package_build_lease
 from .cargo import SourceBuildOutputs
 from .cargo import build_source_binaries
@@ -311,10 +311,6 @@ def main() -> int:
 
         print(f"Built Codex package directory at {package_dir}")
         return 0
-
-
-def pe_machine_for_target(spec):
-    return 0xAA64 if spec.target.startswith("aarch64") else 0x8664
 
 
 _publication = ContextVar("package_publication", default=None)
@@ -792,7 +788,7 @@ def resolve_package_inputs(
         machine = pe_machine(rg_bin)
         if machine is None:
             raise RuntimeError(f"Invalid PE executable for ripgrep: {rg_bin}")
-        if machine != pe_machine_for_target(spec):
+        if machine != spec.pe_machine:
             raise RuntimeError(
                 "ripgrep executable architecture does not match package target"
             )

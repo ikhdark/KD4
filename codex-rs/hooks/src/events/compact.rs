@@ -256,7 +256,7 @@ fn parse_completed(
     run_result: CommandRunResult,
     turn_id: Option<String>,
     event_label: &'static str,
-    parse_output: fn(&str) -> Option<output_parser::StatelessHookOutput>,
+    parse_output: fn(&str) -> Option<output_parser::UniversalOutput>,
 ) -> dispatcher::ParsedHandler<CompactHandlerData> {
     let mut entries = Vec::new();
     let mut status = HookRunStatus::Completed;
@@ -276,29 +276,21 @@ fn parse_completed(
                 let trimmed_stdout = run_result.stdout.trim();
                 if trimmed_stdout.is_empty() {
                 } else if let Some(parsed) = parse_output(&run_result.stdout) {
-                    if let Some(system_message) = parsed.universal.system_message {
+                    if let Some(system_message) = parsed.system_message {
                         entries.push(HookOutputEntry {
                             kind: HookOutputEntryKind::Warning,
                             text: system_message,
                         });
                     }
-                    let _ = parsed.universal.suppress_output;
-                    if !parsed.universal.continue_processing {
+                    if !parsed.continue_processing {
                         status = HookRunStatus::Stopped;
                         should_stop = true;
-                        stop_reason = parsed.universal.stop_reason.clone();
+                        stop_reason = parsed.stop_reason.clone();
                         entries.push(HookOutputEntry {
                             kind: HookOutputEntryKind::Stop,
                             text: parsed
-                                .universal
                                 .stop_reason
                                 .unwrap_or_else(|| format!("{event_label} hook stopped execution")),
-                        });
-                    } else if let Some(invalid_reason) = parsed.invalid_reason {
-                        status = HookRunStatus::Failed;
-                        entries.push(HookOutputEntry {
-                            kind: HookOutputEntryKind::Error,
-                            text: invalid_reason,
                         });
                     }
                 } else if output_parser::looks_like_json(&run_result.stdout) {

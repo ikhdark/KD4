@@ -9,7 +9,6 @@ use crate::protocol::CodexErrorInfo;
 use crate::protocol::ErrorEvent;
 use crate::protocol::RateLimitReachedType;
 use crate::protocol::RateLimitSnapshot;
-use crate::protocol::TruncationPolicy;
 use chrono::DateTime;
 use chrono::Datelike;
 use chrono::Local;
@@ -674,7 +673,7 @@ fn retry_suffix_after_or(resets_at: Option<&DateTime<Utc>>) -> String {
 
 fn format_retry_timestamp(resets_at: &DateTime<Utc>) -> String {
     let local_reset = resets_at.with_timezone(&Local);
-    let local_now = now_for_retry().with_timezone(&Local);
+    let local_now = Utc::now().with_timezone(&Local);
     if local_reset.date_naive() == local_now.date_naive() {
         local_reset.format("%-I:%M %p").to_string()
     } else {
@@ -697,10 +696,6 @@ fn day_suffix(day: u32) -> &'static str {
     }
 }
 
-
-fn now_for_retry() -> DateTime<Utc> {
-    Utc::now()
-}
 
 #[derive(Debug)]
 pub struct EnvVarError {
@@ -759,35 +754,4 @@ fn bounded_exec_output(output: &ExecToolCallOutput) -> String {
     }
 }
 
-pub fn get_error_message_ui(e: &CodexErr) -> String {
-    let message = match e {
-        CodexErr::Sandbox(SandboxErr::Denied { output, .. }) => {
-            let text = bounded_exec_output(output);
-            if text.is_empty() {
-                format!(
-                    "command failed inside sandbox with exit code {}",
-                    output.exit_code
-                )
-            } else {
-                text
-            }
-        }
-        // Timeouts are not sandbox errors from a UX perspective; present them plainly.
-        CodexErr::Sandbox(SandboxErr::Timeout { output }) => {
-            let mut message = format!(
-                "error: command timed out after {} ms",
-                output.duration.as_millis()
-            );
-            let text = bounded_exec_output(output);
-            if !text.is_empty() {
-                message.push('\n');
-                message.push_str(&text);
-            }
-            message
-        }
-        _ => e.to_string(),
-    };
-
-    TruncationPolicy::Bytes(ERROR_MESSAGE_UI_MAX_BYTES).truncate_text(&message)
-}
 

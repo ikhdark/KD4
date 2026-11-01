@@ -5,7 +5,6 @@
 //! of `-c key=value` (or `--config key=value`) will be collected as a raw
 //! string. A helper method converts the raw strings into key/value pairs.
 
-use std::ffi::OsString;
 
 use clap::ArgAction;
 use clap::ArgMatches;
@@ -50,24 +49,6 @@ impl CliConfigOverrides {
             .splice(0..0, root_overrides.raw_overrides);
     }
 
-    /// Collects `-c` values given at every command level of `args`, in
-    /// command-line order.
-    ///
-    /// The flag is global, and clap copies the values of the deepest
-    /// subcommand that received it into every ancestor, replacing values given
-    /// before that subcommand. Parsing `args` against `command` with the flag
-    /// scoped to each level recovers all of them. Returns `None` when `args`
-    /// do not parse.
-    pub fn from_every_command_level<I, T>(command: Command, args: I) -> Option<Self>
-    where
-        I: IntoIterator<Item = T>,
-        T: Into<OsString> + Clone,
-    {
-        let matches = Self::scope_to_each_command_level(command)
-            .try_get_matches_from(args)
-            .ok()?;
-        Some(Self::from_command_levels(&matches))
-    }
 
     /// Declares `-c` as a non-global argument on `command` and on every
     /// subcommand, so each level's matches keep only that level's values.

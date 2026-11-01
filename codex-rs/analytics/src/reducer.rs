@@ -1,6 +1,6 @@
 use crate::accepted_lines::AcceptedLineFingerprintEventInput;
 use crate::accepted_lines::accepted_line_counts_from_unified_diff;
-use crate::accepted_lines::accepted_line_fingerprint_event_requests;
+use crate::accepted_lines::accepted_line_fingerprint_event_request;
 use crate::accepted_lines::accepted_line_repo_hash_for_cwd;
 use crate::events::AppServerRpcTransport;
 use crate::events::CodexAppMentionedEventRequest;
@@ -71,7 +71,6 @@ use crate::facts::CustomAnalyticsFact;
 use crate::facts::HookRunInput;
 use crate::facts::PluginInstallFailedInput;
 use crate::facts::PluginInstallRequestedInput;
-use crate::facts::PluginState;
 use crate::facts::PluginStateChangedInput;
 use crate::facts::PluginUsedInput;
 use crate::facts::SkillInvokedInput;
@@ -666,11 +665,8 @@ impl AnalyticsReducer {
             AnalyticsFact::Notification(notification) => {
                 self.ingest_notification(*notification, out).await;
             }
-            AnalyticsFact::ServerRequest {
-                connection_id,
-                request,
-            } => {
-                self.ingest_server_request(connection_id, *request);
+            AnalyticsFact::ServerRequest { request } => {
+                self.ingest_server_request(*request);
             }
             AnalyticsFact::ServerResponse {
                 completed_at_ms,
@@ -1018,12 +1014,7 @@ impl AnalyticsReducer {
             event_type: plugin_state_event_type(state),
             event_params: codex_plugin_metadata(plugin),
         };
-        out.push(match state {
-            PluginState::Installed => TrackEventRequest::PluginInstalled(event),
-            PluginState::Uninstalled => TrackEventRequest::PluginUninstalled(event),
-            PluginState::Enabled => TrackEventRequest::PluginEnabled(event),
-            PluginState::Disabled => TrackEventRequest::PluginDisabled(event),
-        });
+        out.push(TrackEventRequest::PluginStateChanged(event));
     }
 
     fn ingest_plugin_install_failed(
@@ -1116,7 +1107,7 @@ impl AnalyticsReducer {
         }
     }
 
-    fn ingest_server_request(&mut self, _connection_id: u64, request: ServerRequest) {
+    fn ingest_server_request(&mut self, request: ServerRequest) {
         match request {
             ServerRequest::CommandExecutionRequestApproval { request_id, params } => {
                 let is_network_access_review = params.network_approval_context.is_some();
@@ -1958,7 +1949,7 @@ impl AnalyticsReducer {
         out.push(turn_event);
         if let Some((mut input, cwd)) = accepted_line_event {
             input.repo_hash = accepted_line_repo_hash_for_cwd(cwd.as_path()).await;
-            out.extend(accepted_line_fingerprint_event_requests(input));
+            out.push(accepted_line_fingerprint_event_request(input));
         }
         self.clear_turn_items(turn_id);
         self.turns.insert(
@@ -2283,6 +2274,16 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
         thread_metadata,
         review_summary,
     } = input;
+    let context = ToolItemContext {
+        started_at_ms,
+        completed_at_ms,
+        connection_state,
+        thread_state,
+        thread_metadata,
+        review_summary,
+        review_history_complete,
+        approval_policy,
+    };
     match item {
         ThreadItem::CommandExecution {
             id,
@@ -2308,16 +2309,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                     failure_kind,
                     execution_duration_ms: option_i64_to_u64(*duration_ms),
                 },
-                ToolItemContext {
-                    started_at_ms,
-                    completed_at_ms,
-                    connection_state,
-                    thread_state,
-                    thread_metadata,
-                    review_summary,
-                    review_history_complete,
-                    approval_policy,
-                },
+                context,
             );
             Some(TrackEventRequest::CommandExecution(
                 CodexCommandExecutionEventRequest {
@@ -2354,16 +2346,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                     failure_kind,
                     execution_duration_ms: None,
                 },
-                ToolItemContext {
-                    started_at_ms,
-                    completed_at_ms,
-                    connection_state,
-                    thread_state,
-                    thread_metadata,
-                    review_summary,
-                    review_history_complete,
-                    approval_policy,
-                },
+                context,
             );
             Some(TrackEventRequest::FileChange(CodexFileChangeEventRequest {
                 event_type: "codex_file_change_event",
@@ -2401,16 +2384,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                     failure_kind,
                     execution_duration_ms: option_i64_to_u64(*duration_ms),
                 },
-                ToolItemContext {
-                    started_at_ms,
-                    completed_at_ms,
-                    connection_state,
-                    thread_state,
-                    thread_metadata,
-                    review_summary,
-                    review_history_complete,
-                    approval_policy,
-                },
+                context,
             );
             Some(TrackEventRequest::McpToolCall(
                 CodexMcpToolCallEventRequest {
@@ -2451,16 +2425,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                     failure_kind,
                     execution_duration_ms: option_i64_to_u64(*duration_ms),
                 },
-                ToolItemContext {
-                    started_at_ms,
-                    completed_at_ms,
-                    connection_state,
-                    thread_state,
-                    thread_metadata,
-                    review_summary,
-                    review_history_complete,
-                    approval_policy,
-                },
+                context,
             );
             Some(TrackEventRequest::DynamicToolCall(
                 CodexDynamicToolCallEventRequest {
@@ -2501,16 +2466,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                     failure_kind,
                     execution_duration_ms: None,
                 },
-                ToolItemContext {
-                    started_at_ms,
-                    completed_at_ms,
-                    connection_state,
-                    thread_state,
-                    thread_metadata,
-                    review_summary,
-                    review_history_complete,
-                    approval_policy,
-                },
+                context,
             );
             Some(TrackEventRequest::CollabAgentToolCall(
                 CodexCollabAgentToolCallEventRequest {
@@ -2567,16 +2523,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                     failure_kind,
                     execution_duration_ms: None,
                 },
-                ToolItemContext {
-                    started_at_ms,
-                    completed_at_ms,
-                    connection_state,
-                    thread_state,
-                    thread_metadata,
-                    review_summary,
-                    review_history_complete,
-                    approval_policy,
-                },
+                context,
             );
             Some(TrackEventRequest::WebSearch(CodexWebSearchEventRequest {
                 event_type: "codex_web_search_event",
@@ -2603,16 +2550,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                     failure_kind,
                     execution_duration_ms: None,
                 },
-                ToolItemContext {
-                    started_at_ms,
-                    completed_at_ms,
-                    connection_state,
-                    thread_state,
-                    thread_metadata,
-                    review_summary,
-                    review_history_complete,
-                    approval_policy,
-                },
+                context,
             );
             Some(TrackEventRequest::ImageGeneration(
                 CodexImageGenerationEventRequest {

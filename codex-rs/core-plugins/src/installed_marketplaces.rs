@@ -27,9 +27,7 @@ pub fn installed_marketplace_roots_from_layer_stack(
     config_layer_stack: &ConfigLayerStack,
     codex_home: &Path,
 ) -> Vec<AbsolutePathBuf> {
-    let Some(user_config) = project_effective_user_config(config_layer_stack, codex_home) else {
-        return Vec::new();
-    };
+    let user_config = project_effective_user_config(config_layer_stack, codex_home);
     let Some(marketplaces_value) = user_config.get("marketplaces") else {
         return Vec::new();
     };
@@ -69,21 +67,49 @@ pub fn installed_marketplace_roots_from_layer_stack(
     roots
 }
 
+/// Source binding is independent of revision: a compatible source may advance.
+pub(crate) fn configured_marketplace_source_identity(
+    marketplace_name: &str,
+    marketplace: &toml::Value,
+) -> Result<String, String> {
+    match marketplace.get("source_type").and_then(toml::Value::as_str) {
+        Some("git") => crate::marketplace_upgrade::configured_git_marketplace_source_identity(marketplace_name, marketplace),
+        Some("local") => {
+            let source = marketplace.get("source").and_then(toml::Value::as_str)
+                .filter(|source| !source.is_empty()).ok_or_else(|| "local marketplace is missing source".to_string())?;
+            local_marketplace_source_identity(Path::new(source))
+        }
+        _ => Err(format!("marketplace `{marketplace_name}` has no verifiable source; add or upgrade it again")),
+    }
+}
+
+fn local_marketplace_source_identity(root: &Path) -> Result<String, String> {
+    let root = std::fs::canonicalize(root)
+        .map_err(|err| format!("failed to resolve marketplace source: {err}"))?;
+    serde_json::to_string(&("local", root)).map_err(|err| err.to_string())
+}
+
+pub(crate) fn marketplace_source_identity(root: &Path) -> Result<String, String> {
+    crate::marketplace_upgrade::installed_marketplace_source_identity(root)?
+        .map_or_else(|| local_marketplace_source_identity(root), Ok)
+}
+
 pub fn resolve_configured_marketplace_root(
     marketplace_name: &str,
     marketplace: &toml::Value,
     default_install_root: &Path,
 ) -> Option<PathBuf> {
-    match marketplace.get("source_type") {
-        Some(toml::Value::String(source_type)) if source_type == "local" => marketplace
-            .get("source")
-            .and_then(toml::Value::as_str)
-            .filter(|source| !source.is_empty())
-            .map(PathBuf::from),
-        None => Some(default_install_root.join(marketplace_name)),
-        Some(toml::Value::String(source_type)) if source_type == "git" => {
-            Some(default_install_root.join(marketplace_name))
+    match marketplace.get("source_type").and_then(toml::Value::as_str) {
+        Some("local") => marketplace.get("source").and_then(toml::Value::as_str)
+            .filter(|source| !source.is_empty()).map(PathBuf::from),
+        Some("git") => {
+            let root = default_install_root.join(marketplace_name);
+            let expected = configured_marketplace_source_identity(marketplace_name, marketplace).ok()?;
+            (crate::marketplace_upgrade::installed_marketplace_source_identity(&root).ok().flatten().as_ref()
+                == Some(&expected)).then_some(root)
         }
+        // Name-only legacy installs have no evidence of their configured source.
+        // Re-adding/upgrading re-materializes them and writes the owning metadata.
         _ => None,
     }
 }

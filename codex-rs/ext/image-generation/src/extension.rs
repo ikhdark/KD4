@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use codex_core::config::Config;
+use codex_runtime_config::Config;
 use codex_extension_api::ConfigContributor;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionFuture;

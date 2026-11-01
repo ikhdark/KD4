@@ -25,13 +25,6 @@ use tree_sitter::LanguageError;
 
 const APPLY_PATCH_COMMANDS: [&str; 2] = ["apply_patch", "applypatch"];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ApplyPatchShell {
-    Unix,
-    PowerShell,
-    Cmd,
-}
-
 #[derive(Debug, PartialEq)]
 enum MaybeApplyPatch {
     Body(ApplyPatchArgs),
@@ -57,14 +50,12 @@ fn classify_shell_name(shell: &str, convention: PathConvention) -> Option<String
     Some(stem.to_ascii_lowercase())
 }
 
-fn classify_shell(shell: &str, flag: &str, convention: PathConvention) -> Option<ApplyPatchShell> {
-    classify_shell_name(shell, convention).and_then(|name| match name.as_str() {
-        "bash" | "zsh" | "sh" if matches!(flag, "-lc" | "-c") => Some(ApplyPatchShell::Unix),
-        "pwsh" | "powershell" if flag.eq_ignore_ascii_case("-command") => {
-            Some(ApplyPatchShell::PowerShell)
-        }
-        "cmd" if flag.eq_ignore_ascii_case("/c") => Some(ApplyPatchShell::Cmd),
-        _ => None,
+fn is_patch_shell(shell: &str, flag: &str, convention: PathConvention) -> bool {
+    classify_shell_name(shell, convention).is_some_and(|name| match name.as_str() {
+        "bash" | "zsh" | "sh" => matches!(flag, "-lc" | "-c"),
+        "pwsh" | "powershell" => flag.eq_ignore_ascii_case("-command"),
+        "cmd" => flag.eq_ignore_ascii_case("/c"),
+        _ => false,
     })
 }
 
@@ -74,38 +65,19 @@ fn can_skip_flag(shell: &str, flag: &str, convention: PathConvention) -> bool {
     })
 }
 
-fn parse_shell_script<'a>(argv: &'a [String], cwd: &PathUri) -> Option<(ApplyPatchShell, &'a str)> {
+fn parse_shell_script<'a>(argv: &'a [String], cwd: &PathUri) -> Option<&'a str> {
     let convention = cwd.infer_path_convention()?;
     match argv {
-        [shell, flag, script] => classify_shell(shell, flag, convention).map(|shell_type| {
-            let script = script.as_str();
-            (shell_type, script)
-        }),
+        [shell, flag, script] => {
+            is_patch_shell(shell, flag, convention).then_some(script.as_str())
+        }
         [shell, skip_flag, flag, script] => {
             if !can_skip_flag(shell, skip_flag, convention) {
                 return None;
             }
-            classify_shell(shell, flag, convention).map(|shell_type| {
-                let script = script.as_str();
-                (shell_type, script)
-            })
+            is_patch_shell(shell, flag, convention).then_some(script.as_str())
         }
         _ => None,
-    }
-}
-
-fn extract_apply_patch_from_shell(
-    shell: ApplyPatchShell,
-    script: &str,
-) -> std::result::Result<(String, Option<String>), ExtractHeredocError> {
-    match shell {
-        // Models occasionally emit the canonical POSIX heredoc even when the selected host
-        // shell is PowerShell or cmd.exe. The Bash parser below recognizes only the complete,
-        // single-statement apply_patch forms, so accepting that exact shape is safe and avoids
-        // sending syntax that the host shell cannot execute.
-        ApplyPatchShell::Unix | ApplyPatchShell::PowerShell | ApplyPatchShell::Cmd => {
-            extract_apply_patch_from_bash(script)
-        }
     }
 }
 
@@ -119,7 +91,7 @@ fn maybe_parse_apply_patch(argv: &[String], cwd: &PathUri) -> MaybeApplyPatch {
         },
         // Shell heredoc form: (optional `cd <path> &&`) apply_patch <<'EOF' ...
         _ => match parse_shell_script(argv, cwd) {
-            Some((shell, script)) => match extract_apply_patch_from_shell(shell, script) {
+            Some(script) => match extract_apply_patch_from_bash(script) {
                 Ok((body, workdir)) => match parse_patch(&body) {
                     Ok(mut source) => {
                         source.workdir = workdir;
@@ -198,7 +170,7 @@ async fn maybe_parse_apply_patch_verified_inner(
     {
         return MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::ImplicitInvocation);
     }
-    if let Some((_, script)) = parse_shell_script(argv, cwd) {
+    if let Some(script) = parse_shell_script(argv, cwd) {
         if script.contains(crate::parser::BEGIN_PATCH_MARKER) {
             if parse_patch(script).is_ok() {
                 return MaybeApplyPatchVerified::CorrectnessError(
@@ -513,6 +485,9 @@ pub(crate) async fn mutation_endpoint_identity(
     Ok(resolved.to_string())
 }
 
+/// Models sometimes emit a POSIX heredoc for PowerShell or cmd.exe too. The
+/// strict whole-script Bash forms below are accepted for each supported wrapper.
+///
 /// Extract the heredoc body (and optional `cd` workdir) from a `bash -lc` script
 /// that invokes the apply_patch tool using a heredoc.
 ///

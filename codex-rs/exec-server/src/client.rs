@@ -271,16 +271,9 @@ enum ConnectionStatus {
     Failed(String),
 }
 
-#[derive(Clone, Copy)]
-enum RecoveryPolicy {
-    Wait,
-    FailFast,
-}
-
 #[derive(Clone)]
 pub struct ExecServerClient {
     inner: Arc<Inner>,
-    recovery_policy: RecoveryPolicy,
 }
 
 struct ActiveProcessStart {
@@ -301,7 +294,6 @@ pub(crate) struct LazyRemoteExecServerClient {
     bound_client: Option<ExecServerClient>,
     transport_params: ExecServerTransportParams,
     http_client_factory: codex_http_client::HttpClientFactory,
-    recovery_policy: RecoveryPolicy,
     // Saves the first startup result so callers share it. Retryable failures reconnect.
     startup: Arc<ConnectionAttempt>,
     // The latest successful client, replaced whenever reconnecting succeeds.
@@ -317,7 +309,6 @@ impl LazyRemoteExecServerClient {
             http_client_factory: codex_http_client::HttpClientFactory::new(
                 codex_http_client::OutboundProxyPolicy::ReqwestDefault,
             ),
-            recovery_policy: RecoveryPolicy::Wait,
             startup: Arc::new(ConnectionAttempt::new()),
             current_client: Arc::new(StdMutex::new(None)),
             reconnect: Arc::new(StdMutex::new(None)),
@@ -359,13 +350,6 @@ impl LazyRemoteExecServerClient {
         })
     }
 
-    pub(crate) fn fail_fast(&self) -> Self {
-        Self {
-            recovery_policy: RecoveryPolicy::FailFast,
-            ..self.clone()
-        }
-    }
-
     /// A captured capability can recover its logical session, never replace it.
     pub(crate) fn bound(&self, client: ExecServerClient) -> Self {
         Self {
@@ -380,28 +364,8 @@ impl LazyRemoteExecServerClient {
 
     pub(crate) async fn get(&self) -> Result<ExecServerClient, ExecServerError> {
         if let Some(client) = &self.bound_client {
-            if matches!(self.recovery_policy, RecoveryPolicy::FailFast) {
-                return client.fail_fast();
-            }
             client.rpc_client().await?;
             return Ok(client.clone());
-        }
-        if matches!(self.recovery_policy, RecoveryPolicy::FailFast) {
-            let client = match self.cached_client() {
-                Some(client) => client,
-                None => match self.startup.get() {
-                    Some(Ok(client)) => client.clone(),
-                    Some(Err(error)) => {
-                        return Err(ExecServerError::ConnectionAttempt(Arc::clone(error)));
-                    }
-                    None => {
-                        return Err(ExecServerError::Disconnected(
-                            "exec-server environment is not ready".to_string(),
-                        ));
-                    }
-                },
-            };
-            return client.fail_fast();
         }
         if let Some(client) = self.connected_client() {
             return Ok(client);
@@ -530,7 +494,6 @@ async fn connect_once(
         shell_kind = %info.shell.name,
         "initialized remote execution environment"
     );
-    let _ = client.inner.environment_info.set(info);
     Ok(client)
 }
 
@@ -685,38 +648,8 @@ impl ExecServerClient {
             self.inner.cleanup_records_evicted.load(Ordering::Relaxed),
         )
     }
-    fn fail_fast(&self) -> Result<Self, ExecServerError> {
-        self.rpc_client_without_recovery()?;
-        Ok(Self {
-            inner: Arc::clone(&self.inner),
-            recovery_policy: RecoveryPolicy::FailFast,
-        })
-    }
-
-    fn rpc_client_without_recovery(&self) -> Result<Arc<RpcClient>, ExecServerError> {
-        let connection = self
-            .inner
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match &connection.status {
-            ConnectionStatus::Connected(rpc_client) if !rpc_client.is_disconnected() => {
-                Ok(Arc::clone(rpc_client))
-            }
-            ConnectionStatus::Connected(_) | ConnectionStatus::Recovering => Err(
-                ExecServerError::Disconnected("exec-server environment is recovering".to_string()),
-            ),
-            ConnectionStatus::Failed(message) => {
-                Err(ExecServerError::Disconnected(message.clone()))
-            }
-        }
-    }
-
     pub(crate) async fn rpc_client(&self) -> Result<Arc<RpcClient>, ExecServerError> {
-        match self.recovery_policy {
-            RecoveryPolicy::Wait => self.inner.rpc_client().await,
-            RecoveryPolicy::FailFast => self.rpc_client_without_recovery(),
-        }
+        self.inner.rpc_client().await
     }
 
     pub async fn initialize(
@@ -1323,7 +1256,6 @@ impl ExecServerClient {
         });
         let client = Self {
             inner,
-            recovery_policy: RecoveryPolicy::Wait,
         };
         // An explicit resume can redirect notifications from running processes
         // before initialize returns. Drain them immediately so a burst cannot
@@ -1884,7 +1816,6 @@ impl Session {
                 }
                 Err(error)
                     if is_transport_closed_error(&error)
-                        && matches!(self.client.recovery_policy, RecoveryPolicy::Wait)
                         && !self.client.inner.is_failed() =>
                 {
                     continue;
@@ -1916,7 +1847,6 @@ impl Session {
                 Ok(response) => return Ok(response),
                 Err(error)
                     if is_transport_closed_error(&error)
-                        && matches!(self.client.recovery_policy, RecoveryPolicy::Wait)
                         && !self.client.inner.is_failed() =>
                 {
                     continue;
@@ -1935,7 +1865,6 @@ impl Session {
             match self.client.call(crate::protocol::EXEC_CLOSE_STDIN_METHOD, &params).await {
                 Ok(response) => return Ok(response),
                 Err(error) if is_transport_closed_error(&error)
-                    && matches!(self.client.recovery_policy, RecoveryPolicy::Wait)
                     && !self.client.inner.is_failed() => continue,
                 Err(error) => return Err(error),
             }

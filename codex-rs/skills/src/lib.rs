@@ -7,7 +7,7 @@ use std::hash::Hasher;
 
 use thiserror::Error;
 
-const SYSTEM_SKILLS_DIR: Dir = include_dir::include_dir!("$CARGO_MANIFEST_DIR/src/assets/samples");
+const SYSTEM_SKILLS_DIR: Dir = include_dir::include_dir!("$OUT_DIR/bundled-skills");
 
 const SYSTEM_SKILLS_DIR_NAME: &str = ".system";
 const SKILLS_DIR_NAME: &str = "skills";
@@ -31,15 +31,6 @@ pub fn system_cache_root_dir(codex_home: &AbsolutePathBuf) -> AbsolutePathBuf {
 /// with a fingerprint of the embedded directory. When the marker matches, the
 /// install is skipped.
 pub fn install_system_skills(codex_home: &AbsolutePathBuf) -> Result<(), SystemSkillsError> {
-    install_system_skills_with(codex_home, |dest| {
-        write_embedded_dir(&SYSTEM_SKILLS_DIR, dest)
-    })
-}
-
-fn install_system_skills_with(
-    codex_home: &AbsolutePathBuf,
-    write_skills: impl FnOnce(&AbsolutePathBuf) -> Result<(), SystemSkillsError>,
-) -> Result<(), SystemSkillsError> {
     let _lock = lock_system_skills(codex_home)?;
     let skills_root_dir = codex_home.join(SKILLS_DIR_NAME);
     let backup = skills_root_dir.join(".system-backup");
@@ -72,7 +63,7 @@ fn install_system_skills_with(
         .map_err(|source| SystemSkillsError::io("create system skills staging dir", source))?;
     let staged_system = AbsolutePathBuf::from_absolute_path(staging.path())
         .map_err(|source| SystemSkillsError::io("resolve system skills staging dir", source))?;
-    write_skills(&staged_system)?;
+    write_embedded_dir(&SYSTEM_SKILLS_DIR, &staged_system)?;
     fs::write(
         staged_system.join(SYSTEM_SKILLS_MARKER_FILENAME).as_path(),
         format!("{expected_fingerprint}\n"),

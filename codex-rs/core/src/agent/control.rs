@@ -558,7 +558,7 @@ impl AgentControl {
         let execution_guard = self
             .reserve_execution_capacity_for_turn_start(agent_id, communication.trigger_turn)
             .await?;
-        self.send_inter_agent_communication_after_capacity_check(
+        self.submit_inter_agent_communication(
             agent_id,
             &state,
             communication,
@@ -583,24 +583,6 @@ impl AgentControl {
             return Err(CodexErr::InvalidRequest(ANCESTOR_PROGRESS_REFUSAL.into()));
         }
         Ok(())
-    }
-
-    async fn send_inter_agent_communication_after_capacity_check(
-        &self,
-        agent_id: ThreadId,
-        state: &Arc<ThreadManagerState>,
-        communication: InterAgentCommunication,
-        context: AgentCommunicationContext,
-        execution_guard: Option<AgentExecutionGuard>,
-    ) -> CodexResult<String> {
-        self.submit_inter_agent_communication(
-            agent_id,
-            state,
-            communication,
-            context,
-            execution_guard,
-        )
-        .await
     }
 
     pub(crate) fn retained_input_queue(
@@ -774,21 +756,6 @@ impl AgentControl {
             }
             _ => AgentStatus::NotFound,
         }
-    }
-
-    /// Unlike get_status, durable Active state never proves a loaded producer.
-    pub(crate) async fn has_running_agent(&self, agent_id: ThreadId) -> bool {
-        let Ok(state) = self.upgrade() else {
-            return false;
-        };
-        let Ok(thread) = state.get_thread(agent_id).await else {
-            return false;
-        };
-        thread.is_running()
-            && matches!(
-                thread.agent_status().await,
-                AgentStatus::PendingInit | AgentStatus::Running
-            )
     }
 
     pub(crate) fn register_session_root(
@@ -1003,7 +970,6 @@ impl AgentControl {
 
     pub(crate) async fn resolve_agent_reference(
         &self,
-        _current_thread_id: ThreadId,
         current_session_source: &SessionSource,
         agent_reference: &str,
     ) -> CodexResult<ThreadId> {

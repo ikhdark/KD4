@@ -45,17 +45,12 @@ use std::os::windows::io::OwnedHandle;
 #[cfg(windows)]
 use std::os::windows::io::RawHandle;
 
-#[cfg(windows)]
-enum WindowsChildTerminator {
-    Job { process: OwnedHandle },
-}
-
 struct PipeChildTerminator {
     // Also retains admission while the control handle remains owned.
     #[cfg_attr(not(windows), allow(dead_code))]
     managed: Arc<ManagedRootProcess>,
     #[cfg(windows)]
-    windows: WindowsChildTerminator,
+    process: OwnedHandle,
     #[cfg(unix)]
     process_group: Arc<crate::process::ProcessGroupControl>,
 }
@@ -93,21 +88,17 @@ impl ChildTerminator for PipeChildTerminator {
         }
         #[cfg(windows)]
         {
-            match &self.windows {
-                WindowsChildTerminator::Job { process } => {
-                    self.managed.terminate().map_err(|job_error| {
-                        // Killing only the root cannot establish that its descendants stopped.
-                        // Keep the tree error visible and the terminator available for retry.
-                        let fallback = match terminate_process(process) {
-                            Ok(()) => "succeeded".to_owned(),
-                            Err(error) => format!("also failed: {error}"),
-                        };
-                        io::Error::other(format!(
-                            "failed to terminate pipe job ({job_error}); root process fallback {fallback}"
-                        ))
-                    })
-                }
-            }
+            self.managed.terminate().map_err(|job_error| {
+                // Killing only the root cannot establish that its descendants stopped.
+                // Keep the tree error visible and the terminator available for retry.
+                let fallback = match terminate_process(&self.process) {
+                    Ok(()) => "succeeded".to_owned(),
+                    Err(error) => format!("also failed: {error}"),
+                };
+                io::Error::other(format!(
+                    "failed to terminate pipe job ({job_error}); root process fallback {fallback}"
+                ))
+            })
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -303,7 +294,7 @@ async fn finish_pipe_process_setup(
                 return Err(err.into());
             }
         };
-        WindowsChildTerminator::Job { process }
+        process
     };
     #[cfg(unix)]
     let process_group = Arc::new(crate::process::ProcessGroupControl::new(
@@ -436,7 +427,7 @@ async fn finish_pipe_process_setup(
         Box::new(PipeChildTerminator {
             managed,
             #[cfg(windows)]
-            windows: windows_terminator,
+            process: windows_terminator,
             #[cfg(unix)]
             process_group,
         }),

@@ -8,6 +8,14 @@ Do not publish or republish without permission.
 
 Upstream is https://github.com/openai/codex
 
+## Mandatory autonomy and instrumentation
+
+Follow KDR's [Mandatory instrumentation and evidence-gap follow-through](../KDR/AGENTS.md#mandatory-instrumentation-and-evidence-gap-follow-through) for in-scope investigations and repairs, not only saved-session analysis. That section is the shared authoritative owner; do not duplicate its detailed workflow here.
+
+**Missing evidence is unfinished work, not merely a report caveat.** Inspect the capture, harness and analysis owners; autonomously implement and verify the smallest necessary instrumentation or recovery fix, then resume the original task. Do not stop at "not measured" or wait for a separate implementation request when the work is already authorized.
+
+**For otherwise in-scope work, only live model runs require additional user permission.** Proceed with needed instrumentation, repairs, online lookups and non-model diagnostics without inventing approval gates. Explicit read-only/no-write restrictions, higher-priority permissions, privacy, safety, local-only/publishing and no-provisioning rules still apply. Preserve historical evidence and distinguish future capture improvements from measurements recoverable now; report genuinely blocked outcomes as partial, not healthy or complete.
+
 ## Session analysis
 
 Shared session-analysis and verification policy has one owner in KDR's project guidance. Follow its [Work and evidence](../KDR/AGENTS.md#work-and-evidence), [Implementation and acceptance](../KDR/AGENTS.md#implementation-and-acceptance), [Benchmark workflow](../KDR/AGENTS.md#benchmark-workflow), and [Audits and reporting](../KDR/AGENTS.md#audits-and-reporting) sections. These scoped references own session paths, evidence handling, verification/regression requirements, benchmark routing/history, report location and brief output; they do not import unrelated KDR guidance. KD4-specific source and prompt rules remain above; the audit workflow remains below.

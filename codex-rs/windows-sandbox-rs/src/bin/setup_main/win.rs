@@ -6,7 +6,7 @@ use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use codex_windows_sandbox::LocalSid;
-use codex_windows_sandbox::SETUP_VERSION;
+use codex_windows_sandbox::SETUP_REQUEST_VERSION;
 use codex_windows_sandbox::SetupErrorCode;
 use codex_windows_sandbox::SetupErrorReport;
 use codex_windows_sandbox::SetupFailure;
@@ -97,6 +97,7 @@ fn workspace_write_cap_sids_for_path(
     codex_home: &Path,
     command_cwd: &Path,
     write_roots: &[PathBuf],
+    deny_write_paths: &[PathBuf],
     path: &Path,
 ) -> Result<Vec<String>> {
     let mut sid_strs = Vec::new();
@@ -106,6 +107,8 @@ fn workspace_write_cap_sids_for_path(
                 codex_home,
                 command_cwd,
                 root,
+                write_roots,
+                deny_write_paths,
             )?);
         }
     }
@@ -115,6 +118,8 @@ fn workspace_write_cap_sids_for_path(
                 codex_home,
                 command_cwd,
                 command_cwd,
+                write_roots,
+                deny_write_paths,
             )?);
         } else {
             for root in write_roots {
@@ -122,6 +127,8 @@ fn workspace_write_cap_sids_for_path(
                     codex_home,
                     command_cwd,
                     root,
+                    write_roots,
+                    deny_write_paths,
                 )?);
             }
         }
@@ -144,7 +151,7 @@ fn write_root_needs_refresh(root: &Path, sid: &LocalSid) -> Result<bool> {
     }
 }
 
-fn spawn_read_acl_helper(payload: &Payload, _log: &mut dyn Write) -> Result<()> {
+fn spawn_read_acl_helper(payload: &Payload) -> Result<()> {
     let mut read_payload = payload.clone();
     read_payload.mode = SetupMode::ReadAclsOnly;
     read_payload.refresh_only = true;
@@ -350,7 +357,6 @@ fn lock_sandbox_dir(
     sandbox_group_access_mode: i32,
     sandbox_group_mask: u32,
     real_user_mask: u32,
-    _log: &mut dyn Write,
 ) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let system_sid = resolve_sid("SYSTEM")?;
@@ -471,11 +477,11 @@ fn real_main() -> Result<()> {
         ))
     })?
     };
-    if payload.version != SETUP_VERSION {
+    if payload.version != SETUP_REQUEST_VERSION {
         return Err(anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperRequestArgsFailed,
             format!(
-                "setup version mismatch: expected {SETUP_VERSION}, got {}",
+                "setup request version mismatch: expected {SETUP_REQUEST_VERSION}, got {}",
                 payload.version
             ),
         )));
@@ -695,7 +701,6 @@ fn configure_offline_sandbox_network(
 fn lock_persistent_sandbox_dirs(
     payload: &Payload,
     sandbox_group_sid: &[u8],
-    log: &mut dyn Write,
 ) -> Result<()> {
     lock_sandbox_dir(
         &sandbox_dir(&payload.codex_home),
@@ -704,7 +709,6 @@ fn lock_persistent_sandbox_dirs(
         GRANT_ACCESS,
         FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
         FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
-        log,
     )
     .map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
@@ -722,7 +726,6 @@ fn lock_persistent_sandbox_dirs(
         DENY_ACCESS,
         FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
         FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
-        log,
     )
     .map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
@@ -743,7 +746,6 @@ fn lock_persistent_sandbox_dirs(
 fn lock_sandbox_bin_dir(
     payload: &Payload,
     sandbox_group_sid: &[u8],
-    log: &mut dyn Write,
 ) -> Result<()> {
     lock_sandbox_dir(
         &sandbox_bin_dir(&payload.codex_home),
@@ -752,7 +754,6 @@ fn lock_sandbox_bin_dir(
         GRANT_ACCESS,
         FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
         FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
-        log,
     )
     .map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
@@ -787,8 +788,8 @@ fn run_provision_only(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) ->
 
     configure_offline_sandbox_network(payload, &offline_sid_str, log)?;
 
-    lock_sandbox_bin_dir(payload, &sandbox_group_sid, log)?;
-    lock_persistent_sandbox_dirs(payload, &sandbox_group_sid, log)?;
+    lock_sandbox_bin_dir(payload, &sandbox_group_sid)?;
+    lock_persistent_sandbox_dirs(payload, &sandbox_group_sid)?;
     log_note("setup provisioning binary completed", Some(sbx_dir));
     Ok(())
 }
@@ -879,7 +880,7 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
                 log_line(log, "read ACL helper already running; skipping spawn")?;
             }
             Ok(false) => {
-                spawn_read_acl_helper(payload, log).map_err(|err| {
+                spawn_read_acl_helper(payload).map_err(|err| {
                     anyhow::Error::new(SetupFailure::new(
                         SetupErrorCode::HelperReadAclHelperSpawnFailed,
                         format!("spawn read ACL helper failed: {err}"),
@@ -891,7 +892,7 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
                     log,
                     &format!("read ACL mutex check failed: {err}; spawning anyway"),
                 )?;
-                spawn_read_acl_helper(payload, log).map_err(|spawn_err| {
+                spawn_read_acl_helper(payload).map_err(|spawn_err| {
                     anyhow::Error::new(SetupFailure::new(
                         SetupErrorCode::HelperReadAclHelperSpawnFailed,
                         format!(
@@ -936,7 +937,7 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
             "root_cap"
         };
         let root_cap_sid_str =
-            workspace_write_cap_sid_for_root(&payload.codex_home, &payload.command_cwd, root)?;
+            workspace_write_cap_sid_for_root(&payload.codex_home, &payload.command_cwd, root, &payload.write_roots, &payload.deny_write_paths)?;
         let root_cap_sid = LocalSid::from_string(&root_cap_sid_str)
             .context("convert write root capability SID failed")?;
         for (label, sid) in [
@@ -1039,6 +1040,7 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
             &payload.codex_home,
             &payload.command_cwd,
             &payload.write_roots,
+            &payload.deny_write_paths,
             path,
         )?;
         for deny_sid_str in deny_sid_strs {
@@ -1065,7 +1067,7 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
         }
     }
 
-    lock_sandbox_bin_dir(payload, &sandbox_group_sid, log)?;
+    lock_sandbox_bin_dir(payload, &sandbox_group_sid)?;
 
     if refresh_only {
         log_line(
@@ -1078,7 +1080,7 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
         )?;
     }
     if !refresh_only {
-        lock_persistent_sandbox_dirs(payload, &sandbox_group_sid, log)?;
+        lock_persistent_sandbox_dirs(payload, &sandbox_group_sid)?;
     }
 
     if !refresh_errors.is_empty() {

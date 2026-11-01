@@ -125,10 +125,6 @@ impl NestedCancellation {
         }
     }
 
-    /// Wraps a token whose cause is recorded elsewhere, sharing that cell.
-    pub fn with_cause(token: CancellationToken, cause: Arc<CancellationCauseCell>) -> Self {
-        Self { token, cause }
-    }
 
     /// A cancellation for one call inside this scope: its own write-once cell,
     /// falling back to this scope's cause.

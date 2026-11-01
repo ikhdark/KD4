@@ -746,15 +746,6 @@ pub(super) fn create_auth_storage(
     keyring_backend_kind: AuthKeyringBackendKind,
 ) -> Arc<dyn AuthStorageBackend> {
     let keyring_store: Arc<dyn KeyringStore> = Arc::new(DefaultKeyringStore);
-    create_auth_storage_with_store(codex_home, mode, keyring_store, keyring_backend_kind)
-}
-
-fn create_auth_storage_with_store(
-    codex_home: PathBuf,
-    mode: AuthCredentialsStoreMode,
-    keyring_store: Arc<dyn KeyringStore>,
-    keyring_backend_kind: AuthKeyringBackendKind,
-) -> Arc<dyn AuthStorageBackend> {
     let home = codex_home.clone();
     let inner: Arc<dyn AuthStorageBackend> = match mode {
         AuthCredentialsStoreMode::File => Arc::new(FileAuthStorage::new(codex_home)),

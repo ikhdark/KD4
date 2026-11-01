@@ -152,12 +152,6 @@ impl<PathType> FileSystemPermissions<PathType> {
         }
     }
 
-    pub fn explicit_path_entries(&self) -> impl Iterator<Item = (&PathType, FileSystemAccessMode)> {
-        self.entries.iter().filter_map(|entry| match &entry.path {
-            FileSystemPath::Path { path } => Some((path, entry.access)),
-            FileSystemPath::GlobPattern { .. } | FileSystemPath::Special { .. } => None,
-        })
-    }
 
     pub fn legacy_read_write_roots(&self) -> Option<LegacyReadWriteRoots<PathType>>
     where
@@ -1647,13 +1641,7 @@ const LOCAL_IMAGE_OPEN_TAG_PREFIX: &str = "<image name=";
 const LOCAL_IMAGE_OPEN_TAG_SUFFIX: &str = ">";
 const LOCAL_IMAGE_CLOSE_TAG: &str = IMAGE_CLOSE_TAG;
 
-pub fn image_open_tag_text() -> String {
-    IMAGE_OPEN_TAG.to_string()
-}
 
-pub fn image_close_tag_text() -> String {
-    IMAGE_CLOSE_TAG.to_string()
-}
 
 pub fn local_image_label_text(label_number: usize) -> String {
     format!("[Image #{label_number}]")
@@ -2383,12 +2371,6 @@ impl FunctionCallOutputPayload {
         }
     }
 
-    pub fn text_content_mut(&mut self) -> Option<&mut String> {
-        match &mut self.body {
-            FunctionCallOutputBody::Text(content) => Some(content),
-            FunctionCallOutputBody::ContentItems(_) => None,
-        }
-    }
 
     pub fn content_items(&self) -> Option<&[FunctionCallOutputContentItem]> {
         match &self.body {
@@ -2459,7 +2441,7 @@ impl CallToolResult {
 
     pub fn as_function_call_output_payload(&self) -> FunctionCallOutputPayload {
         mcp_items_to_function_call_output_payload(
-            convert_mcp_content_to_items(&self.content).unwrap_or_default(),
+            convert_mcp_content_to_items(&self.content),
             self.structured_content.as_ref(),
             self.success(),
         )
@@ -2606,18 +2588,16 @@ fn take_mcp_content(content: &mut serde_json::Value) -> Option<McpContent> {
 
 fn convert_mcp_content_to_items(
     contents: &[serde_json::Value],
-) -> Option<Vec<FunctionCallOutputContentItem>> {
-    Some(
-        contents
-            .iter()
-            .map(|content| {
-                convert_mcp_content_item(
-                    McpContent::deserialize(content).ok(),
-                    Cow::Borrowed(content),
-                )
-            })
-            .collect(),
-    )
+) -> Vec<FunctionCallOutputContentItem> {
+    contents
+        .iter()
+        .map(|content| {
+            convert_mcp_content_item(
+                McpContent::deserialize(content).ok(),
+                Cow::Borrowed(content),
+            )
+        })
+        .collect()
 }
 
 fn convert_mcp_content_item(

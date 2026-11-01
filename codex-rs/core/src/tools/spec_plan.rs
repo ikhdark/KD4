@@ -1180,8 +1180,11 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Planne
     let exec_permission_approvals_enabled = features.enabled(Feature::ExecPermissionApprovals)
         && !matches!(turn_context.approval_policy.value(), AskForApproval::Never);
     let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
+    let forward_shell_to_unified_exec = primary_environment_uses_foreign_cwd(context.step_context)
+        || context.step_context.environments.primary()
+            .is_some_and(|environment| environment.environment.is_remote());
     let shell_command_options = ShellCommandHandlerOptions {
-        foreign_environment: primary_environment_uses_foreign_cwd(context.step_context),
+        forward_to_unified_exec: forward_shell_to_unified_exec,
         allow_login_shell,
         allow_escalated_sandbox_permissions,
         exec_permission_approvals_enabled,
@@ -1233,9 +1236,9 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Planne
                 ShellCommandHandler::new(shell_command_options),
                 TypedToolClass::Shell,
             );
-            // Foreign-cwd legacy calls forward to unified exec and can return a
-            // live session; keep its existing polling consumer available.
-            if primary_environment_uses_foreign_cwd(context.step_context) {
+            // Remote/foreign-cwd legacy calls use the selected executor and can
+            // return a live session; retain its existing polling consumer.
+            if forward_shell_to_unified_exec {
                 planned_tools.add_with_authorization_class(
                     WriteStdinHandler::new(turn_context.config.background_terminal_max_timeout),
                     TypedToolClass::Shell,
@@ -1541,7 +1544,9 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
     let turn_context = context.step_context.turn.as_ref();
     let can_spawn = !primary_environment_uses_foreign_cwd(context.step_context);
     if agent_jobs_tools_enabled(context) {
-        if !matches!(turn_context.session_source, SessionSource::SubAgent(_)) {
+        if !matches!(turn_context.session_source, SessionSource::SubAgent(_))
+            && crate::tools::handlers::agent_jobs::native_csv_execution_supported(context.step_context)
+        {
             planned_tools.add_with_authorization_class(
                 SpawnAgentsOnCsvHandler,
                 TypedToolClass::RootTaskControl,

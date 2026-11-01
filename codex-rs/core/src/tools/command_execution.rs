@@ -35,8 +35,6 @@ pub(crate) enum CompletionApplyResult {
     Missing,
 }
 
-impl CompletionApplyResult {
-}
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub(crate) struct CommandAttemptKey {
     tool_name: String,
@@ -272,10 +270,6 @@ struct PersistedInputFailure {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct AttemptEntry {
-    attempts: u32,
-    repairs: u32,
-    consecutive_failures: u8,
-    last_exit_code: Option<i32>,
     deterministic_failure: Option<DeterministicFailureRecord>,
 }
 
@@ -420,39 +414,6 @@ impl CommandExecutionLedger {
     ) -> Self {
         self.workspace_cache = Some(cache);
         self
-    }
-
-
-    /// Reuse a snapshot captured under the dispatch workspace lease. The ledger
-    /// belongs to its original local cwd; another workspace must not seed it.
-    pub(crate) async fn observe_workspace_baseline(
-        &self,
-        turn_id: &str,
-        mutation_revision: u64,
-        cwd: &Path,
-        identity: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
-    ) {
-        let Some(identity) = identity.filter(|identity| !identity.unavailable) else { return; };
-        let Some(persistence) = self.persistence.as_ref() else { return; };
-        if self.state.lock().await.repository.observed_turn_mutation_revisions
-            .get(turn_id).is_some_and(|previous| *previous >= mutation_revision)
-        {
-            return;
-        }
-        let (session_cwd, command_cwd) = (persistence.cwd.clone(), cwd.to_path_buf());
-        self.invalidate_repository_revision(turn_id, mutation_revision).await;
-        let epoch = self.state.lock().await.repository.epoch;
-        let roots = tokio::task::spawn_blocking(move || {
-            let root = |cwd: &Path| codex_git_utils::get_git_repo_root(cwd)
-                .and_then(|root| dunce::canonicalize(root).ok());
-            (root(&session_cwd), root(&command_cwd))
-        }).await.ok();
-        if roots.is_some_and(|(session, command)| session.is_some()
-            && session == command
-            && command.as_ref().and_then(|root| root.to_str()) == identity.repository_root.as_deref()) {
-            self.refresh_workspace_identity(Some((turn_id, mutation_revision)), epoch, Some(identity))
-                .await;
-        }
     }
 
 
@@ -632,11 +593,9 @@ impl CommandExecutionLedger {
                 });
             }
         }
-        let entry = attempt_entry_locked(&mut state, key);
-        entry.attempts = entry.attempts.saturating_add(1);
-        if repaired {
-            entry.repairs = entry.repairs.saturating_add(1);
-        }
+        // Admission still owns cache insertion/eviction order even though the
+        // retired per-entry attempt counters had no consumers.
+        attempt_entry_locked(&mut state, key);
         Ok(())
     }
 
@@ -726,8 +685,6 @@ impl CommandExecutionLedger {
         {
             let mut state = self.state.lock().await;
             let entry = attempt_entry_locked(&mut state, key);
-            entry.last_exit_code = Some(exit_code);
-            entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
             entry.deterministic_failure = Some(
                 DeterministicFailureRecord::from_input_state_determined(proof, evidence, exit_code),
             );
@@ -845,17 +802,6 @@ impl CommandExecutionLedger {
                 && other.execution_context.get("environment") == Some(environment))
                 .then_some((*id, running.incarnation))
         }).collect()
-    }
-
-    pub(crate) async fn identical_running_process(
-        &self,
-        _key: &CommandAttemptKey,
-    ) -> Option<(u32, CommandExecutionId)> {
-        // Git-visible endpoint equality proves neither complete command inputs
-        // (ignored/external files) nor what a live process consumed during an
-        // A->B->A edit. No immutable/consumed-input witness is available here.
-        // Keep existing handles alive, but never suppress a requested new run.
-        None
     }
 
     pub(crate) async fn completed_process_result(
@@ -1373,7 +1319,7 @@ fn record_running_exit_locked(
     record_exit_locked(state, &running.key, exit_code);
 }
 
-fn record_exit_locked(state: &mut CommandExecutionState, key: &CommandAttemptKey, exit_code: i32) {
+fn record_exit_locked(state: &mut CommandExecutionState, key: &CommandAttemptKey, _exit_code: i32) {
     // A fresh execution supersedes a cached diagnosis, even if it failed for a
     // different reason. Never promote an ordinary failure into semantic memory.
     if state
@@ -1385,13 +1331,7 @@ fn record_exit_locked(state: &mut CommandExecutionState, key: &CommandAttemptKey
         state.retry.revision = state.retry.revision.wrapping_add(1);
     }
     let entry = attempt_entry_locked(state, key);
-    entry.last_exit_code = Some(exit_code);
     entry.deterministic_failure = None;
-    if exit_code == 0 {
-        entry.consecutive_failures = 0;
-    } else {
-        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
-    }
 }
 
 fn attempt_entry_locked<'a>(
@@ -1520,49 +1460,4 @@ fn write_cache_document_blocking(
     Ok(DurableCacheCommit)
 }
 
-#[cfg(windows)]
-pub(crate) fn persist_synced_file(
-    temporary: tempfile::NamedTempFile,
-    cache_path: &Path,
-    _parent: &Path,
-) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING;
-    use windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH;
-    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
-    let temporary = temporary.into_temp_path();
-    let source: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
-    let destination: Vec<u16> = cache_path
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-    // The contents were flushed above. Commit the same-directory rename with
-    // write-through; flushing a read-only directory handle fails on Windows.
-    // SAFETY: both paths are live NUL-terminated strings for this call.
-    let moved = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if moved == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-pub(crate) fn persist_synced_file(
-    temporary: tempfile::NamedTempFile,
-    cache_path: &Path,
-    parent: &Path,
-) -> io::Result<()> {
-    temporary.persist(cache_path).map_err(|error| error.error)?;
-    std::fs::File::open(parent)?.sync_all()
-}
-
-
-
-
+pub(crate) use codex_file_system::persist_synced_file;

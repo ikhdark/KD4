@@ -10,7 +10,7 @@ use std::time::Duration;
 use std::time::SystemTime;
 
 use crate::StateDbHandle;
-use crate::exec_env::CODEX_PERMISSION_PROFILE_ENV_VAR;
+use crate::exec_env::exec_env_policy_from_shell_policy;
 use crate::rollout::list::find_thread_path_by_id_str;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::Shell;
@@ -30,7 +30,6 @@ use codex_exec_server::RemoveOptions;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ShellEnvironmentPolicy;
-use codex_shell_command::escape_powershell_single_quoted as powershell_single_quote;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use codex_utils_pty::ManagedRootProcess;
@@ -93,31 +92,8 @@ const SNAPSHOT_RETENTION: Duration = Duration::from_secs(60 * 60 * 24);
 const MAX_CLEANUP_LIVE_ROLLOUTS: usize = 128;
 const SNAPSHOT_DIR: &str = "shell_snapshots";
 const EXCLUDED_EXPORT_VARS: &[&str] = &["PWD", "OLDPWD"];
-pub(crate) const POWERSHELL_SNAPSHOT_FORMAT_HEADER: &str = "# Codex PowerShell snapshot format: 1";
 pub(crate) const CMD_SNAPSHOT_FORMAT_HEADER: &str = "@rem Codex Cmd snapshot format: 1";
 const REMOTE_SNAPSHOT_DIR: &str = ".codex-shell-snapshots";
-
-fn exec_env_policy_from_shell_policy(policy: &ShellEnvironmentPolicy) -> ExecEnvPolicy {
-    let mut exclude = policy
-        .exclude
-        .iter()
-        .map(std::string::ToString::to_string)
-        .collect::<Vec<_>>();
-    exclude.push(CODEX_PERMISSION_PROFILE_ENV_VAR.to_string());
-    let mut r#set = policy.r#set.clone();
-    r#set.retain(|key, _| !key.eq_ignore_ascii_case(CODEX_PERMISSION_PROFILE_ENV_VAR));
-    ExecEnvPolicy {
-        inherit: policy.inherit.clone(),
-        ignore_default_excludes: policy.ignore_default_excludes,
-        exclude,
-        r#set,
-        include_only: policy
-            .include_only
-            .iter()
-            .map(std::string::ToString::to_string)
-            .collect(),
-    }
-}
 
 impl ShellSnapshot {
     pub(crate) fn new(
@@ -344,7 +320,7 @@ impl ShellSnapshot {
         );
 
         if let Err(err) =
-            validate_snapshot(shell, &temp_path, session_cwd, environment_variables).await
+            validate_snapshot(&temp_path).await
         {
             tracing::error!("Shell snapshot validation failed: {err:?}");
             return Err("validation_failed");
@@ -486,12 +462,6 @@ impl ShellSnapshotFile {
         }
     }
 
-    pub(crate) fn native_path_string(&self) -> String {
-        match &self.location {
-            ShellSnapshotLocation::Local(path) => path.to_string_lossy().into_owned(),
-            ShellSnapshotLocation::Remote { path, .. } => path.inferred_native_path_string(),
-        }
-    }
 
     pub(crate) fn contents(&self) -> &str {
         &self.contents
@@ -561,7 +531,7 @@ async fn write_shell_snapshot(
     // Native creation and guard installation have no cancellation boundary.
     // The guard is installed only after create_new succeeds, never for a
     // pre-existing file, and remains with the actual write/sync owner.
-    tokio::task::spawn_blocking(move || write_local_snapshot_file(path, snapshot, || {}))
+    tokio::task::spawn_blocking(move || write_local_snapshot_file(path, snapshot))
         .await?
         .map_err(Into::into)
 }
@@ -569,7 +539,6 @@ async fn write_shell_snapshot(
 fn write_local_snapshot_file(
     path: AbsolutePathBuf,
     contents: String,
-    after_create: impl FnOnce(),
 ) -> std::io::Result<ShellSnapshotFile> {
     use std::io::Write as _;
     let mut file = std::fs::OpenOptions::new()
@@ -580,7 +549,6 @@ fn write_local_snapshot_file(
         location: ShellSnapshotLocation::Local(path),
         contents,
     };
-    after_create();
     let result = file
         .write_all(snapshot.contents.as_bytes())
         .and_then(|()| file.sync_all());
@@ -595,16 +563,13 @@ fn format_snapshot(shell_type: ShellType, raw_snapshot: &str) -> Result<String> 
         ShellType::Bash | ShellType::Zsh | ShellType::Sh => {
             bail!("non-Windows shell snapshots are unsupported")
         }
-        ShellType::PowerShell => POWERSHELL_SNAPSHOT_FORMAT_HEADER,
+        ShellType::PowerShell => bail!("PowerShell snapshot capture is disabled"),
         ShellType::Cmd => "# Codex Cmd snapshot format: 1",
     };
     if !snapshot.lines().any(|line| line == format_header) {
         bail!("Snapshot output missing format marker {format_header}");
     }
-    if shell_type == ShellType::Cmd {
-        return format_cmd_snapshot(&snapshot);
-    }
-    Ok(snapshot)
+    format_cmd_snapshot(&snapshot)
 }
 
 fn format_cmd_snapshot(snapshot: &str) -> Result<String> {
@@ -718,15 +683,7 @@ async fn capture_snapshot(
         ShellType::Bash | ShellType::Zsh | ShellType::Sh => {
             bail!("non-Windows shell snapshots are unsupported")
         }
-        ShellType::PowerShell => {
-            run_shell_script(
-                shell,
-                powershell_snapshot_script(),
-                cwd,
-                environment_variables,
-            )
-            .await
-        }
+        ShellType::PowerShell => bail!("PowerShell snapshot capture is disabled"),
         ShellType::Cmd => {
             run_shell_script(
                 shell,
@@ -751,7 +708,7 @@ async fn capture_snapshot_remote(
         ShellType::Bash | ShellType::Zsh | ShellType::Sh => {
             bail!("non-Windows shell snapshots are unsupported")
         }
-        ShellType::PowerShell => powershell_snapshot_script().to_string(),
+        ShellType::PowerShell => bail!("PowerShell snapshot capture is disabled"),
         ShellType::Cmd => {
             "@echo # Snapshot file&@echo # Codex Cmd snapshot format: 1&@echo # exports&@set"
                 .to_string()
@@ -780,37 +737,11 @@ fn strip_snapshot_preamble(snapshot: &str) -> Result<String> {
     Ok(snapshot[start..].to_string())
 }
 
-async fn validate_snapshot(
-    shell: &Shell,
-    snapshot_path: &AbsolutePathBuf,
-    cwd: &AbsolutePathBuf,
-    environment_variables: &HashMap<String, String>,
-) -> Result<()> {
-    match shell.shell_type {
-        ShellType::PowerShell => {
-            let snapshot_path = powershell_single_quote(&snapshot_path.to_string_lossy());
-            let script = format!("$ErrorActionPreference = 'Stop'; . '{snapshot_path}'");
-            run_script_with_timeout(
-                shell,
-                &script,
-                SNAPSHOT_TIMEOUT,
-                /*use_login_shell*/ false,
-                cwd,
-                environment_variables,
-            )
-            .await
-            .map(|_| ())
-        }
-        ShellType::Bash | ShellType::Zsh | ShellType::Sh => {
-            bail!("non-Windows shell snapshots are unsupported")
-        }
-        ShellType::Cmd => {
-            let snapshot = fs::read_to_string(snapshot_path).await?;
-            parse_cmd_snapshot_environment(&snapshot)
-                .context("Cmd snapshot is not parseable")
-                .map(|_| ())
-        }
-    }
+async fn validate_snapshot(snapshot_path: &AbsolutePathBuf) -> Result<()> {
+    let snapshot = fs::read_to_string(snapshot_path).await?;
+    parse_cmd_snapshot_environment(&snapshot)
+        .context("Cmd snapshot is not parseable")
+        .map(|_| ())
 }
 
 async fn validate_snapshot_remote(
@@ -828,7 +759,7 @@ async fn validate_snapshot_remote(
         snapshot_path.inferred_native_path_string(),
     );
     let script = match shell.shell_type {
-        ShellType::PowerShell => "$ErrorActionPreference = 'Stop'; . $env:__CODEX_SNAPSHOT_FILE",
+        ShellType::PowerShell => bail!("PowerShell snapshot capture is disabled"),
         ShellType::Bash | ShellType::Zsh | ShellType::Sh => {
             bail!("non-Windows shell snapshots are unsupported")
         }
@@ -874,27 +805,6 @@ async fn run_script_with_timeout(
     cwd: &AbsolutePathBuf,
     environment_variables: &HashMap<String, String>,
 ) -> Result<String> {
-    run_script_with_timeout_with_args(
-        shell,
-        script,
-        &[],
-        snapshot_timeout,
-        use_login_shell,
-        cwd,
-        environment_variables,
-    )
-    .await
-}
-
-async fn run_script_with_timeout_with_args(
-    shell: &Shell,
-    script: &str,
-    script_args: &[&OsStr],
-    snapshot_timeout: Duration,
-    use_login_shell: bool,
-    cwd: &AbsolutePathBuf,
-    environment_variables: &HashMap<String, String>,
-) -> Result<String> {
     let timeout_deadline = tokio::time::Instant::now() + snapshot_timeout;
     let args = shell.derive_exec_args(script, use_login_shell)?;
     let args = clean_snapshot_shell_args(shell.shell_type, args, use_login_shell);
@@ -906,7 +816,6 @@ async fn run_script_with_timeout_with_args(
     let process_args = args[1..]
         .iter()
         .map(OsString::from)
-        .chain(script_args.iter().map(|arg| (*arg).to_os_string()))
         .collect::<Vec<_>>();
     configure_windows_command_args(handler.as_std_mut(), OsStr::new(&args[0]), &process_args);
     handler.stdin(Stdio::null());
@@ -1204,59 +1113,6 @@ async fn read_snapshot_output_bounded<R: AsyncRead + Unpin>(
             )));
         }
     }
-}
-
-fn powershell_snapshot_script() -> &'static str {
-    r##"$ErrorActionPreference = 'Stop'
-try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}
-Microsoft.PowerShell.Utility\Write-Output '# Snapshot file'
-Microsoft.PowerShell.Utility\Write-Output '# Codex PowerShell snapshot format: 1'
-Microsoft.PowerShell.Utility\Write-Output '# Unset all aliases to avoid conflicts with functions'
-Microsoft.PowerShell.Utility\Write-Output 'Microsoft.PowerShell.Management\Remove-Item -Path Alias:* -Force -ErrorAction SilentlyContinue'
-Microsoft.PowerShell.Utility\Write-Output '# Functions'
-Microsoft.PowerShell.Management\Get-ChildItem Function: | Microsoft.PowerShell.Core\ForEach-Object {
-    $encodedName = [System.Convert]::ToBase64String(
-        [System.Text.Encoding]::UTF8.GetBytes([string]$_.Name)
-    )
-    $encodedDefinition = [System.Convert]::ToBase64String(
-        [System.Text.Encoding]::UTF8.GetBytes([string]$_.Definition)
-    )
-    Microsoft.PowerShell.Utility\Write-Output (
-        "Microsoft.PowerShell.Management\Set-Item -LiteralPath ('Function:' + [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{0}'))) -Value ([System.Management.Automation.ScriptBlock]::Create([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{1}'))))" -f $encodedName, $encodedDefinition
-    )
-}
-Microsoft.PowerShell.Utility\Write-Output ''
-$aliases = Microsoft.PowerShell.Utility\Get-Alias
-Microsoft.PowerShell.Utility\Write-Output '# aliases'
-$aliases | Microsoft.PowerShell.Core\ForEach-Object {
-    $encodedName = [System.Convert]::ToBase64String(
-        [System.Text.Encoding]::UTF8.GetBytes([string]$_.Name)
-    )
-    $encodedDefinition = [System.Convert]::ToBase64String(
-        [System.Text.Encoding]::UTF8.GetBytes([string]$_.Definition)
-    )
-    Microsoft.PowerShell.Utility\Write-Output (
-        "Microsoft.PowerShell.Utility\Set-Alias -Name ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{0}'))) -Value ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{1}')))" -f $encodedName, $encodedDefinition
-    )
-}
-Microsoft.PowerShell.Utility\Write-Output ''
-$envVars = Microsoft.PowerShell.Management\Get-ChildItem Env:
-Microsoft.PowerShell.Utility\Write-Output '# exports'
-$envVars | Microsoft.PowerShell.Core\ForEach-Object {
-    if ($_.Name -in @('PWD', 'OLDPWD') -or $_.Name -like '__CODEX_SNAPSHOT_*') {
-        return
-    }
-    $encodedName = [System.Convert]::ToBase64String(
-        [System.Text.Encoding]::UTF8.GetBytes([string]$_.Name)
-    )
-    $encodedValue = [System.Convert]::ToBase64String(
-        [System.Text.Encoding]::UTF8.GetBytes([string]$_.Value)
-    )
-    Microsoft.PowerShell.Utility\Write-Output (
-        "Microsoft.PowerShell.Management\Set-Item -LiteralPath ('Env:' + [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{0}'))) -Value ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{1}')))" -f $encodedName, $encodedValue
-    )
-}
-"##
 }
 
 /// Removes shell snapshots that either lack a matching session rollout file or

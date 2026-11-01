@@ -435,15 +435,14 @@ fn build_rustls_client_config_from_pem_data(
     ))
 }
 
-/// Builds a reqwest client using an injected environment source and reqwest builder.
+/// Builds a reqwest client using the process environment and caller's reqwest builder.
 ///
-/// The injected source controls precedence without changing the real process environment.
 /// This selects the CA bundle, delegates file parsing to
 /// the shared content-keyed certificate cache, preserves the caller's chosen `reqwest` builder
 /// configuration, forces rustls when a custom CA is configured, and finally registers each parsed
 /// certificate with that builder.
 fn build_reqwest_client_with_env(
-    env_source: &dyn EnvSource,
+    env_source: &ProcessEnv,
     builder: reqwest::ClientBuilder,
 ) -> Result<reqwest::Client, BuildCustomCaTransportError> {
     build_reqwest_client_with_env_and_policy(
@@ -454,7 +453,7 @@ fn build_reqwest_client_with_env(
 }
 
 fn build_reqwest_client_with_env_and_policy(
-    env_source: &dyn EnvSource,
+    env_source: &ProcessEnv,
     mut builder: reqwest::ClientBuilder,
     custom_ca_policy: CustomCaPolicy,
 ) -> Result<reqwest::Client, BuildCustomCaTransportError> {
@@ -529,7 +528,7 @@ fn build_reqwest_client_with_env_and_policy(
 }
 
 fn build_blocking_reqwest_client_with_env(
-    env_source: &dyn EnvSource,
+    env_source: &ProcessEnv,
     builder: reqwest::blocking::ClientBuilder,
 ) -> Result<reqwest::blocking::Client, BuildCustomCaTransportError> {
     build_blocking_reqwest_client_with_env_and_policy(
@@ -540,7 +539,7 @@ fn build_blocking_reqwest_client_with_env(
 }
 
 fn build_blocking_reqwest_client_with_env_and_policy(
-    env_source: &dyn EnvSource,
+    env_source: &ProcessEnv,
     mut builder: reqwest::blocking::ClientBuilder,
     custom_ca_policy: CustomCaPolicy,
 ) -> Result<reqwest::blocking::Client, BuildCustomCaTransportError> {
@@ -604,15 +603,13 @@ fn build_blocking_reqwest_client_with_env_and_policy(
     })
 }
 
-/// Abstracts environment access without mutating process-wide variables.
-trait EnvSource {
-    /// Returns the environment variable value for `key`, if this source considers it set.
-    ///
-    /// Implementations should return `None` for absent values and may also collapse unreadable
-    /// process-environment states into `None`, because the custom CA logic treats both cases as
-    /// "no override configured". Callers build precedence and empty-string handling on top of this
-    /// method, so implementations should not trim or normalize the returned string.
-    fn var(&self, key: &str) -> Option<String>;
+/// Reads environment values without mutating process-wide variables.
+impl ProcessEnv {
+    /// Absent and unreadable values both mean no override. Precedence and
+    /// empty-string handling below use the unmodified environment value.
+    fn var(&self, key: &str) -> Option<String> {
+        env::var(key).ok()
+    }
 
     /// Returns a non-empty environment variable value interpreted as a filesystem path.
     ///
@@ -649,7 +646,7 @@ trait EnvSource {
 
 /// Rejects an empty SSL_CERT_FILE when no Codex-specific CA bundle is configured.
 fn validate_rustls_ca_environment(
-    env_source: &dyn EnvSource,
+    env_source: &ProcessEnv,
 ) -> Result<(), BuildCustomCaTransportError> {
     if env_source.non_empty_path(CODEX_CA_CERT_ENV).is_none()
         && env_source.var(SSL_CERT_FILE_ENV).as_deref() == Some("") {
@@ -665,11 +662,6 @@ fn validate_rustls_ca_environment(
 /// Reads CA configuration from the real process environment.
 struct ProcessEnv;
 
-impl EnvSource for ProcessEnv {
-    fn var(&self, key: &str) -> Option<String> {
-        env::var(key).ok()
-    }
-}
 
 /// Identifies the CA bundle selected for a client and the policy decision that selected it.
 ///

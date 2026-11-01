@@ -26,6 +26,8 @@ REASONING_RANK = {
     "medium": 3,
     "high": 4,
     "xhigh": 5,
+    "max": 6,
+    "ultra": 7,
 }
 
 
@@ -47,9 +49,9 @@ def _pick_highest_turn_effort(model) -> ReasoningEffort:
 
     best = max(
         model.supported_reasoning_efforts,
-        key=lambda option: REASONING_RANK[option.reasoning_effort.value],
+        key=lambda option: REASONING_RANK.get(option.reasoning_effort.root, -1),
     )
-    return ReasoningEffort(best.reasoning_effort.value)
+    return best.reasoning_effort
 
 
 OUTPUT_SCHEMA = {
@@ -71,11 +73,11 @@ with Codex(config=runtime_config()) as codex:
     selected_effort = _pick_highest_turn_effort(selected_model)
 
     print("selected.model:", selected_model.model)
-    print("selected.effort:", selected_effort.value)
+    print("selected.effort:", selected_effort.root)
 
     thread = codex.thread_start(
         model=selected_model.model,
-        config={"model_reasoning_effort": selected_effort.value},
+        config={"model_reasoning_effort": selected_effort.root},
     )
 
     first = thread.turn(

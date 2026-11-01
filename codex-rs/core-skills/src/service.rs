@@ -37,7 +37,6 @@ const MAX_CACHED_SKILL_SNAPSHOTS: usize = 64;
 struct SnapshotCacheOptions<'a> {
     generation: u64,
     force_reload: bool,
-    cache_result: bool,
     cwd_cache_key: Option<&'a AbsolutePathBuf>,
     plugin_skill_preload: Option<&'a PluginSkillSnapshots>,
 }
@@ -157,7 +156,9 @@ impl SkillsService {
         fs: Option<Arc<dyn ExecutorFileSystem>>,
     ) -> HostSkillsSnapshot {
         let generation = self.cache_generation.load(Ordering::SeqCst);
-        let input_cache_key = (!self.cache_reuse_disabled.load(Ordering::Acquire))
+        let plugin_installations_current = input.plugin_skill_snapshots.as_ref()
+            .is_none_or(PluginSkillSnapshots::is_current);
+        let input_cache_key = (plugin_installations_current && !self.cache_reuse_disabled.load(Ordering::Acquire))
             .then(|| SkillsInputCacheKey::new(input, fs.as_ref(), generation));
         if let Some(snapshot) = input_cache_key
             .as_ref()
@@ -195,7 +196,6 @@ impl SkillsService {
                 SnapshotCacheOptions {
                     generation,
                     force_reload: false,
-                    cache_result: true,
                     cwd_cache_key: None,
                     plugin_skill_preload: None,
                 },
@@ -226,19 +226,10 @@ impl SkillsService {
         roots
     }
 
-    pub async fn snapshot_for_cwd(
-        &self,
-        input: &SkillsLoadInput,
-        force_reload: bool,
-        fs: Option<Arc<dyn ExecutorFileSystem>>,
-    ) -> HostSkillsSnapshot {
-        self.snapshot_for_cwd_with_plugin_skill_preload(input, force_reload, fs, None)
-            .await
-    }
 
-    /// Reuse request-local plugin parsing on a cache miss. Unlike the persistent
-    /// snapshots attached to `SkillsLoadInput`, this preload does not select a
-    /// new cache identity: cwd listings keep their existing until-reload cache.
+    /// Reuse request-local plugin parsing and its publication-bound cache identity.
+    /// A cross-process reinstall must invalidate cwd results even before a watcher
+    /// advances the local skills generation.
     /// Capture `snapshot_generation()` before parsing; invalidated preloads are
     /// ignored rather than published into a newer generation.
     pub async fn snapshot_for_cwd_with_plugin_skill_preload(
@@ -255,7 +246,6 @@ impl SkillsService {
         let plugin_skill_preload = plugin_skill_preload
             .filter(|(preload_generation, _)| *preload_generation == generation)
             .map(|(_, snapshots)| snapshots);
-        let cache_result = true;
         let mut roots = skill_roots(
             fs,
             &input.config_layer_stack,
@@ -275,7 +265,6 @@ impl SkillsService {
             SnapshotCacheOptions {
                 generation,
                 force_reload,
-                cache_result,
                 cwd_cache_key: Some(&input.cwd),
                 plugin_skill_preload,
             },
@@ -293,16 +282,17 @@ impl SkillsService {
         let SnapshotCacheOptions {
             generation,
             force_reload,
-            cache_result,
             cwd_cache_key,
             plugin_skill_preload,
         } = cache_options;
-        let cache_key = (cache_result && !self.cache_reuse_disabled.load(Ordering::Acquire))
+        let plugin_installations_current = input.plugin_skill_snapshots.as_ref().or(plugin_skill_preload)
+            .is_none_or(PluginSkillSnapshots::is_current);
+        let cache_key = (plugin_installations_current && !self.cache_reuse_disabled.load(Ordering::Acquire))
             .then(|| {
                 skills_cache_key(
                     &roots,
                     &skill_config_rules,
-                    input.plugin_skill_snapshots.as_ref(),
+                    input.plugin_skill_snapshots.as_ref().or(plugin_skill_preload),
                     cwd_cache_key,
                     generation,
                 )
@@ -312,10 +302,7 @@ impl SkillsService {
         {
             return snapshot;
         }
-        let _flight = if !cache_result
-            || force_reload
-            || self.cache_reuse_disabled.load(Ordering::Acquire)
-        {
+        let _flight = if force_reload || self.cache_reuse_disabled.load(Ordering::Acquire) {
             None
         } else {
             match cache_key

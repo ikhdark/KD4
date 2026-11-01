@@ -3,7 +3,6 @@
 //! Assumes `apply_patch` verification/approval happened upstream. Reuses the
 //! selected turn environment filesystem for both local and remote turns, with
 //! sandboxing enforced by the explicit filesystem sandbox context.
-use crate::agent::task_capabilities::normalize_absolute_repo_path;
 use crate::exec::is_likely_sandbox_denied;
 use crate::session::turn_context::TurnEnvironment;
 use crate::tools::hook_names::HookToolName;
@@ -12,7 +11,6 @@ use crate::tools::sandboxing::ApprovalCtx;
 use crate::tools::sandboxing::ExecApprovalRequirement;
 use crate::tools::sandboxing::PermissionRequestPayload;
 use crate::tools::sandboxing::SandboxAttempt;
-use crate::tools::sandboxing::Sandboxable;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::ToolRuntime;
@@ -21,17 +19,14 @@ use codex_agent_task_store::AttemptState;
 use codex_apply_patch::AppliedPatchDelta;
 use codex_apply_patch::ApplyPatchAction;
 use codex_exec_server::FileSystemSandboxContext;
-use codex_git_utils::get_git_repo_root;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
 use codex_protocol::models::AdditionalPermissionProfile;
-use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::ReviewDecision;
 use codex_sandboxing::SandboxType;
-use codex_sandboxing::SandboxablePreference;
 use codex_sandboxing::policy_transforms::effective_permission_profile;
 use codex_sandboxing::policy_transforms::effective_permission_profile_uri;
 use codex_utils_path_uri::PathUri;
@@ -69,11 +64,6 @@ pub struct ApplyPatchRuntime {
     patch_mismatch: Option<codex_apply_patch::PatchContextMismatch>,
     revision_guard_mismatch: bool,
     failure: Option<codex_protocol::tool_failure::ToolFailure>,
-    workspace_tracking_started: bool,
-    workspace_tracking_finished: bool,
-    mutation_repo_root: Option<PathBuf>,
-    mutation_repo_paths: Vec<String>,
-    pending_source_mutation: Option<crate::git_workspace::PendingSourceMutation>,
     workspace_operation_permit: Option<crate::scoped_workspace_gate::WorkspaceLease>,
     mutation_in_progress: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -118,21 +108,7 @@ impl ApplyPatchRuntime {
         self.failure.as_ref()
     }
 
-    pub async fn finish_pending_workspace_tracking(&mut self, ctx: &ToolCtx) {
-        if self.mutation_repo_root.is_some() && !self.workspace_tracking_finished {
-            self.finish_workspace_tracking(ctx, true).await;
-        }
-    }
-
-    async fn begin_workspace_tracking(
-        &mut self,
-        req: &ApplyPatchRequest,
-        ctx: &ToolCtx,
-    ) -> Result<(), ToolError> {
-        if self.workspace_tracking_started {
-            return Ok(());
-        }
-
+    async fn validate_assignment(ctx: &ToolCtx) -> Result<(), ToolError> {
         let coordinator = ctx.session.services.agent_control.task_coordinator();
         let binding = coordinator.binding_for_turn(&ctx.turn);
         if let Some(binding) = &binding {
@@ -154,86 +130,7 @@ impl ApplyPatchRuntime {
             }
         }
 
-        if req.turn_environment.environment.is_remote() {
-            self.workspace_tracking_started = true;
-            return Ok(());
-        }
-        let cwd = match req.turn_environment.cwd().to_abs_path() {
-            Ok(cwd) => cwd.to_path_buf(),
-            Err(_) => {
-                self.workspace_tracking_started = true;
-                return Ok(());
-            }
-        };
-        let repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
-        // Task bindings track lifecycle, not filesystem authority. Like root,
-        // subagents may patch outside this repository when the existing
-        // filesystem/approval policy and their assigned task permit it.
-        let mutation_paths = native_mutation_repo_paths(
-            &repo_root,
-            &req.file_paths,
-            /*require_complete*/ false,
-        )?;
-        let repo_paths = mutation_paths.paths;
-
-        // Admission is uncertainty, not evidence that an intended path changed.
-        if self.pending_source_mutation.is_none() {
-            self.pending_source_mutation = Some(
-                ctx.session.services.git_workspace.begin_host_workspace_mutation(),
-            );
-        }
-
-        self.mutation_repo_root = Some(repo_root);
-        self.mutation_repo_paths = repo_paths;
-        self.workspace_tracking_started = true;
         Ok(())
-    }
-
-    async fn finish_workspace_tracking(&mut self, ctx: &ToolCtx, finish_tracking: bool) {
-        self.workspace_tracking_started = false;
-        let (repo_root, _repo_paths) = if finish_tracking {
-            (
-                self.mutation_repo_root.take(),
-                std::mem::take(&mut self.mutation_repo_paths),
-            )
-        } else {
-            // A denied attempt can await retry approval. Retain the pending
-            // invalidation for cancellation there, while still rechecking admission
-            // on a later runtime attempt.
-            (
-                self.mutation_repo_root.clone(),
-                self.mutation_repo_paths.clone(),
-            )
-        };
-        if let Some(repo_root) = repo_root.as_ref() {
-            if self.committed_delta.is_exact() && !self.committed_delta.is_empty() {
-                let paths = self.committed_delta.changes().iter().flat_map(|change| {
-                    let destination = match &change.change {
-                        codex_apply_patch::AppliedPatchFileChange::Update { move_path, .. } => move_path.as_ref(),
-                        _ => None,
-                    };
-                    std::iter::once(&change.path).chain(destination)
-                        .map(|path| path.to_string_lossy().into_owned())
-                }).collect::<Vec<_>>();
-                ctx.session
-                    .services
-                    .git_workspace
-                    .note_host_workspace_mutation_paths(repo_root, &paths)
-                    .await;
-            } else if !self.committed_delta.is_exact() {
-                ctx.session
-                    .services
-                    .git_workspace
-                    .note_host_workspace_mutation();
-            }
-        }
-
-        if finish_tracking {
-            if let Some(pending) = self.pending_source_mutation.take() {
-                pending.settle();
-            }
-            self.workspace_tracking_finished = true;
-        }
     }
 
     fn file_system_sandbox_context_for_attempt(
@@ -271,57 +168,6 @@ impl ApplyPatchRuntime {
             windows_sandbox_level: attempt.windows_sandbox_level,
             windows_sandbox_private_desktop: attempt.windows_sandbox_private_desktop,
         })
-    }
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct NativeMutationRepoPaths {
-    paths: Vec<String>,
-    complete: bool,
-}
-
-fn native_mutation_repo_paths(
-    repo_root: &std::path::Path,
-    file_paths: &[PathUri],
-    require_complete: bool,
-) -> Result<NativeMutationRepoPaths, ToolError> {
-    let mut paths = Vec::new();
-    let mut complete = true;
-    for path in file_paths {
-        let native_path = match path.to_abs_path() {
-            Ok(path) => path,
-            Err(error) if require_complete => {
-                return Err(ToolError::Rejected(format!(
-                    "apply_patch: patch tracking cannot represent `{path}` on this host: {error}"
-                )));
-            }
-            Err(_) => {
-                complete = false;
-                continue;
-            }
-        };
-        match normalize_absolute_repo_path(repo_root, native_path.as_path()) {
-            Ok(path) => paths.push(path),
-            Err(error) if require_complete => {
-                return Err(ToolError::Rejected(format!(
-                    "apply_patch: mutation path `{path}` is outside the patch workspace: {error}"
-                )));
-            }
-            Err(_) => complete = false,
-        }
-    }
-    // Patch changes originate in a map. Keep admission and any rejection stable
-    // across equivalent requests, including partially admitted multi-path calls.
-    paths.sort_unstable();
-    Ok(NativeMutationRepoPaths { paths, complete })
-}
-
-impl Sandboxable for ApplyPatchRuntime {
-    fn sandbox_preference(&self) -> SandboxablePreference {
-        SandboxablePreference::Auto
-    }
-    fn escalate_on_failure(&self) -> bool {
-        self.committed_delta.is_empty() && self.committed_delta.is_exact()
     }
 }
 
@@ -399,15 +245,6 @@ impl Approvable<ApplyPatchRequest> for ApplyPatchRuntime {
         })
     }
 
-    fn wants_no_sandbox_approval(&self, policy: AskForApproval) -> bool {
-        match policy {
-            AskForApproval::Never => false,
-            AskForApproval::Granular(granular_config) => granular_config.allows_sandbox_approval(),
-            AskForApproval::OnRequest => true,
-            AskForApproval::UnlessTrusted => true,
-        }
-    }
-
     // apply_patch approvals are decided upstream by assess_patch_safety.
     //
     // This override ensures the orchestrator runs the patch approval flow when required instead
@@ -450,7 +287,6 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
                 self.workspace_operation_permit = Some(tokio::select! {
                     biased;
                     _ = req.cancellation_token.cancelled() => {
-                        self.finish_workspace_tracking(ctx, true).await;
                         return Err(ToolError::Codex(CodexErr::TurnAborted));
                     }
                     permit = crate::workspace_operation_gate::acquire_patch_operation_with_timeout(
@@ -459,10 +295,7 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
                     ) => permit.map_err(ToolError::Denied)?,
                 });
             }
-            if let Err(error) = self.begin_workspace_tracking(req, ctx).await {
-                self.finish_workspace_tracking(ctx, true).await;
-                return Err(error);
-            }
+            Self::validate_assignment(ctx).await?;
             let started_at = Instant::now();
             let fs = req.turn_environment.environment.get_filesystem();
             let sandbox = Self::file_system_sandbox_context_for_attempt(req, attempt);
@@ -509,7 +342,7 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
                 }
             };
             self.committed_delta.append(delta);
-            let retry_safe = self.escalate_on_failure();
+            let retry_safe = self.committed_delta.is_empty() && self.committed_delta.is_exact();
             if failed && !retry_safe {
                 stderr.push_str("Automatic patch retry withheld because files changed or a failed write may have changed them.\n");
             }
@@ -538,9 +371,8 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
                     }),
                 ],
             );
-            self.finish_workspace_tracking(ctx, !sandbox_denied).await;
             if sandbox_denied {
-                // Keep the verified file state serialized across retry approval too.
+                // Preserve the denied output without replaying the patch.
                 return Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
                     output: Box::new(output),
                     network_policy_decision: None,

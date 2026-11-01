@@ -62,8 +62,9 @@ use crate::UpdatedProject;
 /// Local storage has two compatibility surfaces. Rollout JSONL files are the
 /// durable replay format and remain readable without SQLite, including older
 /// files that encode metadata in `SessionMeta` items and name-index entries.
-/// The SQLite state DB, when available, is the queryable metadata index used by
-/// list/read paths for fast lookup.
+/// The SQLite state DB, when available, owns explicit names/clears and supplies
+/// the metadata index for list/read paths. Canonical read errors must not be
+/// treated as missing rows when consulting compatibility names.
 ///
 /// Live appends still write canonical JSONL history, but append-derived
 /// metadata is observed above the store and applied through

@@ -15,7 +15,6 @@ use futures::Stream;
 use rustls::ClientConfig;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
-use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream as TungsteniteStream;
 use tokio_tungstenite::tungstenite::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::Message;
@@ -149,9 +148,7 @@ impl Stream for WebSocketConnection {
     type Item = Result<Message, WebSocketError>;
 
     fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match &mut self.get_mut().inner {
-            ConnectionInner::Routed(stream) => Pin::new(stream).poll_next(context),
-        }
+        Pin::new(&mut self.get_mut().inner).poll_next(context)
     }
 }
 
@@ -162,39 +159,29 @@ impl Sink<Message> for WebSocketConnection {
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
-        match &mut self.get_mut().inner {
-            ConnectionInner::Routed(stream) => Pin::new(stream).poll_ready(context),
-        }
+        Pin::new(&mut self.get_mut().inner).poll_ready(context)
     }
 
     fn start_send(self: Pin<&mut Self>, message: Message) -> Result<(), Self::Error> {
-        match &mut self.get_mut().inner {
-            ConnectionInner::Routed(stream) => Pin::new(stream).start_send(message),
-        }
+        Pin::new(&mut self.get_mut().inner).start_send(message)
     }
 
     fn poll_flush(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
-        match &mut self.get_mut().inner {
-            ConnectionInner::Routed(stream) => Pin::new(stream).poll_flush(context),
-        }
+        Pin::new(&mut self.get_mut().inner).poll_flush(context)
     }
 
     fn poll_close(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
-        match &mut self.get_mut().inner {
-            ConnectionInner::Routed(stream) => Pin::new(stream).poll_close(context),
-        }
+        Pin::new(&mut self.get_mut().inner).poll_close(context)
     }
 }
 
-pub(crate) enum ConnectionInner {
-    Routed(TungsteniteStream<MaybeTlsStream<Box<dyn AsyncIo>>>),
-}
+pub(crate) type ConnectionInner = TungsteniteStream<Box<dyn AsyncIo>>;
 
 /// Async network I/O carried through optional proxy and target TLS handshakes.
 pub(crate) trait AsyncIo: AsyncRead + AsyncWrite + Send + Unpin {}

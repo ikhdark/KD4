@@ -480,14 +480,12 @@ fn collect_accessible_connectors_from_mcp_tools<'a>(
 
 fn accessible_connectors_for_app_list_from_mcp_tools(mcp_tools: &[ToolInfo]) -> Vec<AppInfo> {
     let non_synthetic_tools = mcp_tools.iter().filter(|tool| {
-        tool.tool
-            .meta
-            .as_deref()
-            .and_then(|meta| meta.get(MCP_TOOL_CODEX_APPS_META_KEY))
-            .and_then(serde_json::Value::as_object)
-            .and_then(|meta| meta.get("synthetic_link"))
-            .and_then(serde_json::Value::as_bool)
-            != Some(true)
+        !codex_connectors::connector_tool_is_synthetic(
+            tool.tool
+                .meta
+                .as_deref()
+                .and_then(|meta| meta.get(MCP_TOOL_CODEX_APPS_META_KEY)),
+        )
     });
     collect_accessible_connectors_from_mcp_tools(non_synthetic_tools)
 }

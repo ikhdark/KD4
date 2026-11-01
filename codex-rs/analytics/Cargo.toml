@@ -20,6 +20,7 @@ codex-login = { workspace = true }
 codex-model-provider = { workspace = true }
 codex-plugin = { workspace = true }
 codex-protocol = { workspace = true }
+codex-turn-timing = { workspace = true }
 hex = { workspace = true }
 os_info = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

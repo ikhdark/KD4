@@ -107,6 +107,14 @@ async fn handle_owned(
     cancellation_token: CancellationToken,
 ) -> Result<FunctionToolOutput, FunctionCallError> {
     let turn = &step.turn;
+    if !native_csv_filesystem_supported(&turn.file_system_sandbox_policy()) {
+        return Err(FunctionCallError::structured(
+            codex_protocol::tool_failure::ToolFailure::no_effects(
+                codex_protocol::tool_failure::ToolFailureCode::PermissionDenied,
+                "spawn_agents_on_csv requires unrestricted filesystem read/write permissions for its native CSV import/export owner; no CSV was read, job created or worker started",
+            ),
+        ));
+    }
     let args: SpawnAgentsOnCsvArgs = parse_arguments(arguments.as_str())?;
     if args.instruction.trim().is_empty() {
         return Err(FunctionCallError::RespondToModel(
@@ -446,8 +454,15 @@ pub(super) fn single_local_environment_cwd(
         ));
     };
 
-    // TODO(anp): Migrate spawn_agents_on_csv filesystem access to PathUri before enabling it for
-    // remote environments.
+    if !turn_environment.environment.get_filesystem().uses_host_native_paths()
+        || turn_environment.cwd().infer_path_convention()
+            != Some(codex_utils_path_uri::PathConvention::native())
+    {
+        return Err(FunctionCallError::RespondToModel(
+            "spawn_agents_on_csv requires a host-native local filesystem and cwd".to_string(),
+        ));
+    }
+    // Scoped and remote CSV IO require an executor-owned streaming API.
     turn_environment.cwd().to_abs_path().map_err(|err| {
         FunctionCallError::RespondToModel(format!(
             "spawn_agents_on_csv cwd `{}` is not native to the Codex host: {err}",

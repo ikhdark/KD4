@@ -21,7 +21,6 @@ use crate::tools::sandboxing::ApprovalCtx;
 use crate::tools::sandboxing::ExecApprovalRequirement;
 use crate::tools::sandboxing::PermissionRequestPayload;
 use crate::tools::sandboxing::SandboxAttempt;
-use crate::tools::sandboxing::Sandboxable;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::ToolRuntime;
@@ -34,7 +33,6 @@ use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::request_permissions::UriAdditionalPermissionProfile;
 use codex_sandboxing::SandboxCommand;
-use codex_sandboxing::SandboxablePreference;
 use codex_utils_path_uri::PathUri;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
@@ -158,16 +156,6 @@ impl<'a> UnifiedExecRuntime<'a> {
             manager,
             pending_spawns,
         }
-    }
-}
-
-impl Sandboxable for UnifiedExecRuntime<'_> {
-    fn sandbox_preference(&self) -> SandboxablePreference {
-        SandboxablePreference::Auto
-    }
-
-    fn escalate_on_failure(&self) -> bool {
-        true
     }
 }
 
@@ -366,6 +354,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
                 &req.command_for_approval,
                 cwd.as_path(),
                 &env,
+                ctx.turn.file_system_sandbox_policy().has_full_disk_read_access(),
             )
             .await
             .map_err(ToolError::Rejected)?;

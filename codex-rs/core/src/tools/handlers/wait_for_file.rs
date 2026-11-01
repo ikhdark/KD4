@@ -328,6 +328,12 @@ impl ToolExecutor<ToolInvocation> for WaitForFileHandler {
 }
 
 impl CoreToolRuntime for WaitForFileHandler {
+    fn waits_for_workspace_changes(&self, _payload: &ToolPayload) -> bool {
+        // The watcher performs independently sandboxed, non-atomic probes.
+        // Producers must remain able to change the state being awaited.
+        true
+    }
+
     fn cancellation_cleanup_policy(&self) -> crate::tools::registry::ToolCleanupPolicy {
         crate::tools::registry::ToolCleanupPolicy::InterruptibleRead
     }

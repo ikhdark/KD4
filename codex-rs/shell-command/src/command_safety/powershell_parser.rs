@@ -429,7 +429,6 @@ pub struct PowershellDirectArgvCandidate {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PowershellParseAnalysis {
     pub commands: Vec<Vec<String>>,
-    pub standalone_command: bool,
     pub direct_argv: Option<PowershellDirectArgvCandidate>,
     /// Resource inspection only; not a direct-execution or runner-receipt proof.
     pub inspection_argv: Option<Vec<String>>,
@@ -1047,7 +1046,6 @@ impl PowershellParserResponse {
                             }
                         });
                     PowershellParseOutcome::Analysis(PowershellParseAnalysis {
-                        standalone_command: self.standalone_command && commands.len() == 1,
                         commands,
                         direct_argv,
                         inspection_argv,

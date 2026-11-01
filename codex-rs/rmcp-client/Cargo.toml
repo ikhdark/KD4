@@ -15,6 +15,7 @@ codex-config = { workspace = true }
 codex-exec-server = { workspace = true }
 codex-http-client = { workspace = true }
 codex-keyring-store = { workspace = true }
+codex-network-types = { workspace = true }
 codex-protocol = { workspace = true }
 codex-secrets = { workspace = true }
 codex-utils-path-uri = { workspace = true }
@@ -23,7 +24,6 @@ bytes = { workspace = true }
 futures = { workspace = true, default-features = false, features = ["std"] }
 hex = { workspace = true }
 http = { workspace = true }
-httpdate = { workspace = true }
 memchr = { workspace = true }
 oauth2 = { workspace = true }
 rmcp = { workspace = true, default-features = false, features = [

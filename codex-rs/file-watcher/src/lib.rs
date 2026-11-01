@@ -1676,7 +1676,7 @@ impl FileWatcher {
                             // there watches its contents, not that timestamp.
                             // Keep structural events and all descendant events.
                             && !(changes.root_metadata_paths.contains(*event_path)
-                                && subscriber_watch_is_stable(subscriber_watch, subscriber_watch_state)
+                                && subscriber_watch_is_stable(subscriber_watch_state)
                                 && (**event_path == subscriber_watch_state.matched.path
                                     || **event_path == subscriber_watch.requested.path)
                                 && event_path.is_dir())
@@ -1701,7 +1701,6 @@ impl FileWatcher {
                                         event_path,
                                     ) && !(changes.root_metadata_paths.contains(*event_path)
                                         && subscriber_watch_is_stable(
-                                            subscriber_watch,
                                             subscriber_watch_state,
                                         )
                                         && **requested_path != subscriber_watch.requested.path
@@ -1719,7 +1718,7 @@ impl FileWatcher {
                 // re-resolves every watch rather than only fallback watches.
                 let stable_descendant_event = !rescan
                     && requested_namespace_paths.is_empty()
-                    && subscriber_watch_is_stable(subscriber_watch, subscriber_watch_state)
+                    && subscriber_watch_is_stable(subscriber_watch_state)
                     && relevant_paths.iter().all(|event_path| {
                         is_strict_descendant(event_path, &subscriber_watch_state.matched.path)
                             || is_strict_descendant(event_path, &subscriber_watch.requested.path)
@@ -1744,7 +1743,7 @@ impl FileWatcher {
                 // watch reports its own creation, removal, or rename, and the
                 // resolution above has already caught a retargeted link.
                 let unmoved_stable_watch =
-                    subscriber_watch_is_stable(subscriber_watch, subscriber_watch_state)
+                    subscriber_watch_is_stable(subscriber_watch_state)
                         && subscriber_watch_state.actual == new_actual
                         && subscriber_watch_state.matched == new_matched;
                 for event_path in relevant_paths
@@ -1880,15 +1879,16 @@ impl FileWatcher {
             // The backend drops a watch whose root is removed. When the root is
             // back before this pass, resolution keeps the watch where it was,
             // so re-arm it before subscribers learn that the root changed.
-            let Some(mode) = state
+            if state
                 .path_ref_counts
                 .get(root)
                 .copied()
                 .and_then(PathWatchCounts::effective_mode)
-            else {
+                .is_none()
+            {
                 continue;
-            };
-            if let Err(err) = Self::rewatch_backend(inner, root, mode, &mut inner_guard) {
+            }
+            if let Err(err) = Self::rewatch_backend(inner, &mut inner_guard) {
                 warn!(
                     "failed to re-establish file watch {}: {err}",
                     root.display()
@@ -1931,8 +1931,6 @@ impl FileWatcher {
     /// loses coverage.
     fn rewatch_backend<'a>(
         inner: Option<&'a Arc<Mutex<FileWatcherInner>>>,
-        path: &Path,
-        mode: RecursiveMode,
         inner_guard: &mut Option<std::sync::MutexGuard<'a, FileWatcherInner>>,
     ) -> notify::Result<()> {
         let Some(inner) = inner else {
@@ -1943,7 +1941,6 @@ impl FileWatcher {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         });
-        let _ = (path, mode);
         guard.needs_rebuild = true;
         let roots = effective_native_paths(&guard.watched_paths);
         Self::rebuild_backend(guard, &roots)?;
@@ -2268,7 +2265,6 @@ fn guard_mapped_event_paths<'a>(
 }
 
 fn subscriber_watch_is_stable(
-    _subscriber_watch: &SubscriberWatchKey,
     subscriber_watch_state: &SubscriberWatchState,
 ) -> bool {
     subscriber_watch_state.last_exists
@@ -2339,7 +2335,7 @@ fn changed_path_for_matched_path(
         return None;
     }
     subscriber_watch_state.last_exists =
-        if subscriber_watch_is_stable(subscriber_watch, subscriber_watch_state) {
+        if subscriber_watch_is_stable(subscriber_watch_state) {
             true
         } else {
             matched.path.exists()

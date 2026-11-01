@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
-use codex_app_server_protocol::SandboxMode;
-use codex_app_server_protocol::ThreadForkParams;
-use codex_app_server_protocol::ThreadResumeParams;
-use codex_app_server_protocol::ThreadSource;
-use codex_app_server_protocol::ThreadStartParams;
-use codex_app_server_protocol::ThreadStartSource;
+use codex_app_server_protocol_types::SandboxMode;
+use codex_app_server_protocol_types::ThreadForkParams;
+use codex_app_server_protocol_types::ThreadResumeParams;
+use codex_app_server_protocol_types::ThreadSource;
+use codex_app_server_protocol_types::ThreadStartParams;
+use codex_app_server_protocol_types::ThreadStartSource;
 use codex_core::config::Config;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::WebSearchMode;

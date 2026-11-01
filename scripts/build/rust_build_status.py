@@ -19,6 +19,7 @@ import hashlib
 import json
 import math
 import os
+import platform
 from pathlib import Path
 from pathlib import PureWindowsPath
 import re
@@ -380,9 +381,6 @@ class BuildStatusSnapshot:
             },
         )
 
-    def lane_name_for(self, process: RustProcess) -> str | None:
-        return self.lane_names_by_process.get(rust_process_key(process))
-
     def lane_mtime(self, path: Path) -> float:
         if path not in self._lane_mtimes:
             self._lane_mtimes[path] = self._lane_mtime(path)
@@ -619,42 +617,8 @@ def _classify_rust_process(process: RustProcess) -> RustProcessClassification:
     return RustProcessClassification(is_rust, _lane_name_from_command_line(process.command_line), target, root)
 
 
-def observe_rust_process(process: RustProcess) -> RustProcess:
-    return process
-
-
-def is_rust_process(process: RustProcess) -> bool:
-    return process.classification.is_rust
-
-
 def lane_name_for_process(process: RustProcess) -> str | None:
     return process.classification.lane_name
-
-
-def shared_target_rust_processes(
-    processes: Sequence[RustProcess],
-    lane_names_by_process: Mapping[tuple[int, str, str], str] | None = None,
-) -> list[RustProcess]:
-    shared = []
-    for process in processes:
-        observed = observe_rust_process(process)
-        lane_name = (
-            lane_names_by_process.get(rust_process_key(observed))
-            if lane_names_by_process is not None
-            else observed.classification.lane_name
-        )
-        if (
-            observed.classification.is_rust
-            and lane_name is None
-            and "nextest show-config" not in observed.command_line
-        ):
-            shared.append(observed)
-    return shared
-
-
-def has_shared_target_rust_jobs(processes: Sequence[RustProcess] | None = None) -> bool:
-    processes = active_rust_processes() if processes is None else processes
-    return bool(shared_target_rust_processes(processes))
 
 
 def cargo_lock_is_busy(target_dir: Path, *, profile: str | None = None) -> bool:
@@ -724,10 +688,6 @@ def _cargo_lock_file_is_busy(lock_path: Path) -> bool:
     finally:
         if handle is not None:
             handle.close()
-
-
-def has_shared_target_cargo_lock(*, repo_root: Path = REPO_ROOT) -> bool:
-    return cargo_lock_is_busy(repo_root / "codex-rs" / "target")
 
 
 def locked_lane_names(lane_dirs: Sequence[Path]) -> set[str]:
@@ -1167,45 +1127,42 @@ def _detach_expendable_lane_cache(path: Path, trash: Path) -> bool:
 def _lane_reservation_candidates(
     lane_root: Path,
     base_lane: str,
-    *,
-    prefer_warm: bool,
 ) -> list[LaneReservationCandidate]:
     candidates: list[LaneReservationCandidate] = []
-    if prefer_warm:
-        pattern = re.compile(rf"^{re.escape(base_lane)}(?:-\d+)?$")
-        warm: list[LaneReservationCandidate] = []
-        with os.scandir(lane_root) as entries:
-            for entry in entries:
-                if pattern.fullmatch(entry.name) is None:
-                    continue
-                try:
-                    observation = entry.stat(follow_symlinks=False)
-                except OSError:
-                    continue
-                if not stat.S_ISDIR(observation.st_mode) or _observation_is_indirect(
-                    observation
-                ):
-                    continue
-                warm.append(
-                    LaneReservationCandidate(
-                        name=entry.name,
-                        path=Path(entry.path),
-                        observation=observation,
-                    )
+    pattern = re.compile(rf"^{re.escape(base_lane)}(?:-\d+)?$")
+    warm: list[LaneReservationCandidate] = []
+    with os.scandir(lane_root) as entries:
+        for entry in entries:
+            if pattern.fullmatch(entry.name) is None:
+                continue
+            try:
+                observation = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if not stat.S_ISDIR(observation.st_mode) or _observation_is_indirect(
+                observation
+            ):
+                continue
+            warm.append(
+                LaneReservationCandidate(
+                    name=entry.name,
+                    path=Path(entry.path),
+                    observation=observation,
                 )
-
-        def warm_sort_key(
-            candidate: LaneReservationCandidate,
-        ) -> tuple[float, str, str]:
-            assert candidate.observation is not None
-            return (
-                -lane_last_used_mtime(candidate.path),
-                candidate.name.casefold(),
-                candidate.name,
             )
 
-        warm.sort(key=warm_sort_key)
-        candidates.extend(warm)
+    def warm_sort_key(
+        candidate: LaneReservationCandidate,
+    ) -> tuple[float, str, str]:
+        assert candidate.observation is not None
+        return (
+            -lane_last_used_mtime(candidate.path),
+            candidate.name.casefold(),
+            candidate.name,
+        )
+
+    warm.sort(key=warm_sort_key)
+    candidates.extend(warm)
     observed_names = {candidate.name for candidate in candidates}
     for name in [base_lane, *(f"{base_lane}-{index}" for index in range(2, 66))]:
         if name not in observed_names:
@@ -1284,7 +1241,7 @@ def reserve_cargo_lane(
     while active_handle is None:
         busy_reusable = False
         with cargo_lane_coordination_lock(root, timeout_seconds=lock_timeout_seconds):
-            candidates = _lane_reservation_candidates(root, base_lane, prefer_warm=True)
+            candidates = _lane_reservation_candidates(root, base_lane)
             warm_paths = {
                 candidate.path for candidate in candidates if _is_warm_lane_dir(candidate.path)
             }
@@ -2857,6 +2814,7 @@ def run_in_cargo_lane(
     started = time.perf_counter()
     record = {"command": list(command), "requestedLane": requested_lane,
               "exitCode": None, "cargoExitCode": None, "status": "running"}
+    timing_evidence = None
     reuse_decisions: list[dict[str, object]] = []
     cache_reuse = {
         "frozenBinary": {"status": "not_requested", "decisions": reuse_decisions},
@@ -2906,7 +2864,33 @@ def run_in_cargo_lane(
             or (external and not (repo_root / ".git").exists())
         )
         source = _source_manifest(repo_root) if freeze else None
-        rustc = _rustc_identity(child_env, Path.cwd()) if freeze else None
+        capture_started = time.perf_counter()
+        rustc = _rustc_identity(child_env, Path.cwd()) if freeze or stream is not None else None
+        if stream is not None:
+            timing_evidence = {
+                "schemaVersion": 1,
+                "sourceManifest": source.summary() if source is not None else source_tree_manifest(repo_root),
+                "buildContext": dict(build_context),
+                "rustc": rustc,
+                "runnerSources": {
+                    name: _file_sha256(REPO_ROOT / name) for name in (
+                        "scripts/build/rust_build_status.py",
+                        "scripts/build/rust_build_status_support.py",
+                        "scripts/build/rust_tool_env.py",
+                        "scripts/common/process_owner.py",
+                        "scripts/common/tool_versions.py",
+                    )
+                },
+                "machine": {
+                    "platform": platform.platform(),
+                    "architecture": platform.machine(),
+                    "processor": platform.processor(),
+                    "logicalProcessors": os.cpu_count(),
+                },
+                "sourceUnchanged": None,
+                "captureMs": (time.perf_counter() - capture_started) * 1000,
+            }
+            record["timingEvidence"] = timing_evidence
         if source is not None and rebuild:
             cache_reuse["frozenBinary"].update(status="disabled", gate="explicit_rebuild")
         if source is not None and not rebuild:
@@ -3010,6 +2994,7 @@ def run_in_cargo_lane(
                         status="not_observed",
                         cause="no invocation-scoped compiler-cache receipt; shared cache counters cannot attribute this build",
                     )
+                    cargo_started = time.perf_counter()
                     code = run_owned(
                         child_command, env=child_env, cwd=child_cwd,
                         creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0),
@@ -3017,6 +3002,7 @@ def run_in_cargo_lane(
                         stdout=messages if messages_path is not None else sys.stdout,
                         stderr=sys.stderr,
                     ).returncode
+                    record["cargoMs"] = (time.perf_counter() - cargo_started) * 1000
                 record["cargoExitCode"] = code
                 record["exitCode"] = code
                 executables = (
@@ -3115,6 +3101,15 @@ def run_in_cargo_lane(
             key: _cache_evidence_summary(value) for key, value in cache_reuse.items()
         }), file=sys.stderr)
         if stream is not None:
+            if timing_evidence is not None:
+                capture_started = time.perf_counter()
+                try:
+                    timing_evidence["sourceUnchanged"] = (
+                        source_tree_manifest(repo_root) == timing_evidence["sourceManifest"]
+                    )
+                except OSError as error:
+                    timing_evidence["sourceObservationError"] = str(error)
+                timing_evidence["captureMs"] += (time.perf_counter() - capture_started) * 1000
             record["totalMs"] = (time.perf_counter() - started) * 1000
             try:
                 with stream:
@@ -3241,14 +3236,6 @@ def is_indirect_directory(path: Path) -> bool:
     return path.is_symlink() or is_windows_junction(path)
 
 
-def active_lane_names(processes: Sequence[RustProcess]) -> set[str]:
-    return {
-        lane
-        for process in processes
-        if (lane := lane_name_for_process(process)) is not None
-    }
-
-
 def env_active_lane_names(env: Mapping[str, str] = os.environ) -> set[str]:
     raw = env.get("CODEX_CARGO_LANE_ACTIVE_NAMES", "")
     active = set()
@@ -3257,17 +3244,6 @@ def env_active_lane_names(env: Mapping[str, str] = os.environ) -> set[str]:
         if name:
             active.add(name)
     return active
-
-
-def stale_lane_dirs(
-    *,
-    repo_root: Path = REPO_ROOT,
-    processes: Sequence[RustProcess] | None = None,
-) -> list[Path]:
-    return BuildStatusSnapshot.collect(
-        repo_root=repo_root,
-        processes=processes,
-    ).stale_lanes
 
 
 def is_timestamped_lane(name: str) -> bool:

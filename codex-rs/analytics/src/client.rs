@@ -63,25 +63,9 @@ const ANALYTICS_EVENTS_BATCH_SIZE: usize = 32;
 
 type UsageEventKey = (String, String, String);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct AnalyticsFailureLogMetadata {
-    status: u16,
-    declared_body_bytes: Option<u64>,
-}
-
-fn analytics_failure_log_metadata(
-    status: u16,
-    declared_body_bytes: Option<u64>,
-) -> AnalyticsFailureLogMetadata {
-    AnalyticsFailureLogMetadata {
-        status,
-        declared_body_bytes,
-    }
-}
-
 #[derive(Clone)]
 pub(crate) struct AnalyticsEventsQueue {
-    pub(crate) auth_manager: Option<Arc<AuthManager>>,
+    pub(crate) auth_manager: Arc<AuthManager>,
     pub(crate) loss_epoch: Arc<AtomicU64>,
     pub(crate) sender: mpsc::Sender<AnalyticsFact>,
     pub(crate) app_used_emitted_keys: Arc<Mutex<HashSet<UsageEventKey>>>,
@@ -90,7 +74,7 @@ pub(crate) struct AnalyticsEventsQueue {
 
 struct AnalyticsPermit<'a> {
     permit: mpsc::Permit<'a, AnalyticsFact>,
-    epoch: Option<u64>,
+    epoch: u64,
 }
 
 impl AnalyticsPermit<'_> {
@@ -99,11 +83,8 @@ impl AnalyticsPermit<'_> {
     }
 }
 
-fn bind_analytics_fact(epoch: Option<u64>, fact: AnalyticsFact) -> AnalyticsFact {
-    match epoch {
-        Some(epoch) => AnalyticsFact::AuthBound { epoch, fact: Box::new(fact) },
-        None => fact,
-    }
+fn bind_analytics_fact(epoch: u64, fact: AnalyticsFact) -> AnalyticsFact {
+    AnalyticsFact::AuthBound { epoch, fact: Box::new(fact) }
 }
 
 struct AnalyticsDispatchGuard { auth_manager: Arc<AuthManager>, epoch: u64 }
@@ -147,10 +128,6 @@ enum AnalyticsEventsDestination {
 impl AnalyticsEventsDestination {
     fn from_base_url(base_url: String) -> Self {
         let capture_file = analytics_capture_file_from_env();
-        Self::from_base_url_and_capture_file(base_url, capture_file)
-    }
-
-    fn from_base_url_and_capture_file(base_url: String, capture_file: Option<PathBuf>) -> Self {
         #[cfg(debug_assertions)]
         if let Some(path) = capture_file {
             if let Err(err) = crate::analytics_capture::initialize(&path) {
@@ -243,7 +220,7 @@ impl AnalyticsEventsQueue {
             }
         });
         Self {
-            auth_manager: Some(queue_auth_manager),
+            auth_manager: queue_auth_manager,
             sender,
             loss_epoch,
             app_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
@@ -259,9 +236,9 @@ impl AnalyticsEventsQueue {
         }
     }
 
-    fn admission_epoch(&self) -> Result<Option<u64>, ()> {
-        self.auth_manager.as_ref().map(|auth| auth.policy_auth_snapshot()
-            .map(|(epoch, _)| epoch).map_err(|_| ())).transpose()
+    fn admission_epoch(&self) -> Result<u64, ()> {
+        self.auth_manager.policy_auth_snapshot()
+            .map(|(epoch, _)| epoch).map_err(|_| ())
     }
 
     fn try_reserve(&self) -> Option<AnalyticsPermit<'_>> {
@@ -291,9 +268,7 @@ impl AnalyticsEventsQueue {
     ) -> Option<AnalyticsPermit<'_>> {
         let Some(mut key) = key else { return self.try_reserve(); };
         let epoch = self.admission_epoch().ok()?;
-        if let Some(epoch) = epoch {
-            key.0 = format!("{epoch}:{}", key.0);
-        }
+        key.0 = format!("{epoch}:{}", key.0);
         let mut emitted = emitted.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if emitted.contains(&key) {
@@ -639,7 +614,7 @@ impl AnalyticsEventsClient {
         });
     }
 
-    pub fn track_server_request(&self, connection_id: u64, request: &ServerRequest) {
+    pub fn track_server_request(&self, _connection_id: u64, request: &ServerRequest) {
         let Some(queue) = self.queue.as_ref() else {
             return;
         };
@@ -655,7 +630,6 @@ impl AnalyticsEventsClient {
             return;
         };
         permit.send(AnalyticsFact::ServerRequest {
-            connection_id,
             request: Box::new(request.clone()),
         });
     }
@@ -862,11 +836,9 @@ async fn send_track_events_request(
         Ok(response) if response.status().is_success() => {}
         Ok(response) => {
             let status = response.status();
-            let metadata =
-                analytics_failure_log_metadata(status.as_u16(), response.content_length());
             tracing::warn!(
-                status = metadata.status,
-                declared_body_bytes = metadata.declared_body_bytes,
+                status = status.as_u16(),
+                declared_body_bytes = response.content_length(),
                 "events request failed"
             );
         }

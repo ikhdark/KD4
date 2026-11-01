@@ -94,7 +94,7 @@ pub(crate) fn connect_proxy_stream(uri: &Uri, host: &str, port: u16) -> Result<O
 }
 
 fn proxy_from_env_for_host(host: &str, port: u16, mode: Mode) -> Result<Option<ProxyConfig>> {
-    if should_bypass_proxy(host, port)? {
+    if should_bypass_proxy(host, port) {
         return Ok(None);
     }
 
@@ -116,19 +116,19 @@ fn get_env_first(keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| env::var(key).ok()).filter(|value| !value.is_empty())
 }
 
-fn should_bypass_proxy(host: &str, port: u16) -> Result<bool> {
+fn should_bypass_proxy(host: &str, port: u16) -> bool {
     let no_proxy = get_env_first(&["NO_PROXY", "no_proxy"]);
     let Some(no_proxy) = no_proxy else {
-        return Ok(false);
+        return false;
     };
 
     let host = normalize_host(host);
     let no_proxy = no_proxy.trim();
     if no_proxy.is_empty() {
-        return Ok(false);
+        return false;
     }
     if no_proxy == "*" {
-        return Ok(true);
+        return true;
     }
 
     for token in no_proxy.split(',') {
@@ -147,20 +147,20 @@ fn should_bypass_proxy(host: &str, port: u16) -> Result<bool> {
         let token_host = normalize_host(token_host);
 
         if host == token_host {
-            return Ok(true);
+            return true;
         }
 
         if token_host.starts_with('.') {
             let token_host = &token_host[1..];
             if host == token_host || host.ends_with(&format!(".{token_host}")) {
-                return Ok(true);
+                return true;
             }
         } else if host.ends_with(&format!(".{token_host}")) {
-            return Ok(true);
+            return true;
         }
     }
 
-    Ok(false)
+    false
 }
 
 fn split_host_port(token: &str) -> (&str, Option<u16>) {
@@ -301,10 +301,10 @@ fn connect_to_proxy(proxy: &ProxyConfig) -> Result<TcpStream> {
     ))))
 }
 
-fn basic_auth_header(auth: &ProxyAuth) -> Result<String> {
+fn basic_auth_header(auth: &ProxyAuth) -> String {
     let token = format!("{}:{}", auth.username, auth.password);
     let encoded = data_encoding::BASE64.encode(token.as_bytes());
-    Ok(format!("Basic {encoded}"))
+    format!("Basic {encoded}")
 }
 
 fn read_connect_response(reader: &mut impl Read) -> Result<Vec<u8>> {
@@ -337,7 +337,7 @@ pub fn build_http_connect_request(authority: &str, auth: Option<&ProxyAuth>) -> 
     request.extend_from_slice(format!("Host: {authority}\r\n").as_bytes());
     request.extend_from_slice(b"Proxy-Connection: Keep-Alive\r\n");
     if let Some(auth) = auth {
-        let token = basic_auth_header(auth)?;
+        let token = basic_auth_header(auth);
         request.extend_from_slice(format!("Proxy-Authorization: {token}\r\n").as_bytes());
     }
     request.extend_from_slice(b"\r\n");

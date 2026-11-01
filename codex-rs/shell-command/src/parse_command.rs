@@ -86,19 +86,18 @@ pub fn parse_command_impl(command: &[String]) -> Vec<ParsedCommand> {
 
     let parts = drop_small_formatting_commands(parts, &operators);
 
-    // Preserve left-to-right execution order for all commands, including bash -c/-lc
-    // so summaries reflect the order they will run.
+    summarize_commands(&parts).unwrap_or_else(|| vec![single_unknown_for_command(command)])
+}
 
-    // Map each pipeline segment to its parsed summary, tracking `cd` to compute paths.
-    let mut commands: Vec<ParsedCommand> = Vec::new();
+/// Summarize source-ordered commands with one shared cwd/rebasing policy.
+fn summarize_commands(parts: &[Vec<String>]) -> Option<Vec<ParsedCommand>> {
+    let mut commands = Vec::new();
     let mut cwd: Option<String> = None;
-    for tokens in &parts {
+    for tokens in parts {
         if let Some((head, tail)) = tokens.split_first()
             && head == "cd"
         {
-            let Some(dir) = cd_target(tail) else {
-                return vec![single_unknown_for_command(command)];
-            };
+            let dir = cd_target(tail)?;
             cwd = Some(match &cwd {
                 Some(base) => join_paths(base, &dir),
                 None => dir,
@@ -125,8 +124,7 @@ pub fn parse_command_impl(command: &[String]) -> Vec<ParsedCommand> {
     }
 
     simplify_commands(&mut commands);
-
-    commands
+    Some(commands)
 }
 
 fn simplify_commands(commands: &mut Vec<ParsedCommand>) {
@@ -538,41 +536,11 @@ pub fn parse_shell_script(script: &str) -> Vec<ParsedCommand> {
                 cmd: script.to_string(),
             }];
         }
-        // Build parsed commands, tracking `cd` segments to compute effective file paths.
-        let mut commands: Vec<ParsedCommand> = Vec::new();
-        let mut cwd: Option<String> = None;
-        for tokens in filtered_commands.into_iter() {
-            if let Some((head, tail)) = tokens.split_first()
-                && head == "cd"
-            {
-                if let Some(dir) = cd_target(tail) {
-                    cwd = Some(match &cwd {
-                        Some(base) => join_paths(base, &dir),
-                        None => dir.clone(),
-                    });
-                }
-                continue;
-            }
-            let parsed = summarize_main_tokens(&tokens);
-            let parsed = match parsed {
-                ParsedCommand::Read { cmd, name, path } => {
-                    if let Some(base) = &cwd {
-                        let full = join_paths(base, &path.to_string_lossy());
-                        ParsedCommand::Read {
-                            cmd,
-                            name,
-                            path: PathBuf::from(full),
-                        }
-                    } else {
-                        ParsedCommand::Read { cmd, name, path }
-                    }
-                }
-                other => other,
-            };
-            commands.push(parsed);
-        }
-
-        simplify_commands(&mut commands);
+        let Some(mut commands) = summarize_commands(&filtered_commands) else {
+            return vec![ParsedCommand::Unknown {
+                cmd: script.to_string(),
+            }];
+        };
         if commands.len() == 1 {
             // If we reduced to a single command, attribute the full original script
             // for clearer UX in file-reading and listing scenarios, or when there were

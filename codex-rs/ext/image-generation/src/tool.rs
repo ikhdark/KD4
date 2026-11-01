@@ -9,8 +9,8 @@ use codex_api::ImageEditRequest;
 use codex_api::ImageGenerationRequest;
 use codex_api::ImageQuality;
 use codex_api::ImageUrl;
-use codex_core::context::extension_image_generation_output_hint;
-use codex_core::image_generation_artifact_path;
+use codex_conversation::context::extension_image_generation_output_hint;
+use codex_tool_artifacts::image_generation_artifact_path;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::LOCAL_FS;
@@ -508,7 +508,7 @@ fn recent_images(history: &[ResponseItem], count: usize) -> Vec<ImageUrl> {
     let boundary = history.iter().rposition(|item| match item {
         ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. } => true,
         ResponseItem::Message { content, .. } => content.iter().any(|item| {
-            matches!(item, ContentItem::InputText { text } if text.starts_with(codex_core::compact::SUMMARY_PREFIX))
+            matches!(item, ContentItem::InputText { text } if text.starts_with(codex_prompts::SUMMARY_PREFIX))
         }),
         _ => false,
     });

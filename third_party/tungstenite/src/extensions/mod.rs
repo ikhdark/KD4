@@ -133,7 +133,7 @@ impl ExtensionsConfig {
     pub(crate) fn accept_offers(
         &self,
         extensions: &SecWebsocketExtensions,
-    ) -> Result<(Extensions, Option<SecWebsocketExtensions>), ExtensionsError> {
+    ) -> (Extensions, Option<SecWebsocketExtensions>) {
         #[cfg_attr(not(feature = "deflate"), allow(unused_mut))]
         let mut per_message_compression = None;
 
@@ -211,10 +211,10 @@ impl ExtensionsConfig {
             None => (None, None),
         };
 
-        Ok((
+        (
             Extensions { per_message_compression },
             response.map(|response| SecWebsocketExtensions::new(std::iter::once(response))),
-        ))
+        )
     }
 }
 

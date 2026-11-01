@@ -23,9 +23,6 @@ impl AgentPath {
         Self(Self::ROOT.to_string())
     }
 
-    pub fn morpheus() -> Self {
-        Self(Self::MORPHEUS.to_string())
-    }
 
     pub fn from_string(path: String) -> Result<Self, String> {
         validate_absolute_path(path.as_str())?;

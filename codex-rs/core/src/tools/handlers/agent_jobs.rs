@@ -1,7 +1,6 @@
 use crate::FunctionCallError;
 use crate::agent::control::AgentJobBinding;
 use crate::agent::control::SpawnAgentOptions;
-use crate::agent::role::AgentRoleLocks;
 use crate::agent::status::is_final;
 use crate::config::Config;
 use crate::environment_selection::TurnEnvironmentSnapshot;
@@ -215,6 +214,20 @@ impl Drop for AgentJobCleanupOwner {
     }
 }
 
+/// Native CSV streaming/publication currently uses host file handles, not the
+/// selected executor's sandbox-aware filesystem port. Do not infer authority
+/// from a job/destination receipt or from merely having a local environment.
+pub(crate) fn native_csv_filesystem_supported(
+    policy: &codex_protocol::permissions::FileSystemSandboxPolicy,
+) -> bool {
+    policy.has_full_disk_read_access() && policy.has_full_disk_write_access()
+}
+
+pub(crate) fn native_csv_execution_supported(step: &StepContext) -> bool {
+    native_csv_filesystem_supported(&step.turn.file_system_sandbox_policy())
+        && spawn_agents_on_csv::single_local_environment_cwd(&step.environments).is_ok()
+}
+
 fn required_state_db(
     session: &Arc<Session>,
 ) -> Result<Arc<codex_state::StateRuntime>, FunctionCallError> {
@@ -251,7 +264,6 @@ async fn build_runner_options(
         &mut spawn_config,
         /*requested_model*/ None,
         /*requested_reasoning_effort*/ None,
-        AgentRoleLocks::default(),
     )
     .await?;
     apply_spawn_agent_service_tier(
@@ -865,10 +877,16 @@ async fn export_job_csv_snapshot(
 
 pub(crate) async fn reconcile_orphaned_agent_jobs_after_restart(
     db: Arc<codex_state::StateRuntime>,
+    native_filesystem_supported: bool,
 ) -> anyhow::Result<()> {
     // The terminal transaction retains export obligations even if loading its
     // returned job summaries fails. Drain previously pending exports regardless.
     let reconciliation = db.reconcile_orphaned_agent_jobs_after_restart().await;
+    if !native_filesystem_supported {
+        // Preserve pending export obligations without claiming them or opening
+        // stored external destinations under a restricted startup profile.
+        return reconciliation.map(|_| ()).map_err(Into::into);
+    }
     let pending = db.claim_agent_job_recovery_exports().await?;
     let mut export_errors = Vec::new();
     if let Err(error) = reconciliation {
@@ -909,7 +927,10 @@ pub(crate) async fn reconcile_orphaned_agent_jobs_after_restart(
     }
 }
 
-pub(crate) fn start_orphaned_agent_job_reconciler(db: Arc<codex_state::StateRuntime>) {
+pub(crate) fn start_orphaned_agent_job_reconciler(
+    db: Arc<codex_state::StateRuntime>,
+    native_filesystem_supported: bool,
+) {
     let runner_instance_id = db.agent_job_runner_instance_id().to_string();
     {
         let mut active = ACTIVE_AGENT_JOB_RECONCILERS
@@ -931,8 +952,15 @@ pub(crate) fn start_orphaned_agent_job_reconciler(db: Arc<codex_state::StateRunt
             if db.is_closed() {
                 break;
             }
-            if let Err(error) = reconcile_orphaned_agent_jobs_after_restart(db).await {
+            if let Err(error) = reconcile_orphaned_agent_jobs_after_restart(
+                db, native_filesystem_supported,
+            ).await {
                 tracing::warn!(%error, "failed to reconcile expired agent job runner leases");
+            }
+            if !native_filesystem_supported {
+                // Allow a later unrestricted session to start the existing
+                // export owner; this one performed database-only recovery.
+                break;
             }
         }
         ACTIVE_AGENT_JOB_RECONCILERS

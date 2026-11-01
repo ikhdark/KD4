@@ -14,7 +14,6 @@ use codex_config::schema::canonicalize as canonicalize_json;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt;
-use codex_protocol::protocol::TurnTimingGenerationDisposition;
 use codex_protocol::protocol::TurnTimingGenerationPurpose;
 use codex_protocol::protocol::TurnTimingProgressKind;
 use codex_tools::ToolName;
@@ -32,7 +31,6 @@ use crate::tool_history::SourceDependencyV1;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::turn_timing::TurnTimingState;
 use crate::validation::ValidationClassification;
-use crate::validation::ValidationOperation;
 use crate::validation::classify_validation;
 
 /// Most paths one completion message names; the rest are counted.
@@ -69,7 +67,6 @@ pub(crate) enum ContinuationDisposition {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GenerationRequestDisposition {
     pub(crate) purpose: Option<TurnTimingGenerationPurpose>,
-    pub(crate) sampling: SamplingGenerationDisposition,
     pub(crate) relevant_state_fingerprint: String,
     pub(crate) failure_fingerprint: Option<String>,
     pub(crate) terminal_completion_only: bool,
@@ -78,24 +75,12 @@ pub(crate) struct GenerationRequestDisposition {
 impl GenerationRequestDisposition {
     pub(crate) fn require_terminal_completion(mut self) -> Self {
         self.purpose = Some(TurnTimingGenerationPurpose::TerminalCompletionReasoning);
-        self.sampling = SamplingGenerationDisposition::DecisionBearing;
         self.terminal_completion_only = true;
         self
     }
 
-    pub(crate) fn timing_disposition(&self) -> TurnTimingGenerationDisposition {
-        match &self.sampling {
-            SamplingGenerationDisposition::DecisionBearing => {
-                TurnTimingGenerationDisposition::DecisionBearing
-            }
-        }
-    }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum SamplingGenerationDisposition {
-    DecisionBearing,
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SamplingRequestBaselines {
@@ -433,11 +418,7 @@ struct SamplingRequestSignalState {
 
     validation_ordinals: BTreeSet<u64>,
     validation_check_identities: BTreeMap<u64, String>,
-    validation_launch_identities: BTreeMap<u64, String>,
     validation_check_descriptions: BTreeMap<u64, String>,
-    test_validation_ordinals: BTreeSet<u64>,
-    final_verification_ordinals: BTreeSet<u64>,
-    mutation_ordinals: BTreeSet<u64>,
     suppressed_blocked_wait: bool,
     deterministic_continuation_receipts: BTreeSet<String>,
     registered_count: usize,
@@ -460,11 +441,7 @@ struct SamplingRequestSignalState {
     authoritative_wait_observations: Vec<AuthoritativeWaitObservation>,
     /// Wake-event identities of child progress the agent wait owner delivered.
     agent_deliveries: Vec<String>,
-    child_runtime_ms: u64,
-    child_runtime_sample_count: usize,
-    child_runtime_by_call: BTreeMap<String, u64>,
     call_ordinals: BTreeMap<String, u64>,
-    delivered_output_bytes: usize,
 }
 
 impl SamplingRequestSignalState {
@@ -483,8 +460,6 @@ impl SamplingRequestSignalState {
             }
         }
         if let Some(identity) = serialized_evidence_identity(&(tool_name, &arguments)) {
-            self.validation_launch_identities
-                .insert(ordinal, identity.clone());
             self.validation_check_identities.insert(ordinal, identity);
         }
         self.validation_check_descriptions.insert(
@@ -515,9 +490,6 @@ impl SamplingRequestSignalState {
         if validation["validation"] == true {
             self.saw_validation = true;
             self.validation_ordinals.insert(ordinal);
-        }
-        if validation["tests"] == true {
-            self.test_validation_ordinals.insert(ordinal);
         }
     }
     fn wrapper_ordinals(&self) -> BTreeSet<u64> {
@@ -653,22 +625,11 @@ impl SamplingRequestSignalCollector {
         crate::tools::registry::ToolSemanticCapabilities::default()
     }
 
-    fn validation_semantics(
-        &self,
-        tool_name: &ToolName,
-        arguments: &Value,
-    ) -> (bool, bool, bool, bool) {
+    fn validation_semantics(&self, tool_name: &ToolName, arguments: &Value) -> bool {
         let Some(format) = self.runtime_semantics(tool_name).command else {
-            return (false, false, false, false);
+            return false;
         };
-        let wire_name = format.canonical_name();
-        let (validation, proof, tests) = validation_status_from_arguments(&wire_name, arguments);
-        (
-            validation,
-            proof,
-            tests,
-            final_diff_status_from_arguments(&wire_name, arguments),
-        )
+        validation_status_from_arguments(&format.canonical_name(), arguments)
     }
 
     pub(crate) fn completion_evidence_key(&self) -> Option<String> {
@@ -723,8 +684,7 @@ impl SamplingRequestSignalCollector {
         let action_identity = deterministic_action_identity(tool_name, &canonical);
         let structured_action =
             structured_action_identity_from_canonical(tool_name, payload, &canonical);
-        let (validation, _validation_proof, test_execution, final_verification) =
-            self.validation_semantics(tool_name, &canonical.value);
+        let validation = self.validation_semantics(tool_name, &canonical.value);
         let semantics = self.runtime_semantics(tool_name);
         let mutation = semantics.mutation;
 
@@ -808,15 +768,6 @@ impl SamplingRequestSignalCollector {
         if validation {
             state.validation_ordinals.insert(ordinal);
         }
-        if test_execution {
-            state.test_validation_ordinals.insert(ordinal);
-        }
-        if final_verification {
-            state.final_verification_ordinals.insert(ordinal);
-        }
-        if mutation {
-            state.mutation_ordinals.insert(ordinal);
-        }
         if let Some(structured_action) = structured_action {
             state.structured_actions.insert(ordinal, structured_action);
         }
@@ -842,24 +793,6 @@ impl SamplingRequestSignalCollector {
             ledger.blocked_wait_gate = None;
         }
     }
-
-    /// A call contributes at most one timing sample, even when its completion
-    /// is observed again. The call ID also binds mixed-request validation costs.
-    pub(crate) fn record_child_runtime_for_call(&self, call_id: &str, runtime_ms: u64) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.child_runtime_by_call.contains_key(call_id) {
-            return;
-        }
-        state
-            .child_runtime_by_call
-            .insert(call_id.to_string(), runtime_ms);
-        state.child_runtime_ms = state.child_runtime_ms.saturating_add(runtime_ms);
-        state.child_runtime_sample_count = state.child_runtime_sample_count.saturating_add(1);
-    }
-
 
     pub(crate) fn record_suppressed_result(&self, ordinal: u64, response: &ResponseInputItem) {
         let mut state = self
@@ -1040,8 +973,7 @@ impl SamplingRequestSignalCollector {
         let canonical = canonical_tool_action(payload);
         let structured_action =
             structured_action_identity_from_canonical(tool_name, payload, &canonical);
-        let (validation, _validation_proof, test_execution, final_verification) =
-            self.validation_semantics(tool_name, &canonical.value);
+        let validation = self.validation_semantics(tool_name, &canonical.value);
         let semantics = self.runtime_semantics(tool_name);
         let mutation = semantics.mutation;
         let evidence_identity = outcome
@@ -1096,15 +1028,6 @@ impl SamplingRequestSignalCollector {
         state.observe_command_validation(ordinal, signal);
         if validation {
             state.validation_ordinals.insert(ordinal);
-        }
-        if test_execution {
-            state.test_validation_ordinals.insert(ordinal);
-        }
-        if final_verification {
-            state.final_verification_ordinals.insert(ordinal);
-        }
-        if mutation {
-            state.mutation_ordinals.insert(ordinal);
         }
         state.accumulate_code_mode_source_dependencies(cell_id, source_dependencies);
         if outcome.is_failure_evidence() && signal.is_none() {
@@ -1165,7 +1088,7 @@ impl SamplingRequestSignalCollector {
             .and_then(|(payload, canonical)| {
                 structured_action_identity_from_canonical(tool_name, payload, canonical)
             });
-        let (validation, _validation_proof, test_execution, final_verification) = canonical
+        let validation = canonical
             .as_ref()
             .map(|canonical| self.validation_semantics(tool_name, &canonical.value))
             .unwrap_or_default();
@@ -1188,15 +1111,6 @@ impl SamplingRequestSignalCollector {
         }
         if validation {
             state.validation_ordinals.insert(ordinal);
-        }
-        if test_execution {
-            state.test_validation_ordinals.insert(ordinal);
-        }
-        if final_verification {
-            state.final_verification_ordinals.insert(ordinal);
-        }
-        if mutation {
-            state.mutation_ordinals.insert(ordinal);
         }
         state.accumulate_code_mode_source_dependencies(cell_id, source_dependencies);
         state.outcomes.push(outcome);
@@ -1331,7 +1245,6 @@ impl SamplingRequestSignalCollector {
             // busy admission, and cannot create repair or replay authority.
             let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             state.validation_ordinals.remove(&ordinal);
-            state.test_validation_ordinals.remove(&ordinal);
             let mut outcome = SamplingToolOutcome::from_signal(
                 ordinal, ToolOutputOutcomeContext::new(ToolOutputOutcome::Skipped), None, None,
             );
@@ -1391,9 +1304,6 @@ impl SamplingRequestSignalCollector {
         }
 
         state.saw_canonical_artifact_requirement |= canonical_artifact_required;
-        state.delivered_output_bytes = state
-            .delivered_output_bytes
-            .saturating_add(response_replay_text_size(response).unwrap_or(0));
         state.outcomes.push(outcome);
         if let Some(evidence_identity) = evidence_identity {
             state.evidence_items.insert(ordinal, evidence_identity);
@@ -1674,10 +1584,6 @@ impl SamplingRequestSignalCollector {
 
 
     pub(crate) fn observed_successful_process_monitor(&self) -> bool {
-        self.monitoring_only_generation(false)
-    }
-
-    fn monitoring_only_generation(&self, yielded_only: bool) -> bool {
         let state = self
             .state
             .lock()
@@ -1692,15 +1598,11 @@ impl SamplingRequestSignalCollector {
         expected > 0
             && outcomes.len() == expected
             && outcomes.iter().all(|outcome| {
-                let eligible = if yielded_only {
-                    outcome.kind == SamplingToolOutcomeKind::Yielded
-                } else {
-                    state.process_monitor_ordinals.contains(&outcome.ordinal)
-                        && matches!(
-                            outcome.kind,
-                            SamplingToolOutcomeKind::Success | SamplingToolOutcomeKind::Yielded
-                        )
-                };
+                let eligible = state.process_monitor_ordinals.contains(&outcome.ordinal)
+                    && matches!(
+                        outcome.kind,
+                        SamplingToolOutcomeKind::Success | SamplingToolOutcomeKind::Yielded
+                    );
                 eligible && outcome.process_observation_progress
             })
     }
@@ -2176,28 +2078,6 @@ fn response_output_text(response: &ResponseInputItem) -> Option<Cow<'_, str>> {
     }
 }
 
-fn response_replay_text_size(response: &ResponseInputItem) -> Option<usize> {
-    use codex_protocol::models::FunctionCallOutputBody;
-    use codex_protocol::models::FunctionCallOutputContentItem;
-
-    let output = match response {
-        ResponseInputItem::FunctionCallOutput { output, .. }
-        | ResponseInputItem::CustomToolCallOutput { output, .. } => output,
-        _ => return None,
-    };
-    match &output.body {
-        FunctionCallOutputBody::Text(text) => Some(text.len()),
-        // Keep the original content array on replay. Non-text content still
-        // needs normal dispatch, and cannot bypass the byte limit via its text.
-        FunctionCallOutputBody::ContentItems(items) => {
-            items.iter().try_fold(0usize, |size, item| match item {
-                FunctionCallOutputContentItem::InputText { text } => size.checked_add(text.len()),
-                _ => None,
-            })
-        }
-    }
-}
-
 fn authoritative_wait_observation(
     expected_adapter: &str,
     tool_name: &ToolName,
@@ -2341,80 +2221,14 @@ fn command_invocation(tool_name: &ToolName, arguments: &Value) -> Option<Command
 }
 
 
-fn validation_status_from_arguments(tool_name: &ToolName, arguments: &Value) -> (bool, bool, bool) {
+fn validation_status_from_arguments(tool_name: &ToolName, arguments: &Value) -> bool {
     let Some(invocation) = command_invocation(tool_name, arguments) else {
-        return (false, false, false);
+        return false;
     };
-    match classify_validation(&invocation) {
-        ValidationClassification::Validation { leaves, .. } if !leaves.is_empty() => (
-            true,
-            true,
-            leaves.iter().any(|leaf| {
-                leaf.operation == ValidationOperation::Test
-                    && leaf.mode
-                        == codex_shell_command::validation::ValidationExecutionMode::Execution
-            }),
-        ),
-        _ => (false, false, false),
-    }
-}
-
-fn final_diff_status_from_arguments(tool_name: &ToolName, arguments: &Value) -> bool {
-    match command_invocation(tool_name, arguments) {
-        Some(CommandInvocation::Argv { program, args }) => final_diff_status_program_is_read_only(
-            &program,
-            &args.iter().map(String::as_str).collect::<Vec<_>>(),
-        ),
-        Some(CommandInvocation::Script(script) | CommandInvocation::PowerShellScript(script)) => {
-            final_diff_status_script_is_read_only(&script)
-        }
-        _ => false,
-    }
-}
-
-fn final_diff_status_script_is_read_only(script: &str) -> bool {
-    let script = script.trim();
-    if script.is_empty()
-        || script
-            .chars()
-            .any(|character| matches!(character, '|' | '>' | '<' | '`' | '$' | '(' | ')'))
-    {
-        return false;
-    }
-
-    let without_conjunctions = script.replace("&&", ";");
-    if without_conjunctions.contains('&') {
-        return false;
-    }
-    let normalized = without_conjunctions.replace(['\r', '\n'], ";");
-    let clauses = normalized
-        .split(';')
-        .map(str::trim)
-        .filter(|clause| !clause.is_empty())
-        .collect::<Vec<_>>();
-    if clauses.is_empty() {
-        return false;
-    }
-
-    clauses.iter().all(|clause| {
-        let words = clause.split_whitespace().collect::<Vec<_>>();
-        match words.split_first() {
-            Some((program, args)) => final_diff_status_program_is_read_only(program, args),
-            None => false,
-        }
-    })
-}
-
-fn final_diff_status_program_is_read_only(program: &str, args: &[&str]) -> bool {
-    let basename = program
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(program)
-        .to_ascii_lowercase();
-    let basename = basename.strip_suffix(".exe").unwrap_or(&basename);
-    basename == "git"
-        && matches!(args.first().copied(), Some("diff" | "status"))
-        && classify_read_only_evidence_program(program, args) != StructuredActionClass::Other
+    matches!(
+        classify_validation(&invocation),
+        ValidationClassification::Validation { leaves, .. } if !leaves.is_empty()
+    )
 }
 
 fn is_wait_tool(tool_name: &ToolName) -> bool {
@@ -2594,12 +2408,8 @@ pub(crate) struct TurnExecutionControl {
 
 
 
-    /// Completed generations since the last one that produced new evidence
-    /// (including child progress delivered to this thread), a workspace
-    /// mutation, or a plan/input change.
-    continuations_without_progress: u32,
-    /// Wake events already credited as delivered child progress this turn.
-    /// They reset only the soft no-progress streak, not the evidence digest.
+    /// Delivered child event identities credited to this turn's evidence digest.
+    /// Re-reading an event must not manufacture new evidence.
     delivered_agent_events: BTreeSet<String>,
     plan: Option<crate::plan_store::PlanExecutionSnapshot>,
     /// An inherited completed checklist is not a final-answer hint for new input.
@@ -2620,14 +2430,6 @@ pub(crate) struct TurnExecutionControl {
     /// Latest native snapshot per locator; avoid scanning every file on each read.
     evidence_fingerprint: OnceLock<String>,
     artifact_source_coverage: BTreeMap<String, BTreeSet<String>>,
-    /// The turn diff tracker's map, adopted at each settlement boundary by
-    /// `retain_validation_across_changes`. Validation bookkeeping below is kept
-    /// in validation revisions; callers pass mutation revisions, which also
-    /// advance for evidence-only observations.
-    /// Validation revision proven by this turn's last passing validation.
-    validated_mutation_revision: Option<u64>,
-    /// The last fresh passing execution's coverage entry, if it has one.
-    /// Re-proving its dependencies does not rewrite the execution revision.
     /// Last terminal result for each check, retained only within this turn.
     failed_validation_checks: BTreeSet<String>,
     validation_check_descriptions: BTreeMap<String, String>,
@@ -2657,7 +2459,6 @@ impl TurnExecutionControl {
 
 
 
-            continuations_without_progress: 0,
             delivered_agent_events: BTreeSet::new(),
             plan: None,
             plan_updated_since_input: false,
@@ -2674,7 +2475,6 @@ impl TurnExecutionControl {
             delivered_coverage: BTreeMap::new(),
             evidence_fingerprint: OnceLock::new(),
             artifact_source_coverage: BTreeMap::new(),
-            validated_mutation_revision: None,
             failed_validation_checks: BTreeSet::new(),
             validation_check_descriptions: BTreeMap::new(),
 
@@ -2706,34 +2506,10 @@ impl TurnExecutionControl {
         self.plan = plan;
     }
 
-    /// Validation settles against source revisions: an uncertain command whose
-    /// Git-visible workspace (outside Git, its bounded workspace tree) was
-    /// unchanged advances only the mutation revision.
-    pub(crate) fn validation_revision_at(&self, mutation_revision: u64) -> u64 {
-        mutation_revision
-    }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     /// Retain known check failures and declared scope debt at the terminal boundary.
     /// A completed checklist is not task-acceptance proof, but an unresolved
     /// owner requirement must not disappear from warnings, resume or child handoffs.
-    fn completion_assessment(
-        &self,
-        _settled_mutation_revision: u64,
-    ) -> codex_protocol::protocol::TurnCompletionAssessment {
+    pub(crate) fn completion_assessment(&self) -> codex_protocol::protocol::TurnCompletionAssessment {
         codex_protocol::protocol::TurnCompletionAssessment {
             failed_checks: self.failed_validation_checks.iter().map(|check| {
                 self.validation_check_descriptions.get(check).cloned().unwrap_or_else(|| check.clone())
@@ -2749,19 +2525,6 @@ impl TurnExecutionControl {
             ..Default::default()
         }
     }
-
-
-    pub(crate) fn completion_assessment_with_runtime_inputs(
-        &self,
-        settled_mutation_revision: u64,
-        _changed_paths: Option<&[(String, std::path::PathBuf)]>,
-        _has_untracked_changes: bool,
-        _runtime_inputs: &[(String, std::path::PathBuf)],
-    ) -> codex_protocol::protocol::TurnCompletionAssessment {
-        self.completion_assessment(settled_mutation_revision)
-    }
-
-
 
 
     /// Owner-derived checklist accounting only, never proof of task completion.
@@ -2797,7 +2560,7 @@ impl TurnExecutionControl {
 
 
 
-    /// Share one novelty decision between the emergency allowance and telemetry.
+    /// Classify novelty for generation telemetry and convergence evidence.
     /// New call IDs, replayed results, and repeated validation/failure evidence
     /// must not be reported as progress just because an observation occurred.
     pub(crate) fn observe_progress(
@@ -2816,7 +2579,6 @@ impl TurnExecutionControl {
             progress.push(TurnTimingProgressKind::WorkspaceMutation);
         }
         let wrappers = state.wrapper_ordinals();
-        let mut process_progress = false;
         for outcome in &state.outcomes {
 
             if outcome.failure_diagnosis_reused
@@ -2826,9 +2588,7 @@ impl TurnExecutionControl {
                 continue;
             }
             if outcome.kind == SamplingToolOutcomeKind::Yielded {
-                // Monitoring can advance without a terminal source result. Keep
-                // the existing generation refund and soft convergence in agreement.
-                process_progress |= outcome.process_observation_progress;
+                // A yielded observation is not a completed source result.
                 continue;
             }
             if let Some(novel) = outcome.source_evidence.as_ref().and_then(|evidence| {
@@ -2898,22 +2658,14 @@ impl TurnExecutionControl {
         progress.sort_by_key(|kind| *kind as u8);
         progress.dedup();
 
-        // A coordinating thread's evidence arrives as child progress, not as
-        // its own reads. Like process monitoring, novel delivered progress ends
-        // the soft no-progress streak without claiming a source-evidence kind;
-        // empty or re-read waits still count toward the intervention.
+        // Delivered child progress changes the evidence identity without claiming
+        // that this coordinating thread acquired new source evidence itself.
         let mut agent_delivery_progress = false;
         for event in &state.agent_deliveries {
             agent_delivery_progress |= self.delivered_agent_events.insert(event.clone());
         }
         if agent_delivery_progress {
             self.evidence_fingerprint.take();
-        }
-        if !progress.is_empty() || process_progress || agent_delivery_progress {
-            self.continuations_without_progress = 0;
-        } else {
-            self.continuations_without_progress =
-                self.continuations_without_progress.saturating_add(1);
         }
         progress
     }
@@ -3058,7 +2810,6 @@ impl TurnExecutionControl {
     ) -> GenerationRequestDisposition {
         GenerationRequestDisposition {
             purpose: Some(TurnTimingGenerationPurpose::InitialReasoning),
-            sampling: SamplingGenerationDisposition::DecisionBearing,
             relevant_state_fingerprint: baselines.relevant_state_fingerprint(),
             failure_fingerprint: None,
             terminal_completion_only: false,
@@ -3085,7 +2836,6 @@ impl TurnExecutionControl {
             // tool even when the preceding response changed no tracked state.
             // Only an explicit owner result may complete work without sampling.
             purpose: collector.generation_purpose(baselines, settled, has_pending_input, false),
-            sampling: SamplingGenerationDisposition::DecisionBearing,
             relevant_state_fingerprint,
             failure_fingerprint: analysis
                 .deterministic_cycle()
@@ -3101,10 +2851,9 @@ impl TurnExecutionControl {
 
         self.input_revision = self.input_revision.saturating_add(1);
         // Without new instructions, accepted input is a child's or peer's
-        // delivered report or final answer: new information that ends a soft
-        // no-progress streak. Only new instructions re-arm the one-shot
+        // delivered report or final answer: new information. Only new
+        // instructions re-arm the one-shot
         // intervention or reset passive cycle identity.
-        self.continuations_without_progress = 0;
         if instructions_changed {
             self.plan_work_since_user_input = false;
             self.completion_reconciliation_issued = false;
@@ -3245,7 +2994,6 @@ impl TurnExecutionControl {
             || self.instruction_revision != baselines.instruction_revision
             || settled.tool_exposure_revision != baselines.tool_exposure_revision
         {
-            self.continuations_without_progress = 0;
             self.reset_convergence();
             self.last_state_revision = Some(settled_revision);
             return SamplingConvergenceDecision::default();
@@ -3377,8 +3125,7 @@ impl TurnExecutionControl {
         }
 
         let Some(cycle) = analysis.deterministic_cycle() else {
-            // Unknown semantics cannot prove a repeat, but do not erase the
-            // independent soft-advisory accounting or prior observations.
+            // Unknown semantics cannot prove a repeat or erase prior observations.
             self.last_state_revision = Some(settled_revision);
             return SamplingConvergenceDecision::default();
         };
@@ -3459,9 +3206,7 @@ impl TurnExecutionControl {
 
     pub(crate) fn settle(
         &mut self,
-        _baselines: &SamplingRequestBaselines,
         collector: &SamplingRequestSignalCollector,
-        settled: &SamplingRequestSettledState,
     ) {
         // Keep only the latest terminal observation for each check in this turn.
         {
@@ -3503,7 +3248,6 @@ impl TurnExecutionControl {
                         self.validation_check_orders.insert(check.clone(), order);
                         if outcome.kind == SamplingToolOutcomeKind::Success {
                             self.failed_validation_checks.remove(&check);
-                            self.validated_mutation_revision = Some(settled.mutation_revision);
                         } else {
                             self.failed_validation_checks.insert(check.clone());
                             if let Some(excerpt) = &outcome.validation_failure_excerpt {

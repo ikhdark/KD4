@@ -18,9 +18,9 @@ from openai_codex import (
     AsyncCodex,
     JsonRpcError,
     ServerBusyError,
+    TurnRunError,
     is_retryable_error,
 )
-from openai_codex.types import TurnStatus
 
 ResultT = TypeVar("ResultT")
 
@@ -71,9 +71,8 @@ async def main() -> None:
         except JsonRpcError as exc:
             print(f"JSON-RPC error {exc.code}: {exc.message}")
             return
-
-        if result.status == TurnStatus.failed:
-            print("Turn failed:", result.error)
+        except TurnRunError as exc:
+            print("Turn failed or incomplete:", exc)
             return
 
         print("Text:", result.final_response)

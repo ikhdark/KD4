@@ -383,8 +383,8 @@ impl McpConnectionManager {
             if !client.startup_complete.load(Ordering::Acquire)
                 || client
                     .startup_reconnect
-                    .as_ref()
-                    .is_some_and(|reconnect| reconnect.pending_client().is_some())
+                    .pending_client()
+                    .is_some()
             {
                 pending.push(name.clone());
             } else {

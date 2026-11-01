@@ -287,9 +287,6 @@ impl ValidationPolicyClassification {
         matches!(self, Self::TargetedCompilation | Self::Benchmark | Self::Tooling | Self::Tests | Self::Checks | Self::Restricted)
     }
 
-    pub fn is_compile_eligible(self) -> bool {
-        matches!(self, Self::TargetedCompilation)
-    }
 }
 
 fn combine_policy_classifications(
@@ -1147,14 +1144,6 @@ fn execution_mode(
     if operation == ValidationOperation::Lint && has(&["--fix", "--write"]) {
         return Mode::Mutation;
     }
-    if binary == "npm"
-        && args
-            .iter()
-            .take_while(|arg| arg.as_str() != "--")
-            .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version" | "-v"))
-    {
-        return Mode::Listing;
-    }
     if binary == "go" {
         let flags = option_flags(args, &["-run", "-test.run", "-bench", "-test.bench", "-count", "-test.count", "-timeout", "-test.timeout", "-cpu", "-test.cpu", "-o", "-coverprofile", "-benchtime", "-test.benchtime",
             ],
@@ -1205,16 +1194,6 @@ fn execution_mode(
     if binary == "cargo"
         && let Ok(Some(index)) = cargo_subcommand_index(args)
     {
-        // Cargo forwards arguments after `--` to libtest. Its help flags
-        // display usage and exit without running any tests or benchmarks.
-        if matches!(args[index].as_str(), "test" | "t" | "bench")
-            && let Some(separator) = args[index + 1..].iter().position(|arg| arg == "--")
-            && args[index + separator + 2..]
-                .iter()
-                .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
-        {
-            return Mode::Listing;
-        }
         match args[index].as_str() {
             "fmt" => {
                 return if has(&["--check"]) {
@@ -1224,9 +1203,6 @@ fn execution_mode(
                 };
             }
             "clippy" if has(&["--fix"]) => return Mode::Mutation,
-            "nextest" if args.get(index + 1).is_some_and(|arg| arg == "list") => {
-                return Mode::Listing;
-            }
             "fuzz" => {
                 return match args.get(index + 1).map(String::as_str) {
                     Some("run") => Mode::Execution,
@@ -1953,13 +1929,6 @@ pub fn analyze_validation_policy_argv_with_runners(
     (policy, policy_selection(leaves, program, args))
 }
 
-pub fn classify_validation_policy_argv_with_runners(
-    program: &str,
-    args: &[String],
-    runners: &[RepositoryRunner],
-) -> ValidationPolicyClassification {
-    analyze_validation_policy_argv_with_runners(program, args, runners).0
-}
 
 /// Whether the caller's cwd also names a selected validation child's cwd.
 /// Unlike policy leaves, this must not discard sibling shell commands: `cd`
@@ -2068,19 +2037,7 @@ pub fn analyze_validation_policy_script_with_runners(
     )
 }
 
-pub fn classify_validation_policy_script_with_runners(
-    script: &str,
-    runners: &[RepositoryRunner],
-) -> ValidationPolicyClassification {
-    analyze_validation_policy_script_with_runners(script, runners, false).0
-}
 
-pub fn classify_validation_policy_powershell_script_with_runners(
-    script: &str,
-    runners: &[RepositoryRunner],
-) -> ValidationPolicyClassification {
-    analyze_validation_policy_script_with_runners(script, runners, true).0
-}
 
 fn policy_selection(mut leaves: Vec<Vec<String>>, program: &str, args: &[String]) -> String {
     if leaves.is_empty() {

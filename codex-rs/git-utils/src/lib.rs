@@ -15,6 +15,8 @@ mod review;
 mod reversal;
 mod status;
 mod working_tree;
+mod workspace_metadata;
+pub use workspace_metadata::GitWorkspaceMetadata;
 
 /// Platform null device used to keep internal Git commands from invoking hooks.
 pub const DISABLED_HOOKS_PATH: &str = "NUL";

@@ -23,6 +23,7 @@ static NEXT_PLUGIN_SKILL_SNAPSHOT_IDENTITY: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone)]
 pub struct PluginSkillSnapshots {
     cache_identity: u64,
+    installations: Arc<Mutex<HashMap<codex_utils_absolute_path::AbsolutePathBuf, (String, Arc<dyn Fn() -> Option<Box<dyn Send + Sync>> + Send + Sync>)>>>,
     snapshots_by_root: Arc<
         Mutex<HashMap<(PluginSkillRoot, crate::service::FileSystemIdentity), SkillRootSnapshot>>,
     >,
@@ -33,8 +34,51 @@ impl PluginSkillSnapshots {
     pub fn for_plugin_load() -> Self {
         Self {
             cache_identity: NEXT_PLUGIN_SKILL_SNAPSHOT_IDENTITY.fetch_add(1, Ordering::Relaxed),
+            installations: Arc::default(),
             snapshots_by_root: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// The publication owner supplies checked read leases without coupling skills to its store.
+    pub fn bind_installation(
+        &self,
+        root: codex_utils_absolute_path::AbsolutePathBuf,
+        plugin_id: String,
+        acquire_read: Arc<dyn Fn() -> Option<Box<dyn Send + Sync>> + Send + Sync>,
+    ) {
+        self.installations.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(root, (plugin_id, acquire_read));
+    }
+
+    pub fn is_current(&self) -> bool {
+        let validators = self.installations.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values().map(|(_, acquire_read)| Arc::clone(acquire_read)).collect::<Vec<_>>();
+        validators.into_iter().all(|acquire_read| acquire_read().is_some())
+    }
+
+    fn root_is_current(&self, root: &codex_utils_absolute_path::AbsolutePathBuf) -> bool {
+        let validate = self.installations.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner).get(root)
+            .map(|(_, acquire_read)| Arc::clone(acquire_read));
+        validate.is_none_or(|acquire_read| acquire_read().is_some())
+    }
+
+    pub(crate) fn read_guard_for_plugin(
+        &self,
+        plugin_id: &str,
+    ) -> std::io::Result<Option<Box<dyn Send + Sync>>> {
+        let acquire_read = self.installations.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .find(|(id, _)| id == plugin_id)
+            .map(|(_, acquire_read)| Arc::clone(acquire_read));
+        acquire_read.map(|acquire_read| acquire_read().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "plugin skill installation changed or is busy; reload the skills catalog",
+            )
+        })).transpose()
     }
 
     pub(crate) fn cache_identity(&self) -> u64 {
@@ -58,6 +102,12 @@ where
 {
     let mut root_snapshots = Vec::new();
     for root in roots {
+        if root.plugin_root.as_ref().is_some_and(|root|
+            plugin_skill_snapshots.is_some_and(|snapshots| !snapshots.root_is_current(root)))
+        {
+            // Never reinterpret a replacement using the old plugin namespace/policy.
+            continue;
+        }
         let cache_key = match (
             root.plugin_id.clone(),
             root.plugin_namespace.clone(),
@@ -102,7 +152,9 @@ where
         root_snapshots.push(snapshot);
     }
 
-    merge_skill_root_snapshots(root_snapshots)
+    let mut outcome = merge_skill_root_snapshots(root_snapshots);
+    outcome.plugin_installations = plugin_skill_snapshots.cloned();
+    outcome
 }
 
 fn merge_skill_root_snapshots(snapshots: Vec<SkillRootSnapshot>) -> SkillLoadOutcome {

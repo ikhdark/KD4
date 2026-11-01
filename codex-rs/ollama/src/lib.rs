@@ -2,10 +2,9 @@ mod client;
 mod line_buffer;
 mod parser;
 mod pull;
-mod url;
 
 pub use client::OllamaClient;
-use codex_core::config::Config;
+use codex_runtime_config::config::Config;
 pub use pull::PullEvent;
 use semver::Version;
 

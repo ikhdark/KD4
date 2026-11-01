@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU8;
-use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
@@ -103,17 +102,12 @@ pub(crate) struct TurnTerminalCoordinator {
     claimed: AtomicBool,
     analytics_emission_claimed: AtomicBool,
     interaction_released: AtomicBool,
-    cleanup_completed: AtomicBool,
     completion_notify: Notify,
-    cleanup_completion_notify: Notify,
     interrupt_fence_state: AtomicU8,
     interrupt_resolution_notify: Notify,
     sampling_admission_gate: Arc<Mutex<()>>,
     tool_call_acceptance: Arc<ToolCallAcceptanceGate>,
     wake_generation: AtomicU64,
-    completion_waiters: AtomicU32,
-    interrupt_resolution_waiters: AtomicU32,
-    sampling_admission_waiters: AtomicU32,
 }
 
 /// The interrupt durability fence is one state machine, not three independent
@@ -170,22 +164,6 @@ pub(crate) enum TerminalWakeResult {
 }
 
 
-struct TerminalWaiterGuard<'a>(&'a AtomicU32);
-
-impl<'a> TerminalWaiterGuard<'a> {
-    fn new(counter: &'a AtomicU32) -> Self {
-        counter.fetch_add(1, Ordering::AcqRel);
-        Self(counter)
-    }
-}
-
-impl Drop for TerminalWaiterGuard<'_> {
-    fn drop(&mut self) {
-        let previous = self.0.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "terminal waiter count underflow");
-    }
-}
-
 impl InterruptFenceState {
     fn from_u8(value: u8) -> Self {
         match value {
@@ -217,17 +195,12 @@ impl TurnTerminalCoordinator {
             claimed: AtomicBool::new(false),
             analytics_emission_claimed: AtomicBool::new(false),
             interaction_released: AtomicBool::new(false),
-            cleanup_completed: AtomicBool::new(false),
             completion_notify: Notify::new(),
-            cleanup_completion_notify: Notify::new(),
             interrupt_fence_state: AtomicU8::new(InterruptFenceState::Open as u8),
             interrupt_resolution_notify: Notify::new(),
             sampling_admission_gate: Arc::new(Mutex::new(())),
             tool_call_acceptance,
             wake_generation: AtomicU64::new(1),
-            completion_waiters: AtomicU32::new(0),
-            interrupt_resolution_waiters: AtomicU32::new(0),
-            sampling_admission_waiters: AtomicU32::new(0),
         })
     }
 
@@ -304,7 +277,6 @@ impl TurnTerminalCoordinator {
     /// Deliver an interruption while admission is locked, fencing only an
     /// accepted delivery before its consumer can claim terminal completion.
     pub(crate) async fn mark_interrupt_pending_if(&self, accept: impl FnOnce() -> bool) -> bool {
-        let _waiter = TerminalWaiterGuard::new(&self.sampling_admission_waiters);
         let _admission_gate = self.sampling_admission_gate.lock().await;
         let _decision = self
             .terminal_decision_gate
@@ -322,7 +294,6 @@ impl TurnTerminalCoordinator {
     }
 
     pub(crate) async fn acquire_sampling_admission(&self) -> Option<OwnedMutexGuard<()>> {
-        let _waiter = TerminalWaiterGuard::new(&self.sampling_admission_waiters);
         let guard = Arc::clone(&self.sampling_admission_gate).lock_owned().await;
         if self.interrupt_pending() {
             None
@@ -393,7 +364,6 @@ impl TurnTerminalCoordinator {
         &self,
         expected_generation: &SamplingGenerationId,
     ) -> TerminalWakeResult {
-        let _waiter = TerminalWaiterGuard::new(&self.interrupt_resolution_waiters);
         loop {
             let notified = self.interrupt_resolution_notify.notified();
             if !self.wake_generation_matches(expected_generation) {
@@ -421,7 +391,6 @@ impl TurnTerminalCoordinator {
     }
 
     pub(crate) async fn wait_completed(&self) {
-        let _waiter = TerminalWaiterGuard::new(&self.completion_waiters);
         loop {
             let notified = self.completion_notify.notified();
             if self.interaction_released() {
@@ -464,10 +433,6 @@ impl TurnTerminalPermit {
             .interaction_released
             .store(true, Ordering::Release);
         self.coordinator.completion_notify.notify_waiters();
-        self.coordinator
-            .cleanup_completed
-            .store(true, Ordering::Release);
-        self.coordinator.cleanup_completion_notify.notify_waiters();
         self.coordinator.release_interrupt_fence();
         self.cleanup_completed = true;
     }

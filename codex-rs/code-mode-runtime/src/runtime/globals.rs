@@ -30,7 +30,6 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     delete_global(scope, global, "Atomics")?;
     delete_global(scope, global, "SharedArrayBuffer")?;
     delete_global(scope, global, "WebAssembly")?;
-    super::output_projection::install(scope)?;
 
     let enabled_tools = scope
         .get_slot::<RuntimeState>()

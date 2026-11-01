@@ -1,5 +1,4 @@
 use crate::FunctionCallError;
-use crate::agent::role::AgentRoleLocks;
 use crate::config::Config;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -24,8 +23,8 @@ use codex_tools::ToolOutputProjectionMetadata;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 
-pub(crate) const DEFAULT_SPAWN_AGENT_MODEL: &str = "gpt-6.1-sol";
-pub(crate) const DEFAULT_SPAWN_AGENT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::XHigh;
+pub(crate) use codex_tools::DEFAULT_SPAWN_AGENT_MODEL;
+pub(crate) use codex_tools::DEFAULT_SPAWN_AGENT_REASONING_EFFORT;
 
 pub(crate) fn function_arguments(payload: ToolPayload) -> Result<String, FunctionCallError> {
     match payload {
@@ -148,9 +147,8 @@ pub(crate) fn thread_spawn_source(
 ///
 /// The returned config starts from the parent's effective config and then refreshes the
 /// runtime-owned fields carried on `turn`, including the active base prompt, model selection,
-/// reasoning settings, approval policy, sandbox, and cwd. Role-specific overrides are layered
-/// after this step;
-/// skipping this helper and cloning stale config state directly can send the child agent out with
+/// reasoning settings, approval policy, sandbox, and cwd. Per-spawn model overrides are applied
+/// after this step; cloning stale config state directly can send the child agent out with
 /// the wrong provider or runtime policy.
 pub(crate) fn build_agent_spawn_config(turn: &TurnContext) -> Result<Config, FunctionCallError> {
     let mut config = build_agent_shared_config(turn)?;
@@ -158,7 +156,7 @@ pub(crate) fn build_agent_spawn_config(turn: &TurnContext) -> Result<Config, Fun
     Ok(config)
 }
 
-/// New work uses the admitting step's cwd before role/model configuration is resolved.
+/// New work uses the admitting step's cwd before model configuration is resolved.
 /// Resume intentionally continues to use its separate stored-child configuration path.
 pub(crate) fn build_agent_spawn_config_for_step(
     step: &crate::session::step_context::StepContext,
@@ -192,86 +190,49 @@ fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, FunctionCallE
         .or_else(|| turn.model_info.default_reasoning_level.clone());
     config.model_reasoning_summary = Some(turn.reasoning_summary);
     config.developer_instructions = turn.developer_instructions.clone();
-    apply_spawn_agent_runtime_overrides(&mut config, turn, AgentRoleLocks::default())?;
+    apply_spawn_agent_runtime_overrides(&mut config, turn)?;
 
     Ok(config)
-}
-
-pub(crate) fn reject_full_fork_spawn_overrides(
-    agent_type: Option<&str>,
-    model: Option<&str>,
-    reasoning_effort: Option<ReasoningEffort>,
-) -> Result<(), FunctionCallError> {
-    if agent_type.is_some() || model.is_some() || reasoning_effort.is_some() {
-        return Err(FunctionCallError::RespondToModel(
-            "Full-history forked agents use the built-in spawn defaults and do not accept per-call agent_type, model, or reasoning_effort overrides; omit those fields, or spawn without a full-history fork.".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 /// Copies runtime-only turn state onto a child config before it is handed to `AgentControl`.
 ///
 /// These values are chosen by the live turn rather than persisted config, so leaving them stale
-/// can make a child agent disagree with its parent about approval policy, cwd, or sandboxing. A
-/// permission profile explicitly supplied by the role remains authoritative.
+/// can make a child agent disagree with its parent about approval policy, cwd, or sandboxing.
 pub(crate) fn apply_spawn_agent_runtime_overrides(
     config: &mut Config,
     turn: &TurnContext,
-    role_locks: AgentRoleLocks,
 ) -> Result<(), FunctionCallError> {
-    let role_permissions = config.permissions.clone();
-    if !role_locks.permissions {
-        config.permissions = turn.config.permissions.clone();
-        config
-            .permissions
-            .set_permission_profile(turn.permission_profile())
-            .map_err(|err| {
-                FunctionCallError::RespondToModel(format!("permission_profile is invalid: {err}"))
-            })?;
-    }
-    config.permissions.allow_login_shell = if role_locks.allow_login_shell {
-        role_permissions.allow_login_shell
-    } else {
-        turn.config.permissions.allow_login_shell
+    config.permissions = turn.config.permissions.clone();
+    config
+        .permissions
+        .set_permission_profile(turn.permission_profile())
+        .map_err(|err| {
+            FunctionCallError::RespondToModel(format!("permission_profile is invalid: {err}"))
+        })?;
+    config.permissions.windows_sandbox_mode = match turn.windows_sandbox_level {
+        WindowsSandboxLevel::Elevated => Some(WindowsSandboxModeToml::Elevated),
+        WindowsSandboxLevel::RestrictedToken => Some(WindowsSandboxModeToml::Unelevated),
+        WindowsSandboxLevel::Disabled => {
+            config
+                .features
+                .disable(Feature::WindowsSandboxElevated)
+                .map_err(|err| {
+                    FunctionCallError::RespondToModel(format!(
+                        "windows sandbox feature state is invalid: {err}"
+                    ))
+                })?;
+            config
+                .features
+                .disable(Feature::WindowsSandbox)
+                .map_err(|err| {
+                    FunctionCallError::RespondToModel(format!(
+                        "windows sandbox feature state is invalid: {err}"
+                    ))
+                })?;
+            None
+        }
     };
-    config.permissions.shell_environment_policy = if role_locks.shell_environment_policy {
-        role_permissions.shell_environment_policy
-    } else {
-        turn.config.permissions.shell_environment_policy.clone()
-    };
-    config.permissions.windows_sandbox_private_desktop = if role_locks.windows_private_desktop {
-        role_permissions.windows_sandbox_private_desktop
-    } else {
-        turn.config.permissions.windows_sandbox_private_desktop
-    };
-    if role_locks.windows_sandbox {
-        config.permissions.windows_sandbox_mode = role_permissions.windows_sandbox_mode;
-    } else {
-        config.permissions.windows_sandbox_mode = match turn.windows_sandbox_level {
-            WindowsSandboxLevel::Elevated => Some(WindowsSandboxModeToml::Elevated),
-            WindowsSandboxLevel::RestrictedToken => Some(WindowsSandboxModeToml::Unelevated),
-            WindowsSandboxLevel::Disabled => {
-                config
-                    .features
-                    .disable(Feature::WindowsSandboxElevated)
-                    .map_err(|err| {
-                        FunctionCallError::RespondToModel(format!(
-                            "windows sandbox feature state is invalid: {err}"
-                        ))
-                    })?;
-                config
-                    .features
-                    .disable(Feature::WindowsSandbox)
-                    .map_err(|err| {
-                        FunctionCallError::RespondToModel(format!(
-                            "windows sandbox feature state is invalid: {err}"
-                        ))
-                    })?;
-                None
-            }
-        };
-    }
     config
         .permissions
         .approval_policy
@@ -330,73 +291,51 @@ pub(crate) async fn worker_startup_preflight(
     ).await
 }
 
-/// Resolves role-locked model settings, explicit per-spawn overrides, and built-in defaults.
+/// Resolves explicit per-spawn model settings and built-in defaults.
 ///
 /// Provider catalogs may qualify the built-in model slug, so default resolution accepts a
 /// provider prefix while explicit model
-/// overrides continue to require an exact advertised model name. Role-locked values take
-/// precedence; omitted settings fall back to the effective provider catalog and supported effort.
+/// overrides continue to require an exact advertised model name. Omitted settings fall back to
+/// the effective provider catalog and supported effort.
 pub(crate) async fn apply_spawn_agent_model_defaults_and_overrides(
     session: &Session,
     turn: &TurnContext,
     config: &mut Config,
     requested_model: Option<&str>,
     requested_reasoning_effort: Option<ReasoningEffort>,
-    role_locks: AgentRoleLocks,
 ) -> Result<(), FunctionCallError> {
     let models_manager = models_manager_for_spawn_config(session, turn, config);
-    let selected_model_name = if role_locks.model {
-        config.model.clone().ok_or_else(|| {
-            FunctionCallError::RespondToModel(
-                "spawn_agent role did not resolve its configured model".to_string(),
-            )
-        })?
-    } else {
-        let available_models = models_manager
-            .list_models_shared(RefreshStrategy::Offline, config.http_client_factory())
-            .await
-            .map_err(|error| {
-                FunctionCallError::RespondToModel(format!(
-                    "could not resolve the child model catalog: {error}"
-                ))
-            })?;
-        match requested_model {
-            Some(requested_model) => {
-                find_spawn_agent_model_name(&available_models, requested_model)?
-            }
-            None => {
-                find_default_spawn_agent_model_name(&available_models, config.model.as_deref())?
-            }
+    let available_models = models_manager
+        .list_models_shared(RefreshStrategy::Offline, config.http_client_factory())
+        .await
+        .map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "could not resolve the child model catalog: {error}"
+            ))
+        })?;
+    let selected_model_name = match requested_model {
+        Some(requested_model) => {
+            find_spawn_agent_model_name(&available_models, requested_model)?
+        }
+        None => {
+            find_default_spawn_agent_model_name(&available_models, config.model.as_deref())?
         }
     };
 
     config.model = Some(selected_model_name.clone());
-    let explicit_reasoning_effort = if role_locks.reasoning_effort {
-        Some(config.model_reasoning_effort.clone().ok_or_else(|| {
-            FunctionCallError::RespondToModel(
-                "spawn_agent role did not resolve its configured reasoning effort".to_string(),
-            )
-        })?)
-    } else {
-        requested_reasoning_effort
-    };
     let selected_model_info = models_manager
         .get_model_info(&selected_model_name, &config.to_models_manager_config())
         .await;
     // Resolved catalog limits are not configuration overrides. Bounded forks
     // resolve their admission budget from the selected model at admission.
-    let reasoning_effort = explicit_reasoning_effort.or_else(|| {
+    let reasoning_effort = requested_reasoning_effort.or_else(|| {
         default_spawn_reasoning_effort(
             &selected_model_info.supported_reasoning_levels,
             selected_model_info.default_reasoning_level.clone(),
         )
     });
 
-    // Fallback metadata has no authoritative effort list. Preserve an explicit role-owned effort
-    // for custom models while still validating every catalog-backed final pair.
-    if let Some(reasoning_effort) = reasoning_effort.as_ref()
-        && (!role_locks.reasoning_effort || !selected_model_info.used_fallback_model_metadata)
-    {
+    if let Some(reasoning_effort) = reasoning_effort.as_ref() {
         let wire_effort = crate::client::request_effort_for_model(
             &selected_model_info,
             Some(reasoning_effort.clone()),

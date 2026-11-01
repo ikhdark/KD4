@@ -14,6 +14,8 @@ from pathlib import Path
 from pathlib import PureWindowsPath
 
 from .targets import REPO_ROOT
+from .targets import HOST_RELEASE_TARGETS
+from .targets import normalize_machine
 from .targets import PackageInputs
 from .targets import PackageVariant
 from .targets import TargetSpec
@@ -156,7 +158,6 @@ def build_package_dir(
     copy_executable(
         inputs.rg_bin,
         path_dir / spec.rg_name,
-        prefer_hardlink=True,
     )
     for alias in APPLY_PATCH_ALIASES:
         write_windows_apply_patch_alias(
@@ -335,18 +336,10 @@ def validate_package_dir(
             raise RuntimeError(f"Invalid package file contents: {relative_file}")
 
 
-def copy_executable(
-    src: Path,
-    dest: Path,
-    *,
-    prefer_hardlink: bool | None = None,
-) -> None:
+def copy_executable(src: Path, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    copy_file_for_staging(
-        src,
-        dest,
-        prefer_hardlink=False,
-    )
+    dest.unlink(missing_ok=True)
+    shutil.copyfile(src, dest)
 
 
 def write_windows_apply_patch_alias(
@@ -366,12 +359,6 @@ def windows_apply_patch_alias_text(entrypoint_relative_path: PureWindowsPath) ->
             "",
         ]
     )
-
-
-def copy_file_for_staging(src: Path, dest: Path, *, prefer_hardlink: bool) -> None:
-    _ = prefer_hardlink
-    dest.unlink(missing_ok=True)
-    shutil.copyfile(src, dest)
 
 
 def write_json(path: Path, value: object) -> None:
@@ -442,12 +429,7 @@ def pe_machine(path: Path) -> int | None:
 def validate_pe_targets(
     package_dir: Path, files: list[dict[str, object]], spec: TargetSpec
 ) -> None:
-    expected_machine = {
-        "x86_64-pc-windows-msvc": 0x8664,
-        "aarch64-pc-windows-msvc": 0xAA64,
-    }.get(spec.target)
-    if expected_machine is None:
-        return
+    expected_machine = spec.pe_machine
     for entry in files:
         relative = str(entry["path"])
         if not relative.lower().endswith(".exe"):
@@ -465,12 +447,7 @@ def validate_pe_targets(
 def validate_host_entrypoint_version(
     entrypoint: Path, spec: TargetSpec, expected_version: str
 ) -> None:
-    host_target = {
-        "amd64": "x86_64-pc-windows-msvc",
-        "x86_64": "x86_64-pc-windows-msvc",
-        "arm64": "aarch64-pc-windows-msvc",
-        "aarch64": "aarch64-pc-windows-msvc",
-    }.get(platform.machine().lower())
+    host_target = HOST_RELEASE_TARGETS.get(normalize_machine(platform.machine()))
     if os.name != "nt" or host_target != spec.target or pe_machine(entrypoint) is None:
         return
     try:

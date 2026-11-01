@@ -1,5 +1,6 @@
 use crate::acl::add_deny_write_ace;
 use crate::acl::path_mask_allows;
+use crate::allow::compute_deny_write_paths_for_permissions;
 use crate::cap::load_or_create_cap_sids;
 use crate::cap::workspace_write_cap_sid_for_root;
 use crate::cap::workspace_write_root_contains_path;
@@ -145,31 +146,7 @@ fn audit_everyone_writable(
     env: &std::collections::HashMap<String, String>,
     logs_base_dir: Option<&Path>,
 ) -> Result<WorldWritableScan> {
-    audit_everyone_writable_with_timeout(
-        cwd,
-        env,
-        logs_base_dir,
-        Duration::from_secs(AUDIT_TIME_LIMIT_SECS as u64),
-    )
-}
-
-fn audit_everyone_writable_with_timeout(
-    cwd: &Path,
-    env: &std::collections::HashMap<String, String>,
-    logs_base_dir: Option<&Path>,
-    time_limit: Duration,
-) -> Result<WorldWritableScan> {
-    audit_everyone_writable_with_candidates(cwd, logs_base_dir, time_limit, || {
-        gather_candidates(cwd, env)
-    })
-}
-
-fn audit_everyone_writable_with_candidates(
-    cwd: &Path,
-    logs_base_dir: Option<&Path>,
-    time_limit: Duration,
-    candidates: impl FnOnce() -> Vec<PathBuf>,
-) -> Result<WorldWritableScan> {
+    let time_limit = Duration::from_secs(AUDIT_TIME_LIMIT_SECS as u64);
     let start = Instant::now();
     let mut incomplete = false;
     let mut flagged: Vec<PathBuf> = Vec::new();
@@ -234,7 +211,7 @@ fn audit_everyone_writable_with_candidates(
         }
     }
     // Continue with broader candidate sweep
-    for root in candidates() {
+    for root in gather_candidates(cwd, env) {
         if start.elapsed() >= time_limit || checked >= MAX_CHECKED_LIMIT as usize {
             incomplete = true;
             break;
@@ -394,10 +371,13 @@ fn apply_capability_denies_for_world_writable_for_permissions(
                 codex_home,
                 /*write_roots_override*/ None,
             );
+            let deny_write_paths = compute_deny_write_paths_for_permissions(
+                permissions, cwd, env_map, &[],
+            );
             let active_sids = roots
                 .iter()
                 .map(|root| {
-                    workspace_write_cap_sid_for_root(codex_home, cwd, root)
+                    workspace_write_cap_sid_for_root(codex_home, cwd, root, &roots, &deny_write_paths)
                         .and_then(|sid| LocalSid::from_string(&sid))
                 })
                 .collect::<Result<Vec<_>>>()?;

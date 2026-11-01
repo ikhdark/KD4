@@ -14,7 +14,8 @@ workspace = true
 
 [dependencies]
 codex-api = { workspace = true }
-codex-core = { workspace = true }
+codex-conversation = { workspace = true }
+codex-runtime-config = { workspace = true }
 codex-extension-api = { workspace = true }
 codex-extension-items = { workspace = true }
 codex-http-client = { workspace = true }

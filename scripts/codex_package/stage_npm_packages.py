@@ -24,10 +24,8 @@ import shutil
 import stat
 import subprocess
 import sys
-import tarfile
 import tempfile
 import threading
-import time
 import uuid
 from pathlib import Path, PurePosixPath
 from typing import Sequence
@@ -40,6 +38,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.common.atomic_json import write_json_atomic  # noqa: E402
+from scripts.common.generated_output_lock import exclusive_file_lock  # noqa: E402
 from scripts.common.process_owner import (  # noqa: E402
     run_owned,
     check_output_owned,
@@ -50,67 +49,17 @@ from scripts.codex_package.targets import BINARY_TARGETS  # noqa: E402
 from scripts.codex_package.layout import sha256_file as file_sha256  # noqa: E402
 
 from scripts.codex_package.stage_npm_archives import (  # noqa: E402
-    archive_name_for_target,
-    artifact_dir_for_target,
-    binary_archive_path,
-    cached_codex_package_archive,
+    DEFAULT_GHA_DOWNLOAD_WORKERS,
     download_worker_count_for,
-    exclusive_file_lock,
-    extract_tar_data,
-    extract_zstd_archive,
-    hardlink_tree,
-    install_binary_components,
     install_codex_package_archives,
-    install_single_binary,
-    install_single_codex_package_archive,
-    is_relative_to,
-    lock_owner_pid,
-    materialize_cached_tree,
-    process_is_running,
-    validate_tar_members_for_legacy_python,
     worker_count_for,
 )
-
-__all__ = [
-    "archive_name_for_target",
-    "artifact_dir_for_target",
-    "binary_archive_path",
-    "cached_codex_package_archive",
-    "download_worker_count_for",
-    "exclusive_file_lock",
-    "extract_tar_data",
-    "extract_zstd_archive",
-    "hardlink_tree",
-    "install_binary_components",
-    "install_codex_package_archives",
-    "install_single_binary",
-    "install_single_codex_package_archive",
-    "is_relative_to",
-    "lock_owner_pid",
-    "materialize_cached_tree",
-    "process_is_running",
-    "validate_tar_members_for_legacy_python",
-    "worker_count_for",
-    "tarfile",
-    "time",
-]
-
 
 BUILD_SCRIPT = REPO_ROOT / "codex-cli" / "scripts" / "build_npm_package.py"
 DEFAULT_GITHUB_REPO = "ikhdark/KD4"
 COMPLETE_MARKER = ".complete"
-LOCK_POLL_SECONDS = 0.1
-LOCK_STALE_SECONDS = 60 * 60
-DEFAULT_GHA_DOWNLOAD_WORKERS = 8
 VENDOR_COPY_MODES = ("auto", "copy", "hardlink")
 MAX_CAPTURED_LOG_CHARS = 20_000
-
-
-@dataclass(frozen=True, slots=True)
-class BinaryComponent:
-    artifact_prefix: str
-    dest_dir: str
-    binary_basename: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,9 +81,6 @@ class StagePackageResult:
     package: str
     pack_output: Path
     log: str
-
-
-BINARY_COMPONENTS: dict[str, BinaryComponent] = {}
 
 
 def _gha_enabled() -> bool:
@@ -453,7 +399,6 @@ def ensure_source_matches_workflow(
     expected_head_sha: str,
     *,
     repo_root: Path = REPO_ROOT,
-    allow_mismatch: bool = False,
     owned_paths: Sequence[Path] = (),
 ) -> None:
     current_head_sha = check_output_owned(
@@ -476,7 +421,7 @@ def ensure_source_matches_workflow(
         if not paths
         or not all(
             any(
-                is_relative_to((repo_root / path).resolve(strict=False), owned_root)
+                (repo_root / path).resolve(strict=False).is_relative_to(owned_root)
                 for owned_root in owned_roots
             )
             for path in paths
@@ -492,9 +437,6 @@ def ensure_source_matches_workflow(
     if not problems:
         return
     message = "; ".join(problems)
-    if allow_mismatch:
-        print(f"WARNING: allowing source/native mismatch: {message}", file=sys.stderr)
-        return
     raise RuntimeError(f"refusing source/native mismatch: {message}")
 
 
@@ -604,7 +546,7 @@ def install_from_workflow_artifacts(
     vendor_copy_mode: str = "auto",
 ) -> None:
     unknown_components = sorted(
-        set(components) - {codex_package_component()} - set(BINARY_COMPONENTS)
+        set(components) - {codex_package_component()}
     )
     if unknown_components:
         raise ValueError(
@@ -612,7 +554,7 @@ def install_from_workflow_artifacts(
         )
     artifacts = select_target_artifacts(workflow_id, github_repo, components, targets)
     download_artifacts(
-        workflow_id, github_repo, artifacts_dir, artifacts, max_download_workers
+        github_repo, artifacts_dir, artifacts, max_download_workers
     )
     if codex_package_component() in components:
         install_codex_package_archives(
@@ -622,12 +564,6 @@ def install_from_workflow_artifacts(
             extracted_cache_dir,
             vendor_copy_mode=vendor_copy_mode,
         )
-    install_binary_components(
-        artifacts_dir,
-        vendor_dir,
-        [BINARY_COMPONENTS[name] for name in components if name in BINARY_COMPONENTS],
-        targets,
-    )
 
 
 def select_target_artifacts(
@@ -636,9 +572,7 @@ def select_target_artifacts(
     components: Sequence[str],
     targets: Sequence[str] = BINARY_TARGETS,
 ) -> list[WorkflowArtifact]:
-    needs_target_artifacts = codex_package_component() in components or any(
-        component in BINARY_COMPONENTS for component in components
-    )
+    needs_target_artifacts = codex_package_component() in components
     if not needs_target_artifacts:
         return []
 
@@ -667,7 +601,6 @@ def select_target_artifacts(
 
 
 def download_artifacts(
-    workflow_id: str,
     github_repo: str,
     dest_dir: Path,
     artifacts: Sequence[WorkflowArtifact],
@@ -685,7 +618,7 @@ def download_artifacts(
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         futures = [
             executor.submit(
-                download_single_artifact, workflow_id, github_repo, dest_dir, artifact
+                download_single_artifact, github_repo, dest_dir, artifact
             )
             for artifact in artifacts
         ]
@@ -694,7 +627,7 @@ def download_artifacts(
 
 
 def download_single_artifact(
-    _workflow_id: str, github_repo: str, dest_dir: Path, artifact: WorkflowArtifact
+    github_repo: str, dest_dir: Path, artifact: WorkflowArtifact
 ) -> None:
     if artifact.archive_sha256 is None:
         raise RuntimeError(
@@ -950,15 +883,6 @@ def run_command_capture(cmd: list[str]) -> str:
             f"Command failed with exit code {result.returncode}:\n{log.rstrip()}"
         )
     return log
-
-
-def bounded_log(text: str, *, max_chars: int = MAX_CAPTURED_LOG_CHARS) -> str:
-    if len(text) <= max_chars:
-        return text
-    half = max_chars // 2
-    omitted = len(text) - (half * 2)
-    tail = text[-half:] if half else ""
-    return text[:half] + f"\n...[truncated {omitted} chars]...\n" + tail
 
 
 def tarball_name_for_package(package: str, version: str) -> str:
@@ -1229,7 +1153,7 @@ def _main() -> int:
     output_dir = args.output_dir or (REPO_ROOT / "dist" / "npm")
 
     runner_temp = Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir())).resolve()
-    if is_relative_to(runner_temp, REPO_ROOT.resolve()):
+    if runner_temp.is_relative_to(REPO_ROOT.resolve()):
         raise ValueError("RUNNER_TEMP must be outside the repository")
     if vendor_src_arg is not None and (args.workflow_url or args.workflow_name):
         raise ValueError(

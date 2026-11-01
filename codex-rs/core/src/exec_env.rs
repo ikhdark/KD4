@@ -28,6 +28,32 @@ pub fn create_env(
     shell_environment::create_env(policy, thread_id.as_deref())
 }
 
+/// Convert shell restrictions for a remote executor without inheriting or
+/// configuring runtime-owned permission-profile metadata.
+pub(crate) fn exec_env_policy_from_shell_policy(
+    policy: &ShellEnvironmentPolicy,
+) -> codex_exec_server::ExecEnvPolicy {
+    let mut exclude = policy
+        .exclude
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>();
+    exclude.push(CODEX_PERMISSION_PROFILE_ENV_VAR.to_string());
+    let mut r#set = policy.r#set.clone();
+    r#set.retain(|key, _| !key.eq_ignore_ascii_case(CODEX_PERMISSION_PROFILE_ENV_VAR));
+    codex_exec_server::ExecEnvPolicy {
+        inherit: policy.inherit.clone(),
+        ignore_default_excludes: policy.ignore_default_excludes,
+        exclude,
+        r#set,
+        include_only: policy
+            .include_only
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect(),
+    }
+}
+
 /// Injects the selected named permission profile into a shell tool's environment.
 ///
 /// This is applied after the shell environment policy so the runtime-selected

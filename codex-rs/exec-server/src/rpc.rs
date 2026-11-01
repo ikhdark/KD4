@@ -669,22 +669,22 @@ impl Drop for RpcClient {
 
 pub(crate) fn encode_server_message(
     message: RpcServerOutboundMessage,
-) -> Result<JSONRPCMessage, serde_json::Error> {
+) -> JSONRPCMessage {
     match message {
         RpcServerOutboundMessage::Response { request_id, result } => {
-            Ok(JSONRPCMessage::Response(JSONRPCResponse {
+            JSONRPCMessage::Response(JSONRPCResponse {
                 id: request_id,
                 result,
-            }))
+            })
         }
         RpcServerOutboundMessage::Error { request_id, error } => {
-            Ok(JSONRPCMessage::Error(JSONRPCError {
+            JSONRPCMessage::Error(JSONRPCError {
                 id: request_id,
                 error,
-            }))
+            })
         }
         RpcServerOutboundMessage::Notification(notification) => {
-            Ok(JSONRPCMessage::Notification(notification))
+            JSONRPCMessage::Notification(notification)
         }
     }
 }

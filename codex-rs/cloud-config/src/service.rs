@@ -3,7 +3,7 @@
 //! Each loader retains one authenticated startup snapshot. Disk bundles are not
 //! policy authority: the backend does not yet supply a verifiable signed envelope.
 
-use crate::backend::BundleClient;
+use crate::backend::BackendBundleClient;
 use crate::backend::BundleRequestError;
 use crate::backend::RetryableFailureKind;
 use crate::metrics::emit_fetch_attempt_metric;
@@ -67,15 +67,15 @@ enum UnauthorizedRecoveryAction {
     RetryNextAttempt,
 }
 
-pub(crate) struct CloudConfigBundleService<C> {
+pub(crate) struct CloudConfigBundleService {
     auth_manager: Arc<AuthManager>,
-    client: Arc<C>,
+    client: Arc<BackendBundleClient>,
     auth_epoch: Option<u64>,
     codex_home: AbsolutePathBuf,
     timeout: Duration,
 }
 
-impl<C> Clone for CloudConfigBundleService<C> {
+impl Clone for CloudConfigBundleService {
     fn clone(&self) -> Self {
         Self {
             auth_manager: Arc::clone(&self.auth_manager),
@@ -87,13 +87,10 @@ impl<C> Clone for CloudConfigBundleService<C> {
     }
 }
 
-impl<C> CloudConfigBundleService<C>
-where
-    C: BundleClient + 'static,
-{
+impl CloudConfigBundleService {
     pub(crate) fn new(
         auth_manager: Arc<AuthManager>,
-        client: Arc<C>,
+        client: Arc<BackendBundleClient>,
         codex_home: PathBuf,
         timeout: Duration,
     ) -> Self {
@@ -216,8 +213,14 @@ where
         let mut auth_recovery = self.auth_manager.unauthorized_recovery();
 
         while attempt <= CLOUD_CONFIG_BUNDLE_MAX_ATTEMPTS {
+            // Bind before validating the service epoch so a same-account
+            // logout/login cannot rebase this retained loader onto new authority.
+            let request_auth = codex_model_provider::auth_provider_from_auth_manager(
+                Arc::clone(&self.auth_manager),
+                &auth,
+            );
             self.validate_current()?;
-            match self.client.get_bundle(&auth).await {
+            match self.client.get_bundle(Arc::clone(&request_auth)).await {
                 Ok(bundle) => {
                     return self
                         .validate_remote_bundle(&auth, trigger, attempt, bundle)
@@ -254,6 +257,7 @@ where
                         .handle_unauthorized(
                             &mut auth,
                             &mut auth_recovery,
+                            request_auth.auth_recovery_revision(),
                             trigger,
                             attempt,
                             status_code,
@@ -353,6 +357,7 @@ where
         &self,
         auth: &mut CodexAuth,
         auth_recovery: &mut UnauthorizedRecovery,
+        rejected_revision: Option<u64>,
         trigger: &'static str,
         attempt: usize,
         status_code: Option<u16>,
@@ -365,7 +370,11 @@ where
                 max_attempts = CLOUD_CONFIG_BUNDLE_MAX_ATTEMPTS,
                 "Cloud config bundle request was unauthorized; attempting auth recovery"
             );
-            match auth_recovery.next_with_auth(auth).await {
+            let recovery = match rejected_revision {
+                Some(revision) => auth_recovery.next_with_auth_revision(revision, Some(auth)).await,
+                None => auth_recovery.next_with_auth(auth).await,
+            };
+            match recovery {
                 Ok(_) => {
                     let Some(refreshed_auth) = self.auth_manager.auth().await else {
                         tracing::error!(

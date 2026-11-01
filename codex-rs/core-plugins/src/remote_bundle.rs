@@ -438,22 +438,6 @@ fn install_remote_plugin_bundle(
     bundle_bytes: Vec<u8>,
     mutation: &crate::remote::RemotePluginCacheMutationGuard,
 ) -> Result<PluginInstallResult, RemotePluginBundleInstallError> {
-    install_remote_plugin_bundle_with_metadata_writer(
-        codex_home,
-        bundle,
-        bundle_bytes,
-        PluginStore::write_remote_plugin_id,
-        mutation,
-    )
-}
-
-fn install_remote_plugin_bundle_with_metadata_writer(
-    codex_home: PathBuf,
-    bundle: ValidatedRemotePluginBundle,
-    bundle_bytes: Vec<u8>,
-    write_metadata: impl FnOnce(&PluginStore, &PluginId, &str) -> Result<(), PluginStoreError>,
-    mutation: &crate::remote::RemotePluginCacheMutationGuard,
-) -> Result<PluginInstallResult, RemotePluginBundleInstallError> {
     let staging_root = codex_home.join(REMOTE_PLUGIN_INSTALL_STAGING_DIR);
     fs::create_dir_all(&staging_root).map_err(|source| {
         RemotePluginBundleInstallError::io(
@@ -490,12 +474,11 @@ fn install_remote_plugin_bundle_with_metadata_writer(
             || mutation.lock_for_publication(),
         )
         .map_err(RemotePluginBundleInstallError::from)?;
-    write_metadata(
-        &store,
+    store.write_remote_plugin_id(
         &pending_install.result().plugin_id,
         &remote_plugin_id,
     )?;
-    Ok(pending_install.commit())
+    pending_install.commit().map_err(RemotePluginBundleInstallError::from)
 }
 
 fn extract_remote_plugin_bundle_to_path(
@@ -644,19 +627,12 @@ fn extract_plugin_bundle_tar_gz(
     bytes: &[u8],
     destination: &Path,
 ) -> Result<(), RemotePluginBundleInstallError> {
-    extract_plugin_bundle_tar_gz_with_limits(
+    unpack_plugin_bundle_tar_gz(
         bytes,
         destination,
         REMOTE_PLUGIN_BUNDLE_MAX_EXTRACTED_BYTES,
     )
-}
-
-fn extract_plugin_bundle_tar_gz_with_limits(
-    bytes: &[u8],
-    destination: &Path,
-    max_total_bytes: u64,
-) -> Result<(), RemotePluginBundleInstallError> {
-    unpack_plugin_bundle_tar_gz(bytes, destination, max_total_bytes).map_err(|err| match err {
+    .map_err(|err| match err {
         PluginBundleUnpackError::ExtractedBundleTooLarge { bytes, max_bytes } => {
             RemotePluginBundleInstallError::ExtractedBundleTooLarge { bytes, max_bytes }
         }

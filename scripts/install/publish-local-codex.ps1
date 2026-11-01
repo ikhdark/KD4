@@ -92,7 +92,7 @@ function Get-FileSha256 {
 $script:LocalPublishContentHashCache = @{}
 # Git pathspec of the tracked publish inputs; the build fingerprint and the
 # embedded dirty flag must describe the same files.
-$script:LocalPublishBuildInputPathspec = @("codex-rs", "third_party/notify", "scripts/install/publish-local-codex.ps1", "scripts/install/publish-local-codex-pgo.ps1", "scripts/build/common-rust-env.ps1", "justfile")
+$script:LocalPublishBuildInputPathspec = @("codex-rs", "third_party/notify", "third_party/tungstenite", "scripts/install/publish-local-codex.ps1", "scripts/install/publish-local-codex-pgo.ps1", "scripts/build/common-rust-env.ps1", "justfile")
 $script:LocalPublishBuildTargetCache = @{}
 
 function Get-TextSha256 {
@@ -618,6 +618,7 @@ function Test-LocalPublishBuildRelevantPath {
     return (
         $normalized -like "codex-rs/*" -or
         $normalized -like "third_party/notify/*" -or
+        $normalized -like "third_party/tungstenite/*" -or
         $normalized -eq "justfile" -or
         $normalized -eq "scripts/install/publish-local-codex.ps1" -or
         $normalized -eq "scripts/install/publish-local-codex-pgo.ps1" -or
@@ -3101,7 +3102,7 @@ function Invoke-CodexBuild {
     $effectiveNoSccache = [bool]$NoSccache -or $null -ne $pgo
     $cargoConfigLines = @(Get-LocalPublishCargoConfigLines -Profile $Profile -DisableSccache $effectiveNoSccache -Pgo $pgo)
     if ($Profile -eq "release") {
-        Write-ProofLine "releaseProfile" "release: opt-level=3, debug=0, thin LTO, codegen-units=1, runtime-dependency-codegen-units=1, build-dependencies=Cargo defaults, incremental=false"
+        Write-ProofLine "releaseProfile" "release: opt-level=3, debug=0, thin LTO, codegen-units=4, runtime-dependency-codegen-units=4, build-dependencies=Cargo defaults, incremental=false"
     }
     if ($Profile -in @("release", "pgo")) {
         Write-ProofLine "linkerOptimization" "Windows MSVC: /OPT:REF, /OPT:ICF"
@@ -3374,7 +3375,6 @@ function New-CodexRuntimeBundleTransaction {
                     BackupPath = [string]$entry.BackupPath
                     HadPreviousTarget = [bool]$entry.HadPreviousTarget
                     Changed = [bool]$entry.Changed
-                    State = "Prepared"
                 })
         }
         $transaction.Phase = "Prepared"
@@ -3394,24 +3394,6 @@ function New-CodexRuntimeBundleTransaction {
         Remove-Item -LiteralPath $JournalPath -Force
         throw
     }
-}
-
-function Publish-CodexRuntimeBundleEntry {
-    param(
-        [object]$Transaction,
-        [string]$Name
-    )
-
-    $matches = @($Transaction.Entries | Where-Object { $_.Name -eq $Name })
-    if ($matches.Count -ne 1) {
-        throw "Runtime bundle transaction does not contain exactly one $Name entry."
-    }
-    $entry = $matches[0]
-    if (-not $entry.Changed) {
-        return $false
-    }
-    $entry.State = "Staged"
-    return $true
 }
 
 function Activate-CodexRuntimeBundleTransaction {
@@ -3769,57 +3751,20 @@ if (-not [string]::IsNullOrWhiteSpace($SourceBundleManifest)) {
         throw "-SourceBundleManifest requires -SkipBuild."
     }
     $sourceBundle = Resolve-SourceBundleManifest -ManifestPath $SourceBundleManifest
-    $SourceExe = $sourceBundle.Codex
-    $SourceCodeModeHostExe = $sourceBundle.CodeModeHost
-    $SourceWindowsSandboxSetupExe = $sourceBundle.SandboxSetup
-    $SourceCommandRunnerExe = $sourceBundle.CommandRunner
+    $SourceExe = Resolve-AbsolutePath $sourceBundle.Codex
+    $SourceCodeModeHostExe = Resolve-AbsolutePath $sourceBundle.CodeModeHost
+    $SourceWindowsSandboxSetupExe = Resolve-AbsolutePath $sourceBundle.SandboxSetup
+    $SourceCommandRunnerExe = Resolve-AbsolutePath $sourceBundle.CommandRunner
     Write-ProofLine "sourceBundleId" $sourceBundle.BundleId
     Write-ProofLine "sourceBundleVersion" $sourceBundle.Version
     Write-ProofLine "sourceBundleTarget" $sourceBundle.Target
 }
 
-$sourceExeWasExplicit = -not [string]::IsNullOrWhiteSpace($SourceExe)
-if (-not $sourceExeWasExplicit) {
+if ($null -eq $sourceBundle) {
     $SourceExe = Get-BuiltCodexPath -RepoRoot $repoRoot -Profile $Profile
-}
-else {
-    $SourceExe = Resolve-AbsolutePath $SourceExe
-}
-
-if ([string]::IsNullOrWhiteSpace($SourceCodeModeHostExe)) {
-    if ($sourceExeWasExplicit) {
-        $SourceCodeModeHostExe = Join-Path (Split-Path -Parent $SourceExe) "codex-code-mode-host.exe"
-    }
-    else {
-        $SourceCodeModeHostExe = Get-BuiltCodeModeHostPath -RepoRoot $repoRoot -Profile $Profile
-    }
-}
-else {
-    $SourceCodeModeHostExe = Resolve-AbsolutePath $SourceCodeModeHostExe
-}
-
-if ([string]::IsNullOrWhiteSpace($SourceWindowsSandboxSetupExe)) {
-    if ($sourceExeWasExplicit) {
-        $SourceWindowsSandboxSetupExe = Join-Path (Split-Path -Parent $SourceExe) "codex-windows-sandbox-setup.exe"
-    }
-    else {
-        $SourceWindowsSandboxSetupExe = Get-BuiltWindowsSandboxSetupPath -RepoRoot $repoRoot -Profile $Profile
-    }
-}
-else {
-    $SourceWindowsSandboxSetupExe = Resolve-AbsolutePath $SourceWindowsSandboxSetupExe
-}
-
-if ([string]::IsNullOrWhiteSpace($SourceCommandRunnerExe)) {
-    if ($sourceExeWasExplicit) {
-        $SourceCommandRunnerExe = Join-Path (Split-Path -Parent $SourceExe) "codex-command-runner.exe"
-    }
-    else {
-        $SourceCommandRunnerExe = Get-BuiltCommandRunnerPath -RepoRoot $repoRoot -Profile $Profile
-    }
-}
-else {
-    $SourceCommandRunnerExe = Resolve-AbsolutePath $SourceCommandRunnerExe
+    $SourceCodeModeHostExe = Get-BuiltCodeModeHostPath -RepoRoot $repoRoot -Profile $Profile
+    $SourceWindowsSandboxSetupExe = Get-BuiltWindowsSandboxSetupPath -RepoRoot $repoRoot -Profile $Profile
+    $SourceCommandRunnerExe = Get-BuiltCommandRunnerPath -RepoRoot $repoRoot -Profile $Profile
 }
 
 if ([string]::IsNullOrWhiteSpace($BackupDir)) {
@@ -4399,12 +4344,7 @@ if ($DryRun) {
     }
 
     if ($RestartDesktop) {
-        if ($ConfigureDesktopLocalCli) {
-            Restart-CodexDesktop -DryRun -Force:$Force -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
-        }
-        else {
-            Restart-CodexDesktop -DryRun -Force:$Force -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
-        }
+        Restart-CodexDesktop -DryRun -Force:$Force -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
     }
     if (-not [string]::IsNullOrWhiteSpace($staleSourceBuildFailureMessage)) {
         throw $staleSourceBuildFailureMessage
@@ -4465,12 +4405,7 @@ if (-not $binaryChanged) {
     Write-ProofLine "publishCommitted" "true"
     if ($RestartDesktop) {
         try {
-            if ($ConfigureDesktopLocalCli) {
-                Restart-CodexDesktop -Force:$Force -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
-            }
-            else {
-                Restart-CodexDesktop -Force:$Force -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
-            }
+            Restart-CodexDesktop -Force:$Force -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
             Write-ProofLine "restartFailed" "false"
         }
         catch {
@@ -4485,10 +4420,6 @@ if (-not $binaryChanged) {
     exit 0
 }
 
-$publishedCodeModeHost = $false
-$publishedWindowsSandboxSetup = $false
-$publishedCommandRunner = $false
-$publishedCodex = $false
 $publishTransaction = $null
 $publishGateDecision = $null
 if ($sourceBuildFreshnessProvenByStamp) {
@@ -4516,10 +4447,6 @@ try {
             [pscustomobject]@{ Name = "codeModeHost"; SourcePath = $SourceCodeModeHostExe; ExpectedSha256 = $sourceCodeModeHostSha256; TargetPath = $codeModeHostTargetPath; BackupPath = $codeModeHostBackupPath; HadPreviousTarget = $codeModeHostTargetExists; Changed = $codeModeHostBinaryChanged }
             [pscustomobject]@{ Name = "codex"; SourcePath = $SourceExe; ExpectedSha256 = $sourceSha256; TargetPath = $targetPath; BackupPath = $backupPath; HadPreviousTarget = $targetExists; Changed = $codexBinaryChanged }
         )
-    $publishedCommandRunner = Publish-CodexRuntimeBundleEntry -Transaction $publishTransaction -Name "commandRunner"
-    $publishedWindowsSandboxSetup = Publish-CodexRuntimeBundleEntry -Transaction $publishTransaction -Name "windowsSandboxSetup"
-    $publishedCodeModeHost = Publish-CodexRuntimeBundleEntry -Transaction $publishTransaction -Name "codeModeHost"
-    $publishedCodex = Publish-CodexRuntimeBundleEntry -Transaction $publishTransaction -Name "codex"
     Activate-CodexRuntimeBundleTransaction -Transaction $publishTransaction
 
     $targetVersionLines = @(Get-VersionProofLines -Path $targetPath -TimeoutMilliseconds 10000 -Attempts 2)
@@ -4636,12 +4563,7 @@ $publishCommitted = $true
 Write-ProofLine "publishCommitted" "true"
 if ($RestartDesktop) {
     try {
-        if ($ConfigureDesktopLocalCli) {
-            Restart-CodexDesktop -Force:$Force -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
-        }
-        else {
-            Restart-CodexDesktop -Force:$Force -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
-        }
+        Restart-CodexDesktop -Force:$Force -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
         Write-ProofLine "restartFailed" "false"
     }
     catch {

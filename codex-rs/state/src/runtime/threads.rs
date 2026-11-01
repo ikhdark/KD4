@@ -80,25 +80,25 @@ ORDER BY parent, child
             .collect()
     }
 
-    /// Fetches `(id, title, first_user_message)` for existing requested threads.
+    /// Fetches `(id, title, first_user_message, title_is_explicit)` for requested threads.
     /// A JSON array keeps this to one query without SQLite's bind-variable limit.
     pub async fn get_thread_titles(
         &self,
         ids: &[ThreadId],
-    ) -> anyhow::Result<Vec<(ThreadId, String, Option<String>)>> {
+    ) -> anyhow::Result<Vec<(ThreadId, String, Option<String>, bool)>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
-            "SELECT id, title, first_user_message FROM threads \
+        let rows: Vec<(String, String, Option<String>, bool)> = sqlx::query_as(
+            "SELECT id, title, first_user_message, title_is_explicit FROM threads \
              WHERE id IN (SELECT value FROM json_each(?))",
         )
         .bind(serde_json::to_string(ids)?)
         .fetch_all(self.pool.as_ref())
         .await?;
         rows.into_iter()
-            .map(|(id, title, first_user_message)| {
-                Ok((ThreadId::try_from(id)?, title, first_user_message))
+            .map(|(id, title, first_user_message, title_is_explicit)| {
+                Ok((ThreadId::try_from(id)?, title, first_user_message, title_is_explicit))
             })
             .collect()
     }
@@ -154,6 +154,7 @@ SELECT
     threads.cwd,
     threads.cli_version,
     threads.title,
+    threads.title_is_explicit,
     threads.preview,
     threads.sandbox_policy,
     threads.approval_mode,
@@ -784,15 +785,6 @@ ON CONFLICT(child_thread_id) DO NOTHING
             .await
     }
 
-    /// Apply a metadata patch to the current row under the SQLite writer
-    /// reservation. The fallback is used only if no row exists at admission.
-    pub async fn patch_thread_metadata(
-        &self,
-        fallback: &crate::ThreadMetadata,
-        patch: impl FnOnce(&mut crate::ThreadMetadata) -> Result<(), String> + Send,
-    ) -> anyhow::Result<crate::ThreadMetadata> {
-        self.patch_thread_metadata_with_recency(fallback, None, patch).await
-    }
 
     /// Advance requested recency in the metadata writer's existing transaction,
     /// returning the same authoritative projection instead of rereading later.
@@ -816,9 +808,11 @@ ON CONFLICT(child_thread_id) DO NOTHING
         }
         self.upsert_thread_on_connection(&mut tx, &metadata, true)
             .await?;
-        // Explicit patches can clear Git/project fields; rollout upserts instead
-        // deliberately preserve those fields. Both writes share this transaction.
-        sqlx::query("UPDATE threads SET git_sha = ?, git_branch = ?, git_origin_url = ?, project_id = ? WHERE id = ?")
+        // Explicit patches own name/clear and Git/project fields. Rollout upserts
+        // preserve them, so publish explicit changes in this same writer transaction.
+        sqlx::query("UPDATE threads SET title = ?, title_is_explicit = ?, git_sha = ?, git_branch = ?, git_origin_url = ?, project_id = ? WHERE id = ?")
+            .bind(metadata.title.as_str())
+            .bind(metadata.title_is_explicit)
             .bind(metadata.git_sha.as_deref())
             .bind(metadata.git_branch.as_deref())
             .bind(metadata.git_origin_url.as_deref())
@@ -838,14 +832,6 @@ ON CONFLICT(child_thread_id) DO NOTHING
         Ok(metadata)
     }
 
-    /// Insert rollout metadata without changing its persisted file timestamps.
-    pub async fn upsert_thread_preserving_timestamps(
-        &self,
-        metadata: &crate::ThreadMetadata,
-    ) -> anyhow::Result<()> {
-        self.upsert_thread_with_timestamps(metadata, /*allocate_timestamps*/ false)
-            .await
-    }
 
     /// Read repair owns only its named fields. Do not recreate a concurrently
     /// deleted row or allocate artificial recency for an otherwise read-only operation.
@@ -967,7 +953,7 @@ ON CONFLICT(child_thread_id) DO NOTHING
         thread_id: ThreadId,
         title: &str,
     ) -> anyhow::Result<bool> {
-        let result = sqlx::query("UPDATE threads SET title = ? WHERE id = ?")
+        let result = sqlx::query("UPDATE threads SET title = ?, title_is_explicit = 1 WHERE id = ?")
             .bind(title)
             .bind(thread_id.to_string())
             .execute(self.pool.as_ref())
@@ -1107,9 +1093,9 @@ impl StateRuntime {
             metadata.recency_at
         };
         let preview = metadata_preview(metadata);
-        // Backfill/reconcile callers merge existing git info before upserting, but that
-        // read/modify/write is not atomic. Preserve non-null SQLite git fields here so
-        // an explicit metadata update cannot be lost if a stale rollout upsert lands later.
+        // A rollout observation cannot replace an explicit name/clear, including
+        // a stale observation taken before the name committed. Preserve that authority
+        // and non-null Git fields at the SQL conflict boundary, not only in read repair.
         sqlx::query(
             r#"
 INSERT INTO threads (
@@ -1134,6 +1120,7 @@ INSERT INTO threads (
     cwd,
     cli_version,
     title,
+    title_is_explicit,
     preview,
     sandbox_policy,
     approval_mode,
@@ -1145,7 +1132,7 @@ INSERT INTO threads (
     git_branch,
     git_origin_url,
     project_id
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
     session_id = COALESCE(threads.session_id, excluded.session_id),
     rollout_path = excluded.rollout_path,
@@ -1166,7 +1153,8 @@ ON CONFLICT(id) DO UPDATE SET
     reasoning_effort = excluded.reasoning_effort,
     cwd = excluded.cwd,
     cli_version = excluded.cli_version,
-    title = excluded.title,
+    title = CASE WHEN threads.title_is_explicit THEN threads.title ELSE excluded.title END,
+    title_is_explicit = threads.title_is_explicit,
     preview = COALESCE(NULLIF(excluded.preview, ''), threads.preview),
     sandbox_policy = excluded.sandbox_policy,
     approval_mode = excluded.approval_mode,
@@ -1210,6 +1198,7 @@ ON CONFLICT(id) DO UPDATE SET
         .bind(metadata.cwd.display().to_string())
         .bind(metadata.cli_version.as_str())
         .bind(metadata.title.as_str())
+        .bind(metadata.title_is_explicit)
         .bind(preview)
         .bind(metadata.sandbox_policy.as_str())
         .bind(metadata.approval_mode.as_str())
@@ -1325,14 +1314,6 @@ ON CONFLICT(id) DO UPDATE SET
     /// after that transaction commits, so a primary failure leaves the complete retry graph and
     /// auxiliary records intact. Auxiliary cleanup is best-effort after the logical delete.
     pub async fn delete_threads_strict(&self, thread_ids: &[ThreadId]) -> anyhow::Result<u64> {
-        let (rows_affected, _) = self.delete_threads_strict_impl(thread_ids).await?;
-        Ok(rows_affected)
-    }
-
-    async fn delete_threads_strict_impl(
-        &self,
-        thread_ids: &[ThreadId],
-    ) -> anyhow::Result<(u64, usize)> {
         self.delete_threads_with_boundary(thread_ids, None).await
     }
 
@@ -1343,10 +1324,7 @@ ON CONFLICT(id) DO UPDATE SET
         root: ThreadId,
         thread_ids: &[ThreadId],
     ) -> anyhow::Result<u64> {
-        let (rows, _) = self
-            .delete_threads_with_boundary(thread_ids, Some(root))
-            .await?;
-        Ok(rows)
+        self.delete_threads_with_boundary(thread_ids, Some(root)).await
     }
 
     /// Explicit restore/import authorization only; ordinary metadata inference
@@ -1374,9 +1352,9 @@ ON CONFLICT(id) DO UPDATE SET
         &self,
         thread_ids: &[ThreadId],
         root: Option<ThreadId>,
-    ) -> anyhow::Result<(u64, usize)> {
+    ) -> anyhow::Result<u64> {
         if thread_ids.is_empty() {
-            return Ok((0, 0));
+            return Ok(0);
         }
 
         let thread_id_strings = thread_ids
@@ -1386,7 +1364,6 @@ ON CONFLICT(id) DO UPDATE SET
         let thread_ids_json = serde_json::to_string(&thread_id_strings)?;
         let now = Utc::now().timestamp();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let mut primary_statement_count = 0;
         if let Some(root) = root {
             anyhow::ensure!(
                 thread_ids.contains(&root),
@@ -1436,7 +1413,6 @@ WHERE status IN (?, ?)
         .bind(&thread_ids_json)
         .execute(&mut *tx)
         .await?;
-        primary_statement_count += 1;
 
         sqlx::query(
             "DELETE FROM thread_dynamic_tools WHERE thread_id IN (SELECT value FROM json_each(?))",
@@ -1444,7 +1420,6 @@ WHERE status IN (?, ?)
         .bind(&thread_ids_json)
         .execute(&mut *tx)
         .await?;
-        primary_statement_count += 1;
 
         sqlx::query(
             r#"
@@ -1464,7 +1439,6 @@ WHERE assigned_thread_id IN (SELECT value FROM json_each(?)) AND status = ?
         .bind(AgentJobItemStatus::Running.as_str())
         .execute(&mut *tx)
         .await?;
-        primary_statement_count += 1;
 
         sqlx::query(
             r#"
@@ -1477,7 +1451,6 @@ WHERE assigned_thread_id IN (SELECT value FROM json_each(?))
         .bind(&thread_ids_json)
         .execute(&mut *tx)
         .await?;
-        primary_statement_count += 1;
 
         sqlx::query(
             r#"
@@ -1490,7 +1463,6 @@ WHERE parent_thread_id IN (SELECT value FROM json_each(?))
         .bind(&thread_ids_json)
         .execute(&mut *tx)
         .await?;
-        primary_statement_count += 1;
 
         let rows_affected =
             sqlx::query("DELETE FROM threads WHERE id IN (SELECT value FROM json_each(?))")
@@ -1498,10 +1470,8 @@ WHERE parent_thread_id IN (SELECT value FROM json_each(?))
                 .execute(&mut *tx)
                 .await?
                 .rows_affected();
-        primary_statement_count += 1;
         sqlx::query("INSERT OR IGNORE INTO deleted_thread_owners (thread_id) SELECT value FROM json_each(?)")
             .bind(&thread_ids_json).execute(&mut *tx).await?;
-        primary_statement_count += 1;
         tx.commit().await?;
 
         if let Err(err) =
@@ -1513,7 +1483,7 @@ WHERE parent_thread_id IN (SELECT value FROM json_each(?))
             warn!("failed to remove logs for deleted threads: {err}");
         }
 
-        Ok((rows_affected, primary_statement_count))
+        Ok(rows_affected)
     }
 }
 
@@ -1666,6 +1636,7 @@ SELECT
     threads.cwd,
     threads.cli_version,
     threads.title,
+    threads.title_is_explicit,
     threads.preview,
     threads.sandbox_policy,
     threads.approval_mode,

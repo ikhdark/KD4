@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::os::raw::c_void;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::slice;
@@ -188,7 +189,7 @@ struct ReadDirectoryChangesServer {
     meta_tx: Sender<MetaEvent>,
     cmd_tx: Sender<Result<PathBuf>>,
     watches: HashMap<PathBuf, WatchState>,
-    wakeup_sem: HANDLE,
+    wakeup_sem: Arc<OwnedHandle>,
 }
 
 impl ReadDirectoryChangesServer {
@@ -197,17 +198,14 @@ impl ReadDirectoryChangesServer {
         event_kinds: EventKindMask,
         meta_tx: Sender<MetaEvent>,
         cmd_tx: Sender<Result<PathBuf>>,
-        wakeup_sem: HANDLE,
+        wakeup_sem: Arc<OwnedHandle>,
     ) -> Sender<Action> {
         let (action_tx, action_rx) = unbounded();
-        // it is, in fact, ok to send the semaphore across threads
-        let sem_temp = wakeup_sem as u64;
         let _ = thread::Builder::new()
             .name("notify-rs windows loop".to_string())
             .spawn({
                 let tx = action_tx.clone();
                 move || {
-                    let wakeup_sem = sem_temp as HANDLE;
                     let server = ReadDirectoryChangesServer {
                         tx,
                         rx: action_rx,
@@ -240,8 +238,12 @@ impl ReadDirectoryChangesServer {
                         self.remove_watch_if_current(path, &stopping)
                     }
                     Action::UnwatchAck(path) => {
-                        self.remove_watch(path.clone());
-                        let _ = self.cmd_tx.send(Ok(path));
+                        let res = if self.remove_watch(path.clone()) {
+                            Ok(path)
+                        } else {
+                            Err(Error::watch_not_found().add_path(path))
+                        };
+                        let _ = self.cmd_tx.send(res);
                     }
                     Action::GetWatchedPaths(tx) => {
                         let _ = tx.send(
@@ -274,17 +276,13 @@ impl ReadDirectoryChangesServer {
                 // wait with alertable flag so that the completion routine fires
                 // External actions signal the semaphore. Internal unwatch
                 // actions run in APC callbacks, which also return this wait.
-                let waitres = WaitForSingleObjectEx(self.wakeup_sem, INFINITE, 1);
+                let waitres = WaitForSingleObjectEx(self.wakeup_sem.as_raw_handle(), INFINITE, 1);
                 if waitres == WAIT_OBJECT_0 {
                     let _ = self.meta_tx.send(MetaEvent::WatcherAwakened);
                 }
             }
         }
 
-        // we have to clean this up, since the watcher may be long gone
-        unsafe {
-            CloseHandle(self.wakeup_sem);
-        }
     }
 
     fn add_watch(
@@ -413,9 +411,12 @@ impl ReadDirectoryChangesServer {
         Ok(watched_path)
     }
 
-    fn remove_watch(&mut self, path: PathBuf) {
+    fn remove_watch(&mut self, path: PathBuf) -> bool {
         if let Some(ws) = self.watches.remove(&path) {
             stop_watch(&ws, &self.meta_tx);
+            true
+        } else {
+            false
         }
     }
 
@@ -440,15 +441,17 @@ fn stop_watch(ws: &WatchState, meta_tx: &Sender<MetaEvent>) {
     // first so that callback does not rearm ReadDirectoryChangesW with the handle closed below.
     ws.stopping.store(true, Ordering::Release);
     unsafe {
-        let cio = CancelIo(ws.dir_handle);
-        let ch = CloseHandle(ws.dir_handle);
-        // have to wait for it, otherwise we leak the memory allocated for there read request
-        if cio != 0 && ch != 0 {
+        if CancelIo(ws.dir_handle) == 0 {
+            // A completion may still use these handles. Leak them rather than let it
+            // access closed handle values that Windows may have reassigned.
+            log::error!("CancelIo failed; leaking the handles of a stopped watch");
+        } else {
             while WaitForSingleObjectEx(ws.complete_sem, INFINITE, 1) != WAIT_OBJECT_0 {
                 // drain the apc queue, fix for https://github.com/notify-rs/notify/issues/287#issuecomment-801465550
             }
+            CloseHandle(ws.dir_handle);
+            CloseHandle(ws.complete_sem);
         }
-        CloseHandle(ws.complete_sem);
     }
     let _ = meta_tx.send(MetaEvent::SingleWatchComplete);
 }
@@ -557,7 +560,7 @@ unsafe extern "system" fn handle_event(
         let request: Box<ReadDirectoryRequest> = Box::from_raw(overlapped.hEvent as *mut _);
 
         // CancelIo does not change a completion that was already queued successfully. Such a callback
-        // can run while stop_watch is waiting for completion, after it has closed the directory handle.
+        // can run while stop_watch waits for completion, before it releases the directory handle.
         if request.data.stopping.load(Ordering::Acquire) {
             ReleaseSemaphore(request.data.complete_sem, 1, ptr::null_mut());
             return;
@@ -769,7 +772,7 @@ unsafe extern "system" fn handle_event(
 pub struct ReadDirectoryChangesWatcher {
     tx: Sender<Action>,
     cmd_rx: Receiver<Result<PathBuf>>,
-    wakeup_sem: HANDLE,
+    wakeup_sem: Arc<OwnedHandle>,
     windows_path_separator_style: WindowsPathSeparatorStyle,
 }
 
@@ -799,13 +802,16 @@ impl ReadDirectoryChangesWatcher {
         if wakeup_sem.is_null() || wakeup_sem == INVALID_HANDLE_VALUE {
             return Err(Error::generic("Failed to create wakeup semaphore."));
         }
+        // Both ends own the semaphore until shutdown has been sent and woken.
+        // Keep send-before-wake: the server's event-driven wait has no timeout.
+        let wakeup_sem = Arc::new(unsafe { OwnedHandle::from_raw_handle(wakeup_sem) });
 
         let action_tx = ReadDirectoryChangesServer::start(
             event_handler,
             event_kinds,
             meta_tx,
             cmd_tx,
-            wakeup_sem,
+            wakeup_sem.clone(),
         );
 
         Ok(ReadDirectoryChangesWatcher {
@@ -819,7 +825,7 @@ impl ReadDirectoryChangesWatcher {
     fn wakeup_server(&self) {
         // Every external action must release the event-driven alertable wait.
         unsafe {
-            ReleaseSemaphore(self.wakeup_sem, 1, ptr::null_mut());
+            ReleaseSemaphore(self.wakeup_sem.as_raw_handle(), 1, ptr::null_mut());
         }
     }
 
@@ -917,9 +923,4 @@ impl Drop for ReadDirectoryChangesWatcher {
     }
 }
 
-// `ReadDirectoryChangesWatcher` is not Send/Sync because of the semaphore Handle.
-// As said elsewhere it's perfectly safe to send it across threads.
-unsafe impl Send for ReadDirectoryChangesWatcher {}
-// Because all public methods are `&mut self` it's also perfectly safe to share references.
-unsafe impl Sync for ReadDirectoryChangesWatcher {}
 

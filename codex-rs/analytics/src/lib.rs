@@ -59,15 +59,6 @@ pub fn now_unix_seconds() -> u64 {
         .as_secs()
 }
 
-pub fn now_unix_millis() -> u64 {
-    u64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
-    )
-    .unwrap_or(u64::MAX)
-}
 
 pub(crate) fn serialize_enum_as_string<T: serde::Serialize>(value: &T) -> Option<String> {
     serde_json::to_value(value)

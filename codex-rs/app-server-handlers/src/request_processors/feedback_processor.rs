@@ -1,0 +1,334 @@
+use super::Arc;
+use super::AuthManager;
+use super::ClientResponsePayload;
+use super::CodexFeedback;
+use super::Config;
+use super::FeedbackAttachmentPath;
+use super::FeedbackUploadOptions;
+use super::FeedbackUploadParams;
+use super::FeedbackUploadResponse;
+use super::HashSet;
+use super::JSONRPCErrorError;
+use super::LogDbLayer;
+use super::Path;
+use super::Result;
+use super::StateDbHandle;
+use super::ThreadId;
+use super::ThreadManager;
+use super::internal_error;
+use super::invalid_request;
+use super::warn;
+
+use codex_feedback::WINDOWS_SANDBOX_LOG_ATTACHMENT_FILENAME;
+use futures::StreamExt;
+
+const MAX_FEEDBACK_TREE_THREADS: usize = 8;
+
+#[derive(Clone)]
+pub(crate) struct FeedbackRequestProcessor {
+    auth_manager: Arc<AuthManager>,
+    thread_manager: Arc<ThreadManager>,
+    config: Arc<Config>,
+    feedback: CodexFeedback,
+    log_db: Option<LogDbLayer>,
+    state_db: Option<StateDbHandle>,
+}
+
+impl FeedbackRequestProcessor {
+    pub(crate) fn new(
+        auth_manager: Arc<AuthManager>,
+        thread_manager: Arc<ThreadManager>,
+        config: Arc<Config>,
+        feedback: CodexFeedback,
+        log_db: Option<LogDbLayer>,
+        state_db: Option<StateDbHandle>,
+    ) -> Self {
+        Self {
+            auth_manager,
+            thread_manager,
+            config,
+            feedback,
+            log_db,
+            state_db,
+        }
+    }
+
+    pub(crate) async fn feedback_upload(
+        &self,
+        params: FeedbackUploadParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        self.upload_feedback_response(params)
+            .await
+            .map(|response| Some(response.into()))
+    }
+
+    async fn upload_feedback_response(
+        &self,
+        params: FeedbackUploadParams,
+    ) -> Result<FeedbackUploadResponse, JSONRPCErrorError> {
+        if !self.config.feedback_enabled {
+            return Err(invalid_request(
+                "sending feedback is disabled by configuration",
+            ));
+        }
+
+        let FeedbackUploadParams {
+            classification,
+            reason,
+            thread_id,
+            include_logs,
+            extra_log_files,
+            tags,
+        } = params;
+        let mut upload_tags = tags.unwrap_or_default();
+
+        let conversation_id = match thread_id.as_deref() {
+            Some(thread_id) => match ThreadId::from_string(thread_id) {
+                Ok(conversation_id) => Some(conversation_id),
+                Err(err) => return Err(invalid_request(format!("invalid thread id: {err}"))),
+            },
+            None => None,
+        };
+
+        if let Some(chatgpt_user_id) = self
+            .auth_manager
+            .auth_cached()
+            .and_then(|auth| auth.get_chatgpt_user_id())
+        {
+            tracing::info!(target: "feedback_tags", chatgpt_user_id);
+        }
+        if let Some(account_id) = self
+            .auth_manager
+            .auth_cached()
+            .and_then(|auth| auth.get_account_id())
+        {
+            tracing::info!(target: "feedback_tags", account_id);
+        }
+        let mut snapshot = self.feedback.snapshot(conversation_id);
+        let thread_id = snapshot.thread_id.clone();
+        let prepare_logs = async {
+            let feedback_thread_ids = if include_logs {
+                let flush = async {
+                    if let Some(log_db) = self.log_db.as_ref()
+                        && let Err(err) = log_db.flush().await
+                    {
+                        tracing::warn!(%err, "failed to flush SQLite logs");
+                    }
+                };
+                let discover = async {
+                    match conversation_id {
+                        Some(conversation_id) => match self
+                            .thread_manager
+                            .list_agent_subtree_thread_ids(conversation_id)
+                            .await
+                        {
+                            Ok(thread_ids) => thread_ids,
+                            Err(err) => {
+                                warn!(
+                                    "failed to list feedback subtree for thread_id={conversation_id}: {err}"
+                                );
+                                vec![conversation_id]
+                            }
+                        },
+                        None => Vec::new(),
+                    }
+                };
+                let (_, feedback_thread_ids) = tokio::join!(flush, discover);
+                let mut feedback_thread_ids = feedback_thread_ids;
+                let original_len = feedback_thread_ids.len();
+                if let Some(conversation_id) = conversation_id {
+                    feedback_thread_ids =
+                        select_feedback_thread_ids(conversation_id, feedback_thread_ids);
+                    if original_len > MAX_FEEDBACK_TREE_THREADS {
+                        warn!(
+                            "feedback log upload for thread_id={conversation_id:?} truncated from {original_len} threads to root plus the most recent descendants"
+                        );
+                    }
+                }
+                feedback_thread_ids
+            } else {
+                Vec::new()
+            };
+            let query_logs = async {
+                let state_db_ctx = self.state_db.clone();
+                if let Some(state_db_ctx) = state_db_ctx.as_ref()
+                    && !feedback_thread_ids.is_empty()
+                {
+                    let thread_id_texts = feedback_thread_ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>();
+                    let thread_id_refs = thread_id_texts
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>();
+                    match state_db_ctx
+                        .query_feedback_logs_for_threads(&thread_id_refs)
+                        .await
+                    {
+                        Ok(logs) if logs.is_empty() => None,
+                        Ok(logs) => Some(logs),
+                        Err(err) => {
+                            let thread_ids = thread_id_texts.join(", ");
+                            warn!(
+                                "failed to query feedback logs from sqlite for thread_ids=[{thread_ids}]: {err}"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            };
+            let prepare_attachments = async {
+                let mut attachment_paths = Vec::new();
+                let mut seen_attachment_paths = HashSet::new();
+                if include_logs {
+                    let rollout_paths = futures::stream::iter(feedback_thread_ids.iter().copied())
+                        .map(|feedback_thread_id| async move {
+                            (
+                                feedback_thread_id,
+                                self.thread_manager
+                                    .resolve_existing_rollout_path(
+                                        feedback_thread_id,
+                                        /*include_archived*/ true,
+                                    )
+                                    .await,
+                            )
+                        })
+                        .buffered(MAX_FEEDBACK_TREE_THREADS);
+                    futures::pin_mut!(rollout_paths);
+                    while let Some((feedback_thread_id, result)) = rollout_paths.next().await {
+                        let rollout_path = match result {
+                            Ok(Some(path)) => path,
+                            Ok(None) => continue,
+                            Err(err) => {
+                                warn!(
+                                    "failed to resolve rollout path for thread_id={feedback_thread_id}: {err}"
+                                );
+                                continue;
+                            }
+                        };
+                        if seen_attachment_paths.insert(rollout_path.clone()) {
+                            attachment_paths.push(FeedbackAttachmentPath {
+                                path: rollout_path,
+                                hydrate_rollout: true,
+                                attachment_filename_override: None,
+                            });
+                        }
+                    }
+                    if let Some(sandbox_log_attachment) =
+                        windows_sandbox_log_attachment(&self.config.codex_home)
+                        && seen_attachment_paths.insert(sandbox_log_attachment.path.clone())
+                    {
+                        attachment_paths.push(sandbox_log_attachment);
+                    }
+                }
+                if let Some(extra_log_files) = extra_log_files {
+                    for extra_log_file in extra_log_files {
+                        if seen_attachment_paths.insert(extra_log_file.clone()) {
+                            attachment_paths.push(FeedbackAttachmentPath {
+                                path: extra_log_file,
+                                hydrate_rollout: false,
+                                attachment_filename_override: None,
+                            });
+                        }
+                    }
+                }
+
+                attachment_paths
+            };
+            let (attachment_paths, sqlite_feedback_logs) =
+                tokio::join!(prepare_attachments, query_logs);
+            (attachment_paths, sqlite_feedback_logs)
+        };
+        let prepare_doctor = async {
+            if include_logs {
+                super::feedback_doctor_report::doctor_feedback_report(&self.config).await
+            } else {
+                None
+            }
+        };
+        let ((attachment_paths, sqlite_feedback_logs), doctor_report) =
+            tokio::join!(prepare_logs, prepare_doctor);
+
+        // A successful query can still return old rows after a batch was lost.
+        // Preserve the independent memory buffer rather than overriding it with incomplete logs.
+        let sqlite_feedback_logs = if self
+            .log_db
+            .as_ref()
+            .is_some_and(LogDbLayer::has_write_failure)
+        {
+            None
+        } else {
+            sqlite_feedback_logs
+        };
+        if include_logs {
+            // Flush/query failures can themselves produce diagnostics during collection.
+            snapshot.refresh_logs(&self.feedback);
+        }
+
+        let mut extra_attachments = Vec::new();
+        if let Some(doctor_report) = doctor_report {
+            extra_attachments.push(doctor_report.attachment);
+            for (key, value) in doctor_report.tags {
+                upload_tags.entry(key).or_insert(value);
+            }
+        }
+
+        let session_source = self.thread_manager.session_source();
+
+        let upload_result = tokio::task::spawn_blocking(move || {
+            let tags = (!upload_tags.is_empty()).then_some(&upload_tags);
+            snapshot.upload_feedback(FeedbackUploadOptions {
+                classification: &classification,
+                reason: reason.as_deref(),
+                tags,
+                include_logs,
+                extra_attachments: &extra_attachments,
+                extra_attachment_paths: &attachment_paths,
+                session_source: Some(session_source),
+                logs_override: sqlite_feedback_logs,
+            })
+        })
+        .await;
+
+        let upload_result = match upload_result {
+            Ok(result) => result,
+            Err(join_err) => {
+                return Err(internal_error(format!(
+                    "failed to upload feedback: {join_err}"
+                )));
+            }
+        };
+
+        upload_result.map_err(|err| internal_error(format!("failed to upload feedback: {err}")))?;
+        Ok(FeedbackUploadResponse { thread_id })
+    }
+}
+
+fn select_feedback_thread_ids(root: ThreadId, thread_ids: Vec<ThreadId>) -> Vec<ThreadId> {
+    let mut descendants = std::collections::BTreeMap::new();
+    for id in thread_ids.into_iter().filter(|id| *id != root) {
+        // UUIDv7 string order tracks creation time. Retain only the seven newest.
+        descendants.insert(id.to_string(), id);
+        if descendants.len() >= MAX_FEEDBACK_TREE_THREADS {
+            descendants.pop_first();
+        }
+    }
+    std::iter::once(root)
+        .chain(descendants.into_values())
+        .collect()
+}
+
+fn windows_sandbox_log_attachment(codex_home: &Path) -> Option<FeedbackAttachmentPath> {
+    let sandbox_log_path = codex_windows_sandbox::current_log_file_path_for_codex_home(codex_home);
+    sandbox_log_path
+        .is_file()
+        .then_some(FeedbackAttachmentPath {
+            hydrate_rollout: false,
+            path: sandbox_log_path,
+            attachment_filename_override: Some(WINDOWS_SANDBOX_LOG_ATTACHMENT_FILENAME.to_string()),
+        })
+}
+

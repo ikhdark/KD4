@@ -186,12 +186,21 @@ impl TerminalInfo {
 
 static TERMINAL_INFO: OnceLock<TerminalInfo> = OnceLock::new();
 
-/// Environment variable access used by terminal detection.
-///
-/// This trait exists to allow faking the environment in tests.
-trait Environment {
+/// Reads environment variables from the running process.
+struct ProcessEnvironment;
+
+impl ProcessEnvironment {
     /// Returns an environment variable when set.
-    fn var(&self, name: &str) -> Option<String>;
+    fn var(&self, name: &str) -> Option<String> {
+        match std::env::var(name) {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                tracing::warn!("failed to read env var {name}: value not valid UTF-8");
+                None
+            }
+        }
+    }
 
     /// Returns whether an environment variable is set.
     fn has(&self, name: &str) -> bool {
@@ -206,22 +215,6 @@ trait Environment {
     /// Returns whether an environment variable is set and non-empty.
     fn has_non_empty(&self, name: &str) -> bool {
         self.var_non_empty(name).is_some()
-    }
-}
-
-/// Reads environment variables from the running process.
-struct ProcessEnvironment;
-
-impl Environment for ProcessEnvironment {
-    fn var(&self, name: &str) -> Option<String> {
-        match std::env::var(name) {
-            Ok(value) => Some(value),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(std::env::VarError::NotUnicode(_)) => {
-                tracing::warn!("failed to read env var {name}: value not valid UTF-8");
-                None
-            }
-        }
     }
 }
 
@@ -240,7 +233,7 @@ fn cached_terminal_info() -> &'static TerminalInfo {
         .get_or_init(|| detect_terminal_info_from_env(&ProcessEnvironment))
 }
 
-/// Detects structured terminal metadata from an injectable environment.
+/// Detects structured terminal metadata from the process environment.
 ///
 /// Detection order favors explicit identifiers before falling back to capability strings:
 /// - `TERM_PROGRAM` (plus `TERM_PROGRAM_VERSION`) drives the detected terminal name,
@@ -248,7 +241,7 @@ fn cached_terminal_info() -> &'static TerminalInfo {
 ///   This means `TERM_PROGRAM` can mask later probes (for example `WT_SESSION`).
 /// - Next, terminal-specific variables (WEZTERM, iTerm2, Apple Terminal, kitty, etc.) are checked.
 /// - Finally, `TERM` is used as the capability fallback.
-fn detect_terminal_info_from_env(env: &dyn Environment) -> TerminalInfo {
+fn detect_terminal_info_from_env(env: &ProcessEnvironment) -> TerminalInfo {
     let multiplexer = detect_multiplexer(env);
 
     if let Some(term_program) = env.var_non_empty("TERM_PROGRAM")
@@ -336,7 +329,7 @@ fn detect_terminal_info_from_env(env: &dyn Environment) -> TerminalInfo {
     TerminalInfo::unknown(multiplexer)
 }
 
-fn detect_multiplexer(env: &dyn Environment) -> Option<Multiplexer> {
+fn detect_multiplexer(env: &ProcessEnvironment) -> Option<Multiplexer> {
     if env.has_non_empty("TMUX") || env.has_non_empty("TMUX_PANE") {
         return Some(Multiplexer::Tmux {
             version: tmux_version_from_env(env),
@@ -359,7 +352,7 @@ fn is_tmux_term_program(value: &str) -> bool {
     value.eq_ignore_ascii_case("tmux")
 }
 
-fn tmux_version_from_env(env: &dyn Environment) -> Option<String> {
+fn tmux_version_from_env(env: &ProcessEnvironment) -> Option<String> {
     let term_program = env.var("TERM_PROGRAM")?;
     if !is_tmux_term_program(&term_program) {
         return None;

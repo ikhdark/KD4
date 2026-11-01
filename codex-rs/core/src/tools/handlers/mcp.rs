@@ -35,24 +35,10 @@ use serde_json::Value;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DeferredJobStatus {
-    pub(crate) job_id: String,
-    pub(crate) tool_name: String,
-    pub(crate) started: Instant,
-}
-
-#[derive(Default)]
-struct McpDeferredJobsInner {
-    next_id: u64,
-    running: HashMap<String, DeferredJobStatus>,
-    results: HashMap<String, watch::Sender<Option<Arc<HandledMcpToolCall>>>>,
-}
-
 /// Session-scoped in-flight calls sharing the original typed MCP result.
 #[derive(Default)]
 pub(crate) struct McpDeferredJobs {
-    inner: std::sync::Mutex<McpDeferredJobsInner>,
+    inner: std::sync::Mutex<HashMap<String, watch::Sender<Option<Arc<HandledMcpToolCall>>>>>,
 }
 
 impl McpDeferredJobs {
@@ -80,33 +66,17 @@ fn canonical_json(value: &Value) -> String {
 
 impl McpDeferredJobs {
 
-    fn reserve(
-        &self,
-        key: String,
-        tool_name: String,
-        started: Instant,
-    ) -> (
-        DeferredJobStatus,
-        bool,
-        watch::Receiver<Option<Arc<HandledMcpToolCall>>>,
-    ) {
+    fn reserve(&self, key: String) -> (bool, watch::Receiver<Option<Arc<HandledMcpToolCall>>>) {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(sender) = inner.results.get(&key) {
-            return (inner.running[&key].clone(), false, sender.subscribe());
+        if let Some(sender) = inner.get(&key) {
+            return (false, sender.subscribe());
         }
-        inner.next_id += 1;
-        let status = DeferredJobStatus {
-            job_id: format!("mcp-job-{}", inner.next_id),
-            tool_name,
-            started,
-        };
         let (sender, receiver) = watch::channel(None);
-        inner.results.insert(key.clone(), sender);
-        inner.running.insert(key, status.clone());
-        (status, true, receiver)
+        inner.insert(key, sender);
+        (true, receiver)
     }
 
     /// Join an identical in-flight call before dispatch. Keep the actual typed
@@ -114,7 +84,6 @@ impl McpDeferredJobs {
     async fn execute<F>(
         self: &Arc<Self>,
         key: String,
-        tool_name: String,
         input: Value,
         cancellation: CancellationToken,
         call: F,
@@ -122,7 +91,7 @@ impl McpDeferredJobs {
     where
         F: Future<Output = HandledMcpToolCall>,
     {
-        let (_status, owner, mut receiver) = self.reserve(key.clone(), tool_name, Instant::now());
+        let (owner, mut receiver) = self.reserve(key.clone());
         if owner {
             let lease = McpCallLease {
                 jobs: Arc::clone(self),
@@ -135,7 +104,7 @@ impl McpDeferredJobs {
                     .inner
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let Some(sender) = inner.results.get(&lease.key) {
+                if let Some(sender) = inner.get(&lease.key) {
                     sender.send_replace(Some(Arc::clone(&result)));
                 }
             }
@@ -185,13 +154,12 @@ impl Drop for McpCallLease {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(sender) = inner.results.remove(&self.key) {
+        if let Some(sender) = inner.remove(&self.key) {
             let unfinished = sender.borrow().is_none();
             if unfinished {
                 sender.send_replace(Some(cancelled_mcp_result(self.input.clone())));
             }
         }
-        inner.running.remove(&self.key);
     }
 }
 
@@ -395,7 +363,6 @@ impl McpHandler {
         let result = jobs
             .execute(
                 job_key,
-                self.hook_tool_name().name().to_string(),
                 tool_input_value,
                 cancellation_token,
                 call,

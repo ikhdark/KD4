@@ -1,0 +1,506 @@
+use std::collections::HashSet;
+use std::future::Future;
+use std::sync::Arc;
+
+use codex_app_server_protocol_types::ClientResponsePayload;
+use codex_app_server_protocol_types::JSONRPCErrorError;
+use codex_app_server_protocol_types::Project;
+use codex_app_server_protocol_types::ProjectChangeType;
+use codex_app_server_protocol_types::ProjectChangedNotification;
+use codex_app_server_protocol_types::ProjectCreateParams;
+use codex_app_server_protocol_types::ProjectCreateResponse;
+use codex_app_server_protocol_types::ProjectDeleteParams;
+use codex_app_server_protocol_types::ProjectDeleteResponse;
+use codex_app_server_protocol_types::ProjectImportParams;
+use codex_app_server_protocol_types::ProjectImportResponse;
+use codex_app_server_protocol_types::ProjectListParams;
+use codex_app_server_protocol_types::ProjectListResponse;
+use codex_app_server_protocol_types::ProjectMoveParams;
+use codex_app_server_protocol_types::ProjectMoveResponse;
+use codex_app_server_protocol_types::ProjectReadParams;
+use codex_app_server_protocol_types::ProjectReadResponse;
+use codex_app_server_protocol_types::ProjectRoot;
+use codex_app_server_protocol_types::ProjectSortKey;
+use codex_app_server_protocol_types::ProjectUpdateParams;
+use codex_app_server_protocol_types::ProjectUpdateResponse;
+use codex_app_server_protocol_types::ServerNotification;
+use codex_app_server_protocol_types::SortDirection;
+use codex_app_server_protocol_types::ThreadProjectUpdatedNotification;
+use codex_thread_store::CreateProjectParams as StoreCreateProjectParams;
+use codex_thread_store::ListProjectsParams as StoreListProjectsParams;
+use codex_thread_store::MoveProjectParams as StoreMoveProjectParams;
+use codex_thread_store::ProjectMoveOutcome;
+use codex_thread_store::ProjectSortKey as StoreProjectSortKey;
+use codex_thread_store::SortDirection as StoreSortDirection;
+use codex_thread_store::StoredProject;
+use codex_thread_store::StoredProjectRoot;
+use codex_thread_store::ThreadStore;
+use codex_thread_store::ThreadStoreError;
+use codex_thread_store::UpdateProjectParams as StoreUpdateProjectParams;
+use tokio_util::task::TaskTracker;
+use tracing::Instrument;
+
+use super::thread_processor::THREAD_PAGE_DEFAULT_LIMIT as THREAD_LIST_DEFAULT_LIMIT;
+use super::thread_processor::THREAD_PAGE_MAX_LIMIT as THREAD_LIST_MAX_LIMIT;
+use super::ThreadListState;
+use crate::error_code::internal_error;
+use crate::error_code::invalid_params;
+use crate::error_code::method_not_found;
+use crate::outgoing_message::OutgoingMessageSender;
+
+#[derive(Clone)]
+pub(crate) struct ProjectRequestProcessor {
+    thread_store: Arc<dyn ThreadStore>,
+    thread_state_manager: crate::thread_state::ThreadStateManager,
+    outgoing: Arc<OutgoingMessageSender>,
+    thread_list_state_permit: Arc<ThreadListState>,
+    background_tasks: TaskTracker,
+}
+
+impl ProjectRequestProcessor {
+    pub(crate) fn new(
+        thread_store: Arc<dyn ThreadStore>,
+        thread_state_manager: crate::thread_state::ThreadStateManager,
+        outgoing: Arc<OutgoingMessageSender>,
+        thread_list_state_permit: Arc<ThreadListState>,
+        background_tasks: TaskTracker,
+    ) -> Self {
+        Self {
+            thread_store,
+            thread_state_manager,
+            outgoing,
+            thread_list_state_permit,
+            background_tasks,
+        }
+    }
+
+    pub(crate) async fn project_list(
+        &self,
+        params: ProjectListParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        if params.sort_key.is_none() && params.sort_direction.is_some() {
+            return Err(invalid_params("sortDirection requires sortKey"));
+        }
+        let sort_key = match params.sort_key.unwrap_or(ProjectSortKey::Position) {
+            ProjectSortKey::Position => StoreProjectSortKey::Position,
+            ProjectSortKey::RecencyAt => StoreProjectSortKey::RecencyAt,
+        };
+        let sort_direction = match params.sort_direction {
+            Some(SortDirection::Asc) => StoreSortDirection::Asc,
+            Some(SortDirection::Desc) => StoreSortDirection::Desc,
+            None => match sort_key {
+                StoreProjectSortKey::Position => StoreSortDirection::Asc,
+                StoreProjectSortKey::RecencyAt => StoreSortDirection::Desc,
+            },
+        };
+        let page = self
+            .thread_store
+            .list_projects(StoreListProjectsParams {
+                cursor: params.cursor,
+                sort_key,
+                sort_direction,
+                limit: params
+                    .limit
+                    .map(|limit| limit as usize)
+                    .unwrap_or(THREAD_LIST_DEFAULT_LIMIT)
+                    .clamp(1, THREAD_LIST_MAX_LIMIT),
+            })
+            .await
+            .map_err(|error| project_store_error("project/list", error))?;
+        Ok(Some(
+            ProjectListResponse {
+                data: page
+                    .projects
+                    .into_iter()
+                    .map(api_project)
+                    .collect::<Result<_, _>>()?,
+                next_cursor: page.next_cursor,
+            }
+            .into(),
+        ))
+    }
+
+    pub(crate) async fn project_read(
+        &self,
+        params: ProjectReadParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let project = self
+            .thread_store
+            .read_project(params.project_id.clone())
+            .await
+            .map_err(|error| project_store_error("project/read", error))?
+            .ok_or_else(|| invalid_params(format!("project not found: {}", params.project_id)))?;
+        Ok(Some(
+            ProjectReadResponse {
+                project: api_project(project)?,
+            }
+            .into(),
+        ))
+    }
+
+    pub(crate) async fn project_create(
+        &self,
+        params: ProjectCreateParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let params = Self::prepare_project_create(
+            params.name,
+            params.roots,
+            params.metadata,
+            Vec::new(),
+            params.idempotency_key,
+        )
+        .await?;
+        self.run_mutation("project/create", move |processor| async move {
+            processor.project_create_inner(params).await
+        })
+        .await
+    }
+
+    async fn project_create_inner(
+        &self,
+        params: StoreCreateProjectParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let (project, created, _) = self.create_project(params, "project/create").await?;
+        if created {
+            self.notify_project_changed(&project.id, ProjectChangeType::Created)
+                .await;
+        }
+        Ok(Some(ProjectCreateResponse { project }.into()))
+    }
+
+    pub(crate) async fn project_import(
+        &self,
+        params: ProjectImportParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let params = Self::prepare_project_create(
+            params.name,
+            params.roots,
+            params.metadata,
+            params.threads.unwrap_or_default(),
+            params.idempotency_key,
+        )
+        .await?;
+        self.run_mutation("project/import", move |processor| async move {
+            processor.project_import_inner(params).await
+        })
+        .await
+    }
+
+    async fn project_import_inner(
+        &self,
+        params: StoreCreateProjectParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let (project, created, thread_ids) = self.create_project(params, "project/import").await?;
+        if created {
+            self.notify_project_changed(&project.id, ProjectChangeType::Created)
+                .await;
+            self.notify_thread_projects(thread_ids, Some(project.id.clone()))
+                .await;
+        }
+        Ok(Some(ProjectImportResponse { project }.into()))
+    }
+
+    pub(crate) async fn project_update(
+        &self,
+        params: ProjectUpdateParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let name = params.name.map(validate_name).transpose()?;
+        let roots = match params.roots {
+            Some(roots) => Some(validate_roots_off_thread(roots).await?),
+            None => None,
+        };
+        let params = StoreUpdateProjectParams {
+            project_id: params.project_id,
+            name,
+            roots,
+            metadata: params.metadata,
+        };
+        self.run_mutation("project/update", move |processor| async move {
+            processor.project_update_inner(params).await
+        })
+        .await
+    }
+
+    async fn project_update_inner(
+        &self,
+        params: StoreUpdateProjectParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let project_id = params.project_id.clone();
+        let updated = self
+            .thread_store
+            .update_project(params)
+            .await
+            .map_err(|error| project_store_error("project/update", error))?
+            .ok_or_else(|| invalid_params(format!("project not found: {project_id}")))?;
+        let project = api_project(updated.project)?;
+        if updated.changed {
+            self.notify_project_changed(&project.id, ProjectChangeType::Updated)
+                .await;
+        }
+        Ok(Some(ProjectUpdateResponse { project }.into()))
+    }
+
+    pub(crate) async fn project_move(
+        &self,
+        params: ProjectMoveParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        self.run_mutation("project/move", move |processor| async move {
+            processor.project_move_inner(params).await
+        })
+        .await
+    }
+
+    async fn project_move_inner(
+        &self,
+        params: ProjectMoveParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let project_id = params.project_id;
+        let outcome = self
+            .thread_store
+            .move_project(StoreMoveProjectParams {
+                project_id: project_id.clone(),
+                before_project_id: params.before_project_id,
+            })
+            .await
+            .map_err(|error| project_store_error("project/move", error))?
+            .ok_or_else(|| invalid_params(format!("project not found: {project_id}")))?;
+        if outcome == ProjectMoveOutcome::Moved {
+            self.notify_project_changed(&project_id, ProjectChangeType::Updated)
+                .await;
+        }
+        Ok(Some(ProjectMoveResponse {}.into()))
+    }
+
+    pub(crate) async fn project_delete(
+        &self,
+        params: ProjectDeleteParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        self.run_mutation("project/delete", move |processor| async move {
+            processor.project_delete_inner(params).await
+        })
+        .await
+    }
+
+    async fn project_delete_inner(
+        &self,
+        params: ProjectDeleteParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let mut deleted = self
+            .thread_store
+            .delete_project(params.project_id.clone())
+            .await
+            .map_err(|error| project_store_error("project/delete", error))?
+            .ok_or_else(|| invalid_params(format!("project not found: {}", params.project_id)))?;
+        deleted.affected_active_thread_ids.extend(
+            self.thread_state_manager
+                .clear_volatile_project(&params.project_id)
+                .await,
+        );
+        deleted.affected_active_thread_ids.sort();
+        deleted.affected_active_thread_ids.dedup();
+        self.notify_project_changed(&params.project_id, ProjectChangeType::Deleted)
+            .await;
+        self.notify_thread_projects(deleted.affected_active_thread_ids, /*project_id*/ None)
+            .await;
+        Ok(Some(ProjectDeleteResponse {}.into()))
+    }
+
+    async fn prepare_project_create(
+        name: String,
+        roots: Vec<ProjectRoot>,
+        metadata: Option<std::collections::BTreeMap<String, String>>,
+        thread_ids: Vec<String>,
+        idempotency_key: String,
+    ) -> Result<StoreCreateProjectParams, JSONRPCErrorError> {
+        let idempotency_key = validate_idempotency_key(idempotency_key)?;
+        let thread_ids = validate_thread_ids(thread_ids)?;
+        let name = validate_name(name)?;
+        let roots = validate_roots_off_thread(roots).await?;
+        Ok(StoreCreateProjectParams {
+            name,
+            roots,
+            metadata: metadata.unwrap_or_default(),
+            thread_ids,
+            idempotency_key,
+        })
+    }
+
+    async fn create_project(
+        &self,
+        params: StoreCreateProjectParams,
+        operation: &'static str,
+    ) -> Result<(Project, bool, Vec<String>), JSONRPCErrorError> {
+        let thread_ids = params.thread_ids.clone();
+        let created = self
+            .thread_store
+            .create_project(params)
+            .await
+            .map_err(|error| project_store_error(operation, error))?;
+        Ok((api_project(created.project)?, created.created, thread_ids))
+    }
+
+    async fn notify_project_changed(&self, project_id: &str, change_type: ProjectChangeType) {
+        self.outgoing
+            .send_server_notification(ServerNotification::ProjectChanged(
+                ProjectChangedNotification {
+                    project_id: project_id.to_string(),
+                    change_type,
+                },
+            ))
+            .await;
+    }
+
+    async fn notify_thread_projects(&self, thread_ids: Vec<String>, project_id: Option<String>) {
+        for thread_id in thread_ids {
+            self.outgoing
+                .send_server_notification(ServerNotification::ThreadProjectUpdated(
+                    ThreadProjectUpdatedNotification {
+                        thread_id,
+                        project_id: project_id.clone(),
+                    },
+                ))
+                .await;
+        }
+    }
+
+    async fn run_mutation<F, Fut>(
+        &self,
+        operation: &'static str,
+        mutation: F,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError>
+    where
+        F: FnOnce(Self) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Option<ClientResponsePayload>, JSONRPCErrorError>> + Send + 'static,
+    {
+        // Preparation and waiting admission remain cancellable. Once admitted,
+        // keep mutation, volatile state repair and notifications under the existing task owner
+        // and gate even when the originating RPC connection disappears.
+        let permit = Arc::clone(&self.thread_list_state_permit)
+            .acquire_owned()
+            .await;
+        let processor = self.clone();
+        self.background_tasks
+            .spawn(
+                async move {
+                    let _thread_list_state_permit = permit;
+                    mutation(processor).await
+                }
+                .instrument(tracing::Span::current()),
+            )
+            .await
+            .map_err(|error| internal_error(format!("{operation} task failed: {error}")))?
+    }
+}
+
+fn validate_name(name: String) -> Result<String, JSONRPCErrorError> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(invalid_params("project name must not be empty"));
+    }
+    Ok(name)
+}
+
+fn validate_idempotency_key(key: String) -> Result<String, JSONRPCErrorError> {
+    if key.trim().is_empty() {
+        return Err(invalid_params("idempotencyKey must not be empty"));
+    }
+    if key.len() > 512 {
+        return Err(invalid_params("idempotencyKey must be at most 512 bytes"));
+    }
+    Ok(key)
+}
+
+fn validate_roots(roots: Vec<ProjectRoot>) -> Result<Vec<StoredProjectRoot>, JSONRPCErrorError> {
+    let mut logical = HashSet::new();
+    let mut canonical = HashSet::new();
+    roots
+        .into_iter()
+        .map(|root| {
+            let path = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path_checked(
+                root.path.into_path_buf(),
+            )
+            .map_err(|error| invalid_params(format!("invalid project root: {error}")))?
+            .into_path_buf();
+            if !logical.insert(path.clone()) {
+                return Err(invalid_params(format!(
+                    "duplicate project root: {}",
+                    path.display()
+                )));
+            }
+            if let Ok(resolved) = std::fs::canonicalize(&path)
+                && !canonical.insert(resolved)
+            {
+                return Err(invalid_params(format!(
+                    "duplicate resolved project root: {}",
+                    path.display()
+                )));
+            }
+            Ok(StoredProjectRoot {
+                path: path.display().to_string(),
+            })
+        })
+        .collect()
+}
+
+async fn validate_roots_off_thread(
+    roots: Vec<ProjectRoot>,
+) -> Result<Vec<StoredProjectRoot>, JSONRPCErrorError> {
+    if roots.is_empty() {
+        return Ok(Vec::new());
+    }
+    tokio::task::spawn_blocking(move || validate_roots(roots))
+        .await
+        .map_err(|error| internal_error(format!("project root validation worker failed: {error}")))?
+}
+
+fn validate_thread_ids(thread_ids: Vec<String>) -> Result<Vec<String>, JSONRPCErrorError> {
+    let mut seen = HashSet::new();
+    for thread_id in &thread_ids {
+        if !seen.insert(thread_id.clone()) {
+            return Err(invalid_params(format!("duplicate thread id: {thread_id}")));
+        }
+    }
+    Ok(thread_ids)
+}
+
+fn api_project(project: StoredProject) -> Result<Project, JSONRPCErrorError> {
+    Ok(Project {
+        id: project.id,
+        name: project.name,
+        roots: project
+            .roots
+            .into_iter()
+            .map(|root| {
+                Ok(ProjectRoot {
+                    path: codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(root.path)
+                        .map_err(|error| {
+                            internal_error(format!("stored project root is not absolute: {error}"))
+                        })?,
+                })
+            })
+            .collect::<Result<_, JSONRPCErrorError>>()?,
+        metadata: project.metadata,
+        position: project.position,
+        created_at: project.created_at_ms / 1000,
+        updated_at: project.updated_at_ms / 1000,
+        recency_at: project
+            .recency_at_ms
+            .map(|timestamp| timestamp.div_euclid(/*rhs*/ 1000)),
+    })
+}
+
+fn project_store_error(operation: &'static str, error: ThreadStoreError) -> JSONRPCErrorError {
+    match error {
+        ThreadStoreError::Unsupported { .. } => {
+            method_not_found(format!("{operation} is unavailable without sqlite state"))
+        }
+        ThreadStoreError::InvalidRequest { message } => invalid_params(message),
+        ThreadStoreError::Internal { message }
+            if message.contains("thread not found") || message.contains("project not found") =>
+        {
+            invalid_params(message)
+        }
+        error => internal_error(format!("failed to run {operation}: {error}")),
+    }
+}
+

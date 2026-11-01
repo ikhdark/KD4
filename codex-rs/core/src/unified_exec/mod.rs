@@ -2,10 +2,9 @@
 //!
 //! Responsibilities
 //! - Manages interactive processes (create, reuse, buffer output with caps).
-//! - Uses the shared ToolOrchestrator to handle approval, sandbox selection, and
-//!   retry semantics in a single, descriptive flow.
-//! - Spawns the PTY from a sandbox-transformed `ExecRequest`; on sandbox denial,
-//!   retries without sandbox when policy allows (no re‑prompt thanks to caching).
+//! - Uses the shared ToolOrchestrator for approval and sandbox selection.
+//! - Spawns the PTY from a sandbox-transformed `ExecRequest`; sandbox denial
+//!   returns the original failure without replaying the command.
 //! - Uses the shared `is_likely_sandbox_denied` heuristic to keep denial messages
 //!   consistent with other exec paths.
 //!
@@ -13,8 +12,8 @@
 //! 1) Build a small request `{ command, cwd }`.
 //! 2) Orchestrator: approval (bypass/cache/prompt) → select sandbox → run.
 //! 3) Runtime: transform `SandboxTransformRequest` -> `ExecRequest` -> spawn PTY.
-//! 4) If denial, orchestrator retries with `SandboxType::None`.
-//! 5) Process handle is returned with streaming output + metadata.
+//! 4) Return the process handle with streaming output + metadata, or the
+//!    original failure without a second launch.
 //!
 //! This keeps policy logic and user interaction centralized while the PTY/process
 //! concerns remain isolated here. The implementation is split between:
@@ -70,10 +69,10 @@ pub(crate) use process_manager::nested_poll_bound;
 pub(crate) const MIN_YIELD_TIME_MS: u64 = 250;
 pub(crate) const WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS: u64 = 2_000;
 // Minimum configurable ceiling for background `write_stdin` waits.
-pub(crate) const MIN_EMPTY_YIELD_TIME_MS: u64 = 5_000;
+pub(crate) use codex_features::MIN_EMPTY_YIELD_TIME_MS;
 pub(crate) const MAX_YIELD_TIME_MS: u64 = 30_000;
 pub(crate) const MAX_INITIAL_YIELD_TIME_MS: u64 = 300_000;
-pub(crate) const DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS: u64 = 300_000;
+pub(crate) use codex_features::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS;
 
 pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
 pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_TOKENS: usize = UNIFIED_EXEC_OUTPUT_MAX_BYTES / 4;
@@ -159,7 +158,7 @@ pub(crate) struct ExecCommandRequest {
     pub validation_launch: bool,
 }
 
-/// Retains every process created by sandbox retries until startup is either
+/// Retains processes created during provisional startup until it is either
 /// committed to the process store/ledger or cancelled and cleaned up.
 #[derive(Clone, Default)]
 pub(crate) struct PendingSpawnRegistration {

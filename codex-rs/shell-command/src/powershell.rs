@@ -11,7 +11,6 @@ use std::path::PathBuf;
 
 use std::path::Prefix;
 
-use codex_utils_absolute_path::AbsolutePathBuf;
 
 pub use crate::command_safety::PowershellDirectArgvCandidate;
 
@@ -248,13 +247,6 @@ pub fn parse_powershell_command_into_plain_commands(
     try_parse_powershell_ast_commands(extracted.shell, extracted.script)
 }
 
-/// Prove one literal command launch, without claiming native argv equivalence.
-/// Numeric arguments can preserve launch count while remaining ineligible for
-/// direct execution. This syntax-only proof must not authenticate runner receipts.
-pub fn is_standalone_powershell_command(script: &str) -> bool {
-    try_parse_powershell_ast_analysis("pwsh", script)
-        .is_some_and(|analysis| analysis.standalone_command)
-}
 
 /// Inspect one literal native command, including canonical decimal integers.
 /// This proof is only for resource admission: it must not authorize direct
@@ -541,46 +533,7 @@ fn uses_legacy_windows_native_arguments(path: &Path) -> bool {
         })
 }
 
-/// This function attempts to find a powershell.exe executable on the system.
-pub fn try_find_powershell_executable_blocking() -> Option<AbsolutePathBuf> {
-    try_find_powershellish_executable_in_path(&["powershell.exe"])
-}
 
-/// This function attempts to find a pwsh.exe executable on the system.
-/// Note that pwsh.exe and powershell.exe are different executables:
-///
-/// - pwsh.exe is the cross-platform PowerShell Core (v6+) executable
-/// - powershell.exe is the Windows PowerShell (v5.1 and earlier) executable
-///
-/// Further, while powershell.exe is included by default on Windows systems,
-/// pwsh.exe must be installed separately by the user. And even when the user
-/// has installed pwsh.exe, it may not be available in the system PATH, in which
-/// case we attempt to locate it via other means.
-pub fn try_find_pwsh_executable_blocking() -> Option<AbsolutePathBuf> {
-    try_find_powershellish_executable_in_path(&["pwsh.exe"]).or_else(|| {
-        let program_files = std::env::var_os("ProgramFiles")?;
-        let candidate = PathBuf::from(program_files).join("PowerShell/7/pwsh.exe");
-        candidate
-            .is_file()
-            .then(|| AbsolutePathBuf::from_absolute_path(candidate).ok())
-            .flatten()
-    })
-}
 
-fn try_find_powershellish_executable_in_path(candidates: &[&str]) -> Option<AbsolutePathBuf> {
-    for candidate in candidates {
-        let Ok(resolved_path) = which::which(candidate) else {
-            continue;
-        };
-
-        let Ok(abs_path) = AbsolutePathBuf::from_absolute_path(resolved_path) else {
-            continue;
-        };
-
-        return Some(abs_path);
-    }
-
-    None
-}
 
 

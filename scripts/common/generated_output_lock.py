@@ -9,7 +9,7 @@ import json
 import os
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import TextIO
 
@@ -61,6 +61,8 @@ def repository_lock(
     resource: str = "repository resource",
     *,
     timeout: float = 0,
+    poll_seconds: float = 0.05,
+    check_cancelled: Callable[[], None] | None = None,
 ) -> Iterator[Path]:
     owner = owner.strip()
     if not owner:
@@ -79,6 +81,8 @@ def repository_lock(
     waiting = False
     try:
         while True:
+            if check_cancelled is not None:
+                check_cancelled()
             try:
                 _acquire_nonblocking(handle)
                 break
@@ -99,7 +103,7 @@ def repository_lock(
                         file=sys.stderr,
                     )
                     waiting = True
-                time.sleep(min(0.05, remaining))
+                time.sleep(min(poll_seconds, remaining))
     except BaseException:
         handle.close()
         raise
@@ -117,5 +121,36 @@ def repository_lock(
             _release(handle)
         finally:
             handle.close()
+
+
+@contextlib.contextmanager
+def exclusive_file_lock(
+    lock_path: Path,
+    *,
+    timeout_seconds: float = 60 * 60,
+    poll_seconds: float = 0.1,
+) -> Iterator[None]:
+    """Wait cancellably for a package output lock without replacing its inode."""
+    from scripts.common.process_owner import check_operation
+
+    if timeout_seconds < 0:
+        raise ValueError("lock timeout must be non-negative")
+    if poll_seconds <= 0:
+        raise ValueError("lock poll interval must be positive")
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(
+                repository_lock(
+                    lock_path,
+                    "package output",
+                    "package output",
+                    timeout=timeout_seconds,
+                    poll_seconds=poll_seconds,
+                    check_cancelled=check_operation,
+                )
+            )
+        except GenerationLockError as error:
+            raise TimeoutError(str(error)) from error
+        yield
 
 

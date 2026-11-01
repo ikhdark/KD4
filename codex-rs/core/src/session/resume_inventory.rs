@@ -9,7 +9,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-pub(crate) const LOCATOR: &str = "context:resume-state";
+pub(crate) use codex_conversation::RESUME_STATE_LOCATOR as LOCATOR;
 
 fn checkpoint_records(item: &ResponseItem, index: usize, records: &mut BTreeMap<String, Value>) {
     let Some(inventory) = crate::unified_exec::process_inventory::recorded_inventory(item) else {

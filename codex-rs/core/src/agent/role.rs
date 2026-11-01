@@ -1,8 +1,8 @@
 //! Agent-role lookup shared by spawn paths.
 //!
 //! New subagents use the generic runtime profile; role configs are not applied as config layers.
-//! This module owns the default role name, the role-owned settings locks consumed by spawn
-//! defaults, and role lookup for metadata such as nickname candidates. It does not decide when to
+//! This module owns the default role name and role lookup for metadata such as nickname
+//! candidates. It does not decide when to
 //! spawn a sub-agent; the multi-agent tool handler owns that orchestration.
 
 use crate::config::AgentRoleConfig;
@@ -12,18 +12,6 @@ use std::sync::LazyLock;
 
 /// The role name used when a caller omits `agent_type`.
 pub const DEFAULT_ROLE_NAME: &str = "default";
-
-/// Settings that a role explicitly owns and that spawn defaults must not replace.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct AgentRoleLocks {
-    pub(crate) model: bool,
-    pub(crate) reasoning_effort: bool,
-    pub(crate) permissions: bool,
-    pub(crate) allow_login_shell: bool,
-    pub(crate) shell_environment_policy: bool,
-    pub(crate) windows_sandbox: bool,
-    pub(crate) windows_private_desktop: bool,
-}
 
 pub(crate) fn resolve_role_config<'a>(
     config: &'a Config,

@@ -31,14 +31,13 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> TokenStream {
     let name = &input.ident;
     let type_name_lit = LitStr::new(&name.to_string(), Span::call_site());
 
-    let (checks, experimental_fields, registrations) = match &data.fields {
+    let (checks, registrations) = match &data.fields {
         Fields::Named(named) => {
             let mut checks = Vec::new();
-            let mut experimental_fields = Vec::new();
             let mut registrations = Vec::new();
             for field in &named.named {
                 if let Some(reason) = experimental_reason(&field.attrs) {
-                    let expr = experimental_presence_expr(field, /*tuple_struct*/ false);
+                    let expr = experimental_presence_expr(field);
                     checks.push(quote! {
                         if #expr {
                             return Some(#reason);
@@ -47,13 +46,6 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> TokenStream {
 
                     if let Some(field_name) = field_serialized_name(field) {
                         let field_name_lit = LitStr::new(&field_name, Span::call_site());
-                        experimental_fields.push(quote! {
-                            crate::experimental_api::ExperimentalField {
-                                type_name: #type_name_lit,
-                                field_name: #field_name_lit,
-                                reason: #reason,
-                            }
-                        });
                         registrations.push(quote! {
                             ::inventory::submit! {
                                 crate::experimental_api::ExperimentalField {
@@ -77,11 +69,10 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> TokenStream {
                     });
                 }
             }
-            (checks, experimental_fields, registrations)
+            (checks, registrations)
         }
         Fields::Unnamed(unnamed) => {
             let mut checks = Vec::new();
-            let mut experimental_fields = Vec::new();
             let mut registrations = Vec::new();
             for (index, field) in unnamed.unnamed.iter().enumerate() {
                 if let Some(reason) = experimental_reason(&field.attrs) {
@@ -93,13 +84,6 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> TokenStream {
                     });
 
                     let field_name_lit = LitStr::new(&index.to_string(), Span::call_site());
-                    experimental_fields.push(quote! {
-                        crate::experimental_api::ExperimentalField {
-                            type_name: #type_name_lit,
-                            field_name: #field_name_lit,
-                            reason: #reason,
-                        }
-                    });
                     registrations.push(quote! {
                         ::inventory::submit! {
                             crate::experimental_api::ExperimentalField {
@@ -120,9 +104,9 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> TokenStream {
                     });
                 }
             }
-            (checks, experimental_fields, registrations)
+            (checks, registrations)
         }
-        Fields::Unit => (Vec::new(), Vec::new(), Vec::new()),
+        Fields::Unit => (Vec::new(), Vec::new()),
     };
 
     let checks = if checks.is_empty() {
@@ -134,19 +118,8 @@ fn derive_for_struct(input: &DeriveInput, data: &DataStruct) -> TokenStream {
         }
     };
 
-    let experimental_fields = if experimental_fields.is_empty() {
-        quote! { &[] }
-    } else {
-        quote! { &[ #(#experimental_fields,)* ] }
-    };
-
     let expanded = quote! {
         #(#registrations)*
-
-        impl #name {
-            pub(crate) const EXPERIMENTAL_FIELDS: &'static [crate::experimental_api::ExperimentalField] =
-                #experimental_fields;
-        }
 
         impl crate::experimental_api::ExperimentalApi for #name {
             fn experimental_reason(&self) -> Option<&'static str> {
@@ -241,13 +214,7 @@ fn snake_to_camel(s: &str) -> String {
     out
 }
 
-fn experimental_presence_expr(
-    field: &Field,
-    tuple_struct: bool,
-) -> Option<proc_macro2::TokenStream> {
-    if tuple_struct {
-        return None;
-    }
+fn experimental_presence_expr(field: &Field) -> Option<proc_macro2::TokenStream> {
     let ident = field.ident.as_ref()?;
     Some(presence_expr_for_access(quote!(self.#ident), &field.ty))
 }

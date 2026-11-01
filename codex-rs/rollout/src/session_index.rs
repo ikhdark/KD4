@@ -199,7 +199,7 @@ pub async fn find_thread_names_by_ids(
 }
 
 /// Locate a recorded thread rollout and read its session metadata by thread name.
-/// Returns the newest indexed name that still has a readable rollout header.
+/// Returns the newest indexed name with a readable header that canonical metadata permits.
 pub async fn find_thread_meta_by_name_str(
     codex_home: &Path,
     name: &str,
@@ -211,6 +211,7 @@ pub async fn find_thread_meta_by_name_str(
     let path = session_index_path(codex_home);
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     let name = name.to_string();
+    let requested_name = name.clone();
     // Stream matching ids newest-first instead of stopping at the first name hit: the newest entry
     // may point at a thread whose rollout was never materialized.
     let scan = tokio::task::spawn_blocking(move || {
@@ -221,6 +222,15 @@ pub async fn find_thread_meta_by_name_str(
     });
 
     while let Some(thread_id) = rx.recv().await {
+        // The index is a compatibility projection, not an alias registry. A committed
+        // rename or clear revokes stale entries even when its index append failed.
+        if let Some(state_db) = state_db_ctx
+            && let Some(metadata) = state_db.get_thread(thread_id).await.map_err(std::io::Error::other)?
+            && (metadata.title_is_explicit || metadata.thread_name().is_some())
+            && metadata.thread_name() != Some(requested_name.as_str())
+        {
+            continue;
+        }
         // Keep walking until a matching id resolves to a loadable rollout so an unsaved or partial
         // rename cannot shadow an older persisted session with the same name.
         if let Some((path, header)) = super::list::find_thread_path_and_meta_by_id_str(

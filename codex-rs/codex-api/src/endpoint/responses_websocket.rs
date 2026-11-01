@@ -56,7 +56,7 @@ struct WsStream {
     handshake_metadata_emitted: bool,
     tx_command: mpsc::Sender<WsCommand>,
     rx_message: WsIngressReceiver,
-    rx_failure: Option<oneshot::Receiver<WsIngressFailure>>,
+    rx_failure: Option<oneshot::Receiver<WsError>>,
     pending_failure: Option<WsError>,
     response_history: crate::responses_stream::ConnectionResponseHistory,
     pump_task: tokio::task::JoinHandle<()>,
@@ -90,12 +90,6 @@ struct WsIngressReceiver {
 enum WsIngressSendError {
     Full,
     Closed,
-}
-
-#[derive(Debug)]
-enum WsIngressFailure {
-    Transport(WsError),
-    Overflow(WsError),
 }
 
 fn ws_ingress_channel(
@@ -178,12 +172,10 @@ impl WsIngressReceiver {
     }
 }
 
-enum WsCommand {
-    Send {
-        message: Message,
-        dispatch_guard: Option<Arc<dyn codex_http_client::RequestDispatchGuard>>,
-        receipt: WsSendReceipt,
-    },
+struct WsCommand {
+    message: Message,
+    dispatch_guard: Option<Arc<dyn codex_http_client::RequestDispatchGuard>>,
+    receipt: WsSendReceipt,
 }
 
 /// Dropping a queued command proves it was never handed to the socket. Dropping
@@ -246,27 +238,24 @@ impl WsStream {
                         let Some(command) = command else {
                             break;
                         };
-                        match command {
-                            WsCommand::Send { message, dispatch_guard, mut receipt } => {
-                                // A cancelled queued request must never be sent later.
-                                if receipt.is_closed() {
-                                    continue;
-                                }
-                                if pump_retired.load(Ordering::Acquire) {
-                                    receipt.finish(Err(WsSendError::NotSent));
-                                    continue;
-                                }
-                                receipt.dispatch_started = true;
-                                let result = codex_http_client::with_dispatch_guard(dispatch_guard,
-                                    codex_http_client::admit_dispatch(inner.send(message))).await
-                                    .map_err(WsSendError::Admission)
-                                    .and_then(|result| result.map_err(WsSendError::Socket));
-                                let should_break = matches!(&result, Err(WsSendError::Socket(_)));
-                                receipt.finish(result);
-                                if should_break {
-                                    break;
-                                }
-                            }
+                        let WsCommand { message, dispatch_guard, mut receipt } = command;
+                        // A cancelled queued request must never be sent later.
+                        if receipt.is_closed() {
+                            continue;
+                        }
+                        if pump_retired.load(Ordering::Acquire) {
+                            receipt.finish(Err(WsSendError::NotSent));
+                            continue;
+                        }
+                        receipt.dispatch_started = true;
+                        let result = codex_http_client::with_dispatch_guard(dispatch_guard,
+                            codex_http_client::admit_dispatch(inner.send(message))).await
+                            .map_err(WsSendError::Admission)
+                            .and_then(|result| result.map_err(WsSendError::Socket));
+                        let should_break = matches!(&result, Err(WsSendError::Socket(_)));
+                        receipt.finish(result);
+                        if should_break {
+                            break;
                         }
                     }
                     // Pause reads at the ingress bounds, but keep dispatch commands
@@ -285,11 +274,9 @@ impl WsStream {
                             }
                             Err(WsIngressSendError::Full) => {
                                 if let Some(tx_failure) = tx_failure.take() {
-                                    let _ = tx_failure.send(WsIngressFailure::Overflow(
-                                        WsError::Io(std::io::Error::other(
-                                            WEBSOCKET_INGRESS_OVERFLOW_MESSAGE,
-                                        )),
-                                    ));
+                                    let _ = tx_failure.send(WsError::Io(std::io::Error::other(
+                                        WEBSOCKET_INGRESS_OVERFLOW_MESSAGE,
+                                    )));
                                 }
                                 break;
                             }
@@ -305,7 +292,7 @@ impl WsStream {
                             Ok(Message::Ping(payload)) => {
                                 if let Err(err) = inner.send(Message::Pong(payload)).await {
                                     if let Some(tx_failure) = tx_failure.take() {
-                                        let _ = tx_failure.send(WsIngressFailure::Transport(err));
+                                        let _ = tx_failure.send(err);
                                     }
                                     break;
                                 }
@@ -324,7 +311,7 @@ impl WsStream {
                             }
                             Err(err) => {
                                 if let Some(tx_failure) = tx_failure.take() {
-                                    let _ = tx_failure.send(WsIngressFailure::Transport(err));
+                                    let _ = tx_failure.send(err);
                                 }
                                 break;
                             }
@@ -360,7 +347,7 @@ impl WsStream {
             })?
             .map_err(|_| websocket_closed_before_dispatch())?;
         let (tx_result, rx_result) = oneshot::channel();
-        permit.send(WsCommand::Send {
+        permit.send(WsCommand {
             message,
             dispatch_guard,
             receipt: WsSendReceipt { tx_result: Some(tx_result), dispatch_started: false },
@@ -403,7 +390,7 @@ impl WsStream {
                     failure = rx_failure => {
                         self.rx_failure = None;
                         match failure {
-                            Ok(WsIngressFailure::Overflow(error) | WsIngressFailure::Transport(error)) => {
+                            Ok(error) => {
                                 self.pending_failure = Some(error);
                                 continue;
                             }

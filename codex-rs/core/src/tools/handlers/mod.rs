@@ -479,7 +479,6 @@ pub(crate) fn normalize_and_validate_additional_permissions(
     sandbox_permissions: SandboxPermissions,
     additional_permissions: Option<AdditionalPermissionProfile>,
     permissions_preapproved: bool,
-    _cwd: &Path,
 ) -> Result<Option<AdditionalPermissionProfile>, String> {
     normalize_and_validate_permission_profile(
         additional_permissions_allowed,

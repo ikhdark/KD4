@@ -32,7 +32,7 @@ pub(crate) async fn resolve_agent_target(
             || control.get_agent_id_for_path(&path).is_some()
         {
             return control
-                .resolve_agent_reference(session.thread_id, &turn.session_source, target)
+                .resolve_agent_reference(&turn.session_source, target)
                 .await
                 .map_err(|error| FunctionCallError::RespondToModel(error.to_string()));
         }
@@ -57,7 +57,7 @@ pub(crate) async fn resolve_agent_target(
     session
         .services
         .agent_control
-        .resolve_agent_reference(session.thread_id, &turn.session_source, target)
+        .resolve_agent_reference(&turn.session_source, target)
         .await
         .map_err(|err| match err {
             codex_protocol::error::CodexErr::UnsupportedOperation(message) => {

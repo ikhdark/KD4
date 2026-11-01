@@ -219,11 +219,6 @@ export class Thread {
           controller.abort();
           break;
         }
-        if (terminal && (event.type === "turn.completed" || event.type === "turn.failed")) {
-          // Preserve the first terminal's accounting; a later success cannot
-          // erase an already observed failure while we drain trailing output.
-          throw new Error("Invalid turn stream: multiple terminal events received");
-        }
         if (
           event.type === "item.started" ||
           event.type === "item.updated" ||

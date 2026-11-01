@@ -21,17 +21,10 @@ pub(crate) struct CollectedToolMentions {
 }
 
 pub(crate) fn collect_tool_mentions_from_messages(messages: &[String]) -> CollectedToolMentions {
-    collect_tool_mentions_from_messages_with_sigil(messages, TOOL_MENTION_SIGIL)
-}
-
-fn collect_tool_mentions_from_messages_with_sigil(
-    messages: &[String],
-    sigil: char,
-) -> CollectedToolMentions {
     let mut plain_names = HashSet::new();
     let mut paths = HashSet::new();
     for message in messages {
-        let mentions = extract_tool_mentions_with_sigil(message, sigil);
+        let mentions = extract_tool_mentions_with_sigil(message, TOOL_MENTION_SIGIL);
         plain_names.extend(mentions.plain_names().map(str::to_string));
         paths.extend(mentions.paths().map(str::to_string));
     }

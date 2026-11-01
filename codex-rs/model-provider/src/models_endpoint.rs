@@ -1,6 +1,3 @@
-use std::fmt;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -51,7 +48,7 @@ pub(crate) struct OpenAiModelsEndpoint {
     model_provider_id: String,
     provider_info: ModelProviderInfo,
     auth_manager: Option<Arc<AuthManager>>,
-    transport_builder: Arc<dyn ModelsTransportBuilder>,
+    transport_builder: RouteAwareModelsTransportBuilder,
     cache_identity_components: std::sync::OnceLock<crate::provider::ModelProviderCacheIdentity>,
 }
 
@@ -65,7 +62,7 @@ impl OpenAiModelsEndpoint {
             model_provider_id,
             provider_info,
             auth_manager,
-            transport_builder: Arc::new(RouteAwareModelsTransportBuilder::default()),
+            transport_builder: RouteAwareModelsTransportBuilder::default(),
             cache_identity_components: std::sync::OnceLock::new(),
         }
     }
@@ -178,8 +175,7 @@ impl OpenAiModelsEndpoint {
         });
         timeout(MODELS_NETWORK_TIMEOUT, async {
             let transport = self
-                .transport_for(http_client_factory, request_url.clone())
-                .await?;
+                .transport_for(http_client_factory);
             let client = ModelsClient::new(transport, api_provider, api_auth)
                 .with_telemetry(Some(request_telemetry));
             client
@@ -202,14 +198,8 @@ impl OpenAiModelsEndpoint {
         .map_err(|_| CodexErr::Timeout)?
     }
 
-    async fn transport_for(
-        &self,
-        http_client_factory: HttpClientFactory,
-        request_url: String,
-    ) -> std::io::Result<ReqwestTransport> {
-        self.transport_builder
-            .build(http_client_factory, request_url)
-            .await
+    fn transport_for(&self, http_client_factory: HttpClientFactory) -> ReqwestTransport {
+        ReqwestTransport::from_client_pool(self.transport_builder.pool_for(http_client_factory))
     }
 
     fn auth_env(&self) -> AuthEnvTelemetry {
@@ -276,20 +266,6 @@ impl ModelsEndpointClient for OpenAiModelsEndpoint {
     }
 }
 
-type ModelsTransportFuture<'a> =
-    Pin<Box<dyn Future<Output = std::io::Result<ReqwestTransport>> + Send + 'a>>;
-
-/// Builds the concrete transport selected for one models request.
-///
-/// Implementations must honor the supplied request-time client factory and exact request URL.
-trait ModelsTransportBuilder: fmt::Debug + Send + Sync {
-    fn build(
-        &self,
-        http_client_factory: HttpClientFactory,
-        request_url: String,
-    ) -> ModelsTransportFuture<'_>;
-}
-
 #[derive(Debug, Default)]
 struct RouteAwareModelsTransportBuilder {
     pool: Mutex<Option<(HttpClientFactory, HeaderMap, bool, RouteAwareClientPool)>>,
@@ -333,20 +309,6 @@ impl RouteAwareModelsTransportBuilder {
         };
         *cached = Some((factory, headers, sandboxed, pool.clone()));
         pool
-    }
-}
-
-impl ModelsTransportBuilder for RouteAwareModelsTransportBuilder {
-    fn build(
-        &self,
-        http_client_factory: HttpClientFactory,
-        _request_url: String,
-    ) -> ModelsTransportFuture<'_> {
-        Box::pin(async move {
-            Ok(ReqwestTransport::from_client_pool(
-                self.pool_for(http_client_factory),
-            ))
-        })
     }
 }
 

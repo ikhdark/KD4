@@ -8,11 +8,8 @@ use codex_protocol::protocol::McpInvocation;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 
-use rmcp::model::ListResourcesResult;
-
 use super::ListResourcesArgs;
 use super::ListResourcesPayload;
-use super::McpServerCollection;
 use super::canonical_all_list_resources;
 use super::canonical_single_list_resources;
 use super::ensure_cursor_has_server;
@@ -26,12 +23,6 @@ use super::serialize_function_output;
 use super::take_server_result;
 
 pub struct ListMcpResourcesHandler;
-
-fn exhaustive_resource_pages(
-    collection: McpServerCollection<ListResourcesResult>,
-) -> McpServerCollection<ListResourcesResult> {
-    collection
-}
 
 impl ToolExecutor<ToolInvocation> for ListMcpResourcesHandler {
     fn tool_name(&self) -> ToolName {
@@ -105,7 +96,7 @@ impl ListMcpResourcesHandler {
                                 .list_all_resources(|candidate| candidate == server_name)
                                 .await;
                             take_server_result(
-                                exhaustive_resource_pages(collection),
+                                collection,
                                 &server_name,
                                 "resources/list",
                             )
@@ -135,9 +126,9 @@ impl ListMcpResourcesHandler {
                             model_can_access_mcp_server(turn.as_ref(), server_name)
                         })
                         .await;
-                    let pages = exhaustive_resource_pages(collection);
-                    let canonical = canonical_all_list_resources(&pages)?;
-                    let payload = ListResourcesPayload::from_all_servers(pages, truncation_policy)?;
+                    let canonical = canonical_all_list_resources(&collection)?;
+                    let payload =
+                        ListResourcesPayload::from_all_servers(collection, truncation_policy)?;
                     (payload, canonical)
                 };
                 serialize_function_output(payload, canonical, truncation_policy)

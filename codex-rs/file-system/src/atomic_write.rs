@@ -162,9 +162,7 @@ pub fn write_bytes_atomically_preserving_permissions(
     write_path: &Path,
     contents: &[u8],
 ) -> io::Result<()> {
-    stage_and_replace_preserving(write_path, true, true, |temporary| {
-        temporary.write_all(contents)
-    })
+    write_bytes_atomically(write_path, contents)
 }
 
 /// Same-directory replacement without durability barriers or parent creation.
@@ -185,15 +183,6 @@ fn stage_and_replace(
     sync: bool,
     write: impl FnOnce(&mut File) -> io::Result<()>,
 ) -> io::Result<()> {
-    stage_and_replace_preserving(write_path, sync, true, write)
-}
-
-fn stage_and_replace_preserving(
-    write_path: &Path,
-    sync: bool,
-    preserve_permissions: bool,
-    write: impl FnOnce(&mut File) -> io::Result<()>,
-) -> io::Result<()> {
     let parent = write_path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -203,22 +192,18 @@ fn stage_and_replace_preserving(
     if sync {
         std::fs::create_dir_all(parent)?;
     }
-    let permissions = if !preserve_permissions {
-        None
-    } else {
-        match std::fs::metadata(write_path) {
-            Ok(metadata) => {
-                if metadata.permissions().readonly() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "destination is read-only",
-                    ));
-                }
-                Some(metadata.permissions())
+    let permissions = match std::fs::metadata(write_path) {
+        Ok(metadata) => {
+            if metadata.permissions().readonly() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "destination is read-only",
+                ));
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
+            Some(metadata.permissions())
         }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
     };
     let mut temporary = NamedTempFile::new_in(parent)?;
     if permissions.is_some() {

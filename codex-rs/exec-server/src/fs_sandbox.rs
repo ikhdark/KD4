@@ -58,10 +58,6 @@ impl FileSystemSandboxRunner {
         }
     }
 
-    pub(crate) fn with_env(mut self, env: HashMap<String, String>) -> Self {
-        self.helper_env.extend(env);
-        self
-    }
 
     pub(crate) async fn run(
         &self,

@@ -10,21 +10,20 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
 
-use crate::allow::AllowDenyPaths;
-use crate::allow::compute_allow_paths_for_permissions;
+use crate::allow::compute_deny_write_paths_for_permissions;
 use crate::helper_materialization::bundled_executable_path_for_exe;
 use crate::helper_materialization::helper_bin_dir;
 use crate::identity::sandbox_setup_is_complete;
 use crate::logging::current_log_file_path;
 use crate::logging::log_note;
 use crate::path_normalization::canonical_path_key;
-use crate::path_normalization::canonicalize_path;
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
 use crate::setup_error::SetupErrorCode;
 use crate::setup_error::SetupFailure;
 use crate::setup_error::clear_setup_error_report;
 use crate::setup_error::failure;
 use crate::setup_error::read_setup_error_report;
+use crate::setup_protocol::SETUP_REQUEST_VERSION;
 use crate::setup_protocol::SetupMode;
 use crate::setup_protocol::SetupPayload;
 use crate::ssh_config_dependencies::ssh_config_dependency_paths;
@@ -239,13 +238,14 @@ fn run_setup_refresh_inner(
     if !request.permissions.is_enforceable_by_windows_sandbox() {
         anyhow::bail!("unsupported filesystem permissions for Windows sandbox setup");
     }
+    request.permissions.ensure_read_policy_supported(request.command_cwd)?;
     let (read_roots, write_roots) = build_payload_roots(&request, &overrides);
     let deny_read_paths = build_payload_deny_read_paths(overrides.deny_read_paths);
     let deny_write_paths = build_payload_deny_write_paths(&request, overrides.deny_write_paths);
     let offline_proxy_settings =
         offline_proxy_settings_for_request(&request, offline_proxy_settings_override);
     let payload = SetupPayload {
-        version: SETUP_VERSION,
+        version: SETUP_REQUEST_VERSION,
         offline_username: OFFLINE_USERNAME.to_string(),
         online_username: ONLINE_USERNAME.to_string(),
         codex_home: request.codex_home.to_path_buf(),
@@ -968,6 +968,7 @@ fn run_elevated_setup_inner(
     if !request.permissions.is_enforceable_by_windows_sandbox() {
         anyhow::bail!("unsupported filesystem permissions for Windows sandbox setup");
     }
+    request.permissions.ensure_read_policy_supported(request.command_cwd)?;
     // Ensure the shared sandbox directory exists before we send it to the elevated helper.
     let sbx_dir = sandbox_dir(request.codex_home);
     std::fs::create_dir_all(&sbx_dir).map_err(|err| {
@@ -982,7 +983,7 @@ fn run_elevated_setup_inner(
     let offline_proxy_settings =
         offline_proxy_settings_for_request(&request, offline_proxy_settings_override);
     let payload = SetupPayload {
-        version: SETUP_VERSION,
+        version: SETUP_REQUEST_VERSION,
         offline_username: OFFLINE_USERNAME.to_string(),
         online_username: ONLINE_USERNAME.to_string(),
         codex_home: request.codex_home.to_path_buf(),
@@ -1027,7 +1028,7 @@ pub fn run_elevated_provisioning_setup(codex_home: &Path, real_user: &str) -> Re
         ));
     }
     let payload = SetupPayload {
-        version: SETUP_VERSION,
+        version: SETUP_REQUEST_VERSION,
         offline_username: OFFLINE_USERNAME.to_string(),
         online_username: ONLINE_USERNAME.to_string(),
         codex_home: codex_home.to_path_buf(),
@@ -1058,8 +1059,8 @@ fn build_payload_roots(
         overrides.write_roots.as_deref(),
     );
     let mut read_roots = if let Some(roots) = overrides.read_roots.as_deref() {
-        // An explicit override is the split policy's complete readable set. Keep only the
-        // helper/platform roots the elevated setup needs; do not re-add legacy cwd/full-read roots.
+        // These are grant-preparation roots, not a read restriction. Admission
+        // already requires the profile's unrestricted-read baseline.
         let mut read_roots = gather_helper_read_roots(request.codex_home);
         if overrides.read_roots_include_platform_defaults {
             read_roots.extend(
@@ -1088,18 +1089,12 @@ fn build_payload_deny_write_paths(
     request: &SandboxSetupRequest<'_>,
     explicit_deny_write_paths: Option<Vec<PathBuf>>,
 ) -> Vec<PathBuf> {
-    let allow_deny_paths: AllowDenyPaths = compute_allow_paths_for_permissions(
+    compute_deny_write_paths_for_permissions(
         request.permissions,
         request.command_cwd,
         request.env_map,
-    );
-    let mut deny_write_paths: Vec<PathBuf> = explicit_deny_write_paths
-        .unwrap_or_default()
-        .into_iter()
-        .map(|path| canonicalize_path(&path))
-        .collect();
-    deny_write_paths.extend(allow_deny_paths.deny);
-    deny_write_paths
+        &explicit_deny_write_paths.unwrap_or_default(),
+    )
 }
 
 fn build_payload_deny_read_paths(explicit_deny_read_paths: Option<Vec<PathBuf>>) -> Vec<PathBuf> {

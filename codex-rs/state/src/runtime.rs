@@ -142,7 +142,7 @@ pub struct StateRuntime {
     codex_home: PathBuf,
     default_provider: String,
     pool: Arc<sqlx::SqlitePool>,
-    input_receipts_pool: Arc<tokio::sync::OnceCell<sqlx::SqlitePool>>,
+    input_receipts_pool: Arc<tokio::sync::Mutex<Option<sqlx::SqlitePool>>>,
     logs_pool: Arc<sqlx::SqlitePool>,
     agent_job_runner_instance_id: String,
     // Capability for owning jobs; the actual lease is enrolled on first use.
@@ -369,8 +369,15 @@ SELECT
         }
         *enrolled = false;
         drop(enrolled);
+        // Retain lazy-pool custody until the primary pool is closed. An
+        // admission cannot initialize a fresh writer after shutdown checked it.
+        let input_receipts_pool = self.input_receipts_pool.lock().await;
+        if let Some(pool) = input_receipts_pool.as_ref() {
+            pool.close().await;
+        }
         self.logs_pool.close().await;
         self.pool.close().await;
+        drop(input_receipts_pool);
     }
 }
 

@@ -37,7 +37,7 @@ pub fn get_git_repo_root(base_dir: &Path) -> Option<PathBuf> {
     } else {
         base_dir.parent()?
     };
-    find_ancestor_git_entry(base).map(|(repo_root, _)| repo_root)
+    find_ancestor_git_entry(base)
 }
 
 /// Return the repository root for `cwd` using the provided filesystem.
@@ -452,7 +452,7 @@ pub async fn git_diff_to_remote(cwd: &Path) -> Option<GitDiffToRemote> {
     let root = get_git_repo_root(cwd)?;
 
     let remotes = get_git_remotes(&root).await?;
-    let branches = branch_ancestry(&root, &remotes).await?;
+    let branches = branch_ancestry(&root, &remotes).await;
     let base_sha = find_closest_sha(&root, &branches, &remotes).await?;
     let diff = diff_against_sha(&root, &base_sha).await?;
 
@@ -811,7 +811,7 @@ async fn get_default_branch_local(cwd: &Path) -> Option<String> {
 
 /// Build an ancestry of branches starting at the current branch and ending at the
 /// repository's default branch (if determinable)..
-async fn branch_ancestry(cwd: &Path, remotes: &[String]) -> Option<Vec<String>> {
+async fn branch_ancestry(cwd: &Path, remotes: &[String]) -> Vec<String> {
     // Discover current branch (ignore detached HEAD by treating it as None)
     let current_branch = run_git_command_with_timeout(&["rev-parse", "--abbrev-ref", "HEAD"], cwd)
         .await
@@ -874,8 +874,7 @@ async fn branch_ancestry(cwd: &Path, remotes: &[String]) -> Option<Vec<String>> 
         }
     }
 
-    // Ensure we return Some vector, even if empty, to allow caller logic to proceed
-    Some(ancestry)
+    ancestry
 }
 
 // Helper for a single branch: return its merge base with the first matching
@@ -1127,13 +1126,13 @@ pub async fn resolve_root_git_project_for_trust_from_checkout(
     common_uri.parent()?.to_abs_path().ok()
 }
 
-fn find_ancestor_git_entry(base_dir: &Path) -> Option<(PathBuf, PathBuf)> {
+fn find_ancestor_git_entry(base_dir: &Path) -> Option<PathBuf> {
     let mut dir = base_dir.to_path_buf();
 
     loop {
         let dot_git = dir.join(".git");
         if dot_git.exists() {
-            return Some((dir, dot_git));
+            return Some(dir);
         }
 
         // Pop one component (go up one directory). `pop` returns false when

@@ -321,11 +321,7 @@ impl FullSuiteBudget {
         }
     }
 
-    pub fn start(
-        &self,
-        owner: &str,
-        _acknowledgement: Option<(PathBuf, String)>,
-    ) -> Result<(), String> {
+    pub fn start(&self, owner: &str) -> Result<(), String> {
         let mut state = self
             .0
             .lock()

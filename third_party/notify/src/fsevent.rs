@@ -16,7 +16,7 @@
 
 use crate::paths::{absolute_path, reported_path};
 use crate::{
-    Config, Error, ErrorKind, EventHandler, EventKindMask, RecursiveMode, Result, Sender, Watcher,
+    Config, Error, ErrorKind, EventHandler, EventKindMask, RecursiveMode, Result, Watcher,
     unbounded,
 };
 use crate::{PathOp, event::*};
@@ -155,22 +155,13 @@ unsafe impl Send for FsEventWatcher {}
 // It's Sync because all methods that change the mutable state use `&mut self`.
 unsafe impl Sync for FsEventWatcher {}
 
-fn translate_flags(flags: StreamFlags, precise: bool) -> Vec<Event> {
-    let mut evs = Vec::new();
-    translate_flags_with(flags, precise, |ev| evs.push(ev));
-    evs
-}
-
 // Keep this in sync with `translate_flags_with`; the callback uses it to avoid path clones.
-fn translated_event_count(flags: &StreamFlags, precise: bool) -> usize {
+fn translated_event_count(flags: &StreamFlags) -> usize {
     if flags.contains(StreamFlags::HISTORY_DONE) {
         return 0;
     }
 
     let mut count = usize::from(flags.contains(StreamFlags::MUST_SCAN_SUBDIRS));
-    if !precise {
-        return count + 1;
-    }
 
     let root_changed = flags.contains(StreamFlags::ROOT_CHANGED);
     count += usize::from(root_changed);
@@ -187,7 +178,7 @@ fn translated_event_count(flags: &StreamFlags, precise: bool) -> usize {
     count
 }
 
-fn translate_flags_with(flags: StreamFlags, precise: bool, mut emit: impl FnMut(Event)) {
+fn translate_flags_with(flags: StreamFlags, mut emit: impl FnMut(Event)) {
     // «Denotes a sentinel event sent to mark the end of the "historical" events
     // sent as a result of specifying a `sinceWhen` value in the FSEvents.Create
     // call that created this event stream. After invoking the client's callback
@@ -196,8 +187,7 @@ fn translate_flags_with(flags: StreamFlags, precise: bool, mut emit: impl FnMut(
     // The client should ignore the path supplied in this callback.»
     // — https://www.mbsplugins.eu/FSEventsNextEvent.shtml
     //
-    // As a result, we just stop processing here and return an empty vec, which
-    // will ignore this completely and not emit any Events whatsoever.
+    // Ignore this sentinel without emitting any Events.
     if flags.contains(StreamFlags::HISTORY_DONE) {
         return;
     }
@@ -205,8 +195,8 @@ fn translate_flags_with(flags: StreamFlags, precise: bool, mut emit: impl FnMut(
     // `ITEM_CLONED` can be present alongside other flags (including create/modify/remove).
     // Preserve any existing `info` (like "root changed"), but annotate otherwise so downstream
     // can detect and filter clone-related events. See https://github.com/notify-rs/notify/issues/465.
-    let clone_related = precise && flags.contains(StreamFlags::ITEM_CLONED);
-    let own_process_id = if precise && flags.contains(StreamFlags::OWN_EVENT) {
+    let clone_related = flags.contains(StreamFlags::ITEM_CLONED);
+    let own_process_id = if flags.contains(StreamFlags::OWN_EVENT) {
         Some(std::process::id())
     } else {
         None
@@ -235,13 +225,6 @@ fn translate_flags_with(flags: StreamFlags, precise: bool, mut emit: impl FnMut(
         } else {
             e
         });
-    }
-
-    // In imprecise mode, let's not even bother parsing the kind of the event
-    // except for the above very special events.
-    if !precise {
-        emit(Event::new(EventKind::Any));
-        return;
     }
 
     // A watched root changed (renamed or removed). If the flags provide a hint,
@@ -700,10 +683,6 @@ impl FsEventWatcher {
         Ok(())
     }
 
-    fn configure_raw_mode(&mut self, _config: Config, tx: Sender<Result<bool>>) {
-        tx.send(Ok(false))
-            .expect("configuration channel disconnect");
-    }
 }
 
 // A twelfth rather than a tenth: the edge also shifts with how many descriptors
@@ -796,7 +775,7 @@ unsafe fn callback_impl(
         let Some((watch_path, watch_info)) = watch_match else {
             continue;
         };
-        let translated_count = translated_event_count(&flag, true);
+        let translated_count = translated_event_count(&flag);
         if translated_count == 0 {
             continue;
         }
@@ -806,7 +785,7 @@ unsafe fn callback_impl(
 
         log::trace!("FSEvent: path = `{}`, flag = {:?}", path.display(), flag);
 
-        translate_flags_with(flag, true, |mut ev| {
+        translate_flags_with(flag, |mut ev| {
             // Filter events based on EventKindMask before adding the path.
             if !event_kinds.matches(&ev.kind) {
                 return;
@@ -859,12 +838,6 @@ impl Watcher for FsEventWatcher {
 
     fn update_paths(&mut self, ops: Vec<PathOp>) -> crate::StdResult<(), crate::UpdatePathsError> {
         self.update_paths_inner(ops)
-    }
-
-    fn configure(&mut self, config: Config) -> Result<bool> {
-        let (tx, rx) = unbounded();
-        self.configure_raw_mode(config, tx);
-        rx.recv()?
     }
 
     fn watched_paths(&self) -> Result<Vec<(PathBuf, RecursiveMode)>> {

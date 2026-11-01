@@ -1,4 +1,4 @@
-use codex_core::config::Config;
+use codex_runtime_config::Config;
 use codex_extension_api::ExtensionFuture;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::McpServerContribution;

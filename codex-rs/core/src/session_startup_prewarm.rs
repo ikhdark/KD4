@@ -352,7 +352,7 @@ impl Session {
             .await;
     }
 
-    pub(crate) async fn schedule_startup_prewarm(self: &Arc<Self>, base_instructions: String) {
+    pub(crate) async fn schedule_startup_prewarm(self: &Arc<Self>) {
         let session_telemetry = self.services.session_telemetry.clone();
         let started_at = Instant::now();
         let startup_prewarm_session = Arc::clone(self);
@@ -370,7 +370,6 @@ impl Session {
                 _ = cancellation.cancelled() => Ok(None),
                 result = schedule_startup_prewarm_inner(
                 startup_prewarm_session,
-                base_instructions,
                 startup_transport,
             )
                 => result,
@@ -451,7 +450,6 @@ fn code_mode_prewarm_enabled(turn: &crate::session::turn_context::TurnContext) -
 
 async fn schedule_startup_prewarm_inner(
     session: Arc<Session>,
-    _base_instructions: String,
     startup_transport: Option<SessionStartupTransportHandle>,
 ) -> CodexResult<Option<ModelClientSession>> {
     let _preparation = session

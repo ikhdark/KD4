@@ -906,7 +906,7 @@ impl Codex {
         .await
         .map_err(|e| {
             error!("Failed to create session: {e:#}");
-            map_session_init_error(&e, &config.codex_home)
+            map_session_init_error(&e)
         })?;
         if let Some(message) = initial_service_tier_warning {
             // The ordered writer retains this even before the lazy rollout
@@ -1809,29 +1809,6 @@ impl Session {
         }
     }
 
-    /// Retain generation evidence until invalidation and publication finish,
-    /// including when the sampling worker is aborted during a capture.
-    pub(crate) async fn flush_workspace_evidence_generation(
-        self: &Arc<Self>,
-        turn_context: &Arc<TurnContext>,
-        batch: &Arc<crate::tools::parallel::WorkspaceEvidenceGenerationBatch>,
-        tracker: &crate::tools::context::SharedTurnDiffTracker,
-    ) -> CodexResult<crate::tools::parallel::WorkspaceEvidenceGenerationFlush> {
-        let in_flight = self.retain_tool_dispatch_commit();
-        let session = Arc::clone(self);
-        let turn_context = Arc::clone(turn_context);
-        let batch = Arc::clone(batch);
-        let tracker = Arc::clone(tracker);
-        tokio::spawn(async move {
-            let _in_flight = in_flight;
-            batch.flush(&session, &turn_context, &tracker).await
-        })
-        .await
-        .map_err(|error| {
-            CodexErr::Fatal(format!("workspace evidence flush task failed: {error}"))
-        })?
-    }
-
     pub(crate) async fn wait_for_ordered_history_commits(&self) {
         loop {
             let changed = self.durable_history_commits_changed.notified();
@@ -2015,7 +1992,7 @@ impl Session {
         turn_context: &TurnContext,
     ) -> Option<i64> {
         let history = self.state.lock().await.history.clone();
-        history.estimate_token_count(turn_context)
+        history.estimate_token_count(&turn_context.model_info.input_modalities, turn_context.base_instructions.as_ref())
     }
 
     pub(crate) async fn get_base_instructions(&self) -> BaseInstructions {
@@ -3225,7 +3202,7 @@ impl Session {
                 warn!(%error, "child result remains pending; complete report retention/delivery failed");
                 if let Some(binding) = turn_context.agent_task_binding.get().and_then(Option::as_ref) {
                     let _ = self.services.agent_control.task_coordinator().record_host_completion_observation(
-                        binding, self.thread_id, &format!("{}:result-retention", turn_context.sub_id),
+                        binding, self.thread_id, &format!("{}:parent-delivery", turn_context.sub_id),
                         error, None,
                     ).await;
                 }
@@ -4852,7 +4829,7 @@ impl Session {
             } else {
                 previous_world_state
                     .replacing_section(
-                        crate::context::world_state::AgentsMdState::new_cached(
+                        world_state::agents_md_state(
                             step_context.loaded_agents_md.as_deref(),
                             step_context.agents_md_stable_context.as_ref(),
                             step_context.agents_md_freshness,
@@ -5604,13 +5581,11 @@ impl Session {
     ) -> InitialContextBuild {
         let mut developer_sections = Vec::<String>::with_capacity(8);
         let mut contextual_user_sections = Vec::<String>::with_capacity(2);
-        let separate_developer_sections = Vec::<String>::new();
         // Settings and world state have typed baselines and dedicated diff protocols. Fragment
         // receipts intentionally cover only unstructured prompt material that cannot otherwise be
         // compared safely.
         let mut stable_developer_sections = Vec::<String>::with_capacity(4);
         let mut stable_contextual_user_sections = Vec::<String>::with_capacity(2);
-        let stable_separate_developer_sections = Vec::<String>::new();
         let (previous_turn_settings, session_source, retractable) = {
             let state = self.state.lock().await;
             (
@@ -5969,14 +5944,6 @@ impl Session {
         {
             stable_items.push(message);
         }
-        stable_items.extend(
-            stable_separate_developer_sections
-                .into_iter()
-                .filter_map(|section| {
-                    crate::context_manager::updates::build_developer_update_item(vec![section])
-                }),
-        );
-
         if let Some(usage_hint_sections) = multi_agent_v2_usage_hint_sections.clone()
             && let Some(usage_hint_message) =
                 crate::context_manager::updates::build_developer_update_item(usage_hint_sections)
@@ -6120,13 +6087,6 @@ impl Session {
             crate::context_manager::updates::build_developer_update_item(developer_sections)
         {
             items.push(developer_message);
-        }
-        for section in separate_developer_sections {
-            if let Some(developer_message) =
-                crate::context_manager::updates::build_developer_update_item(vec![section])
-            {
-                items.push(developer_message);
-            }
         }
         if let Some(usage_hint_sections) = multi_agent_v2_usage_hint_sections
             && !crate::stable_context::is_redundant_retraction(&usage_hint_sections, &retractable)
@@ -7004,28 +6964,6 @@ impl Session {
             .map_err(|error| {
                 CodexErr::Fatal(format!("completed-tool history checkpoint failed: {error}"))
             })
-    }
-
-    pub(crate) async fn invalidate_tool_history_source_dependencies(
-        &self,
-        affected_paths: Option<&std::collections::BTreeSet<std::path::PathBuf>>,
-        current_workspace_identity: Option<&crate::git_workspace::WorkspaceEvidenceIdentity>,
-    ) -> CodexResult<()> {
-        self.invalidate_tool_history_source_dependencies_excluding_call_ids(
-            affected_paths,
-            current_workspace_identity,
-            &std::collections::BTreeSet::new(),
-        )
-        .await
-    }
-
-    pub(crate) async fn invalidate_tool_history_source_dependencies_excluding_call_ids(
-        &self,
-        _affected_paths: Option<&std::collections::BTreeSet<std::path::PathBuf>>,
-        _current_workspace_identity: Option<&crate::git_workspace::WorkspaceEvidenceIdentity>,
-        _excluded_call_ids: &std::collections::BTreeSet<String>,
-    ) -> CodexResult<()> {
-        Ok(())
     }
 
     pub(crate) async fn mark_tool_history_consumed(

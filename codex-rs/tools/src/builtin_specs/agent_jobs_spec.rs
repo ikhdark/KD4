@@ -1,0 +1,142 @@
+use crate::JsonSchema;
+use crate::ResponsesApiTool;
+use crate::ToolSpec;
+use std::collections::BTreeMap;
+
+use crate::DEFAULT_SPAWN_AGENT_MODEL;
+use crate::DEFAULT_SPAWN_AGENT_REASONING_EFFORT;
+
+fn spawn_agents_on_csv_description() -> String {
+    format!(
+        "Root-agent-only: process a CSV by spawning one worker sub-agent per data record, including explicit empty records. Requires exactly one host-native local environment and unrestricted filesystem read/write permissions; scoped and remote CSV IO are unsupported. Nested CSV jobs are unsupported because a waiting subagent can hold the capacity its batch needs. A header-only CSV exports zero outcomes. Workers use `{DEFAULT_SPAWN_AGENT_MODEL}` with `{DEFAULT_SPAWN_AGENT_REASONING_EFFORT}` reasoning by default. The instruction string is a template where `{{column}}` placeholders are replaced with row values. Each worker must call `report_agent_job_result` with a JSON object (matching `output_schema` when provided); missing reports are treated as failures. This call blocks until all rows finish and automatically exports results to `output_csv_path` (or a default path)."
+    )
+}
+
+pub fn create_spawn_agents_on_csv_tool() -> ToolSpec {
+    let mut output_schema = JsonSchema::object(
+        BTreeMap::new(),
+        /*required*/ None,
+        /*additional_properties*/ None,
+    );
+    output_schema.description = Some(
+        "JSON Schema enforced for each worker result. Its root type must allow an object. Omit to accept any result object."
+            .to_string(),
+    );
+
+    let properties = BTreeMap::from([
+        (
+            "csv_path".to_string(),
+            JsonSchema::string(Some("Path to a regular CSV file: at most 8 MiB, 10,000 data rows, 128 columns, 1 KiB per header/source ID before collision suffixing, 64 KiB per field and 32 MiB charged materialized input. Split larger inputs into separate jobs; worker concurrency does not raise these admission limits.".to_string())),
+        ),
+        (
+            "instruction".to_string(),
+            JsonSchema::string(Some(
+                "Instruction template to apply to each CSV row. Use {column_name} placeholders to inject values from the row."
+                    .to_string(),
+            )),
+        ),
+        (
+            "id_column".to_string(),
+            JsonSchema::string(Some(
+                "CSV column to use as stable item id. Omit to use row numbers.".to_string(),
+            )),
+        ),
+        (
+            "output_csv_path".to_string(),
+            JsonSchema::string(Some(
+                "Output CSV path for exported results. Omit to create one next to the input CSV."
+                    .to_string(),
+            )),
+        ),
+        (
+            "max_concurrency".to_string(),
+            JsonSchema { minimum: Some(1.into()), maximum: Some(usize::MAX.into()), ..JsonSchema::integer(Some(
+                "Maximum concurrent workers for this job. Defaults to 16 and is capped by config."
+                    .to_string(),
+            )) },
+        ),
+        (
+            "max_workers".to_string(),
+            JsonSchema { minimum: Some(1.into()), maximum: Some(usize::MAX.into()), ..JsonSchema::integer(Some(
+                "Legacy alias; prefer max_concurrency and omit this field.".to_string(),
+            )) },
+        ),
+        (
+            "max_runtime_seconds".to_string(),
+            JsonSchema { minimum: Some(1.into()), maximum: Some(u64::MAX.into()), ..JsonSchema::integer(Some(
+                "Maximum runtime per worker before failure. Defaults to 1800 seconds; config may set a different default."
+                    .to_string(),
+            )) },
+        ),
+        ("output_schema".to_string(), output_schema),
+        (
+            "deliver".to_string(),
+            JsonSchema::boolean(Some(
+                "Opt in only when this top-level call completes the entire request. Deliver the final successful export receipt directly; pending input, sibling failures, schema mismatch, or incomplete work prevent delivery.".to_string(),
+            )),
+        ),
+    ]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "spawn_agents_on_csv".to_string(),
+        description: spawn_agents_on_csv_description(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(
+            properties,
+            Some(vec!["csv_path".to_string(), "instruction".to_string()]),
+            Some(false.into()),
+        ),
+        output_schema: None,
+    })
+}
+
+pub fn create_report_agent_job_result_tool() -> ToolSpec {
+    let mut result_schema = JsonSchema::object(
+        BTreeMap::new(),
+        /*required*/ None,
+        /*additional_properties*/ None,
+    );
+    result_schema.description = Some("Result object for this job item.".to_string());
+
+    let properties = BTreeMap::from([
+        (
+            "job_id".to_string(),
+            JsonSchema::string(Some("Identifier of the job.".to_string())),
+        ),
+        (
+            "item_id".to_string(),
+            JsonSchema::string(Some("Identifier of the job item.".to_string())),
+        ),
+        ("result".to_string(), result_schema),
+        (
+            "deliver".to_string(),
+            JsonSchema::boolean(Some(
+                "Opt in only when this top-level report completes the worker's entire assignment. Deliver the accepted result directly; rejected reports, pending input, sibling failures, or final-schema mismatch prevent delivery.".to_string(),
+            )),
+        ),
+        (
+            "stop".to_string(),
+            JsonSchema::boolean(Some(
+                "True cancels remaining job items after this result is recorded; false or omitted continues the job."
+                    .to_string(),
+            )),
+        ),
+    ]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "report_agent_job_result".to_string(),
+        description:
+            "Worker-only tool to report a result for an agent job item. Main agents should not call this. Inspect accepted: only accepted:true confirms the result is recorded. acknowledgment is accepted_new for a new report or accepted_replay for the same retained report; a replay does not record new work. For accepted:false, follow rejection_reason; a successful tool call alone is not an accepted report."
+                .to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(properties, Some(vec![
+                "job_id".to_string(),
+                "item_id".to_string(),
+                "result".to_string(),
+            ]), Some(false.into())),
+        output_schema: None,
+    })
+}
+

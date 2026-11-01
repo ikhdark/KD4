@@ -60,12 +60,6 @@ pub enum AmazonBedrockCredentialSource {
 }
 
 impl PlanType {
-    pub fn is_team_like(self) -> bool {
-        matches!(
-            self,
-            Self::Team | Self::SelfServeBusinessProLite | Self::SelfServeBusinessUsageBased
-        )
-    }
 
     pub fn is_business_like(self) -> bool {
         matches!(

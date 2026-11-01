@@ -59,7 +59,7 @@ impl Session {
             };
         let mut world_state = WorldState::default();
         world_state.add_section(
-            AgentsMdState::new_cached(
+            agents_md_state(
                 step_context.loaded_agents_md.as_deref(),
                 step_context.agents_md_stable_context.as_ref(),
                 step_context.agents_md_freshness,
@@ -73,10 +73,7 @@ impl Session {
             }),
         );
         if turn_context.config.include_environment_context {
-            world_state.add_section(EnvironmentsState::from_turn_context_with_environments(
-                turn_context,
-                &step_context.environments,
-            ));
+            world_state.add_section(environment_state(turn_context, &step_context.environments));
             if !environment_subagents.is_empty()
                 || previous_world_state
                     .as_ref()
@@ -238,4 +235,80 @@ fn apps_availability_for_unavailable_capture(previous: Option<&WorldStateSnapsho
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
 }
+
+
+pub(crate) fn agents_md_state(
+    loaded: Option<&crate::agents_md::LoadedAgentsMd>,
+    stable_context: Option<&crate::agents_md::RepositoryStableContextBundle>,
+    freshness: crate::agents_md::AgentsMdFreshness,
+) -> AgentsMdState {
+    let instructions = loaded.map(|loaded| {
+        let rendered = stable_context
+            .map(|bundle| bundle.rendered.to_string())
+            .unwrap_or_else(|| loaded.text());
+        loaded.contextual_user_fragment_with_text(rendered)
+    });
+    let source_snapshot = stable_context.and_then(|bundle| bundle.source_snapshot.clone());
+    AgentsMdState::from_snapshot(instructions, source_snapshot, freshness)
+}
+
+fn environment_state(
+    turn_context: &crate::session::turn_context::TurnContext,
+    environments: &crate::environment_selection::TurnEnvironmentSnapshot,
+) -> EnvironmentsState {
+    use codex_conversation::context::environment_context::FileSystemContext;
+    EnvironmentsState::from_inputs(
+        environment_states(environments),
+        environments.to_selections().first().map(|selection| selection.environment_id.clone()),
+        turn_context.current_date.clone(),
+        turn_context.timezone.clone(),
+        Some(FileSystemContext::from_permission_profile(
+            &turn_context.permission_profile, turn_context.effective_workspace_roots(),
+        ).without_session_visualizations(&turn_context.config.codex_home)),
+    )
+}
+
+use codex_conversation::context::world_state::{EnvironmentState, EnvironmentStatus};
+use std::collections::BTreeMap;
+fn environment_states(snapshot: &crate::environment_selection::TurnEnvironmentSnapshot) -> BTreeMap<String, EnvironmentState> {
+    let mut environments = snapshot
+        .turn_environments
+        .iter()
+        .map(|environment| {
+            (
+                environment.environment_id.clone(),
+                EnvironmentState {
+                    owner_id: Some(environment.owner_id()),
+                    cwd: environment.cwd().clone(),
+                    os: environment.operating_system.clone(),
+                    status: EnvironmentStatus::Available,
+                    shell: environment
+                        .shell
+                        .as_ref()
+                        .map(|shell| shell.name().to_string()),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for environment in &snapshot.starting {
+        // Failed futures remain selected for dispatch. Preserve their identity:
+        // dropping them can hide the surviving secondary's explicit ID behind
+        // the legacy single-environment rendering, although it is not primary.
+        environments
+            .entry(environment.selection.environment_id.clone())
+            .or_insert_with(|| EnvironmentState {
+                owner_id: None,
+                cwd: environment.selection.cwd.clone(),
+                os: None,
+                status: if environment.has_failed() {
+                    EnvironmentStatus::Failed
+                } else {
+                    EnvironmentStatus::Starting
+                },
+                shell: None,
+            });
+    }
+    environments
+}
+
 

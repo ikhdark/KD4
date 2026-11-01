@@ -322,13 +322,7 @@ impl ManagedRootProcess {
         self,
         child: tokio::process::Child,
     ) -> impl Future<Output = io::Result<()>> {
-        self.cleanup_with_process_operations(
-            child,
-            Self::terminate,
-            tokio::process::Child::start_kill,
-            |child| Box::pin(child.wait()),
-            true,
-        )
+        self.cleanup_child(child, true)
     }
 
     /// Terminate a contained process tree and retain its admission until reaped.
@@ -338,40 +332,21 @@ impl ManagedRootProcess {
         self,
         child: tokio::process::Child,
     ) -> impl Future<Output = io::Result<()>> {
-        self.cleanup_with_process_operations(
-            child,
-            Self::terminate,
-            tokio::process::Child::start_kill,
-            |child| Box::pin(child.wait()),
-            false,
-        )
+        self.cleanup_child(child, false)
     }
 
     #[cfg(windows)]
-    fn cleanup_with_process_operations<J, K, W>(
+    fn cleanup_child(
         self,
         mut child: tokio::process::Child,
-        terminate_job: J,
-        terminate_child: K,
-        wait_for_child: W,
         always_terminate_root: bool,
-    ) -> impl Future<Output = io::Result<()>>
-    where
-        J: FnOnce(&Self) -> io::Result<()> + Send + 'static,
-        K: FnOnce(&mut tokio::process::Child) -> io::Result<()> + Send + 'static,
-        W: for<'a> FnOnce(
-                &'a mut tokio::process::Child,
-            ) -> Pin<
-                Box<dyn Future<Output = io::Result<std::process::ExitStatus>> + Send + 'a>,
-            > + Send
-            + 'static,
-    {
+    ) -> impl Future<Output = io::Result<()>> {
         // Spawn before returning the future: dropping an unpolled caller must
         // not discard the cleanup owner or release admission before reaping.
         let runtime = tokio::runtime::Handle::current();
         let cleanup = tokio::task::spawn_blocking(move || {
             runtime.block_on(async move {
-                let job_error = terminate_job(&self).err();
+                let job_error = self.terminate().err();
                 if let Some(error) = &job_error {
                     log::warn!("failed to terminate managed process job: {error}");
                 }
@@ -379,14 +354,14 @@ impl ManagedRootProcess {
                 // job terminates successfully. A contained tree needs that fallback
                 // only when job termination fails.
                 let kill_error = if always_terminate_root || job_error.is_some() {
-                    terminate_child(&mut child).err()
+                    child.start_kill().err()
                 } else {
                     None
                 };
                 if let Some(error) = &kill_error {
                     log::warn!("failed to terminate managed root process: {error}");
                 }
-                if let Err(error) = wait_for_child(&mut child).await {
+                if let Err(error) = child.wait().await {
                     log::warn!(
                         "failed to wait for managed root process; retaining admission and polling for exit: {error}"
                     );

@@ -10,7 +10,6 @@ use std::path::Path;
 
 use codex_core::config::Config;
 use codex_install_context::InstallContext;
-use codex_install_context::InstallMethod;
 use codex_install_context::UpdateAction;
 use codex_install_context::is_newer_version;
 use codex_install_context::is_source_build_version;
@@ -39,7 +38,7 @@ pub(super) fn updates_check(config: &Config) -> DoctorCheck {
     let npm_result = doctor_managed_by_npm(current_exe.as_deref()).then(npm_global_root_check);
     let current_version = codex_utils_build_info::CODEX_VERSION;
     let latest =
-        (!is_source_build_version(current_version)).then(|| fetch_latest_version(&install_context));
+        (!is_source_build_version(current_version)).then(fetch_latest_github_release_version);
     updates_check_from_inputs(
         config,
         &install_context,
@@ -166,16 +165,6 @@ fn push_cached_version_details(details: &mut Vec<String>, version_file: &Path) {
             details.push("version cache: missing".to_string());
         }
         Err(err) => details.push(format!("version cache read: {err}")),
-    }
-}
-
-fn fetch_latest_version(context: &InstallContext) -> Result<String, String> {
-    match &context.method {
-        InstallMethod::Npm
-        | InstallMethod::Bun
-        | InstallMethod::Pnpm
-        | InstallMethod::Standalone { .. }
-        | InstallMethod::Other => fetch_latest_github_release_version(),
     }
 }
 

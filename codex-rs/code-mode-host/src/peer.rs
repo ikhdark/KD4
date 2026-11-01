@@ -36,13 +36,6 @@ pub(super) struct OutgoingFrame {
     _slot: Option<OwnedSemaphorePermit>,
 }
 
-impl std::ops::Deref for OutgoingFrame {
-    type Target = EncodedFrame;
-    fn deref(&self) -> &Self::Target {
-        &self.frame
-    }
-}
-
 pub(super) struct HostPeer {
     outgoing_tx: mpsc::Sender<OutgoingFrame>,
     outgoing_bytes: Arc<Semaphore>,

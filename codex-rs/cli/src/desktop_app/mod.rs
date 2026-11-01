@@ -29,3 +29,11 @@ pub async fn run_app_open_or_install(
 ) -> anyhow::Result<()> {
     anyhow::bail!("`codex app` is supported only on macOS and Windows")
 }
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn codex_new_thread_url(workspace: &std::path::Path) -> String {
+    let workspace = workspace.as_os_str().to_string_lossy();
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("path", workspace.as_ref());
+    let query = serializer.finish();
+    format!("codex://threads/new?{query}")
+}

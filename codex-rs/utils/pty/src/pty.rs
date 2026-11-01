@@ -668,9 +668,9 @@ fn open_unix_pty(size: TerminalSize) -> Result<(File, File)> {
     // SAFETY: Successful openpty returned this new slave descriptor, distinct from master,
     // which is transferred into one File owner.
     let slave = unsafe { File::from_raw_fd(slave) };
-    Ok(configure_owned_pty_files(master, slave, |file| {
-        set_cloexec(file.as_raw_fd())
-    })?)
+    set_cloexec(master.as_raw_fd())?;
+    set_cloexec(slave.as_raw_fd())?;
+    Ok((master, slave))
 }
 
 #[cfg(unix)]
@@ -687,17 +687,6 @@ fn set_cloexec(fd: RawFd) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn configure_owned_pty_files<T>(
-    master: T,
-    slave: T,
-    mut configure: impl FnMut(&T) -> std::io::Result<()>,
-) -> std::io::Result<(T, T)> {
-    configure(&master)?;
-    configure(&slave)?;
-    Ok((master, slave))
 }
 
 

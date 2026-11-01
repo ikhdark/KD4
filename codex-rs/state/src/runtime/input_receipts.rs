@@ -15,16 +15,24 @@ pub struct InputReceipt {
 }
 
 impl StateRuntime {
-    async fn input_receipts_pool(&self) -> anyhow::Result<&sqlx::SqlitePool> {
-        self.input_receipts_pool.get_or_try_init(|| async {
-            // The shared metadata pool deliberately uses NORMAL. Admissions
-            // must survive a crash before model/tool work, so keep FULL on a
-            // separately owned, single-connection pool for this same database.
-            let options = self.pool.connect_options().as_ref().clone()
-                .synchronous(sqlx::sqlite::SqliteSynchronous::Full);
-            Ok(sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
-                .connect_with(options).await?)
-        }).await
+    async fn input_receipts_pool(&self) -> anyhow::Result<sqlx::SqlitePool> {
+        let mut pool = self.input_receipts_pool.lock().await;
+        anyhow::ensure!(
+            !self.pool.is_closed() && !*self.agent_job_runner_heartbeat_shutdown.borrow(),
+            "state runtime is closing"
+        );
+        if let Some(pool) = pool.as_ref() {
+            return Ok(pool.clone());
+        }
+        // The shared metadata pool deliberately uses NORMAL. Admissions
+        // must survive a crash before model/tool work, so keep FULL on a
+        // separately owned, single-connection pool for this same database.
+        let options = self.pool.connect_options().as_ref().clone()
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Full);
+        let connected = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+            .connect_with(options).await?;
+        *pool = Some(connected.clone());
+        Ok(connected)
     }
 
     pub async fn input_receipt(
@@ -45,7 +53,7 @@ impl StateRuntime {
         let result = sqlx::query("INSERT INTO input_receipts (thread_id, kind, scope, client_id, fingerprint, turn_id, payload) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING")
             .bind(thread_id.to_string()).bind(&receipt.kind).bind(&receipt.scope)
             .bind(&receipt.client_id).bind(&receipt.fingerprint).bind(&receipt.turn_id).bind(&receipt.payload)
-            .execute(self.input_receipts_pool().await?).await?;
+            .execute(&self.input_receipts_pool().await?).await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -55,7 +63,7 @@ impl StateRuntime {
     ) -> anyhow::Result<()> {
         let result = sqlx::query("UPDATE input_receipts SET payload = ? WHERE thread_id = ? AND kind = ? AND scope = ? AND client_id = ? AND turn_id = ? AND payload IS NULL AND consumed = 0")
             .bind(payload).bind(thread_id.to_string()).bind(kind).bind(scope).bind(client_id).bind(turn_id)
-            .execute(self.input_receipts_pool().await?).await?;
+            .execute(&self.input_receipts_pool().await?).await?;
         anyhow::ensure!(result.rows_affected() == 1, "input receipt is not a fresh admission");
         Ok(())
     }
@@ -72,7 +80,7 @@ impl StateRuntime {
     pub async fn consume_input_receipt(&self, thread_id: ThreadId, receipt: &InputReceipt) -> anyhow::Result<()> {
         sqlx::query("UPDATE input_receipts SET consumed = 1, payload = NULL WHERE thread_id = ? AND kind = ? AND scope = ? AND client_id = ?")
             .bind(thread_id.to_string()).bind(&receipt.kind).bind(&receipt.scope).bind(&receipt.client_id)
-            .execute(self.input_receipts_pool().await?).await?;
+            .execute(&self.input_receipts_pool().await?).await?;
         Ok(())
     }
 
@@ -82,7 +90,7 @@ impl StateRuntime {
         // unaccepted reservations without erasing that accepted source.
         sqlx::query("UPDATE input_receipts SET consumed = 1, payload = NULL WHERE thread_id = ? AND turn_id = ? AND (kind != 'start' OR payload IS NULL)")
             .bind(thread_id.to_string()).bind(turn_id)
-            .execute(self.input_receipts_pool().await?).await?;
+            .execute(&self.input_receipts_pool().await?).await?;
         Ok(())
     }
 }

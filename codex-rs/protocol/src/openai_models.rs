@@ -341,9 +341,6 @@ impl TruncationPolicyConfig {
     }
 }
 
-/// Semantic version triple encoded as an array in JSON (e.g. [0, 62, 0]).
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, TS, JsonSchema)]
-pub struct ClientVersion(pub i32, pub i32, pub i32);
 
 const fn default_effective_context_window_percent() -> i64 {
     95
@@ -715,16 +712,6 @@ impl From<&ModelInfo> for ModelPreset {
     }
 }
 
-impl ModelPreset {
-    pub fn supports_fast_mode(&self) -> bool {
-        supports_service_tier(
-            &self.service_tiers,
-            &self.additional_speed_tiers,
-            ServiceTier::Fast.request_value(),
-        )
-    }
-}
-
 fn supports_service_tier(
     service_tiers: &[ModelServiceTier],
     additional_speed_tiers: &[String],
@@ -778,15 +765,6 @@ impl ModelInfo {
 }
 
 impl ModelPreset {
-    /// Filter models based on authentication mode.
-    ///
-    /// In ChatGPT mode, all models are visible. Otherwise, only API-supported models are shown.
-    pub fn filter_by_auth(models: Vec<ModelPreset>, chatgpt_mode: bool) -> Vec<ModelPreset> {
-        models
-            .into_iter()
-            .filter(|model| chatgpt_mode || model.supported_in_api)
-            .collect()
-    }
 
     /// Recompute the single default preset using picker visibility.
     ///

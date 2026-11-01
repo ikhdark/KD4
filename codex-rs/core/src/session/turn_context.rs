@@ -463,9 +463,10 @@ pub struct TurnContext {
     pub(crate) available_models: Arc<Vec<ModelPreset>>,
     pub(crate) final_output_json_schema: Option<Arc<PreparedOutputSchema>>,
     pub(crate) dynamic_tools: Vec<DynamicToolSpec>,
-    /// Deferred tools selected during this root task, bound to exact capability revisions.
     pub(crate) workspace_execution_coordinator:
         Arc<crate::tools::parallel::WorkspaceExecutionCoordinator>,
+    /// Activations survive sampling requests within this turn. Capability refresh
+    /// expires stale revisions; dropping the turn releases the remaining state.
     pub(crate) deferred_tool_activations: Arc<std::sync::RwLock<DeferredToolActivationState>>,
     pub(crate) turn_metadata_state: Arc<TurnMetadataState>,
     pub(crate) extension_data: Arc<codex_extension_api::ExtensionData>,
@@ -713,18 +714,6 @@ impl TurnContext {
 
     pub(crate) fn activated_deferred_tools(&self) -> HashSet<codex_tools::ToolName> {
         self.deferred_tool_activation_snapshot().1
-    }
-
-    /// Settles a sampling request that advertised deferred capabilities.
-    ///
-    /// Activations deliberately remain live for the rest of this turn. A model may need an
-    /// intervening reasoning or tool step before it can call a discovered tool, so request-scoped
-    /// release can erase the only callable schema before use. Capability refresh still removes
-    /// stale revisions, and dropping this turn context removes all remaining activations.
-    pub(crate) fn release_advertised_deferred_tools(
-        &self,
-        _advertised: &HashSet<codex_tools::ToolName>,
-    ) {
     }
 
     pub(crate) fn refresh_deferred_tool_capabilities(

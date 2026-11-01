@@ -54,9 +54,9 @@ use crate::analytics_utils::analytics_events_client_from_config;
 use crate::config_manager::ConfigManager;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
-use crate::message_processor::ConnectionSessionState;
-use crate::message_processor::MessageProcessor;
-use crate::message_processor::MessageProcessorArgs;
+use codex_app_server_rpc::connection_session::ConnectionSessionState;
+use codex_app_server_handlers::MessageProcessor;
+use codex_app_server_handlers::MessageProcessorArgs;
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingEnvelope;
 use crate::outgoing_message::OutgoingMessage;
@@ -66,18 +66,18 @@ use crate::transport::CHANNEL_CAPACITY;
 use crate::transport::OutboundConnectionState;
 use crate::transport::route_outgoing_envelope;
 use codex_analytics::AppServerRpcTransport;
-use codex_app_server_protocol::ClientNotification;
-use codex_app_server_protocol::ClientRequest;
-use codex_app_server_protocol::ConfigWarningNotification;
-use codex_app_server_protocol::InitializeParams;
-use codex_app_server_protocol::JSONRPCErrorError;
-use codex_app_server_protocol::OverloadReason;
-use codex_app_server_protocol::RequestId;
-use codex_app_server_protocol::Result;
-use codex_app_server_protocol::ServerNotification;
-use codex_app_server_protocol::ServerRequest;
-use codex_app_server_protocol::overloaded_error;
-use codex_app_server_protocol::server_notification_requires_delivery;
+use codex_app_server_protocol_types::ClientNotification;
+use codex_app_server_protocol_types::ClientRequest;
+use codex_app_server_protocol_types::ConfigWarningNotification;
+use codex_app_server_protocol_types::InitializeParams;
+use codex_app_server_protocol_types::JSONRPCErrorError;
+use codex_app_server_protocol_types::OverloadReason;
+use codex_app_server_protocol_types::RequestId;
+use codex_app_server_protocol_types::Result;
+use codex_app_server_protocol_types::ServerNotification;
+use codex_app_server_protocol_types::ServerRequest;
+use codex_app_server_protocol_types::overloaded_error;
+use codex_app_server_protocol_types::server_notification_requires_delivery;
 use codex_arg0::Arg0DispatchPaths;
 use codex_config::CloudConfigBundleLoader;
 use codex_config::LoaderOverrides;
@@ -397,7 +397,7 @@ pub struct InProcessClientHandle {
     client: InProcessClientSender,
     event_rx: mpsc::Receiver<InProcessServerEvent>,
     runtime_handle: tokio::task::JoinHandle<IoResult<()>>,
-    initialize_response: Option<codex_app_server_protocol::Result>,
+    initialize_response: Option<codex_app_server_protocol_types::Result>,
 }
 
 impl InProcessClientHandle {
@@ -458,7 +458,7 @@ impl InProcessClientHandle {
     }
 
     /// Returns the successful initialize result after [`start`] completes.
-    pub fn initialize_response(&self) -> Option<&codex_app_server_protocol::Result> {
+    pub fn initialize_response(&self) -> Option<&codex_app_server_protocol_types::Result> {
         self.initialize_response.as_ref()
     }
 }
@@ -470,13 +470,7 @@ impl InProcessClientHandle {
 /// the runtime is shut down and an `InvalidData` error is returned.
 pub async fn start(mut args: InProcessStartArgs) -> IoResult<InProcessClientHandle> {
     if let Ok(Some(err)) = check_execpolicy_for_warnings(&args.config.config_layer_stack).await {
-        let (path, range) = crate::exec_policy_warning_location(&err);
-        args.config_warnings.push(ConfigWarningNotification {
-            summary: "Error parsing rules; custom rules not applied.".to_string(),
-            details: Some(err.to_string()),
-            path,
-            range,
-        });
+        args.config_warnings.push(crate::exec_policy_config_warning(&err));
     }
     let initialize = args.initialize.clone();
     let mut client = start_uninitialized(args).await?;
@@ -654,7 +648,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                 remote_control_handle: None,
                 plugin_startup_tasks: crate::PluginStartupTasks::Start,
             }));
-            let mut thread_created_rx = processor.thread_manager.subscribe_thread_created();
+            let mut thread_created_rx = processor.subscribe_thread_created();
             let session = Arc::new(ConnectionSessionState::new());
             let mut listen_for_threads = true;
             let mut thread_attachment_tasks = tokio::task::JoinSet::new();
@@ -691,9 +685,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                                         Ordering::Release,
                                     );
 
-                                    processor
-                                        .initialize_processor
-                                        .send_initialize_notifications()
+                                    processor.send_initialize_notifications()
                                         .await;
                                 }
                             }
@@ -720,8 +712,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                         };
                         let processor = Arc::clone(&processor);
                         thread_attachment_tasks.spawn(async move {
-                            processor.thread_processor
-                                .handle_thread_created_event(created, connection_ids).await
+                            processor.handle_thread_created_event(created, connection_ids).await
                         });
                     }
                 }
@@ -729,21 +720,16 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
 
             processor.clear_runtime_references();
             thread_attachment_tasks.shutdown().await;
-            processor.account_processor.cancel_active_login().await;
+            processor.cancel_active_login().await;
             processor
                 .connection_closed(IN_PROCESS_CONNECTION_ID, &session)
                 .await;
-            processor
-                .thread_processor
-                .thread_state_manager
-                .clear_all_listeners()
+            processor.clear_all_listeners()
                 .await;
             processor.drain_background_tasks().await;
-            let result = processor
-                .thread_processor
-                .shutdown_threads_with_result()
+            let result = processor.shutdown_threads_with_result()
                 .await;
-            processor.thread_processor.wait_for_background_tasks().await;
+            processor.wait_for_background_tasks().await;
             processor.finish_shutdown_delivery().await;
             result
         });

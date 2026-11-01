@@ -1,4 +1,3 @@
-use crate::config::Config;
 pub use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
 pub use codex_rollout::Cursor;
 pub use codex_rollout::INTERACTIVE_SESSION_SOURCES;
@@ -20,24 +19,6 @@ pub use codex_rollout::parse_cursor;
 pub use codex_rollout::read_head_for_summary;
 pub use codex_rollout::read_session_meta_line;
 pub use codex_rollout::rollout_date_parts;
-
-impl codex_rollout::RolloutConfigView for Config {
-    fn codex_home(&self) -> &std::path::Path {
-        self.codex_home.as_path()
-    }
-
-    fn sqlite_home(&self) -> &std::path::Path {
-        self.sqlite_home.as_path()
-    }
-
-    fn cwd(&self) -> &std::path::Path {
-        self.cwd.as_path()
-    }
-
-    fn model_provider_id(&self) -> &str {
-        self.model_provider_id.as_str()
-    }
-}
 
 pub(crate) mod list {
     pub use codex_rollout::find_thread_path_by_id_str;

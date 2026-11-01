@@ -454,10 +454,11 @@ class AsyncCodexClient:
         login_id: str,
     ) -> AccountLoginCompletedNotification:
         """Wait for the completion notification routed to one login attempt."""
-        self.register_login_notifications(login_id)
+        router = self._sync._router
+        router.register_login(login_id)
         try:
             while True:
-                notification = await self.next_login_notification(login_id)
+                notification = await router.login_notification_queue(login_id).get_async()
                 if (
                     notification.method == "account/login/completed"
                     and isinstance(notification.payload, AccountLoginCompletedNotification)
@@ -465,7 +466,7 @@ class AsyncCodexClient:
                 ):
                     return notification.payload
         finally:
-            self.unregister_login_notifications(login_id)
+            router.unregister_login(login_id)
 
     async def wait_for_turn_completed(self, turn_id: str) -> TurnCompletedNotification:
         """Wait for the completion notification routed to one turn."""

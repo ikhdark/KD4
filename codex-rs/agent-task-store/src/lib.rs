@@ -1,8 +1,9 @@
 //! Typed, durable coordination state for MultiAgentV2 assignments.
 //!
 //! The store owns a private SQLite database and task capsules below the
-//! configured Codex home. It depends on [`codex_state::StateRuntime`] only to
-//! locate that home, keeping `codex-state` independent of coordination types.
+//! configured Codex home. [`codex_state::StateRuntime`] supplies that home;
+//! `codex-state` also owns the shared SQLite connection and concurrent-migration
+//! recovery helpers, while remaining independent of coordination types.
 
 mod error;
 mod id;

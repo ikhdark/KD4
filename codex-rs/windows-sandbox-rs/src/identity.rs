@@ -191,6 +191,8 @@ pub(crate) fn require_logon_sandbox_creds_with_additional_read_roots(
     cancellation: Option<&crate::WindowsSandboxCancellationToken>,
 ) -> Result<SandboxCreds> {
     crate::setup::check_setup_cancellation(cancellation)?;
+    permissions.ensure_read_policy_supported(command_cwd)?;
+    anyhow::ensure!(read_roots_override.is_none(), "Windows sandbox cannot enforce a complete readable-root override with shared sandbox accounts; refusing to launch");
     let sandbox_dir = crate::setup::sandbox_dir(codex_home);
     let mut needed_read = read_roots_override
         .map(<[PathBuf]>::to_vec)
@@ -355,6 +357,8 @@ pub(crate) fn refresh_logon_sandbox_creds(
     cancellation: Option<&crate::WindowsSandboxCancellationToken>,
 ) -> Result<SandboxCreds> {
     crate::setup::check_setup_cancellation(cancellation)?;
+    permissions.ensure_read_policy_supported(command_cwd)?;
+    anyhow::ensure!(read_roots_override.is_none(), "Windows sandbox cannot enforce a complete readable-root override with shared sandbox accounts; refusing to launch");
     remove_sandbox_users_file(codex_home, "sandbox user login failed")?;
     require_logon_sandbox_creds_with_additional_read_roots(
         permissions,

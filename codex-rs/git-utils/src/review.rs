@@ -6,7 +6,11 @@ use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::historical::disabled_filter_config;
+use crate::historical::read_git_command_with;
+use crate::inspection::private_index_copy;
 use crate::merge_base_with_head;
+use crate::operations::GitCommandControl;
 use crate::operations::resolve_head;
 use crate::operations::resolve_repository_root;
 use crate::operations::run_git_for_stdout_exact_limited;
@@ -133,7 +137,25 @@ impl ReviewSourceScope {
     }
 
     fn read_diff(root: &Path, comparison: &[String]) -> Result<String, String> {
-        let args = comparison.iter().map(String::as_str).chain([
+        let control = GitCommandControl::new();
+        let worktree = comparison.first().is_some_and(|command| command == "diff")
+            && !comparison.iter().any(|arg| arg == "--cached");
+        let filters = if worktree {
+            disabled_filter_config(root, &control)?
+        } else {
+            Vec::new()
+        };
+        let index = if worktree {
+            Some(private_index_copy(root, &control)?)
+        } else {
+            None
+        };
+        let mut args = Vec::new();
+        if worktree {
+            args.extend(["-c", "core.splitIndex=false", "-c", "core.safecrlf=false"]);
+        }
+        args.extend(comparison.iter().map(String::as_str));
+        args.extend([
             "--no-ext-diff",
             "--no-textconv",
             "--no-color",
@@ -143,11 +165,21 @@ impl ReviewSourceScope {
             "--dst-prefix=b/",
             "--",
         ]);
-        let diff = run_git_for_stdout(root, args, None).map_err(|error| error.to_string())?;
-        if diff.len() > 8 * 1024 * 1024 {
-            return Err("review diff exceeds supported 8 MiB scope".into());
+        let output = read_git_command_with(
+            root,
+            &args,
+            index.as_ref().map(|(_, path)| path.as_path()),
+            &filters,
+            8 * 1024 * 1024,
+            &control,
+        )?;
+        if !output.status.success() {
+            return Err(format!(
+                "Git review diff failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
         }
-        Ok(diff)
+        String::from_utf8(output.stdout).map_err(|error| error.to_string())
     }
 
     /// Validate anchors and reject observable target drift. Supporting evidence is

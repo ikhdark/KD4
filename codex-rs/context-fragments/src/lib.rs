@@ -4,6 +4,7 @@ mod fragment;
 mod user_turn;
 pub use user_turn::LegacyInterAgentMailReader;
 pub use user_turn::is_code_mode_notification_id;
+pub use user_turn::is_legacy_compaction_warning_text;
 pub use user_turn::is_user_turn_boundary;
 pub use user_turn::new_code_mode_notification_id;
 

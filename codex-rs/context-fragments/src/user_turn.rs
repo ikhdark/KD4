@@ -108,6 +108,12 @@ fn is_contextual_user_text(text: &str) -> bool {
     {
         return true;
     }
+    is_legacy_compaction_warning_text(text)
+}
+
+/// Recognize retired host warnings without treating appended user text as context.
+/// Shared by rollback boundaries and conversation/compaction classification.
+pub fn is_legacy_compaction_warning_text(text: &str) -> bool {
     let text = text.trim();
     if matches!(
         text,

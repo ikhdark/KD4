@@ -60,10 +60,10 @@ mod windows_impl {
     fn spawn_cancel_writer(
         pipe_write: &Arc<Mutex<File>>,
         cancellation: Option<crate::WindowsSandboxCancellationToken>,
-        runner: Option<Arc<crate::runner_client::RunnerProcess>>,
-    ) -> Result<Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)>> {
+        runner: Arc<crate::runner_client::RunnerProcess>,
+    ) -> Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)> {
         let Some(cancellation) = cancellation else {
-            return Ok(None);
+            return None;
         };
         let pipe_write = Arc::clone(pipe_write);
         let done = Arc::new(AtomicBool::new(false));
@@ -78,15 +78,16 @@ mod windows_impl {
                                     payload: EmptyPayload::default(),
                                 },
                             };
-                        if crate::runner_client::write_control_frame(&pipe_write, &frame).is_err()
-                            && let Some(runner) = runner.as_ref() { runner.terminate(); }
+                        if crate::runner_client::write_control_frame(&pipe_write, &frame).is_err() {
+                            runner.terminate();
+                        }
                     }
                     break;
                 }
                 std::thread::park_timeout(Duration::from_millis(50));
             }
         });
-        Ok(Some((handle, done)))
+        Some((handle, done))
     }
 
     /// Launches the command runner under the sandbox user and captures its output.
@@ -210,7 +211,7 @@ mod windows_impl {
             crate::runner_client::set_nonblocking_pipe(&pipe_write)?;
             let runner = Arc::new(runner);
             let pipe_write = Arc::new(Mutex::new(pipe_write));
-            let cancel_writer = spawn_cancel_writer(&pipe_write, cancellation.clone(), Some(Arc::clone(&runner)))?;
+            let cancel_writer = spawn_cancel_writer(&pipe_write, cancellation.clone(), Arc::clone(&runner));
 
             let mut stdout = crate::RetainedCapture::new(retained_bytes_cap);
             let mut stderr = crate::RetainedCapture::new(retained_bytes_cap);

@@ -37,21 +37,12 @@ pub(super) struct SelectedRolloutThreads {
     pub(super) page: codex_rollout::ThreadsPage,
     storage_path: ThreadListStoragePath,
     pub(super) state_metadata: HashMap<codex_protocol::ThreadId, codex_state::ThreadMetadata>,
-    state_db_reads: usize,
 }
 
 pub(super) async fn list_threads(
     store: &LocalThreadStore,
     params: ListThreadsParams,
 ) -> ThreadStoreResult<ThreadPage> {
-    let (page, _) = list_threads_with_state_db_read_count(store, params).await?;
-    Ok(page)
-}
-
-async fn list_threads_with_state_db_read_count(
-    store: &LocalThreadStore,
-    params: ListThreadsParams,
-) -> ThreadStoreResult<(ThreadPage, usize)> {
     let cursor = params
         .cursor
         .as_deref()
@@ -69,7 +60,6 @@ async fn list_threads_with_state_db_read_count(
         page,
         storage_path,
         mut state_metadata,
-        mut state_db_reads,
     } = select_rollout_threads(
         state_db.clone(),
         &rollout_config,
@@ -107,10 +97,12 @@ async fn list_threads_with_state_db_read_count(
             item.thread_id.or_else(|| super::helpers::thread_id_from_rollout_path(&item.path))
         }).collect::<Vec<_>>();
         if !ids.is_empty() {
-            state_db_reads += 1;
-            if let Ok(metadata) = state_db_ctx.get_threads_for_listing(&ids).await {
-                state_metadata = metadata.into_iter().map(|metadata| (metadata.id, metadata)).collect();
-            }
+            let metadata = state_db_ctx.get_threads_for_listing(&ids).await.map_err(|error| {
+                ThreadStoreError::Internal {
+                    message: format!("failed to read canonical listing metadata: {error}"),
+                }
+            })?;
+            state_metadata = metadata.into_iter().map(|metadata| (metadata.id, metadata)).collect();
         }
     }
     let mut items = Vec::with_capacity(page.items.len());
@@ -126,6 +118,14 @@ async fn list_threads_with_state_db_read_count(
         let metadata = state_metadata.remove(&thread.thread_id);
         if let Some(metadata) = metadata {
             let name = distinct_thread_metadata_title(&metadata);
+            if metadata.title_is_explicit {
+                resolved_title_ids.insert(thread.thread_id);
+                names.remove(&thread.thread_id);
+                if let Some(title) = name.as_ref() {
+                    names.insert(thread.thread_id, title.clone());
+                }
+                thread.name = name.clone();
+            }
             if let Some(title) = name.as_ref() {
                 resolved_title_ids.insert(thread.thread_id);
                 names
@@ -209,14 +209,11 @@ async fn list_threads_with_state_db_read_count(
         })
         .map(|position| bind_cursor(storage_path, &position));
 
-    Ok((
-        ThreadPage {
-            items,
-            next_cursor,
-            backwards_cursor,
-        },
-        state_db_reads,
-    ))
+    Ok(ThreadPage {
+        items,
+        next_cursor,
+        backwards_cursor,
+    })
 }
 
 pub(super) async fn select_rollout_threads(
@@ -226,54 +223,31 @@ pub(super) async fn select_rollout_threads(
     params: &ListThreadsParams,
     cursor: Option<&BoundThreadListCursor>,
 ) -> ThreadStoreResult<SelectedRolloutThreads> {
-    let selected_path = storage_path_for_request(params, cursor)?;
-    if selected_path == Some(ThreadListStoragePath::StateDb) {
-        return list_state_threads_for_storage(
-            state_db,
-            config,
-            params,
-            cursor.map(|cursor| &cursor.position),
-        )
-        .await;
-    }
-    if selected_path == Some(ThreadListStoragePath::ScanAndRepair) {
-        let page = list_rollout_threads_for_storage(
-            state_db,
-            config,
-            default_model_provider_id,
-            params,
-            cursor.map(|cursor| &cursor.position),
-            ThreadListStoragePath::ScanAndRepair,
-        )
-        .await?;
-        return Ok(SelectedRolloutThreads {
-            page,
-            storage_path: ThreadListStoragePath::ScanAndRepair,
-            state_metadata: HashMap::new(),
-            state_db_reads: 0,
-        });
-    }
-
-    match list_state_threads_for_storage(state_db.clone(), config, params, /*cursor*/ None).await {
-        Ok(selected) => Ok(selected),
-        Err(ThreadStoreError::Internal { .. }) => {
+    match storage_path_for_request(params, cursor)? {
+        ThreadListStoragePath::StateDb => {
+            list_state_threads_for_storage(
+                state_db,
+                config,
+                params,
+                cursor.map(|cursor| &cursor.position),
+            )
+            .await
+        }
+        ThreadListStoragePath::ScanAndRepair => {
             let page = list_rollout_threads_for_storage(
                 state_db,
                 config,
                 default_model_provider_id,
                 params,
-                /*cursor*/ None,
-                ThreadListStoragePath::ScanAndRepair,
+                cursor.map(|cursor| &cursor.position),
             )
             .await?;
             Ok(SelectedRolloutThreads {
                 page,
                 storage_path: ThreadListStoragePath::ScanAndRepair,
                 state_metadata: HashMap::new(),
-                state_db_reads: 0,
             })
         }
-        Err(err) => Err(err),
     }
 }
 
@@ -292,7 +266,6 @@ async fn list_state_threads_for_storage(
             page: codex_rollout::ThreadsPage::default(),
             storage_path: ThreadListStoragePath::StateDb,
             state_metadata: HashMap::new(),
-            state_db_reads: 0,
         });
     }
 
@@ -325,7 +298,6 @@ async fn list_state_threads_for_storage(
         page: state_page.into(),
         storage_path: ThreadListStoragePath::StateDb,
         state_metadata,
-        state_db_reads: 1,
     })
 }
 
@@ -335,70 +307,17 @@ pub(super) async fn list_rollout_threads_for_storage(
     default_model_provider_id: &str,
     params: &ListThreadsParams,
     cursor: Option<&codex_rollout::Cursor>,
-    storage_path: ThreadListStoragePath,
 ) -> ThreadStoreResult<codex_rollout::ThreadsPage> {
     let sort_key = params.sort_key;
     let sort_direction = params.sort_direction;
-    if let Some(relation_filter) = params.relation_filter {
-        if storage_path != ThreadListStoragePath::StateDb {
-            return Err(ThreadStoreError::InvalidRequest {
-                message: "relationship-filtered thread listing requires state DB storage"
-                    .to_string(),
-            });
-        }
-        let page = codex_rollout::state_integration::list_threads_db(
-            state_db.as_deref(),
-            config.codex_home.as_path(),
-            params.page_size,
-            cursor,
-            sort_key,
-            sort_direction,
-            params.allowed_sources.as_slice(),
-            params.model_providers.as_deref(),
-            params.cwd_filters.as_deref(),
-            Some(relation_filter),
-            params.archived,
-            params.project_id.as_ref().map(Option::as_deref),
-            params.search_term.as_deref(),
-        )
-        .await
-        .ok_or_else(|| ThreadStoreError::Internal {
-            message: "state DB unavailable for relationship-filtered thread listing".to_string(),
-        })?;
-        return Ok(page.into());
+    if params.relation_filter.is_some() {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: "relationship-filtered thread listing requires state DB storage"
+                .to_string(),
+        });
     }
 
-    let page = if storage_path == ThreadListStoragePath::StateDb && params.archived {
-        RolloutRecorder::list_archived_threads_from_state_db(
-            state_db,
-            config,
-            params.page_size,
-            cursor,
-            sort_key,
-            sort_direction,
-            params.allowed_sources.as_slice(),
-            params.model_providers.as_deref(),
-            params.cwd_filters.as_deref(),
-            default_model_provider_id,
-            params.search_term.as_deref(),
-        )
-        .await
-    } else if storage_path == ThreadListStoragePath::StateDb {
-        RolloutRecorder::list_threads_from_state_db(
-            state_db,
-            config,
-            params.page_size,
-            cursor,
-            sort_key,
-            sort_direction,
-            params.allowed_sources.as_slice(),
-            params.model_providers.as_deref(),
-            params.cwd_filters.as_deref(),
-            default_model_provider_id,
-            params.search_term.as_deref(),
-        )
-        .await
-    } else if params.archived {
+    let page = if params.archived {
         RolloutRecorder::list_archived_threads(
             state_db,
             config,
@@ -437,7 +356,7 @@ pub(super) async fn list_rollout_threads_for_storage(
 fn storage_path_for_request(
     params: &ListThreadsParams,
     cursor: Option<&BoundThreadListCursor>,
-) -> ThreadStoreResult<Option<ThreadListStoragePath>> {
+) -> ThreadStoreResult<ThreadListStoragePath> {
     if params.project_id.is_some() {
         if params.storage_mode == ThreadListStorageMode::ScanAndRepair {
             return Err(ThreadStoreError::InvalidRequest {
@@ -480,20 +399,20 @@ fn storage_path_for_request(
                     .to_string(),
             });
         }
-        return Ok(Some(cursor.storage_path));
+        return Ok(cursor.storage_path);
     }
 
     if params.relation_filter.is_some() || params.project_id.is_some() {
-        return Ok(Some(ThreadListStoragePath::StateDb));
+        return Ok(ThreadListStoragePath::StateDb);
     }
     Ok(match params.storage_mode {
         // A completed one-time backfill is not a current root-coverage proof:
         // another writer can publish or move a rollout without updating SQL.
         // Reuse canonical scan/repair until the index has a durable freshness
         // contract. Explicit DB views and already-bound cursors stay DB-only.
-        ThreadListStorageMode::PreferStateDb => Some(ThreadListStoragePath::ScanAndRepair),
-        ThreadListStorageMode::StateDbOnly => Some(ThreadListStoragePath::StateDb),
-        ThreadListStorageMode::ScanAndRepair => Some(ThreadListStoragePath::ScanAndRepair),
+        ThreadListStorageMode::PreferStateDb => ThreadListStoragePath::ScanAndRepair,
+        ThreadListStorageMode::StateDbOnly => ThreadListStoragePath::StateDb,
+        ThreadListStorageMode::ScanAndRepair => ThreadListStoragePath::ScanAndRepair,
     })
 }
 

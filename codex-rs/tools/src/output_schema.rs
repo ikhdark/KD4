@@ -23,7 +23,7 @@ impl ToolOutputSchema {
         let properties = match &self.0 {
             OutputSchemaStorage::Json(schema) => {
                 if schema
-                    .get(codex_code_mode::MCP_RESULT_SCHEMA_MARKER)
+                    .get(codex_code_mode_protocol::MCP_RESULT_SCHEMA_MARKER)
                     .and_then(Value::as_bool)
                     == Some(true)
                 {

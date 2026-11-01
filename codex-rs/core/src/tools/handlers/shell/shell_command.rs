@@ -70,7 +70,7 @@ pub struct ShellCommandHandler {
 
 #[derive(Clone, Copy)]
 pub(crate) struct ShellCommandHandlerOptions {
-    pub(crate) foreign_environment: bool,
+    pub(crate) forward_to_unified_exec: bool,
     pub(crate) allow_login_shell: bool,
     pub(crate) allow_escalated_sandbox_permissions: bool,
     pub(crate) exec_permission_approvals_enabled: bool,
@@ -171,7 +171,7 @@ impl ShellCommandHandler {
 impl Default for ShellCommandHandler {
     fn default() -> Self {
         Self::new(ShellCommandHandlerOptions {
-            foreign_environment: false,
+            forward_to_unified_exec: false,
             allow_login_shell: false,
             allow_escalated_sandbox_permissions: false,
             exec_permission_approvals_enabled: false,
@@ -185,7 +185,7 @@ impl ToolExecutor<ToolInvocation> for ShellCommandHandler {
     }
 
     fn spec(&self) -> ToolSpec {
-        if self.options.foreign_environment {
+        if self.options.forward_to_unified_exec {
             return create_foreign_shell_command_tool(
                 CommandToolOptions {
                     allow_login_shell: self.options.allow_login_shell,
@@ -235,7 +235,7 @@ impl ShellCommandHandler {
         };
         let cwd_uses_native_convention =
             turn_environment.cwd().infer_path_convention() == Some(PathConvention::native());
-        if !cwd_uses_native_convention {
+        if turn_environment.environment.is_remote() || !cwd_uses_native_convention {
             let turn = &invocation.step_context.turn;
             let allow_login_shell = turn.config.permissions.allow_login_shell;
             let ToolPayload::Function { arguments } = &mut invocation.payload else {
@@ -261,6 +261,9 @@ impl ShellCommandHandler {
             .await;
         }
 
+        let allow_native_analysis = crate::tools::parallel::native_workspace_analysis_cwd(
+            &invocation.step_context, &invocation.payload,
+        ).is_some();
         let ToolInvocation {
             session,
             step_context,
@@ -337,7 +340,7 @@ impl ShellCommandHandler {
         let (mut policy_classification, mut policy_selection) =
             crate::validation::analyze_validation_policy_with_shell(
                 &original_invocation, original_shell_type,
-                (!turn_environment.environment.is_remote()).then_some(cwd.as_path()),
+                allow_native_analysis.then_some(cwd.as_path()),
             ).await;
         if let Some(refusal) = crate::validation_task::mode_refusal(
             &turn, policy_classification, params.validation.is_some(),
@@ -350,7 +353,7 @@ impl ShellCommandHandler {
             &original_invocation,
             &original_safety_command,
             original_shell_type,
-            (!turn_environment.environment.is_remote()).then_some(cwd.as_path()),
+            allow_native_analysis.then_some(cwd.as_path()),
         )
         .await
         .map_err(|issue| {
@@ -367,7 +370,7 @@ impl ShellCommandHandler {
             (policy_classification, policy_selection) =
                 crate::validation::analyze_validation_policy_with_shell(
                     &command_invocation, original_shell_type,
-                    (!turn_environment.environment.is_remote()).then_some(cwd.as_path()),
+                    allow_native_analysis.then_some(cwd.as_path()),
                 ).await;
             if let Some(refusal) = crate::validation_task::mode_refusal(
                 &turn, policy_classification, params.validation.is_some(),
@@ -378,7 +381,7 @@ impl ShellCommandHandler {
         let validation = crate::validation::resolve_command_validation_with_shell(
             &command_invocation,
             original_shell_type,
-            (!turn_environment.environment.is_remote()).then_some(cwd.as_path()),
+            allow_native_analysis.then_some(cwd.as_path()),
             params.validation.clone(),
         )
         .await;
@@ -448,14 +451,13 @@ impl ShellCommandHandler {
             .command_execution
             .observe_repository_revision(&turn.sub_id, observed_mutation_revision)
             .await;
-        let workspace_identity = session
-            .services
-            .command_execution
-            .current_workspace_identity_hash(
-                &turn_environment.environment_id,
-                exec_params.cwd.as_path(),
-            )
-            .await;
+        let workspace_identity = if allow_native_analysis {
+            session.services.command_execution.current_workspace_identity_hash(
+                &turn_environment.environment_id, exec_params.cwd.as_path(),
+            ).await
+        } else {
+            None
+        };
         let validation_cwd = PathUri::from_abs_path(&exec_params.cwd).to_string();
         let attempt_key = if !validation_launch {
             let attempt_key = CommandAttemptKey::new(
@@ -521,7 +523,6 @@ impl ShellCommandHandler {
             tracker,
             call_id,
             tool_call_source,
-            track_command_mutations: true,
             attempt_key,
             repair_notice,
             command_repaired,
@@ -628,6 +629,10 @@ impl CoreToolRuntime for ShellCommandHandler {
 
     fn waits_for_runtime_cancellation(&self) -> bool {
         true
+    }
+
+    fn owns_unified_exec_processes(&self) -> bool {
+        self.options.forward_to_unified_exec
     }
 
     fn pre_tool_use_hook_name(

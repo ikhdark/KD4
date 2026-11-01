@@ -1,3 +1,4 @@
+use codex_api::SharedAuthProvider;
 use codex_backend_client::Client as BackendClient;
 use codex_backend_client::ConfigBundleResponse;
 use codex_backend_client::DeliveredTomlFragment;
@@ -9,8 +10,7 @@ use codex_config::CloudConfigTomlBundle;
 use codex_config::CloudRequirementsFragment;
 use codex_config::CloudRequirementsTomlBundle;
 use codex_http_client::HttpClientFactory;
-use codex_login::CodexAuth;
-use std::future::Future;
+use codex_login::default_client::get_codex_user_agent;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RetryableFailureKind {
@@ -46,17 +46,6 @@ pub(crate) enum BundleRequestError {
     },
 }
 
-/// Retrieves one cloud config bundle from the backend.
-///
-/// Implementations should return the backend-selected bundle exactly as delivered and leave
-/// validation, caching, and config/requirements parsing decisions to the service layer.
-pub(crate) trait BundleClient: Send + Sync {
-    fn get_bundle(
-        &self,
-        auth: &CodexAuth,
-    ) -> impl Future<Output = Result<CloudConfigBundle, BundleRequestError>> + Send;
-}
-
 pub(crate) struct BackendBundleClient {
     client: BackendClient,
 }
@@ -67,13 +56,14 @@ impl BackendBundleClient {
             client: BackendClient::new(base_url, http_client_factory),
         }
     }
-}
 
-impl BundleClient for BackendBundleClient {
-    async fn get_bundle(&self, auth: &CodexAuth) -> Result<CloudConfigBundle, BundleRequestError> {
+    /// Retrieves the backend-selected bundle; validation and composition belong to the service.
+    pub(crate) async fn get_bundle(&self, auth: SharedAuthProvider) -> Result<CloudConfigBundle, BundleRequestError> {
         // Keep the route-aware transport pool across retries and refreshes, but
         // always use the current credentials (including after 401 recovery).
-        let client = self.client.clone().with_auth(auth);
+        let client = self.client.clone()
+            .with_user_agent(get_codex_user_agent())
+            .with_auth_provider(auth);
 
         let response = client
             .get_config_bundle()

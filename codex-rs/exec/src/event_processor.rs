@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::path::Path;
 
 use codex_app_server_protocol::ServerNotification;
@@ -87,29 +86,10 @@ fn write_last_message(output_file: &Path, message: &str) -> std::io::Result<()> 
     {
         return std::fs::write(output_file, message);
     }
-    let parent = output_file
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
-    if let Some(metadata) = metadata {
-        if metadata.permissions().readonly() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "last message file is read-only",
-            ));
-        }
-        staged.as_file().set_permissions(metadata.permissions())?;
-    }
-    staged.write_all(message.as_bytes())?;
-    staged.flush()?;
-    // std uses POSIX replacement semantics on supported Windows versions,
-    // retaining existing readers of the old generation.
-    std::fs::rename(staged.path(), output_file)?;
-    Ok(())
+    codex_file_system::write_bytes_atomically_without_sync(output_file, message.as_bytes())
 }
 
-/// Bounded streaming counterpart of the recovered-item selector. Keep only the
+/// Bounded selector for streamed and recovered items. Keep only the
 /// best eligible message; commentary remains in the transcript, not this cache.
 #[derive(Default)]
 pub(crate) struct FinalMessageSelection {
@@ -133,14 +113,6 @@ impl FinalMessageSelection {
     }
 }
 
-pub(crate) fn final_message_from_turn_items(items: &[ThreadItem]) -> Option<String> {
-    items
-        .iter()
-        .filter_map(final_message_candidate)
-        .max_by_key(|(_, rank)| *rank)
-        .map(|(text, _)| text.to_string())
-}
-
 fn final_message_candidate(item: &ThreadItem) -> Option<(&str, u8)> {
     if matches!(item, ThreadItem::AgentMessage { interruption: Some(_), .. }) {
         return None;
@@ -158,17 +130,6 @@ fn final_message_candidate(item: &ThreadItem) -> Option<(&str, u8)> {
         ThreadItem::Plan { text, .. } => Some((text, 1)),
         _ => None,
     }
-}
-
-pub(crate) fn final_message_from_turn(
-    items: &[ThreadItem],
-    timing: Option<&codex_protocol::protocol::TurnTiming>,
-) -> Option<String> {
-    if let Some(answer) = timing.and_then(|timing| timing.final_answer.as_ref()) {
-        return answer.message.as_ref().map(|message| message.text.clone());
-    }
-    // Legacy producers carry no acceptance receipt. Never promote commentary.
-    final_message_from_turn_items(items)
 }
 
 /// Some(None) is an authoritative no-final receipt, not missing evidence.

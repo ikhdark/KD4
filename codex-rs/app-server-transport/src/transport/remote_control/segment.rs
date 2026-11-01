@@ -6,7 +6,7 @@ use super::protocol::ServerEvent;
 use super::protocol::StreamId;
 use base64::DecodeSliceError;
 use base64::Engine;
-use codex_app_server_protocol::JSONRPCMessage;
+use codex_app_server_protocol_types::JSONRPCMessage;
 use std::collections::HashMap;
 use std::io;
 use std::io::ErrorKind;
@@ -348,12 +348,12 @@ pub(super) struct EncodedServerPayload {
 /// Keep this budget identical to the encoder's inner-message ceiling.
 pub fn remote_control_response_size_error(
     response: &crate::outgoing_message::OutgoingResponse,
-) -> Option<codex_app_server_protocol::JSONRPCErrorError> {
+) -> Option<codex_app_server_protocol_types::JSONRPCErrorError> {
     (crate::transport::serialized_request_bytes_up_to(
         response,
         REMOTE_CONTROL_REASSEMBLED_MAX_BYTES,
     ) > REMOTE_CONTROL_REASSEMBLED_MAX_BYTES)
-        .then(|| codex_app_server_protocol::JSONRPCErrorError {
+        .then(|| codex_app_server_protocol_types::JSONRPCErrorError {
             code: -32603,
             message: "Response exceeds the Remote message size limit; request paginated history with thread/turns/list or thread/items/list, or resume with excludeTurns=true.".to_string(),
             data: Some(serde_json::json!({

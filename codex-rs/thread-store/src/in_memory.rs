@@ -100,7 +100,6 @@ struct InMemoryThreadStoreState {
     created_threads: HashMap<ThreadId, CreateThreadParams>,
     histories: HashMap<ThreadId, Vec<RolloutItem>>,
     metadata_updates: HashMap<ThreadId, ThreadMetadataPatch>,
-    names: HashMap<ThreadId, Option<String>>,
     rollout_paths: HashMap<PathBuf, ThreadId>,
 }
 
@@ -434,9 +433,6 @@ impl InMemoryThreadStore {
         let mut state = self.state.lock().await;
         state.calls.update_thread_metadata += 1;
         require_thread(&state, params.thread_id)?;
-        if let Some(name) = params.patch.name.clone() {
-            state.names.insert(params.thread_id, name);
-        }
         state
             .metadata_updates
             .entry(params.thread_id)
@@ -450,7 +446,6 @@ impl InMemoryThreadStore {
         state.calls.delete_thread += 1;
         let existed = state.histories.remove(&params.thread_id).is_some();
         state.created_threads.remove(&params.thread_id);
-        state.names.remove(&params.thread_id);
         state.metadata_updates.remove(&params.thread_id);
         state
             .rollout_paths
@@ -614,8 +609,8 @@ fn stored_thread_from_state(
         thread_id,
         items: state.histories.get(&thread_id).cloned().unwrap_or_default(),
     });
-    let name = state.names.get(&thread_id).cloned().flatten();
     let metadata = state.metadata_updates.get(&thread_id);
+    let name = metadata.and_then(|metadata| metadata.name.clone().flatten());
 
     let missing_timestamp = || ThreadStoreError::Internal {
         message: format!("thread {thread_id} is missing its creation timestamps"),

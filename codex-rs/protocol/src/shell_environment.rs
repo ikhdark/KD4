@@ -59,29 +59,6 @@ pub fn create_env_from_vars<I>(
 where
     I: IntoIterator<Item = (String, String)>,
 {
-    populate_env_impl(vars, policy, thread_id, /*inject_pathext*/ true)
-}
-
-pub fn populate_env<I>(
-    vars: I,
-    policy: &ShellEnvironmentPolicy,
-    thread_id: Option<&str>,
-) -> HashMap<String, String>
-where
-    I: IntoIterator<Item = (String, String)>,
-{
-    populate_env_impl(vars, policy, thread_id, /*inject_pathext*/ false)
-}
-
-fn populate_env_impl<I>(
-    vars: I,
-    policy: &ShellEnvironmentPolicy,
-    thread_id: Option<&str>,
-    inject_pathext: bool,
-) -> HashMap<String, String>
-where
-    I: IntoIterator<Item = (String, String)>,
-{
     // Step 1 - determine the starting set of variables based on the
     // `inherit` strategy.
     let mut env_map: HashMap<String, String> = match policy.inherit {
@@ -101,7 +78,7 @@ where
 
     // Windows command lookup needs PATHEXT, but the policy's explicit exclude
     // and include-only filters remain authoritative.
-    if inject_pathext && !env_map.keys().any(|k| k.eq_ignore_ascii_case("PATHEXT")) {
+    if !env_map.keys().any(|k| k.eq_ignore_ascii_case("PATHEXT")) {
         env_map.insert("PATHEXT".to_string(), ".COM;.EXE;.BAT;.CMD".to_string());
     }
 

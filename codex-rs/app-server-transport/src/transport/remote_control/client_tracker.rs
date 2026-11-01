@@ -11,7 +11,7 @@ use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::QueuedOutgoingMessage;
 use crate::transport::ConnectionOrigin;
 use crate::transport::remote_control::QueuedServerEnvelope;
-use codex_app_server_protocol::JSONRPCMessage;
+use codex_app_server_protocol_types::JSONRPCMessage;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
@@ -430,13 +430,6 @@ impl ClientTracker {
     }
 
     async fn send_transport_event(&self, event: TransportEvent) -> Result<(), Stopped> {
-        let event = match event {
-            TransportEvent::ConnectionClosed { connection_id } => {
-                return self.send_connection_closed(connection_id).await;
-            }
-            event => event,
-        };
-
         if let TransportEvent::IncomingMessage {
             connection_id,
             message: JSONRPCMessage::Request(_),
@@ -489,21 +482,6 @@ impl ClientTracker {
         }
     }
 
-    async fn send_connection_closed(&self, connection_id: ConnectionId) -> Result<(), Stopped> {
-        // Worker shutdown can abort the caller; detach the cleanup event before awaiting it.
-        match self.spawn_connection_closed(connection_id).await {
-            Ok(result) => result,
-            Err(err) => {
-                warn!(
-                    transport_event = "connection_closed",
-                    ?err,
-                    "remote control transport event forwarding task failed"
-                );
-                Err(Stopped)
-            }
-        }
-    }
-
     fn spawn_connection_closed(
         &self,
         connection_id: ConnectionId,
@@ -551,7 +529,7 @@ fn transport_event_name(event: &TransportEvent) -> &'static str {
 fn remote_control_message_starts_connection(message: &JSONRPCMessage) -> bool {
     matches!(
         message,
-        JSONRPCMessage::Request(codex_app_server_protocol::JSONRPCRequest { method, .. })
+        JSONRPCMessage::Request(codex_app_server_protocol_types::JSONRPCRequest { method, .. })
             if method == "initialize"
     )
 }

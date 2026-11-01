@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import shutil
 import stat
 import subprocess
@@ -17,6 +16,7 @@ from functools import lru_cache
 from pathlib import Path
 from pathlib import PurePosixPath
 from urllib.parse import urlparse
+from scripts.common.atomic_json import write_json_atomic
 from scripts.common.process_owner import check_operation
 from scripts.common.process_owner import run_owned
 
@@ -42,7 +42,7 @@ except OSError as error:
 
 
 _FETCHED_EXECUTABLES: dict[
-    tuple[str, Path, str, str, bool], tuple[Path, DotSlashArtifact] | None
+    tuple[str, Path, str, str], tuple[Path, DotSlashArtifact]
 ] = {}
 _JSON_STAMP_CACHE: dict[Path, tuple[tuple[int, int] | None, dict | None]] = {}
 
@@ -63,19 +63,15 @@ def fetch_dotslash_executable(
     artifact_label: str,
     cache_key: str,
     dest_name: str,
-    missing_ok: bool = False,
-) -> Path | None:
+) -> Path:
     cache_key_tuple = (
         spec.target,
         manifest_path,
         cache_key,
         dest_name,
-        missing_ok,
     )
     if cache_key_tuple in _FETCHED_EXECUTABLES:
         cached = _FETCHED_EXECUTABLES[cache_key_tuple]
-        if cached is None:
-            return None
         cached_dest, cached_artifact = cached
         if extracted_member_is_valid(cached_dest, cached_artifact):
             return cached_dest
@@ -85,12 +81,7 @@ def fetch_dotslash_executable(
         spec,
         manifest_path,
         artifact_label=artifact_label,
-        missing_ok=missing_ok,
     )
-    if artifact is None:
-        _FETCHED_EXECUTABLES[cache_key_tuple] = None
-        return None
-
     identity = hashlib.sha256(
         json.dumps(
             [artifact.digest, artifact.archive_format, artifact.archive_member],
@@ -118,19 +109,12 @@ def fetch_dotslash_executable(
     return dest
 
 
-def clear_runtime_caches() -> None:
-    _FETCHED_EXECUTABLES.clear()
-    _JSON_STAMP_CACHE.clear()
-    load_manifest.cache_clear()
-
-
 def artifact_for_target(
     spec: TargetSpec,
     manifest_path: Path,
     *,
     artifact_label: str,
-    missing_ok: bool = False,
-) -> DotSlashArtifact | None:
+) -> DotSlashArtifact:
     manifest = load_manifest(manifest_path)
     if not isinstance(manifest, dict):
         raise RuntimeError(f"Invalid {artifact_label} manifest: {manifest_path}")
@@ -141,8 +125,6 @@ def artifact_for_target(
         )
     platform_info = platforms.get(spec.dotslash_platform)
     if platform_info is None:
-        if missing_ok:
-            return None
         raise RuntimeError(
             f"{artifact_label} manifest {manifest_path} is missing platform "
             f"{spec.dotslash_platform!r}"
@@ -289,7 +271,6 @@ def verify_archive(
             f"{artifact_label} archive {archive_path} has sha256 {actual_digest}, "
             f"expected {artifact.digest}"
         )
-    write_verified_archive_stamp(archive_path, artifact)
 
 
 def download_archive(url: str, archive_path: Path) -> None:
@@ -333,26 +314,6 @@ def download_archive(url: str, archive_path: Path) -> None:
         temp_path.unlink(missing_ok=True)
 
 
-def write_verified_archive_stamp(
-    archive_path: Path,
-    artifact: DotSlashArtifact,
-) -> None:
-    write_json_stamp(
-        verified_archive_stamp_path(archive_path),
-        {
-            "kind": "dotslash-archive",
-            "url": artifact.url,
-            "size": artifact.size,
-            "digest": artifact.digest,
-            "file": file_stamp(archive_path),
-        },
-    )
-
-
-def verified_archive_stamp_path(archive_path: Path) -> Path:
-    return archive_path.with_name(f"{archive_path.name}.verified.json")
-
-
 def extracted_member_is_valid(dest: Path, artifact: DotSlashArtifact) -> bool:
     if not dest.is_file():
         return False
@@ -372,9 +333,8 @@ def extracted_member_is_valid(dest: Path, artifact: DotSlashArtifact) -> bool:
 
 
 def write_extracted_member_stamp(
-    dest: Path, artifact: DotSlashArtifact, *, source: Path | None = None
+    dest: Path, artifact: DotSlashArtifact, *, source: Path
 ) -> None:
-    source = dest if source is None else source
     write_json_stamp(
         extracted_member_stamp_path(dest),
         {
@@ -424,14 +384,9 @@ def read_json_stamp(path: Path) -> dict | None:
 
 
 def write_json_stamp(path: Path, value: dict) -> None:
-    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    temporary = Path(name)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as out:
-            out.write(json.dumps(value, sort_keys=True, indent=2) + "\n")
-        temporary.replace(path)
+        write_json_atomic(path, value)
     finally:
-        temporary.unlink(missing_ok=True)
         _JSON_STAMP_CACHE.pop(path, None)
 
 

@@ -189,19 +189,6 @@ function Get-ReleaseArtifactIdentity {
     finally { $sha256.Dispose() }
 }
 
-function Get-ReleaseAssetMetadata {
-    param(
-        [string]$AssetName,
-        [string]$ResolvedVersion
-    )
-
-    $metadata = Find-ReleaseAssetMetadata -AssetName $AssetName -ResolvedVersion $ResolvedVersion
-    if ($null -eq $metadata) {
-        throw "Could not find release asset $AssetName for Codex $ResolvedVersion."
-    }
-
-    return $metadata
-}
 
 function Get-FileSha256 {
     param([string]$Path)
@@ -932,7 +919,6 @@ function Write-InstallMetadata {
         [string]$ReleaseDir,
         [string]$ResolvedVersion,
         [string]$Target,
-        [string]$Layout,
         [string]$ArtifactIdentity,
         [object]$PackageMetadata,
         [object]$ChecksumMetadata
@@ -945,7 +931,7 @@ function Write-InstallMetadata {
             'receiptVersion=2'
             "version=$ResolvedVersion"
             "target=$Target"
-            "layout=$Layout"
+            "layout=Package"
             "repository=$ReleaseRepository"
             "releaseId=$($PackageMetadata.ReleaseId)"
             "assetId=$($PackageMetadata.AssetId)"
@@ -988,21 +974,13 @@ function Test-ReleaseIsComplete {
         [string]$ReleaseDir,
         [string]$ExpectedVersion,
         [string]$ExpectedTarget,
-        [string]$Layout,
         [Parameter(Mandatory = $true)][string]$ArtifactIdentity,
         [Parameter(Mandatory = $true)][object]$PackageMetadata,
         [Parameter(Mandatory = $true)][object]$ChecksumMetadata
     )
 
-    switch ($Layout) {
-        "Package" {
-            if (-not (Test-PackageContentsAreComplete -PackageDir $ReleaseDir -ExpectedVersion $ExpectedVersion -ExpectedTarget $ExpectedTarget)) {
-                return $false
-            }
-        }
-        default {
-            throw "Unknown Codex installer layout: $Layout"
-        }
+    if (-not (Test-PackageContentsAreComplete -PackageDir $ReleaseDir -ExpectedVersion $ExpectedVersion -ExpectedTarget $ExpectedTarget)) {
+        return $false
     }
 
     if ((Split-Path -Leaf $ReleaseDir) -ne "$ExpectedVersion-$ExpectedTarget-$ArtifactIdentity") {
@@ -1011,7 +989,7 @@ function Test-ReleaseIsComplete {
 
     $metadataMatches = (Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "version") -eq $ExpectedVersion -and
         (Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "target") -eq $ExpectedTarget -and
-        (Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "layout") -eq $Layout -and
+        (Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "layout") -eq "Package" -and
         (Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "receiptVersion") -ceq '2' -and
         (Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "repository") -ceq $ReleaseRepository -and
         (Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "artifactIdentity") -ceq $ArtifactIdentity -and
@@ -1178,8 +1156,9 @@ if ([string]::IsNullOrWhiteSpace($env:CODEX_INSTALL_DIR)) {
     $visibleBinDir = $env:CODEX_INSTALL_DIR
 }
 
+# Serialize activation, deletion and PATH updates under one persistent lock.
+Invoke-WithInstallLock -LockPath $lockPath -Script {
 if ($Uninstall) {
-    Invoke-WithInstallLock -LockPath $lockPath -Script {
         if (Test-IsJunction -Path $visibleBinDir) {
             $visibleTarget = [string](Get-Item -LiteralPath $visibleBinDir -Force).Target
             if (-not (Test-PathIsEqualOrDescendant -CandidatePath $visibleTarget -RootPath $standaloneRoot)) {
@@ -1194,10 +1173,8 @@ if ($Uninstall) {
                 Remove-Item -LiteralPath $ownedPath -Recurse -Force
             }
         }
-    }
-    if (Test-Path -LiteralPath $standaloneRoot) {
-        Remove-Item -LiteralPath $standaloneRoot -Recurse -Force
-    }
+    # Keep install.lock and its parent: removing them after unlocking could
+    # delete a successor install or let two writers lock different files.
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
     $newUserPath = Remove-PathEntry -PathValue $userPath -Entry $visibleBinDir
     if ($newUserPath -cne $userPath) {
@@ -1232,7 +1209,6 @@ if ($null -eq $releaseMetadata) {
 }
 $packageMetadata = Find-ReleaseAssetMetadata -AssetName $packageAsset -ResolvedVersion $resolvedVersion -ReleaseMetadata $releaseMetadata
 $checksumMetadata = Find-ReleaseAssetMetadata -AssetName $checksumAsset -ResolvedVersion $resolvedVersion -ReleaseMetadata $releaseMetadata
-$installLayout = "Package"
 if ($null -eq $packageMetadata -or $null -eq $checksumMetadata) {
     throw "Could not find Codex standalone package release assets for Codex $resolvedVersion."
 }
@@ -1243,10 +1219,9 @@ $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("codex-install-" + [Syst
 New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
 
 try {
-    Invoke-WithInstallLock -LockPath $lockPath -Script {
         Remove-StaleInstallArtifacts -ReleasesDir $releasesDir
 
-        if (-not (Test-ReleaseIsComplete -ReleaseDir $releaseDir -ExpectedVersion $resolvedVersion -ExpectedTarget $target -Layout $installLayout -ArtifactIdentity $artifactIdentity -PackageMetadata $packageMetadata -ChecksumMetadata $checksumMetadata)) {
+        if (-not (Test-ReleaseIsComplete -ReleaseDir $releaseDir -ExpectedVersion $resolvedVersion -ExpectedTarget $target -ArtifactIdentity $artifactIdentity -PackageMetadata $packageMetadata -ChecksumMetadata $checksumMetadata)) {
             if (Test-Path -LiteralPath $releaseDir) {
                 Write-WarningStep "Found incomplete existing release at $releaseDir. Reinstalling."
             }
@@ -1271,6 +1246,9 @@ try {
             }
             New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null
             & $tarCommand -xzf $archivePath -C $stagingDir
+            if ($LASTEXITCODE -ne 0) {
+                throw "Extracting the Codex package archive failed with exit code $LASTEXITCODE."
+            }
             if (-not (Test-PackageContentsAreComplete -PackageDir $stagingDir -ExpectedVersion $resolvedVersion -ExpectedTarget $target)) {
                 throw "Downloaded Codex package archive did not contain the expected package layout."
             }
@@ -1281,7 +1259,7 @@ try {
                 throw "Downloaded Codex binary version did not match release metadata. Expected $resolvedVersion but got $stagedVersion."
             }
 
-            Write-InstallMetadata -ReleaseDir $stagingDir -ResolvedVersion $resolvedVersion -Target $target -Layout $installLayout -ArtifactIdentity $artifactIdentity -PackageMetadata $packageMetadata -ChecksumMetadata $checksumMetadata
+            Write-InstallMetadata -ReleaseDir $stagingDir -ResolvedVersion $resolvedVersion -Target $target -ArtifactIdentity $artifactIdentity -PackageMetadata $packageMetadata -ChecksumMetadata $checksumMetadata
 
             $repairBackup = $null
             if (Test-Path -LiteralPath $releaseDir) {
@@ -1334,7 +1312,6 @@ try {
             Remove-Item -LiteralPath $oldStandaloneBackup -Recurse -Force
         }
         Remove-OldCompletedReleases -ReleasesDir $releasesDir -ActiveReleaseDir $releaseDir
-    }
 } finally {
     Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue
 }
@@ -1379,6 +1356,7 @@ if ($prioritizeVisibleBin) {
 Write-Step "Current PowerShell session: codex"
 Write-Step "Future PowerShell windows: open a new PowerShell window and run: codex"
 Write-Host "Codex CLI $resolvedVersion installed successfully."
+}
 
 $codexCommand = Join-Path $visibleBinDir "codex.exe"
 if (Prompt-YesNo "Start Codex now?") {

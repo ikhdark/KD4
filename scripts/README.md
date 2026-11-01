@@ -44,6 +44,15 @@ Eligible source-mirror builds enable bounded overflow automatically. The short
 
 ## Cargo artifact receipts
 
+Opt-in `--timing-json` captures source/settings/compiler/runner identities and
+before/after source stability under `timingEvidence`. `cargoMs` times the owned
+Cargo invocation (including its process/cache preparation), separately from
+`totalMs`, the wrapper timer including all metadata observations. Metadata
+`captureMs` is already included in that total; do not add it to `cargoMs` or
+compare newer wrapper totals with legacy totals as if capture were free. This capture
+does not change lane admission, compiler settings, cache decisions or freezing.
+Frozen reuse has no Cargo duration. KDR owns retained timing comparison.
+
 Freezing or reusing a bundle prints its `Build receipt:` path on stderr.
 `just cargo-artifacts cargo build --release -p codex-cli` prints the existing
 `build-receipt.json` to stdout for the exact source/settings/command match,

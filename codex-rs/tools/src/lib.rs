@@ -1,6 +1,7 @@
 //! Shared tool definitions and Responses API tool primitives that can live
 //! outside `codex-core`.
 
+pub mod builtin_specs;
 mod code_mode;
 mod dynamic_tool;
 mod function_call_error;
@@ -19,6 +20,8 @@ mod tool_output;
 mod tool_payload;
 mod tool_search;
 mod tool_spec;
+mod tool_schema_artifact;
+pub use tool_schema_artifact::ToolSchemaArtifact;
 
 pub use code_mode::augment_tool_spec_for_code_mode;
 pub use code_mode::code_mode_name_for_tool_name;
@@ -70,6 +73,8 @@ pub use tool_call::ToolCallSource;
 pub use tool_call::ToolEnvironment;
 pub use tool_call::TurnItemEmissionFuture;
 pub use tool_call::TurnItemEmitter;
+pub use tool_config::DEFAULT_SPAWN_AGENT_MODEL;
+pub use tool_config::DEFAULT_SPAWN_AGENT_REASONING_EFFORT;
 pub use tool_config::ToolEnvironmentMode;
 pub use tool_config::UnifiedExecFeatureMode;
 pub use tool_config::request_user_input_available_modes;

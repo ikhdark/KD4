@@ -293,7 +293,7 @@ pub(super) async fn search_threads(
             snippet: item.snippet,
         });
     }
-    set_thread_search_result_names(store, &mut items, names, resolved_title_ids).await;
+    set_thread_search_result_names(store, &mut items, names, resolved_title_ids).await?;
 
     Ok(ThreadSearchPage { items, next_cursor })
 }
@@ -330,7 +330,7 @@ async fn set_thread_search_result_names(
     items: &mut [StoredThreadSearchResult],
     mut names: HashMap<ThreadId, String>,
     resolved_title_ids: HashSet<ThreadId>,
-) {
+) -> ThreadStoreResult<()> {
     let thread_ids = items
         .iter()
         .map(|item| item.thread.thread_id)
@@ -339,13 +339,24 @@ async fn set_thread_search_result_names(
         .difference(&resolved_title_ids)
         .copied()
         .collect::<HashSet<_>>();
-    if !unresolved_thread_ids.is_empty()
+    if !thread_ids.is_empty()
         && let Some(state_db_ctx) = store.state_db().await
-        && let Ok(titles) = state_db_ctx
-            .get_thread_titles(&unresolved_thread_ids.iter().copied().collect::<Vec<_>>())
-            .await
     {
-        for (thread_id, title, first_user_message) in titles {
+        let titles = state_db_ctx
+            .get_thread_titles(&thread_ids.iter().copied().collect::<Vec<_>>())
+            .await
+            .map_err(|error| ThreadStoreError::Internal {
+                message: format!("failed to read canonical search names: {error}"),
+            })?;
+        for (thread_id, title, first_user_message, title_is_explicit) in titles {
+            if title_is_explicit {
+                unresolved_thread_ids.remove(&thread_id);
+                names.remove(&thread_id);
+                if !title.trim().is_empty() {
+                    names.insert(thread_id, title.trim().to_owned());
+                }
+                continue;
+            }
             if let Some(title) = distinct_thread_title(&title, first_user_message.as_deref()) {
                 unresolved_thread_ids.remove(&thread_id);
                 names.insert(thread_id, title);
@@ -362,8 +373,13 @@ async fn set_thread_search_result_names(
         }
     }
     for item in items {
-        if let Some(title) = names.get(&item.thread.thread_id).cloned() {
+        if !unresolved_thread_ids.contains(&item.thread.thread_id) {
+            // Resolved includes authoritative clears: remove a name observed in
+            // an older projection instead of only overwriting nonempty names.
+            item.thread.name = names.get(&item.thread.thread_id).cloned();
+        } else if let Some(title) = names.get(&item.thread.thread_id).cloned() {
             set_thread_name_from_title(&mut item.thread, title);
         }
     }
+    Ok(())
 }

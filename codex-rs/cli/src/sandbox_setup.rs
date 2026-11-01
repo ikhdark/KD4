@@ -39,25 +39,12 @@ pub(crate) struct SandboxSetupCommand {
     codex_home: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SandboxSetupLevel {
-    Elevated,
-}
-
-impl SandboxSetupCommand {
-    fn setup_level(&self) -> anyhow::Result<SandboxSetupLevel> {
-        if self.elevated_sandbox_level {
-            Ok(SandboxSetupLevel::Elevated)
-        } else {
-            anyhow::bail!("`codex sandbox setup` currently requires --elevated");
-        }
-    }
-}
-
 pub(crate) async fn run(cmd: SandboxSetupCommand) -> anyhow::Result<()> {
-    match cmd.setup_level()? {
-        SandboxSetupLevel::Elevated => run_elevated(cmd).await,
-    }
+    anyhow::ensure!(
+        cmd.elevated_sandbox_level,
+        "`codex sandbox setup` currently requires --elevated"
+    );
+    run_elevated(cmd).await
 }
 
 async fn run_elevated(cmd: SandboxSetupCommand) -> anyhow::Result<()> {
