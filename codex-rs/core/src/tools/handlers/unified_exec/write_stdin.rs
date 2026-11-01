@@ -1,5 +1,4 @@
 use crate::FunctionCallError;
-use crate::agent::task_capabilities::validate_independent_review_stdin;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -269,10 +268,6 @@ impl WriteStdinHandler {
                 "wait_for_output requires empty chars; send input separately".to_string(),
             ));
         }
-        validate_independent_review_stdin(&turn.session_source, &args.chars, args.terminate || args.close_stdin)
-            .map_err(|message| FunctionCallError::structured(ToolFailure::no_effects(
-                ToolFailureCode::PermissionDenied, message,
-            )))?;
         if args.terminate
             && !session
                 .services

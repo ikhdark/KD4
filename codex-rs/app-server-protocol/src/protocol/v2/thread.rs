@@ -121,7 +121,9 @@ pub struct ThreadStartParams {
     pub personality: Option<Personality>,
     #[ts(optional = nullable)]
     pub ephemeral: Option<bool>,
-    /// Persisted thread history contract to use for this new thread.
+    /// Preferred persisted thread history contract for this new thread.
+    /// Local rollout-backed servers fall back to `legacy` for `paginated` requests.
+    /// The returned thread's `historyMode` reports the selected contract.
     #[experimental("thread/start.historyMode")]
     #[ts(optional = nullable)]
     pub history_mode: Option<ThreadHistoryMode>,

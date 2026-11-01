@@ -4,7 +4,6 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::FunctionCallError;
-use crate::agent::task_capabilities::validate_independent_review_shell;
 use crate::maybe_emit_implicit_skill_invocation;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::turn_context::TurnContext;
@@ -50,8 +49,6 @@ use codex_otel::TOOL_CALL_UNIFIED_EXEC_METRIC;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
 use codex_sandboxing::select_initial;
-use codex_shell_command::is_safe_command::is_known_safe_command_in_state;
-use codex_shell_command::is_safe_command::is_known_safe_direct_argv_in_state;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use codex_utils_output_truncation::approx_token_count;
@@ -478,11 +475,7 @@ impl ExecCommandHandler {
             .shell_for_environment(turn_environment)
             .await
             .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
-        let allow_login_shell =
-            super::super::shell::ShellCommandHandler::effective_allow_login_shell(
-                &turn.session_source,
-                turn.config.permissions.allow_login_shell,
-            );
+        let allow_login_shell = turn.config.permissions.allow_login_shell;
         let (mut args, original_resolved_command) = get_command_async(
             args,
             Arc::clone(&shell),
@@ -595,31 +588,10 @@ impl ExecCommandHandler {
                 FunctionCallError::RespondToModel(format!("command search worker failed: {error}"))
             })
         };
-        let safety_command = resolved_command.safety_command.clone();
-        let direct_argv = command_invocation.is_argv();
-        let inspection_state = native_cwd
-            .as_ref()
-            .filter(|_| {
-                !environment_is_remote
-                    && crate::agent::task_capabilities::is_independent_review_source(
-                        &turn.session_source,
-                    )
-            })
-            .map(|cwd| (cwd.clone(), manager.effective_environment(&context)));
-        let safety_analysis = crate::tools::run_blocking_command_analysis(move || {
-            let Some((cwd, inspection_env)) = inspection_state else {
-                return false;
-            };
-            if direct_argv {
-                is_known_safe_direct_argv_in_state(&safety_command, cwd.as_path(), &inspection_env)
-            } else {
-                is_known_safe_command_in_state(&safety_command, cwd.as_path(), &inspection_env)
-            }
-        });
         // Pure launch analyses share inputs but not results. Join them before
         // applying observation/approval policy; no process starts in this phase.
-        let ((mut validation, long_running), search_no_match_eligible, inspection_command) =
-            tokio::join!(validation_analysis, search_analysis, safety_analysis);
+        let ((mut validation, long_running), search_no_match_eligible) =
+            tokio::join!(validation_analysis, search_analysis);
         args.apply_validation_observation_policy(
             long_running || validation
                 .as_ref()
@@ -635,16 +607,6 @@ impl ExecCommandHandler {
         } else {
             search_no_match_eligible?
         };
-        let inspection_command = inspection_command.map_err(|error| {
-            FunctionCallError::RespondToModel(format!("command safety worker failed: {error}"))
-        })?;
-        validate_independent_review_shell(
-            &turn.session_source,
-            inspection_command && args.env.is_empty(),
-            args.sandbox_permissions.requests_sandbox_override(),
-            args.additional_permissions.is_some(),
-        )
-        .map_err(|message| FunctionCallError::RespondToModel(message.to_string()))?;
         let hook_command = command_invocation.display_command();
         // Implicit skill detection requires a native path, so foreign PathUri
         // workdirs are intentionally skipped here.

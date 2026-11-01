@@ -144,7 +144,7 @@ pub fn create_send_message_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "send_message".to_string(),
-        description: "Queue a message for a child or peer, or the same message for explicit targets, without starting a new turn. Use this for quiet-window requests and matching releases/slot grants to live waiting workers; these continue the existing assignment, not a new turn. Sub-agents cannot message ancestors: finish with one final answer including any blockers; the host reports the terminal outcome automatically. Do not send progress updates or request acknowledgment. Use followup_task for new assignments, corrections requiring action, or urgent work that must start."
+        description: "Queue a message for a child or peer, or the same message for explicit targets, without starting a new turn. Sub-agents cannot message ancestors: finish with one final answer including any blockers; the host reports the terminal outcome automatically. Do not send progress updates or request acknowledgment. Use followup_task for new assignments, corrections requiring action, or urgent work that must start."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -186,7 +186,7 @@ pub fn create_followup_task_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "followup_task".to_string(),
-        description: "Send a new assignment, correction requiring action, or urgent intervention to an existing non-root agent; trigger a turn if idle. If running, deliver promptly at message boundaries while sampling, or after the pending tool call completes. Use send_message for information or quiet-window releases/slot grants to live waiting workers; a temporary wait does not require a follow-up. A typed (`assignment`) agent accepts a follow-up only while its attempt is active; once its receipt is sealed, spawn a new assignment instead."
+        description: "Send a new assignment, correction requiring action, or urgent intervention to an existing non-root agent; trigger a turn if idle. If running, deliver promptly at message boundaries while sampling, or after the pending tool call completes. Use send_message for information that does not require a new turn. A typed (`assignment`) agent accepts a follow-up only while its attempt is active; once its receipt is sealed, spawn a new assignment instead."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -200,7 +200,7 @@ pub fn create_followup_task_tool() -> ToolSpec {
 pub fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "wait_agent".to_string(),
-        description: "Wait in-turn. Supply nonempty targets (child task names or thread IDs) for selected-child completion subscriptions; completion_mode is any (default) or all. Pins current producer attempts, returns durable terminal outcomes and exact result_recovery references, not deliverable acceptance. No status polling, mailbox consumption, cursor advancement or worker cancellation; cancellation/deadline returns partial outcomes and pending obligations. Independent of unrelated mail; omit targets for the existing progress/input wait. For a quiet-window release or slot grant, set mailbox_only:true and omit timeout_ms: waits for mailbox, deferred-result or new user input even when descendants settled. Default progress mode returns at the first event, not necessarily completion, or immediately when owned assignments settled. On input wake return from the exec cell and process input. Empty typed_deltas alone is not a reason to wait again. If a required release/grant has not arrived, keep waiting in-turn. Default-mode admission bookkeeping and delivered completion events are folded internally. Omit cursor to retain position; supply one only to replay. Message content arrives on your next request."
+        description: "Wait in-turn. Supply nonempty targets (child task names or thread IDs) for selected-child completion subscriptions; completion_mode is any (default) or all. Pins current producer attempts, returns durable terminal outcomes and exact result_recovery references, not deliverable acceptance. No status polling, mailbox consumption, cursor advancement or worker cancellation; cancellation/deadline returns partial outcomes and pending obligations. Independent of unrelated mail; omit targets for the existing progress/input wait. mailbox_only:true waits for mailbox, deferred-result or new user input even when descendants settled. Default progress mode returns at the first event, not necessarily completion, or immediately when owned assignments settled. On input wake return from the exec cell and process input. Empty typed_deltas alone is not a reason to wait again. Default-mode admission bookkeeping and delivered completion events are folded internally. Omit cursor to retain position; supply one only to replay. Message content arrives on your next request."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -595,7 +595,7 @@ fn spawn_agent_common_properties_v2(
         (
             "fork_turns".to_string(),
             JsonSchema::string(Some(format!(
-                "Optional fork mode. Omitted or `none` creates a lineage-preserving TaskCapsule fork with no parent conversation; prefer this for self-contained tasks. Use the smallest sufficient integer string from 1 through 5 only when prior conversation is needed. Full history (`all`) is disabled by default.{full_history_override_guidance}"
+                "Optional fork mode. Omitted or `none` creates a lineage-preserving TaskCapsule fork with no parent conversation; prefer this for self-contained tasks. Use the smallest sufficient integer string from 1 through 5 only when prior conversation is needed.{full_history_override_guidance}"
             ))),
         ),
         (
@@ -636,12 +636,11 @@ fn hide_spawn_agent_metadata_options(properties: &mut BTreeMap<String, JsonSchem
 
 
 // Keep tool/assignment mechanics here; audit policy belongs to the base instructions,
-// and role/coordination guidance belongs to config/mod.rs. See AGENTS.md for ownership.
+// and role guidance belongs to config/mod.rs. See AGENTS.md for ownership.
 fn spawn_agent_tool_description_v2(
     usage_hint_text: Option<String>,
 ) -> String {
     let default_model_guidance = spawn_agent_default_guidance();
-    let full_history_override_guidance = SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE;
 
     let tool_description = format!(
         r#"
@@ -650,7 +649,7 @@ Registered leaf names take precedence over compact UUIDs; use a hyphenated UUID 
 The spawned agent receives a durable task binding.
 {default_model_guidance}
 Only call this tool for a concrete, bounded subtask that can run independently alongside useful local work; otherwise continue locally.
-Apply the base instructions for audit/review scope, verification, validation, and completion, and the team guidance for ownership and coordination.
+Apply the base instructions for audit/review scope, verification, validation, and completion, and applicable assignment restrictions.
 Fit assignments to actual worker context, reserving reasoning/evidence/reporting space; partition by cohesive subsystems and execution paths, not just file size.
 The `message` must include the task type, intended read/write scope, category inclusions/exclusions, detection criteria, conversation-only user restrictions, required evidence, and stop condition. Give task-specific deltas, not copies of inherited project instructions, permissions or base policy. Read-only tasks remain read-only by instruction; no specialized profile is selected.
 Launch authorized independent assignments in the same batch, not a serial spawn loop. In exec, use bounded Promise.allSettled and retain every success and failure; failed siblings do not justify respawning successes.
@@ -658,7 +657,6 @@ Sequence only real dependencies or shared-resource conflicts. Integrate completi
 It can message its children and peers, but cannot message ancestors. Its final answer and terminal outcome are delivered to its parent automatically when it finishes.
 Supply `message` (or its `prompt`/`instructions` alias). Each task is durably tracked with a repository-wide diagnostic claim and returns an `assignment_id` and `overlap_warnings` identifying active task/attempt/worker IDs. These compare effective contracts, declared scopes and deliverables before launch and are advisory, not proof of redundancy or grounds to reject/reuse work. Set independent_verification:true for intentional independent checking; resemblance alone never blocks assignment. The host records the final outcome automatically, without a role-specific receipt workflow.
 
-    {full_history_override_guidance}
 Omitted `fork_turns` and `fork_turns="none"` create a lineage-preserving TaskCapsule fork: the capsule is the sole structured bootstrap and no parent conversation or conversation-derived capability selection is inherited. Integers from 1 through 5 retain bounded history. `fork_turns="all"` is disabled by default and is only available with the configuration escape hatch."#
     );
 
@@ -712,7 +710,7 @@ fn wait_agent_tool_parameters_v2(options: WaitAgentTimeoutOptions) -> JsonSchema
         (
             "mailbox_only".to_string(),
             JsonSchema::boolean(Some(
-                "Default false. True waits only for mailbox, deferred-result or new user input; no task-state scan, maintenance nudge or cursor advancement. Use for a release/grant wait regardless of descendant task state. Cancellation and explicit deadlines still apply.".to_string(),
+                "Default false. True waits only for mailbox, deferred-result or new user input; no task-state scan, maintenance nudge or cursor advancement. Cancellation and explicit deadlines still apply.".to_string(),
             )),
         ),
         (

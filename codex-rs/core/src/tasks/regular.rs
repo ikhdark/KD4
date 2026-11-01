@@ -86,6 +86,11 @@ impl SessionTask for RegularTask {
                     // ordinary (including absent) finals must satisfy it too. A turn that
                     // already recorded a terminal error has no final; keep that cause.
                     validate_final_response(&ctx, &turn_result).await?;
+                    if let Some(message) = turn_result.accepted_final_message.as_ref() {
+                        crate::stream_events_utils::publish_deferred_final_output(
+                            &sess, &ctx, &message.item_id,
+                        ).await;
+                    }
                     // Completion metadata is not a transcript item. Publish direct
                     // answers through the normal persisted message lifecycle so
                     // clients see them both live and when reopening the thread.

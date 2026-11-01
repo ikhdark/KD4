@@ -1008,9 +1008,12 @@ Windows safety rules (apply when executing in a Windows environment, regardless 
 /// when every selectable execution environment has a known POSIX cwd.
 pub(crate) fn omit_windows_shell_guidance(spec: &mut ToolSpec) {
     if let ToolSpec::Function(tool) = spec
-        && let Some(start) = tool.description.find("\n\nWindows safety rules")
+        && let Some((_, windows_rules)) = windows_shell_guidance().split_once("\n\nWindows safety rules")
     {
-        tool.description.truncate(start);
+        tool.description = tool.description.replace(
+            &format!("\n\nWindows safety rules{windows_rules}"),
+            "",
+        );
     }
 }
 

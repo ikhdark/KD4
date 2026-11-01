@@ -117,6 +117,25 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
             // Scripts keep both fields, and history pins carry their own.
             projected.remove("raw_output_artifact_id");
             projected.remove("raw_output_artifact_bytes");
+            // The same holds for its reference once the exited command's whole,
+            // completely captured log is this view. Polls and partial captures keep it.
+            if object.get("execution_state").and_then(Value::as_str) == Some("exited")
+                && object.get("session_id").is_none_or(Value::is_null)
+                && object.get("streams_complete") == Some(&Value::Bool(true))
+                && object.get("output_reference").is_some_and(|reference| {
+                    reference["capture_complete"] == true && reference["missing_bytes"] == 0
+                })
+            {
+                projected.remove("output_reference");
+            }
+        }
+        // Routine launch provenance repeats per call and often outweighs the
+        // command output. Print what ran; anything unusual keeps the receipt.
+        if let Some(receipt) = object
+            .get("environment_receipt")
+            .and_then(routine_launch_receipt)
+        {
+            projected.insert("environment_receipt".into(), receipt);
         }
         // These are exact script inputs, not a second copy to spend the cell's
         // display budget on. Scripts can explicitly emit selected stream data.
@@ -239,7 +258,63 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
             }
         }
     }
+    omit_first_attempt_history(&mut projected);
     (raw_text || mcp_text || projected != *object).then_some(Value::Object(projected))
+}
+
+/// Retry memory exists to surface earlier outcomes for identical input. A
+/// first attempt has none, so its advisory repeats only this call's identity
+/// and fixed policy text. Scripts and harness fingerprints keep the native field.
+fn omit_first_attempt_history(projected: &mut serde_json::Map<String, Value>) {
+    if projected.get("operation_history").is_some_and(|history| {
+        history["previous_attempt_count"] == 0
+            && history["last_unsuccessful_attempt"].is_null()
+            && history["recovery_required"] != true
+    }) {
+        projected.remove("operation_history");
+    }
+}
+
+/// Keep each instrumented root's created executable and prepared shell startup.
+/// Unobserved, dropped or unresolved launches, unresolved search roots and
+/// observed descendants keep the complete receipt; the script value is unchanged.
+fn routine_launch_receipt(receipt: &Value) -> Option<Value> {
+    let receipt = receipt.as_object()?;
+    if !receipt.get("unobserved_launch_environment")?.is_null()
+        || receipt.get("dropped_details")?.as_u64()? != 0
+        || !receipt.get("descendant_starts").is_none_or(Value::is_null)
+    {
+        return None;
+    }
+    let roots = receipt.get("roots")?.as_array()?;
+    if roots.is_empty() {
+        return None;
+    }
+    let mut compact = Vec::with_capacity(roots.len());
+    for root in roots {
+        let executable = root.get("resolved_executable")?.as_str()?;
+        let environment = root.get("environment")?.as_object()?;
+        if !root.pointer("/executable_identity/underlying_program")?.is_null()
+            || environment
+                .get("search_roots")
+                .and_then(Value::as_array)
+                .is_some_and(|roots| roots.iter().any(|root| !root["error"].is_null()))
+        {
+            return None;
+        }
+        let mut entry = serde_json::Map::from_iter([(
+            "resolved_executable".to_string(),
+            Value::from(executable),
+        )]);
+        if let Some(shell) = environment.get("shell").filter(|shell| !shell.is_null()) {
+            entry.insert("shell".into(), shell.clone());
+        }
+        compact.push(Value::Object(entry));
+    }
+    Some(serde_json::json!({
+        "roots": compact,
+        "compact": "routine launch fields omitted; the result object keeps the full receipt",
+    }))
 }
 
 /// Code Mode printing may use references that are not native schema fields.
@@ -315,6 +390,7 @@ fn patch_without_repeated_summary(raw: &Value) -> Option<Value> {
     {
         projected.remove("text");
     }
+    omit_first_attempt_history(&mut projected);
     // Register even when nothing can be removed: fallback display must not
     // replace a partial delta or custom diagnostic with a generic success.
     Some(Value::Object(projected))

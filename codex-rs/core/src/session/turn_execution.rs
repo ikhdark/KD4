@@ -2604,6 +2604,9 @@ pub(crate) struct TurnExecutionControl {
     plan: Option<crate::plan_store::PlanExecutionSnapshot>,
     /// An inherited completed checklist is not a final-answer hint for new input.
     plan_updated_since_input: bool,
+    /// Unlike answer hints, task debt survives delivered child reports.
+    plan_work_since_user_input: bool,
+    completion_reconciliation_issued: bool,
     plan_revision: u64,
     input_revision: u64,
     /// Passive cycle identity excludes reports, unlike completion/dispatch authority.
@@ -2658,6 +2661,8 @@ impl TurnExecutionControl {
             delivered_agent_events: BTreeSet::new(),
             plan: None,
             plan_updated_since_input: false,
+            plan_work_since_user_input: false,
+            completion_reconciliation_issued: false,
             plan_revision: 0,
             input_revision: 0,
             instruction_revision: 0,
@@ -2686,6 +2691,7 @@ impl TurnExecutionControl {
     ) -> Self {
         self.refresh_plan(plan);
         self.plan_updated_since_input = false;
+        self.plan_work_since_user_input = false;
         self
     }
 
@@ -2695,6 +2701,7 @@ impl TurnExecutionControl {
         if self.plan != plan {
             self.plan_revision = self.plan_revision.saturating_add(1);
             self.plan_updated_since_input = plan.is_some();
+            self.plan_work_since_user_input |= plan.is_some();
         }
         self.plan = plan;
     }
@@ -2720,10 +2727,9 @@ impl TurnExecutionControl {
 
 
 
-    /// Mechanical reasons this turn is not a verified completion: workspace
-    /// changes after its last passing validation, not checklist accounting.
-    /// The revision is the last settled request's validation revision. The turn
-    /// owner separately reports the post-validation boundary of a mutating finalizer.
+    /// Retain known check failures and declared scope debt at the terminal boundary.
+    /// A completed checklist is not task-acceptance proof, but an unresolved
+    /// owner requirement must not disappear from warnings, resume or child handoffs.
     fn completion_assessment(
         &self,
         _settled_mutation_revision: u64,
@@ -2731,6 +2737,14 @@ impl TurnExecutionControl {
         codex_protocol::protocol::TurnCompletionAssessment {
             failed_checks: self.failed_validation_checks.iter().map(|check| {
                 self.validation_check_descriptions.get(check).cloned().unwrap_or_else(|| check.clone())
+            }).collect(),
+            verification_gaps: self.plan.iter().flat_map(|plan| {
+                plan.obligations.unresolved.iter().map(|id| {
+                    format!(
+                        "Declared plan requirement {id} is unresolved (plan revision {}).",
+                        plan.revision,
+                    )
+                })
             }).collect(),
             ..Default::default()
         }
@@ -2757,6 +2771,28 @@ impl TurnExecutionControl {
                 .plan
                 .as_ref()
                 .is_some_and(|plan| plan.has_steps && plan.obligations.unresolved.is_empty())
+    }
+
+    fn unresolved_current_plan(&self) -> Option<&crate::plan_store::PlanExecutionSnapshot> {
+        if !self.plan_work_since_user_input {
+            return None;
+        }
+        self.plan.as_ref().filter(|plan| !plan.obligations.unresolved.is_empty())
+    }
+
+    /// One decision opportunity before hooks, not a loop until the model closes
+    /// a checklist. Genuine blockers may hand back with the debt still reported.
+    pub(crate) fn take_completion_reconciliation(&mut self) -> Option<String> {
+        if self.completion_reconciliation_issued {
+            return None;
+        }
+        let plan = self.unresolved_current_plan()?;
+        let directive = format!(
+            "Final answer deferred: the current plan still has unresolved requirement IDs {} (revision {}). Continue the requested work or explicitly resolve genuinely finished requirements through update_plan. If a real permission, user-decision or external blocker prevents progress, leave the affected requirements unresolved and report that blocker. This is one reconciliation opportunity, not permission to retry unchanged failures, invent evidence or alter scope.",
+            plan.obligations.unresolved.join(", "), plan.revision,
+        );
+        self.completion_reconciliation_issued = true;
+        Some(directive)
     }
 
 
@@ -3070,6 +3106,8 @@ impl TurnExecutionControl {
         // intervention or reset passive cycle identity.
         self.continuations_without_progress = 0;
         if instructions_changed {
+            self.plan_work_since_user_input = false;
+            self.completion_reconciliation_issued = false;
             self.instruction_revision = self.instruction_revision.saturating_add(1);
 
             self.reset_convergence();

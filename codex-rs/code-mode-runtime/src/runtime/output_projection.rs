@@ -74,6 +74,13 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
     }
     return entry;
   };
+  // Display cloning must not erase native receipt identity before the normal
+  // projector sees it. Mutated values and custom serializers still opt out.
+  function unmodifiedNativeEvidence(value) {
+    const entry = get(value);
+    return entry && inert(value, new Set()) && same(value, entry.original) &&
+      (!entry.root || same(entry.root, entry.rootOriginal));
+  }
   // Canonical helper evidence is not a diagnostic preview. Clone data
   // descriptors without invoking user code, retaining every node and control
   // field. Storage's existing byte admission rejects an oversized snapshot
@@ -95,6 +102,7 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
       if (typeof value === 'function' || typeof value === 'symbol')
         return unsupported('Unsupported canonical error evidence value');
       if (value === null || typeof value !== 'object') return value;
+      if (display && unmodifiedNativeEvidence(value)) return value;
       if (depth >= 128 || isProxy(value) || active.has(value))
         return unsupported('Canonical error evidence is cyclic, proxied, or too deep');
       if (!display && completed.has(value)) return completed.get(value);
@@ -197,6 +205,7 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
         return value.length > count ? value.slice(0, count) + "[truncated]" : value;
       }
       if (value === null || typeof value !== 'object') return value;
+      if (unmodifiedNativeEvidence(value)) return value;
       if (seen.has(value)) return "[circular error evidence]";
       seen.add(value);
       const array = Array.isArray(value);

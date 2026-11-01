@@ -1318,7 +1318,6 @@ pub(crate) struct RegisteredTool {
     runtime: Arc<dyn CoreToolRuntime>,
     exposure: ToolExposure,
     authorization_class: TypedToolClass,
-    external_mutation_intent: crate::agent::task_capabilities::ExternalMutationIntent,
     spec: ToolSpec,
     canonical_spec_sha256: OnceLock<String>,
     effective_input_schema: OnceLock<Option<Value>>,
@@ -1356,8 +1355,6 @@ impl RegisteredTool {
             provider_authority: None,
             exposure,
             authorization_class,
-            external_mutation_intent:
-                crate::agent::task_capabilities::ExternalMutationIntent::MayMutate,
             spec,
             canonical_spec_sha256: OnceLock::new(),
             effective_input_schema: OnceLock::new(),
@@ -1365,14 +1362,6 @@ impl RegisteredTool {
             search_info: OnceLock::new(),
             code_mode_argument_preflight: Arc::new(CodeModeArgumentPreflight::default()),
         }
-    }
-
-    pub(crate) fn with_external_mutation_intent(
-        mut self,
-        intent: crate::agent::task_capabilities::ExternalMutationIntent,
-    ) -> Self {
-        self.external_mutation_intent = intent;
-        self
     }
 
     pub(crate) fn runtime(&self) -> &Arc<dyn CoreToolRuntime> {
@@ -1399,12 +1388,6 @@ impl RegisteredTool {
 
     pub(crate) fn authorization_class(&self) -> TypedToolClass {
         self.authorization_class
-    }
-
-    pub(crate) fn external_mutation_intent(
-        &self,
-    ) -> crate::agent::task_capabilities::ExternalMutationIntent {
-        self.external_mutation_intent
     }
 
     pub(crate) fn spec(&self) -> &ToolSpec {
@@ -1615,10 +1598,11 @@ impl ToolRegistry {
             };
         };
         ToolSemanticCapabilities {
-            mutation: tool.authorization_class() == TypedToolClass::StructuredEdit
-                || (tool.authorization_class() == TypedToolClass::DynamicExternal
-                    && tool.external_mutation_intent()
-                        == crate::agent::task_capabilities::ExternalMutationIntent::MayMutate),
+            // External tool annotations are advisory, not read-only authority.
+            mutation: matches!(
+                tool.authorization_class(),
+                TypedToolClass::StructuredEdit | TypedToolClass::DynamicExternal
+            ),
             coordination: matches!(
                 tool.authorization_class(),
                 TypedToolClass::AgentCommunication | TypedToolClass::RootTaskControl
@@ -2557,6 +2541,20 @@ fn with_operation_history_notice(
     {
         fields.entry("operation_history").or_insert_with(|| history["operation_history"].clone());
         *text = value.to_string();
+        return response;
+    }
+    // Appended notices are display. A first attempt without a fingerprint has
+    // neither an earlier outcome nor a failure signature for this to carry.
+    if notice
+        .and_then(|notice| serde_json::from_str::<Value>(notice).ok())
+        .is_some_and(|notice| {
+            let history = &notice["operation_history"];
+            history["previous_attempt_count"] == 0
+                && history["last_unsuccessful_attempt"].is_null()
+                && history["recovery_required"] != true
+                && history["instance"]["fingerprint"].is_null()
+        })
+    {
         return response;
     }
     with_model_delivery_notice(response, notice)

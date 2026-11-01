@@ -1,7 +1,5 @@
 use crate::FunctionCallError;
-use crate::agent::task_capabilities::ExternalMutationIntent;
 use crate::agent::task_capabilities::TypedToolClass;
-use crate::agent::task_capabilities::is_independent_review_source;
 use crate::client_common::ToolSchemaArtifact;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
@@ -24,7 +22,6 @@ use codex_mcp::ToolInfo;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::SearchToolCallParams;
-use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ToolManifestItem;
 use codex_tools::DiscoverableTool;
 use codex_tools::ToolCall as ExtensionToolCall;
@@ -733,18 +730,6 @@ impl ToolRouter {
                 )));
             }
         }
-        let external_mutation_intent = registered
-            .map(RegisteredTool::external_mutation_intent)
-            .unwrap_or(ExternalMutationIntent::MayMutate);
-        let tool_class = registered
-            .map(RegisteredTool::authorization_class)
-            .unwrap_or(TypedToolClass::Unknown);
-        authorize_independent_review_tool_call(
-            &step_context.turn.session_source,
-            tool_class,
-            &call,
-            external_mutation_intent,
-        )?;
         let authorization_state_started = Instant::now();
         let authorization_result = authorize_bound_typed_tool_call(
             session.as_ref(),
@@ -857,33 +842,6 @@ fn apply_visible_namespace_description_budget(visible: &mut [ToolSpec]) {
     }
 }
 
-fn authorize_independent_review_tool_call(
-    session_source: &SessionSource,
-    class: TypedToolClass,
-    call: &ToolCall,
-    external_mutation_intent: ExternalMutationIntent,
-) -> Result<(), FunctionCallError> {
-    if !is_independent_review_source(session_source) {
-        return Ok(());
-    }
-    let allowed = matches!(
-        class,
-        TypedToolClass::AgentCommunication
-            | TypedToolClass::OwnTask
-            | TypedToolClass::ReadSearch
-            | TypedToolClass::CodeModeControl
-            | TypedToolClass::Shell
-    ) || (class == TypedToolClass::DynamicExternal
-        && external_mutation_intent == ExternalMutationIntent::ProvenReadOnly);
-    if allowed {
-        Ok(())
-    } else {
-        Err(FunctionCallError::RespondToModel(format!(
-            "{}: independent review capability denied: no tool was run; only read-only repository inspection tools are available. Do not retry the mutation under the current permissions",
-            call.tool_name.name
-        )))
-    }
-}
 
 async fn authorize_bound_typed_tool_call(
     session: &Session,
@@ -924,8 +882,7 @@ async fn authorize_bound_typed_tool_call(
     }
 
     // A task binding governs lifecycle, not tool authority. Active subagents
-    // use the same tool permissions as root; task-specific restrictions are
-    // enforced separately (including independent-review read-only policy).
+    // use the same tool permissions as root and remain subject to their assignment.
     // An authorized tool call is meaningful progress, not just liveness.
     let heartbeated = coordinator
         .heartbeat_typed_actor_binding(&binding, /*progress*/ true)

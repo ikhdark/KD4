@@ -9,7 +9,6 @@ use codex_utils_path_uri::PathConvention;
 use codex_utils_path_uri::PathUri;
 
 use crate::FunctionCallError;
-use crate::agent::task_capabilities::is_independent_review_source;
 use crate::exec::DEFAULT_EXEC_COMMAND_TIMEOUT_MS;
 use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecParams;
@@ -106,13 +105,6 @@ impl ShellCommandHandler {
                 "failed to forward shell_command arguments: {err}"
             ))
         })
-    }
-
-    pub(crate) fn effective_allow_login_shell(
-        session_source: &codex_protocol::protocol::SessionSource,
-        allow_login_shell: bool,
-    ) -> bool {
-        allow_login_shell && !is_independent_review_source(session_source)
     }
 
     pub(crate) fn new(options: ShellCommandHandlerOptions) -> Self {
@@ -245,10 +237,7 @@ impl ShellCommandHandler {
             turn_environment.cwd().infer_path_convention() == Some(PathConvention::native());
         if !cwd_uses_native_convention {
             let turn = &invocation.step_context.turn;
-            let allow_login_shell = Self::effective_allow_login_shell(
-                &turn.session_source,
-                turn.config.permissions.allow_login_shell,
-            );
+            let allow_login_shell = turn.config.permissions.allow_login_shell;
             let ToolPayload::Function { arguments } = &mut invocation.payload else {
                 return Err(FunctionCallError::RespondToModel(
                     "unsupported payload for shell_command handler".to_string(),
@@ -309,10 +298,7 @@ impl ShellCommandHandler {
             params.script_body.as_deref(),
         )?;
         let prefix_rule = params.prefix_rule.clone();
-        let allow_login_shell = Self::effective_allow_login_shell(
-            &turn.session_source,
-            turn.config.permissions.allow_login_shell,
-        );
+        let allow_login_shell = turn.config.permissions.allow_login_shell;
         let use_login_shell = Self::resolve_use_login_shell(params.login, allow_login_shell)?;
         let session_shell = session
             .shell_for_environment(&turn_environment)

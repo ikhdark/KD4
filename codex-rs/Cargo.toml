@@ -455,7 +455,7 @@ ignored = [
 
 [profile.dev]
 # Minimize local build work; optimized runtime builds use release profiles.
-opt-level = 2
+opt-level = 0
 debug = "none"
 lto = "off"
 codegen-units = 256

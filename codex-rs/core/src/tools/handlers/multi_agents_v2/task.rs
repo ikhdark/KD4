@@ -9,7 +9,6 @@ use codex_agent_task_store::AgentRole;
 use codex_agent_task_store::AgentStatusClaim;
 use codex_agent_task_store::AgentTask;
 use codex_agent_task_store::ArchitectureContractV1;
-use codex_agent_task_store::AssignmentAdmissionOrigin;
 use codex_agent_task_store::AssignmentId;
 use codex_agent_task_store::Attempt;
 use codex_agent_task_store::AttemptAmendment;
@@ -25,7 +24,6 @@ use codex_agent_task_store::ReceiptDraft;
 use codex_agent_task_store::RelationKind;
 use codex_agent_task_store::RiskDomain;
 use codex_agent_task_store::StoreError;
-use codex_agent_task_store::TaskActor;
 use codex_agent_task_store::ValidationCall;
 use codex_git_utils::get_git_repo_root;
 use codex_protocol::ThreadId;
@@ -127,48 +125,15 @@ define_handler!(
 
 async fn load_authorized_task(
     coordinator: &crate::agent::task_coordinator::AgentTaskCoordinator,
-    turn: &crate::session::turn_context::TurnContext,
+    _turn: &crate::session::turn_context::TurnContext,
     assignment_id: AssignmentId,
     observation_limit: usize,
     tool_name: &'static str,
 ) -> Result<AgentTask, FunctionCallError> {
-    let caller_binding = coordinator.binding_for_turn(&turn);
-    if crate::agent::task_capabilities::is_independent_review_source(&turn.session_source)
-        && caller_binding.is_none()
-    {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "{tool_name}: independent reviewers require their current bound task"
-        )));
-    }
-    let task = coordinator
+    coordinator
         .get_agent_task(assignment_id, Some(observation_limit))
         .await
-        .map_err(|error| task_store_error(tool_name, error))?;
-    if crate::agent::task_capabilities::is_independent_review_source(&turn.session_source)
-        && let Some(binding) = &caller_binding
-    {
-        let caller = if binding.assignment_id == assignment_id {
-            task.clone()
-        } else {
-            coordinator
-                .get_agent_task(binding.assignment_id, Some(0))
-                .await
-                .map_err(|error| task_store_error(tool_name, error))?
-        };
-        let current = caller.current_attempt.attempt_id == binding.attempt_id
-            && caller.assignment.root_session_id == binding.root_session_id;
-        let immediate_child = matches!(task.assignment.admission_origin,
-            AssignmentAdmissionOrigin::LegacyMessage { parent_assignment_id: Some(parent) }
-            if parent == binding.assignment_id)
-            && caller.assignment.root_session_id == task.assignment.root_session_id
-            && caller.assignment.repository_id == task.assignment.repository_id;
-        if !current || (binding.assignment_id != assignment_id && !immediate_child) {
-            return Err(FunctionCallError::RespondToModel(format!(
-                "{tool_name}: independent reviewers may read only their current bound task or its immediate children"
-            )));
-        }
-    }
-    Ok(task)
+        .map_err(|error| task_store_error(tool_name, error))
 }
 
 async fn handle_get_agent_task(
@@ -584,20 +549,9 @@ async fn handle_set_agent_gate(
         .parse::<AttemptId>()
         .map_err(|error| task_store_error(SET_AGENT_GATE_TOOL, error))?;
     let coordinator = session.services.agent_control.task_coordinator();
-    let actor = if crate::agent::task_capabilities::is_independent_review_source(
-        &turn.session_source,
-    ) {
-        let binding = coordinator.binding_for_turn(&turn).ok_or_else(|| {
-            FunctionCallError::RespondToModel(format!(
-                "{SET_AGENT_GATE_TOOL}: the caller is not a typed agent with a bound task"
-            ))
-        })?;
-        TaskActor::Attempt(binding.attempt_id)
-    } else {
-        coordinator
-            .root_actor()
-            .map_err(|error| task_store_error(SET_AGENT_GATE_TOOL, error))?
-    };
+    let actor = coordinator
+        .root_actor()
+        .map_err(|error| task_store_error(SET_AGENT_GATE_TOOL, error))?;
     let store = coordinator.store().ok_or_else(|| {
         FunctionCallError::RespondToModel(format!(
             "{SET_AGENT_GATE_TOOL}: the typed task store is unavailable"
@@ -1873,8 +1827,7 @@ fn get_agent_task_spec() -> ToolSpec {
          with read_tool_output using canonical_recovery.artifact_id and the supplied JSON pointers. \
          Summaries and worker declarations are not proof or workspace-freshness claims; null \
          receipts mean unavailable. Current attempts are separate from pinned admission provenance. \
-         Handoffs include no transcripts. Root and active subagents may read tasks in this team; \
-         independent reviewers remain limited to their bound task and immediate children.",
+         Handoffs include no transcripts. Root and active subagents may read tasks in this team.",
         object_schema(
             [
                 (
@@ -2118,7 +2071,7 @@ fn submit_agent_receipt_spec() -> ToolSpec {
 fn set_agent_gate_spec() -> ToolSpec {
     function_spec(
         SET_AGENT_GATE_TOOL,
-        "Submit an evidence-backed gate verdict using the team's shared authority. Independent reviewers remain limited to review gates for their declared targets. Use waive_agent_gate for permitted soft-gate waivers.",
+        "Submit an evidence-backed gate verdict using the team's shared authority. Use waive_agent_gate for permitted soft-gate waivers.",
         object_schema(
             [
                 ("assignment_id", assignment_id_schema()),

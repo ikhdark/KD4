@@ -1,17 +1,5 @@
-You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary
-for another language model that will resume the task.
-
-Produce a self-contained recovery checkpoint. Preserve the conversation's exact
-goal, implementation state, observed results, failures, and unresolved context.
-
-Do not turn assumptions into facts. Do not claim that an edit, check, or result
-occurred unless the conversation or tool state establishes it. Preserve
-important unresolved disagreements rather than silently choosing one side.
-
-Do not include private chain-of-thought. Include only concise conclusions,
-evidence, decisions, and task-relevant rationale.
-
-Use exactly these headings, in this order:
+Create a self-contained CONTEXT CHECKPOINT COMPACTION summary for the model
+resuming this task.
 
 Aim for at most 2,400 tokens total, with section-body targets of 250 tokens for
 Goal, 350 for Current state, 250 for Completed work, 350 for Unresolved work,

@@ -108,10 +108,7 @@ pub(crate) async fn recheck_readonly_command_before_launch(
         ExecApprovalRequirement::Skip { bypass_sandbox: false, .. }
     ) && (ctx.turn.approval_policy.value() == AskForApproval::UnlessTrusted
         || managed_without_backend);
-    let independent_reviewer = crate::agent::task_capabilities::is_independent_review_source(
-        &ctx.turn.session_source,
-    );
-    if !independent_reviewer && !heuristic_readonly {
+    if !heuristic_readonly {
         return Ok(None);
     }
     let cwd = cwd.ok_or_else(|| {
@@ -119,36 +116,34 @@ pub(crate) async fn recheck_readonly_command_before_launch(
             "Readonly executable provenance is unavailable for this execution environment.".into(),
         )
     })?.to_path_buf();
-    if !independent_reviewer {
-        // Reuse the policy owner so explicitly allowed segments remain allowed;
-        // only unmatched readonly segments need provenance. Never replace an
-        // explicit authorization with a blanket whole-script safelist check.
-        let request = crate::exec_policy::ExecApprovalRequest {
-            command,
-            command_for_safety: None,
-            execution_context: Some((&cwd, env)),
-            approval_policy: ctx.turn.approval_policy.value(),
-            permission_profile: profile,
-            windows_sandbox_level: ctx.turn.windows_sandbox_level,
-            sandbox_permissions,
-            prefix_rule: None,
-        };
-        let policy = &ctx.session.services.exec_policy;
-        let refreshed = if shell_wrapper_is_owned {
-            policy.create_exec_approval_requirement_for_command(request).await
-        } else {
-            policy.create_exec_approval_requirement_for_direct_argv(request).await
-        };
-        match refreshed {
-            ExecApprovalRequirement::Skip { bypass_sandbox, .. } => {
-                if shell_wrapper_is_owned || bypass_sandbox {
-                    return Ok(None);
-                }
+    // Reuse the policy owner so explicitly allowed segments remain allowed;
+    // only unmatched readonly segments need provenance. Never replace an
+    // explicit authorization with a blanket whole-script safelist check.
+    let request = crate::exec_policy::ExecApprovalRequest {
+        command,
+        command_for_safety: None,
+        execution_context: Some((&cwd, env)),
+        approval_policy: ctx.turn.approval_policy.value(),
+        permission_profile: profile,
+        windows_sandbox_level: ctx.turn.windows_sandbox_level,
+        sandbox_permissions,
+        prefix_rule: None,
+    };
+    let policy = &ctx.session.services.exec_policy;
+    let refreshed = if shell_wrapper_is_owned {
+        policy.create_exec_approval_requirement_for_command(request).await
+    } else {
+        policy.create_exec_approval_requirement_for_direct_argv(request).await
+    };
+    match refreshed {
+        ExecApprovalRequirement::Skip { bypass_sandbox, .. } => {
+            if shell_wrapper_is_owned || bypass_sandbox {
+                return Ok(None);
             }
-            _ => return Err(ToolError::Rejected(
-                "Readonly executable provenance changed before launch; the requested command was not started.".into(),
-            )),
         }
+        _ => return Err(ToolError::Rejected(
+            "Readonly executable provenance changed before launch; the requested command was not started.".into(),
+        )),
     }
     let command = command.to_vec();
     let env = env.clone();

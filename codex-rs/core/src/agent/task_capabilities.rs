@@ -6,8 +6,6 @@ use codex_agent_task_store::CapabilityProfile;
 use codex_agent_task_store::MutationEvidence;
 use codex_agent_task_store::repository_lineage_id;
 use codex_agent_task_store::repository_workspace_id;
-use codex_protocol::protocol::SessionSource;
-use codex_protocol::protocol::SubAgentSource;
 use serde::Serialize;
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -26,57 +24,6 @@ pub(crate) enum TypedToolClass {
     StructuredEdit,
     DynamicExternal,
     Unknown,
-}
-
-/// Whether an external tool is proven read-only or might mutate state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ExternalMutationIntent {
-    ProvenReadOnly,
-    MayMutate,
-}
-
-pub(crate) fn is_independent_review_source(source: &SessionSource) -> bool {
-    match source {
-        SessionSource::SubAgent(SubAgentSource::Review) => true,
-        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-            agent_role: Some(role),
-            ..
-        }) => role == "reviewer",
-        _ => false,
-    }
-}
-
-pub(crate) fn validate_independent_review_shell(
-    source: &SessionSource,
-    inspection_command: bool,
-    sandbox_override: bool,
-    additional_permissions: bool,
-) -> Result<(), &'static str> {
-    if !is_independent_review_source(source) {
-        return Ok(());
-    }
-    if sandbox_override || additional_permissions {
-        return Err(
-            "independent reviewers cannot request shell sandbox overrides or additional permissions",
-        );
-    }
-    if !inspection_command {
-        return Err(
-            "independent reviewers may run only shell commands proven read-only; on PowerShell use safelisted read-only commands (Get-Content, Get-ChildItem, Select-String, Test-Path, `rg`, `git -c core.fsmonitor=false diff --no-ext-diff --no-textconv --`, `git --no-optional-locks -c core.fsmonitor=false status --short`), without assignments, script blocks or redirection; `git log`/`show` are not safelisted, so use the supplied immutable comparison command for commit reviews",
-        );
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_independent_review_stdin(
-    source: &SessionSource,
-    chars: &str,
-    terminate: bool,
-) -> Result<(), &'static str> {
-    if is_independent_review_source(source) && (!chars.is_empty() || terminate) {
-        return Err("independent reviewers may only poll read-only shell commands");
-    }
-    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]

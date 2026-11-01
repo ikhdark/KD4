@@ -203,14 +203,12 @@ impl PlannedTools {
     }
 
     fn add_mcp_runtime(&mut self, handler: McpHandler, exposure: ToolExposure, authority: String) {
-        let intent = handler.external_mutation_intent();
         self.runtimes.push(
             RegisteredTool::with_exposure(
                 Arc::new(handler),
                 exposure,
                 TypedToolClass::DynamicExternal,
             )
-            .with_external_mutation_intent(intent)
             .with_provider_authority(authority),
         );
     }
@@ -300,20 +298,6 @@ fn build_tool_specs_and_registry(
     };
     let mut planned_tools = PlannedTools::default();
     add_tool_sources(&context, &mut planned_tools);
-    if crate::agent::task_capabilities::is_independent_review_source(&turn_context.session_source) {
-        planned_tools.runtimes.retain(|runtime| {
-            matches!(
-                runtime.authorization_class(),
-                TypedToolClass::AgentCommunication
-                    | TypedToolClass::OwnTask
-                    | TypedToolClass::ReadSearch
-                    | TypedToolClass::CodeModeControl
-                    | TypedToolClass::Shell
-            ) || (runtime.authorization_class() == TypedToolClass::DynamicExternal
-                && runtime.external_mutation_intent()
-                    == crate::agent::task_capabilities::ExternalMutationIntent::ProvenReadOnly)
-        });
-    }
     promote_deferred_tools(turn_context, &mut planned_tools);
     apply_direct_model_only_namespace_overrides(turn_context, &mut planned_tools);
     retain_unique_planned_tool_names(&mut planned_tools);

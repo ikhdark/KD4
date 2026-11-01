@@ -171,6 +171,44 @@ pub(crate) struct OutputItemResult {
     pub read_only_prefetch_eligible: bool,
 }
 
+/// Turn-local client publication only. Authored history and finalized facts
+/// retain their existing owner; rejected candidates never become completed UI items.
+#[derive(Default)]
+pub(crate) struct DeferredFinalOutput {
+    items: Mutex<Vec<TurnItem>>,
+}
+
+pub(crate) fn deferred_final_output(
+    turn: &TurnContext,
+    item: &TurnItem,
+) -> Option<Arc<DeferredFinalOutput>> {
+    match item {
+        TurnItem::AgentMessage(message)
+            if !matches!(message.phase, Some(MessagePhase::Commentary | MessagePhase::PartialAnswer)) =>
+        {
+            turn.extension_data.get::<DeferredFinalOutput>()
+        }
+        _ => None,
+    }
+}
+
+pub(crate) async fn publish_deferred_final_output(
+    sess: &Session,
+    turn: &TurnContext,
+    accepted_item_id: &str,
+) {
+    let Some(buffer) = turn.extension_data.remove::<DeferredFinalOutput>() else {
+        return;
+    };
+    // Never hold the buffer lock while acquiring session/event locks.
+    let items = std::mem::take(&mut *buffer.items.lock().await);
+    for item in items.into_iter().filter(|item| item.id() == accepted_item_id) {
+        sess.emit_turn_item_started(turn, &item).await;
+        emit_finalized_assistant_text_replay(sess, turn, &item).await;
+        sess.emit_turn_item_completed(turn, item).await;
+    }
+}
+
 pub(crate) struct HandleOutputCtx {
     pub sess: Arc<Session>,
     pub turn_context: Arc<TurnContext>,
@@ -592,26 +630,36 @@ pub(crate) async fn handle_output_item_done(
                 .as_ref()
                 .map(|finalized| finalized.facts.clone());
             if let Some(finalized_turn_item) = finalized_turn_item {
-                if previously_active_item.is_none() {
-                    ctx.sess
-                        .emit_turn_item_started(&ctx.turn_context, &finalized_turn_item.turn_item)
-                        .await;
-                    // S1: this item never streamed live, either because a turn-item
-                    // contributor may rewrite assistant text or because the provider sent no
-                    // `OutputItemAdded`. Replay the finalized text as a delta so a client
-                    // still observes started -> delta -> completed, and so the deltas it sees
-                    // agree with the contributed item rather than the pre-contribution text.
-                    emit_finalized_assistant_text_replay(
-                        ctx.sess.as_ref(),
-                        &ctx.turn_context,
-                        &finalized_turn_item.turn_item,
+                // A message already streamed before plan work began must still
+                // close normally; known-debt finals never start streaming.
+                if previously_active_item.is_none()
+                    && let Some(buffer) = deferred_final_output(
+                        &ctx.turn_context, &finalized_turn_item.turn_item,
                     )
-                    .await;
-                }
+                {
+                    buffer.items.lock().await.push(finalized_turn_item.turn_item);
+                } else {
+                    if previously_active_item.is_none() {
+                        ctx.sess
+                            .emit_turn_item_started(&ctx.turn_context, &finalized_turn_item.turn_item)
+                            .await;
+                        // S1: this item never streamed live, either because a turn-item
+                        // contributor may rewrite assistant text or because the provider sent no
+                        // `OutputItemAdded`. Replay the finalized text as a delta so a client
+                        // still observes started -> delta -> completed, and so the deltas it sees
+                        // agree with the contributed item rather than the pre-contribution text.
+                        emit_finalized_assistant_text_replay(
+                            ctx.sess.as_ref(),
+                            &ctx.turn_context,
+                            &finalized_turn_item.turn_item,
+                        )
+                        .await;
+                    }
 
-                ctx.sess
-                    .emit_turn_item_completed(&ctx.turn_context, finalized_turn_item.turn_item)
-                    .await;
+                    ctx.sess
+                        .emit_turn_item_completed(&ctx.turn_context, finalized_turn_item.turn_item)
+                        .await;
+                }
             }
             drop(
                 ctx.response_item_recorder

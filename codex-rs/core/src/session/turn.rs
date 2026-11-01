@@ -1529,13 +1529,52 @@ pub(crate) fn run_turn(
                         } else {
                             last_agent_message = output_state.answer_text();
                         }
+                        // Reconcile owner-derived task debt before any effectful hook.
+                        // Terminal-only repairs and explicit stops cannot reopen work.
+                        if kd4_runtime
+                            && !generation_request.terminal_completion_only
+                            && !stop_hook_active
+                            && finalized_mutation_revision.is_none()
+                            && let Some(text) = turn_execution.take_completion_reconciliation()
+                            && admit_regular_follow_up(
+                                sess.as_ref(),
+                                turn_context.as_ref(),
+                                logical_generation_budget,
+                                &mut generation_budget_error_reported,
+                            ).await
+                        {
+                            sess.record_conversation_items(&turn_context, &[ResponseItem::Message {
+                                id: None,
+                                role: "developer".to_string(),
+                                content: vec![ContentItem::InputText { text }],
+                                phase: None,
+                                internal_chat_message_metadata_passthrough: None,
+                            }]).await?;
+                            output_state.invalidate_for_repair();
+                            let _ = turn_context.extension_data
+                                .remove::<crate::stream_events_utils::DeferredFinalOutput>();
+                            last_agent_message = None;
+                            pending_generation_request = Some(GenerationRequestDisposition {
+                                purpose: Some(TurnTimingGenerationPurpose::Repair),
+                                sampling: SamplingGenerationDisposition::DecisionBearing,
+                                relevant_state_fingerprint: turn_execution
+                                    .baselines_with_tool_exposure_revision(
+                                        settled_state.mutation_revision,
+                                        settled_state.tool_exposure_revision,
+                                    ).relevant_state_fingerprint(),
+                                failure_fingerprint: None,
+                                terminal_completion_only: false,
+                            });
+                            pending_continuation_cause = Some(ContinuationCause::StopHook);
+                            continue 'sampling_loop;
+                        }
                         // C1: the direct runtime shares this completion path. It must not skip
                         // the after-agent and completion-stop hooks, because those are the
                         // authoritative, user-configured control over whether a turn may finish.
-                        // Ordinary chat completion is not a task-acceptance gate.
-                        // Failed checks and checklist debt remain reportable below;
-                        // they cannot manufacture another model generation. Explicit
-                        // goal terminal intents retain their separate acceptance owner.
+                        // A final answer alone is not task-acceptance proof. Known
+                        // debt gets the bounded reconciliation above, then remains
+                        // reportable without auto-looping on a genuine blocker.
+                        // Explicit goal intents retain their separate acceptance owner.
                         let mut finalizer_ran = false;
                         let mutating_finalizer_aborted = if matches!(
                             turn_context.config.after_agent_policy,
@@ -8642,7 +8681,10 @@ fn try_run_sampling_request<'a>(
                     .await
                     {
                         let mut turn_item = turn_item;
-                        let stream_item_to_client = !defer_streamed_turn_items_for_contributors;
+                        let stream_item_to_client = !defer_streamed_turn_items_for_contributors
+                            && crate::stream_events_utils::deferred_final_output(
+                                &turn_context, &turn_item,
+                            ).is_none();
                         let mut seeded_parsed: Option<ParsedAssistantTextDelta> = None;
                         let mut seeded_item_id: Option<String> = None;
                         if stream_item_to_client

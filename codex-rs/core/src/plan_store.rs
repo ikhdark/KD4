@@ -574,12 +574,14 @@ pub(crate) struct PlanScopeInputs {
     latest: Option<String>,
     references: Vec<PlanInputReference>,
     revision: String,
+    initial_pins: Vec<PinnedRequirementArg>,
 }
 
 impl PlanScopeInputs {
     pub(crate) fn from_history(items: &[ResponseItem]) -> Self {
         let mut inputs = Self::default();
         let mut hash = Sha256::new();
+        let mut latest_content = None;
         for item in items {
             let ResponseItem::Message { id: Some(id), role, content, .. } = item else {
                 continue;
@@ -588,6 +590,7 @@ impl PlanScopeInputs {
                 continue;
             }
             inputs.latest = Some(id.to_string());
+            latest_content = Some(content);
             hash.update((id.len() as u64).to_le_bytes());
             hash.update(id.as_bytes());
             // Include non-text boundaries too: image-only steering invalidates
@@ -613,6 +616,25 @@ impl PlanScopeInputs {
             }
         }
         inputs.revision = hex::encode(hash.finalize());
+        // Retain the accepted request itself, not just the model's proposed
+        // checklist. Reuse the same source filtering and authenticated hashes.
+        if let (Some(input_id), Some(content)) = (&inputs.latest, latest_content) {
+            for part in content {
+                let codex_protocol::models::ContentItem::InputText { text } = part else {
+                    continue;
+                };
+                let source = PlanInputReference {
+                    input_id: input_id.clone(),
+                    sha256: hex::encode(Sha256::digest(text.as_bytes())),
+                };
+                if inputs.references.contains(&source) {
+                    inputs.initial_pins.push(PinnedRequirementArg {
+                        text: text.clone(),
+                        source: Some(source),
+                    });
+                }
+            }
+        }
         inputs
     }
 
@@ -632,7 +654,8 @@ impl PlanScopeInputs {
 
 impl PlanToolArgs {
     pub(crate) fn needs_scope_inputs(&self, previous: Option<&UpdatePlanArgs>) -> bool {
-        !self.pin.is_empty() || !self.superseded.is_empty() || self.plan.as_ref().is_some_and(|plan| {
+        (self.plan.is_some() && previous.is_none())
+            || !self.pin.is_empty() || !self.superseded.is_empty() || self.plan.as_ref().is_some_and(|plan| {
             (!self.superseded.is_empty() || !self.scope_change_instructions.is_empty()
                 || !self.scope_change_refs.is_empty())
                 && (previous.is_none_or(|old| old.plan.len() != plan.len()
@@ -940,14 +963,14 @@ impl PlanStore {
             sampling_revision,
             plan,
             set: statuses,
-            pin,
+            mut pin,
             expected_step_revisions,
             superseded,
             scope_change_instructions,
             mut scope_change_refs,
             scope_change_reviewed_revision,
             resolve,
-            scope_inputs,
+            mut scope_inputs,
         } = args;
         if usize::from(plan.is_some()) + usize::from(statuses.is_some())
             + usize::from(!pin.is_empty()) != 1 {
@@ -1027,6 +1050,11 @@ impl PlanStore {
         }
         let mut current = guard.clone();
         let mut lineage = current.lineage.clone();
+        if current.plan.is_none() {
+            if let Some(inputs) = scope_inputs.as_mut() {
+                pin.append(&mut inputs.initial_pins);
+            }
+        }
         if !pin.is_empty() {
             let inputs = scope_inputs.as_ref().ok_or(
                 "pinning requires authentic accepted user input; no changes were made"

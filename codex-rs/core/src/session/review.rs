@@ -19,11 +19,6 @@ pub(super) async fn spawn_review_thread(
         .models_manager
         .get_model_info(&model, &config.to_models_manager_config())
         .await;
-    // For reviews, disable web_search and view_image regardless of global settings.
-    let mut review_features = sess.features.clone();
-    let _ = review_features.disable(Feature::WebSearchRequest);
-    let _ = review_features.disable(Feature::WebSearchCached);
-    let review_web_search_mode = WebSearchMode::Disabled;
     let available_models = sess
         .services
         .models_manager
@@ -44,7 +39,6 @@ pub(super) async fn spawn_review_thread(
     // Build per‑turn client with the requested model/family.
     let mut per_turn_config = (*parent_turn_context.config).clone();
     per_turn_config.model = Some(model.clone());
-    per_turn_config.features = review_features.clone();
     if review_model_info.slug != parent_turn_context.model_info.slug
         && !review_model_info.used_fallback_model_metadata
         && per_turn_config.model_reasoning_effort.is_some()
@@ -72,15 +66,6 @@ pub(super) async fn spawn_review_thread(
         .shell_environment_policy
         .clone();
     per_turn_config.compact_prompt = parent_turn_context.config.compact_prompt.clone();
-    if let Err(err) = per_turn_config.web_search_mode.set(review_web_search_mode) {
-        let fallback_value = per_turn_config.web_search_mode.value();
-        tracing::warn!(
-            error = %err,
-            ?review_web_search_mode,
-            ?fallback_value,
-            "review web_search_mode is disallowed by requirements; keeping constrained value"
-        );
-    }
 
     let session_telemetry = parent_turn_context
         .session_telemetry
@@ -152,7 +137,7 @@ pub(super) async fn spawn_review_thread(
         app_server_client_name: parent_turn_context.app_server_client_name.clone(),
         developer_instructions: None,
         collaboration_mode: parent_turn_context.collaboration_mode.clone(),
-        multi_agent_version: MultiAgentVersion::Disabled,
+        multi_agent_version: parent_turn_context.multi_agent_version,
         validation_mode: parent_turn_context.validation_mode,
         validation_root_turn: parent_turn_context.validation_root_turn.clone(),
         personality: parent_turn_context.personality,

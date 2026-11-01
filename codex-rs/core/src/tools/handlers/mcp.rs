@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::FunctionCallError;
-use crate::agent::task_capabilities::ExternalMutationIntent;
 use crate::mcp_tool_call::HandledMcpToolCall;
 use crate::mcp_tool_call::handle_mcp_tool_call;
 use crate::tools::context::McpToolOutput;
@@ -246,10 +245,6 @@ impl McpHandler {
         HookToolName::mcp(&self.tool_info.server_name, &self.tool_info.tool.name)
     }
 
-    pub(crate) fn external_mutation_intent(&self) -> ExternalMutationIntent {
-        // Server annotations are advisory, not host-established read-only authority.
-        ExternalMutationIntent::MayMutate
-    }
 }
 impl ToolExecutor<ToolInvocation> for McpHandler {
     fn tool_name(&self) -> ToolName {

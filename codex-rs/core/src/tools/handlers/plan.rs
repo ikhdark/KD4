@@ -238,9 +238,10 @@ impl PlanHandler {
                     "update_plan was cancelled before publication admission; no changes were made".into(),
                 )),
             };
-            // Lazy provenance lookup: no input journal, prompt projection, or
-            // history scan on ordinary requests or status-only plan updates.
-            let scope_guard = if (!requested_args.pin.is_empty() || !requested_args.superseded.is_empty()
+            // Anchor the first checklist to accepted input. Later status-only
+            // updates still avoid history scans and keep that original anchor.
+            let scope_guard = if (requested_args.plan.is_some()
+                || !requested_args.pin.is_empty() || !requested_args.superseded.is_empty()
                 || !requested_args.scope_change_instructions.is_empty()
                 || !requested_args.scope_change_refs.is_empty()) && requested_args.needs_scope_inputs(
                 session.services.plan_store.snapshot().await.as_ref(),
@@ -291,6 +292,15 @@ impl PlanHandler {
                 )))?;
             let update = staged.commit_published();
             drop(scope_guard);
+            if turn.config.features.enabled(codex_features::Feature::Kd4Runtime)
+                && !update.lineage.obligation_summary(&update.current).unresolved.is_empty()
+            {
+                // Reuse turn-local state; a later resolution must not discard an
+                // already finalized candidate before the terminal owner accepts it.
+                let _ = turn.extension_data.get_or_init(
+                    crate::stream_events_utils::DeferredFinalOutput::default,
+                );
+            }
             match update.effect {
                 PlanUpdateEffect::Initial => turn.turn_timing_state.record_initial_plan_generation(),
                 PlanUpdateEffect::StructuralRevision => {

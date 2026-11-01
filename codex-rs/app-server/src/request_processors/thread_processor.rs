@@ -909,6 +909,20 @@ impl ThreadRequestProcessor {
             project_id,
             environments,
         } = params;
+        // Paginated API reads work with legacy rollouts, but the local store cannot
+        // persist the paginated history contract yet. Select its supported mode
+        // before startup so the writer, live session, and response all agree.
+        let history_mode = match history_mode {
+            Some(ThreadHistoryMode::Paginated)
+                if self
+                    .thread_store
+                    .as_any()
+                    .is::<codex_thread_store::LocalThreadStore>() =>
+            {
+                Some(self.thread_store.default_history_mode())
+            }
+            mode => mode,
+        };
         if permissions.is_some() && (sandbox.is_some() || permission_profile.is_some()) {
             return Err(invalid_request(
                 "`permissions` cannot be combined with `sandbox` or `permissionProfile`",

@@ -1,5 +1,5 @@
 //! Nonterminal evidence uses the task store, not ancestor progress mail or a
-//! worker-private artifact. Reads retain the existing team/reviewer boundary.
+//! worker-private artifact. Reads retain the existing team boundary.
 
 use super::*;
 use codex_agent_task_store::AgentPartialResult;
@@ -298,7 +298,7 @@ fn publish_spec() -> ToolSpec {
 fn get_spec() -> ToolSpec {
     function_spec(
         GET_TOOL,
-        "Retrieve a worker's durable PROVISIONAL partial result through the existing team task owner. Omit attempt_id/version for the current attempt's latest result, or supply both to recover an exact immutable historical publication. Versions start at 1 and are scoped to an attempt. Null means no matching publication, not successful completion. Evidence, source identities and limitations are retained here, independently of worker-private artifacts; oversized delivery uses the caller's ordinary read_tool_output recovery. Partial results never establish acceptance or terminal completion. Team and independent-review read restrictions are identical to get_agent_task.",
+        "Retrieve a worker's durable PROVISIONAL partial result through the existing team task owner. Omit attempt_id/version for the current attempt's latest result, or supply both to recover an exact immutable historical publication. Versions start at 1 and are scoped to an attempt. Null means no matching publication, not successful completion. Evidence, source identities and limitations are retained here, independently of worker-private artifacts; oversized delivery uses the caller's ordinary read_tool_output recovery. Partial results never establish acceptance or terminal completion. Team read restrictions are identical to get_agent_task.",
         object_schema([
             ("assignment_id", assignment_id_schema()),
             ("attempt_id", JsonSchema::string(Some("Optional exact producer attempt; omitted selects the current attempt.".into()))),
