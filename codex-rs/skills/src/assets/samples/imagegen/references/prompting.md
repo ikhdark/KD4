@@ -83,13 +83,7 @@ Do not add:
 - Use CLI `gpt-image-1.5 --background transparent --output-format png` only after the user explicitly confirms the fallback, or when the user already explicitly requested `gpt-image-1.5`, `scripts/image_gen.py`, or CLI fallback. Ask first for true/native transparency requests, failed chroma-key validation, or complex transparent subjects such as hair, fur, glass, smoke, liquids, translucent materials, reflective objects, or soft shadows.
 
 ## Fallback-only execution controls
-- `quality`, `input_fidelity`, explicit masks, output format, and output paths are fallback-only execution controls.
-- Do not assume they are built-in `image_gen` tool arguments.
-- If the user explicitly chooses CLI fallback, see `references/cli.md` and `references/image-api.md` for those controls.
-- In CLI fallback mode, `gpt-image-2` is the default. It supports `quality=low|medium|high|auto`; use `low` for fast drafts and thumbnails, and move to `medium`, `high`, or `auto` for final assets.
-- `gpt-image-2` always uses high fidelity for image inputs, so do not set `input_fidelity` with that model.
-- If a transparent request needs true CLI transparency, ask before using `gpt-image-1.5` unless the user already explicitly chose it. Explain that built-in chroma-key removal is the default path, but `gpt-image-2` does not support `background=transparent`.
-- If the user asks for 4K-style output with `gpt-image-2`, use `3840x2160` for landscape or `2160x3840` for portrait.
+`quality`, `input_fidelity`, explicit masks, output format, and output paths are CLI/API controls, not built-in `image_gen` arguments. For an authorized fallback route, read [CLI usage](cli.md) for commands and [Image API](image-api.md) for model-specific parameters and limits. Route selection and fallback consent remain in [SKILL.md](../SKILL.md#execution-mode); transparency post-processing is above.
 
 ## Use-case tips
 Generate:

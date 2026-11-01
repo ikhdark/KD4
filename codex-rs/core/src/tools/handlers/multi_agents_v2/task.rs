@@ -1244,7 +1244,7 @@ fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
         "target_receipt_scope": target_scope,
         "receipt_handoffs": {
             "count": result.receipt_handoffs.len(),
-            "policy": "Assigned target/dependency summaries, not verified proof. A null receipt means unavailable. Recover only the contract, receipt fields or captured evidence needed for the decision with read_tool_output JSON pointers. No direct target/sibling access; workspace freshness is unverified.",
+            "policy": "Assigned target/dependency summaries, not verified proof. A null receipt means unavailable. Recover only the contract, receipt fields or captured evidence needed for the decision with read_tool_output JSON pointers. Same-team task reads remain available; workspace freshness is unverified.",
             "summaries": handoffs,
             "omitted_summaries": result.receipt_handoffs.len().saturating_sub(handoffs.len()),
             "context_recovery_json_pointers": result.cold_review_context.as_ref().map(|_| [

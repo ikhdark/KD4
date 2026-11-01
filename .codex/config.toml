@@ -1,6 +1,6 @@
 approval_policy = "never"
 validation_mode = "benchmark"
-developer_instructions = "Use repository runners for authorized validation. Follow the base instructions and active validation mode for authorization and limits."
+developer_instructions = "Use repository runners for authorized validation."
 
 
 sandbox_mode = "danger-full-access"

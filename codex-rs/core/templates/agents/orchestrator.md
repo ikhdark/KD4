@@ -4,9 +4,11 @@ This file is a maintainer reference, not a model prompt.
 
 Keep rules in their active owning surfaces:
 
-- `core/src/config/mod.rs`: the root, subagent and shared multi-agent usage hints.
+- `core/src/config/mod.rs`: composition and selection of default/custom/disabled hints.
 - `core/templates/agents/{root_execution,worker_execution}.md`: root execution
   and worker execution guidance, embedded in the corresponding default hints.
+- `core/templates/agents/{assignment_contract,shared_context,dependency_liveness,build_handoff,campaign_control}.md`:
+  assignment fields and shared context, dependency, build-reuse and workload-limit guidance.
 - `core/src/stable_context.rs`: hint wrapping and the root classifier.
 - `core/src/tools/handlers/multi_agents_spec.rs`: agent tool contracts.
 - `core/src/context/multi_agent_mode_instructions.rs`: spawn authorization.

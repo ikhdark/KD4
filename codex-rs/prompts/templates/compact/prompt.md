@@ -20,6 +20,8 @@ owner explicitly records completion or accepted user-authorized supersession.
 Every section must contain an explicit value. Write `None` when there is no
 task-relevant content for a required section; never leave a section empty.
 
+Use exactly these headings, in this order:
+
 ## Goal
 
 Current goal and exact user constraints, including prohibitions and out-of-scope work.

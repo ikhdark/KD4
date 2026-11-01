@@ -54,5 +54,5 @@ These scripts use the network. Use already-permitted network access; request add
 - Curated listing is fetched from `https://github.com/openai/skills/tree/main/skills/.curated` via the GitHub API. If it is unavailable, explain the error and exit.
 - Private GitHub repos can be accessed via existing git credentials or optional `GITHUB_TOKEN`/`GH_TOKEN` for download.
 - Git fallback tries HTTPS first, then SSH.
-- The skills at https://github.com/openai/skills/tree/main/skills/.system are preinstalled, so no need to help users install those. If they ask, just explain this. If they insist, you can download and overwrite.
+- The skills at https://github.com/openai/skills/tree/main/skills/.system are preinstalled; explain that no installation is needed. For an explicitly requested separate copy, use a non-conflicting `--dest` or `--name`. Do not overwrite the managed `.system` directory; the helper rejects existing destinations.
 - Installed annotations come from `$CODEX_HOME/skills`.
