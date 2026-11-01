@@ -13,12 +13,29 @@ The word `batch` in a user request is not CLI opt-in by itself.
 Real API calls require **network access** + `OPENAI_API_KEY`. `--dry-run` does not.
 
 ## Quick start (works from any repo)
-Set a stable path to the skill CLI (default `CODEX_HOME` is `~/.codex`):
+Set a stable path to the installed skill CLI (default `CODEX_HOME` is `~/.codex`).
 
+PowerShell on Windows:
+
+```powershell
+if (-not $env:CODEX_HOME) { $env:CODEX_HOME = Join-Path $HOME ".codex" }
+$IMAGE_GEN = Join-Path $env:CODEX_HOME "skills/.system/imagegen/scripts/image_gen.py"
 ```
+
+Bash:
+
+```bash
 export CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 export IMAGE_GEN="$CODEX_HOME/skills/.system/imagegen/scripts/image_gen.py"
 ```
+
+For a source-checkout workflow, set `IMAGE_GEN` to this skill's actual
+`scripts/image_gen.py` instead. Editing bundled source does not update an
+already installed system-skill cache.
+
+The multiline examples below use Bash syntax. In PowerShell, put Python commands
+on one line or use PowerShell continuation syntax, and create batch JSONL inputs
+with your editor or PowerShell rather than the Bash here-document.
 
 Install dependencies into that environment with its package manager. In uv-managed environments, `uv pip install ...` remains the preferred path.
 
@@ -231,7 +248,7 @@ Notes:
 ## CLI notes
 - Supported sizes depend on the model. `gpt-image-2` supports flexible constrained sizes; older GPT Image models support `1024x1024`, `1536x1024`, `1024x1536`, or `auto`.
 - True transparent CLI outputs require `output_format` to be `png` or `webp` and are not supported by `gpt-image-2`.
-- `--prompt-file`, `--output-compression`, `--moderation`, `--max-attempts`, `--fail-fast`, `--force`, and `--no-augment` are supported.
+- `--prompt-file`, `--output-compression`, `--moderation`, `--force`, and `--no-augment` are shared options. `--max-attempts` (default `3`, range `1–10`) and `--fail-fast` apply only to `generate-batch`; `--concurrency` is also batch-only (default `5`, range `1–25`).
 - This CLI is intended for GPT Image models. Do not assume older non-GPT image-model behavior applies here.
 
 ## See also

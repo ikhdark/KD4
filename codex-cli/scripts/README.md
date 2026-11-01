@@ -1,26 +1,35 @@
-# npm releases
+# Local npm packaging
 
-Use the staging helper in the repo root to generate npm tarballs for a release. For
-example, to stage the CLI, responses proxy, and SDK packages for version `0.6.0`:
+Use `scripts/codex_package/stage_npm_packages.py` from the repository root to
+stage local tarballs. This prepares packages; it does not publish them. Publishing
+or republishing requires explicit permission.
 
-```bash
-./scripts/codex_package/stage_npm_packages.py \
-  --release-version 0.6.0 \
-  --workflow-url "https://github.com/ikhdark/KD4/actions/runs/$RUN_ID" \
-  --package codex \
+For a prehydrated canonical vendor tree containing both supported Windows targets
+(`x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`):
+
+```powershell
+python .\scripts\codex_package\stage_npm_packages.py `
+  --release-version 0.0.0-dev `
+  --vendor-src C:\path\to\vendor `
+  --package codex `
   --package codex-sdk
 ```
 
-This downloads the required native package archive artifacts, hydrates `vendor/` for
-each package, and writes tarballs to `dist/npm/`.
+`--package codex` expands to the launcher plus Windows x64 and ARM64 native
+packages. `codex-sdk` stages the TypeScript SDK with a matching CLI dependency.
+The helper writes tarballs to `dist/npm/` by default; `--output-dir` overrides it.
+Native tarballs contain the canonical runtime tree under `vendor/<target>/`;
+the launcher and SDK do not embed native payloads.
 
-The workflow URL is explicit because this checkout does not own an implicit
-release-workflow path; staging never falls back to an upstream workflow.
+When intentionally reusing GitHub artifacts instead, replace `--vendor-src` with
+an explicit `--workflow-url`, or supply `--workflow-name` and, where needed,
+`--github-repo`. There is no implicit workflow name and no fallback to an upstream
+workflow. Local vendor input cannot be combined with workflow artifact options.
+That route downloads artifacts and requires the configured GitHub tooling/access.
 
-When `--package codex` is provided, the staging helper builds the lightweight
-`@openai/codex` meta package plus all platform-native `@openai/codex` variants
-that are later published under platform-specific dist-tags.
-
-Direct `build_npm_package.py` invocations are still useful for package-specific
-debugging, but native packages expect `--vendor-src` to point at a prehydrated
-`vendor/` tree. Release packaging should use `scripts/codex_package/stage_npm_packages.py`.
+`codex-cli/scripts/build_npm_package.py` remains the package-specific entry point.
+It accepts `--package`, `--version` (or `--release-version`), `--staging-dir`, and
+`--pack-output`; native packages additionally require `--vendor-src` pointing at
+a prehydrated canonical vendor tree. Use the root staging helper for a matching
+set of CLI, native, and SDK tarballs, then follow the
+[local install instructions](../README.npm.md).

@@ -2,6 +2,7 @@
 
 See the repository [AGENTS.md](../AGENTS.md) for durable instructions.
 This guide is navigation, not another instruction or configuration owner.
+The [root README](../README.md) indexes the active product and development guides.
 
 ## Layout
 
@@ -20,6 +21,8 @@ Repository-owned test-only files and dedicated test commands have been removed
 across all languages. Build/lint checks, production examples/generators, and
 mixed-purpose validation-runner registrations remain. SDK check recipes perform
 lint/type checks, not tests. See [AGENTS.md](../AGENTS.md) for guidance.
+Runner registration is not execution permission: the active validation mode
+still applies, and retained benchmark workloads may generate and run tests.
 
 ## Retained history
 

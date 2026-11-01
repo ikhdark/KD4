@@ -503,7 +503,11 @@ impl From<CoreTurnItem> for ThreadItem {
             CoreTurnItem::UserMessage(user) => ThreadItem::UserMessage {
                 id: user.id,
                 client_id: user.client_id,
-                content: user.content.into_iter().map(UserInput::from).collect(),
+                content: user
+                    .content
+                    .into_iter()
+                    .map(UserInput::from_core_for_history)
+                    .collect(),
             },
             CoreTurnItem::HookPrompt(hook_prompt) => ThreadItem::HookPrompt {
                 id: hook_prompt.id,

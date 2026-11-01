@@ -96,6 +96,8 @@ coverage/
 
 # personal files
 /current-diff.txt
+# Local task handoff reports.
+/*-handoff.txt
 # Local diff dumps; use .scratch/ for new scratch output.
 /.d[0-9a-f].txt
 /.e[0-9a-f].txt
@@ -110,6 +112,7 @@ personal/
 .codex/locks/
 /.codex/diagnostics/
 /.codex/audits/
+/.codex/fix-evidence/
 /.codex/gitdiff/
 /.codex/benchmark-runs/
 /.codex/tmp/
@@ -148,3 +151,7 @@ __pycache__/
 /scripts/test_source_map_check.py
 /scripts/source_owners.py
 /scripts/test_source_owners.py
+
+# Retired LTO benchmark.
+/scripts/build/benchmark_lto_runtime.py
+/scripts/build/lto-runtime-benchmark.md

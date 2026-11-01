@@ -1,36 +1,32 @@
 # Codex CLI
 
-Codex CLI is a coding agent from OpenAI that runs locally on Windows.
+This is the npm launcher for the local, Windows-only KD4 checkout of OpenAI Codex.
+It is not an installation guide for the upstream npm distribution. See the
+[repository README](../README.md) for the local build and setup workflow.
 
-## Install
+## Install locally staged tarballs
 
-Install the staged KD4 tarball together with the native tarball for your
-architecture from the same fork release. On Windows x64:
+Use the CLI and native tarballs staged from the same local package inputs.
+The launcher requires Node.js 16+. From the directory containing the tarballs,
+on Windows x64:
 
-```shell
-npm install -g ./codex-npm-${VERSION}.tgz "@openai/codex-win32-x64@file:./codex-npm-win32-x64-${VERSION}.tgz"
+```powershell
+$version = "0.0.0-dev" # replace with the version used while staging
+npm install -g ".\codex-npm-$version.tgz" "@openai/codex-win32-x64@file:.\codex-npm-win32-x64-$version.tgz"
 ```
 
-On Windows ARM64, use `@openai/codex-win32-arm64@file:./codex-npm-win32-arm64-${VERSION}.tgz`
-instead. The native package is not published to the npm registry, so installing
-the main tarball alone leaves Codex without its native binary.
+On Windows ARM64, use
+`@openai/codex-win32-arm64@file:.\codex-npm-win32-arm64-$version.tgz` instead.
+The main tarball contains only the launcher; the native tarball contains the
+canonical runtime tree. Installing only the main tarball does not supply that
+runtime. The launcher's alias pin requires the exact KD4 native version, so do
+not mix it with an upstream registry package.
 
-Then run:
+Run `codex` after local installation. Use your configured Codex authentication;
+[upstream authentication documentation](https://developers.openai.com/codex/auth)
+describes the account flows, not publication or deployment of this checkout.
 
-```shell
-codex
-```
-
-On first launch, sign in with ChatGPT or configure an API key. See the
-[Codex documentation](https://developers.openai.com/codex) for authentication,
-configuration, sandboxing, and command-line usage.
-
-## Windows standalone installer
-
-`powershell -ExecutionPolicy ByPass -c "irm
-https://raw.githubusercontent.com/ikhdark/KD4/main/scripts/install/install.ps1 | iex"`
-
-Release archives are available from the
-[KD4 GitHub releases](https://github.com/ikhdark/KD4/releases/latest).
+[Local npm staging](scripts/README.md) creates tarballs without publishing them.
+Publishing or republishing requires explicit permission.
 
 This project is licensed under the Apache-2.0 License.

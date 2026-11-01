@@ -1,15 +1,18 @@
 # Critical-path timing evidence
 
-Timing schema 36 extends the existing process-clock `activityTimeline` with
-optional `blocking` evidence. It does not change scheduling or admission.
+Introduced in timing schema 36, optional `blocking` evidence extends the existing
+process-clock `activityTimeline`. It does not change scheduling or admission.
 
 - An interval starts only when an instrumented future returns Pending and ends
   when it returns Ready. Cancellation closes it with `cancelled: true`; an open
   endpoint is censored at the frozen timeline boundary. Await envelopes include
   wake/re-poll latency, not CPU execution or synchronous preparation.
 - Resource-contention observers cover shared/exclusive/cohort/scoped workspace
-  admission, diff/evidence tracker acquisition and sampling admission. Resource
-  prerequisites name classes, not particular lock holders or repositories.
+  admission, diff/evidence tracker acquisition, sampling admission and cooperative
+  `agent_lock` waits. Most resource prerequisites name classes, not particular
+  holders or repositories. `agent_lock` prerequisites additionally retain the
+  resource, observed holder and acquisition token from the lock owner's atomic
+  busy/subscription snapshot; this is historical attribution, not current ownership.
 - Dependency-wait observers cover ordered tool-result collection and interrupt
   resolution. Explicit edges also link model-issued (direct) tool executions to
   their emitting generation and a resumed generation to model-visible tool
@@ -27,5 +30,5 @@ complete task dependency graph. It distinguishes resource contention, dependency
 waits, observed process execution, model latency and tool latency. Process flight
 is not CPU time; model/tool envelopes include internal waits. Category unions
 overlap and must not be added. Uninstrumented dependencies, remote descendants
-and holder identities remain unknown; these records alone do not prove a full
-causal critical path or achievable scheduling savings.
+and unattributed holder identities remain unknown; these records alone do not
+prove a full causal critical path or achievable scheduling savings.

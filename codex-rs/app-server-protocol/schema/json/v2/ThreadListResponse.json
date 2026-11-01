@@ -1356,20 +1356,7 @@
       ],
       "type": "object"
     },
-    "ThreadActiveFlag": {
-      "enum": [
-        "waitingOnApproval",
-        "waitingOnUserInput",
-        "resolvingResources",
-        "waitingOnDiffTracker",
-        "waitingOnWorkspaceGate",
-        "waitingOnEvidenceTracker",
-        "waitingOnDelivery",
-        "waitingOnProcessCleanup",
-        "readyToSample"
-      ],
-      "type": "string"
-    },
+    "ThreadActiveFlag": {"enum":["waitingOnApproval","waitingOnUserInput"],"type":"string"},
     "ThreadExtra": {
       "description": "Extra app-server data for a thread.",
       "type": "object"
@@ -2351,7 +2338,8 @@
               ],
               "title": "ActiveThreadStatusType",
               "type": "string"
-            }
+            },
+            "harnessPhases": {"description":"Optional harness diagnostics, separate from the upstream active-flag enum.","items":{"$ref":"#/definitions/HarnessPhase"},"type":["array","null"]}
           },
           "required": [
             "activeFlags",
@@ -6437,7 +6425,8 @@
           "type": "object"
         }
       ]
-    }
+    },
+    "HarnessPhase": {"enum":["resourceResolution","diffTracker","workspaceGate","evidenceTracker","delivery","processCleanup","readyToSample"],"type":"string"}
   },
   "properties": {
     "backwardsCursor": {

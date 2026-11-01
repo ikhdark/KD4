@@ -1,6 +1,8 @@
 # OpenAI Codex Python SDK (Beta) - API Reference
 
-Public surface of `openai_codex` for Codex workflows.
+Public surface of the `openai_codex` source in this local Windows-only KD4 checkout.
+See [local setup](getting-started.md) to select a KD4 runtime rather than the
+upstream package from the public index.
 
 This SDK is in beta. Public APIs may change before `1.0`. Turn streams are routed by turn ID so one
 client can consume multiple active turns concurrently.
@@ -14,6 +16,7 @@ from openai_codex import (
     Codex,
     AsyncCodex,
     CodexConfig,
+    TurnRunError,
     ApprovalMode,
     Sandbox,
     ChatgptLoginHandle,
@@ -49,8 +52,16 @@ from openai_codex.types import (
 ```
 
 - Version: `openai_codex.__version__`
-- Requires Python >= 3.10
+- Requires Windows and Python >= 3.10
 - Public Codex protocol value and event types live in `openai_codex.types`
+
+## CodexConfig
+
+`CodexConfig(codex_bin=r"C:\path\to\codex.exe")` explicitly selects a local
+runtime. Without it, the SDK resolves its pinned `openai-codex-cli-bin` package,
+not `PATH`. `cwd`, `env`, `config_overrides`, and `launch_args_override` configure
+the subprocess; see [transport limits](../README.md#transport-safety-and-limits)
+for the bounded-operation defaults.
 
 ## Codex (sync)
 
@@ -61,6 +72,7 @@ Codex(config: CodexConfig | None = None)
 Properties/methods:
 
 - `metadata -> InitializeResponse`
+- `next_notification(timeout_s: float | None = None) -> Notification`
 - `close() -> None`
 - `login_api_key(api_key: str) -> None`
 - `login_chatgpt() -> ChatgptLoginHandle`
@@ -69,17 +81,17 @@ Properties/methods:
 - `logout() -> None`
 - `thread_start(*, approval_mode=ApprovalMode.deny_all, base_instructions=None, config=None,
   cwd=None, developer_instructions=None, ephemeral=None, model=None, model_provider=None,
-  personality=None, sandbox: Sandbox | None = None, service_name=None, service_tier=None,
+  personality=None, sandbox: Sandbox | None = None, service_name=None, service_tier=UNSET,
   session_start_source=None, thread_source=None) -> Thread`
 - `thread_list(*, archived=None, cursor=None, cwd=None, limit=None, model_providers=None,
   search_term=None, sort_direction=None, sort_key=None, source_kinds=None, use_state_db_only=None)
   -> ThreadListResponse`
 - `thread_resume(thread_id: str, *, approval_mode=None, base_instructions=None, config=None,
   cwd=None, developer_instructions=None, model=None, model_provider=None, personality=None, sandbox:
-  Sandbox | None = None, service_tier=None) -> Thread`
+  Sandbox | None = None, service_tier=UNSET) -> Thread`
 - `thread_fork(thread_id: str, *, approval_mode=None, base_instructions=None, config=None, cwd=None,
-  developer_instructions=None, ephemeral=None, model=None, model_provider=None, sandbox: Sandbox |
-  None = None, service_tier=None, thread_source=None) -> Thread`
+  developer_instructions=None, ephemeral=None, last_turn_id=None, model=None, model_provider=None, sandbox: Sandbox |
+  None = None, service_tier=UNSET, thread_source=None) -> Thread`
 - `thread_archive(thread_id: str) -> ThreadArchiveResponse`
 - `thread_unarchive(thread_id: str) -> Thread`
 - `models(*, include_hidden: bool = False) -> ModelListResponse`
@@ -90,6 +102,11 @@ Context manager:
 with Codex() as codex:
     ...
 ```
+
+`UNSET` in the signatures denotes the internal omitted-argument default for
+`service_tier`. Omit the keyword to preserve the runtime's configured value;
+pass `None` to send an explicit null. Do not replace omission with `None` when
+forwarding optional settings.
 
 ## AsyncCodex (async parity)
 
@@ -110,6 +127,7 @@ ensures startup and shutdown are paired explicitly.
 Properties/methods:
 
 - `metadata -> InitializeResponse`
+- `next_notification() -> Awaitable[Notification]`
 - `close() -> Awaitable[None]`
 - `login_api_key(api_key: str) -> Awaitable[None]`
 - `login_chatgpt() -> Awaitable[AsyncChatgptLoginHandle]`
@@ -118,17 +136,17 @@ Properties/methods:
 - `logout() -> Awaitable[None]`
 - `thread_start(*, approval_mode=ApprovalMode.deny_all, base_instructions=None, config=None,
   cwd=None, developer_instructions=None, ephemeral=None, model=None, model_provider=None,
-  personality=None, sandbox: Sandbox | None = None, service_name=None, service_tier=None,
+  personality=None, sandbox: Sandbox | None = None, service_name=None, service_tier=UNSET,
   session_start_source=None, thread_source=None) -> Awaitable[AsyncThread]`
 - `thread_list(*, archived=None, cursor=None, cwd=None, limit=None, model_providers=None,
   search_term=None, sort_direction=None, sort_key=None, source_kinds=None, use_state_db_only=None)
   -> Awaitable[ThreadListResponse]`
 - `thread_resume(thread_id: str, *, approval_mode=None, base_instructions=None, config=None,
   cwd=None, developer_instructions=None, model=None, model_provider=None, personality=None, sandbox:
-  Sandbox | None = None, service_tier=None) -> Awaitable[AsyncThread]`
+  Sandbox | None = None, service_tier=UNSET) -> Awaitable[AsyncThread]`
 - `thread_fork(thread_id: str, *, approval_mode=None, base_instructions=None, config=None, cwd=None,
-  developer_instructions=None, ephemeral=None, model=None, model_provider=None, sandbox: Sandbox |
-  None = None, service_tier=None, thread_source=None) -> Awaitable[AsyncThread]`
+  developer_instructions=None, ephemeral=None, last_turn_id=None, model=None, model_provider=None, sandbox: Sandbox |
+  None = None, service_tier=UNSET, thread_source=None) -> Awaitable[AsyncThread]`
 - `thread_archive(thread_id: str) -> Awaitable[ThreadArchiveResponse]`
 - `thread_unarchive(thread_id: str) -> Awaitable[AsyncThread]`
 - `models(*, include_hidden: bool = False) -> Awaitable[ModelListResponse]`
@@ -170,11 +188,11 @@ attempt. API-key login completes synchronously and does not return a handle.
 
 ### Thread
 
-- `run(input: str | Input, *, approval_mode=None, cwd=None, effort=None, model=None,
-  output_schema=None, personality=None, sandbox: Sandbox | None = None, service_tier=None,
+- `run(input: str | Input, *, approval_mode=None, allow_no_prose=None, cwd=None, effort=None, model=None,
+  output_schema=None, personality=None, sandbox: Sandbox | None = None, service_tier=UNSET,
   summary=None) -> TurnResult`
-- `turn(input: str | Input, *, approval_mode=None, cwd=None, effort=None, model=None,
-  output_schema=None, personality=None, sandbox: Sandbox | None = None, service_tier=None,
+- `turn(input: str | Input, *, approval_mode=None, allow_no_prose=None, cwd=None, effort=None, model=None,
+  output_schema=None, personality=None, run_independently=None, sandbox: Sandbox | None = None, service_tier=UNSET,
   summary=None) -> TurnHandle`
 - `read(*, include_turns: bool = False) -> ThreadReadResponse`
 - `set_name(name: str) -> ThreadSetNameResponse`
@@ -182,11 +200,11 @@ attempt. API-key login completes synchronously and does not return a handle.
 
 ### AsyncThread
 
-- `run(input: str | Input, *, approval_mode=None, cwd=None, effort=None, model=None,
-  output_schema=None, personality=None, sandbox: Sandbox | None = None, service_tier=None,
+- `run(input: str | Input, *, approval_mode=None, allow_no_prose=None, cwd=None, effort=None, model=None,
+  output_schema=None, personality=None, sandbox: Sandbox | None = None, service_tier=UNSET,
   summary=None) -> Awaitable[TurnResult]`
-- `turn(input: str | Input, *, approval_mode=None, cwd=None, effort=None, model=None,
-  output_schema=None, personality=None, sandbox: Sandbox | None = None, service_tier=None,
+- `turn(input: str | Input, *, approval_mode=None, allow_no_prose=None, cwd=None, effort=None, model=None,
+  output_schema=None, personality=None, run_independently=None, sandbox: Sandbox | None = None, service_tier=UNSET,
   summary=None) -> Awaitable[AsyncTurnHandle]`
 - `read(*, include_turns: bool = False) -> Awaitable[ThreadReadResponse]`
 - `set_name(name: str) -> Awaitable[ThreadSetNameResponse]`
@@ -205,9 +223,24 @@ object with:
 - `final_response: str | None`
 - `items: list[ThreadItem]`
 - `usage: ThreadTokenUsage | None`
+- `surfaced_result: SurfacedToolResult | None`
+- `timing: TurnTiming | None`
 
-`final_response` is `None` when the turn finishes without a final-answer or
-phase-less assistant message item.
+`final_response` uses the terminal surfaced tool result's `canonical_message`,
+then the terminal `timing.final_answer` receipt. A present receipt without a
+message suppresses visible-item fallback. Older runtimes fall back to an
+uninterrupted final-answer or phase-less assistant message; without one the value
+is `None`. Timing diagnostics alone do not certify completion.
+
+Failed or incomplete buffered runs raise `TurnRunError`, retaining observed
+`items`, `usage`, `turn_id`, `thread_id`, and any `terminal` / collected `result`.
+Inspect those receipts before retrying because prior tool effects may be committed.
+Async cancellation continues to propagate `CancelledError`.
+
+`allow_no_prose=True` explicitly permits an exactly empty final answer for that
+request only; it does not waive work, schemas, or completion hooks.
+`run_independently` is available on `turn(...)`, not on the buffered `run(...)`
+shortcut, and is forwarded to the runtime.
 
 Use `turn(...)` when you need low-level turn control (`stream()`, `steer()`,
 `interrupt()`) before collecting the turn result.

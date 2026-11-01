@@ -1,4 +1,5 @@
 use super::ActivePermissionProfile;
+use super::ApprovalsReviewer;
 use super::AskForApproval;
 use super::SandboxMode;
 use super::SandboxPolicy;
@@ -211,6 +212,9 @@ pub struct ThreadStartResponse {
     pub instruction_sources: Vec<LegacyAppPathString>,
     #[experimental(nested)]
     pub approval_policy: AskForApproval,
+    /// Reviewer currently used for approval requests on this thread.
+    #[serde(default)]
+    pub approvals_reviewer: ApprovalsReviewer,
     /// Legacy sandbox policy retained for compatibility. Experimental clients
     /// should prefer `permissionProfile` for exact permissions and
     /// `activePermissionProfile` for profile provenance.
@@ -311,6 +315,9 @@ pub struct ThreadSettings {
     #[ts(optional)]
     pub environments: Option<Vec<ThreadSelectedEnvironment>>,
     pub approval_policy: AskForApproval,
+    /// Reviewer currently used for approval requests on this thread.
+    #[serde(default)]
+    pub approvals_reviewer: ApprovalsReviewer,
     pub sandbox_policy: SandboxPolicy,
     /// Exact permission profile enforced for this thread.
     #[experimental("thread/settings/update.permissionProfile")]
@@ -470,6 +477,9 @@ pub struct ThreadResumeResponse {
     pub instruction_sources: Vec<LegacyAppPathString>,
     #[experimental(nested)]
     pub approval_policy: AskForApproval,
+    /// Reviewer currently used for approval requests on this thread.
+    #[serde(default)]
+    pub approvals_reviewer: ApprovalsReviewer,
     /// Legacy sandbox policy retained for compatibility. Experimental clients
     /// should prefer `permissionProfile` for exact permissions and
     /// `activePermissionProfile` for profile provenance.
@@ -644,6 +654,9 @@ pub struct ThreadForkResponse {
     pub instruction_sources: Vec<LegacyAppPathString>,
     #[experimental(nested)]
     pub approval_policy: AskForApproval,
+    /// Reviewer currently used for approval requests on this thread.
+    #[serde(default)]
+    pub approvals_reviewer: ApprovalsReviewer,
     /// Legacy sandbox policy retained for compatibility. Experimental clients
     /// should prefer `permissionProfile` for exact permissions and
     /// `activePermissionProfile` for profile provenance.
@@ -1208,6 +1221,10 @@ pub enum ThreadStatus {
     #[ts(rename_all = "camelCase")]
     Active {
         active_flags: Vec<ThreadActiveFlag>,
+        /// Optional harness diagnostics, separate from the upstream active-flag enum.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        harness_phases: Option<Vec<codex_protocol::protocol::HarnessPhase>>,
     },
 }
 
@@ -1217,13 +1234,6 @@ pub enum ThreadStatus {
 pub enum ThreadActiveFlag {
     WaitingOnApproval,
     WaitingOnUserInput,
-    ResolvingResources,
-    WaitingOnDiffTracker,
-    WaitingOnWorkspaceGate,
-    WaitingOnEvidenceTracker,
-    WaitingOnDelivery,
-    WaitingOnProcessCleanup,
-    ReadyToSample,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

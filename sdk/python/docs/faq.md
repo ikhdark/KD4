@@ -2,15 +2,18 @@
 
 ## Is the Python SDK stable?
 
-`openai-codex` is a public beta. Install it with
-`pip install openai-codex`; public APIs may change before `1.0`. While beta
-releases are the only published SDK releases, pip selects the latest beta.
-After a stable release exists, pass `--pre` to opt into newer prereleases.
+The source retains the upstream beta API and package name; APIs may change
+before `1.0`. This local Windows-only KD4 checkout is not a published SDK.
+`pip install openai-codex` installs the upstream distribution, not the code here.
+Use the [local setup guide](getting-started.md) and select your KD4 executable
+with `CodexConfig.codex_bin`.
 
 ## Why does the SDK install a runtime package?
 
-The SDK and runtime packages are versioned independently. Each SDK release
-pins and installs one compatible runtime dependency automatically.
+The SDK and runtime packages are versioned independently. `pyproject.toml`
+pins one compatible runtime dependency for dependency-resolving installations.
+Without `CodexConfig.codex_bin`, the SDK uses that bundled runtime and does not
+search `PATH`. An explicit local executable bypasses bundled-runtime discovery.
 
 ## Thread vs turn
 
@@ -55,7 +58,7 @@ Public API keyword names are snake_case. The SDK still maps them to wire camelCa
 
 If you are migrating older code, update these names:
 
-- `approvalPolicy` -> `approval_policy`
+- Wire `approvalPolicy` -> curated `approval_mode` (`ApprovalMode`), not `approval_policy`
 - `baseInstructions` -> `base_instructions`
 - `developerInstructions` -> `developer_instructions`
 - `modelProvider` -> `model_provider`
@@ -85,14 +88,15 @@ The presets are:
 When `sandbox=` is omitted, Codex uses its configured default. A turn
 sandbox override applies to that turn and subsequent turns.
 
-## Why only `thread_start(...)` and `thread_resume(...)`?
+## Which thread lifecycle methods are available?
 
-The public API keeps only explicit lifecycle calls:
+The public API uses explicit lifecycle calls:
 
 - `thread_start(...)` to create new threads
 - `thread_resume(thread_id, ...)` to continue existing threads
-
-This avoids duplicate ways to do the same operation and keeps behavior explicit.
+- `thread_fork(thread_id, ...)` to branch a conversation; `last_turn_id` optionally selects the cutoff
+- `thread_archive(thread_id)` and `thread_unarchive(thread_id)` for stored threads
+- `thread_list(...)` to discover stored threads
 
 ## Why does constructor fail?
 
@@ -116,7 +120,10 @@ A turn is complete only when `turn/completed` arrives for that turn ID.
 Use `retry_on_overload(...)` for transient overload failures (`ServerBusyError`).
 
 Do not blindly retry all errors. For `InvalidParamsError` or
-`MethodNotFoundError`, fix the input or use the runtime pinned by the SDK.
+`MethodNotFoundError`, fix the input or select a runtime that supports the operation.
+Buffered `run()` failures raise `TurnRunError` with observed items, usage and any
+terminal result. Earlier tools may already have completed; inspect those receipts
+before retrying.
 
 ## Common pitfalls
 

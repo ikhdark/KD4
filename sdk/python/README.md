@@ -11,13 +11,23 @@ existing target configuration and report unsupported source controls as per-item
 failures. Imported session tool activity is inert history, not executable tool calls.
 A runtime missing the API raises `MethodNotFoundError` without retrying.
 
-## Install
+## Local setup
 
-Install the SDK:
+This is the SDK source in the local, Windows-only KD4 checkout, not a published
+KD4 package. `pip install openai-codex` selects the upstream distribution, not
+these sources. Use Python 3.10+ with the dependencies from `pyproject.toml`
+(`pydantic>=2.12`) already configured. From the repository root, install only the
+local SDK source into that environment:
 
-```bash
-pip install openai-codex
+```powershell
+python -m pip install --no-deps -e .\sdk\python
 ```
+
+Pass `CodexConfig(codex_bin=r"C:\path\to\codex.exe")` to select your local
+KD4 executable. Without that override, the SDK requires the installed
+`openai-codex-cli-bin` runtime package pinned by `pyproject.toml`; it does not
+search `PATH`. Dependency installation and example bootstrapping are separate
+setup operations, not offline validation.
 
 ## Quickstart
 
@@ -25,9 +35,10 @@ The SDK reuses your existing Codex authentication when one is already
 available:
 
 ```python
-from openai_codex import Codex
+from openai_codex import Codex, CodexConfig
 
-with Codex() as codex:
+config = CodexConfig(codex_bin=r"C:\path\to\codex.exe")
+with Codex(config) as codex:
     thread = codex.thread_start()
     result = thread.run("Explain this repository in three bullets.")
     print(result.final_response)
@@ -44,13 +55,13 @@ Async cancellation still propagates `CancelledError`.
 
 ## Authentication
 
-Existing Codex authentication is reused automatically. To start ChatGPT
-browser login explicitly:
+Pass the same `config` from the quickstart to each client below. Existing Codex
+authentication is reused automatically. To start ChatGPT browser login explicitly:
 
 ```python
 from openai_codex import Codex
 
-with Codex() as codex:
+with Codex(config) as codex:
     login = codex.login_chatgpt()
     print(login.auth_url)
     print(login.wait().success)
@@ -59,7 +70,7 @@ with Codex() as codex:
 For device-code login:
 
 ```python
-with Codex() as codex:
+with Codex(config) as codex:
     login = codex.login_chatgpt_device_code()
     print(login.verification_url, login.user_code)
     login.wait()
@@ -68,7 +79,7 @@ with Codex() as codex:
 For API-key login:
 
 ```python
-with Codex() as codex:
+with Codex(config) as codex:
     codex.login_api_key("sk-...")
 ```
 
@@ -153,10 +164,10 @@ Use Python's standard `help(openai_codex)`, `help(Codex)`, or
 
 ## Documentation
 
-- [Getting started](https://github.com/openai/codex/blob/main/sdk/python/docs/getting-started.md)
-- [API reference](https://github.com/openai/codex/blob/main/sdk/python/docs/api-reference.md)
-- [FAQ](https://github.com/openai/codex/blob/main/sdk/python/docs/faq.md)
-- [Examples](https://github.com/openai/codex/blob/main/sdk/python/examples/README.md)
+- [Getting started](docs/getting-started.md)
+- [API reference](docs/api-reference.md)
+- [FAQ](docs/faq.md)
+- [Examples](examples/README.md)
 
 The package is licensed under the
-[repository Apache License 2.0](https://github.com/openai/codex/blob/main/LICENSE).
+[repository Apache License 2.0](../../LICENSE).

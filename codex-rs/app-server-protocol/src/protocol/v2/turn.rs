@@ -336,6 +336,18 @@ pub enum UserInput {
 }
 
 impl UserInput {
+    /// Project captured local paths to a text variant understood by upstream history clients.
+    /// Request conversion remains lossless so model-side attachment budgets still apply.
+    pub(crate) fn from_core_for_history(value: CoreUserInput) -> Self {
+        match value {
+            CoreUserInput::LocalPath { path, content } => Self::Text {
+                text: format!("{}\n\n{content}", path.display()),
+                text_elements: Vec::new(),
+            },
+            value => Self::from(value),
+        }
+    }
+
     pub fn into_core(self) -> CoreUserInput {
         match self {
             UserInput::Text {

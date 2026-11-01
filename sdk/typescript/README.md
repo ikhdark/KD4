@@ -2,25 +2,34 @@
 
 Embed the Codex agent in your workflows and apps.
 
-The TypeScript SDK wraps the `codex` CLI from `@openai/codex`. It spawns the CLI and exchanges JSONL
-events over stdin/stdout.
+The TypeScript SDK wraps the local `codex` CLI. It spawns the CLI and exchanges JSONL
+events over stdin/stdout. This KD4 checkout is Windows-only; its package names are
+inherited from upstream and do not identify a published KD4 SDK.
 
-## Installation
+## Local setup
 
-```bash
-npm install @openai/codex-sdk
+Requires Windows and Node.js 18+. In an already configured checkout, build the SDK
+from the repository root:
+
+```powershell
+pnpm --filter @openai/codex-sdk build
 ```
 
-Requires Node.js 18+.
+Use `codexPathOverride` to select your local KD4 `codex.exe` explicitly. Without
+an override, the SDK resolves a locally installed `@openai/codex` package and its
+matching native package, not a `codex` executable on `PATH`. See the
+[local npm packaging guide](../../codex-cli/scripts/README.md) when staging SDK
+and CLI tarballs. Installing `@openai/codex-sdk` from the public registry does not
+install this checkout.
 
 ## Quickstart
 
 ```typescript
 import { Codex } from "@openai/codex-sdk";
 
-const codex = new Codex();
+const codex = new Codex({ codexPathOverride: "C:\\path\\to\\codex.exe" });
 const thread = codex.startThread();
-const turn = await thread.run("Diagnose the test failure and propose a fix");
+const turn = await thread.run("Diagnose the compiler failure and propose a fix");
 
 console.log(turn.finalResponse);
 console.log(turn.items);
@@ -41,8 +50,12 @@ const nextTurn = await thread.run("Implement the fix");
 streaming responses, and file change notifications—use `runStreamed()` instead, which returns an
 async generator of structured events.
 
-Final text prefers the latest completed agent message, falling back to a completed
-`plan` item. A Plan is planning content, not verified implementation. Usage is
+Final text uses the terminal `surfaced_result.canonicalMessage` when present,
+otherwise the terminal `timing.finalAnswer` receipt. A present final-answer receipt
+with no message suppresses visible-item fallback. Older streams fall back to the
+latest uninterrupted final-answer (or phase-less) agent message, then a completed
+`plan` item. A Plan is planning content, not verified implementation. `run()` also
+returns available `timing`, `finalAnswer`, and `surfacedResult` metadata. Usage is
 `null` when no accounting snapshot was received; counters remain cumulative for
 the primary thread. Web-search `id` is the exec item identity; `call_id` preserves
 the provider identity. Known malformed envelopes and lifecycle mutations after a
@@ -62,7 +75,7 @@ still resolves only after terminal completion and retains observed partial text 
 last-message files still contain only the accepted final answer.
 
 ```typescript
-const { events } = await thread.runStreamed("Diagnose the test failure and propose a fix");
+const { events } = await thread.runStreamed("Diagnose the compiler failure and propose a fix");
 
 for await (const event of events) {
   switch (event.type) {
@@ -129,8 +142,9 @@ const turn = await thread.run([
 
 ### Resuming an existing thread
 
-Threads are persisted in `~/.codex/sessions`. If you lose the in-memory `Thread` object, reconstruct
-it with `resumeThread()` and keep going.
+Threads are persisted under `CODEX_HOME/sessions` (normally
+`%USERPROFILE%\.codex\sessions`). If you lose the in-memory `Thread` object,
+reconstruct it with `resumeThread()` and keep going.
 
 ```typescript
 const savedThreadId = process.env.CODEX_THREAD_ID!;
@@ -146,7 +160,7 @@ passing the `skipGitRepoCheck` option when creating a thread.
 
 ```typescript
 const thread = codex.startThread({
-  workingDirectory: "/path/to/project",
+  workingDirectory: "C:\\path\\to\\project",
   skipGitRepoCheck: true,
 });
 ```
@@ -160,8 +174,9 @@ Electron apps.
 
 ```typescript
 const codex = new Codex({
+  codexPathOverride: "C:\\path\\to\\codex.exe",
   env: {
-    PATH: "/usr/local/bin",
+    Path: "C:\\Windows\\System32",
   },
 });
 ```
@@ -179,6 +194,7 @@ key=value` flags.
 
 ```typescript
 const codex = new Codex({
+  codexPathOverride: "C:\\path\\to\\codex.exe",
   config: {
     show_raw_agent_reasoning: true,
     sandbox_workspace_write: { network_access: true },
@@ -188,6 +204,12 @@ const codex = new Codex({
 
 Thread options still take precedence for overlapping settings because they are emitted after these
 global overrides.
+
+### Intentionally empty final answers
+
+Set the turn-scoped `allowNoProse: true` option only when the request permits an
+exactly empty final answer. It does not waive requested work, output schemas, or
+completion hooks.
 
 ## Development
 

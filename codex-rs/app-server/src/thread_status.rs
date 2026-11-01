@@ -424,6 +424,7 @@ pub(crate) fn resolve_thread_status(
     if has_in_progress_turn && matches!(status, ThreadStatus::Idle | ThreadStatus::NotLoaded) {
         return ThreadStatus::Active {
             active_flags: Vec::new(),
+            harness_phases: None,
         };
     }
 
@@ -577,20 +578,6 @@ fn loaded_thread_status(runtime: &RuntimeFacts) -> ThreadStatus {
     }
 
     let mut active_flags = Vec::new();
-    if runtime.running {
-        active_flags.extend(runtime.harness_phases.iter().map(|phase| {
-            use codex_protocol::protocol::HarnessPhase;
-            match phase {
-                HarnessPhase::ResourceResolution => ThreadActiveFlag::ResolvingResources,
-                HarnessPhase::DiffTracker => ThreadActiveFlag::WaitingOnDiffTracker,
-                HarnessPhase::WorkspaceGate => ThreadActiveFlag::WaitingOnWorkspaceGate,
-                HarnessPhase::EvidenceTracker => ThreadActiveFlag::WaitingOnEvidenceTracker,
-                HarnessPhase::Delivery => ThreadActiveFlag::WaitingOnDelivery,
-                HarnessPhase::ProcessCleanup => ThreadActiveFlag::WaitingOnProcessCleanup,
-                HarnessPhase::ReadyToSample => ThreadActiveFlag::ReadyToSample,
-            }
-        }));
-    }
     if runtime.pending_permission_requests > 0 {
         active_flags.push(ThreadActiveFlag::WaitingOnApproval);
     }
@@ -599,7 +586,13 @@ fn loaded_thread_status(runtime: &RuntimeFacts) -> ThreadStatus {
     }
 
     if runtime.running || !active_flags.is_empty() {
-        return ThreadStatus::Active { active_flags };
+        return ThreadStatus::Active {
+            active_flags,
+            harness_phases: runtime
+                .running
+                .then(|| runtime.harness_phases.clone())
+                .filter(|phases| !phases.is_empty()),
+        };
     }
 
     if runtime.has_system_error {

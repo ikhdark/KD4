@@ -103,7 +103,7 @@ Or as an object directly in `plugin.json`:
 - `privacyPolicyURL` (`string`): Privacy policy URL.
 - `termsOfServiceURL` (`string`): Terms of service URL.
 - `defaultPrompt` (`array` of `string`, or a legacy single `string`): Starter prompts shown in composer/UX context. Use this camelCase field; `default_prompt` is not read by the native loader.
-  - Include at most 3 strings. Entries after the first 3 are ignored and will not be included.
+  - Include at most 3 strings for the bundled validator. The native loader keeps the first 3 valid prompts, skipping invalid entries.
   - Each string is capped at 128 characters after whitespace normalization. Longer entries are ignored by the loader and rejected by the validator.
   - Prefer short starter prompts around 50 characters so they scan well in the UI.
 - `brandColor` (`string`): Theme color for the plugin card.
@@ -118,7 +118,7 @@ Or as an object directly in `plugin.json`:
 
 - Path values should be relative and begin with `./`.
 - `skills` and string-valued `mcpServers` are supplemented on top of default component discovery; they do not replace defaults. The bundled validator rejects a `hooks` manifest field; omit it from `plugin.json`.
-- Custom path values must follow the plugin root convention and naming/namespacing rules.
+- For this scaffold's validator, `skills` must resolve to `skills`, `apps` to `.app.json`, and a string-valued `mcpServers` to `.mcp.json`. Native loader support for other component paths does not make those paths valid for this scaffold.
 - This repo’s scaffold writes `.codex-plugin/plugin.json`; treat that as the manifest location this skill generates.
 
 # Marketplace JSON sample spec

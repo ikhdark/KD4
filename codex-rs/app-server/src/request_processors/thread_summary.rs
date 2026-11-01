@@ -67,6 +67,7 @@ pub(crate) fn thread_settings_from_config_snapshot(
                 .collect(),
         ),
         approval_policy: config_snapshot.approval_policy.into(),
+        approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::User,
         sandbox_policy: thread_response_sandbox_policy(
             &config_snapshot.permission_profile,
             config_snapshot.cwd().as_path(),
@@ -121,6 +122,7 @@ pub(crate) fn thread_settings_from_core_snapshot(
         permission_profile: Some(permission_profile),
         cwd,
         approval_policy: approval_policy.into(),
+        approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::User,
         active_permission_profile: thread_response_active_permission_profile(
             active_permission_profile.flatten(),
         ),

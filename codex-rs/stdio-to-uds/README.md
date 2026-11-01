@@ -7,11 +7,20 @@ This crate helps enable a third, which is UNIX domain socket, because it has the
 - The UDS can be attached to long-running process, like an HTTP server.
 - The UDS can leverage UNIX file permissions to restrict access.
 
-To that end, this crate provides an adapter between a UDS and stdio. The idea is that someone could start an MCP server that communicates over `/tmp/mcp.sock`. Then the user could specify this on the fly like so:
+To that end, this crate provides an adapter between a UDS and stdio. Start an MCP
+server that listens on a socket, then configure Codex to launch the adapter with
+exactly one argument: the server's socket path. For example, on Windows in
+`config.toml`:
 
+```toml
+[mcp_servers.example]
+command = "codex-stdio-to-uds"
+args = ['C:\path\to\mcp.sock']
 ```
-codex --config mcp_servers.example={command="codex-stdio-to-uds",args=["/tmp/mcp.sock"]}
-```
+
+The adapter executable must already be built and available on `PATH`, or `command`
+must be its absolute path. The reusable crate also supports Unix socket paths
+such as `/tmp/mcp.sock`; that does not make this KD4 checkout a Unix distribution.
 
 Unfortunately, the Rust standard library does not provide support for UNIX domain sockets on Windows today even though support was added in October 2018 in Windows 10:
 

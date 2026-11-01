@@ -46,7 +46,7 @@ These scripts use the network. Use already-permitted network access; request add
 - If download fails with auth/permission errors, falls back to git sparse checkout.
 - Aborts if the destination skill directory already exists.
 - Installs into `$CODEX_HOME/skills/<skill-name>` (defaults to `~/.codex/skills`).
-- Multiple `--path` values install multiple skills in one run, each named from the path basename unless `--name` is supplied.
+- Multiple `--path` values install multiple skills in one run, each named from its path basename. `--name` overrides the destination name only for a single-path install; it is ignored when multiple paths are supplied.
 - Options: `--ref <ref>` (default `main`), `--dest <path>`, `--method auto|download|git`.
 
 ## Notes

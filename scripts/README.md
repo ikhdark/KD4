@@ -1,21 +1,29 @@
 # Repository scripts
 
+Start with the [repository overview](../README.md) for the documentation index
+and [AGENTS.md](../AGENTS.md) for workflow policy. Commands below describe the
+available tooling; they do not authorize provisioning, publishing or workloads
+disallowed by the active validation mode.
+
 Keep executable paths small. Build wrappers must save wall-clock time; policy
 gates, validation receipts, evidence ledgers, static oracles and audit inventories
 do not belong here.
 
 - `build/`: warm Cargo lane reuse, shared sccache/linker setup, bounded process
-  execution and the opt-in LTO wall-clock benchmark. Lane commands execute once;
-  they do not publish validation receipts or enforce command-selection policy.
+  execution. Lane commands execute once; they do not publish validation receipts
+  or enforce command-selection policy.
 - `maintenance/`: parallel formatting with explicit language/package selection.
 - `install/`: install and publish the CLI, Code Mode host and sandbox helpers.
 - `codex_package/`: construct and stage distributable packages.
 - `common/`: shared file locking, atomic writes and process-tree cleanup.
 
 Run Cargo directly from `codex-rs`, or use
-`just cargo-lane <lane> cargo <command> ...` to reuse bounded warm build
-directories. Resolved lanes include a source-root hash: legacy target caches are
-retained but not adopted, preventing cross-checkout timestamp-only reuse. Use
+`just cargo-lane <lane> cargo <command> ...` from the checkout root to reuse
+bounded warm build directories. Direct `rust_build_status.py run-lane` calls do
+not change cwd: run them from the source's `codex-rs` directory so its pinned
+toolchain and Cargo configuration apply. Resolved lanes include a source-root
+hash: legacy target caches are retained but not adopted, preventing
+cross-checkout timestamp-only reuse. Use
 the emitted target directory rather than deriving it from the requested name.
 Sealed snapshots (no `.git`) built with `rust_build_status.py run-lane --repo-root
 SNAPSHOT` reuse an exact frozen bundle, or build in the nearest free warm slot
@@ -27,6 +35,12 @@ eligible, including live checkouts, so edits after the copy cannot invalidate
 the compiled bundle. Ordinary checkout builds without freezing stay in place;
 `--source-mirror never` remains an explicit opt-out. Relocation/configuration
 checks and in-place source-change rejection remain unchanged.
+
+Busy reusable lanes wait for an owner to finish by default. `--warm-wait-seconds`
+is the delay before explicitly enabled `--allow-cold-overflow`, not a total
+wait timeout; `--max-active-lanes` bounds that family's concurrent builds.
+Eligible source-mirror builds enable bounded overflow automatically. The short
+`--lock-timeout-seconds` covers coordination-lock acquisition, not build time.
 
 ## Cargo artifact receipts
 
@@ -71,11 +85,10 @@ Repository test suites, test-only support files, and named test and
 coverage recipes have been removed. Generic Cargo tooling still accepts
 caller-selected commands without supplying a repository test suite.
 
-The opt-in LTO runtime benchmark generates a disposable coding workload and its
-behavior oracle outside the repository source tree. That benchmark input is not
-a retained repository test suite; see `build/lto-runtime-benchmark.md`.
-
 Formatting remains opt-in: `just fmt` selects Just and Rust;
 `just fmt-full` runs the independent formatters in parallel.
+`--rust-package PACKAGE` scopes Rust formatting; `--only GROUP` selects an
+explicit formatter group. The `pnpm format` family checks formatting;
+`pnpm format:fix` writes it. Check recipes remain subject to validation policy.
 The `scripts/` Python project retains only formatting and archive dependencies.
 Saved-session analysis belongs in KDR, not compatibility shims in this tree.

@@ -44,6 +44,7 @@ export type { GetConversationSummaryResponse } from "./GetConversationSummaryRes
 export type { GitDiffToRemoteParams } from "./GitDiffToRemoteParams";
 export type { GitDiffToRemoteResponse } from "./GitDiffToRemoteResponse";
 export type { GitSha } from "./GitSha";
+export type { HarnessPhase } from "./HarnessPhase";
 export type { ImageDetail } from "./ImageDetail";
 export type { ImageGenerationItem } from "./ImageGenerationItem";
 export type { ImageGenerationUsage } from "./ImageGenerationUsage";

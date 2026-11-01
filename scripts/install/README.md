@@ -5,8 +5,12 @@ human-facing overview of the installer surface.
 
 ## Overview
 
-This directory owns the Windows standalone Codex install entrypoint,
-`install.ps1`.
+This directory owns the Windows standalone Codex installer (`install.ps1`),
+local build/activation publisher (`publish-local-codex.ps1`), staged PGO
+wrapper (`publish-local-codex-pgo.ps1`), and Desktop context patch preparation
+helper. Release installation downloads packages; local publishing builds from
+this checkout. Neither is part of ordinary documentation maintenance, and
+publishing or republishing requires explicit permission.
 
 The installer fetches KD4 release artifacts from `ikhdark/KD4`, verifies release
 digests, stages standalone package layouts under the Codex home directory,
@@ -56,6 +60,11 @@ Build freshness includes the bytes of the automatically selected Cargo Rusty V8
 cache archive, not just explicit archive overrides. A cached archive change
 invalidates auto-skip even if file timestamps are preserved.
 
+The local publisher does not download a missing Rusty V8 archive by default.
+Reuse its Cargo cache, pass `-RustyV8Archive` or `RUSTY_V8_ARCHIVE` with an
+existing local archive, or opt into `-AllowRustyV8Download` only when downloading
+is authorized. A missing archive is not permission to provision the machine.
+
 Before activation, close processes using any of the four installed bundle
 executables; before restart, close Desktop as well. The publisher cannot prove
 home ownership or live chat state from an executable path, so it refuses to stop
@@ -77,7 +86,8 @@ the existing publisher for Cargo builds, build stamps, transactional installatio
 fork-home routing, rollback, and live-chat/restart protection. The final recipe
 remains available unchanged. No speedup is assumed or promised.
 
-Install the matching profiler tools once, from `codex-rs` (not a random system LLVM):
+When toolchain setup is authorized, install the matching profiler tools once
+from `codex-rs` (not a random system LLVM); otherwise reuse an existing component:
 
 ```powershell
 rustup component add llvm-tools-preview
@@ -149,5 +159,4 @@ Activation may still be deferred when called inside Codex.
 
 Compare the optimized bundle against a same-source normal final build on separate,
 held-out tasks before publishing. Use KDR for real session comparisons. PGO targets
-local Rust CPU work, not model/network latency. The LTO fixture is not by itself a
-suitable PGO training corpus.
+local Rust CPU work, not model/network latency.

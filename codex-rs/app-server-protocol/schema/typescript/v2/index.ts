@@ -39,6 +39,7 @@ export type { AppsListParams } from "./AppsListParams";
 export type { AppsListResponse } from "./AppsListResponse";
 export type { AppsReadParams } from "./AppsReadParams";
 export type { AppsReadResponse } from "./AppsReadResponse";
+export type { ApprovalsReviewer } from "./ApprovalsReviewer";
 export type { AskForApproval } from "./AskForApproval";
 export type { AttestationGenerateParams } from "./AttestationGenerateParams";
 export type { AttestationGenerateResponse } from "./AttestationGenerateResponse";

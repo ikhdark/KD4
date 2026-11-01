@@ -1869,20 +1869,7 @@
       ],
       "type": "object"
     },
-    "ThreadActiveFlag": {
-      "enum": [
-        "waitingOnApproval",
-        "waitingOnUserInput",
-        "resolvingResources",
-        "waitingOnDiffTracker",
-        "waitingOnWorkspaceGate",
-        "waitingOnEvidenceTracker",
-        "waitingOnDelivery",
-        "waitingOnProcessCleanup",
-        "readyToSample"
-      ],
-      "type": "string"
-    },
+    "ThreadActiveFlag": {"enum":["waitingOnApproval","waitingOnUserInput"],"type":"string"},
     "ThreadExtra": {
       "description": "Extra app-server data for a thread.",
       "type": "object"
@@ -2879,7 +2866,8 @@
               ],
               "title": "ActiveThreadStatusType",
               "type": "string"
-            }
+            },
+            "harnessPhases": {"description":"Optional harness diagnostics, separate from the upstream active-flag enum.","items":{"$ref":"#/definitions/HarnessPhase"},"type":["array","null"]}
           },
           "required": [
             "activeFlags",
@@ -6965,7 +6953,9 @@
           "type": "object"
         }
       ]
-    }
+    },
+    "ApprovalsReviewer": {"description":"Approval reviewer reported to API clients. This build supports user review only.","enum":["user"],"type":"string"},
+    "HarnessPhase": {"enum":["resourceResolution","diffTracker","workspaceGate","evidenceTracker","delivery","processCleanup","readyToSample"],"type":"string"}
   },
   "properties": {
     "approvalPolicy": {
@@ -7014,7 +7004,8 @@
     },
     "thread": {
       "$ref": "#/definitions/Thread"
-    }
+    },
+    "approvalsReviewer": {"allOf":[{"$ref":"#/definitions/ApprovalsReviewer"}],"default":"user","description":"Reviewer currently used for approval requests on this thread."}
   },
   "required": [
     "approvalPolicy",

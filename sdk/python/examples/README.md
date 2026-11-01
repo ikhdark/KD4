@@ -1,9 +1,11 @@
 # Python SDK Examples
 
-Each example folder contains runnable versions:
+Most example folders contain both runnable versions:
 
 - `sync.py` (public sync surface: `Codex`)
 - `async.py` (public async surface: `AsyncCodex`)
+
+`09_async_parity` contains only `sync.py`; the other folders include both files.
 
 All examples intentionally use only public SDK exports from `openai_codex`
 and `openai_codex.types`.
@@ -13,31 +15,34 @@ multimodal or structured input lists.
 
 ## Prerequisites
 
-- Python `>=3.10`
+- Windows and Python `>=3.10`
 - Install the SDK for the same Python interpreter you will use to run examples
 
-Install the published beta:
-
-```bash
-python -m pip install openai-codex
-```
-
-The SDK installs its pinned `openai-codex-cli-bin` runtime dependency.
-The pinned runtime version comes from the SDK package dependency.
+This local KD4 checkout is not the SDK distribution on the public package index.
+See [local SDK setup](../docs/getting-started.md) for source-only use with an
+explicit `CodexConfig.codex_bin`. A dependency-resolving SDK install requests the
+`openai-codex-cli-bin` version pinned by `sdk/python/pyproject.toml`.
 
 ## Run From A Checkout
 
 Contributors using these checked-in scripts should install development
 dependencies from `sdk/python`:
 
-```bash
+```powershell
 uv sync --group dev
-source .venv/bin/activate
+.\.venv\Scripts\Activate.ps1
 ```
 
 The examples bootstrap local SDK imports from `sdk/python/src`. If the pinned
 runtime is not already installed, the bootstrap installs the matching runtime
-package for the active interpreter and cleans up temporary files afterward.
+package for the active interpreter from a KD4 release archive and cleans up
+temporary staging files afterward. This can download artifacts and install a
+package; it does not select a locally rebuilt executable. Do not run these
+examples in a no-install or offline-validation task. For local-runtime control,
+use the explicit `CodexConfig` pattern in the setup guide instead.
+
+These examples may authenticate and make live model requests. Running them is not
+a test-free, offline documentation check.
 
 ## Run examples
 

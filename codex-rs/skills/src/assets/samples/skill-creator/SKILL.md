@@ -34,14 +34,17 @@ Follow these steps, skipping those already satisfied or inapplicable to an updat
 
 ### Naming and destination
 
-Use lowercase letters, digits, and hyphens; normalize titles to hyphen-case and keep names under 64 characters. Prefer short verb-led names, adding a tool/domain namespace when it improves discovery. The folder must match the skill name.
+Use lowercase letters, digits, and hyphens; normalize titles to hyphen-case and keep names at most 64 characters long. Prefer short verb-led names, adding a tool/domain namespace when it improves discovery. The folder must match the skill name.
 
 Honor the user's destination. Otherwise use `$CODEX_HOME/skills`, or `~/.codex/skills` when unset; ask only if a material ambiguity remains.
 
 ### Initialization and metadata
 
+Run these commands from the skill's root with the configured Python interpreter
+(`python` below; on Windows this avoids relying on `.py` file associations).
+
 ```bash
-scripts/init_skill.py <skill-name> --path <output-directory> [--resources scripts,references,assets] [--examples]
+python scripts/init_skill.py <skill-name> --path <output-directory> [--resources scripts,references,assets] [--examples] [--interface key=value]
 ```
 
 The initializer creates the directory, frontmatter/body starter, and `agents/openai.yaml`; optional resources/examples require their flags. Replace or delete generated placeholders and unused examples.
@@ -49,7 +52,7 @@ The initializer creates the directory, frontmatter/body starter, and `agents/ope
 Generate `display_name`, `short_description`, and `default_prompt` from the skill and pass them with `--interface key=value`. To regenerate metadata:
 
 ```bash
-scripts/generate_openai_yaml.py <path/to/skill-folder> --interface key=value
+python scripts/generate_openai_yaml.py <path/to/skill-folder> --interface key=value
 ```
 
 Validate that UI metadata still matches on updates. Include other optional interface fields only if the user supplied them. Field definitions and examples live in [openai_yaml.md](references/openai_yaml.md).
@@ -57,7 +60,7 @@ Validate that UI metadata still matches on updates. Include other optional inter
 ### Validation
 
 ```bash
-scripts/quick_validate.py <path/to/skill-folder>
+python scripts/quick_validate.py <path/to/skill-folder>
 ```
 
 Fix reported frontmatter/naming issues and rerun affected validation. Structural validation does not prove the workflow works; examine outputs from realistic uses and improve only the demonstrated weak points.

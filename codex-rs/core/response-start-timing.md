@@ -1,11 +1,12 @@
 # Passive HTTP response-start timing
 
-This instrumentation extends existing telemetry records. It does not add model
-requests, tasks, queues, body buffering, awaits, locks, atomics, or log emissions.
-It captures `std::time::Instant` values in the existing request-local timing
-slot, and enriches the telemetry callbacks that already run. SSE processing uses
-that same task-local mechanism in its existing stream task; no state is shared
-between independent requests.
+This instrumentation reuses request-local transport timing and existing telemetry
+callbacks. Boundary capture stores `std::time::Instant` values in a task-local
+slot without adding model requests, tasks, queues, body buffering or async waits.
+SSE processing uses that same mechanism in its existing stream task. Core copies
+the observations under the existing model-attempt clock mutex and retains bounded
+per-attempt summaries through the existing turn-timing owner. Independent requests
+do not share their task-local timing slots.
 
 ## Boundaries
 
@@ -39,8 +40,10 @@ telemetry context. The existing `codex.provider_reported_model` receipt also
 retains a bounded `reported_service_tier` from `response.service_tier` when a
 response reports its model. Join that receipt to the completed model attempt by
 its provider response ID. Missing provider metadata is unknown, not the requested
-tier. These observations do not independently prove provider queueing,
-throttling, or provider computation time.
+tier. When supplied, the bounded numeric `openai-processing-ms` header is retained
+as `provider_processing_us`; it is provider-reported processing, not an isolated
+inference or queue duration. These observations do not independently prove provider
+queueing, throttling, or provider computation time.
 
 The header and first-body timestamps describe occurrences, not when their
 existing telemetry callbacks finish. The first-body receipt is emitted with
@@ -55,5 +58,13 @@ header/body timings. The native UI is outside this checkout: server publication
 does not establish when content became visible in the interface.
 
 Use existing local/OTEL telemetry collection and filters to retain the phase
-records; no new logger or background collector is installed. Saved rollout
-terminal timing alone does not contain these new transport-phase fields.
+records; no new logger or background collector is installed. The
+`codex.model_stream_delivery` event also carries a content-free JSON summary.
+For retained physical attempts, checkpoint and terminal timing preserve those
+JSON strings in `modelRequests[].streamDeliveryByAttempt`, keyed by the physical
+attempt ID. They include `clock_id`, the three available HTTP boundary timestamps
+and `provider_processing_us`, alongside decoded-delta delivery measurements.
+This is not a copy of every phase record: provider request IDs, service-tier
+receipts and server-publication events still require their corresponding
+telemetry. Missing fields, evicted attempts and summaries marked `complete: false`
+retain their availability and partial-stream qualifications.

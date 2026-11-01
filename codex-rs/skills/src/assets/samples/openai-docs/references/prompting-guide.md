@@ -2,7 +2,7 @@ GPT-5.5 works best when prompts define the outcome and leave room for the model 
 
 Avoid carrying over every instruction from an older prompt stack. Legacy prompts often over-specify the process because earlier models needed more help staying on track. With GPT-5.5, that can add noise, narrow the model's search space, or lead to overly mechanical answers.
 
-For more detail on GPT-5.5 behavior changes, start with the [Using GPT-5.5 guide](/api/docs/guides/latest-model). This guide focuses on prompt changes that follow from those behavior changes.
+For more detail on GPT-5.5 behavior changes, start with the [Using GPT-5.5 guide](https://developers.openai.com/api/docs/guides/latest-model). This guide focuses on prompt changes that follow from those behavior changes.
 
 The patterns here are starting points. Adapt them to your product surface, tools, evals, and user experience goals.
 
@@ -133,7 +133,7 @@ Preserve the requested artifact, length, structure, and genre first. Quietly imp
 
 ## Grounding, citations, and retrieval budgets
 
-For grounded answers, citation behavior should be part of the prompt. Define what needs support, what counts as enough evidence, and how the model should behave when evidence is missing. Absence of evidence shouldn't automatically become a factual "no." For more details and examples, see the [citation formatting guide](/api/docs/guides/citation-formatting).
+For grounded answers, citation behavior should be part of the prompt. Define what needs support, what counts as enough evidence, and how the model should behave when evidence is missing. Absence of evidence shouldn't automatically become a factual "no." For more details and examples, see the [citation formatting guide](https://developers.openai.com/api/docs/guides/citation-formatting).
 
 ### Add an explicit retrieval budget
 
@@ -166,7 +166,7 @@ For creative or generative requests such as slides, leadership blurbs, outbound 
 
 ## Frontend engineering and visual taste
 
-For frontend work, refer to the [example instructions](/api/docs/guides/frontend-prompt) for practical ways to steer UI quality. They cover product and user context, design-system alignment, first-screen usability, familiar controls, expected states, responsive behavior, and common generated-UI defaults to avoid, such as generic heroes, nested cards, decorative gradients, visible instructional text, and broken layouts.
+For frontend work, refer to the [example instructions](https://developers.openai.com/api/docs/guides/frontend-prompt) for practical ways to steer UI quality. They cover product and user context, design-system alignment, first-screen usability, familiar controls, expected states, responsive behavior, and common generated-UI defaults to avoid, such as generic heroes, nested cards, decorative gradients, visible instructional text, and broken layouts.
 
 ## Prompt the model to check its work
 

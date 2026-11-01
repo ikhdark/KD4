@@ -239,6 +239,15 @@ impl From<CoreNonSteerableTurnKind> for NonSteerableTurnKind {
         }
     }
 }
+/// Approval reviewer reported to API clients. This build supports user review only.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export_to = "v2/")]
+pub enum ApprovalsReviewer {
+    #[default]
+    User,
+}
+
 
 #[derive(
     Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS, ExperimentalApi,

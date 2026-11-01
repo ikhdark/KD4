@@ -1408,6 +1408,7 @@ pub(super) async fn handle_pending_thread_resume_request(
         runtime_workspace_roots: workspace_roots,
         instruction_sources,
         approval_policy: approval_policy.into(),
+        approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::User,
         sandbox,
         permission_profile: Some(permission_profile),
         active_permission_profile,
@@ -1560,7 +1561,7 @@ pub(super) fn set_thread_status_and_interrupt_stale_turns(
     has_live_in_progress_turn: bool,
 ) {
     let loaded_status = match loaded_status {
-        ThreadStatus::Active { active_flags }
+        ThreadStatus::Active { active_flags, .. }
             if !has_live_in_progress_turn && active_flags.is_empty() =>
         {
             ThreadStatus::Idle

@@ -5,7 +5,7 @@ version gating:
 
 | Method | Parameters (in addition to `threadId`) | Response |
 | --- | --- | --- |
-| `thread/queue/list` | optional `cursor`, `limit` | `data`, `nextCursor` |
+| `thread/queue/list` | optional `cursor`, `limit` | `data`, `nextCursor`, optional `snapshot` |
 | `thread/queue/add` | `input`, optional `clientUserMessageId` | `queuedSubmission` |
 | `thread/queue/update` | `queuedSubmissionId`, `input` | `queuedSubmission` |
 | `thread/queue/delete` | `queuedSubmissionId` | `deleted` |
@@ -14,10 +14,15 @@ version gating:
 
 Each queued submission contains `id`, `clientUserMessageId`, and the original
 typed `input`. Mutations notify subscribed connections with
-`thread/queue/changed` (`threadId`). Reordering moves the listed entries to the
-front and preserves the relative order of omitted entries. Duplicate or unknown
+`thread/queue/changed` (`threadId`, optional `revision`). Reordering moves listed
+entries to the front and preserves the relative order of omitted entries. Duplicate or unknown
 IDs reject the whole reorder. Pagination cursors are revision-bound; restart
 pagination when the queue changes.
+
+The list snapshot exposes `revision`, `paused`, `pendingStart`, and bounded recent
+`acceptedSubmissions` receipts mapping queued submission IDs to turn IDs. An
+absent snapshot on an older peer, or an ID missing from the bounded receipts, is
+unknown or expired evidence, not proof of rejection or permission to resubmit.
 
 ## Execution and persistence
 
@@ -36,7 +41,12 @@ pagination when the queue changes.
   recovery checks live and persisted history before restoring or consuming the
   entry, and pauses the queue for explicit resumption.
 - Retried adds with the same client message ID and unchanged input return the
-  existing queued entry. Different input under that ID is rejected.
+  existing pending entry or retained accepted receipt's submission. Different
+  input under a retained ID is rejected; deduplication is not an unlimited history.
+- Local images are decoded and snapshotted before durable acceptance. Public
+  queued input retains the original typed paths, but execution uses the sealed
+  content rather than rereading mutable files. Legacy queued images without a
+  snapshot must be updated before they can start.
 - Each thread is limited to 100 entries and a 16 MiB persisted queue payload.
   Existing turn-input validation also applies.
 

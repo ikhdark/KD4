@@ -17,7 +17,8 @@ helpers are re-exported from `codex_config`:
 - `ConfigLayerStack`
   - `effective_config() -> toml::Value`
   - `origins() -> HashMap<String, ConfigLayerMetadata>`
-  - `layers_high_to_low() -> Vec<&ConfigLayerEntry>`
+  - `layers_high_to_low() -> Vec<&ConfigLayerEntry>` (enabled layers only)
+  - `get_layers(ordering, include_disabled) -> Vec<&ConfigLayerEntry>`
   - `with_user_config(config_toml, user_config) -> ConfigLayerStack`
 - `ConfigLayerEntry` (one layer’s `{name, config, version, disabled_reason}`; `name` carries source
   metadata)
@@ -42,9 +43,16 @@ precedence first, highest precedence last, so later layers override earlier
 layers when folded. Thread config entries supplied by `thread_config_loader` are
 inserted according to their translated `ConfigLayerSource` precedence.
 
-Layers with a `disabled_reason` are still surfaced for UI, but are ignored when
-computing the effective config and origins metadata. This is what
-`ConfigLayerStack::effective_config()` implements.
+Layers with a `disabled_reason` remain in the stack, but are ignored when
+computing the effective config and origins metadata. `layers_high_to_low()` also
+excludes them. UI callers that need disabled layers must use `get_layers()` with
+`include_disabled = true`. Requirement sources are tracked separately and are
+not part of ordinary config-layer origins.
+
+Untrusted project config is retained but disabled. Enabled project-local config
+cannot set credential destinations, providers, `notify`, profile selection, or
+telemetry (`otel`); `PROJECT_LOCAL_CONFIG_DENYLIST` in `mod.rs` owns the exact
+restriction list.
 
 ### Cloud policy lifetime and trust
 
@@ -72,6 +80,7 @@ invalid disk-cache TTL or a permanently memoized successful download.
 Most callers want the effective config plus metadata:
 
 ```rust
+use codex_config::ConfigLayerStackOrdering;
 use codex_config::LoaderOverrides;
 use codex_config::NoopThreadConfigLoader;
 use codex_config::loader::load_config_layers_state;
@@ -92,7 +101,11 @@ let layers = load_config_layers_state(
 
 let effective = layers.effective_config();
 let origins = layers.origins();
-let layers_for_ui = layers.layers_high_to_low();
+let enabled_layers = layers.layers_high_to_low();
+let layers_for_ui = layers.get_layers(
+    ConfigLayerStackOrdering::HighestPrecedenceFirst,
+    true, // include disabled layers for display
+);
 ```
 
 ## Internal layout
