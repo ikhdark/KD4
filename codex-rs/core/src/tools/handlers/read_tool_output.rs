@@ -164,6 +164,7 @@ impl CoreToolRuntime for ReadToolOutputHandler {
 }
 
 struct RecoveryAttemptObservation<'a> {
+    timing: &'a codex_turn_timing::turn_timing::TurnTimingState,
     thread_id: &'a codex_protocol::ThreadId,
     turn_id: &'a str,
     call_id: &'a str,
@@ -172,6 +173,7 @@ struct RecoveryAttemptObservation<'a> {
     started: std::time::Instant,
     phase: &'static str,
     completed: bool,
+    audit_only: bool,
     delivery_scope: &'static str,
     selection_observed: bool,
     selection_successful: bool,
@@ -181,6 +183,17 @@ struct RecoveryAttemptObservation<'a> {
 
 impl Drop for RecoveryAttemptObservation<'_> {
     fn drop(&mut self) {
+        if !self.audit_only {
+            self.timing.record_artifact_recovery(self.call_id, self.started, serde_json::json!({
+                "artifact_id":self.artifact_id, "source_thread_id":self.source_thread_id,
+                "phase":self.phase, "completed":self.completed,
+                "selection_observed":self.selection_observed,
+                "selection_successful":self.selection_successful,
+                "selection_complete":self.selection_complete,
+                "retained_artifact_complete":self.retained_artifact_complete,
+                "delivery_scope":self.delivery_scope, "model_delivery_verified":false,
+            }));
+        }
         tracing::info!(event.name = "codex.tool_output_recovery.attempt_finished",
             thread_id = %self.thread_id, turn_id = self.turn_id, call_id = self.call_id,
             source_thread_id = %self.source_thread_id, artifact_id = self.artifact_id.as_str(),
@@ -205,12 +218,14 @@ async fn handle_read_tool_output(
     invocation: ToolInvocation,
 ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
     let mut attempt = RecoveryAttemptObservation {
+        timing: &invocation.step_context.turn.turn_timing_state,
         thread_id: &invocation.session.thread_id,
         turn_id: &invocation.step_context.turn.sub_id,
         call_id: &invocation.call_id,
         source_thread_id: invocation.session.thread_id,
         artifact_id: String::new(),
         started: std::time::Instant::now(), phase: "arguments", completed: false,
+        audit_only: false,
         delivery_scope: "unknown",
         selection_observed: false,
         selection_successful: false,
@@ -223,6 +238,7 @@ async fn handle_read_tool_output(
         ));
     };
     let args = parse_read_tool_output_args(arguments)?;
+    attempt.audit_only = args.audit_only;
     let source_thread_id = args.source_thread_id.unwrap_or(invocation.session.thread_id);
     attempt.source_thread_id = source_thread_id;
     // Do not put arbitrary malformed argument text into diagnostic logs.
@@ -390,9 +406,11 @@ async fn handle_read_tool_output(
         let mut result = JsonToolOutput::with_success(output, Some(success))
             .with_code_mode_failure_as_data();
         if let Some(evidence) = evidence {
-            result = result.with_sampling_request_signal(
-                crate::tools::context::semantic_evidence_sampling_signal(evidence),
-            );
+            let mut signal = crate::tools::context::semantic_evidence_sampling_signal(evidence);
+            if let Some(receipt) = super::read_file::native_read_measurement(result.value(), &serde_json::json!({
+                "artifact":args.artifact_id, "thread":source_thread_id,
+            })) { signal["native_read"] = receipt; }
+            result = result.with_sampling_request_signal(signal);
         }
         if let Some(model_value) = model_value {
             result = result.with_model_value(model_value);
@@ -681,6 +699,13 @@ fn recovery_tool_output(
                 signal.insert("semantic_evidence".to_string(), evidence);
             }
         }
+        result = result.with_sampling_request_signal(signal);
+    }
+    if let Some(receipt) = super::read_file::native_read_measurement(result.value(), &serde_json::json!({
+        "artifact":result.value()["artifact_id"], "thread":result.value()["source_thread_id"],
+    })) {
+        let mut signal = result.sampling_request_signal().unwrap_or_else(|| serde_json::json!({}));
+        signal["native_read"] = receipt;
         result = result.with_sampling_request_signal(signal);
     }
     result

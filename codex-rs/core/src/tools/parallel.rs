@@ -2240,6 +2240,7 @@ impl ToolCallRuntime {
         let measurement_timing = Arc::clone(&timing);
         let measurement_turn = Arc::clone(&turn);
         let measurement_call_id = call.call_id.clone();
+        let measurement_tool_name = call.tool_name.to_string();
         let mut dispatch_handle: AbortOnDropHandle<Result<AnyToolResult, FunctionCallError>> =
             AbortOnDropHandle::new(tokio::spawn(crate::tools::tool_dispatch_trace::scope_tool_blocking_timing(Arc::clone(&timing), Box::pin(async move {
                 let admission_tool_name = router.semantic_tool_name(&dispatch_call.tool_name);
@@ -2876,6 +2877,7 @@ impl ToolCallRuntime {
                     &measurement_turn.turn_timing_state,
                     measurement_timing.execution_id().0.as_str(),
                     &measurement_call_id,
+                    &measurement_tool_name,
                     &result,
                 );
                 result

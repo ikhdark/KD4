@@ -1201,6 +1201,13 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 .with_code_mode_failure_as_data();
             if let Some(evidence) = evidence {
                 let mut signal = crate::tools::context::semantic_evidence_sampling_signal(evidence);
+                let delivered = if script_consumer { output.value() } else { &projected };
+                if let Some(receipt) = native_read_measurement(delivered, &json!({
+                    "path":delivered["path"], "environment":delivered["environment_id"],
+                    "canonical_uri":delivered["canonical_uri"],
+                })) {
+                    signal["native_read"] = receipt;
+                }
                 // Recovery handles bind coverage but are not semantic evidence:
                 // retaining the same bytes again can allocate a different handle.
                 if let Some(artifact_id) = artifact_id {
@@ -1213,6 +1220,37 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             Ok(boxed_tool_output(output))
         })
     }
+}
+
+/// Metadata only; never clone the file body or promote parsed/structured
+/// selections to exact delivered source-byte extents.
+pub(super) fn native_read_measurement(packet: &serde_json::Value, scope: &serde_json::Value) -> Option<serde_json::Value> {
+    use sha2::Digest;
+    let hash = packet.get("canonical_sha256").or_else(|| packet.get("source_sha256"))?.as_str()?;
+    let bytes = packet["canonical_bytes"].as_u64()?;
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) { return None; }
+    let results = packet["results"].as_array()?;
+    if results.len() > 2048 { return None; }
+    let mut ranges = Vec::new();
+    for result in results {
+        if result["status"] != "ok" || result["complete"] != true
+            || !(result["text"].is_string() || result["data_base64"].is_string() || result["data_hex"].is_string()) {
+            return None;
+        }
+        let start = result["canonical_range"]["start"].as_u64()?;
+        let end = result["canonical_range"]["end"].as_u64()?;
+        if start > end || end > bytes { return None; }
+        ranges.push((start, end));
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut() && start <= last.1 { last.1 = last.1.max(end); }
+        else { merged.push((start, end)); }
+    }
+    let resource = hex::encode(sha2::Sha256::digest(serde_json::to_vec(scope).ok()?));
+    Some(json!({"resourceId":resource, "contentSha256":hash, "contentBytes":bytes,
+        "ranges":merged, "basis":"exact_immutable_delivered_snapshot_ranges"}))
 }
 
 // Reuse the recovery engine's lexical boundaries only when explicitly requested.

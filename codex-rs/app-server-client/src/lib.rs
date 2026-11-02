@@ -616,6 +616,7 @@ impl ClientCommand {
 /// callers aligned with app-server behavior while still avoiding a process
 /// boundary.
 pub struct InProcessAppServerClient {
+    observation_id: u64,
     command_tx: mpsc::Sender<ClientCommand>,
     event_rx: mpsc::Receiver<InProcessServerEvent>,
     initialize_response: AppServerInitializeResponse,
@@ -786,7 +787,10 @@ impl InProcessAppServerClient {
             result
         });
 
+        let observation_id = codex_protocol::timing::client_probe::instance();
+        codex_protocol::timing::client_probe::record(110, observation_id, 0, 0, 0, [0; 4]);
         Ok(Self {
+            observation_id,
             command_tx,
             event_rx,
             initialize_response,
@@ -913,7 +917,15 @@ impl InProcessAppServerClient {
     /// the worker emits [`InProcessServerEvent::Lagged`] markers and may reject
     /// pending server requests rather than letting approval flows hang.
     pub async fn next_event(&mut self) -> Option<InProcessServerEvent> {
-        self.event_rx.recv().await
+        let event = self.event_rx.recv().await;
+        if codex_protocol::timing::client_probe::enabled()
+            && let Some(InProcessServerEvent::ServerNotification(ServerNotification::Warning(warning))) = &event
+        {
+            use codex_protocol::timing::client_probe::{key, record};
+            record(121, self.observation_id, warning.thread_id.as_deref().map(key).unwrap_or(0),
+                0, key(&warning.message), [1, 0, 0, 0]);
+        }
+        event
     }
 
     /// Shuts down worker and in-process runtime with bounded wait.
@@ -934,11 +946,13 @@ impl InProcessAppServerClient {
 
     async fn shutdown_owned(self) -> IoResult<()> {
         let Self {
+            observation_id,
             command_tx,
             event_rx,
             initialize_response: _initialize_response,
             worker_handle,
         } = self;
+        codex_protocol::timing::client_probe::record(111, observation_id, 0, 0, 0, [0; 4]);
         // Drop the caller-facing receiver before asking the worker to shut
         // down. That unblocks any pending must-deliver `event_tx.send(..)`
         // so the worker can reach `handle.shutdown()` instead of timing out
@@ -957,9 +971,11 @@ impl InProcessAppServerClient {
         drop(command_tx);
         // Event-consumer closure may beat the queued command. The joined worker
         // result still confirms runtime cleanup (or propagates its real failure).
-        worker_handle
+        let result = worker_handle
             .await
-            .map_err(|error| IoError::other(format!("in-process facade worker failed: {error}")))?
+            .map_err(|error| IoError::other(format!("in-process facade worker failed: {error}")))?;
+        codex_protocol::timing::client_probe::record(112, observation_id, 0, 0, 0, [u64::from(result.is_ok()), 0, 0, 0]);
+        result
     }
 }
 

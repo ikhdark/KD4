@@ -101,6 +101,8 @@ const MAX_ADDITIONAL_CONTEXT_ENTRIES: usize = 64;
 const MAX_ADDITIONAL_CONTEXT_SOURCE_BYTES: usize = 256;
 const MAX_ADDITIONAL_CONTEXT_AGGREGATE_RAW_BYTES: usize = 128 * 1_024;
 const MAX_ADDITIONAL_CONTEXT_AGGREGATE_RENDERED_BYTES: usize = 128 * 1_024;
+// Bound only the start request's observation, never the original terminal owner.
+const TURN_START_FINALIZATION_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 // Context fragments cap each escaped value at approximately 4,000 tokens.
 const MAX_ADDITIONAL_CONTEXT_VALUE_RENDERED_BYTES: usize = 16 * 1_024;
 const ESTIMATED_ADDITIONAL_CONTEXT_WRAPPER_BYTES: usize = 96;
@@ -1050,8 +1052,20 @@ impl TurnRequestProcessor {
             _ = cancellation.cancelled() => {
                 return Err(invalid_request("turn start was cancelled by startup interrupt"));
             }
-            turn_id = thread.wait_for_turn_finalization() => turn_id,
-        };
+            result = thread.wait_for_turn_finalization(TURN_START_FINALIZATION_WAIT_TIMEOUT) => result,
+        }
+        .map_err(|pending| {
+            self.track_error_response(&request_id, /*error_type*/ None);
+            let mut error = internal_error(format!(
+                "timed out waiting for turn {}; terminal persistence is not confirmed. No new turn was started; retry after the turn settles",
+                pending.turn_id,
+            ));
+            error.data = Some(serde_json::json!({
+                "reason": "turnFinalizationPending",
+                "turnId": pending.turn_id,
+            }));
+            error
+        })?;
         let active_turn_id = thread.active_turn_id().await;
         validate_turn_start_target(active_turn_id.as_deref()).inspect_err(|_| {
             self.track_error_response(&request_id, /*error_type*/ None);

@@ -13,6 +13,15 @@ import type { TurnTimingRequestTokenCategories } from "./TurnTimingRequestTokenC
 
 export type TurnTimingModelRequest = {
 /**
+ * Explicit controlled-run comparison key, not inferred from cache hits.
+ */
+cacheComparisonKey?: string,
+/**
+ * SHA256 of the full logical instructions/input/tools, before transport
+ * delta normalization, independently of optional heavy diagnostics.
+ */
+logicalContextSha256?: string,
+/**
  * Versioned content-free JSON delivery summaries by retained physical
  * attempt. Chunks are decoded deltas, not individual provider tokens.
  */

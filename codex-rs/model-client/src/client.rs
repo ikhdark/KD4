@@ -2798,18 +2798,32 @@ fn session_telemetry_for_request(
         // Full logical input, before WS incremental normalization. Stream into
         // SHA256: no extra full-prompt allocation/tokenization.
         // Optional heavy diagnostics may be cancelled after a fast response.
-        struct ContextWriter(Sha256);
+        let measured = tracing::enabled!(target: "codex.prompt_measurement", tracing::Level::DEBUG);
+        let started = measured.then(Instant::now);
+        struct ContextWriter { hash: Sha256, bytes: Option<u64> }
         impl std::io::Write for ContextWriter {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.update(bytes);
+                self.hash.update(bytes);
+                if let Some(count) = self.bytes.as_mut() {
+                    *count = count.saturating_add(bytes.len() as u64);
+                }
                 Ok(bytes.len())
             }
             fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
         }
-        let mut context = ContextWriter(Sha256::new());
+        let mut context = ContextWriter { hash: Sha256::new(), bytes: measured.then_some(0) };
         if serde_json::to_writer(&mut context,
             &(&request.instructions, &request.input, &request.tools)).is_ok() {
-            timing.record_model_context_sha256(hex::encode(context.0.finalize()));
+            let hash = hex::encode(context.hash.finalize());
+            let elapsed_ns = started.map(|started| started.elapsed().as_nanos());
+            if let Some(elapsed_ns) = elapsed_ns {
+                tracing::debug!(target: "codex.prompt_measurement",
+                    measurement_phase = "logical_context_hash",
+                    elapsed_ns = u64::try_from(elapsed_ns).unwrap_or(u64::MAX),
+                    serialized_bytes = context.bytes.unwrap_or_default(), logical_sha256 = hash.as_str(),
+                    "logical prompt measurement");
+            }
+            timing.record_model_context_sha256(hash);
         }
     }
     session_telemetry.clone().with_inference_request(
@@ -3288,6 +3302,8 @@ fn websocket_connection_expiring(connected_at: Option<Instant>, now: Instant) ->
 #[derive(Debug, Default)]
 struct WebsocketSession {
     connection: Option<ApiWebSocketConnection>,
+    /// Local transport lifetime identity, also present without startup capture.
+    diagnostic_connection_id: Option<String>,
     startup_observation: Option<codex_turn_timing::startup_timing::StartupConnectionObservation>,
     /// When `connection` was established; drives rotation before the server's age limit.
     connected_at: Option<Instant>,
@@ -4468,6 +4484,7 @@ impl ModelClientSession {
 
     fn reset_websocket_session(&mut self) {
         self.websocket_session.connection = None;
+        self.websocket_session.diagnostic_connection_id = None;
         if let Some(observation) = self.websocket_session.startup_observation.take() {
             observation.release("connection_reset");
         }
@@ -5217,6 +5234,7 @@ impl ModelClientSession {
 
         if needs_new {
             self.invalidate_incremental_history("websocket reconnect");
+            self.websocket_session.diagnostic_connection_id = Some(Uuid::now_v7().to_string());
             // Recovery may happen in the same turn that invalidated the cache. Take a fresh
             // publication epoch before connecting, so a later fallback can still revoke it.
             // Never restore publication rights to a speculative or explicitly revoked owner.
@@ -5679,6 +5697,12 @@ impl ModelClientSession {
                 provider_event_at_transport: true,
                 ..ModelAttemptClock::new()
             });
+            // Allocate correlation before connection setup, without registering
+            // a physical dispatch. Failed setup receipts remain outside the
+            // independently counted transport-attempt inventory.
+            let attempt_identity = attempt_clock
+                .as_ref()
+                .map(|_| new_attempt_identity(sampling_request_id));
             let prepared_attempt = if warmup {
                 None
             } else {
@@ -5774,6 +5798,8 @@ impl ModelClientSession {
             }
             let request_auth_for_recovery = Arc::clone(&client_setup.api_auth);
             let request_auth_snapshot = client_setup.auth.clone();
+            let connection_started = Instant::now();
+            let had_connection = self.websocket_session.connection.is_some();
             let connection_result = self
                 .websocket_connection(WebsocketConnectParams {
                     session_telemetry,
@@ -5794,9 +5820,19 @@ impl ModelClientSession {
                         RESPONSES_ENDPOINT,
                     ),
                 })
-                .await;
+                .await.map(|_| ());
             if let Some(clock) = attempt_clock.as_ref() {
                 clock.mark_connection_setup_finished();
+            }
+            if !warmup && let (Some(timing), Some(identity)) = (&self.turn_timing, &attempt_identity) {
+                let kind = if connection_result.is_ok() {
+                    if self.websocket_session.connection_reused() { "reuse" }
+                    else if had_connection { "reconnect" } else { "websocketEstablish" }
+                } else { "connectFailure" };
+                let connection = self.websocket_session.diagnostic_connection_id.clone()
+                    .unwrap_or_else(|| format!("setup:{}", identity.physical_attempt_id));
+                timing.record_connection_observation(&identity.sampling_request_id,
+                    &identity.physical_attempt_id, &connection, kind, connection_started);
             }
             match connection_result {
                 Ok(_) => {}
@@ -5961,9 +5997,6 @@ impl ModelClientSession {
                         "websocket connection is unavailable".to_string(),
                     ))
                 })?;
-            let attempt_identity = attempt_clock
-                .as_ref()
-                .map(|_| new_attempt_identity(sampling_request_id));
             let connection_reused = self.websocket_session.connection_reused();
             let mut essential_attempt =
                 attempt_identity
@@ -7415,6 +7448,25 @@ struct ApiTelemetry {
 }
 
 impl ApiTelemetry {
+    fn physical_transport_identity(&self, attempt: u64) -> Option<ResponseAttemptIdentity> {
+        let context = self.model_request.as_ref()?;
+        Some(ResponseAttemptIdentity {
+            sampling_request_id: context.identity.sampling_request_id.clone(),
+            physical_attempt_id: if attempt == 0 { context.identity.physical_attempt_id.clone() }
+                else { format!("{}:http-{attempt}", context.identity.physical_attempt_id) },
+        })
+    }
+
+    fn record_native_transport_phase(&self, attempt: u64, observation: TransportPhaseObservation) {
+        if let Some(context) = &self.model_request
+            && let Some(timing) = &context.timing
+            && let Some(identity) = self.physical_transport_identity(attempt) {
+            timing.record_transport_phase(&identity.sampling_request_id, &identity.physical_attempt_id,
+                observation.phase.as_str(), observation.duration, observation.wire_bytes,
+                observation.provenance, observation.unavailable_reason);
+        }
+    }
+
     fn new(
         session_telemetry: SessionTelemetry,
         auth_context: AuthRequestTelemetryContext,
@@ -7554,6 +7606,7 @@ impl RequestTelemetry for ApiTelemetry {
 
     fn on_transport_phase(&self, attempt: u64, observation: TransportPhaseObservation) {
         self.last_attempt.store(attempt, Ordering::Relaxed);
+        self.record_native_transport_phase(attempt, observation);
         self.session_telemetry.record_transport_phase(
             &self.logical_request_id,
             attempt,
@@ -7573,7 +7626,8 @@ impl RequestTelemetry for ApiTelemetry {
         headers: Option<&ApiHeaderMap>,
     ) {
         self.last_attempt.store(attempt, Ordering::Relaxed);
-        let identity = self.model_request.as_ref().map(|request| &request.identity);
+        self.record_native_transport_phase(attempt, observation);
+        let identity = self.physical_transport_identity(attempt);
         let provider_request_id = headers
             .and_then(|headers| headers.get("x-request-id"))
             .and_then(|value| value.to_str().ok())
@@ -7584,8 +7638,8 @@ impl RequestTelemetry for ApiTelemetry {
             });
         let mut response_start = codex_otel::ResponseStartTelemetry::from_transport_timing(
             timing,
-            identity.map(|identity| identity.sampling_request_id.as_str()),
-            identity.map(|identity| identity.physical_attempt_id.as_str()),
+            identity.as_ref().map(|identity| identity.sampling_request_id.as_str()),
+            identity.as_ref().map(|identity| identity.physical_attempt_id.as_str()),
             provider_request_id,
         );
         // A provider-reported processing duration is not isolated inference or

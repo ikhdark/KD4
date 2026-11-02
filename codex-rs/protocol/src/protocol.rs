@@ -1809,6 +1809,11 @@ pub struct TurnTiming {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub activity_timeline: Option<crate::timing::TurnTimingTimeline>,
+    /// Native causal envelopes. A partial graph retains reasons, not a claimed
+    /// critical path; streaming forks and descendants need independent coverage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub dependency_graph: Option<crate::timing::TurnTimingDependencyGraph>,
     /// Accepted answer identity frozen after completion hooks and pending-input
     /// admission. Some with no message explicitly means no accepted answer;
     /// absence is legacy unknown. This is not the last visible/partial message.
@@ -1835,6 +1840,12 @@ pub struct TurnTiming {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional, type = "unknown")]
     pub recovery_telemetry: Option<serde_json::Value>,
+    /// Same-clock native transport/connection observations and current-process
+    /// resource accounting. Missing endpoints remain unknown. Explicit runner
+    /// cohort labels do not independently certify matched workloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "unknown")]
+    pub performance_observations: Option<serde_json::Value>,
     /// Content identity of tracked and non-ignored untracked files captured
     /// before this turn's tools ran. Absent means capture was unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2592,6 +2603,10 @@ pub enum TurnTimingRequestDiagnosticsStatus {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnTimingModelRequest {
+    /// Explicit controlled-run comparison key, not inferred from cache hits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub cache_comparison_key: Option<String>,
     /// SHA256 of the full logical instructions/input/tools, before transport
     /// delta normalization, independently of optional heavy diagnostics.
     #[serde(default, skip_serializing_if = "Option::is_none")]

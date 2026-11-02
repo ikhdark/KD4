@@ -5,6 +5,7 @@ import type { TurnCompletionAssessment } from "./TurnCompletionAssessment";
 import type { TurnExecutionStopCause } from "./TurnExecutionStopCause";
 import type { TurnFinalAnswer } from "./TurnFinalAnswer";
 import type { TurnTimingCounters } from "./TurnTimingCounters";
+import type { TurnTimingDependencyGraph } from "./TurnTimingDependencyGraph";
 import type { TurnTimingDeterministicContinuationReceipt } from "./TurnTimingDeterministicContinuationReceipt";
 import type { TurnTimingDiagnosticLatencyAggregate } from "./TurnTimingDiagnosticLatencyAggregate";
 import type { TurnTimingDiagnosticTokenAggregate } from "./TurnTimingDiagnosticTokenAggregate";
@@ -36,6 +37,11 @@ stopCause?: TurnExecutionStopCause,
  */
 activityTimeline?: TurnTimingTimeline,
 /**
+ * Native causal envelopes. A partial graph retains reasons, not a claimed
+ * critical path; streaming forks and descendants need independent coverage.
+ */
+dependencyGraph?: TurnTimingDependencyGraph,
+/**
  * Accepted answer identity frozen after completion hooks and pending-input
  * admission. Some with no message explicitly means no accepted answer;
  * absence is legacy unknown. This is not the last visible/partial message.
@@ -52,6 +58,21 @@ completionAssessment?: TurnCompletionAssessment,
  * invoice: concurrent turns, replenishments, or delayed reports may affect it.
  */
 creditDelta?: string,
+/**
+ * Versioned identity-backed output/context evidence and explicit request
+ * classifications. Absence is legacy unknown, never a measured zero.
+ */
+measurementEvidence?: unknown,
+/**
+ * Versioned physical-attempt capture and referenced recovery attribution.
+ */
+recoveryTelemetry?: unknown,
+/**
+ * Same-clock native transport/connection observations and current-process
+ * resource accounting. Missing endpoints remain unknown. Explicit runner
+ * cohort labels do not independently certify matched workloads.
+ */
+performanceObservations?: unknown,
 /**
  * Content identity of tracked and non-ignored untracked files captured
  * before this turn's tools ran. Absent means capture was unavailable.

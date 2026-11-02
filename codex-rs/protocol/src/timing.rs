@@ -3,6 +3,8 @@
 //! Offsets are comparable only when clock-domain IDs match. They are not Unix
 //! timestamps, provider clocks, or evidence of task acceptance/client rendering.
 
+pub mod client_probe;
+
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -199,6 +201,65 @@ pub struct TurnTimingDependencyEdge {
     pub dependent: String,
     pub prerequisite: String,
     pub relation: String,
+}
+
+/// Bounded native task envelopes, not a prediction of achievable savings.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnTimingDependencyGraph {
+    pub schema_version: u16,
+    pub complete: bool,
+    pub includes_descendants: bool,
+    pub clock_domain_id: Option<String>,
+    pub started_at_ns: u64,
+    pub duration_ns: u64,
+    pub start_node: String,
+    pub finish_node: String,
+    pub nodes: Vec<TurnTimingDependencyNode>,
+    pub unavailable_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnTimingDependencyNode {
+    pub id: String,
+    pub kind: TurnTimingDependencyNodeKind,
+    pub start_ns: Option<u64>,
+    pub end_ns: Option<u64>,
+    pub depends_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub sampling_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub repeat_of: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub work_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub input_identity: Option<String>,
+    /// Explicit referenced assessment, never inferred from equal identities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub necessity: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub necessity_evidence: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub evidence_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export_to = "v2/")]
+pub enum TurnTimingDependencyNodeKind {
+    Boundary,
+    Model,
+    Tool,
+    Wait,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]

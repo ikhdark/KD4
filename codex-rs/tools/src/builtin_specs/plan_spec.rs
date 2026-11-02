@@ -59,6 +59,8 @@ pub fn create_update_plan_tool() -> ToolSpec {
             ("requests".into(), JsonSchema::array(annotations, Some(
                 "Optional evidence-backed rework/necessity/time annotations for at most 128 retained requests. Totals require complete classification. Does not complete requirements or authorize work.".into()))),
             ("recovery".into(), evidence_object()),
+            ("dependencyNodes".into(), JsonSchema::array(evidence_object(), Some(
+                "At most 128 referenced annotations for retained native graph node IDs (generation-N or tool executionId). Fields: id, evidenceRef, repeatOf, workIdentity/inputIdentity (SHA256), necessity (required/unnecessary/unknown), necessityEvidence (1..16 refs). These are explicit assessments, not inferred savings or authority to complete work; they do not supply missing causal edges, clocks or descendant coverage.".into()))),
         ]), None, Some(false.into()))),
         ("plan".into(), JsonSchema::array(item,
             Some("Replace the checklist. Rows may be renamed or removed, but unfinished requirements must be retained via continues or retired with accepted user authorization.".into()))),

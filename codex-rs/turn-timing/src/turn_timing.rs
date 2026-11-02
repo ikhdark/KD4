@@ -59,8 +59,12 @@ use codex_api::ResponseEvent;
 use crate::raw_assistant_output_text_from_item;
 use crate::tool_dispatch_trace::ToolDispatchTimingSnapshot;
 
+mod app_server;
 mod blocking;
+mod dependency;
 mod measurements;
+mod operations;
+mod performance;
 pub mod retries;
 
 const NANOS_PER_MILLISECOND: u128 = 1_000_000;
@@ -659,6 +663,7 @@ impl TurnTimingSnapshot {
                         categories
                     });
                 TurnTimingModelRequest {
+                    cache_comparison_key: profile.measurements.performance.cache_comparison_key.clone(),
                     logical_context_sha256: request.logical_context_sha256.clone(),
                     stream_delivery_by_attempt: request.stream_delivery_by_attempt.clone(),
                     response_queue_timing_by_attempt: request
@@ -843,19 +848,24 @@ impl TurnTimingSnapshot {
         let scope = format!("native-turn:{}", model_requests.first()
             .and_then(|request: &TurnTimingModelRequest| request.sampling_request_id.as_deref())
             .map(str::to_owned).unwrap_or_else(|| self.started_at_unix_ms.unwrap_or_default().to_string()));
-        let (measurement_evidence, recovery_telemetry) = profile.measurements.snapshot(
+        let (mut measurement_evidence, recovery_telemetry) = profile.measurements.snapshot(
             &model_requests, inclusive_duration_ms,
             self.activity_timeline.clock_domain_id.as_deref(), &scope,
             &profile.retry_measurements,
         );
-        TurnTiming {
+        if let Some(evidence) = measurement_evidence.as_mut() {
+            evidence["operations"] = profile.measurements.operations.snapshot(&profile.tool_calls);
+        }
+        let mut timing = TurnTiming {
             stop_cause: None,
             activity_timeline: Some(self.activity_timeline.clone()),
+            dependency_graph: None,
             final_answer: None,
             completion_assessment: None,
             credit_delta: self.credit_delta.clone(),
             measurement_evidence,
             recovery_telemetry,
+            performance_observations: Some(profile.measurements.performance.snapshot(&self.activity_timeline)),
             // No checkout capture runs; the wire field stays for older records.
             checkout_snapshot_sha256: None,
             schema_version: profile.schema_version,
@@ -888,7 +898,9 @@ impl TurnTimingSnapshot {
             deterministic_continuation_receipt_overflow: profile
                 .deterministic_continuation_receipt_overflow,
             pre_first_model_output,
-        }
+        };
+        timing.dependency_graph = dependency::snapshot(&timing);
+        timing
     }
 }
 
@@ -2113,8 +2125,13 @@ impl TurnTimingState {
     pub fn mark_turn_started(&self) -> i64 {
         let mut state = self.state();
         let sample = self.clock.sample();
+        let first_start = state.started_sample.is_none();
         let started_at = state.start(sample);
         state.activity_timeline.clock_domain_id = self.clock.domain_id().map(str::to_owned);
+        if first_start {
+            state.measurements.performance.start();
+            state.measurements.app_server.start(sample.time.monotonic_ns, self.clock.domain_id());
+        }
         started_at
     }
 
@@ -2219,6 +2236,7 @@ impl TurnTimingState {
 
     pub fn complete_snapshot(&self) -> TurnTimingSnapshot {
         let mut state = self.state();
+        if state.completed_snapshot.is_none() { state.measurements.performance.finish(); }
         let sample = self.clock.sample();
         state.retry_decisions.finish(sample.time.monotonic_ns, None);
         state.complete(sample)
@@ -2242,10 +2260,11 @@ impl TurnTimingState {
                 sample,
             )
         };
-        let mut timing = observation.complete(sample).protocol_timing();
-        if let Some(timeline) = timing.activity_timeline.as_mut() {
-            timeline.tail_unknown = true;
-        }
+        let mut snapshot = observation.complete(sample);
+        // No finish boundary exists yet. Skip terminal graph construction too,
+        // rather than rebuilding the cumulative graph at every checkpoint.
+        snapshot.activity_timeline.tail_unknown = true;
+        let mut timing = snapshot.protocol_timing();
         timing.tool_calls.clear();
         timing.tool_closure = tool_closure;
         {
@@ -2508,6 +2527,7 @@ impl TurnTimingState {
                 sampling_generation_id,
             });
         if accepted && is_new {
+            state.measurements.app_server.request(&execution_id.0, sample.time.monotonic_ns);
             if let Some(elapsed_ns) = state.elapsed_since_start(sample.time.monotonic_ns) {
                 // A new acceptance just inserted this entry; record a missing one
                 // as an invalid ledger transition rather than panicking.

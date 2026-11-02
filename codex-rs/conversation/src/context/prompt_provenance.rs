@@ -579,7 +579,18 @@ impl PromptContextBreakdown {
         let origins = Self::tool_origins(items);
         let aligned_offset = items.len().saturating_sub(sidecar.aligned_items.len());
         for (index, item) in items.iter().enumerate() {
+            let serialization_started = (matches!(item,
+                ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. })
+                && tracing::enabled!(target: "codex.prompt_measurement", tracing::Level::DEBUG))
+                .then(std::time::Instant::now);
             let serialized_item = serde_json::to_vec(item)?;
+            if let Some(started) = serialization_started {
+                tracing::debug!(target: "codex.prompt_measurement",
+                    measurement_phase = "tool_result_serialization", input_index = index,
+                    serialized_bytes = serialized_item.len() as u64,
+                    elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    "logical prompt measurement");
+            }
             breakdown.record_tool_result(index, item, &serialized_item, &origins);
             let aligned = index
                 .checked_sub(aligned_offset)
@@ -661,8 +672,11 @@ impl PromptContextBreakdown {
         };
         // Hashes identify the actual projected representation, not its original
         // artifact. Retries and later history inclusions each retain a record.
+        let started = tracing::enabled!(target: "codex.prompt_measurement", tracing::Level::DEBUG)
+            .then(std::time::Instant::now);
         let representation_hash = Sha256::digest(serialized).into();
-        self.tool_result_attribution.push(ModelToolResultTelemetry {
+        let hash_elapsed_ns = started.map(|started| started.elapsed().as_nanos());
+        let attribution = ModelToolResultTelemetry {
             input_index,
             kind,
             tool_name: origins.get(call_id.as_str()).copied().flatten()
@@ -674,7 +688,17 @@ impl PromptContextBreakdown {
             serialized_bytes: u64::try_from(serialized.len()).unwrap_or(u64::MAX),
             estimated_tokens: content_aware_serialized_tokens(serialized),
             tokenizer_estimate: text_only.then(|| cached_tool_result_tokens(serialized, representation_hash)),
-        });
+        };
+        if let Some(started) = started {
+            tracing::debug!(target: "codex.prompt_measurement",
+                measurement_phase = "tool_result_attribution", input_index,
+                serialized_bytes = attribution.serialized_bytes,
+                representation_sha256 = attribution.representation_sha256.as_str(),
+                hash_elapsed_ns = u64::try_from(hash_elapsed_ns.unwrap_or_default()).unwrap_or(u64::MAX),
+                elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                "logical prompt measurement");
+        }
+        self.tool_result_attribution.push(attribution);
     }
 
     fn contribution_counts(&self) -> (usize, usize) {

@@ -2847,6 +2847,43 @@ impl Session {
         } else {
             (msg, true, None)
         };
+        // Native accepted-tool events were captured at their owners, on the
+        // process clock. Close/export that inventory before the same ordered
+        // terminal append; never synthesize unsupported AS capabilities.
+        if persist {
+            let timing = match &mut msg {
+                EventMsg::TurnComplete(event) => event.timing.as_mut(),
+                EventMsg::TurnAborted(event) => event.timing.as_mut(),
+                _ => None,
+            };
+            if let Some(timing) = timing
+                && let Some(trace) = turn_context.turn_timing_state.close_native_app_server_trace(
+                    &self.thread_id.to_string(), &turn_context.sub_id) {
+                let evidence = timing.measurement_evidence.get_or_insert_with(|| serde_json::json!({"schemaVersion":1}));
+                if evidence.is_object() { evidence["appServerTrace"] = trace; }
+            }
+        }
+        // Runner cohort metadata is qualified by the operational terminal, not
+        // by plan completion or a fabricated success at snapshot time.
+        match &mut msg {
+            EventMsg::TurnComplete(event) => {
+                if let Some(execution) = event.timing.as_mut()
+                    .and_then(|timing| timing.performance_observations.as_mut())
+                    .and_then(|packet| packet.get_mut("execution"))
+                    .filter(|execution| execution.is_object()) {
+                    execution["outcome"] = serde_json::json!(if event.error.is_some() { "failed" } else { "success" });
+                }
+            }
+            EventMsg::TurnAborted(event) => {
+                if let Some(execution) = event.timing.as_mut()
+                    .and_then(|timing| timing.performance_observations.as_mut())
+                    .and_then(|packet| packet.get_mut("execution"))
+                    .filter(|execution| execution.is_object()) {
+                    execution["outcome"] = serde_json::json!("cancelled");
+                }
+            }
+            _ => {}
+        }
         // Stage the canonical terminal before the stable-storage barrier. Live
         // consumers may stop as soon as they see this event, so its persistence
         // outcome must already be known (or explicitly uncertain) at delivery.
@@ -3955,7 +3992,7 @@ impl Session {
     }
 
 
-    /// Match and persist native input before waking its consumer. The existing
+    /// Match and order native input before waking its consumer. The existing
     /// history gate orders it against steering, compaction, rollback and plan
     /// publication; the in-flight owner survives cancellation of the notifier.
     #[expect(
@@ -4026,10 +4063,10 @@ impl Session {
                 session.state.lock().await.record_items(
                     std::iter::once(&item), turn_context.model_info.truncation_policy.into(),
                 );
-                if let Err(error) = session.flush_rollout().await {
-                    turn_context.turn_timing_state.record_tool_result_persistence_barrier_failed();
-                    return Err(error);
-                }
+                // As with chat input, canonical append acceptance is sufficient
+                // for live delivery. The existing terminal barrier owns artifact,
+                // rollout and metadata durability; do not make an accepted answer
+                // depend on another flush of unrelated pending tool artifacts.
             }
             tx_response.send(response).ok();
             Ok::<(), std::io::Error>(())

@@ -32,3 +32,39 @@ is not CPU time; model/tool envelopes include internal waits. Category unions
 overlap and must not be added. Uninstrumented dependencies, remote descendants
 and unattributed holder identities remain unknown; these records alone do not
 prove a full causal critical path or achievable scheduling savings.
+
+## Native graph and recovery inventories
+
+Terminal timing also exports a typed `dependencyGraph` in the same clock domain.
+Its model nodes use retained request IDs and dispatch/completion boundaries;
+tool nodes use native execution IDs and acceptance/delivery boundaries. Edges
+come only from the emitting-generation and consumed-result owners. Host handoff
+boundary spans cover the intervening envelope, without assigning a CPU/wait cause.
+Checkpoints omit the graph: an in-flight observation cannot certify task finish.
+
+`complete` is independent of elapsed coverage. Missing identities/endpoints,
+overflow, open processes, nested fork/join and model-prefix release remain
+explicit `unavailableReasons`. In particular, `emitted_by` does not establish
+that a tool waited for the *whole* model request to finish, even when rounded
+timestamps coincide. Such graphs stay partial. Descendants are not claimed.
+The current full-request graph contract cannot certify streaming-prefix or
+arbitrary JavaScript task dependencies; those require authoritative segmented
+fork/join evidence, not chronology or fabricated waits.
+
+The existing `update_plan.measurements.dependencyNodes` annotation lane accepts
+referenced repeat/input/work identity and necessity assessments for retained
+native nodes. Validation precedes plan effects; publication uses the existing
+plan owner. Labels cannot repair missing causal coverage or prove savings.
+
+`measurementEvidence.artifactRecoveries` persists bounded read_tool_output
+attempts, including failed/abandoned selections, with native clock endpoints
+and selection/retention/delivery facts. Metadata-only audits are excluded.
+The physical-model-retry inventory is unchanged; this separate inventory does
+not claim exhaustive recovery, restored task correctness or causal added delay.
+
+`measurementEvidence.nestedResults` reuses the complete byte count from the
+actual Code Mode result serializer, before script/outer-display projection.
+`native_nested_result_json_v1` measures that full JSON object, including wrapper
+metadata, after the owning tool's per-result budget. It is not canonical artifact
+bytes, displayed bytes, provider tokens, or an unbounded pre-owner-reduction
+object. Counts and retention completeness are independent and bounded to 1,024.

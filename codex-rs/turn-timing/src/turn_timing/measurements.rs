@@ -8,6 +8,9 @@ const LIMIT: usize = 1024;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct Capture {
+    pub(super) app_server: super::app_server::Capture,
+    pub(super) performance: super::performance::Capture,
+    pub(super) operations: super::operations::Capture,
     enabled: bool,
     actual_attempts: u64,
     actual_logical_requests: u64,
@@ -15,9 +18,16 @@ pub(super) struct Capture {
     attempts: BTreeMap<String, Value>,
     outputs: BTreeMap<String, Value>,
     annotations: BTreeMap<String, Value>,
+    dependency_annotations: BTreeMap<String, Value>,
     recovery_evidence: Option<Value>,
     dropped_attempts: u64,
     dropped_outputs: u64,
+    actual_nested_results: u64,
+    nested_results: BTreeMap<String, Value>,
+    dropped_nested_results: u64,
+    actual_artifact_recoveries: u64,
+    artifact_recoveries: BTreeMap<String, Value>,
+    dropped_artifact_recoveries: u64,
 }
 
 fn digest(value: &impl serde::Serialize) -> Option<String> {
@@ -231,10 +241,19 @@ impl Capture {
         }
         (Some(json!({
             "schemaVersion":1,
+            "dependencyNodes":self.dependency_annotations.values().collect::<Vec<_>>(),
             "requests":{"complete":annotations.len() as u64 == self.actual_logical_requests,
                         "actualCount":self.actual_logical_requests, "rows":annotations},
             "outputs":{"complete":self.dropped_outputs == 0, "actualCount":self.actual_outputs,
                        "rows":self.outputs.values().collect::<Vec<_>>()},
+            "nestedResults":{"complete":self.dropped_nested_results == 0 && self.actual_nested_results != u64::MAX,
+                "actualCount":self.actual_nested_results,
+                "rows":self.nested_results.values().collect::<Vec<_>>(),
+                "scope":"settled_native_code_mode_results_before_script_and_outer_display_projection"},
+            "artifactRecoveries":{"complete":self.dropped_artifact_recoveries == 0 && self.actual_artifact_recoveries != u64::MAX,
+                "actualCount":self.actual_artifact_recoveries,
+                "rows":self.artifact_recoveries.values().collect::<Vec<_>>(),
+                "scope":"read_tool_output_attempts; audit_only excluded; not exhaustive recovery"},
             "capture":{"scope":"tool_runtime_results_before_caller_display", "droppedOutputs":self.dropped_outputs,
                 "semanticLabels":"explicit_referenced_assertions_not_automatic_waste_verdicts"}
         })), Some(recovery))
@@ -242,6 +261,52 @@ impl Capture {
 }
 
 impl TurnTimingState {
+    /// Reuse the byte count from the actual nested-result serializer. This is
+    /// not canonical artifact size, caller-visible text, or provider tokens.
+    pub fn record_native_nested_result(&self, call: &str, cell: &str, runtime_call: &str,
+                                       parent: Option<&str>, bytes: usize) {
+        let mut state = self.state();
+        if state.completed_snapshot.is_some() { return; }
+        let capture = &mut state.measurements;
+        capture.enabled = true;
+        capture.actual_nested_results = capture.actual_nested_results.saturating_add(1);
+        if bytes == 0 || capture.nested_results.len() >= LIMIT || capture.nested_results.contains_key(call) {
+            capture.dropped_nested_results = capture.dropped_nested_results.saturating_add(1);
+            return;
+        }
+        capture.nested_results.insert(call.to_owned(), json!({
+            "callId":call, "parentCallId":parent, "parentCellId":cell,
+            "runtimeToolCallId":runtime_call, "rawToolResultBytes":bytes,
+            "byteAccounting":"native_nested_result_json_v1",
+            "evidenceRef":format!("native:nested-result:{call}")
+        }));
+    }
+
+    /// The owner supplies an observed Instant, not a duration subtracted from a
+    /// later timestamp. A foreign/pre-turn clock observation stays unavailable.
+    pub fn record_artifact_recovery(&self, call: &str, started: std::time::Instant, facts: Value) {
+        let mut state = self.state();
+        if state.completed_snapshot.is_some() { return; }
+        let start_ms = codex_protocol::timing::process_monotonic_ns_at(started)
+            .filter(|_| self.clock.domain_id() == Some(codex_protocol::timing::process_clock_domain_id()))
+            .and_then(|at| at.checked_sub(state.started_sample?.time.monotonic_ns)).map(u128_to_u64_ms);
+        let end_ms = state.started_sample.and_then(|start| self.clock.sample().time.monotonic_ns
+            .checked_sub(start.time.monotonic_ns)).map(u128_to_u64_ms);
+        let capture = &mut state.measurements;
+        capture.enabled = true;
+        capture.actual_artifact_recoveries = capture.actual_artifact_recoveries.saturating_add(1);
+        if capture.artifact_recoveries.len() >= LIMIT || capture.artifact_recoveries.contains_key(call) {
+            capture.dropped_artifact_recoveries = capture.dropped_artifact_recoveries.saturating_add(1);
+            return;
+        }
+        capture.artifact_recoveries.insert(call.to_owned(), json!({
+            "event_id":format!("artifact:{call}"), "call_id":call,
+            "mechanism":"artifact_retrieval", "start_ms":start_ms, "end_ms":end_ms,
+            "clock_id":self.clock.domain_id(), "facts":facts,
+            "evidence_ref":format!("native:artifact-recovery:{call}")
+        }));
+    }
+
     pub fn record_model_context_sha256(&self, hash: String) {
         if let Some(request) = self.state().model_requests.last_mut() {
             request.logical_context_sha256 = Some(hash);
@@ -254,11 +319,56 @@ impl TurnTimingState {
             return Err("measurement annotations exceed 32 KiB".into());
         }
         let object = packet.as_object().ok_or("measurements must be an object")?;
-        if object.keys().any(|key| !matches!(key.as_str(), "requests" | "recovery")) {
-            return Err("measurements accepts only requests and recovery".into());
+        if object.keys().any(|key| !matches!(key.as_str(), "requests" | "recovery" | "dependencyNodes")) {
+            return Err("measurements accepts only requests, recovery and dependencyNodes".into());
         }
         let state = self.state();
         let mut resolved = packet.clone();
+        if let Some(rows) = packet.get("dependencyNodes") {
+            let rows = rows.as_array().filter(|rows| rows.len() <= 128)
+                .ok_or("dependencyNodes must contain at most 128 annotations")?;
+            let known = state.model_requests.iter().map(|request| format!("generation-{}", request.generation_index))
+                .chain(state.tool_calls.iter().map(|call| call.execution_id.0.clone())).collect::<BTreeSet<_>>();
+            let mut seen = BTreeSet::new();
+            for row in rows {
+                let fields = row.as_object().ok_or("dependency node annotation must be an object")?;
+                if fields.keys().any(|key| !matches!(key.as_str(), "id" | "repeatOf" | "workIdentity"
+                    | "inputIdentity" | "necessity" | "necessityEvidence" | "evidenceRef")) {
+                    return Err("unsupported dependency node annotation field".into());
+                }
+                let id = row["id"].as_str().filter(|id| known.contains(*id)).ok_or("dependency node is not retained in this turn")?;
+                if !seen.insert(id) || !text(row.get("evidenceRef")) {
+                    return Err("dependency labels require unique native IDs and evidenceRef".into());
+                }
+                for field in ["workIdentity", "inputIdentity"] {
+                    if let Some(value) = row.get(field) {
+                        let hash = value.as_str().unwrap_or_default();
+                        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+                            return Err("dependency work/input identities must be lowercase SHA256".into());
+                        }
+                    }
+                }
+                if let Some(repeat) = row.get("repeatOf") {
+                    if !repeat.as_str().is_some_and(|prior| prior != id && known.contains(prior))
+                        || !row["workIdentity"].is_string() || !row["inputIdentity"].is_string() {
+                        return Err("repeatOf requires a distinct retained native node and work/input identities".into());
+                    }
+                }
+                if let Some(necessity) = row.get("necessity") {
+                    if !matches!(necessity.as_str(), Some("required" | "unnecessary" | "unknown")) {
+                        return Err("necessity must be required, unnecessary or unknown".into());
+                    }
+                    if necessity != "unknown" && !row["necessityEvidence"].as_array().is_some_and(|refs|
+                        !refs.is_empty() && refs.len() <= 16 && refs.iter().all(|value| text(Some(value)))) {
+                        return Err("necessity assessments require 1..16 evidence references".into());
+                    }
+                }
+            }
+            let added = seen.iter().filter(|id| !state.measurements.dependency_annotations.contains_key(**id)).count();
+            if state.measurements.dependency_annotations.len() + added > LIMIT {
+                return Err("dependency annotation retention is full".into());
+            }
+        }
         if let Some(rows) = resolved.get_mut("requests") {
             let rows = rows.as_array_mut().filter(|rows| rows.len() <= 128)
                 .ok_or("measurements.requests must contain at most 128 annotations")?;
@@ -340,6 +450,13 @@ impl TurnTimingState {
     pub fn record_measurement_annotations(&self, packet: Value) {
         let mut state = self.state();
         state.measurements.enabled = true;
+        if let Some(rows) = packet.get("dependencyNodes").and_then(Value::as_array) {
+            for row in rows {
+                if let Some(id) = row["id"].as_str() {
+                    state.measurements.dependency_annotations.insert(id.to_owned(), row.clone());
+                }
+            }
+        }
         if let Some(rows) = packet.get("requests").and_then(Value::as_array) {
             for row in rows {
                 if let Some(id) = row.get("samplingRequestId").and_then(Value::as_str) {
@@ -361,6 +478,7 @@ impl TurnTimingState {
 
     pub fn record_tool_output_measurement(&self, call_id: &str, execution_id: &str, row: Value) {
         let mut state = self.state();
+        state.measurements.app_server.result(execution_id, self.clock.sample().time.monotonic_ns);
         if state.completed_snapshot.is_some() { return; }
         if row.is_null() {
             state.measurements.output(execution_id, row);

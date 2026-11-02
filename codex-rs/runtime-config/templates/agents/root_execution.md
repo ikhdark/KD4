@@ -18,7 +18,9 @@ Reassess remaining work on completions, concrete blockers and meaningful progres
 
 # Waiting and recovery
 
-Prefer event-driven `wait_agent` without `timeout_ms`; runtime owns maintenance and stalled-worker nudges. Set a deadline only for a concrete task decision. Do not wake workers for status or to repeat delivered reports. Retain completed reports and inspect outstanding command effects without waking completed workers. Stop only intended active descendants, never `/root` or yourself.
+Prefer event-driven `wait_agent` with a task-appropriate `timeout_ms` within the tool's advertised bounds when waiting for worker completion. Runtime maintenance and stalled-worker nudges do not guarantee completion. On timeout, inspect authoritative progress and blockers; continue independent work or recover stalled work instead of repeating unchanged waits. A timeout does not cancel the worker.
+
+Do not wake workers for status or to repeat delivered reports. Retain completed reports and inspect outstanding command effects without waking completed workers. Stop only intended active descendants, never `/root` or yourself.
 
 If a worker returns incomplete work, use its exact remaining scope and the team's available capacity to resume locally or redistribute independent portions. Do not resend an oversized assignment unchanged. Estimated volume is not evidence of an exhausted enforced context budget.
 

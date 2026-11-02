@@ -394,6 +394,7 @@ impl InProcessClientSender {
 /// through `codex-app-server-client`, which adds worker-task buffering,
 /// request/response helpers, and surface-specific startup policy.
 pub struct InProcessClientHandle {
+    observation_id: u64,
     client: InProcessClientSender,
     event_rx: mpsc::Receiver<InProcessServerEvent>,
     runtime_handle: tokio::task::JoinHandle<IoResult<()>>,
@@ -427,6 +428,8 @@ impl InProcessClientHandle {
     }
 
     async fn shutdown_owned(mut self) -> IoResult<()> {
+        let observation_id = self.observation_id;
+        codex_protocol::timing::client_probe::record(101, observation_id, 0, 0, 0, [0; 4]);
         // Explicit shutdown abandons unread events. Close the receiver first so
         // a runtime task blocked on a must-deliver event can observe closure,
         // finish cleanup, and avoid leaving both transport directions stalled.
@@ -444,13 +447,15 @@ impl InProcessClientHandle {
         // A completed join can contain a panic; timeout success is not task success.
         let runtime_result =
             finish_in_process_task("runtime", &mut runtime_handle, None, deadline).await;
-        match runtime_result {
+        let result = match runtime_result {
             // Closing unread lossless delivery can finish the runtime before it
             // consumes Shutdown. Its joined result is the authoritative barrier,
             // including persistence, even if the queued acknowledgement was lost.
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) | Err(error) => Err(error),
-        }
+        };
+        codex_protocol::timing::client_probe::record(102, observation_id, 0, 0, 0, [u64::from(result.is_ok()), 0, 0, 0]);
+        result
     }
 
     pub fn sender(&self) -> InProcessClientSender {
@@ -494,6 +499,7 @@ pub async fn start(mut args: InProcessStartArgs) -> IoResult<InProcessClientHand
     };
     client.initialize_response = Some(initialize_response);
     sender.notify(ClientNotification::Initialized)?;
+    codex_protocol::timing::client_probe::record(100, client.observation_id, 0, 0, 0, [0; 4]);
 
     Ok(client)
 }
@@ -991,6 +997,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
 
 
     Ok(InProcessClientHandle {
+        observation_id: codex_protocol::timing::client_probe::instance(),
         client: InProcessClientSender { client_tx },
         event_rx,
         runtime_handle,

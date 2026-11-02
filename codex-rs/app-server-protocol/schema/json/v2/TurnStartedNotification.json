@@ -2847,7 +2847,11 @@
         },
         "unions": {
           "$ref": "#/definitions/TurnTimingUnions"
-        }
+        },
+        "dependencyGraph": {"anyOf":[{"$ref":"#/definitions/TurnTimingDependencyGraph"},{"type":"null"}],"description":"Native causal envelopes. A partial graph retains reasons, not a claimed critical path; streaming forks and descendants need independent coverage."},
+        "measurementEvidence": {"description":"Versioned identity-backed output/context evidence and explicit request classifications. Absence is legacy unknown, never a measured zero."},
+        "recoveryTelemetry": {"description":"Versioned physical-attempt capture and referenced recovery attribution."},
+        "performanceObservations": {"description":"Same-clock native transport/connection observations and current-process resource accounting. Missing endpoints remain unknown. Explicit runner cohort labels do not independently certify matched workloads."}
       },
       "required": [
         "classificationComplete",
@@ -4594,7 +4598,9 @@
         "unchangedRelevantState": {
           "default": false,
           "type": "boolean"
-        }
+        },
+        "cacheComparisonKey": {"description":"Explicit controlled-run comparison key, not inferred from cache hits.","type":["string","null"]},
+        "logicalContextSha256": {"description":"SHA256 of the full logical instructions/input/tools, before transport delta normalization, independently of optional heavy diagnostics.","type":["string","null"]}
       },
       "required": [
         "isContinuation"
@@ -6025,7 +6031,10 @@
           "type": "object"
         }
       ]
-    }
+    },
+    "TurnTimingDependencyGraph": {"description":"Bounded native task envelopes, not a prediction of achievable savings.","properties":{"clockDomainId":{"type":["string","null"]},"complete":{"type":"boolean"},"durationNs":{"format":"uint64","minimum":0,"type":"integer"},"finishNode":{"type":"string"},"includesDescendants":{"type":"boolean"},"nodes":{"items":{"$ref":"#/definitions/TurnTimingDependencyNode"},"type":"array"},"schemaVersion":{"format":"uint16","minimum":0,"type":"integer"},"startNode":{"type":"string"},"startedAtNs":{"format":"uint64","minimum":0,"type":"integer"},"unavailableReasons":{"items":{"type":"string"},"type":"array"}},"required":["complete","durationNs","finishNode","includesDescendants","nodes","schemaVersion","startNode","startedAtNs","unavailableReasons"],"type":"object"},
+    "TurnTimingDependencyNode": {"properties":{"dependsOn":{"items":{"type":"string"},"type":"array"},"endNs":{"format":"uint64","minimum":0,"type":["integer","null"]},"evidenceRef":{"type":["string","null"]},"id":{"type":"string"},"inputIdentity":{"type":["string","null"]},"kind":{"$ref":"#/definitions/TurnTimingDependencyNodeKind"},"necessity":{"description":"Explicit referenced assessment, never inferred from equal identities.","type":["string","null"]},"necessityEvidence":{"items":{"type":"string"},"type":"array"},"repeatOf":{"type":["string","null"]},"samplingRequestId":{"type":["string","null"]},"startNs":{"format":"uint64","minimum":0,"type":["integer","null"]},"workIdentity":{"type":["string","null"]}},"required":["dependsOn","id","kind"],"type":"object"},
+    "TurnTimingDependencyNodeKind": {"enum":["boundary","model","tool","wait"],"type":"string"}
   },
   "properties": {
     "threadId": {

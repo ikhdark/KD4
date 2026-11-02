@@ -3288,6 +3288,10 @@ async fn call_nested_tool(
     } else {
         bounded_serialized_json(&result_value)
     };
+    exec.turn.turn_timing_state.record_native_nested_result(
+        &nested_call_id, cell_id.as_str(), &runtime_tool_call_id,
+        parent_tool_call_id.as_deref(), result_bytes,
+    );
     // Source evidence may outlive the packet; retain its independent pin when
     // it cannot use a compact native read receipt or a small inline observation.
     let compact_source_read =

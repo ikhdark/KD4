@@ -37,13 +37,21 @@ impl ExtensionEventSink for AppServerExtensionEventSink {
     fn emit_for_thread(&self, thread_id: ThreadId, event: Event) {
         match event.msg {
             EventMsg::Warning(warning) => {
-                self.outgoing
+                let identity = codex_protocol::timing::client_probe::enabled().then(|| (
+                    codex_protocol::timing::client_probe::key(&thread_id.to_string()),
+                    codex_protocol::timing::client_probe::key(&warning.message),
+                ));
+                let accepted = self.outgoing
                     .try_send_server_notification(ServerNotification::Warning(
                         WarningNotification {
                             thread_id: Some(thread_id.to_string()),
                             message: warning.message,
                         },
                     ));
+                if let Some((thread, message)) = identity {
+                    codex_protocol::timing::client_probe::record(120, 0, thread, 0, message,
+                        [u64::from(accepted), 0, 0, 0]);
+                }
             }
             _ => self.emit(event),
         }

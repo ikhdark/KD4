@@ -99,6 +99,12 @@ pub enum TryStartTurnIfIdleRejectionReason {
     PendingInputLimitExceeded,
 }
 
+/// A start observer timed out without settling or cancelling the terminal owner.
+#[derive(Debug)]
+pub struct TurnFinalizationTimeout {
+    pub turn_id: String,
+}
+
 /// Failed live admission retains the caller's items for an explicit retry.
 #[derive(Debug)]
 pub enum InjectResponseItemsError {
@@ -806,7 +812,11 @@ impl CodexThread {
 
     /// Wait for and identify an already-finalizing turn without replacing it.
     /// A worker that is still running remains a start/steer precondition.
-    pub async fn wait_for_turn_finalization(&self) -> Option<String> {
+    /// Timing out or dropping this observer leaves the owner and its fences intact.
+    pub async fn wait_for_turn_finalization(
+        &self,
+        wait_timeout: std::time::Duration,
+    ) -> Result<Option<String>, TurnFinalizationTimeout> {
         let terminal = {
             let active = self.codex.session.active_turn.lock().await;
             active
@@ -815,10 +825,17 @@ impl CodexThread {
                 .and_then(|turn| turn.terminal.clone())
         };
         if let Some(terminal) = terminal {
-            terminal.wait_completed().await;
-            return Some(terminal.turn_id().to_owned());
+            if tokio::time::timeout(wait_timeout, terminal.wait_completed())
+                .await
+                .is_err()
+            {
+                return Err(TurnFinalizationTimeout {
+                    turn_id: terminal.turn_id().to_owned(),
+                });
+            }
+            return Ok(Some(terminal.turn_id().to_owned()));
         }
-        None
+        Ok(None)
     }
 
     pub async fn load_history(

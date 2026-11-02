@@ -2344,6 +2344,7 @@ def _cargo_command_with_message_format(command: Sequence[str]) -> list[str]:
 
 def _cargo_executables(
     messages: Path, freshness: dict[str, object] | None = None,
+    *, link_crates: Sequence[str] = (), link_artifacts: list[dict[str, object]] | None = None,
 ) -> list[Path]:
     executables: dict[str, Path] = {}
     with messages.open(encoding="utf-8", errors="replace") as stream:
@@ -2364,6 +2365,22 @@ def _cargo_executables(
                         "fresh": message.get("fresh"),
                         "cause": "not reported by Cargo compiler-artifact messages",
                     })
+                crate = (message.get("target") or {}).get("name")
+                if link_artifacts is not None and crate in link_crates:
+                    for name in message.get("filenames", []):
+                        path = Path(name)
+                        if path.suffix != ".rlib" or any(row["cargoPath"] == str(path) for row in link_artifacts):
+                            continue
+                        suffix = path.stem.rsplit("-", 1)[1]
+                        fingerprints = list((path.parent.parent / ".fingerprint").glob(
+                            f"*-{suffix}/lib-{crate}.json"))
+                        if len(fingerprints) != 1:
+                            raise ValueError(f"no unique compiler fingerprint for {path}")
+                        fingerprint = fingerprints[0]
+                        link_artifacts.append({"crate": crate, "cargoPath": str(path),
+                            "profile": message.get("profile"),
+                            "fingerprint": json.loads(fingerprint.read_text(encoding="utf-8")),
+                            "cargoFingerprint": fingerprint.with_suffix("").read_text(encoding="utf-8").strip()})
                 if message.get("executable"):
                     path = Path(message["executable"])
                     executables.setdefault(source_root_identity(path), path)
@@ -2443,9 +2460,11 @@ def _reuse_bundle(
     """Hand out a verified bundle; copy it when the caller named a new directory."""
     if destination is None:
         return source, list(receipt["binaries"])
-    copies = freeze_bundle(destination, [source / entry["name"] for entry in receipt["binaries"]])
-    if [(entry["name"], entry["sha256"]) for entry in copies] != [
-        (entry["name"], entry["sha256"]) for entry in receipt["binaries"]
+    entries = [*receipt["binaries"], *receipt.get("linkArtifacts", [])]
+    all_copies = freeze_bundle(destination, [source / entry["name"] for entry in entries])
+    copies = all_copies[:len(receipt["binaries"])]
+    if [(entry["name"], entry["sha256"]) for entry in all_copies] != [
+        (entry["name"], entry["sha256"]) for entry in entries
     ]:
         raise RuntimeError(f"copied bundle hashes differ from {source}")
     _write_receipt(destination, {
@@ -2565,7 +2584,7 @@ def _verified_receipt(
             _reuse_decision(decisions, gate, "missing_evidence", candidate=bundle,
                             expected="nonempty binary manifest", observed=receipt.get("binaries"))
             return None
-        for entry in receipt["binaries"]:
+        for entry in [*receipt["binaries"], *receipt.get("linkArtifacts", [])]:
             gate = "binary_sha256"
             binary = bundle / entry["name"]
             candidate = binary
@@ -2792,6 +2811,7 @@ def run_in_cargo_lane(
     max_active_lanes: int | None = None,
     source_mirror: str = "auto",
     freeze_bundle_dir: Path | None = None,
+    record_link_crates: Sequence[str] = (),
     rebuild: bool = False,
 ) -> int:
     """Reuse a compatible warm build directory and run the command once.
@@ -2804,6 +2824,11 @@ def run_in_cargo_lane(
         raise ValueError("run-lane requires a command after --")
     if source_mirror not in SOURCE_MIRROR_MODES:
         raise ValueError(f"unknown source mirror mode {source_mirror!r}")
+    if record_link_crates:
+        if freeze_bundle_dir is None or any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) for name in record_link_crates):
+            raise ValueError("--record-link-crate needs crate names and an explicit --freeze-bundle")
+        # Existing binary-only receipts cannot prove a requested link-input capture.
+        rebuild = True
     if freeze_bundle_dir is not None:
         freeze_bundle_dir = freeze_bundle_dir.absolute()
         if freeze_bundle_dir.exists():
@@ -3005,10 +3030,14 @@ def run_in_cargo_lane(
                     record["cargoMs"] = (time.perf_counter() - cargo_started) * 1000
                 record["cargoExitCode"] = code
                 record["exitCode"] = code
+                link_artifacts: list[dict[str, object]] = []
                 executables = (
-                    _cargo_executables(messages_path, cache_reuse["cargoFreshness"])
+                    _cargo_executables(messages_path, cache_reuse["cargoFreshness"],
+                        link_crates=record_link_crates if code == 0 else (), link_artifacts=link_artifacts)
                     if messages_path is not None else []
                 )
+                if code == 0 and set(record_link_crates) != {row["crate"] for row in link_artifacts}:
+                    raise ValueError("requested link crates missing from actual Cargo artifacts")
                 if code == 0:
                     try:
                         (target_dir / ".lane-build-context.json").write_text(
@@ -3037,7 +3066,13 @@ def run_in_cargo_lane(
                         _prune_bundle_store(store, max_age_days=max(1.0, max_age))
                         bundle_dir = store / f"{manifest['sha256'][:16]}-{uuid.uuid4().hex[:8]}"
                     if bundle_dir is not None:
-                        binaries = freeze_bundle(bundle_dir, executables)
+                        capture_started = time.perf_counter()
+                        frozen = freeze_bundle(bundle_dir, [*executables,
+                            *(Path(row["cargoPath"]) for row in link_artifacts)])
+                        binaries = frozen[:len(executables)]
+                        links = [{**row, **identity} for row, identity in
+                                 zip(link_artifacts, frozen[len(executables):])]
+                        record["linkArtifactCaptureMs"] = (time.perf_counter() - capture_started) * 1000
                         _write_receipt(bundle_dir, {
                             "version": BUNDLE_RECEIPT_VERSION,
                             "createdUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -3051,6 +3086,8 @@ def run_in_cargo_lane(
                             "resolvedLane": resolved_lane,
                             "targetDir": str(target_dir),
                             "binaries": binaries,
+                            **({"linkArtifacts": links, "sourceFiles": mirror_entries if skipped is None else source.entries}
+                               if record_link_crates else {}),
                         })
                         record["bundle"] = {"dir": str(bundle_dir), "binaries": binaries}
                         print(
@@ -3819,6 +3856,10 @@ def main(argv: list[str] | None = None) -> int:
         "Sealed snapshots without it freeze into the local bundle store.",
     )
     run_lane_parser.add_argument(
+        "--record-link-crate", action="append", default=[],
+        help="With --freeze-bundle, retain exact Cargo rlibs/fingerprints and source hashes for a named crate; repeatable. No binary-only reuse.",
+    )
+    run_lane_parser.add_argument(
         "--rebuild",
         action="store_true",
         help="Build even when an exact frozen bundle already exists.",
@@ -3934,6 +3975,7 @@ def main(argv: list[str] | None = None) -> int:
                 or (max_active_lanes_per_base() if args.allow_cold_overflow else None),
                 source_mirror=args.source_mirror,
                 freeze_bundle_dir=args.freeze_bundle,
+                record_link_crates=args.record_link_crate,
                 rebuild=args.rebuild,
             )
         elif args.command == "find-bundle":

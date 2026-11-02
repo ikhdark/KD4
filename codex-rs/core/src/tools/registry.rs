@@ -445,9 +445,18 @@ pub(crate) fn record_tool_result_measurement(
     timing: &TurnTimingState,
     execution_id: &str,
     call_id: &str,
+    tool_name: &str,
     result: &Result<AnyToolResult, FunctionCallError>,
 ) {
     use sha2::Digest;
+    let name = tool_name.strip_prefix("functions.").unwrap_or(tool_name);
+    if matches!(name, "read_file" | "read_tool_output" | "exec_command" | "shell_command" | "shell") {
+        let signal = result.as_ref().ok().and_then(|result| result.result.sampling_request_signal());
+        let history = result.as_ref().ok().and_then(|result| result.operation_history.clone());
+        timing.record_native_operation(execution_id, call_id,
+            if matches!(name, "read_file" | "read_tool_output") { "read" } else { "command" },
+            signal.as_ref().and_then(|signal| signal.get("native_read")).cloned(), history);
+    }
     let (rendered, projection) = match result {
         Ok(result) => (serde_json::to_vec(&result.response()).ok(), result.model_projection.as_ref()),
         Err(error) => (serde_json::to_vec(&serde_json::json!({"error":error.to_string()})).ok(), None),
