@@ -3908,11 +3908,15 @@ impl Session {
                         .as_ref()
                         .map(|task| task.turn_context.sub_id.as_str())
                 });
-            if active_id != Some(sub_id.as_str()) {
+            if active_id != Some(sub_id.as_str())
+                || at.terminal.as_ref().is_some_and(|terminal|
+                    terminal.interrupt_pending() || terminal.interaction_released())
+                || at.task.as_ref().is_some_and(|task| task.cancellation_token.is_cancelled())
+            {
                 return None;
             }
             let mut ts = at.turn_state.lock().await;
-            let previous = ts.insert_pending_user_input(sub_id, call_id.clone(), tx_response);
+            let previous = ts.insert_pending_user_input(sub_id, call_id.clone(), args.clone(), tx_response);
             (Arc::clone(&at.turn_state), previous)
         };
         self.terminal_tasks.spawn(async move {
@@ -3951,44 +3955,89 @@ impl Session {
     }
 
 
+    /// Match and persist native input before waking its consumer. The existing
+    /// history gate orders it against steering, compaction, rollback and plan
+    /// publication; the in-flight owner survives cancellation of the notifier.
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state updates must remain atomic"
     )]
     pub async fn notify_user_input_response_for_request(
-        &self,
+        self: &Arc<Self>,
         sub_id: &str,
         call_id: Option<&str>,
         response: RequestUserInputResponse,
     ) {
-        let entry = {
-            let mut active = self.active_turn.lock().await;
-            match active.as_mut() {
-                Some(at) => {
-                    let mut ts = at.turn_state.lock().await;
-                    ts.remove_matching_user_input(sub_id, call_id)
-                        .map(|tx_response| (tx_response, at.terminal.clone()))
+        let session = Arc::clone(self);
+        let sub_id = sub_id.to_owned();
+        let call_id = call_id.map(str::to_owned);
+        let in_flight = self.retain_tool_dispatch_commit();
+        let result = tokio::spawn(async move {
+            let _in_flight = in_flight;
+            let _commit = session.durable_history_commit_gate.acquire().await
+                .map_err(|_| std::io::Error::other("history commit gate is closed"))?;
+            let entry = {
+                let active = session.active_turn.lock().await;
+                match active.as_ref() {
+                    Some(at) => {
+                        let active_id = at.terminal.as_ref().map(|terminal| terminal.turn_id())
+                            .or_else(|| at.task.as_ref().map(|task| task.turn_context.sub_id.as_str()));
+                        if active_id != Some(sub_id.as_str())
+                            || at.terminal.as_ref().is_some_and(|terminal|
+                                terminal.interrupt_pending() || terminal.interaction_released())
+                            || at.task.as_ref().is_some_and(|task| task.cancellation_token.is_cancelled())
+                        {
+                            return Ok(());
+                        }
+                        let mut ts = at.turn_state.lock().await;
+                        ts.remove_matching_user_input(&sub_id, call_id.as_deref())
+                            .map(|pending| (pending, at.terminal.clone(),
+                                at.task.as_ref().map(|task| Arc::clone(&task.turn_context))))
+                    }
+                    None => None,
                 }
-                None => None,
+            };
+            let Some(((call_id, args, tx_response), terminal, turn_context)) = entry else {
+                warn!("No pending user input found for sub_id: {sub_id}");
+                return Ok(());
+            };
+            if tx_response.is_closed() {
+                return Ok(());
             }
-        };
-        match entry {
-            Some((tx_response, terminal)) => {
-                // Delivery and fencing share admission locks so a canceled
-                // waiter is inert and an accepted consumer cannot finish first.
-                if response.interrupted
-                    && let Some(terminal) = terminal
-                {
-                    terminal
-                        .mark_interrupt_pending_if(|| tx_response.send(response).is_ok())
-                        .await;
+            if response.interrupted {
+                // Sampling admission must never be acquired while holding the
+                // history gate: a sampling owner can itself be recording input.
+                drop(_commit);
+                if let Some(terminal) = terminal {
+                    terminal.mark_interrupt_pending_if(|| tx_response.send(response).is_ok()).await;
                 } else {
                     tx_response.send(response).ok();
                 }
+                return Ok(());
             }
-            None => {
-                warn!("No pending user input found for sub_id: {sub_id}");
+            if let Some(item) = user_decision::AcceptedUserDecision::snapshot(
+                &sub_id, &call_id, &args, &response,
+            ).map_err(std::io::Error::other)? {
+                let turn_context = turn_context.ok_or_else(||
+                    std::io::Error::other("native decision has no originating turn context"))?;
+                // Input was admitted with a live matched waiter. Later cancellation
+                // does not erase that accepted user decision, just as with chat input.
+                session.persist_rollout_items_ordered(&[RolloutItem::ResponseItem(item.clone())]).await?;
+                session.state.lock().await.record_items(
+                    std::iter::once(&item), turn_context.model_info.truncation_policy.into(),
+                );
+                if let Err(error) = session.flush_rollout().await {
+                    turn_context.turn_timing_state.record_tool_result_persistence_barrier_failed();
+                    return Err(error);
+                }
             }
+            tx_response.send(response).ok();
+            Ok::<(), std::io::Error>(())
+        }).await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!("Could not persist native user decision: {error}"),
+            Err(error) => warn!("Native user decision owner failed: {error}"),
         }
     }
 

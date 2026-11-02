@@ -82,6 +82,9 @@ impl RetryDecision {
 #[derive(Clone, Debug, Default)]
 pub struct RetryDecisionLedger {
     pending: Option<RetryDecision>,
+    history: std::collections::VecDeque<RetryDecision>,
+    actual_decisions: u64,
+    dropped_decisions: u64,
 }
 
 pub struct RetryPlan<'a> {
@@ -117,6 +120,7 @@ impl RetryDecisionLedger {
 
     pub fn plan(&mut self, now_ns: u128, plan: RetryPlan<'_>) {
         self.finish(now_ns, None);
+        self.actual_decisions = self.actual_decisions.saturating_add(1);
         let decision = RetryDecision {
             schema_version: 1,
             clock_id: plan.clock_id,
@@ -177,5 +181,22 @@ impl RetryDecisionLedger {
             "not_executed"
         };
         decision.emit();
+        if self.history.len() == 256 {
+            self.history.pop_front();
+            self.dropped_decisions = self.dropped_decisions.saturating_add(1);
+        }
+        self.history.push_back(decision);
+    }
+
+    pub fn measurement_snapshot(&self, origin_ns: Option<u128>) -> serde_json::Value {
+        let rows = self.history.iter().chain(self.pending.iter()).filter_map(|decision| {
+            let origin = origin_ns?;
+            let mut row = serde_json::to_value(decision).ok()?;
+            row["start_time"] = serde_json::json!(decision.started_ns.checked_sub(origin)? as f64 / 1e9);
+            row["end_time"] = serde_json::json!(decision.ended_ns.and_then(|end| end.checked_sub(origin)).map(|end| end as f64 / 1e9));
+            Some(row)
+        }).collect::<Vec<_>>();
+        serde_json::json!({"actualCount":self.actual_decisions, "dropped":self.dropped_decisions,
+            "complete":self.dropped_decisions == 0 && rows.len() as u64 == self.actual_decisions, "rows":rows})
     }
 }

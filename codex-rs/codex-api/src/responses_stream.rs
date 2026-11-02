@@ -786,8 +786,16 @@ impl ResponsesStreamEvent<'_> {
         let completed = response.and_then(|v| v.completed_at.as_ref());
         let created_at = timestamp(created);
         let completed_at = timestamp(completed);
+        let raw_tier = response.and_then(|value| value.service_tier.as_ref());
+        let response_service_tier = raw_tier.and_then(Value::as_str).filter(|tier| {
+            !tier.is_empty() && tier.len() <= 64
+                && tier.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        });
         Some(crate::telemetry::ProviderObservation {
             phase, response_id: response_id.map(str::to_owned), created_at, completed_at,
+            response_service_tier: response_service_tier.map(str::to_owned),
+            response_service_tier_invalid: raw_tier.is_some_and(|value| !value.is_null())
+                && response_service_tier.is_none(),
             safety_buffering,
             output_token_receipts: token_receipts,
             token_receipts_complete: false,

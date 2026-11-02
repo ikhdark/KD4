@@ -573,6 +573,13 @@ impl SessionTelemetry {
         self.metadata.conversation_id
     }
 
+    pub fn requested_service_tier(&self) -> Option<&str> {
+        self.metadata.service_tier.as_deref().filter(|tier| {
+            !tier.is_empty() && tier.len() <= 64
+                && tier.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        })
+    }
+
     pub fn with_auth_env(mut self, auth_env: AuthEnvTelemetryMetadata) -> Self {
         self.metadata.auth_env = auth_env;
         self

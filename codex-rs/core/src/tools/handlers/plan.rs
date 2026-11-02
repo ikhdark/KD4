@@ -179,8 +179,14 @@ impl PlanHandler {
             ));
         }
 
+        let mut arguments: JsonValue = serde_json::from_str(&arguments).map_err(|error| {
+            FunctionCallError::RespondToModel(format!("failed to parse function arguments: {error}"))
+        })?;
+        let measurements = arguments.as_object_mut().and_then(|arguments| arguments.remove("measurements"))
+            .map(|packet| turn.turn_timing_state.validate_measurement_annotations(&packet))
+            .transpose().map_err(FunctionCallError::RespondToModel)?;
         let mut requested_args =
-            serde_json::from_str::<PlanToolArgs>(&arguments).map_err(|error| {
+            serde_json::from_value::<PlanToolArgs>(arguments).map_err(|error| {
                 FunctionCallError::RespondToModel(format!(
                     "failed to parse function arguments: {error}"
                 ))
@@ -269,6 +275,9 @@ impl PlanHandler {
                 lineage: staged.update.lineage.clone(),
             };
             if !staged.needs_publication() {
+                if let Some(measurements) = measurements {
+                    turn.turn_timing_state.record_measurement_annotations(measurements);
+                }
                 return Ok(boxed_tool_output(output));
             }
             let response = output.durable_response();
@@ -285,6 +294,9 @@ impl PlanHandler {
                     "durable plan publication failed: {error}; the previous plan and revision are unchanged"
                 )))?;
             let update = staged.commit_published();
+            if let Some(measurements) = measurements {
+                turn.turn_timing_state.record_measurement_annotations(measurements);
+            }
             drop(scope_guard);
             if turn.config.features.enabled(codex_features::Feature::Kd4Runtime)
                 && !update.lineage.obligation_summary(&update.current).unresolved.is_empty()

@@ -944,15 +944,10 @@ impl Session {
         let schedule = self
             .schedule_turn_terminal(Some(turn_id), TurnTerminalOutcome::Aborted(reason))
             .await;
-        let matched = schedule.matched();
-        if let Some(coordinator) = schedule.coordinator() {
-            tokio::time::timeout(Duration::from_secs(5), coordinator.wait_completed())
-                .await
-                .map_err(|_| CodexErr::InvalidRequest(
-                    "cancellation requested; terminal persistence is still pending. The turn remains fenced until its owned writes settle".to_string(),
-                ))?;
-        }
-        Ok(matched)
+        // Scheduling accepts cancellation; it does not declare the turn settled.
+        // The app-server listener owns the response after terminal persistence
+        // and queue pausing. Its wait must not become a spurious core error.
+        Ok(schedule.matched())
     }
 
     fn schedule_turn_terminal<'a>(

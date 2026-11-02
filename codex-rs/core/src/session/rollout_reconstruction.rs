@@ -1255,7 +1255,7 @@ impl Session {
                     // Durable plan state is replay metadata, not another model
                     // message or a second tool result.
                     if crate::plan_store::plan_snapshot_from_item(response_item).is_none()
-                        && !super::user_decision::AcceptedUserDecision::is_snapshot(response_item)
+                        && !super::user_decision::is_legacy_snapshot(response_item)
                     {
                         history.record_items(std::iter::once(response_item), truncation_policy);
                     }

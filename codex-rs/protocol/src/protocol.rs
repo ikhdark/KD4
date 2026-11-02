@@ -1826,6 +1826,15 @@ pub struct TurnTiming {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub credit_delta: Option<String>,
+    /// Versioned identity-backed output/context evidence and explicit request
+    /// classifications. Absence is legacy unknown, never a measured zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "unknown")]
+    pub measurement_evidence: Option<serde_json::Value>,
+    /// Versioned physical-attempt capture and referenced recovery attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "unknown")]
+    pub recovery_telemetry: Option<serde_json::Value>,
     /// Content identity of tracked and non-ignored untracked files captured
     /// before this turn's tools ran. Absent means capture was unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2583,6 +2592,11 @@ pub enum TurnTimingRequestDiagnosticsStatus {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnTimingModelRequest {
+    /// SHA256 of the full logical instructions/input/tools, before transport
+    /// delta normalization, independently of optional heavy diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub logical_context_sha256: Option<String>,
     /// Versioned content-free JSON delivery summaries by retained physical
     /// attempt. Chunks are decoded deltas, not individual provider tokens.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

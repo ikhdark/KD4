@@ -76,11 +76,18 @@ impl RequestUserInputHandler {
                 ))
             })?;
 
-        let content = serde_json::to_value(&response).map_err(|err| {
+        let mut content = serde_json::to_value(&response).map_err(|err| {
             FunctionCallError::Fatal(format!(
                 "failed to serialize {REQUEST_USER_INPUT_TOOL_NAME} response: {err}"
             ))
         })?;
+
+        if !response.interrupted {
+            let (_guard, inputs) = session.plan_scope_inputs().await.map_err(|error| {
+                FunctionCallError::Fatal(format!("failed to reconcile native input provenance: {error}"))
+            })?;
+            content["scope_input_provenance"] = inputs.reconciliation_value();
+        }
 
         Ok(boxed_tool_output(JsonToolOutput::new(content)))
     }

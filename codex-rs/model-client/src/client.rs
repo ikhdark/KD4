@@ -1432,6 +1432,8 @@ struct ProviderPhaseReceipt {
 struct ProviderObservations {
     version: u32,
     response_id: Option<String>,
+    response_service_tier: Option<String>,
+    response_service_tier_invalid: bool,
     created_at: Option<f64>,
     completed_at: Option<f64>,
     invalid: bool,
@@ -1523,6 +1525,14 @@ impl ModelAttemptClock {
             version: 1, ..Default::default()
         });
         evidence.invalid |= observation.invalid_source_fields || now_us == u64::MAX;
+        evidence.response_service_tier_invalid |= observation.response_service_tier_invalid;
+        if let Some(tier) = observation.response_service_tier {
+            if let Some(previous) = &evidence.response_service_tier {
+                evidence.response_service_tier_invalid |= previous != &tier;
+            } else {
+                evidence.response_service_tier = Some(tier);
+            }
+        }
         if let Some(id) = observation.response_id {
             if let Some(previous) = &evidence.response_id {
                 evidence.invalid |= previous != &id;
@@ -1823,6 +1833,8 @@ impl ModelTokenReceipts {
 struct ModelStreamDelivery {
     version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
+    requested_service_tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     token_receipts: Option<ModelTokenReceipts>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider_observations: Option<ProviderObservations>,
@@ -1866,6 +1878,7 @@ impl ModelStreamDeliveryObserver {
         identity: Option<ResponseAttemptIdentity>,
         clock: Option<ModelAttemptClock>,
         turn_timing: Option<Arc<TurnTimingState>>,
+        requested_service_tier: Option<String>,
     ) -> Self {
         Self {
             identity,
@@ -1873,6 +1886,7 @@ impl ModelStreamDeliveryObserver {
             turn_timing,
             summary: ModelStreamDelivery {
                 version: 1,
+                requested_service_tier,
                 clock_id: codex_protocol::timing::process_clock_domain_id(),
                 stall_threshold_us: 1_000_000,
                 payload_measurement_version: 1,
@@ -2110,6 +2124,20 @@ impl ModelAttemptGuard {
         }
         self.emitted = true;
         self.clock.mark_completed();
+        if let Some(timing) = &self.turn_timing {
+            let outcome = match outcome {
+                ModelAttemptOutcome::Success => "success",
+                ModelAttemptOutcome::Failed => "failed",
+                ModelAttemptOutcome::Cancelled => "cancelled",
+            };
+            let (progress, transport_attempt) = {
+                let offsets = self.clock.offsets.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                (offsets.first_actionable_output_us.is_some(), offsets.transport_attempt)
+            };
+            let physical_attempt = if transport_attempt == 0 { self.attempt_id.clone() }
+                else { format!("{}:http-{transport_attempt}", self.attempt_id) };
+            timing.record_model_attempt_outcome(&physical_attempt, outcome, progress, self.terminal_usage.as_ref());
+        }
         if self.provider_completed && let Some(timing) = &self.turn_timing {
             timing.record_provider_terminal(&self.sampling_request_id, &self.attempt_id);
         }
@@ -2764,7 +2792,26 @@ pub fn validate_reasoning_effort(
 fn session_telemetry_for_request(
     session_telemetry: &SessionTelemetry,
     request: &ResponsesApiRequest,
+    turn_timing: Option<&Arc<TurnTimingState>>,
 ) -> SessionTelemetry {
+    if let Some(timing) = turn_timing {
+        // Full logical input, before WS incremental normalization. Stream into
+        // SHA256: no extra full-prompt allocation/tokenization.
+        // Optional heavy diagnostics may be cancelled after a fast response.
+        struct ContextWriter(Sha256);
+        impl std::io::Write for ContextWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.update(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let mut context = ContextWriter(Sha256::new());
+        if serde_json::to_writer(&mut context,
+            &(&request.instructions, &request.input, &request.tools)).is_ok() {
+            timing.record_model_context_sha256(hex::encode(context.0.finalize()));
+        }
+    }
     session_telemetry.clone().with_inference_request(
         request.service_tier.as_deref(),
         request
@@ -5325,7 +5372,7 @@ impl ModelClientSession {
                     self.client
                         .prepare_response_items_for_request(&mut request.input);
                     drop(request_transformation_guard);
-                    let request_session_telemetry = session_telemetry_for_request(session_telemetry, &request);
+                    let request_session_telemetry = session_telemetry_for_request(session_telemetry, &request, self.turn_timing.as_ref());
                     let attempt_identity = new_attempt_identity(sampling_request_id);
                     let mut essential_attempt = ModelAttemptGuard::new(
                         request_session_telemetry.clone(), attempt_identity.clone(), retry_index,
@@ -5702,7 +5749,7 @@ impl ModelClientSession {
                 // `generate=false` prewarm is connection setup, not an inference request.
                 session_telemetry.clone()
             } else {
-                session_telemetry_for_request(session_telemetry, &request)
+                session_telemetry_for_request(session_telemetry, &request, self.turn_timing.as_ref())
             };
             let mut client_metadata = self
                 .client
@@ -6780,6 +6827,7 @@ where
                 terminal_delivery_identity.clone(),
                 attempt_clock.clone(),
                 delivery_turn_timing,
+                session_telemetry.requested_service_tier().map(str::to_owned),
             );
             let mut items_added: Vec<ResponseItem> = Vec::new();
             let mut ttft_ms = None;
@@ -7578,6 +7626,11 @@ impl RequestTelemetry for ApiTelemetry {
             context.dispatched.store(false, Ordering::Release);
             if let Some(timing) = &context.timing {
                 timing.mark_model_request_attempt_ended();
+                if error.is_some() || status.is_some_and(|status| status.as_u16() >= 400) {
+                    let physical_attempt = if attempt == 0 { context.identity.physical_attempt_id.clone() }
+                        else { format!("{}:http-{attempt}", context.identity.physical_attempt_id) };
+                    timing.record_model_attempt_outcome(&physical_attempt, "failed", false, None);
+                }
             }
             if error.is_some() {
                 *context

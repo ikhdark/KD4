@@ -603,10 +603,10 @@ impl CodexThread {
             .await
     }
 
-    /// Interrupt only the identified turn, leaving any newer turn untouched.
+    /// Request cancellation of only the identified turn, leaving any newer turn untouched.
     pub async fn interrupt_turn_if_active(&self, turn_id: &str) -> CodexResult<bool> {
         // Terminalization is owned by the session tracker, not by this RPC.
-        // Expiring the UI wait must not cancel admitted writes or admit a successor.
+        // Accepting the RPC must not cancel admitted writes or admit a successor.
         self.codex
             .session
             .abort_turn_if_active(
@@ -802,6 +802,23 @@ impl CodexThread {
         self.codex.session.active_turn.lock().await.as_ref()
             .and_then(|turn| turn.task.as_ref())
             .map(|task| task.turn_context.sub_id.clone())
+    }
+
+    /// Wait for and identify an already-finalizing turn without replacing it.
+    /// A worker that is still running remains a start/steer precondition.
+    pub async fn wait_for_turn_finalization(&self) -> Option<String> {
+        let terminal = {
+            let active = self.codex.session.active_turn.lock().await;
+            active
+                .as_ref()
+                .filter(|turn| turn.task.is_none())
+                .and_then(|turn| turn.terminal.clone())
+        };
+        if let Some(terminal) = terminal {
+            terminal.wait_completed().await;
+            return Some(terminal.turn_id().to_owned());
+        }
+        None
     }
 
     pub async fn load_history(

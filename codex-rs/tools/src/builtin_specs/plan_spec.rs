@@ -36,7 +36,30 @@ pub fn create_update_plan_tool() -> ToolSpec {
     ]), Some(vec!["text".into()]), Some(false.into())), Some(
         "Add requirements without replacing any checklist or outstanding scope. Source defaults to the latest accepted user text; explicit input_id/sha256 must authenticate against accepted input. Repeating the same text/source preserves its stable ID and state.".into()));
     pins.min_items = Some(1);
+    let evidence_object = || JsonSchema::object(BTreeMap::new(), None, Some(true.into()));
+    let annotations = JsonSchema::object(BTreeMap::from([
+        ("samplingRequestId".into(), JsonSchema::string(Some("Retained request ID, current for this generation, or next for the next distinct logical request in this turn. No inferred labels.".into()))),
+        ("workKind".into(), JsonSchema::string_enum(vec![json!("implementation"), json!("rework"), json!("other")], None)),
+        ("revision".into(), JsonSchema::object(BTreeMap::from([
+            ("artifactSha256".into(), JsonSchema::string(None)),
+            ("implementedAtMs".into(), JsonSchema::integer(Some("Native turn-clock implementation milestone, no later than this request dispatch.".into()))),
+            ("evidenceRef".into(), JsonSchema::string(Some("Reference establishing revision of implemented work, not temporal order alone.".into()))),
+            ("cause".into(), JsonSchema::string(None)),
+            ("causeEvidenceRef".into(), JsonSchema::string(None)),
+            ("criticalPath".into(), evidence_object()),
+        ]), Some(vec!["artifactSha256".into(), "implementedAtMs".into(), "evidenceRef".into()]), Some(false.into()))),
+        ("unnecessary".into(), JsonSchema::boolean(Some("Explicit necessity assessment, not inferred from retries/repetition.".into()))),
+        ("necessityEvidenceRef".into(), JsonSchema::string(None)),
+        ("operationId".into(), JsonSchema::string(None)),
+        ("duplicateOf".into(), JsonSchema::string(None)),
+        ("modelTimeAttribution".into(), evidence_object()),
+    ]), Some(vec!["samplingRequestId".into()]), Some(false.into()));
     let properties = BTreeMap::from([
+        ("measurements".into(), JsonSchema::object(BTreeMap::from([
+            ("requests".into(), JsonSchema::array(annotations, Some(
+                "Optional evidence-backed rework/necessity/time annotations for at most 128 retained requests. Totals require complete classification. Does not complete requirements or authorize work.".into()))),
+            ("recovery".into(), evidence_object()),
+        ]), None, Some(false.into()))),
         ("plan".into(), JsonSchema::array(item,
             Some("Replace the checklist. Rows may be renamed or removed, but unfinished requirements must be retained via continues or retired with accepted user authorization.".into()))),
         ("set".into(), updates),

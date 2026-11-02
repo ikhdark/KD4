@@ -566,11 +566,13 @@ pub struct PinnedRequirementArg {
 
 /// Reconstructed only for pinning or a structural scope retirement. Never populated from
 /// model arguments, rendered context, tool output, or inter-agent messages.
+/// Native clarification receipts use their own host-assigned history identity.
 #[derive(Debug, Default)]
 pub struct PlanScopeInputs {
     latest: Option<String>,
     references: Vec<PlanInputReference>,
     revision: String,
+    compacted: bool,
     initial_pins: Vec<PinnedRequirementArg>,
 }
 
@@ -579,7 +581,42 @@ impl PlanScopeInputs {
         let mut inputs = Self::default();
         let mut hash = Sha256::new();
         let mut latest_content = None;
+        let mut latest_user_id = None;
         for item in items {
+            if crate::compact::is_compaction_summary_item(item)
+                || matches!(item, ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. })
+            {
+                inputs.compacted = true;
+                // Omitted steering must not resurrect a pre-compaction reviewed
+                // revision merely because the remaining input hashes match it.
+                hash.update(b"compacted_scope_inputs");
+                if let Some(id) = item.id() {
+                    hash.update((id.len() as u64).to_le_bytes());
+                    hash.update(id.as_bytes());
+                } else if let Ok(bytes) = serde_json::to_vec(item) {
+                    hash.update(Sha256::digest(bytes));
+                }
+            }
+            if let Some(decision) = crate::user_decision::AcceptedUserDecision::from_item(item) {
+                let Some(id) = item.id() else { continue };
+                inputs.latest = Some(id.to_string());
+                hash.update((id.len() as u64).to_le_bytes());
+                hash.update(id.as_bytes());
+                // Bind interpretation to the originating call and complete question,
+                // not only an option label that can recur in unrelated requests.
+                if let Ok(bytes) = serde_json::to_vec(&decision) {
+                    hash.update(Sha256::digest(bytes));
+                }
+                for answer in decision.answers.values().flatten() {
+                    if !answer.trim().is_empty() {
+                        inputs.references.push(PlanInputReference {
+                            input_id: id.to_string(),
+                            sha256: hex::encode(Sha256::digest(answer.as_bytes())),
+                        });
+                    }
+                }
+                continue;
+            }
             let ResponseItem::Message { id: Some(id), role, content, .. } = item else {
                 continue;
             };
@@ -587,6 +624,7 @@ impl PlanScopeInputs {
                 continue;
             }
             inputs.latest = Some(id.to_string());
+            latest_user_id = Some(id.to_string());
             latest_content = Some(content);
             hash.update((id.len() as u64).to_le_bytes());
             hash.update(id.as_bytes());
@@ -611,7 +649,7 @@ impl PlanScopeInputs {
         inputs.revision = hex::encode(hash.finalize());
         // Retain the accepted request itself, not just the model's proposed
         // checklist. Reuse the same source filtering and authenticated hashes.
-        if let (Some(input_id), Some(content)) = (&inputs.latest, latest_content) {
+        if let (Some(input_id), Some(content)) = (&latest_user_id, latest_content) {
             for part in content {
                 let codex_protocol::models::ContentItem::InputText { text } = part else {
                     continue;
@@ -633,15 +671,22 @@ impl PlanScopeInputs {
 
     fn permits(&self, reference: &PlanInputReference, reviewed: Option<&str>) -> bool {
         self.references.contains(reference)
-            && (self.latest.as_deref() == Some(reference.input_id.as_str())
+            // A compacted window can omit later chat boundaries. Retained native
+            // answers remain citeable, but must not silently become latest again.
+            && ((self.latest.as_deref() == Some(reference.input_id.as_str())
+                && !(self.compacted && reference.input_id.starts_with("msg_user_decision_")))
                 || reviewed == Some(self.revision.as_str()))
     }
 
-    fn reconciliation(&self) -> String {
+    pub fn reconciliation_value(&self) -> serde_json::Value {
         serde_json::json!({
             "scope_change_refs": self.references,
             "scope_change_reviewed_revision": self.revision,
-        }).to_string()
+        })
+    }
+
+    fn reconciliation(&self) -> String {
+        self.reconciliation_value().to_string()
     }
 }
 
@@ -1043,6 +1088,13 @@ impl PlanStore {
         }
         let mut current = guard.clone();
         let mut lineage = current.lineage.clone();
+        // Automatic retention preserves the latest ordinary request even when
+        // a native clarification followed it. This authorizes only additive
+        // initial pins; scope retirement still requires permits/reconciliation.
+        let automatic_sources = if current.plan.is_none() {
+            scope_inputs.as_ref().map(|inputs| inputs.initial_pins.iter()
+                .filter_map(|pin| pin.source.clone()).collect::<Vec<_>>()).unwrap_or_default()
+        } else { Vec::new() };
         if current.plan.is_none() {
             if let Some(inputs) = scope_inputs.as_mut() {
                 pin.append(&mut inputs.initial_pins);
@@ -1060,7 +1112,7 @@ impl PlanStore {
                     .find(|reference| Some(&reference.input_id) == inputs.latest.as_ref()).cloned());
                 let source = source.filter(|reference| inputs.permits(
                     reference, scope_change_reviewed_revision.as_deref(),
-                )).ok_or_else(|| format!(
+                ) || automatic_sources.contains(reference)).ok_or_else(|| format!(
                     "pin source must cite authentic accepted user text, reconciled with later input; no changes were made. Available input provenance: {}",
                     inputs.reconciliation()
                 ))?;

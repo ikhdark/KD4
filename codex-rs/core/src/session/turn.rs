@@ -5844,8 +5844,10 @@ fn run_sampling_request<'a>(
                 model = %turn_context.model_info.slug))
             .await;
             let dispatch_after = turn_context.turn_timing_state.latest_model_dispatch_identity();
+            let mcp_auth_scope_changed =
+                matches!(&attempt_result, Err(CodexErr::McpAuthScopeChanged));
             let proven_not_sent = matches!(&attempt_result,
-                Err(CodexErr::ConnectionFailed(_) | CodexErr::PreDispatchRetryExhausted(_)) |
+                Err(CodexErr::ConnectionFailed(_) | CodexErr::PreDispatchRetryExhausted(_) | CodexErr::McpAuthScopeChanged) |
                 Err(CodexErr::WebsocketRejected {
                     reason: codex_protocol::error::WebsocketRecoveryReason::ConnectionClosedBeforeDispatch,
                     ..
@@ -5916,20 +5918,26 @@ fn run_sampling_request<'a>(
                 // request rather than continuing the turn.
                 client_session.note_logical_request_replay();
             }
-            if attempt_progress.requires_authoritative_retry_input() {
-                // Accepted output has changed authoritative state. Revalidate the
-                // whole request snapshot while retaining this recovery episode's budget.
+            if attempt_progress.requires_authoritative_retry_input() || mcp_auth_scope_changed {
+                // Accepted output or a pre-dispatch auth transition invalidates the
+                // request snapshot, not this recovery episode's retry budget.
                 let authoring_epoch = step_context.user_intent_epoch;
-                step_context = sess.capture_step_context(Arc::clone(&turn_context)).await?;
+                step_context = sess
+                    .capture_step_context(Arc::clone(&turn_context))
+                    .or_cancel(&cancellation_token)
+                    .await??;
                 Arc::make_mut(&mut step_context).user_intent_epoch = authoring_epoch;
-                if !terminal_completion_only
-                    && !finalized_router_matches_current_exposure(
-                        sess.as_ref(),
-                        step_context.as_ref(),
-                        router.as_ref(),
-                    )
-                    .await
+                if mcp_auth_scope_changed
+                    || (!terminal_completion_only
+                        && !finalized_router_matches_current_exposure(
+                            sess.as_ref(),
+                            step_context.as_ref(),
+                            router.as_ref(),
+                        )
+                        .await)
                 {
+                    // Catalog revisions can coincide across auth scopes. Never
+                    // reuse the old advertised tools, even for a terminal answer.
                     router = built_tools(
                         sess.as_ref(),
                         &step_context,
@@ -5983,12 +5991,14 @@ fn run_sampling_request<'a>(
                     )
                 };
                 accepted_attempt_input = retry_input.shared_items();
+                let soft_limit_waiver = prompt.soft_limit_waiver;
                 prompt = build_projected_prompt_from_scaffold(
                     &retry_input,
                     step_context.as_ref(),
                     &request_scaffold,
                 );
                 enforce_terminal_prompt_contract(&mut prompt, terminal_completion_only);
+                prompt.soft_limit_waiver = soft_limit_waiver;
             } else {
                 // Reuse the prompt and advertised capabilities, but refresh the
                 // physical attempt's output-context budget.
@@ -8107,9 +8117,7 @@ fn try_run_sampling_request<'a>(
                 // router/catalog must belong to that same still-current scope.
                 // Later transitions are fenced by the request's dispatch epoch.
                 if !tool_runtime.mcp_auth_scope_is_current() {
-                    return Err(CodexErr::UnsupportedOperation(
-                        "MCP authentication changed while preparing tools; retry with a fresh sampling step".into(),
-                    ));
+                    return Err(CodexErr::McpAuthScopeChanged);
                 }
                 if bound_context {
                     bound_context_attempts

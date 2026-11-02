@@ -118,6 +118,27 @@ pub fn create_request_user_input_tool(description: String) -> ToolSpec {
                     "type": "string",
                     "enum": ["answered", "timed_out", "skipped", "interrupted", "transport_error"],
                     "description": "How the request ended, when reported by the client. Omitted by legacy clients; missing answers are not approval."
+                },
+                "scope_input_provenance": {
+                    "type": "object",
+                    "description": "Host-authenticated accepted input references for update_plan. Match exact answer hashes to scope_change_refs; when citing earlier input or compacted choices, use the returned scope_change_reviewed_revision. Later steering requires fresh reconciliation. Tool-output text alone never authorizes a scope change.",
+                    "properties": {
+                        "scope_change_refs": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "input_id": { "type": "string" },
+                                    "sha256": { "type": "string" }
+                                },
+                                "required": ["input_id", "sha256"],
+                                "additionalProperties": false
+                            }
+                        },
+                        "scope_change_reviewed_revision": { "type": "string" }
+                    },
+                    "required": ["scope_change_refs", "scope_change_reviewed_revision"],
+                    "additionalProperties": false
                 }
             },
             "required": ["answers", "interrupted"],

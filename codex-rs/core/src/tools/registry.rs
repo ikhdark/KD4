@@ -441,6 +441,35 @@ pub(crate) struct AnyToolResult {
     pub(crate) operation_history: Option<Value>,
 }
 
+pub(crate) fn record_tool_result_measurement(
+    timing: &TurnTimingState,
+    execution_id: &str,
+    call_id: &str,
+    result: &Result<AnyToolResult, FunctionCallError>,
+) {
+    use sha2::Digest;
+    let (rendered, projection) = match result {
+        Ok(result) => (serde_json::to_vec(&result.response()).ok(), result.model_projection.as_ref()),
+        Err(error) => (serde_json::to_vec(&serde_json::json!({"error":error.to_string()})).ok(), None),
+    };
+    let Some(rendered) = rendered else {
+        timing.record_tool_output_measurement(call_id, execution_id, serde_json::Value::Null);
+        return;
+    };
+    let rendered_hash = hex::encode(sha2::Sha256::digest(&rendered));
+    let (canonical_hash, original_bytes, truncated) = projection.map_or_else(
+        || (rendered_hash.clone(), rendered.len() as u64, false),
+        |projection| (projection.canonical_sha256.clone(), projection.canonical_bytes,
+            projection.projection_truncated || projection.omitted_sections > 0),
+    );
+    timing.record_tool_output_measurement(call_id, execution_id, serde_json::json!({
+        "byteAccounting":"canonical_and_rendered_v1",
+        "contentSha256":canonical_hash, "originalBytes":original_bytes,
+        "renderedSha256":rendered_hash, "renderedBytes":rendered.len(),
+        "truncated":truncated,
+    }));
+}
+
 pub(crate) struct ModelToolProjection {
     original_response: ResponseInputItem,
     bounded: BoundedModelProjection,
@@ -449,6 +478,7 @@ pub(crate) struct ModelToolProjection {
     candidate: Option<crate::tool_history::ToolHistoryCandidate>,
     projected_tokens: u64,
     canonical_bytes: u64,
+    canonical_sha256: String,
     canonical_tokens: u64,
     model_bytes: u64,
     artifact_created: bool,
@@ -3844,6 +3874,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         original_response,
         materialization,
     } = input;
+    let canonical_sha256 = canonical.sha256.clone();
     let successful = matches!(&outcome, ToolOutputOutcome::Success);
     let total_applied_token_limit = applied_token_limit;
     // Make the canonical artifact durable before spending time on the inline
@@ -3977,6 +4008,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
                 as u64,
             canonical_bytes: canonical.exact_bytes,
             canonical_tokens: canonical.approximate_tokens,
+            canonical_sha256: canonical_sha256.clone(),
             model_bytes: rendered.len().saturating_add(retained_non_text_bytes) as u64,
             artifact_created: false,
             artifact_reused: false,
@@ -4016,6 +4048,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             projected_tokens: approx_token_count(&text).saturating_add(non_text_tokens) as u64,
             canonical_bytes: canonical.exact_bytes,
             canonical_tokens: canonical.approximate_tokens,
+            canonical_sha256: canonical_sha256.clone(),
             model_bytes: text.len().saturating_add(non_text_bytes) as u64,
             artifact_created: false,
             artifact_reused: false,
@@ -4138,6 +4171,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
                 .saturating_add(non_text_tokens) as u64,
             canonical_bytes: canonical.exact_bytes,
             canonical_tokens: canonical.approximate_tokens,
+            canonical_sha256: canonical_sha256.clone(),
             model_bytes: original_output_text.len().saturating_add(non_text_bytes) as u64,
             artifact_created,
             artifact_reused: !artifact_created,
@@ -4294,6 +4328,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         projected_tokens,
         canonical_bytes: canonical.exact_bytes,
         canonical_tokens: canonical.approximate_tokens,
+        canonical_sha256,
         model_bytes,
         artifact_created,
         artifact_reused: !artifact_created,

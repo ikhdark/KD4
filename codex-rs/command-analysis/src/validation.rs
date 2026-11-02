@@ -14,6 +14,24 @@ pub struct CommandValidation {
     pub execution_context: Option<ValidationExecutionContext>,
     pub declared: Option<codex_protocol::validation::ValidationCommandContext>,
     pub classification: ValidationClassification,
+    // Completion bookkeeping only; never an execution/replay identity.
+    compilation_check: Option<(Vec<String>, CompilationCheckScope)>,
+}
+
+/// A covering pass must preserve the literal launch owner and normalized Cargo
+/// target/options selection. Locked success covers unlocked failure, not vice
+/// versa: an unlocked pass does not prove the lockfile constraint.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompilationCheckScope {
+    pub identity: String,
+    pub locked: bool,
+}
+
+impl CompilationCheckScope {
+    pub fn covers(&self, earlier: &Self) -> bool {
+        self.identity == earlier.identity && (self.locked || !earlier.locked)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -54,6 +72,11 @@ impl CommandValidation {
             "tests": self.is_test(),
             "execution_modes": modes,
             "execution_context": self.execution_context,
+            "compilation_scope": self.compilation_check.as_ref().and_then(|(command, scope)| {
+                self.execution_context.as_ref()
+                    .filter(|context| &context.command == command)
+                    .map(|_| scope)
+            }),
         })
     }
 }
@@ -483,12 +506,39 @@ pub async fn resolve_command_launch_analysis_with_shell(
         };
         let long_running = matches!(classification, ValidationClassification::Validation { .. })
             || prefers_long_observation_wait(&invocation);
+        // Reuse the authoritative policy/selection owner, but admit coverage
+        // only for direct Cargo and the authenticated check-lane entrypoint.
+        // Shells, arbitrary wrappers and other flag changes keep exact keys.
+        let compilation_check = if let CommandInvocation::Argv { program, args } = &invocation {
+            let binary = program.rsplit(['/', '\\']).next().unwrap_or(program)
+                .to_ascii_lowercase();
+            let binary = binary.strip_suffix(".exe").unwrap_or(&binary);
+            let supported = binary == "cargo" || binary == "just"
+                && args.first().is_some_and(|arg| arg == "check-lane")
+                && runners.iter().any(|runner| runner.matches(program, args)
+                    && runner.admission_runner.as_deref() == Some("rust_build_status")
+                    && runner.operations.contains(&ValidationOperation::Check));
+            let (policy, selection) = analyze_policy_with_runners(&invocation, &runners);
+            if supported && policy == ValidationPolicyClassification::TargetedCompilation {
+                let command = std::iter::once(program.clone()).chain(args.iter().cloned())
+                    .collect::<Vec<_>>();
+                let launch = std::iter::once(program.clone())
+                    .chain(args.iter().filter(|arg| arg.as_str() != "--locked").cloned())
+                    .collect::<Vec<_>>();
+                serde_json::to_string(&(launch, compilation_source_selection(&selection))).ok()
+                    .map(|identity| (command, CompilationCheckScope {
+                        identity,
+                        locked: args.iter().any(|arg| arg == "--locked"),
+                    }))
+            } else { None }
+        } else { None };
         let validation = (declared.is_some()
             || matches!(classification, ValidationClassification::Validation { .. }))
         .then_some(CommandValidation {
             execution_context: None,
             declared,
             classification,
+            compilation_check,
         });
         (validation, long_running)
     })

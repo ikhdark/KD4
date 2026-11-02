@@ -1482,6 +1482,9 @@ impl ContextManager {
     /// Image evidence is preserved; model compatibility is a request-admission decision.
     fn normalize_history(&mut self, _input_modalities: &[InputModality]) {
         let items = Arc::make_mut(&mut self.items);
+        // Host decision records are provenance, not developer instructions or
+        // another user turn. Keep them only in raw/persisted history.
+        items.retain(|item| !crate::user_decision::AcceptedUserDecision::is_native_snapshot(item));
 
         // all function/tool calls must have a corresponding output
         normalize::ensure_call_outputs_present(items);
@@ -2226,6 +2229,9 @@ fn estimate_encrypted_function_output_length(encoded_len: usize) -> usize {
 }
 
 pub fn estimate_item_token_count(item: &ResponseItem) -> i64 {
+    if crate::user_decision::AcceptedUserDecision::is_native_snapshot(item) {
+        return 0;
+    }
     let model_visible_bytes = estimate_response_item_model_visible_bytes(item);
     approx_tokens_from_byte_count_i64(model_visible_bytes)
 }

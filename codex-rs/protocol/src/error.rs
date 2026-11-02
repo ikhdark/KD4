@@ -88,6 +88,11 @@ pub enum CodexErr {
     /// malformed request data, so outer response-stream loops must not retry this error.
     #[error("request could not be built: {0}")]
     RequestBuild(String),
+    /// The prepared MCP surface no longer belongs to the current auth scope.
+    /// The sampling owner must recapture the step and rebuild advertised tools;
+    /// replaying the unchanged prompt cannot repair this pre-dispatch refusal.
+    #[error("MCP authentication changed while preparing tools")]
+    McpAuthScopeChanged,
     #[error(
         "Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying."
     )]
@@ -280,6 +285,7 @@ impl CodexErr {
                 error.status == StatusCode::TOO_MANY_REQUESTS || error.status.is_server_error()
             }
             CodexErr::Stream(..)
+            | CodexErr::McpAuthScopeChanged
             | CodexErr::WebsocketRejected { .. }
             | CodexErr::Timeout
             | CodexErr::RequestTimeout

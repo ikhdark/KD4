@@ -2142,6 +2142,7 @@ pub(crate) fn task_compaction_items(items: &[ResponseItem]) -> Vec<ResponseItem>
                     || Some(*index) == latest_assistant
                     || Some(*index) == latest_summary
                     || is_selected_skill_item(item)
+                    || codex_conversation::user_decision::AcceptedUserDecision::is_native_snapshot(item)
                     || (matches!(item, ResponseItem::Message { role, .. } if role == "user")
                         && !is_compaction_summary_item(item))
             })
@@ -2294,7 +2295,10 @@ fn build_bounded_input_history(
                     || codex_rollout::is_rollout_reconstruction_notice(item)
                     || crate::stable_context::is_unsettled_tool_recovery_notice(item)
                     || is_selected_skill_item(item)
+                    || codex_conversation::user_decision::AcceptedUserDecision::is_native_snapshot(item)
             })
+            // Provenance is retained verbatim in source order, outside the
+            // model-visible text budget (history projection never sends it).
             .map(|(index, item)| (index, item.clone())),
     );
     let latest_assistant = unresolved.iter().rposition(

@@ -12,6 +12,7 @@ pub mod plan_store;
 pub mod stable_context;
 pub mod tool_history;
 pub mod tool_occurrence;
+pub mod user_decision;
 pub mod workspace;
 use codex_command_analysis::validation;
 pub const RESUME_STATE_LOCATOR: &str = "context:resume-state";

@@ -60,6 +60,7 @@ use crate::raw_assistant_output_text_from_item;
 use crate::tool_dispatch_trace::ToolDispatchTimingSnapshot;
 
 mod blocking;
+mod measurements;
 pub mod retries;
 
 const NANOS_PER_MILLISECOND: u128 = 1_000_000;
@@ -637,7 +638,7 @@ impl TurnTimingSnapshot {
                         &mut saturation_count,
                     ),
                 });
-        let model_requests = profile
+        let model_requests: Vec<TurnTimingModelRequest> = profile
             .model_requests
             .iter()
             .map(|request| {
@@ -658,6 +659,7 @@ impl TurnTimingSnapshot {
                         categories
                     });
                 TurnTimingModelRequest {
+                    logical_context_sha256: request.logical_context_sha256.clone(),
                     stream_delivery_by_attempt: request.stream_delivery_by_attempt.clone(),
                     response_queue_timing_by_attempt: request
                         .response_queue_timing_by_attempt
@@ -838,12 +840,22 @@ impl TurnTimingSnapshot {
             saturation_count,
         };
 
+        let scope = format!("native-turn:{}", model_requests.first()
+            .and_then(|request: &TurnTimingModelRequest| request.sampling_request_id.as_deref())
+            .map(str::to_owned).unwrap_or_else(|| self.started_at_unix_ms.unwrap_or_default().to_string()));
+        let (measurement_evidence, recovery_telemetry) = profile.measurements.snapshot(
+            &model_requests, inclusive_duration_ms,
+            self.activity_timeline.clock_domain_id.as_deref(), &scope,
+            &profile.retry_measurements,
+        );
         TurnTiming {
             stop_cause: None,
             activity_timeline: Some(self.activity_timeline.clone()),
             final_answer: None,
             completion_assessment: None,
             credit_delta: self.credit_delta.clone(),
+            measurement_evidence,
+            recovery_telemetry,
             // No checkout capture runs; the wire field stays for older records.
             checkout_snapshot_sha256: None,
             schema_version: profile.schema_version,
@@ -938,6 +950,8 @@ async fn retain_turn_timing_artifact(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TurnTimingProfile {
+    measurements: measurements::Capture,
+    retry_measurements: serde_json::Value,
     pub schema_version: u16,
     pub started: bool,
     pub profile_valid: bool,
@@ -963,6 +977,7 @@ pub struct TurnTimingProfile {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModelRequestTiming {
+    logical_context_sha256: Option<String>,
     stream_delivery_by_attempt: BTreeMap<String, String>,
     response_queue_timing_by_attempt:
         BTreeMap<String, BTreeMap<String, codex_protocol::timing::ResponseQueueTiming>>,
@@ -1252,6 +1267,7 @@ pub struct TimingCounters {
 
 #[derive(Clone, Debug, Default)]
 struct TurnTimingStateInner {
+    measurements: measurements::Capture,
     retry_decisions: retries::RetryDecisionLedger,
     activity_timeline: codex_protocol::timing::TurnTimingTimeline,
     final_content: FinalContentObservations,
@@ -1392,6 +1408,9 @@ impl TurnTimingStateInner {
         }
         Self {
             retry_decisions: self.retry_decisions.clone(),
+            // Terminal capture owns this bounded inventory. Sampling checkpoints
+            // retain existing request/usage facts, not repeated output inventories.
+            measurements: measurements::Capture::default(),
             final_content: self.final_content.clone(),
             activity_timeline: self.activity_timeline.clone(),
             starting_credit_balance: self.starting_credit_balance,
@@ -3888,6 +3907,7 @@ impl TurnTimingState {
             let relevant_state_fingerprint = state.current_relevant_state_fingerprint.clone();
             let failure_fingerprint = state.current_failure_fingerprint.clone();
             let attempt_kind = std::mem::take(&mut state.next_attempt_kind);
+            state.measurements.logical_request();
             if state.model_requests.len() >= MAX_MODEL_REQUEST_TIMINGS {
                 state.model_requests.remove(0);
                 state.model_request_history_truncated = true;
@@ -4433,6 +4453,10 @@ impl TurnTimingState {
         state.activity.provider_request_dispatched = true;
         state.activity.provider_terminal_observed = false;
         let elapsed_ns = state.elapsed_since_start(sample.time.monotonic_ns);
+        if let Some(elapsed_ns) = elapsed_ns {
+            state.measurements.dispatch(sampling_request_id, physical_attempt_id,
+                u128_to_u64_ms(elapsed_ns), attempt_kind != TurnTimingAttemptKind::Primary);
+        }
         let lifecycle_context = self.lifecycle_context();
         let mut consumed_tools = Vec::new();
         if let Some(model_resumed_at_ms) = state
@@ -5148,6 +5172,8 @@ impl TurnTimingStateInner {
             && self.counters.clock_regression_count == 0
             && self.counters.saturation_count == 0;
         let profile = TurnTimingProfile {
+            measurements: self.measurements.clone(),
+            retry_measurements: self.retry_decisions.measurement_snapshot(started_sample.map(|sample| sample.time.monotonic_ns)),
             schema_version: TIMING_SCHEMA_VERSION,
             started: started_sample.is_some(),
             profile_valid,

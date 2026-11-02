@@ -2237,6 +2237,9 @@ impl ToolCallRuntime {
             .then(|| self.session.retain_tool_dispatch_commit());
         let terminal_tasks = self.session.terminal_tasks.clone();
 
+        let measurement_timing = Arc::clone(&timing);
+        let measurement_turn = Arc::clone(&turn);
+        let measurement_call_id = call.call_id.clone();
         let mut dispatch_handle: AbortOnDropHandle<Result<AnyToolResult, FunctionCallError>> =
             AbortOnDropHandle::new(tokio::spawn(crate::tools::tool_dispatch_trace::scope_tool_blocking_timing(Arc::clone(&timing), Box::pin(async move {
                 let admission_tool_name = router.semantic_tool_name(&dispatch_call.tool_name);
@@ -2761,6 +2764,7 @@ impl ToolCallRuntime {
 
         let cancellation_owner = terminal_tasks.spawn(
             async move {
+                let result = async {
                 tokio::select! {
                 res = &mut dispatch_handle => Self::joined_tool_result(res, &dispatch_state).await,
                 _ = cancellation_token.cancelled() => {
@@ -2866,7 +2870,15 @@ impl ToolCallRuntime {
                         Ok(response)
                     }
                 },
-            }
+                }
+                }.await;
+                crate::tools::registry::record_tool_result_measurement(
+                    &measurement_turn.turn_timing_state,
+                    measurement_timing.execution_id().0.as_str(),
+                    &measurement_call_id,
+                    &result,
+                );
+                result
         }
             .in_current_span(),
         );

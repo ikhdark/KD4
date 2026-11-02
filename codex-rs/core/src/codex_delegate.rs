@@ -757,7 +757,7 @@ async fn handle_request_permissions(
 
 async fn await_user_input_with_cancel<F>(
     fut: F,
-    parent_session: &Session,
+    parent_session: &Arc<Session>,
     sub_id: &str,
     call_id: &str,
     cancel_token: &CancellationToken,

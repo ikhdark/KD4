@@ -67,6 +67,8 @@ impl SseCleanupOutcome {
 pub struct ProviderObservation {
     pub phase: &'static str,
     pub response_id: Option<String>,
+    pub response_service_tier: Option<String>,
+    pub response_service_tier_invalid: bool,
     pub created_at: Option<f64>,
     pub completed_at: Option<f64>,
     pub safety_buffering: bool,

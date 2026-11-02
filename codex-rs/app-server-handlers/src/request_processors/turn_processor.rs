@@ -159,11 +159,8 @@ fn active_turn_in_progress_error(turn_id: Option<&str>) -> JSONRPCErrorError {
     error
 }
 
-fn validate_turn_start_target(
-    active_turn_id: Option<&str>,
-    is_running: bool,
-) -> Result<(), JSONRPCErrorError> {
-    if active_turn_id.is_some() || is_running {
+fn validate_turn_start_target(active_turn_id: Option<&str>) -> Result<(), JSONRPCErrorError> {
+    if active_turn_id.is_some() {
         return Err(active_turn_in_progress_error(active_turn_id));
     }
     Ok(())
@@ -1045,18 +1042,39 @@ impl TurnRequestProcessor {
         {
             return self.replay_turn_start(&request_id, thread_id, thread.as_ref(), original).await;
         }
-        let is_running = matches!(thread.agent_status().await, AgentStatus::Running);
-        let active_turn_id = {
-            let thread_state = self.thread_state_manager.thread_state(thread_id).await;
-            thread_state
-                .lock()
-                .await
-                .in_progress_turn_id()
-                .map(str::to_owned)
+        // A finalizing turn is no longer steerable, but still fences its writes.
+        // Wait for that owner rather than bouncing the client between a rejected
+        // steer and a rejected start using the listener's lagging projection.
+        let finalized_turn_id = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                return Err(invalid_request("turn start was cancelled by startup interrupt"));
+            }
+            turn_id = thread.wait_for_turn_finalization() => turn_id,
         };
-        validate_turn_start_target(active_turn_id.as_deref(), is_running).inspect_err(|_| {
+        let active_turn_id = thread.active_turn_id().await;
+        validate_turn_start_target(active_turn_id.as_deref()).inspect_err(|_| {
             self.track_error_response(&request_id, /*error_type*/ None);
         })?;
+        // Core can release interaction before the listener consumes its terminal
+        // event. Retire only a claim proven terminal, never a pending preparation.
+        if let Some(previous) = self
+            .thread_state_manager
+            .pending_turn_start_id(thread_id)
+            .await
+            && (finalized_turn_id.as_deref() == Some(previous.as_str())
+                || thread
+                    .turn_terminal_event(&previous)
+                    .await
+                    .map_err(|error| {
+                        internal_error(format!("failed to reconcile previous turn: {error}"))
+                    })?
+                    .is_some())
+        {
+            self.thread_state_manager
+                .release_turn_start(thread_id, &previous)
+                .await;
+        }
         let queued = reserved_turn_id.is_some();
         let turn_id = reserved_turn_id.unwrap_or_else(|| thread.reserve_turn_id());
         // Direct intake accepts responsibility before configuration/preparation

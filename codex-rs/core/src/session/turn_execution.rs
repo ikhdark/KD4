@@ -174,6 +174,7 @@ struct SamplingToolOutcome {
 struct PendingValidation {
     execution_order: (u64, u64),
     check: String,
+    compilation_scope: Option<crate::validation::CompilationCheckScope>,
 }
 
 /// Preserve the process identity from an actual poll, without coverage claims.
@@ -418,6 +419,7 @@ struct SamplingRequestSignalState {
 
     validation_ordinals: BTreeSet<u64>,
     validation_check_identities: BTreeMap<u64, String>,
+    compilation_check_scopes: BTreeMap<u64, crate::validation::CompilationCheckScope>,
     validation_check_descriptions: BTreeMap<u64, String>,
     suppressed_blocked_wait: bool,
     deterministic_continuation_receipts: BTreeSet<String>,
@@ -482,6 +484,17 @@ impl SamplingRequestSignalState {
         }) && let Some(identity) = serialized_evidence_identity(context)
         {
             self.validation_check_identities.insert(ordinal, identity);
+            if let Some(mut scope) = validation.get("compilation_scope")
+                .and_then(|scope| serde_json::from_value::<crate::validation::CompilationCheckScope>(scope.clone()).ok())
+                .filter(|scope| !scope.identity.is_empty())
+                && let Some(identity) = serialized_evidence_identity(&(
+                    &context["cwd"], &context["environment_id"],
+                    &context["environment_fingerprint"], &scope.identity,
+                ))
+            {
+                scope.identity = identity;
+                self.compilation_check_scopes.insert(ordinal, scope);
+            }
             self.validation_check_descriptions.insert(
                 ordinal,
                 bounded_validation_detail(&format!("Execution: {context}")),
@@ -2434,6 +2447,8 @@ pub(crate) struct TurnExecutionControl {
     failed_validation_checks: BTreeSet<String>,
     validation_check_descriptions: BTreeMap<String, String>,
     validation_check_orders: BTreeMap<String, (u64, u64)>,
+    compilation_check_scopes: BTreeMap<String, crate::validation::CompilationCheckScope>,
+    successful_compilation_scopes: BTreeMap<crate::validation::CompilationCheckScope, (u64, u64)>,
     next_validation_request: AtomicU64,
     pending_validation_processes: BTreeMap<u64, PendingValidation>,
 
@@ -2479,6 +2494,8 @@ impl TurnExecutionControl {
             validation_check_descriptions: BTreeMap::new(),
 
             validation_check_orders: BTreeMap::new(),
+            compilation_check_scopes: BTreeMap::new(),
+            successful_compilation_scopes: BTreeMap::new(),
             next_validation_request: AtomicU64::new(0),
             pending_validation_processes: BTreeMap::new(),
 
@@ -3233,10 +3250,14 @@ impl TurnExecutionControl {
                         }).unwrap_or("unavailable");
                         self.validation_check_descriptions.insert(check.clone(), format!("call {call}; {description}"));
                     }
+                    let compilation_scope = pending.as_ref()
+                        .map(|pending| pending.compilation_scope.clone())
+                        .unwrap_or_else(|| state.compilation_check_scopes.get(&outcome.ordinal).cloned());
                     if let Some(id) = outcome.background_process_id {
                         self.pending_validation_processes.insert(id, PendingValidation {
                             execution_order: order,
                             check,
+                            compilation_scope,
                         });
                         continue;
                     }
@@ -3246,10 +3267,36 @@ impl TurnExecutionControl {
                             | SamplingToolOutcomeKind::RecoverableCancellation)
                     {
                         self.validation_check_orders.insert(check.clone(), order);
+                        if let Some(scope) = compilation_scope.as_ref() {
+                            self.compilation_check_scopes.insert(check.clone(), scope.clone());
+                        } else {
+                            self.compilation_check_scopes.remove(&check);
+                        }
                         if outcome.kind == SamplingToolOutcomeKind::Success {
                             self.failed_validation_checks.remove(&check);
+                            if let Some(scope) = compilation_scope.as_ref() {
+                                self.successful_compilation_scopes.entry(scope.clone())
+                                    .and_modify(|previous| *previous = (*previous).max(order))
+                                    .or_insert(order);
+                                // Only a later covering terminal pass resolves
+                                // this obligation. Exact failures/receipts stay
+                                // in tool history and replay remains unchanged.
+                                self.failed_validation_checks.retain(|failed| {
+                                    !self.compilation_check_scopes.get(failed)
+                                        .is_some_and(|earlier| scope.covers(earlier)
+                                            && self.validation_check_orders.get(failed)
+                                                .is_some_and(|previous| *previous <= order))
+                                });
+                            }
                         } else {
-                            self.failed_validation_checks.insert(check.clone());
+                            // A delayed poll of an older launch must not
+                            // resurrect a failure covered by a later pass.
+                            let covered = compilation_scope.as_ref().is_some_and(|scope|
+                                self.successful_compilation_scopes.iter().any(|(successful, previous)|
+                                    successful.covers(scope) && *previous >= order));
+                            if !covered {
+                                self.failed_validation_checks.insert(check.clone());
+                            }
                             if let Some(excerpt) = &outcome.validation_failure_excerpt {
                                 self.validation_check_descriptions.entry(check).or_default()
                                     .push_str(&format!("; result: {excerpt}"));

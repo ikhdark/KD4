@@ -21,6 +21,7 @@ use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_permissions::UriAdditionalPermissionProfile;
 use codex_protocol::request_user_input::RequestUserInputResponse;
+use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_rmcp_client::ElicitationResponse;
 use codex_sandboxing::policy_transforms::merge_uri_permission_profiles;
 use rmcp::model::RequestId;
@@ -456,7 +457,7 @@ impl Drop for TurnTerminalPermit {
 pub(crate) struct TurnState {
     pending_approvals: HashMap<String, oneshot::Sender<ReviewDecision>>,
     pending_request_permissions: HashMap<String, PendingRequestPermissions>,
-    pending_user_input: HashMap<String, (String, oneshot::Sender<RequestUserInputResponse>)>,
+    pending_user_input: HashMap<String, (String, RequestUserInputArgs, oneshot::Sender<RequestUserInputResponse>)>,
     user_input_request_counts: HashMap<String, usize>,
     pending_elicitations: HashMap<(String, RequestId), oneshot::Sender<ElicitationResponse>>,
     pending_dynamic_tools: HashMap<String, (String, oneshot::Sender<DynamicToolResponse>)>,
@@ -548,6 +549,7 @@ impl TurnState {
         &mut self,
         key: String,
         call_id: String,
+        args: RequestUserInputArgs,
         tx: oneshot::Sender<RequestUserInputResponse>,
     ) -> Option<oneshot::Sender<RequestUserInputResponse>> {
         let count = self
@@ -556,23 +558,23 @@ impl TurnState {
             .or_default();
         *count = count.saturating_add(1);
         self.pending_user_input
-            .insert(key, (call_id, tx))
-            .map(|(_, tx)| tx)
+            .insert(key, (call_id, args, tx))
+            .map(|(_, _, tx)| tx)
     }
 
     pub(crate) fn remove_pending_user_input(
         &mut self,
         key: &str,
-    ) -> Option<oneshot::Sender<RequestUserInputResponse>> {
-        self.pending_user_input.remove(key).map(|(_, tx)| tx)
+    ) -> Option<(String, RequestUserInputArgs, oneshot::Sender<RequestUserInputResponse>)> {
+        self.pending_user_input.remove(key)
     }
 
     pub(crate) fn remove_matching_user_input(
         &mut self,
         key: &str,
         call_id: Option<&str>,
-    ) -> Option<oneshot::Sender<RequestUserInputResponse>> {
-        let (pending_id, _) = self.pending_user_input.get(key)?;
+    ) -> Option<(String, RequestUserInputArgs, oneshot::Sender<RequestUserInputResponse>)> {
+        let (pending_id, _, _) = self.pending_user_input.get(key)?;
         let matches = match call_id {
             Some(call_id) => call_id == pending_id,
             None => self.user_input_request_counts.get(key) == Some(&1),
@@ -588,7 +590,7 @@ impl TurnState {
         if self
             .pending_user_input
             .get(key)
-            .is_some_and(|(_, tx)| tx.is_closed())
+            .is_some_and(|(_, _, tx)| tx.is_closed())
         {
             self.pending_user_input.remove(key);
         }
