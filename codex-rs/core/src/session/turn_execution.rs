@@ -2000,20 +2000,33 @@ fn bounded_validation_detail(text: &str) -> String {
 }
 
 fn validation_failure_excerpt(value: &Value) -> Option<String> {
-    let excerpt = ["stderr", "error", "output", "message"]
+    let texts = ["stderr", "error", "output", "message"]
         .into_iter()
-        .find_map(|key| {
+        .filter_map(|key| {
             value
                 .get(key)
                 .and_then(Value::as_str)
                 .filter(|text| !text.is_empty())
         })
-        .map(bounded_validation_detail);
+        .collect::<Vec<_>>();
+    // Reuse the command owner's diagnostic classifier before bounding text;
+    // dependency build chatter must not crowd out the primary failure.
+    let diagnostic = texts.iter().find_map(|text| {
+        let mut lines = text.lines();
+        let primary = lines.find(|line| codex_command_analysis::shell_output_summary::is_critical_output_line(line))?;
+        Some(std::iter::once(primary).chain(lines.take(3)).collect::<Vec<_>>().join("\n"))
+    });
+    let excerpt = diagnostic.as_deref().or_else(|| texts.first().copied()).map(bounded_validation_detail)
+        .map(|text| match value.get("exit_code").and_then(Value::as_i64) {
+            Some(code) => format!("exit {code}; {text}"),
+            None => text,
+        });
     // Name where the complete output is, so it is read rather than sought
     // through a guessed status tool (audit 2026-10-22 #29).
     let artifact = value
         .get("raw_output_artifact_id")
         .and_then(Value::as_str)
+        .or_else(|| value.get("output_reference")?.get("artifact_id")?.as_str())
         .filter(|id| !id.is_empty())
         .map(|id| format!("full output: read_tool_output artifact_id {id}"));
     match (excerpt, artifact) {
@@ -2552,8 +2565,9 @@ impl TurnExecutionControl {
             verification_gaps: self.plan.iter().flat_map(|plan| {
                 plan.obligations.unresolved.iter().map(|id| {
                     format!(
-                        "Declared plan requirement {id} is unresolved (plan revision {}).",
+                        "Declared plan requirement {id} is unresolved (plan revision {}); requirement: {:?}.",
                         plan.revision,
+                        plan.requirement_texts.get(id).map(String::as_str).unwrap_or("text unavailable in owner snapshot"),
                     )
                 })
             }).collect(),

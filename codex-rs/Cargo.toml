@@ -506,7 +506,7 @@ split-debuginfo = "off"
 strip = "symbols"
 
 # Final publish and ordinary release share one source of optimization settings.
-codegen-units = 4
+codegen-units = 1
 incremental = false
 
 # Both PGO passes use this same Cargo profile, in separate target directories.

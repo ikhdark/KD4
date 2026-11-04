@@ -60,7 +60,7 @@ async fn lookup(
         if state.directories.len() >= 64 { return None; }
         state.directories.insert(key.clone(), None);
         let root = codex_file_system::find_nearest_ancestor_with_markers(
-            fs, &directory, vec![".git".into(), ".codex/fix-evidence/index.json".into()],
+            fs, &directory, vec![".git".into(), ".local/evidence/fixes/index.json".into(), ".codex/fix-evidence/index.json".into()],
             FindUpErrorPolicy::Ignore, Some(sandbox),
         ).await.ok()?;
         state.directories.insert(key.clone(), root);
@@ -70,7 +70,9 @@ async fn lookup(
     if !state.roots.contains_key(&root_key) {
         if state.roots.len() >= 8 { return None; }
         state.roots.insert(root_key.clone(), None);
-        let index_path = root.join(".codex/fix-evidence/index.json").ok()?;
+        let candidates = [root.join(".local/evidence/fixes/index.json").ok()?,
+            root.join(".codex/fix-evidence/index.json").ok()?];
+        let index_path = fs.first_regular_file(&candidates, Some(sandbox)).await.ok()??;
         let loaded = read_json(fs, &index_path, INDEX_BYTES, sandbox).await
             .filter(|(v, _)| v["schema_version"] == 1 && v["fixes"].is_array())
             .map(|(index, hash)| Memory { index, path: index_path, hash,

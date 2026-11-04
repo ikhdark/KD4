@@ -42,6 +42,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.common.process_owner import run_owned, CleanupFailed  # noqa: E402
+from scripts.common.atomic_json import write_json_atomic  # noqa: E402
 
 from scripts.common.tool_versions import cargo_lane_patterns  # noqa: E402
 from scripts.build.rust_tool_env import cargo_package_specs, local_rust_env  # noqa: E402
@@ -2924,9 +2925,6 @@ def run_in_cargo_lane(
         freeze_bundle_dir = freeze_bundle_dir.absolute()
         if freeze_bundle_dir.exists():
             raise ValueError(f"--freeze-bundle must name a new directory: {freeze_bundle_dir}")
-    if timing_path is not None:
-        timing_path.parent.mkdir(parents=True, exist_ok=True)
-    stream = timing_path.open("x", encoding="utf-8") if timing_path else None
     started = time.perf_counter()
     record = {"command": list(command), "requestedLane": requested_lane,
               "exitCode": None, "cargoExitCode": None, "status": "running"}
@@ -2938,6 +2936,10 @@ def run_in_cargo_lane(
         "compilerCache": {"status": "not_run"},
     }
     record["cacheReuse"] = cache_reuse
+    if timing_path is not None:
+        # Readers may observe a live build. Reserve the destination without
+        # exposing an empty/partial JSON file or weakening no-overwrite admission.
+        write_json_atomic(timing_path, record, exclusive=True)
     try:
         if not repo_root.is_dir():
             # The lane is named for this root; a mistyped root would silently
@@ -2983,8 +2985,8 @@ def run_in_cargo_lane(
         )
         source = _source_manifest(repo_root, materialize_internal_file_links=materialize_internal_file_links) if freeze else None
         capture_started = time.perf_counter()
-        rustc = _rustc_identity(child_env, Path.cwd()) if freeze or stream is not None else None
-        if stream is not None:
+        rustc = _rustc_identity(child_env, Path.cwd()) if freeze or timing_path is not None else None
+        if timing_path is not None:
             timing_evidence = {
                 "schemaVersion": 1,
                 "sourceManifest": source.summary() if source is not None else source_tree_manifest(repo_root),
@@ -3235,7 +3237,7 @@ def run_in_cargo_lane(
         print("Build reuse: " + json.dumps({
             key: _cache_evidence_summary(value) for key, value in cache_reuse.items()
         }), file=sys.stderr)
-        if stream is not None:
+        if timing_path is not None:
             if timing_evidence is not None:
                 capture_started = time.perf_counter()
                 try:
@@ -3248,9 +3250,7 @@ def run_in_cargo_lane(
                 timing_evidence["captureMs"] += (time.perf_counter() - capture_started) * 1000
             record["totalMs"] = (time.perf_counter() - started) * 1000
             try:
-                with stream:
-                    json.dump(record, stream, indent=2)
-                    stream.write("\n")
+                write_json_atomic(timing_path, record)
             except OSError as error:
                 print(f"warning: Cargo lane timing could not be saved: {error}", file=sys.stderr)
 

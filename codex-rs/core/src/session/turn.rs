@@ -2113,7 +2113,7 @@ fn changed_tests_advisory(paths: &[String]) -> Option<String> {
     (!paths.is_empty()).then(|| {
         format!(
             "This turn modified or deleted existing test files; review any changed expectations or execution policy: {}.",
-            crate::session::turn_execution::bounded_path_list(paths)
+            serde_json::to_string(paths).expect("path inventory is JSON serializable")
         )
     })
 }
@@ -2121,7 +2121,7 @@ fn changed_tests_advisory(paths: &[String]) -> Option<String> {
 fn incomplete_test_evidence_advisory(paths: &[String]) -> Option<String> {
     (!paths.is_empty()).then(|| format!(
         "Existing-test evidence could not be fully assessed (incomplete analysis or uncertain before/after attribution): {}. Do not treat this as proof that tests were unchanged or attribute uncertain edits to this turn.",
-        crate::session::turn_execution::bounded_path_list(paths)
+        serde_json::to_string(paths).expect("path inventory is JSON serializable")
     ))
 }
 

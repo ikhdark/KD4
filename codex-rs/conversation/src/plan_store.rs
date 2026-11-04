@@ -503,6 +503,8 @@ impl PlanState {
 pub struct PlanExecutionSnapshot {
     pub revision: String,
     pub obligations: PlanObligationSummary,
+    /// Exact owner text for terminal diagnostics, including pinned obligations.
+    pub requirement_texts: BTreeMap<String, String>,
     pub has_steps: bool,
 
 
@@ -923,9 +925,21 @@ impl PlanStore {
             .execution
             .get_or_init(|| {
                 let plan = current.plan.as_ref()?;
+                let fallback;
+                let lineage = if current.lineage.requirements.is_empty() {
+                    fallback = PlanLineage::from_plan(Some(plan));
+                    &fallback
+                } else {
+                    &current.lineage
+                };
+                let obligations = lineage.obligation_summary(plan);
+                let requirement_texts = obligations.unresolved.iter().filter_map(|id| {
+                    lineage.requirements.get(id).map(|requirement| (id.clone(), requirement.text.clone()))
+                }).collect();
                 Some(PlanExecutionSnapshot {
                     revision: current.revision().to_string(),
-                    obligations: current.lineage.obligation_summary(plan),
+                    obligations,
+                    requirement_texts,
                     has_steps: !plan.plan.is_empty(),
                 })
             })

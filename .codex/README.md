@@ -10,11 +10,16 @@ The [root README](../README.md) indexes the active product and development guide
 | --- | --- |
 | [config.toml](config.toml) | Repository-local Codex configuration; kept at its runtime path. |
 | [test-runners.json](test-runners.json) | Validation runner registration; kept at its runtime path. |
-| [audits/](audits/README.md) | Reports, captured artifacts, and per-run evidence bundles. |
-| [fix-evidence/](fix-evidence/index.json) | Shared fix-to-receipt index and task-grouped standalone evidence; existing audit receipts stay in their audit task folders. |
+| [audits/](audits/README.md) | Retained historical reports/captures; new investigation reports use [KDR/audits](../../KDR/audits/README.md). |
+| [fix-evidence/](fix-evidence/index.json) | Existing KD4 fix-to-receipt bindings; moved KDR evidence and shared benchmark learning are linked without copies. |
 | `gitdiff/` (when present) | Runtime output path for named patch receipts from the diff-saving tool. |
-| `benchmark-runs/` (when present) | Benchmark cases and their captured results. |
+| `benchmark-runs/` (when present) | Historical benchmark captures; new output uses KDR's `.local/benchmarks/`. |
 | [locks/](locks/) | Tool-managed coordination files; not disposable audit clutter. |
+
+New investigation evidence, proposals and benchmark learning use
+[KDR's canonical owners](../../KDR/docs/STORAGE_LAYOUT.md), not new stores here.
+Both fix indexes link KDR's `.local/benchmarks/learning/advisories/` projection.
+Preserve existing receipt bytes and historical locations; do not mirror them.
 
 ## Current repository state
 

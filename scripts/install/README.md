@@ -33,7 +33,7 @@ The configured Cargo profiles and publisher `-Profile` values are `dev`,
 ## Final builds
 
 `release` uses optimization level 3, no debug info (`debug = 0`), Thin LTO,
-four codegen units for workspace crates and runtime dependencies, and incremental
+one codegen unit for workspace crates and runtime dependencies, and incremental
 compilation disabled. Build scripts, proc macros, and build-only dependencies
 retain Cargo's build defaults. `pgo` inherits these settings.
 Windows builds retain native CPU tuning,
