@@ -1006,6 +1006,13 @@ impl AgentControl {
         let Some(graph) = state.agent_graph_store() else {
             return Ok(());
         };
+        // A resume can precede full indexing. Unindexed children cannot be restored, the same
+        // as without a store, and a resume never waits for them.
+        if !graph.edge_coverage_certified().await.unwrap_or(false) {
+            tracing::warn!(
+                "restoring descendants of {root_thread_id} before the thread index is complete"
+            );
+        }
         let root_path = self
             .get_agent_metadata(root_thread_id)
             .and_then(|metadata| metadata.agent_path)

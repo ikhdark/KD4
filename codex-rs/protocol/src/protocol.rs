@@ -2192,20 +2192,26 @@ pub enum ToolLifecycleBoundary {
     NextModelSampleStart,
 }
 
+// Zero lifecycle counters are omitted from serialized timing; a missing counter
+// deserializes as zero, so older records and readers stay compatible.
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
 /// Queue and waiter state captured at a lifecycle boundary.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(rename_all = "camelCase")]
 pub struct ToolLifecycleContext {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub relay_queue_depth: u32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub parallel_gate_waiter_count: u32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub sampling_gate_waiter_count: u32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub process_output_waiter_count: u32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub active_tool_count: u32,
 }
 
@@ -2280,9 +2286,9 @@ pub struct TurnTimingToolLifecycleEvent {
     pub at_ms: u64,
     #[serde(default)]
     pub context: ToolLifecycleContext,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub retry_count: u32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub reentry_count: u32,
 }
 

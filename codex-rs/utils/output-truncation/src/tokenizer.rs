@@ -4,6 +4,15 @@ pub fn model_token_count(text: &str) -> usize {
     tiktoken_rs::o200k_base_singleton().count_ordinary(text)
 }
 
+/// Loads the o200k vocabulary ahead of the first count that needs it. The load
+/// takes tens of milliseconds, and projections that exceed their byte shortcut
+/// pay it on the critical path of whichever tool result is first. The vocabulary
+/// is a process-wide `LazyLock`: a concurrent count waits for this load rather
+/// than repeating it, and calling this again is free.
+pub fn warm_model_tokenizer() {
+    let _ = tiktoken_rs::o200k_base_singleton();
+}
+
 /// Keep the head and failure tail, counting the complete rendered packet.
 pub fn truncate_model_text(text: &str, limit: usize) -> String {
     truncate_model_text_at_lines(text, limit, 0, text.lines().count())

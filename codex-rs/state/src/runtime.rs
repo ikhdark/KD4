@@ -153,6 +153,7 @@ pub struct StateRuntime {
     db_telemetry: Option<DbTelemetryHandle>,
     thread_updated_at_millis: Arc<AtomicI64>,
     thread_recency_at_millis: Arc<AtomicI64>,
+    backfill_worker: Arc<backfill::BackfillWorker>,
 }
 
 impl StateRuntime {
@@ -336,6 +337,7 @@ SELECT
             default_provider,
             thread_updated_at_millis: Arc::new(AtomicI64::new(thread_updated_at_millis)),
             thread_recency_at_millis: Arc::new(AtomicI64::new(thread_recency_at_millis)),
+            backfill_worker: Default::default(),
         });
         Ok(runtime)
     }

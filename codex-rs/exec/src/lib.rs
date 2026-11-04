@@ -163,8 +163,30 @@ use uuid::Uuid;
 use crate::cli::Command as ExecCommand;
 use crate::event_processor::EventProcessor;
 
-const DEFAULT_ANALYTICS_ENABLED: bool = true;
+// The exit flush uploads metrics before the process can end, adding the network
+// round trip to every run. As for app-server, `[analytics] enabled = true` opts in.
+const DEFAULT_ANALYTICS_ENABLED: bool = false;
 const EXEC_DEFAULT_LOG_FILTER: &str = "error,opentelemetry_sdk=off,opentelemetry_otlp=off";
+/// Desktop publish/restart prompt (`publishLocalCodex`) from the app-server's
+/// runtime provenance; exec has no Desktop build to publish.
+/// Runtime warnings that ask for a Desktop republish or restart, which exec cannot act on.
+const DESKTOP_RUNTIME_WARNING_CODES: [&str; 2] = ["localBuildDirty", "runningBinaryMismatch"];
+
+/// Notifications that only feed streaming `item.progress` records. `--json`
+/// consumers get the complete `item.completed` snapshots without them unless
+/// they pass `--json-progress`; human output renders them and keeps the stream.
+fn json_stream_opt_out_methods(json_mode: bool, json_progress: bool) -> Vec<String> {
+    if !json_mode || json_progress {
+        return Vec::new();
+    }
+    [
+        "item/agentMessage/delta",
+        "item/commandExecution/outputDelta",
+        "item/mcpToolCall/progress",
+    ]
+    .map(str::to_string)
+    .to_vec()
+}
 
 fn build_exec_otel_provider(
     config: &Config,
@@ -224,6 +246,7 @@ struct ExecRunArgs {
     initial_operation: InitialOperation,
     prompt_summary: String,
     json_mode: bool,
+    json_progress: bool,
     last_message_file: Option<PathBuf>,
     model_provider: Option<String>,
     oss: bool,
@@ -274,6 +297,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         color,
         last_message_file,
         json: json_mode,
+        json_progress,
         prompt,
         output_schema: output_schema_path,
         allow_no_prose,
@@ -563,6 +587,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         initial_operation,
         prompt_summary,
         json_mode,
+        json_progress,
         last_message_file,
         model_provider,
         oss,
@@ -691,6 +716,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
         initial_operation,
         prompt_summary,
         json_mode,
+        json_progress,
         last_message_file,
         model_provider,
         oss,
@@ -762,7 +788,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
         client_version: env!("CARGO_PKG_VERSION").to_string(),
         experimental_api: true,
         mcp_server_openai_form_elicitation: false,
-        opt_out_notification_methods: Vec::new(),
+        opt_out_notification_methods: json_stream_opt_out_methods(json_mode, json_progress),
         channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
     };
 
@@ -772,7 +798,12 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
         .map_err(|err| {
             anyhow::anyhow!("failed to initialize in-process app-server client: {err}")
         })?;
-    for warning in client.initialize_response().runtime_warnings() {
+    for warning in client
+        .initialize_response()
+        .runtime_warnings()
+        .iter()
+        .filter(|warning| !DESKTOP_RUNTIME_WARNING_CODES.contains(&warning.code.as_str()))
+    {
         eprintln!(
             "{}",
             codex_app_server_client::format_runtime_warning(warning)
@@ -1102,6 +1133,9 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
     }
 
     let shutdown_error = client.shutdown().await.err();
+    if let Some(state_db) = state_db.as_ref() {
+        state_db.stop_backfill_worker().await;
+    }
     // Publish accepted content before fatal diagnostics start the SDK's bounded
     // failure drain, including when artifact publication uses slow storage.
     let output_error = event_processor.print_final_output().err();

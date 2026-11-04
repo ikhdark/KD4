@@ -15,6 +15,7 @@ pub use tokenizer::truncate_model_text_at_lines;
 pub use tokenizer::truncate_model_text_at_lines_with_artifact;
 pub use tokenizer::truncate_model_text_at_lines_with_limits;
 pub use tokenizer::truncate_model_text_at_lines_with_recovery;
+pub use tokenizer::warm_model_tokenizer;
 
 pub use codex_protocol::protocol::TruncationPolicy;
 

@@ -1085,8 +1085,10 @@ impl ContextManager {
         input_modalities: &[InputModality],
         base_instructions: &BaseInstructions,
     ) -> Option<i64> {
-        let prepared = self
-            .clone()
+        // Budgets are computed while a call runs, before its output exists.
+        let mut estimate_source = self.clone();
+        normalize::pair_in_flight_calls_for_estimate(&mut estimate_source.items);
+        let prepared = estimate_source
             .prepare_for_prompt_target(input_modalities, StableContextTarget::Sampling);
         let prepared_items = prepared.shared_items();
         let (projected, tail) = self.sampling_items_for_estimate(&prepared_items);

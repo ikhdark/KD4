@@ -92,14 +92,6 @@ pub(crate) fn record_log_retention_event(telemetry: Option<&dyn DbTelemetry>, ev
     record_counter(telemetry, DB_LOG_RETENTION_METRIC, &[("event", event)]);
 }
 
-pub fn record_backfill_gate(
-    telemetry: Option<&dyn DbTelemetry>,
-    duration: Duration,
-    result: &anyhow::Result<()>,
-) {
-    record_init_result(telemetry, DbKind::State, "backfill_gate", duration, result);
-}
-
 pub fn record_fallback(
     caller: &'static str,
     reason: &'static str,

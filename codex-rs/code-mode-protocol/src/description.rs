@@ -5,11 +5,18 @@
 //! declarations. Schema rendering is isolated because it changes independently of both
 //! the public prompt and the execution parser.
 
+mod contract_sections;
 mod exec_prompt;
 mod metadata;
 mod pragma;
 mod schema_ts;
 
+pub use contract_sections::append_to_contract_core;
+pub use contract_sections::contract_core;
+pub use contract_sections::contract_section;
+pub use contract_sections::contract_section_names;
+pub use contract_sections::first_sentence;
+pub use exec_prompt::EXEC_REFERENCE;
 pub use exec_prompt::build_exec_tool_description;
 pub use exec_prompt::build_wait_tool_description;
 pub use metadata::CodeModeToolKind;

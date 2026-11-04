@@ -35,9 +35,12 @@
     return size;
   };
   const capability = (name) => {
-    if (!ALL_TOOL_NAMES.includes(name))
+    // Discovery omits compatibility aliases; resolve against the admitted catalog,
+    // just as direct dispatch does. Hidden/disabled tools still cannot resolve.
+    const tool = globalThis.resolve_tool(name);
+    if (typeof tool !== "function")
       throw new TypeError(`required tool unavailable: ${name}`);
-    return tools[name];
+    return tool;
   };
 
   // A packet may be retained by its caller and mutated during a native await.
@@ -213,9 +216,15 @@
               kind: revision !== undefined ? "git_commit" : expected.size ? "declared_identities" : "independent",
               status: "unknown",
               atomic_live_workspace: false,
-              reason: "Independent file observations do not establish an atomic live-workspace snapshot.",
+              ...(revision === undefined && !expected.size ? {} : {
+                reason: "Independent file observations do not establish an atomic live-workspace snapshot.",
+              }),
             },
           };
+          // Nothing was declared, so this says only that nothing was checked. Scripts
+          // can still read it; every printed row would otherwise repeat it.
+          if (revision === undefined && !expected.size)
+            Object.defineProperty(evidence, "consistency", {enumerable: false});
           if (revision !== undefined) {
             evidence.consistency.revision = revision.toLowerCase();
             if (initial.git_source?.commit_oid !== revision.toLowerCase() ||

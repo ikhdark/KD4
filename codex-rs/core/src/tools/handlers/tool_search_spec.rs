@@ -48,16 +48,15 @@ pub(crate) fn render_tool_search_sources<'a>(
     let mut owners = BTreeMap::<&str, BTreeSet<Option<&str>>>::new();
     let mut source_descriptions = BTreeMap::<&str, Option<&str>>::new();
     let mut has_unnamed_tools = false;
+    let mut has_capability_groups = false;
     for (info, capability_group) in search_infos {
         let scope = canonical_source(info);
         let (name, description) = match &info.source_info {
             Some(source) => (Some(source.name.as_str()), source.description.as_deref()),
-            None => (
-                capability_group,
-                capability_group.map(|_| {
-                    "Grouped by existing authorization class, not a permission grant; session permissions and task restrictions still apply."
-                }),
-            ),
+            None => {
+                has_capability_groups |= capability_group.is_some();
+                (capability_group, None)
+            }
         };
         scopes.entry(name.unwrap_or("")).or_default().insert(scope);
         owners.entry(scope).or_default().insert(name);
@@ -140,7 +139,13 @@ pub(crate) fn render_tool_search_sources<'a>(
             description.push('\n');
         }
         crate::tools::spec_plan::apply_fair_description_budget(&mut source_descriptions);
-        source_descriptions.concat().trim_end().to_string()
+        let listing = source_descriptions.concat();
+        let listing = listing.trim_end();
+        if has_capability_groups {
+            format!("{listing}\nNative groups follow authorization classes; membership is not a permission grant.")
+        } else {
+            listing.to_string()
+        }
     }
 }
 

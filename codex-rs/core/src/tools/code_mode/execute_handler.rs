@@ -23,9 +23,13 @@ use super::wait_handler::hold_until_state_change;
 use super::wait_handler::input_activity_response;
 use super::wait_handler::terminate_interrupted_cell;
 
+type NestedCatalogRender = Box<dyn FnOnce() -> Arc<[codex_code_mode::ToolDefinition]> + Send>;
+
 pub struct CodeModeExecuteHandler {
     spec: ToolSpec,
-    enabled_tools: Arc<[codex_code_mode::ToolDefinition]>,
+    /// Rendering every nested declaration is most of a router build, and only cells read
+    /// it. It runs beside dispatch, so a first request never waits for it.
+    enabled_tools: Arc<std::sync::LazyLock<Arc<[codex_code_mode::ToolDefinition]>, NestedCatalogRender>>,
     timeout_catalog: std::sync::Mutex<Option<TimeoutCatalog>>,
 }
 
@@ -233,66 +237,77 @@ impl CodeModeExecuteHandler {
         spec: ToolSpec,
         direct_nested_tool_specs: Vec<ToolSpec>,
         deferred_nested_tool_specs: Vec<ToolSpec>,
-        canonical_input_schemas: &HashMap<codex_tools::ToolName, serde_json::Value>,
-        effective_contract_revisions: &HashMap<codex_tools::ToolName, String>,
-    ) -> Result<Self, String> {
-        let mut nested_tool_specs = direct_nested_tool_specs;
-        // Deferred tools stay out of the model-visible `exec` description, but
-        // code running inside the isolate can discover and invoke them through
-        // `ALL_TOOLS`. Cache the complete runtime registry once per handler so
-        // every cell does not rebuild it from cloned tool specs.
-        nested_tool_specs.extend(deferred_nested_tool_specs);
-        // Keep multi-member namespace expansion and sorting with the shared
-        // collector, but render provider constraints from their canonical owner.
-        let mut enabled_tools = codex_tools::collect_code_mode_tool_definitions_with_input_schemas(
-            &nested_tool_specs,
-            canonical_input_schemas,
-        );
-        // The collector assigns unique normalized names. The runtime also
-        // validates catalogs at its host boundary; no second pass is needed here.
-        // The rendered descriptions already contain the schema-derived TypeScript
-        // declarations. The isolate consumes only callable metadata, so do not
-        // clone and transport the original JSON schema trees for every cell.
-        for definition in &mut enabled_tools {
-            // Keep the immutable runtime catalog revision-bound even when a
-            // changed constraint has the same TypeScript projection.
-            if let Some(revision) = effective_contract_revisions.get(&definition.tool_name) {
-                definition.description = format!(
-                    "{}\nEffective contract revision: {revision}.",
-                    definition.description,
-                )
-                .into();
-            }
-            definition.input_schema = None;
-            definition.output_schema = None;
-        }
-        Ok(Self {
-            spec,
-            enabled_tools: enabled_tools.into(),
-            timeout_catalog: std::sync::Mutex::new(None),
-        })
-    }
-
-    pub(crate) fn with_native_catalog_policy(
-        mut self,
+        canonical_input_schemas: HashMap<codex_tools::ToolName, serde_json::Value>,
+        effective_contract_revisions: HashMap<codex_tools::ToolName, String>,
         registered: &[crate::tools::registry::RegisteredTool],
     ) -> Self {
-        for definition in Arc::make_mut(&mut self.enabled_tools) {
-            let Some(tool) = registered.iter().find(|tool| tool.tool_name() == &definition.tool_name)
-                .filter(|tool| tool.authorization_class() != TypedToolClass::DynamicExternal) else { continue; };
-            let operations = tool.runtime().operation_routes();
-            let compatibility = tool.exposure() == crate::tools::registry::ToolExposure::Compatibility;
-            if compatibility || !operations.is_empty() {
+        let mut native_routing = registered
+            .iter()
+            .filter(|tool| tool.authorization_class() != TypedToolClass::DynamicExternal)
+            .filter_map(|tool| {
+                let operations = tool.runtime().operation_routes();
+                let compatibility =
+                    tool.exposure() == crate::tools::registry::ToolExposure::Compatibility;
+                (compatibility || !operations.is_empty()).then(|| {
+                    (
+                        tool.tool_name().clone(),
+                        serde_json::json!({
+                            "x-codex-native-routing-v1": { "compatibility": compatibility, "operations": operations }
+                        }),
+                    )
+                })
+            })
+            .collect::<HashMap<_, _>>();
+        let render: NestedCatalogRender = Box::new(move || {
+            let mut nested_tool_specs = direct_nested_tool_specs;
+            // Deferred tools stay out of the model-visible `exec` description, but
+            // code running inside the isolate can discover and invoke them through
+            // `ALL_TOOLS`. Cache the complete runtime registry once per handler so
+            // every cell does not rebuild it from cloned tool specs.
+            nested_tool_specs.extend(deferred_nested_tool_specs);
+            // Keep multi-member namespace expansion and sorting with the shared
+            // collector, but render provider constraints from their canonical owner.
+            let mut enabled_tools = codex_tools::collect_code_mode_tool_definitions_with_input_schemas(
+                &nested_tool_specs,
+                &canonical_input_schemas,
+            );
+            // The collector assigns unique normalized names. The runtime also
+            // validates catalogs at its host boundary; no second pass is needed here.
+            // The rendered descriptions already contain the schema-derived TypeScript
+            // declarations. The isolate consumes only callable metadata, so do not
+            // clone and transport the original JSON schema trees for every cell.
+            for definition in &mut enabled_tools {
+                // Keep the immutable runtime catalog revision-bound even when a
+                // changed constraint has the same TypeScript projection.
+                if let Some(revision) = effective_contract_revisions.get(&definition.tool_name) {
+                    definition.description = codex_code_mode::append_to_contract_core(
+                        &definition.description,
+                        &format!("Effective contract revision: {revision}."),
+                    )
+                    .into();
+                }
+                definition.output_schema = None;
                 // Retain only a producer-owned schema annotation, not the large
                 // schema trees already rendered into the immutable description.
                 // Extensions cannot inject this policy through their input schema:
-                // new_with_input_schemas clears schemas before this native pass.
-                definition.input_schema = Some(serde_json::json!({
-                    "x-codex-native-routing-v1": { "compatibility": compatibility, "operations": operations }
-                }));
+                // it replaces whatever schema the collector carried.
+                definition.input_schema = native_routing.remove(&definition.tool_name);
             }
+            enabled_tools.into()
+        });
+        let enabled_tools = Arc::new(std::sync::LazyLock::new(render));
+        let warm = Arc::clone(&enabled_tools);
+        // Best effort: without a thread the first cell renders it.
+        let _ = std::thread::Builder::new()
+            .name("code-mode-catalog".to_string())
+            .spawn(move || {
+                std::sync::LazyLock::force(&warm);
+            });
+        Self {
+            spec,
+            enabled_tools,
+            timeout_catalog: std::sync::Mutex::new(None),
         }
-        self
     }
 
     fn catalog_with_timeouts(
@@ -387,6 +402,12 @@ impl CodeModeExecuteHandler {
                 )
             })
             .collect::<HashMap<_, _>>();
+        // Almost always rendered by now; a cell that outran it must not hold a runtime worker.
+        let catalog = Arc::clone(&self.enabled_tools);
+        let _ = tokio::task::spawn_blocking(move || {
+            std::sync::LazyLock::force(&catalog);
+        })
+        .await;
         if let Some(router) = step_context.tool_router() {
             for tool in self.enabled_tools.iter() {
                 if tool.tool_name.name == "wait_agent"

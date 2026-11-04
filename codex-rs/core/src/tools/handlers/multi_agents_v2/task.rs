@@ -2087,7 +2087,7 @@ fn submit_agent_receipt_spec() -> ToolSpec {
 fn set_agent_gate_spec() -> ToolSpec {
     function_spec(
         SET_AGENT_GATE_TOOL,
-        "Submit an evidence-backed gate verdict using the team's shared authority. Use waive_agent_gate for permitted soft-gate waivers.",
+        "Submit an evidence-backed gate verdict. Subagents cannot seal gates; root must independently review their receipts. Use waive_agent_gate for permitted soft-gate waivers.",
         object_schema(
             [
                 ("assignment_id", assignment_id_schema()),

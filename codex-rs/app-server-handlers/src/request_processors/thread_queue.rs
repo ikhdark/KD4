@@ -423,7 +423,15 @@ impl ThreadQueueRequestProcessor {
 
     async fn load(&self, id: ThreadId) -> Result<Queue, JSONRPCErrorError> {
         let db = self.db()?;
-        let metadata = db.get_thread(id).await.map_err(queue_error)?;
+        let mut metadata = db.get_thread(id).await.map_err(queue_error)?;
+        let mut loaded = None;
+        if metadata.is_none() {
+            loaded = self.thread_manager.get_thread(id).await.ok();
+            // An unloaded thread may only be missing from an index still being built.
+            if loaded.is_none() && db.await_thread_index().await {
+                metadata = db.get_thread(id).await.map_err(queue_error)?;
+            }
+        }
         if metadata
             .as_ref()
             .is_some_and(|metadata| metadata.archived_at.is_some())
@@ -431,11 +439,7 @@ impl ThreadQueueRequestProcessor {
             return Err(invalid_params("thread is archived"));
         }
         if metadata.is_none() {
-            let thread = self
-                .thread_manager
-                .get_thread(id)
-                .await
-                .map_err(|_| invalid_params("thread not found"))?;
+            let thread = loaded.ok_or_else(|| invalid_params("thread not found"))?;
             if thread.rollout_path().is_none() {
                 return Err(invalid_params("ephemeral threads do not support queues"));
             }

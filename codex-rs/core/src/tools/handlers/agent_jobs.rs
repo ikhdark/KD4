@@ -1357,6 +1357,7 @@ fn build_worker_prompt(
         "You are processing one item for a generic agent job.\n\
 Job ID: {job_id}\n\
 Item ID: {item_id}\n\n\
+Worker capabilities: native read/search and result reporting; no commands, external/opaque I/O, source writes or delegation. Include unmet execution dependencies in your result.\n\n\
 Task instruction:\n\
 {instruction}\n\n\
 Input row (JSON):\n\

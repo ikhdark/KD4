@@ -29,6 +29,14 @@ impl LocalAgentGraphStore {
 }
 
 impl AgentGraphStore for LocalAgentGraphStore {
+    fn await_edge_coverage(&self) -> AgentGraphStoreFuture<'_, bool> {
+        Box::pin(async move { Ok(self.state_db.await_thread_index().await) })
+    }
+
+    fn edge_coverage_certified(&self) -> AgentGraphStoreFuture<'_, bool> {
+        Box::pin(async move { Ok(self.state_db.thread_index_certified().await) })
+    }
+
     fn list_reconciled_thread_spawn_edges(
         &self,
         root_thread_id: ThreadId,

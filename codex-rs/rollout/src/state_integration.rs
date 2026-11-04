@@ -27,27 +27,28 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::Instant;
-use tracing::info;
 use tracing::warn;
 
 /// Core-facing handle to the SQLite-backed state runtime.
 pub type StateDbHandle = Arc<codex_state::StateRuntime>;
 
-const STARTUP_BACKFILL_POLL_INTERVAL: Duration = Duration::from_secs(1);
-const STARTUP_BACKFILL_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Reconciliation cadence once coverage is settled.
+const BACKFILL_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+/// Pause before a process's first pass, so it never competes with the first model
+/// request, and before resuming a pass that had more work left.
+const BACKFILL_RESUME_DELAY: Duration = Duration::from_secs(1);
+/// One pass, after which it hands the claim back and resumes from its checkpoint.
+const BACKFILL_PASS_BOUND: Duration = Duration::from_secs(20);
 const MAX_CONCURRENT_ROLLOUT_PATH_VALIDATIONS: usize = 8;
-// The startup bound caps each backfill run, so its lease must outlive one bounded run.
 const _: () = assert!(
-    metadata::BACKFILL_LEASE_SECONDS as u64 > STARTUP_BACKFILL_WAIT_TIMEOUT.as_secs(),
-    "a backfill lease must outlive the startup bound that limits each run"
+    metadata::BACKFILL_LEASE_SECONDS as u64 > BACKFILL_PASS_BOUND.as_secs(),
+    "a backfill lease must outlive the bound that limits each pass"
 );
 
 /// Initialize the state runtime for thread state persistence.
 ///
 /// This is the process entry point for local state: it opens the SQLite-backed
-/// runtime, applies rollout metadata backfills as needed, and returns the
-/// initialized handle.
+/// runtime, starts the rollout metadata owner, and returns the initialized handle.
 pub async fn init(config: &impl RolloutConfigView) -> Option<StateDbHandle> {
     let config = RolloutConfig::from_view(config);
     match try_init_with_roots(
@@ -79,30 +80,14 @@ pub async fn try_init(config: &impl RolloutConfigView) -> anyhow::Result<StateDb
     .await
 }
 
+/// Startup opens the schema and never waits for historical rollouts: serving is separate
+/// from certification. Default listings and thread lookups are filesystem-backed, and readers
+/// for which a missing row means absence wait for coverage themselves
+/// ([`codex_state::StateRuntime::await_thread_index`]). The background owner builds the index.
 async fn try_init_with_roots(
     codex_home: PathBuf,
     sqlite_home: PathBuf,
     default_model_provider_id: String,
-) -> anyhow::Result<StateDbHandle> {
-    try_init_with_roots_inner(
-        codex_home,
-        sqlite_home,
-        default_model_provider_id,
-        /*backfill_lease_seconds*/ None,
-        STARTUP_BACKFILL_WAIT_TIMEOUT,
-        STARTUP_BACKFILL_POLL_INTERVAL,
-    )
-    .await
-}
-
-
-async fn try_init_with_roots_inner(
-    codex_home: PathBuf,
-    sqlite_home: PathBuf,
-    default_model_provider_id: String,
-    backfill_lease_seconds: Option<i64>,
-    wait_timeout: Duration,
-    poll_interval: Duration,
 ) -> anyhow::Result<StateDbHandle> {
     let runtime =
         codex_state::StateRuntime::init(sqlite_home.clone(), default_model_provider_id.clone())
@@ -113,35 +98,43 @@ async fn try_init_with_roots_inner(
                     sqlite_home.display()
                 )
             })?;
-    let mut backfill_memo = metadata::BackfillMemo::default();
-    let backfill_gate_started = Instant::now();
-    let backfill_gate_result = wait_for_backfill_gate_with_timeout(
-        codex_home.as_path(),
-        wait_timeout,
-        wait_for_backfill_gate(
-            runtime.as_ref(),
-            codex_home.as_path(),
-            default_model_provider_id.as_str(),
-            backfill_lease_seconds,
-            wait_timeout,
-            poll_interval,
-            &mut backfill_memo,
-        ),
-    )
-    .await;
-    codex_state::record_backfill_gate(
-        /*telemetry*/ None,
-        backfill_gate_started.elapsed(),
-        &backfill_gate_result,
+    let backfill_state = match runtime.get_backfill_state().await {
+        Ok(state) => state,
+        Err(err) => {
+            runtime.close().await;
+            anyhow::bail!(
+                "failed to read backfill state at {}: {err}",
+                codex_home.display()
+            );
+        }
+    };
+    let initial_delay = if backfill_state.coverage_certified() {
+        BACKFILL_REFRESH_INTERVAL
+    } else {
+        BACKFILL_RESUME_DELAY
+    };
+    spawn_backfill_refresh(
+        &runtime,
+        codex_home,
+        default_model_provider_id,
+        metadata::BackfillMemo::default(),
+        initial_delay,
     );
-    if let Err(err) = backfill_gate_result {
-        runtime.close().await;
-        return Err(err);
-    }
-    let weak = std::sync::Arc::downgrade(&runtime);
+    Ok(runtime)
+}
+
+fn spawn_backfill_refresh(
+    runtime: &StateDbHandle,
+    codex_home: PathBuf,
+    default_model_provider_id: String,
+    mut backfill_memo: metadata::BackfillMemo,
+    initial_delay: Duration,
+) {
+    let weak = std::sync::Arc::downgrade(runtime);
     tokio::spawn(async move {
+        let mut delay = initial_delay;
         loop {
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            tokio::time::sleep(delay).await;
             let Some(runtime) = weak.upgrade() else {
                 break;
             };
@@ -152,9 +145,25 @@ async fn try_init_with_roots_inner(
                 &mut backfill_memo,
             )
             .await;
+            delay = match backfill_memo.last_pass_remainder() {
+                // A fairness slice is not a failed traversal; it released its lease already.
+                Some(metadata::PassRemainder::DiscoveryPending) => Duration::ZERO,
+                Some(metadata::PassRemainder::Stopped) => BACKFILL_RESUME_DELAY,
+                Some(metadata::PassRemainder::Settled | metadata::PassRemainder::Unresolved) => {
+                    BACKFILL_REFRESH_INTERVAL
+                }
+                // No claim: another worker holds it, or a killed one's lease is running out.
+                None if matches!(
+                    runtime.get_backfill_state().await,
+                    Ok(state) if state.status == codex_state::BackfillStatus::Running
+                ) =>
+                {
+                    BACKFILL_RESUME_DELAY
+                }
+                None => BACKFILL_REFRESH_INTERVAL,
+            };
         }
     });
-    Ok(runtime)
 }
 
 /// One periodic reconciliation pass: reopen coverage completed at least one
@@ -170,7 +179,7 @@ async fn refresh_backfill_once(
         warn!(%error, "rollout metadata reconciliation remains pending");
         return None;
     }
-    let stop_at = tokio::time::Instant::now() + Duration::from_secs(20);
+    let stop_at = tokio::time::Instant::now() + BACKFILL_PASS_BOUND;
     Some(
         metadata::backfill_sessions_until(
             runtime,
@@ -182,118 +191,6 @@ async fn refresh_backfill_once(
         )
         .await,
     )
-}
-
-async fn wait_for_backfill_gate_with_timeout(
-    codex_home: &Path,
-    wait_timeout: Duration,
-    wait: impl std::future::Future<Output = anyhow::Result<()>>,
-) -> anyhow::Result<()> {
-    match tokio::time::timeout(wait_timeout, wait).await {
-        Ok(result) => result,
-        Err(_) => Err(anyhow::anyhow!(
-            "timed out waiting for state db backfill at {} after {:?}",
-            codex_home.display(),
-            wait_timeout,
-        )),
-    }
-}
-
-async fn wait_for_backfill_gate(
-    runtime: &codex_state::StateRuntime,
-    codex_home: &Path,
-    default_model_provider_id: &str,
-    backfill_lease_seconds: Option<i64>,
-    wait_timeout: Duration,
-    poll_interval: Duration,
-    memo: &mut metadata::BackfillMemo,
-) -> anyhow::Result<()> {
-    // Stop this startup's own backfill before the outer bound cancels it, leaving time to
-    // checkpoint and release the claim. A cancelled claim would make every later startup
-    // wait out its bound and fail until the lease expired.
-    let backfill_stop_at =
-        tokio::time::Instant::now() + wait_timeout.saturating_sub(wait_timeout / 6);
-    let backfill_lease_seconds = backfill_lease_seconds.unwrap_or(metadata::BACKFILL_LEASE_SECONDS);
-    let mut reported_wait = false;
-    let mut confirming_gaps = false;
-    loop {
-        let backfill_state = runtime.get_backfill_state().await.map_err(|err| {
-            anyhow::anyhow!(
-                "failed to read backfill state at {}: {err}",
-                codex_home.display()
-            )
-        })?;
-        if backfill_coverage_certified(&backfill_state) {
-            return Ok(());
-        }
-
-        metadata::backfill_sessions_until(
-            runtime,
-            codex_home,
-            default_model_provider_id,
-            backfill_lease_seconds,
-            memo,
-            || tokio::time::Instant::now() >= backfill_stop_at,
-        )
-        .await;
-        let backfill_state = runtime.get_backfill_state().await.map_err(|err| {
-            anyhow::anyhow!(
-                "failed to read backfill state at {} after startup backfill: {err}",
-                codex_home.display()
-            )
-        })?;
-        if backfill_state.status == codex_state::BackfillStatus::Complete {
-            return Ok(());
-        }
-        if backfill_state.status == codex_state::BackfillStatus::Pending {
-            // Serving is separate from certification. When the only unsettled rollouts
-            // are payload gaps a reread at unchanged versions confirmed, serve the rows
-            // indexed so far. Coverage stays uncertified and each gap keeps the
-            // checkpoint before it, so a later repair is still reconciled.
-            match memo.last_pass_remainder() {
-                Some(metadata::PassRemainder::DiscoveryPending)
-                    if tokio::time::Instant::now() < backfill_stop_at =>
-                {
-                    // A fairness slice is not a failed traversal. The pass
-                    // released its lease; yield before resuming the same memo.
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                Some(metadata::PassRemainder::ConfirmedPayloadGaps(gaps)) => {
-                    warn!(
-                        "state db at {} serves with {gaps} rollouts whose payload artifacts are missing; backfill coverage remains pending",
-                        codex_home.display(),
-                    );
-                    return Ok(());
-                }
-                // A gap read once may be a transient payload read failure. One more
-                // pass stamps the payloads it names and reads it again, reusing every
-                // rollout this pass settled.
-                Some(metadata::PassRemainder::UnconfirmedPayloadGaps) if !confirming_gaps => {
-                    confirming_gaps = true;
-                    continue;
-                }
-                _ => {}
-            }
-            return Err(anyhow::anyhow!(
-                "state db backfill remains incomplete at {}; falling back until a later startup retry",
-                codex_home.display(),
-            ));
-        }
-        let message = format!(
-            "state db backfill is {} at {}; waiting up to {:?} before retrying startup initialization",
-            backfill_state.status.as_str(),
-            codex_home.display(),
-            wait_timeout,
-        );
-        if reported_wait {
-            info!("{message}");
-        } else {
-            emit_startup_warning(&message);
-            reported_wait = true;
-        }
-        tokio::time::sleep(poll_interval).await;
-    }
 }
 
 fn emit_startup_warning(message: &str) {
@@ -350,16 +247,12 @@ pub fn sqlite_telemetry_recorder(
 /// Coverage certified once stays usable. The periodic refresh and the identity
 /// migration reopen reconciliation without invalidating indexed rows, and readers
 /// fall back to rollout headers for fields a later pass has not filled yet.
-fn backfill_coverage_certified(state: &codex_state::BackfillState) -> bool {
-    state.status == codex_state::BackfillStatus::Complete || state.last_success_at.is_some()
-}
-
 async fn require_backfill_complete(
     runtime: StateDbHandle,
     codex_home: &Path,
 ) -> Option<StateDbHandle> {
     match runtime.get_backfill_state().await {
-        Ok(state) if backfill_coverage_certified(&state) => Some(runtime),
+        Ok(state) if state.coverage_certified() => Some(runtime),
         Ok(state) => {
             warn!(
                 "state db backfill not complete at {} (status: {})",

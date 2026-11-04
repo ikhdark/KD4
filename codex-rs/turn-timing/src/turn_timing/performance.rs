@@ -12,6 +12,7 @@ pub(super) struct Capture {
     latest: Option<ResourceSample>,
     connections: Vec<Value>,
     transport_phases: Vec<Value>,
+    startup_dial: Option<Value>,
     dropped_connections: u64,
     dropped_transport_phases: u64,
     execution: Option<Value>,
@@ -84,6 +85,7 @@ impl Capture {
         json!({"schemaVersion":1, "clockDomainId":timeline.clock_domain_id,
             "observedThroughMs":timeline.duration_ns as f64 / 1e6,
             "connections":self.connections, "transportPhases":self.transport_phases,
+            "startupDial":self.startup_dial,
             "resources":resources, "execution":self.execution,
             "capture":{"droppedConnections":self.dropped_connections,
                 "droppedTransportPhases":self.dropped_transport_phases,
@@ -95,6 +97,44 @@ impl Capture {
 }
 
 impl TurnTimingState {
+    /// Selection is separate from transport entry: adopting a socket does not
+    /// prove that it served a request. Missing observations remain unknown.
+    pub fn record_startup_dial_outcome(&self, outcome: &str, hedge_started: bool) {
+        let mut state = self.state();
+        if state.completed_snapshot.is_some() {
+            return;
+        }
+        let observation = state.measurements.performance.startup_dial.get_or_insert_with(|| {
+            json!({"outcome":null, "hedgeStarted":false, "firstTransportAttempt":null})
+        });
+        observation["outcome"] = json!(outcome);
+        observation["hedgeStarted"] = json!(hedge_started
+            || observation["hedgeStarted"].as_bool().unwrap_or(false));
+    }
+
+    /// Called only at the first non-warmup physical transport entry. This is
+    /// local attempt evidence, not proof of successful send or provider receipt.
+    pub fn record_startup_dial_transport_attempt(
+        &self,
+        transport: &str,
+        used_startup_dial: bool,
+        connection: Option<&str>,
+        attempt: &str,
+    ) {
+        let mut state = self.state();
+        if state.completed_snapshot.is_some() {
+            return;
+        }
+        let Some(observation) = state.measurements.performance.startup_dial.as_mut() else {
+            return;
+        };
+        if observation["firstTransportAttempt"].is_null() {
+            observation["firstTransportAttempt"] = json!({"transport":transport,
+                "usedStartupDial":used_startup_dial, "connectionId":connection,
+                "physicalAttemptId":attempt});
+        }
+    }
+
     /// The physical attempt identity comes from the same transport callback as
     /// dispatch. Preserve unavailable phases too; never fill them by residuals.
     pub fn record_transport_phase(

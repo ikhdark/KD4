@@ -222,12 +222,14 @@ impl ThreadEnvironments {
         }
     }
 
-    pub(crate) fn update_selections(&self, environments: &[TurnEnvironmentSelection]) {
+    /// Returns whether the selected environments changed. Unchanged selections
+    /// keep their resolutions, so planning built against them remains valid.
+    pub(crate) fn update_selections(&self, environments: &[TurnEnvironmentSelection]) -> bool {
         let _guard = self
             .update_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.update_selections_locked(environments, /*retry_failed*/ true);
+        self.update_selections_locked(environments, /*retry_failed*/ true)
     }
 
     /// `retry_failed` is true for an explicit selection update, which retries a
@@ -241,9 +243,9 @@ impl ThreadEnvironments {
         &self,
         environments: &[TurnEnvironmentSelection],
         retry_failed: bool,
-    ) {
+    ) -> bool {
         if self.shutdown.load(std::sync::atomic::Ordering::Acquire) {
-            return;
+            return false;
         }
         let previous = self.environments.load();
         let mut seen_environment_ids = HashSet::with_capacity(environments.len());
@@ -363,13 +365,14 @@ impl ThreadEnvironments {
                 .zip(&next)
                 .any(|(previous, next)| previous.selection != next.selection);
         if !replaced_resolution && !selections_changed {
-            return;
+            return false;
         }
         self.environments
             .store(Arc::new(SelectedTurnEnvironmentState {
                 generation: previous.generation.saturating_add(1),
                 environments: next,
             }));
+        true
     }
 
     fn resolve_environment(

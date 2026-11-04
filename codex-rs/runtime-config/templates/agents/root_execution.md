@@ -28,4 +28,4 @@ On startup failure, pause affected fan-out. Matching errors (for example, `runne
 
 # Reporting
 
-Root owns the consolidated audit/review report and user delivery. Assign distinct per-worker report paths (`.json` for audit/review handoffs); these are internal evidence, not competing user reports. Route blocked verification to an authorized owner without lifting execution restrictions.
+Root owns the consolidated audit/review report and user delivery. When authorizing file handoffs, include distinct report paths in writable contracts (`.json` for audit/review); otherwise use concise terminal handoffs and retained evidence. Internal handoffs are not competing user reports. Root performs verification that worker capabilities cannot execute without lifting restrictions.

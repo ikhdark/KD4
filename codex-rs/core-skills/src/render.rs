@@ -28,6 +28,11 @@ pub const SKILLS_HOW_TO_USE: &str = r###"- Use the smallest skill set named by t
 - Read task-required linked instructions with the same mechanism, load only relevant variants, and reuse supplied scripts, templates, and assets.
 - If a named skill or required read is unavailable, state it and use the safest fallback. Retry shell invocation/transport failures through a permitted dedicated read-only route; never bypass permission denials with another tool."###;
 
+/// The XML-escaped skill name of a line rendered by `SkillLine`.
+pub fn rendered_skill_line_name(line: &str) -> Option<&str> {
+    line.strip_prefix("- ")?.split_once(" — ").map(|(name, _)| name)
+}
+
 pub fn render_available_skills_body(skill_lines: &[String]) -> String {
     let capacity = "\n## Skills\n".len()
         + SKILLS_INTRO_WITH_ABSOLUTE_PATHS.len()

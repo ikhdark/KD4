@@ -1797,6 +1797,10 @@ impl ToolOutput for ExecCommandToolOutput {
             #[serde(skip_serializing_if = "Option::is_none")]
             stderr: Option<String>,
             #[serde(skip_serializing_if = "Option::is_none")]
+            retained_output: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            retained_output_complete: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             stream_ranges: Option<[std::ops::Range<u64>; 2]>,
             stream_chunks_complete: bool,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -1912,6 +1916,7 @@ impl ToolOutput for ExecCommandToolOutput {
             .raw_output_artifact
             .as_ref()
             .is_some_and(RawOutputArtifact::retention_limit_hit);
+        let retained_output = self.retained_terminal_output(limits.applied_limit).map(str::to_owned);
         let result = UnifiedExecCodeModeResult {
             output_reference: RawOutputArtifact::output_reference(self.raw_output_artifact.as_ref()),
             environment_receipt: self.environment_receipt.clone(),
@@ -1946,6 +1951,8 @@ impl ToolOutput for ExecCommandToolOutput {
                 .or_else(|| self.exit_code.and_then(windows_abnormal_exit_notice)),
             stdout,
             stderr,
+            retained_output_complete: retained_output.as_ref().map(|_| true),
+            retained_output,
             stream_ranges: self.stream_ranges.clone(),
             stream_chunks_complete,
             streams_complete,
@@ -3122,11 +3129,40 @@ impl ExecCommandToolOutput {
     }
 
 
+    /// An empty terminal drain need not force another artifact read just to
+    /// recover a small transcript already held by the process owner. Keep it
+    /// separate from `output` and the per-pipe deltas, whose coordinates must
+    /// never repeat previously consumed bytes. No I/O or new capture is needed.
+    fn retained_terminal_output(&self, token_limit: usize) -> Option<&str> {
+        if !self.process_exited
+            || self.process_id.is_some()
+            || !self.raw_output.is_empty()
+            || self.quiet_on_success
+            || self.output_ranges.is_none()
+        {
+            return None;
+        }
+        let snapshot = self.process_output.as_ref()?;
+        if !snapshot.output_closed
+            || !snapshot.aggregated_output_is_exact
+            || snapshot.aggregated_output.is_empty()
+            || snapshot.aggregated_output.len() > 4096
+        {
+            return None;
+        }
+        let output = std::str::from_utf8(&snapshot.aggregated_output).ok()?;
+        (codex_utils_string::approx_token_count(output) <= token_limit).then_some(output)
+    }
+
     fn response_text_from_raw(&self, raw_output: &str) -> String {
 
         let projected = self.projected_model_output(raw_output, None);
         let mut fields = serde_json::Map::new();
         fields.insert("output_reference".into(), RawOutputArtifact::output_reference(self.raw_output_artifact.as_ref()));
+        if let Some(output) = self.retained_terminal_output(self.model_output_max_tokens()) {
+            fields.insert("retained_output".into(), output.into());
+            fields.insert("retained_output_complete".into(), true.into());
+        }
         if let Some(receipt) = &self.environment_receipt {
             fields.insert("environment_receipt".into(), serde_json::json!(receipt));
         }

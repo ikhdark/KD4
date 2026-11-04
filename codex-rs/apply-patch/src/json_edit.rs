@@ -10,6 +10,7 @@ use serde_json::value::RawValue;
 use sha2::Digest;
 use sha2::Sha256;
 
+use crate::SourceHashRef;
 use crate::UpdateFileChunk;
 use crate::UpdateLineKind;
 
@@ -35,10 +36,10 @@ pub(crate) fn apply(
         .change_context
         .as_deref()
         .and_then(|context| context.strip_prefix("codex-json sha256:"))
-        .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .ok_or("expected @@ codex-json sha256:<whole-file source_sha256>")?;
+        .ok_or_else(|| format!("expected @@ codex-json {}", SourceHashRef::FORM))?;
+    let hash = SourceHashRef::parse(hash).map_err(|error| format!("codex-json: {error}"))?;
     let current = hex::encode(Sha256::digest(source.as_bytes()));
-    if !hash.eq_ignore_ascii_case(&current) {
+    if !hash.matches(&current) {
         return Err(format!(
             "codex-json source hash changed (current sha256:{current}); re-read and reconcile before editing"
         ));

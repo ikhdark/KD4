@@ -28,6 +28,11 @@ from pathlib import Path
 
 from scripts.build.rust_tool_env import direct_compiler_env
 
+# The PowerShell entrypoint executes this file directly. Resource admission
+# imports this owner too: share cancellation context and exception identities.
+if __name__ == "__main__":
+    sys.modules["scripts.common.process_owner"] = sys.modules[__name__]
+
 
 class Operation:
     def __init__(self, timeout=None):
@@ -103,7 +108,7 @@ class CleanupFailed(RuntimeError):
 
 
 class WindowsJob:
-    def __init__(self):
+    def __init__(self, name=None):
         from ctypes import wintypes as w
 
         self.api = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -121,8 +126,8 @@ class WindowsJob:
             ),
             "CloseHandle": ([w.HANDLE], w.BOOL),
         }
-        for name, (args, result) in signatures.items():
-            function = getattr(self.api, name)
+        for api_name, (args, result) in signatures.items():
+            function = getattr(self.api, api_name)
             function.argtypes, function.restype = args, result
 
         class BasicLimits(ctypes.Structure):
@@ -148,9 +153,13 @@ class WindowsJob:
                 ("peak_job_memory", ctypes.c_size_t),
             ]
 
-        self.handle = self.api.CreateJobObjectW(None, None)
+        ctypes.set_last_error(0)
+        self.handle = self.api.CreateJobObjectW(None, name)
         if not self.handle:
             raise ctypes.WinError(ctypes.get_last_error())
+        if ctypes.get_last_error() == 183:
+            self.close()
+            raise FileExistsError(f"owning job already exists: {name}")
         limits = ExtendedLimits()
         limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         self.limits = limits
@@ -160,9 +169,11 @@ class WindowsJob:
             self.close()
             raise ctypes.WinError(ctypes.get_last_error())
 
-    def assign_and_resume(self, process):
+    def assign_and_resume(self, process, before_resume=None):
         if not self.api.AssignProcessToJobObject(self.handle, int(process._handle)):
             raise ctypes.WinError(ctypes.get_last_error())
+        if before_resume is not None:
+            before_resume()
         # Popen closes the initial thread handle. Resume the suspended process
         # only after the job owns it, so no descendant can escape assignment.
         resume = ctypes.WinDLL("ntdll").NtResumeProcess
@@ -187,6 +198,29 @@ class WindowsJob:
                 raise CleanupFailed("owned job still has active processes")
             time.sleep(0.02)
 
+    def build_resource_receipt(self):
+        """Kernel lifetime accounting for this tree, including exited members."""
+        accounting = ctypes.create_string_buffer(48)
+        limits = type(self.limits)()
+        memory = (ctypes.c_uint64 * 2)()
+        for kind, value in ((1, accounting), (9, limits), (28, memory)):
+            if not self.api.QueryInformationJobObject(
+                self.handle, kind, ctypes.byref(value), ctypes.sizeof(value), None
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+        user = int.from_bytes(accounting.raw[:8], 'little') / 10_000_000
+        kernel = int.from_bytes(accounting.raw[8:16], 'little') / 10_000_000
+        return {
+            'source': 'QueryInformationJobObject; owning tree including exited members',
+            'totalCpuSeconds': user + kernel,
+            'peakJobCommitBytes': limits.peak_job_memory,
+            'peakProcessCommitBytes': limits.peak_process_memory,
+            'currentJobCommitBytes': memory[0],
+            'pageFaults': int.from_bytes(accounting.raw[32:36], 'little'),
+            'totalProcesses': int.from_bytes(accounting.raw[36:40], 'little'),
+            'activeProcesses': int.from_bytes(accounting.raw[40:44], 'little'),
+        }
+
     def close(self):
         if self.handle:
             self.api.CloseHandle(self.handle)
@@ -201,8 +235,9 @@ class WindowsJob:
 
 
 @contextlib.contextmanager
-def owned_process(args, *, preserve_descendants_on_success=False, on_spawn=None, on_spawn_error=None, **kwargs):
-    job = WindowsJob() if os.name == "nt" else None
+def owned_process(args, *, preserve_descendants_on_success=False, on_spawn=None, on_spawn_error=None,
+                  job_name=None, on_job_ready=None, on_job_stopped=None, **kwargs):
+    job = WindowsJob(name=job_name) if os.name == "nt" else None
     process = None
     preserve = False
     try:
@@ -221,7 +256,9 @@ def owned_process(args, *, preserve_descendants_on_success=False, on_spawn=None,
             raise
         if job:
             try:
-                job.assign_and_resume(process)
+                job.assign_and_resume(process, before_resume=(
+                    (lambda: on_job_ready(job)) if on_job_ready is not None else None
+                ))
             except BaseException:
                 process.kill()
                 process.wait(timeout=5)
@@ -255,8 +292,12 @@ def owned_process(args, *, preserve_descendants_on_success=False, on_spawn=None,
                 f"cleanup_failed for process {process.pid if process else 'unstarted'}"
             ) from error
         finally:
-            if job:
-                job.close()
+            try:
+                if job and on_job_stopped is not None:
+                    on_job_stopped(job)
+            finally:
+                if job:
+                    job.close()
 
 
 def run_owned(
@@ -266,6 +307,7 @@ def run_owned(
     check=False,
     capture_output=False,
     prepare_sccache=False,
+    on_poll=None,
     **kwargs,
 ):
     """Run once; reap owned descendants before draining terminal output.
@@ -290,6 +332,8 @@ def run_owned(
             deadline = time.monotonic() + timeout if timeout else None
             while True:
                 check_operation()
+                if on_poll is not None:
+                    on_poll()
                 remaining = deadline - time.monotonic() if deadline else None
                 if remaining is not None and remaining <= 0:
                     raise subprocess.TimeoutExpired(args, timeout)
@@ -517,6 +561,13 @@ def main(argv=None):
         help="Initialize a configured shared sccache before the owned command.",
     )
     parser.add_argument(
+        "--cargo-resources", action="store_true",
+        help="Use the shared Windows managed-build CPU/memory budget.",
+    )
+    parser.add_argument("--cargo-cold", action="store_true")
+    parser.add_argument("--cargo-resource-no-wait", action="store_true")
+    parser.add_argument("--lane-wait-ms", type=float, default=0.0)
+    parser.add_argument(
         "--cleanup-failed-marker",
         type=Path,
         help="Write this file if the tree's exit cannot be confirmed.",
@@ -532,11 +583,19 @@ def main(argv=None):
                 target=_cancel_after_exit, args=(args.parent_pid, owned), daemon=True
             ).start()
         try:
-            return run_owned(
+            runner = run_owned
+            resource_options = {}
+            if args.cargo_resources:
+                from scripts.build.cargo_resources import run_build, BuildResourcesBusy
+                runner = run_build
+                resource_options = {"cold": args.cargo_cold, "lane_wait_ms": args.lane_wait_ms,
+                                    "wait": not args.cargo_resource_no_wait}
+            return runner(
                 command,
                 stdout=sys.stdout,
                 stderr=sys.stderr,
                 prepare_sccache=args.prepare_sccache,
+                **resource_options,
             ).returncode
         except CleanupFailed:
             if args.cleanup_failed_marker is not None:
@@ -548,6 +607,15 @@ def main(argv=None):
         except CancelledError:
             # The parent is gone and run_owned has already stopped the tree.
             return 1
+        except RuntimeError as error:
+            if args.cargo_resources and isinstance(error, BuildResourcesBusy):
+                import json
+                print(json.dumps({"kind": "codex_rust_admission_v1", "status": "busy",
+                    "exit_code": 75, "resource": "global_build_budget", "validation_status": "pending",
+                    "executed": False, "queued": False, "automatic_retry": False,
+                    "automatic_resume": False, "pending_command": command}), file=sys.stderr)
+                return 75
+            raise
 
 
 if __name__ == "__main__":

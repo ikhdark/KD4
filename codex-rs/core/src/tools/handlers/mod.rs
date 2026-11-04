@@ -37,7 +37,7 @@ pub(crate) mod multi_agents_v2;
 pub(crate) mod native_tools;
 mod plan;
 pub(crate) mod plan_spec;
-mod read_file;
+pub(crate) mod read_file;
 pub(crate) use read_file::syntax_regression;
 mod read_tool_output;
 pub(crate) mod read_tool_output_spec;

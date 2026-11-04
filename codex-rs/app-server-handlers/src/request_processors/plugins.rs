@@ -658,7 +658,13 @@ impl PluginRequestProcessor {
         let thread_manager = Arc::clone(&self.thread_manager);
         let config_manager = self.config_manager.clone();
         Arc::new(move || {
-            Self::invalidate_effective_plugins_and_spawn_refresh(
+            // Fired by background plugin refreshes (startup sync, remote
+            // installed-plugin fetch, marketplace auto-upgrade, list-triggered
+            // cache refreshes). Config does not depend on plugin state, so these
+            // must not advance the policy generation: that would fail a
+            // concurrent thread/start admission and force a full retry.
+            config_manager.discard_cached_loads();
+            Self::clear_plugin_runtime_caches_and_spawn_refresh(
                 Arc::clone(&thread_manager),
                 config_manager.clone(),
             );
@@ -678,7 +684,15 @@ impl PluginRequestProcessor {
     ) {
         // Cache invalidation is part of mutation completion; loaded-session
         // user-layer/hooks and MCP publication share the best-effort refresh owner.
+        // RPC-driven plugin mutations write config.toml, so they keep the policy fence.
         config_manager.invalidate_load_cache();
+        Self::clear_plugin_runtime_caches_and_spawn_refresh(thread_manager, config_manager);
+    }
+
+    fn clear_plugin_runtime_caches_and_spawn_refresh(
+        thread_manager: Arc<ThreadManager>,
+        config_manager: ConfigManager,
+    ) {
         thread_manager.plugins_manager().clear_cache();
         thread_manager.skills_service().clear_cache();
         tokio::spawn(async move {

@@ -1,4 +1,5 @@
 use crate::ApplyPatchError;
+use crate::SourceHashRef;
 use crate::UpdateFileChunk;
 use crate::UpdateLineKind;
 use codex_utils_path_uri::PathUri;
@@ -33,21 +34,16 @@ pub(crate) fn replace(
         .ok_or_else(|| invalid("missing replacement descriptor"))?;
     let (count, hash) = descriptor
         .split_once(" sha256:")
-        .ok_or_else(|| invalid("expected COUNT sha256:<64 hexadecimal characters>"))?;
-    if count.is_empty()
-        || !count.bytes().all(|byte| byte.is_ascii_digit())
-        || hash.len() != 64
-        || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(invalid(
-            "expected a nonnegative occurrence count and a whole-file SHA-256",
-        ));
+        .ok_or_else(|| invalid(&format!("expected COUNT {}", SourceHashRef::FORM)))?;
+    if count.is_empty() || !count.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid("expected a nonnegative occurrence count"));
     }
+    let hash = SourceHashRef::parse(hash).map_err(|error| invalid(&error.to_string()))?;
     let expected = count
         .parse::<usize>()
         .map_err(|_| invalid("occurrence count is too large"))?;
     let current = hex::encode(Sha256::digest(source.as_bytes()));
-    if !current.eq_ignore_ascii_case(hash) {
+    if !hash.matches(&current) {
         return Err(ApplyPatchError::RevisionGuardMismatch(format!(
             "codex-replace revision guard failed for {}: expected {hash}, current {current}. Re-read and reconcile before submitting a fresh patch.",
             path.inferred_native_path_string()

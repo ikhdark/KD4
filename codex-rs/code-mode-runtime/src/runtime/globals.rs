@@ -374,8 +374,10 @@ fn build_all_tools_value<'s>(
         // This boundary is explicit producer metadata, never inferred shared
         // prose. Full callable metadata and resolve_tool remain self-contained.
         let guidance = tool.namespace_description.as_deref().map(str::trim).filter(|text| !text.is_empty());
-        let local = guidance.and_then(|guidance| tool.description.strip_prefix(guidance))
-            .and_then(|rest| rest.strip_prefix("\n\n")).unwrap_or(&tool.description);
+        // Discovery prints this, so it carries the bounded core; resolve_tool serves the rest.
+        let core = codex_code_mode_protocol::contract_core(&tool.description);
+        let local = guidance.and_then(|guidance| core.strip_prefix(guidance))
+            .and_then(|rest| rest.strip_prefix("\n\n")).unwrap_or(core);
         let description = shared_description(scope, local)?;
         if let Some(guidance) = guidance {
             let first = *first_guidance.entry((tool.tool_name.namespace.as_deref(), guidance)).or_insert(index);
@@ -516,6 +518,12 @@ fn tool_function<'s>(
             return Err("failed to install lazy tool description".into());
         }
     }
+    let section = v8::FunctionTemplate::builder(tool_section_callback)
+        .data(data.into())
+        .build(scope)
+        .get_function(scope)
+        .ok_or_else(|| "failed to create tool section reader".to_string())?;
+    set_global(scope, function.into(), "section", section.into())?;
     // Keep JSON discovery receipts compatible while allowing direct invocation.
     let to_json = v8::FunctionTemplate::builder(tool_metadata_callback)
         .data(metadata.into())
@@ -557,9 +565,51 @@ fn tool_description_callback(
         throw_type_error(scope, "missing tool description");
         return;
     };
-    match shared_description(scope, &tool.description) {
+    match shared_description(scope, codex_code_mode_protocol::contract_core(&tool.description)) {
         Ok(description) => retval.set(description.into()),
         Err(error) => throw_type_error(scope, &error),
+    }
+}
+
+/// Reads one named contract section locally, without a tool call. An unknown name answers with
+/// the valid ones instead of throwing, so a wrong guess cannot end the cell.
+fn tool_section_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue<v8::Value>,
+) {
+    let index = args.data().uint32_value(scope).map(|index| index as usize);
+    let catalog = scope
+        .get_slot::<RuntimeState>()
+        .map(|state| Arc::clone(&state.enabled_tools));
+    let Some(tool) = catalog
+        .as_ref()
+        .and_then(|catalog| index.and_then(|index| catalog.get(index)))
+    else {
+        throw_type_error(scope, "missing tool description");
+        return;
+    };
+    let requested = args.get(0).is_string().then(|| args.get(0).to_rust_string_lossy(scope));
+    let unknown;
+    let text = match requested
+        .as_deref()
+        .and_then(|name| codex_code_mode_protocol::contract_section(&tool.description, name))
+    {
+        Some(text) => text,
+        None => {
+            let names = codex_code_mode_protocol::contract_section_names(&tool.description)
+                .collect::<Vec<_>>();
+            unknown = if names.is_empty() {
+                "This contract has no sections; .description is complete.".to_string()
+            } else {
+                format!("Sections of this contract: {}.", names.join(", "))
+            };
+            &unknown
+        }
+    };
+    match v8::String::new_from_utf8(scope, text.as_bytes(), v8::NewStringType::Normal) {
+        Some(text) => retval.set(text.into()),
+        None => throw_type_error(scope, "failed to allocate tool section"),
     }
 }
 

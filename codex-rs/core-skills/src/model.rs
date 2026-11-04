@@ -248,6 +248,17 @@ impl HostSkillsSnapshot {
             .filter(|skill| self.outcome.is_skill_enabled(skill))
     }
 
+    /// Enabled skills that `skill:<name>` could mean; catalog IDs take precedence over names.
+    pub fn enabled_skills_named(&self, locator: &str) -> Vec<&SkillMetadata> {
+        let Some(name) = locator.strip_prefix(SKILL_CATALOG_LOCATOR_PREFIX) else {
+            return Vec::new();
+        };
+        self.outcome
+            .skills
+            .iter()
+            .filter(|skill| skill.name == name && self.outcome.is_skill_enabled(skill))
+            .collect()
+    }
 }
 
 pub fn skill_catalog_id(skill: &SkillMetadata) -> String {

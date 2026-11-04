@@ -54,6 +54,14 @@ mod ranges;
 pub(crate) struct ReadFileHandler;
 pub(crate) struct ReadStatusHandler;
 
+/// Eager prompt projection of the read_file contract. Every request repeats this text;
+/// resolve_tool keeps the complete contract, including paging and encoding detail.
+pub(crate) fn eager_read_file_description() -> String {
+    format!(
+        "Read a file without shell quoting. Path alone returns a first page capped at about {DEFAULT_FILE_READ_TOKEN_CEILING} tokens plus continuation; small files fit inline. Prefer explicit line ranges or supported symbols for known code; do not dump whole files to locate one function. Symbol, enclosing and search with enclosing:true support Rust (.rs) and Python (.py); section outline/item IDs also support Markdown; for other languages use fixed-string search or line ranges. In code mode explicit selections return up to 1 MiB to the script independently of its display budget: consume it there and print only needed evidence. Use read_tool_output with the artifact_id and continuation only for needed remaining ranges. A complete inline read may have no retained artifact; that is not a read failure. Text snapshots are limited to {MAX_FILE_MIB} MiB; larger files take bytes selectors, and encoding:hex|base64 returns raw bytes. Pass a skill: locator to read its SKILL.md; omit environment_id for host-owned locators. Large-file paging, binary, UTF-16, HTML and unsupported-text detail: `resolve_tool(\"read_file\").section(\"details\")`.\n\nresults[] is normalized, not request-ordered: match rows by their echoed selector, and sort resolved ranges before multi-range patches. A print omits what only restates success, so no complete or status means a complete read, and file_complete:false means part of the source. Script values keep every field: path, total_lines, source_sha256, canonical_bytes, complete, file_complete, retained_artifact_complete, results[]{{selector,status,complete,canonical_range,text|value|data_hex|data_base64}} and, when partial, artifact_id, continuation and page_selectors.",
+    )
+}
+
 impl ToolExecutor<ToolInvocation> for ReadStatusHandler {
     fn tool_name(&self) -> ToolName {
         ToolName::plain("read_status")
@@ -363,7 +371,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
     }
 
     fn spec(&self) -> ToolSpec {
-        let mut selectors = JsonSchema::array(file_selector_schema(), Some("Omit to read the first page immediately. Batch known ranges here. Search results include text in results[].value.hydrated_ranges; enclosing:true also returns enclosing Rust/Python items as line selections. json_pointer selects a complete JSON value; structured projects/filters JSON, JSONL, CSV or TSV rows with explicit malformed_rows policy. {\"kind\":\"section\",\"id\":\"outline\"} lists items; symbol and enclosing share its parser; qualified names (Type::method or Class.method) disambiguate items. Oversized selections return child_selectors.".to_string()));
+        let mut selectors = JsonSchema::array(file_selector_schema(), Some("Omit to read the first page; batch known ranges here: search returns text in results[].value.hydrated_ranges (enclosing:true adds enclosing Rust/Python items), json_pointer a complete JSON value, structured projects/filters JSON, JSONL, CSV or TSV rows, {\"kind\":\"section\",\"id\":\"outline\"} lists items, symbol and enclosing share its parser with qualified names (Type::method or Class.method) to disambiguate. Oversized selections return child_selectors.".to_string()));
         selectors.min_items = Some(1);
         selectors.max_items = Some(READ_TOOL_OUTPUT_MAX_SELECTORS as u64);
         let mut output = read_tool_output_output_schema(file_selector_schema());
@@ -540,7 +548,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     ..JsonSchema::object(BTreeMap::new(), None, None)
                 }).collect()),
                 ..JsonSchema::object(BTreeMap::from([
-                ("path".to_string(), JsonSchema::string(Some("File path, relative to the environment cwd or absolute, a `skill:` locator, `skill:catalog` for enabled skill metadata, `context:desktop` for Desktop guidance, `context:workflow-evidence` for diagnostic/evidence-role and metric-attribution guidance, `context:resume-state` for a read-only durable-operation/process/artifact inventory, or the `context:unsettled-tools/<offset>` recovery_path from a resume notice. Omit environment_id for host-owned locators. Resume inventory supports conjunctive resume_filter selection by parent_cell_id, call_id, artifact_id or unresolved_only; selected terminal metadata remains visible. It defaults to a bounded /outstanding summary; its full immutable inventory stays in this read's retained artifact. Recover exact JSON pointers or structured pages through read_tool_output, not another inventory call. Counts include omitted history; this grants no live control authority.".to_string()))),
+                ("path".to_string(), JsonSchema::string(Some("File path, relative to the environment cwd or absolute, `skill:<name>` or a catalog `skill:` locator, `skill:catalog` for enabled skill metadata, `context:desktop` for Desktop guidance, `context:workflow-evidence` for diagnostic/evidence-role and metric-attribution guidance, `context:exec-reference` for full exec helper and failure semantics, `context:resume-state` for a read-only durable-operation/process/artifact inventory, or the `context:unsettled-tools/<offset>` recovery_path from a resume notice. Omit environment_id for host-owned locators. Resume inventory supports conjunctive resume_filter selection by parent_cell_id, call_id, artifact_id or unresolved_only; selected terminal metadata remains visible. It defaults to a bounded /outstanding summary; its full immutable inventory stays in this read's retained artifact. Recover exact JSON pointers or structured pages through read_tool_output, not another inventory call. Counts include omitted history; this grants no live control authority.".to_string()))),
                 ("file_path".to_string(), JsonSchema::string(Some("Legacy alias for path; use only one.".to_string()))),
                 ("offset".to_string(), JsonSchema { minimum: Some(1.into()), maximum: Some(usize::MAX.into()), ..JsonSchema::integer(Some("Legacy 1-based starting line; use instead of selectors, defaults to 1.".to_string())) }),
                 ("limit".to_string(), JsonSchema { minimum: Some(1.into()), maximum: Some(usize::MAX.into()), ..JsonSchema::integer(Some("Legacy positive line count; defaults to 2000 when offset is supplied.".to_string())) }),
@@ -548,7 +556,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 ("encoding".to_string(), JsonSchema { enum_values: Some(vec!["hex".into(), "base64".into()]), ..JsonSchema::string(Some("Explicit raw-byte output for filesystem bytes-only selectors at any file size. hex returns lowercase data_hex; base64 returns standard padded data_base64. No text decoding or execution. Uses bounded live ranges, not whole-file snapshots; cannot combine with revision or if_source_hash.".into())) }),
                 ("revision".to_string(), JsonSchema::string(Some("Read an exact Git blob at this commit revision instead of the workspace. Path is repository-root-relative (repository selected by environment cwd). Resolves once to immutable commit_oid/blob_oid in git_source; reuse returned commit_oid as revision to pin later selectors, or recover the retained snapshot. All source selectors and the 8 MiB UTF-8 limit apply. Local environments with full disk read access only; no fetching, filters, text conversion or replacement objects. Historical path/URI are distinct from workspace evidence. Omit for current contents.".into()))),
                 ("if_file_revision".to_string(), JsonSchema::string(Some("Opaque file_revision from a large-file byte read. Requires filesystem bytes-only selectors; refuses a changed object/metadata revision, even if the file shrank below 8 MiB. Not a hash, snapshot, or if_source_hash freshness shortcut. Cannot combine with revision or if_source_hash.".into()))),
-                ("if_source_hash".to_string(), JsonSchema::string(Some("Optional 64-hex source_sha256 from a previous read. Reacquire current contents through the same authorized owner and compare the whole selected representation, not just requested ranges. On a match and complete selector resolution, return unchanged:true without content or retention; invalid, missing or partial selections keep their normal results. Omit when you need content (including a new selection); a match is not evidence that you previously acquired these selectors. Default rendered HTML and explicit exact markup have different identities.".to_string()))),
+                ("if_source_hash".to_string(), JsonSchema::string(Some("Optional 64-hex source_sha256 from a previous read: on a match returns unchanged:true without content or retention. Reacquire current contents through the same authorized owner and compare the whole selected representation, not just requested ranges. On a match and complete selector resolution, return unchanged:true without content or retention; invalid, missing or partial selections keep their normal results. Omit when you need content (including a new selection); a match is not evidence that you previously acquired these selectors. Default rendered HTML and explicit exact markup have different identities.".to_string()))),
                 ("force_fresh".to_string(), JsonSchema::boolean(Some("Legacy compatibility option; every call reads current contents.".to_string()))),
                 ("resume_filter".to_string(), JsonSchema::object(BTreeMap::from([
                     ("parent_cell_id".into(), JsonSchema::string(Some("Exact originating Code Mode cell identity.".into()))),
@@ -734,6 +742,18 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                         })?;
                 (
                     contents.to_string(),
+                    args.path.clone(),
+                    "host-context".to_string(),
+                    args.path.clone(),
+                )
+            } else if args.path == "context:exec-reference" {
+                if args.environment_id.is_some() {
+                    return Err(FunctionCallError::RespondToModel(
+                        "omit environment_id for the host-owned exec reference".to_string(),
+                    ));
+                }
+                (
+                    codex_code_mode::EXEC_REFERENCE.to_string(),
                     args.path.clone(),
                     "host-context".to_string(),
                     args.path.clone(),
@@ -1831,15 +1851,31 @@ async fn read_skill_locator(
         }
         return Ok((contents, args.path.clone()));
     }
-    let skill = snapshot
-        .resolve_catalog_locator(&args.path)
-        .ok_or_else(|| {
-            FunctionCallError::RespondToModel(format!(
-                "unknown skill locator `{}`; use a locator from the skills catalog",
-                args.path
-            ))
-        })?
-        .clone();
+    let skill = match snapshot.resolve_catalog_locator(&args.path) {
+        Some(skill) => skill,
+        None => match snapshot.enabled_skills_named(&args.path).as_slice() {
+            [skill] => *skill,
+            [] => {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "unknown skill locator `{}`; use a listed skill name or a locator from skill:catalog",
+                    args.path
+                )));
+            }
+            // Picking one source silently could load the wrong instructions.
+            candidates => {
+                let locators = candidates
+                    .iter()
+                    .map(|skill| format!("skill:{}", codex_core_skills::skill_catalog_id(skill)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "skill name in `{}` is shared by several skills; read one of: {locators}",
+                    args.path
+                )));
+            }
+        },
+    }
+    .clone();
     let (contents, path) = snapshot
         .read_skill_text_bounded(&skill, MAX_FILE_BYTES)
         .await

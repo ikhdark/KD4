@@ -5,4 +5,4 @@
 /**
  * Queue and waiter state captured at a lifecycle boundary.
  */
-export type ToolLifecycleContext = { relayQueueDepth: number, parallelGateWaiterCount: number, samplingGateWaiterCount: number, processOutputWaiterCount: number, activeToolCount: number, };
+export type ToolLifecycleContext = { relayQueueDepth?: number, parallelGateWaiterCount?: number, samplingGateWaiterCount?: number, processOutputWaiterCount?: number, activeToolCount?: number, };

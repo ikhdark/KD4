@@ -262,7 +262,11 @@ impl EventProcessorWithJsonOutput {
                 id: make_id(),
                 details: ThreadItemDetails::CommandExecution(CommandExecutionItem {
                     output_metadata,
-                    stdout,
+                    // Most commands print only to stdout, so the app-server copy is
+                    // byte-identical to `aggregated_output`; emit that text once.
+                    stdout: stdout.filter(|stdout| {
+                        stdout.as_str() != aggregated_output.as_deref().unwrap_or_default()
+                    }),
                     stderr,
                     command,
                     aggregated_output: aggregated_output.unwrap_or_default(),

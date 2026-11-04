@@ -296,8 +296,10 @@ fn build_tool_specs_and_registry(
         wait_agent_timeouts: wait_agent_timeout_options(turn_context),
         exposure_identity: &exposure_identity,
     };
+    let mut phases = crate::StartupPhaseLog::start("router_specs");
     let mut planned_tools = PlannedTools::default();
     add_tool_sources(&context, &mut planned_tools);
+    phases.mark("tool_sources");
     promote_deferred_tools(turn_context, &mut planned_tools);
     apply_direct_model_only_namespace_overrides(turn_context, &mut planned_tools);
     retain_unique_planned_tool_names(&mut planned_tools);
@@ -311,15 +313,19 @@ fn build_tool_specs_and_registry(
 
     apply_namespace_description_budget(&mut planned_tools);
     reserve_generated_control_names(turn_context, &mut planned_tools);
+    phases.mark("inventory");
     let tool_search = append_tool_search_executor(&context, &mut planned_tools);
+    phases.mark("tool_search");
     // Generated native controls take precedence before code mode captures its
     // catalog; final registry deduplication cannot repair an earlier snapshot.
     retain_unique_planned_tool_names(&mut planned_tools);
     prepend_code_mode_executors(&context, &mut planned_tools)?;
+    phases.mark("code_mode");
     let (specs, registry, warnings) = build_model_visible_specs_and_registry(
         turn_context,
         planned_tools,
     );
+    phases.mark("registry");
     let search_sources = tool_search.map(|(handler, indexes)| {
         // Reuse the handler's immutable inventory, including on a warm cache
         // hit. Generated-control collisions were removed before this inventory
@@ -343,6 +349,7 @@ fn build_tool_specs_and_registry(
             infos.iter().copied(),
         )
     });
+    phases.mark("search_sources");
     Ok((specs, registry, warnings, search_sources))
 }
 
@@ -767,6 +774,22 @@ fn is_excluded_from_code_mode(turn_context: &TurnContext, tool_name: &ToolName) 
     })
 }
 
+/// The request manifest and the nested catalog need both hashes of every tool, and
+/// each one serializes that tool's whole contract: the slowest step of a router build.
+fn warm_tool_contract_hashes(executors: &[RegisteredTool]) {
+    let threads = std::thread::available_parallelism().map_or(1, usize::from).min(8);
+    std::thread::scope(|scope| {
+        for chunk in executors.chunks(executors.len().div_ceil(threads).max(1)) {
+            scope.spawn(move || {
+                for executor in chunk {
+                    executor.effective_contract_revision();
+                    executor.canonical_spec_sha256();
+                }
+            });
+        }
+    });
+}
+
 fn build_code_mode_executors(
     turn_context: &TurnContext,
     executors: &[RegisteredTool],
@@ -788,6 +811,9 @@ fn build_code_mode_executors(
     let mut canonical_input_schemas = HashMap::new();
     let mut effective_contract_revisions = HashMap::new();
     let deferred_tools_guidance_enabled = search_tool_enabled(turn_context);
+    let mut phases = crate::StartupPhaseLog::start("router_code_mode");
+    warm_tool_contract_hashes(executors);
+    phases.mark("contract_hashes");
     for executor in executors {
         let exposure = executor.exposure();
         if exposure == ToolExposure::DirectModelOnly {
@@ -877,8 +903,22 @@ fn build_code_mode_executors(
                         .then(crate::tools::handlers::shell_spec::unified_exec_eager_output_schema);
                 // Eager prompt projection only: registration and resolve_tool keep
                 // the full contract, and the handlers still decode these fields.
+                // Each is used by under 3% of threads (or is set from a ready recipe).
                 let withdrawn: &[&str] = match &*definition.name {
-                    "read_file" => &["file_path", "offset", "limit"],
+                    "read_file" => &[
+                        "file_path",
+                        "offset",
+                        "limit",
+                        "encoding",
+                        "if_file_revision",
+                        "resume_filter",
+                    ],
+                    "read_tool_output" => &["audit_only", "cell_recovery", "source_thread_id"],
+                    "exec_command" => &["login", "tty", "pipe_stdin", "stall_timeout_ms"],
+                    "update_plan" => &[
+                        "measurements",
+                        "scope_change_instructions",
+                    ],
                     _ => &[],
                 };
                 if let Some(schema) = definition
@@ -899,23 +939,46 @@ fn build_code_mode_executors(
                         schema.remove("oneOf");
                         schema.insert("required".to_string(), serde_json::json!(["path"]));
                     }
+                    if &*definition.name == "read_tool_output" {
+                        // Selectors are the only advertised mode once audit_only is withdrawn.
+                        schema.remove("oneOf");
+                        schema.insert(
+                            "required".to_string(),
+                            serde_json::json!(["artifact_id", "selectors"]),
+                        );
+                    }
                 }
+                // A field's first sentence states its purpose; every request repeats it.
+                for schema in [&mut definition.input_schema, &mut definition.output_schema] {
+                    if let Some(schema) = schema.as_mut() {
+                        keep_first_description_sentences(schema);
+                    }
+                }
+                let hidden_description = definition.description.is_empty();
                 if definition.name == "apply_patch" {
-                    definition.description = format!("{}\nNested apply_patch is available: await tools.apply_patch(patchText). Result: {{success, operation_id, outcome, text, changes, changes_exact, environment_id, diagnostics, tool_failure?, retry?}}; outcome is committed/unchanged/failed/unknown, independently of success; multi_file_atomic is false. changes[].write_receipt hashes exact committed bytes, not current freshness; check success before continuing.", definition.description).into();
+                    let needs_environment =
+                        definition.description.contains("*** Environment ID: <id>");
+                    definition.description = if hidden_description {
+                        "Nested apply_patch is available: await tools.apply_patch(patchText). Result: {success, operation_id, outcome, text, changes, changes_exact, environment_id, diagnostics, tool_failure?, retry?}; outcome is committed/unchanged/failed/unknown, independently of success; multi_file_atomic is false. changes[].write_receipt hashes exact committed bytes, not current freshness; a rejected patch returns success:false instead of throwing.".to_string()
+                    } else if needs_environment {
+                        format!("{}\nPut `*** Environment ID: <id>` immediately after `*** Begin Patch` to select the target execution environment; it is required when multiple environments are available.", codex_prompts::APPLY_PATCH_EAGER_INSTRUCTIONS.trim_end())
+                    } else {
+                        codex_prompts::APPLY_PATCH_EAGER_INSTRUCTIONS.trim_end().to_string()
+                    }
+                    .into();
+                } else if definition.name == "exec_command" && !hidden_description {
+                    definition.description = crate::tools::handlers::shell_spec::eager_exec_command_description(
+                        definition.description.contains("Windows safety rules"),
+                    )
+                    .into();
+                } else if definition.name == "read_tool_output" && !hidden_description {
+                    definition.description =
+                        crate::tools::handlers::read_tool_output_spec::EAGER_READ_TOOL_OUTPUT_DESCRIPTION.into();
+                } else if definition.name == "read_file" && !hidden_description {
+                    definition.description =
+                        crate::tools::handlers::read_file::eager_read_file_description().into();
                 } else if definition.name == "read_file" {
-                    // Eager projection only. Preserve the full resolver contract,
-                    // coordinates, limits and recovery rules; defer parser internals.
-                    definition.description = definition.description
-                        .replace(
-                            "Section outline/item IDs also support Markdown (.md, .markdown): headings have source-bound IDs, levels, parent IDs and exact byte ranges; sections include descendants until the next equal/shallower heading. Duplicate titles are distinct; fenced code is ignored and Setext headings are recognized.",
-                            "Markdown outline/section selectors return source-bound IDs and exact ranges including descendants; duplicate titles have distinct IDs. Use returned IDs; resolve read_file for parser details.",
-                        )
-                        .replace(
-                            "Compatible byte ranges are merged before I/O within each revision-bound delivery group, then sliced and encoded at original selector boundaries. Live results retain selector_index (including duplicates); merging grants no extra coverage or revision guarantee.",
-                            "Raw-byte results retain original selector_index, including duplicates; merged acquisition grants no extra coverage or revision guarantee.",
-                        )
-                        .into();
-                    definition.description = format!("{}\nResult fields: path, retained_bytes, complete, file_complete, retained_artifact_complete, results. Snapshot reads add total_lines, source_sha256, canonical_bytes and optional artifact_id, continuation, page_selectors, snapshot_error, canonical_sha256 (decoded UTF-16 snapshot identity; join recovery pages on it when present), unchanged; live byte pages instead add read_mode:byte_ranges, file_bytes, file_revision and, when incomplete, range_recovery. Each results[] item has selector, status, complete and text, value or data_hex/data_base64 (search hydrated_ranges), with recovery fields when incomplete.", definition.description).into();
+                    definition.description = "Result fields: path, retained_bytes, complete, file_complete, retained_artifact_complete, results. Snapshot reads add total_lines, source_sha256, canonical_bytes and optional artifact_id, continuation, page_selectors, snapshot_error, canonical_sha256 (decoded UTF-16 snapshot identity; join recovery pages on it when present), unchanged; live byte pages instead add read_mode:byte_ranges, file_bytes, file_revision and, when incomplete, range_recovery. Each results[] item has selector, status, complete and text, value or data_hex/data_base64 (search hydrated_ranges), with recovery fields when incomplete.".into();
                 }
                 eager_nested_tool_definitions.push(definition);
             } else if tool_mode == ToolMode::CodeModeOnly
@@ -929,6 +992,7 @@ fn build_code_mode_executors(
         }
     }
 
+    phases.mark("code_mode_specs");
     direct_only_tool_names.sort();
     direct_only_tool_names.dedup();
     let mut eager_nested_tool_descriptions = if eager_nested_tool_definitions.is_empty() {
@@ -942,7 +1006,7 @@ fn build_code_mode_executors(
         eager_nested_tool_descriptions.push("Nested apply_patch is unavailable in this session; use its direct interface only if advertised.".to_string());
     }
     if has_nested_list_files {
-        let guide = "- `await tools.list_files({path, include?, exclude?, exclude_directories?, include_paths?, exclude_paths?, exclude_directory_paths?, include_hidden?, include_ignored?, include_metadata?, summary_only?, max_depth?, max_entries?})`: include/exclude/exclude_directories are arrays of case-sensitive basename patterns, never booleans. Explicit include_paths/exclude_paths/exclude_directory_paths are case-sensitive root-relative patterns with / or \\ separators, segment-local * and ?, and whole-segment ** for zero or more segments. Inclusion groups are unioned; exclusions win. max_depth:0 lists only the selected directory; default depth 8 and 2000 entries. By default respects .gitignore only inside Git repositories (from each entry's nearest repository root down; never outside one); include_ignored:true bypasses it. Hidden directories are not traversed unless include_hidden:true, independently of ignored-file filtering. For unfiltered coverage set both true and omit filters. Returns `{entries:[{path,kind}], truncated, complete}`. With include patterns only matching files are listed, but subdirectories are still traversed unless pruned by exclude_directories or exclude_directory_paths. Combine known patterns for the same root/options; check completeness under the combined limits. summary_only:true aggregates file/directory counts and logical file bytes in the same scan instead of returning entry paths; check summary.skipped and summary.totals_complete along with errors/cutoffs. Traversal and metadata costs still apply. include_metadata:true adds cheap entry size/timestamps/link/readonly metadata; omitted by default, no content detection or link-target probes. Check per-path errors and metadata_error. Resolve the full contract for other options.".to_string();
+        let guide = "- `await tools.list_files({path, include?, exclude?, exclude_directories?, include_hidden?, include_ignored?, include_metadata?, summary_only?, max_depth?, max_entries?})`: include/exclude/exclude_directories are arrays of case-sensitive basename patterns, never booleans. Default depth 8 and 2000 entries; respects .gitignore inside Git repositories and skips hidden directories unless include_ignored/include_hidden. Returns `{entries:[{path,kind}], truncated, complete}`; check completeness and per-path errors. summary_only:true aggregates counts and bytes. For root-relative patterns or other options, resolve_tool(\"list_files\") gives only this operation's full contract; do not dump the whole inspect_files union.".to_string();
         let guide = if has_nested_file_inspection {
             guide
                 .replacen("await tools.list_files(", "await tools.inspect_files({operation:\"list\", arguments:", 1)
@@ -970,21 +1034,48 @@ fn build_code_mode_executors(
                 .join(", ")
         ));
     }
+    let code_mode_tool = create_code_mode_tool(
+        tool_mode == ToolMode::CodeModeOnly,
+        turn_context.config.features.enabled(Feature::Kd4Runtime),
+        has_deferred_tools,
+        &direct_only_tool_names,
+        &eager_nested_tool_descriptions,
+    );
+    phases.mark("exec_description");
     let mut result: Vec<Arc<dyn CoreToolRuntime>> = vec![Arc::new(CodeModeExecuteHandler::new_with_input_schemas(
-        create_code_mode_tool(
-            tool_mode == ToolMode::CodeModeOnly,
-            turn_context.config.features.enabled(Feature::Kd4Runtime),
-            has_deferred_tools,
-            &direct_only_tool_names,
-            &eager_nested_tool_descriptions,
-        ),
+        code_mode_tool,
         code_mode_nested_tool_specs,
         deferred_code_mode_nested_tool_specs,
-        &canonical_input_schemas,
-        &effective_contract_revisions,
-    )?.with_native_catalog_policy(executors))];
+        canonical_input_schemas,
+        effective_contract_revisions,
+        executors,
+    ))];
+    phases.mark("nested_catalog");
     result.push(Arc::new(CodeModeWaitHandler));
     Ok(result)
+}
+
+/// Reduces every field description in an eager schema to its first sentence, in place.
+fn keep_first_description_sentences(schema: &mut serde_json::Value) {
+    match schema {
+        serde_json::Value::Object(object) => {
+            for (key, value) in object.iter_mut() {
+                match value {
+                    serde_json::Value::String(text) if key == "description" => {
+                        let kept = codex_code_mode::first_sentence(text).len();
+                        text.truncate(kept);
+                    }
+                    _ => keep_first_description_sentences(value),
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                keep_first_description_sentences(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[instrument(level = "trace", skip_all, fields(tool_spec_count = specs.len()))]

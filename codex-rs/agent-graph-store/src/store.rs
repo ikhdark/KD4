@@ -15,6 +15,17 @@ pub type AgentGraphStoreFuture<'a, T> =
 /// Implementations are expected to return stable ordering for list methods so callers can merge
 /// persisted graph state with live in-memory state without introducing nondeterministic output.
 pub trait AgentGraphStore: Send + Sync {
+    /// Waits, within the owner's bound, for durable edges to cover rollouts written earlier, and
+    /// returns whether they do. Call it before reading an absent edge as "no such descendant".
+    fn await_edge_coverage(&self) -> AgentGraphStoreFuture<'_, bool> {
+        Box::pin(async { Ok(true) })
+    }
+
+    /// Whether durable edges cover earlier rollouts right now, without waiting.
+    fn edge_coverage_certified(&self) -> AgentGraphStoreFuture<'_, bool> {
+        Box::pin(async { Ok(true) })
+    }
+
     /// Reconcile retained/live edges with current durable parent authority, then
     /// return reachable edges from the root. A durable incoming edge wins over
     /// a supplied edge for the same child, including Closed/future-status edges.

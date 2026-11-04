@@ -5,6 +5,7 @@ mod manifest;
 mod parser;
 mod provenance;
 mod seek_sequence;
+mod source_hash;
 mod standalone_executable;
 mod streaming_parser;
 mod transaction;
@@ -33,6 +34,7 @@ pub use parser::UpdateFileChunk;
 pub use parser::UpdateLineKind;
 pub use parser::parse_patch;
 use serde::Serialize;
+pub use source_hash::SourceHashRef;
 use sha2::Digest;
 use sha2::Sha256;
 use similar::TextDiff;
@@ -142,6 +144,8 @@ pub struct PatchContextMismatch {
     pub current_line_end: usize,
     pub current_excerpt: String,
     pub expected_excerpt: String,
+    /// The codex-range hash as supplied: a lowercase hex prefix (at least 12
+    /// characters) or the full hash, never the revision identity.
     pub expected_source_sha256: Option<String>,
     pub candidate_locations: Vec<PatchCandidateLocation>,
     pub message: String,
@@ -1260,7 +1264,7 @@ pub(crate) async fn validate_revision_guards(
             match fs.read_file(&path, sandbox).await {
                 Ok(bytes) => {
                     let hash = hex::encode(Sha256::digest(&bytes));
-                    if guard.expected_sha256.as_ref() != Some(&hash)
+                    if guard.expected_sha256.as_ref().is_some_and(|expected| !expected.matches(&hash))
                         && let Ok(text) = std::str::from_utf8(&bytes) {
                         current_excerpt = bounded_expected_lines(text.lines());
                     }
@@ -1288,11 +1292,18 @@ pub(crate) async fn validate_revision_guards(
                 })),
             }
         };
-        if current != guard.expected_sha256 {
+        // `current` is the full hash (or "present"); a supplied prefix is only
+        // resolved against it here, never treated as the revision identity.
+        let satisfied = match (&guard.expected_sha256, &current) {
+            (Some(expected), Some(hash)) => expected.matches(hash),
+            (None, None) => true,
+            _ => false,
+        };
+        if !satisfied {
             failures.push(format!(
                 "Revision guard failed for {}: expected {}, current {}{}",
                 path.inferred_native_path_string(),
-                guard.expected_sha256.as_deref().unwrap_or("absent"),
+                guard.expected_sha256.as_ref().map_or("absent", SourceHashRef::as_str),
                 current.as_deref().unwrap_or("absent"),
                 if current_excerpt.is_empty() { String::new() } else {
                     format!("\nCurrent excerpt (bounded, from line 1; expected guard supplies a hash only):\n{current_excerpt}")
@@ -2282,7 +2293,7 @@ impl<'a> ChunkMatcher<'a> {
         let malformed = || {
             invalid(
                 PatchContextMismatchKind::MalformedRange,
-                "Malformed codex-range handle; expected START:END sha256:<64 hexadecimal characters>",
+                &format!("Malformed codex-range handle; expected START:END {}", SourceHashRef::FORM),
                 None,
             )
         };
@@ -2290,9 +2301,13 @@ impl<'a> ChunkMatcher<'a> {
         let (start, end) = range.split_once(':').ok_or_else(malformed)?;
         let start = start.parse::<usize>().map_err(|_| malformed())?;
         let end = end.parse::<usize>().map_err(|_| malformed())?;
-        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(malformed());
-        }
+        let hash = SourceHashRef::parse(hash).map_err(|error| {
+            invalid(
+                PatchContextMismatchKind::MalformedRange,
+                &format!("Malformed codex-range handle: {error}"),
+                None,
+            )
+        })?;
         if start == 0 || end < start || end > original_lines.len() {
             return Err(invalid(
                 PatchContextMismatchKind::RangeOutOfBounds,
@@ -2308,7 +2323,7 @@ impl<'a> ChunkMatcher<'a> {
                 excerpt(),
             ));
         }
-        if hash != self.source_hash() {
+        if !hash.matches(self.source_hash()) {
             return Err(invalid(
                 PatchContextMismatchKind::StaleRange,
                 "codex-range source hash changed; reconcile current source before editing",
@@ -2978,8 +2993,9 @@ fn located_patch_mismatch(
     let expected_source_sha256 = chunk.and_then(|chunk| chunk.change_context.as_deref())
         .and_then(|context| context.strip_prefix("codex-range "))
         .and_then(|handle| handle.split_once(" sha256:").map(|(_, hash)| hash))
-        .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .map(str::to_owned);
+        // As supplied (a prefix or the full hash); `current_content_sha256` is the full one.
+        .and_then(|hash| SourceHashRef::parse(hash).ok())
+        .map(|hash| hash.to_string());
     let candidate_locations = (current_line_start != 0).then(|| PatchCandidateLocation {
         line_start: current_line_start, line_end: current_line_end, advisory_only: true,
     }).into_iter().collect();

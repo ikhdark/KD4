@@ -3,7 +3,6 @@ use crate::SESSIONS_SUBDIR;
 use crate::compression;
 use crate::list::parse_timestamp_uuid_from_filename;
 use crate::payload_artifact::PayloadDependencyVersion;
-use crate::recorder::RolloutRecorder;
 use crate::state_integration::normalize_cwd_for_state_db;
 use chrono::DateTime;
 use chrono::NaiveDateTime;
@@ -25,6 +24,7 @@ use codex_state::ExtractionOutcome;
 use codex_state::ThreadMetadataBuilder;
 use codex_state::ThreadMetadataRolloutReducer;
 use codex_utils_absolute_path::normalize_for_native_workdir;
+use futures::StreamExt;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -38,9 +38,14 @@ use tracing::warn;
 
 const BACKFILL_BATCH_SIZE: usize = 200;
 const EXTRACTION_CACHE_CAPACITY: usize = 256;
-/// A claim must outlive one bounded startup run so live workers never overlap, yet expire
-/// soon after a worker is killed so later startups can resume instead of timing out behind it.
-pub(crate) const BACKFILL_LEASE_SECONDS: i64 = 60;
+/// Concurrent rollout reads within one pass; capped so a cold corpus scan cannot
+/// saturate storage or the blocking pool while foreground turns are running.
+const MAX_CONCURRENT_BACKFILL_READS: usize = 8;
+/// A claim must outlive one bounded pass so live workers never overlap, yet expire soon
+/// after a worker is killed so a later one can resume behind it. Checkpoints renew it.
+pub(crate) const BACKFILL_LEASE_SECONDS: i64 = 30;
+/// How much a killed worker can lose. Short processes must still add up to full coverage.
+const BACKFILL_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub(crate) fn builder_from_session_meta(
     session_meta: &SessionMetaLine,
@@ -165,12 +170,18 @@ pub(crate) async fn extract_metadata_from_rollout_with_cache_status(
     if let Some(outcome) = cached_extraction_outcome(rollout_path, default_provider).await {
         return Ok((outcome, true));
     }
-    let mut accumulator = RolloutMetadataAccumulator::default();
-    let (_thread_id, parse_errors, _, unresolved_payloads) =
-        RolloutRecorder::for_each_rollout_item_with_integrity(rollout_path, false, |item, _| {
-            accumulator.push(item, rollout_path, default_provider);
-        })
-        .await?;
+    let scan = tokio::task::spawn_blocking({
+        let rollout_path = rollout_path.to_path_buf();
+        let default_provider = default_provider.to_string();
+        move || scan_rollout_metadata(&rollout_path, &default_provider)
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+    let RolloutMetadataScan {
+        accumulator,
+        parse_errors,
+        unresolved_payloads,
+    } = scan;
     let mut outcome = accumulator
         .finish(rollout_path, default_provider, parse_errors)
         .await
@@ -185,6 +196,210 @@ pub(crate) async fn extract_metadata_from_rollout_with_cache_status(
         })?;
     outcome.unresolved_payloads = unresolved_payloads;
     Ok((outcome, false))
+}
+
+/// Size of the buffered window over one rollout; large enough that typical lines
+/// are classified in place while the scan stays bounded per concurrent rollout.
+const METADATA_SCAN_BUFFER_BYTES: usize = 256 * 1024;
+
+struct RolloutMetadataScan {
+    accumulator: RolloutMetadataAccumulator,
+    parse_errors: usize,
+    unresolved_payloads: usize,
+}
+
+/// Project one rollout into thread metadata on a blocking thread.
+///
+/// Thread metadata reads only the records named by
+/// [`codex_state::rollout_item_affects_thread_metadata`], so everything else is
+/// classified from its leading bytes and dropped without a JSON parse or a payload
+/// read. Only a referenced `session_meta` body is ever hydrated: an unreadable tool
+/// manifest, timing checkpoint or terminal event cannot change this projection and
+/// is therefore not a payload gap.
+fn scan_rollout_metadata(
+    rollout_path: &Path,
+    default_provider: &str,
+) -> std::io::Result<RolloutMetadataScan> {
+    use std::io::BufRead;
+    use std::io::Read;
+
+    let physical = compression::existing_rollout_path_blocking(rollout_path)
+        .unwrap_or_else(|| rollout_path.to_path_buf());
+    let file = compression::open_rollout_file_with_retry(&physical)?;
+    let input: Box<dyn Read + Send> = if physical
+        .extension()
+        .is_some_and(|extension| extension == "zst")
+    {
+        Box::new(zstd::stream::read::Decoder::new(file)?)
+    } else {
+        Box::new(file)
+    };
+    let mut reader = std::io::BufReader::with_capacity(METADATA_SCAN_BUFFER_BYTES, input);
+    let mut decoder = crate::recorder::RolloutRecordDecoder::default();
+    let mut accumulator = RolloutMetadataAccumulator::default();
+    let mut unresolved_payloads = 0usize;
+    let mut raw = Vec::new();
+    loop {
+        raw.clear();
+        if reader.read_until(b'\n', &mut raw)? == 0 {
+            break;
+        }
+        let terminated = raw.last() == Some(&b'\n');
+        if raw.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        if !metadata_record_needs_parse(&raw) {
+            decoder.note_undecoded_record();
+            accumulator.note_undecoded_record(rollout_path, default_provider);
+            continue;
+        }
+        let text = compression::decode_rollout_line(std::mem::take(&mut raw));
+        let line = if crate::payload_artifact::may_be_reference(&text) {
+            match crate::payload_artifact::hydrate_line(&physical, text) {
+                Ok(line) => line,
+                Err(error) => {
+                    // The caller reports the repairable gap once per rollout; one
+                    // missing artifact must not warn per record across a whole corpus.
+                    tracing::debug!(path = %rollout_path.display(), %error, "unreadable session metadata payload");
+                    unresolved_payloads = unresolved_payloads.saturating_add(1);
+                    decoder.note_unreadable_record();
+                    continue;
+                }
+            }
+        } else {
+            text
+        };
+        match decoder.decode(&line, terminated) {
+            Ok(Some(item)) => accumulator.push(item, rollout_path, default_provider),
+            Ok(None) => {}
+            Err(error) if is_unknown_record_type(&error, &line) => {
+                accumulator.note_undecoded_record(rollout_path, default_provider);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    decoder.finish(rollout_path)?;
+    Ok(RolloutMetadataScan {
+        accumulator,
+        parse_errors: decoder.parse_errors(),
+        unresolved_payloads,
+    })
+}
+
+/// A record whose own type this build does not know names nothing its projection reads, so
+/// the thread still gets its row: another writer sharing this home, such as a different Codex
+/// build, must not keep the index uncertified. Reconstruction keeps refusing such a rollout,
+/// and an unknown value nested in a known record stays an error.
+fn is_unknown_record_type(error: &std::io::Error, line: &str) -> bool {
+    if error.kind() != std::io::ErrorKind::Unsupported {
+        return false;
+    }
+    let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    record
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|record_type| {
+            error
+                .to_string()
+                .contains(&format!("unknown variant `{record_type}`"))
+        })
+}
+
+/// Whether a raw JSONL record can change thread metadata.
+///
+/// This recognizes only the exact shape the current writer emits; any other prefix,
+/// including legacy records and unsupported format versions, keeps the canonical
+/// decoder and its errors. Keep it in step with
+/// [`codex_state::rollout_item_affects_thread_metadata`], and with the reference
+/// candidates in `payload_artifact::is_artifact_candidate`.
+fn metadata_record_needs_parse(line: &[u8]) -> bool {
+    let Some((tag, rest)) = rollout_record_tag(line) else {
+        return true;
+    };
+    match tag {
+        b"response_item"
+        | b"world_state"
+        | b"compacted"
+        | b"tool_manifest"
+        | b"sampling_boundary"
+        | b"inter_agent_communication"
+        | b"inter_agent_communication_metadata"
+        | b"additional_context_state" => false,
+        b"event_msg" => event_record_needs_parse(rest),
+        crate::payload_artifact::KIND_BYTES => reference_record_needs_parse(rest),
+        _ => true,
+    }
+}
+
+/// Splits `{"timestamp":"..","format_version":N,"type":"TAG"` from a current record.
+fn rollout_record_tag(line: &[u8]) -> Option<(&[u8], &[u8])> {
+    let rest = line.strip_prefix(br#"{"timestamp":""#)?;
+    let rest = &rest[rest.iter().position(|byte| *byte == b'"')? + 1..];
+    let rest = rest.strip_prefix(br#","format_version":"#)?;
+    let digits = rest.iter().take_while(|byte| byte.is_ascii_digit()).count();
+    let version = std::str::from_utf8(&rest[..digits]).ok()?.parse::<u64>().ok()?;
+    if version != 0
+        && version != u64::from(codex_protocol::protocol::CURRENT_ROLLOUT_FORMAT_VERSION)
+    {
+        return None;
+    }
+    take_string_field(&rest[digits..], br#","type":""#)
+}
+
+/// Returns a JSON string value that cannot contain an escape, and what follows it.
+fn take_string_field<'a>(input: &'a [u8], key: &[u8]) -> Option<(&'a [u8], &'a [u8])> {
+    let rest = input.strip_prefix(key)?;
+    let end = rest.iter().position(|byte| *byte == b'"')?;
+    let value = &rest[..end];
+    (!value.contains(&b'\\')).then_some((value, &rest[end + 1..]))
+}
+
+fn event_record_needs_parse(rest: &[u8]) -> bool {
+    let Some((event, rest)) = take_string_field(rest, br#","payload":{"type":""#) else {
+        return true;
+    };
+    match event {
+        b"token_count"
+        | b"user_message"
+        | b"thread_goal_updated"
+        | b"thread_settings_applied"
+        | b"task_started"
+        | b"turn_started" => true,
+        b"item_completed" => completed_item_needs_parse(rest),
+        _ => false,
+    }
+}
+
+/// Completed items dominate rollout bytes, yet only a user message affects metadata.
+fn completed_item_needs_parse(rest: &[u8]) -> bool {
+    let Some((_, rest)) = take_string_field(rest, br#","thread_id":""#) else {
+        return true;
+    };
+    let Some((_, rest)) = take_string_field(rest, br#","turn_id":""#) else {
+        return true;
+    };
+    match take_string_field(rest, br#","item":{"type":""#) {
+        Some((item, _)) => item == b"UserMessage",
+        None => true,
+    }
+}
+
+fn reference_record_needs_parse(rest: &[u8]) -> bool {
+    let Some((_, rest)) = take_string_field(rest, br#","payload":{"sha256":""#) else {
+        return true;
+    };
+    let Some(rest) = rest.strip_prefix(br#","bytes":"#) else {
+        return true;
+    };
+    let digits = rest.iter().take_while(|byte| byte.is_ascii_digit()).count();
+    match take_string_field(&rest[digits..], br#","item_type":""#) {
+        // Writers offload only patch ends, terminal events, manifests and timing
+        // checkpoints besides session metadata; none of those affect metadata.
+        Some((b"tool_manifest" | b"sampling_boundary" | b"event_msg", _)) => false,
+        _ => true,
+    }
 }
 
 /// Extraction failed only after referenced payload artifacts were unreadable.
@@ -366,7 +581,12 @@ pub(crate) struct RolloutMetadataAccumulator {
 }
 
 impl RolloutMetadataAccumulator {
-    pub(crate) fn push(&mut self, item: RolloutItem, rollout_path: &Path, default_provider: &str) {
+    /// A record classified as irrelevant still proves the rollout is not empty.
+    fn note_undecoded_record(&mut self, rollout_path: &Path, default_provider: &str) {
+        self.begin_projection(rollout_path, default_provider);
+    }
+
+    fn begin_projection(&mut self, rollout_path: &Path, default_provider: &str) {
         self.saw_item = true;
         if self.metadata.is_none() {
             let builder = builder_from_items(&[], rollout_path);
@@ -385,6 +605,10 @@ impl RolloutMetadataAccumulator {
             self.metadata = Some(builder.build(default_provider));
             self.reducer = Some(ThreadMetadataRolloutReducer::default());
         }
+    }
+
+    pub(crate) fn push(&mut self, item: RolloutItem, rollout_path: &Path, default_provider: &str) {
+        self.begin_projection(rollout_path, default_provider);
         if let RolloutItem::SessionMeta(meta_line) = &item
             && !self.saw_first_session_meta
         {
@@ -477,6 +701,7 @@ pub(crate) struct BackfillMemo {
     entries: HashMap<PathBuf, BackfillMemoEntry>,
     last_pass: Option<PassRemainder>,
     discovery: Option<BackfillDiscovery>,
+    reported_payload_gaps: usize,
 }
 
 struct BackfillDiscovery {
@@ -491,18 +716,14 @@ struct BackfillDiscovery {
 /// What a pass that claimed the backfill lease left unsettled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PassRemainder {
-    /// Every rollout after the checkpoint settled.
+    /// Every rollout after the checkpoint settled, payload gaps included.
     Settled,
-    /// Only payload gaps remain, each read again at the rollout version of its
-    /// previous read with the payloads it names stamped before that read, or
-    /// reused while all of those stay unchanged.
-    ConfirmedPayloadGaps(usize),
-    /// Some payload gap was read only once at its current rollout version.
-    UnconfirmedPayloadGaps,
     /// Discovery retained a traversal cursor after a bounded slice. The caller
     /// may continue with this memo while its overall deadline permits.
     DiscoveryPending,
-    /// The pass stopped early, or a failure a retry may resolve remains.
+    /// The bounded pass stopped with work left; its checkpoint is durable.
+    Stopped,
+    /// A failure a retry may resolve remains.
     Unresolved,
 }
 
@@ -515,10 +736,10 @@ struct BackfillMemoEntry {
 enum BackfillMemoOutcome {
     /// Reconciled, or content that no retry can repair.
     Settled,
-    /// Indexed provisionally with unreadable payloads. It stays unsettled and
-    /// keeps the checkpoint before it. Payload versions stamped before the
-    /// read that confirmed the gap decide when to read it again; `None` until
-    /// such a read.
+    /// Indexed provisionally with an unreadable session metadata payload. A lost
+    /// artifact never pins the checkpoint: it is read again on later passes unless
+    /// the payload versions stamped before the read that confirmed the gap still
+    /// match; `None` until such a read.
     PayloadGap(Option<Vec<PayloadDependencyVersion>>),
 }
 
@@ -567,6 +788,94 @@ pub(crate) struct BackfillPassReport {
     pub(crate) unchanged: usize,
 }
 
+/// One rollout's independent read work within a backfill pass.
+enum BackfillRead {
+    SourceUnavailable,
+    AuthorityUnavailable,
+    Unchanged {
+        settled: bool,
+    },
+    Read {
+        source_version: RolloutSourceVersion,
+        gap_dependencies: Option<Vec<PayloadDependencyVersion>>,
+        expected: Option<codex_state::ThreadMetadata>,
+        extraction: anyhow::Result<ExtractionOutcome>,
+    },
+}
+
+/// A rollout's stamps and row snapshot, taken before its history is read.
+struct BackfillReadStart {
+    source_version: RolloutSourceVersion,
+    gap_dependencies: Option<Vec<PayloadDependencyVersion>>,
+    expected: Option<codex_state::ThreadMetadata>,
+}
+
+/// Everything a read needs from the database, awaited on the pass's own task. An in-flight read
+/// advances only while the pass polls it, so one waiting on a pooled connection would keep it
+/// through the pass's writes: enough of them exhaust the pool, the pass cannot write, and every
+/// state DB user waits out the pool's acquire timeout.
+async fn start_backfill_read(
+    runtime: &codex_state::StateRuntime,
+    rollout: &BackfillRolloutPath,
+    memo: &BackfillMemo,
+) -> Result<BackfillReadStart, BackfillRead> {
+    let Ok(source_version) = rollout_source_version(&rollout.path).await else {
+        return Err(BackfillRead::SourceUnavailable);
+    };
+    if let Some(settled) = memo.reusable_outcome(&rollout.path, &source_version).await {
+        return Err(BackfillRead::Unchanged { settled });
+    }
+    // Stamp a known gap's payloads before reading it again, so a payload that
+    // appears during or after this read is still a change for the next pass.
+    let gap_dependencies = if memo.payload_gap_at(&rollout.path, &source_version) {
+        crate::payload_artifact::named_payload_versions(&source_version.0)
+            .await
+            .ok()
+    } else {
+        None
+    };
+    let Ok(expected) = expected_thread_metadata_for_rollout(runtime, &rollout.path).await else {
+        return Err(BackfillRead::AuthorityUnavailable);
+    };
+    Ok(BackfillReadStart {
+        source_version,
+        gap_dependencies,
+        expected,
+    })
+}
+
+async fn finish_backfill_read(
+    start: Result<BackfillReadStart, BackfillRead>,
+    rollout: &BackfillRolloutPath,
+    default_provider: &str,
+) -> BackfillRead {
+    match start {
+        Ok(start) => BackfillRead::Read {
+            extraction: extract_metadata_from_rollout(&rollout.path, default_provider).await,
+            source_version: start.source_version,
+            gap_dependencies: start.gap_dependencies,
+            expected: start.expected,
+        },
+        Err(read) => read,
+    }
+}
+
+fn apply_backfill_memo_updates(
+    memo: &mut BackfillMemo,
+    updates: &mut Vec<(PathBuf, Option<BackfillMemoEntry>)>,
+) {
+    for (path, entry) in updates.drain(..) {
+        match entry {
+            Some(entry) => {
+                memo.entries.insert(path, entry);
+            }
+            None => {
+                memo.entries.remove(&path);
+            }
+        }
+    }
+}
+
 /// Backfill rollout metadata into SQLite under the shared worker lease.
 ///
 /// `should_stop` is checked between rollouts. A stopped run checkpoints its contiguous
@@ -581,6 +890,7 @@ pub(crate) async fn backfill_sessions_until(
     memo: &mut BackfillMemo,
     mut should_stop: impl FnMut() -> bool,
 ) -> BackfillPassReport {
+    let mut should_stop = move || runtime.backfill_stop_requested() || should_stop();
     memo.last_pass = None;
     let metric_client = codex_otel::global();
     let timer = metric_client
@@ -655,63 +965,79 @@ pub(crate) async fn backfill_sessions_until(
     };
     let mut contiguous_watermark = backfill_state.last_watermark.clone();
     let mut checkpointed_watermark = backfill_state.last_watermark.clone();
+    let mut last_checkpoint = std::time::Instant::now();
     let mut stopped = false;
     let mut report = BackfillPassReport::default();
-    // Separate payload gaps from failures a retry may resolve. Only discovery can
-    // have failed so far, and a rollout it missed is unread.
-    let mut transient_failures = unresolved_failures;
-    let mut confirmed_gaps = 0usize;
-    let mut unconfirmed_gaps = 0usize;
+    let mut payload_gaps = 0usize;
+    let mut memo_updates: Vec<(PathBuf, Option<BackfillMemoEntry>)> = Vec::new();
+    let parallelism = std::thread::available_parallelism()
+        .map_or(2, |threads| threads.get() / 2)
+        .clamp(2, MAX_CONCURRENT_BACKFILL_READS);
     'batches: for batch in rollout_paths.chunks(BACKFILL_BATCH_SIZE) {
-        for rollout in batch {
-            if should_stop() {
-                stopped = true;
-                break 'batches;
-            }
-            stats.scanned = stats.scanned.saturating_add(1);
-            let Ok(source_version) = rollout_source_version(&rollout.path).await else {
-                memo.entries.remove(&rollout.path);
-                stats.failed = stats.failed.saturating_add(1);
-                unresolved_failures = true;
-                transient_failures = true;
-                continue;
-            };
-            // Re-reading unchanged inputs reproduces the same outcome, so keep it.
-            // A payload gap stays unsettled and keeps the checkpoint before it.
-            if let Some(settled) = memo.reusable_outcome(&rollout.path, &source_version).await {
-                report.unchanged = report.unchanged.saturating_add(1);
-                if settled {
-                    if !unresolved_failures {
-                        contiguous_watermark = Some(rollout.watermark.clone());
-                    }
-                } else {
-                    // Only a gap whose named payloads were stamped is reused.
-                    confirmed_gaps = confirmed_gaps.saturating_add(1);
-                    stats.failed = stats.failed.saturating_add(1);
-                    unresolved_failures = true;
+        {
+            // Reading is independent per rollout and dominates a pass. Results
+            // still apply strictly in watermark order below.
+            let memo_view = &*memo;
+            let mut unread = batch.iter();
+            let mut attempts = futures::stream::FuturesOrdered::new();
+            for rollout in batch {
+                if should_stop() {
+                    stopped = true;
+                    break 'batches;
                 }
-                continue;
-            }
-            // Stamp a known gap's payloads before reading it again, so a payload that
-            // appears during or after this read is still a change for the next pass.
-            let gap_dependencies = if memo.payload_gap_at(&rollout.path, &source_version) {
-                crate::payload_artifact::named_payload_versions(&source_version.0)
-                    .await
-                    .ok()
-            } else {
-                None
-            };
-            let Ok(expected) = expected_thread_metadata_for_rollout(runtime, &rollout.path).await
-            else {
-                memo.entries.remove(&rollout.path);
-                stats.failed = stats.failed.saturating_add(1);
-                unresolved_failures = true;
-                transient_failures = true;
-                continue;
-            };
-            report.extracted = report.extracted.saturating_add(1);
-            let (settled, remembered) =
-                match extract_metadata_from_rollout(&rollout.path, default_provider).await {
+                if last_checkpoint.elapsed() >= BACKFILL_CHECKPOINT_INTERVAL {
+                    last_checkpoint = std::time::Instant::now();
+                    if contiguous_watermark != checkpointed_watermark
+                        && let Some(watermark) = contiguous_watermark.as_deref()
+                    {
+                        if let Err(err) = runtime.checkpoint_backfill_claim(&claim, watermark).await {
+                            unresolved_failures = true;
+                            warn!(
+                                "failed to checkpoint backfill at {}: {err}",
+                                codex_home.display()
+                            );
+                            break 'batches;
+                        }
+                        checkpointed_watermark = contiguous_watermark.clone();
+                    }
+                }
+                while attempts.len() < parallelism
+                    && let Some(next) = unread.next()
+                {
+                    let start = start_backfill_read(runtime, next, memo_view).await;
+                    attempts.push_back(finish_backfill_read(start, next, default_provider));
+                }
+                let Some(attempt) = attempts.next().await else {
+                    break;
+                };
+                stats.scanned = stats.scanned.saturating_add(1);
+                let (source_version, gap_dependencies, expected, extraction) = match attempt {
+                    BackfillRead::SourceUnavailable | BackfillRead::AuthorityUnavailable => {
+                        memo_updates.push((rollout.path.clone(), None));
+                        stats.failed = stats.failed.saturating_add(1);
+                        unresolved_failures = true;
+                        continue;
+                    }
+                    // Re-reading unchanged inputs reproduces the same outcome, so keep it.
+                    BackfillRead::Unchanged { settled } => {
+                        report.unchanged = report.unchanged.saturating_add(1);
+                        if !settled {
+                            payload_gaps = payload_gaps.saturating_add(1);
+                        }
+                        if !unresolved_failures {
+                            contiguous_watermark = Some(rollout.watermark.clone());
+                        }
+                        continue;
+                    }
+                    BackfillRead::Read {
+                        source_version,
+                        gap_dependencies,
+                        expected,
+                        extraction,
+                    } => (source_version, gap_dependencies, expected, extraction),
+                };
+                report.extracted = report.extracted.saturating_add(1);
+                let (settled, remembered) = match extraction {
                     Ok(outcome) => {
                         if outcome.parse_errors > 0
                             && let Some(ref metric_client) = metric_client
@@ -763,13 +1089,10 @@ pub(crate) async fn backfill_sessions_until(
                             (false, None)
                         } else {
                             stats.upserted = stats.upserted.saturating_add(1);
-                            // Provisional rows remain useful, but may not certify lineage.
-                            // Retry on a later bounded pass, with the checkpoint before this gap.
+                            // A provisional row keeps the rollout listed. Later passes reread it
+                            // once its payload changes; a lost artifact must not pin progress.
                             if recoverable_gap {
-                                (
-                                    false,
-                                    Some(BackfillMemoOutcome::PayloadGap(gap_dependencies)),
-                                )
+                                (true, Some(BackfillMemoOutcome::PayloadGap(gap_dependencies)))
                             } else {
                                 (true, Some(BackfillMemoOutcome::Settled))
                             }
@@ -790,57 +1113,40 @@ pub(crate) async fn backfill_sessions_until(
                             stats.failed = stats.failed.saturating_add(1);
                             (true, Some(BackfillMemoOutcome::Settled))
                         } else if is_repairable_payload_gap(&err) {
-                            (
-                                false,
-                                Some(BackfillMemoOutcome::PayloadGap(gap_dependencies)),
-                            )
+                            (true, Some(BackfillMemoOutcome::PayloadGap(gap_dependencies)))
                         } else {
                             (false, None)
                         }
                     }
                 };
-            if !settled {
-                match &remembered {
-                    Some(BackfillMemoOutcome::PayloadGap(Some(_))) => {
-                        confirmed_gaps = confirmed_gaps.saturating_add(1);
+                if matches!(remembered, Some(BackfillMemoOutcome::PayloadGap(_))) {
+                    payload_gaps = payload_gaps.saturating_add(1);
+                }
+                memo_updates.push((
+                    rollout.path.clone(),
+                    remembered.map(|outcome| BackfillMemoEntry {
+                        source: source_version,
+                        outcome,
+                        observed_at: std::time::Instant::now(),
+                    }),
+                ));
+                if settled {
+                    if !unresolved_failures {
+                        contiguous_watermark = Some(rollout.watermark.clone());
                     }
-                    Some(BackfillMemoOutcome::PayloadGap(None)) => {
-                        unconfirmed_gaps = unconfirmed_gaps.saturating_add(1);
-                    }
-                    Some(BackfillMemoOutcome::Settled) | None => transient_failures = true,
+                } else {
+                    stats.failed = stats.failed.saturating_add(1);
+                    unresolved_failures = true;
                 }
-            }
-            match remembered {
-                Some(outcome) => {
-                    memo.entries.insert(
-                        rollout.path.clone(),
-                        BackfillMemoEntry {
-                            source: source_version,
-                            outcome,
-                            observed_at: std::time::Instant::now(),
-                        },
-                    );
-                }
-                None => {
-                    memo.entries.remove(&rollout.path);
-                }
-            }
-            if settled {
-                if !unresolved_failures {
-                    contiguous_watermark = Some(rollout.watermark.clone());
-                }
-            } else {
-                stats.failed = stats.failed.saturating_add(1);
-                unresolved_failures = true;
             }
         }
+        apply_backfill_memo_updates(memo, &mut memo_updates);
 
         if contiguous_watermark != checkpointed_watermark
             && let Some(watermark) = contiguous_watermark.as_deref()
         {
             if let Err(err) = runtime.checkpoint_backfill_claim(&claim, watermark).await {
                 unresolved_failures = true;
-                transient_failures = true;
                 warn!(
                     "failed to checkpoint backfill at {}: {err}",
                     codex_home.display()
@@ -851,6 +1157,7 @@ pub(crate) async fn backfill_sessions_until(
             }
         }
     }
+    apply_backfill_memo_updates(memo, &mut memo_updates);
     // A stopped run skipped its batch checkpoint; save the contiguous progress so the next
     // claim resumes after it instead of rescanning the batch.
     if stopped
@@ -880,7 +1187,7 @@ pub(crate) async fn backfill_sessions_until(
         .complete_backfill_claim(&claim, contiguous_watermark.as_deref())
         .await
     {
-        transient_failures = true;
+        unresolved_failures = true;
         warn!(
             "failed to mark backfill complete at {}: {err}",
             codex_home.display()
@@ -892,19 +1199,27 @@ pub(crate) async fn backfill_sessions_until(
             );
         }
     }
-    memo.last_pass = Some(if stopped || transient_failures {
+    // Lost artifacts no longer hold certification back, so say what they cost, once per change.
+    if !stopped && payload_gaps != memo.reported_payload_gaps {
+        memo.reported_payload_gaps = payload_gaps;
+        if payload_gaps > 0 {
+            warn!(
+                "{payload_gaps} rollouts at {} have unreadable payload artifacts; they are indexed provisionally and may show incomplete metadata",
+                codex_home.display()
+            );
+        }
+    }
+    memo.last_pass = Some(if stopped {
+        PassRemainder::Stopped
+    } else if unresolved_failures {
         PassRemainder::Unresolved
-    } else if unconfirmed_gaps > 0 {
-        PassRemainder::UnconfirmedPayloadGaps
-    } else if confirmed_gaps > 0 {
-        PassRemainder::ConfirmedPayloadGaps(confirmed_gaps)
     } else {
         PassRemainder::Settled
     });
 
     info!(
-        "state db backfill scanned={}, extracted={}, unchanged={}, upserted={}, failed={}",
-        stats.scanned, report.extracted, report.unchanged, stats.upserted, stats.failed
+        "state db backfill scanned={}, extracted={}, unchanged={}, upserted={}, failed={}, payload_gaps={}",
+        stats.scanned, report.extracted, report.unchanged, stats.upserted, stats.failed, payload_gaps
     );
     if metric_client.is_some() || timer.is_some() {
         // SDK instrument creation and measurement may take shared SDK locks or

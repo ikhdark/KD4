@@ -105,7 +105,18 @@ pub fn executable_sha256() -> Option<&'static str> {
         .as_deref()
 }
 
-/// Starts [`executable_sha256`] on a background thread, once per process.
+/// [`executable_sha256`] for provenance recorded on the session path: rollout
+/// metadata and turn identity. Hashing a 300 MB binary takes over 100 ms and the
+/// first rollout write waits for it, so the digest is remembered across processes
+/// per executable path while the file's size and modification time are unchanged.
+/// Attestation (the Desktop runtime receipt) keeps hashing the bytes.
+pub fn executable_identity_sha256() -> Option<&'static str> {
+    static HASH: OnceLock<Option<String>> = OnceLock::new();
+    HASH.get_or_init(|| remembered_executable_sha256().ok())
+        .as_deref()
+}
+
+/// Starts [`executable_identity_sha256`] on a background thread, once per process.
 /// The first rollout metadata write waits for this hash; starting it when a
 /// session is created overlaps it with session startup instead of the first
 /// turn. A later caller blocks only until the same computation finishes.
@@ -116,9 +127,54 @@ pub fn prehash_executable() {
         let _ = std::thread::Builder::new()
             .name("executable-sha256".to_string())
             .spawn(|| {
-                executable_sha256();
+                executable_identity_sha256();
             });
     });
+}
+
+/// A best-effort cache in the user's temp directory: any failure hashes again.
+fn remembered_executable_sha256() -> io::Result<String> {
+    let path = std::env::current_exe()?;
+    let stamp = file_stamp(&path)?;
+    let memo = std::env::temp_dir()
+        .join("codex-executable-sha256")
+        .join(hex::encode(Sha256::digest(path.as_os_str().as_encoded_bytes())));
+    if let Ok(saved) = std::fs::read_to_string(&memo)
+        && let Some((saved_stamp, digest)) = saved.rsplit_once(' ')
+        && saved_stamp == stamp
+        && digest.len() == 64
+        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Ok(digest.to_string());
+    }
+    let digest = executable_sha256()
+        .ok_or_else(|| io::Error::other("could not hash the running executable"))?
+        .to_string();
+    // A file replaced while it was being hashed stays unremembered.
+    if file_stamp(&path).is_ok_and(|current| current == stamp) {
+        let _ = write_executable_memo(&memo, &format!("{stamp} {digest}"));
+    }
+    Ok(digest)
+}
+
+fn file_stamp(path: &Path) -> io::Result<String> {
+    let metadata = std::fs::metadata(path)?;
+    let modified = metadata
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(io::Error::other)?;
+    Ok(format!("{} {}", metadata.len(), modified.as_nanos()))
+}
+
+fn write_executable_memo(memo: &Path, contents: &str) -> io::Result<()> {
+    if let Some(parent) = memo.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary = memo.with_extension(std::process::id().to_string());
+    std::fs::write(&temporary, contents)?;
+    std::fs::rename(&temporary, memo).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temporary);
+    })
 }
 
 #[cfg(target_os = "linux")]

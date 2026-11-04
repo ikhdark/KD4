@@ -5,6 +5,33 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 const STARTUP_TIMING_SCHEMA_VERSION: u16 = 3;
+
+/// Debug timeline of one startup-path operation: `RUST_LOG=codex_startup_phase=debug`.
+pub struct StartupPhaseLog {
+    scope: &'static str,
+    last: Instant,
+}
+
+impl StartupPhaseLog {
+    pub fn start(scope: &'static str) -> Self {
+        Self {
+            scope,
+            last: Instant::now(),
+        }
+    }
+
+    /// Records the time since the previous mark as `phase`.
+    pub fn mark(&mut self, phase: &'static str) {
+        let now = Instant::now();
+        tracing::debug!(
+            target: "codex_startup_phase",
+            scope = self.scope,
+            phase,
+            elapsed_us = now.duration_since(self.last).as_micros() as u64,
+        );
+        self.last = now;
+    }
+}
 const MAX_STARTUP_LIFECYCLE_EVENTS: u32 = 128;
 
 #[derive(Debug, serde::Serialize)]

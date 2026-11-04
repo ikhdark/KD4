@@ -33,6 +33,12 @@ impl Default for BackfillState {
 }
 
 impl BackfillState {
+    /// Thread rows and spawn edges have covered the rollouts on disk at least once. A later
+    /// refresh pass reconciles newer writers without withdrawing this.
+    pub fn coverage_certified(&self) -> bool {
+        self.status == BackfillStatus::Complete || self.last_success_at.is_some()
+    }
+
     pub(crate) fn try_from_row(row: &SqliteRow) -> Result<Self> {
         let status: String = row.try_get("status")?;
         let last_success_at = row

@@ -109,17 +109,13 @@ fn catalog_from_outcome(outcome: &SkillLoadOutcome) -> SkillCatalog {
     let mut catalog = SkillCatalog {
         continuation: None,
         entries: Vec::new(),
+        // Optional-metadata warnings describe skills that loaded and are already
+        // logged at session init; they are not per-turn model/user diagnostics.
         warnings: outcome
             .errors
             .iter()
-            .map(|err| {
-                format!(
-                    "{} at {}: {}",
-                    if err.is_warning { "Skill metadata warning" } else { "Failed to load skill" },
-                    err.path.display(),
-                    err.message
-                )
-            })
+            .filter(|err| !err.is_warning)
+            .map(|err| format!("Failed to load skill at {}: {}", err.path.display(), err.message))
             .collect(),
     };
 

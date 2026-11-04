@@ -42,6 +42,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.common.process_owner import run_owned, CleanupFailed  # noqa: E402
+from scripts.build.cargo_resources import BuildLease, _inherited_lease, run_build  # noqa: E402
 from scripts.common.atomic_json import write_json_atomic  # noqa: E402
 
 from scripts.common.tool_versions import cargo_lane_patterns  # noqa: E402
@@ -1267,6 +1268,7 @@ def reserve_cargo_lane(
     max_active_lanes: int | None = None,
     source_identity: str | None = None,
     rank: Callable[[Path], int] | None = None,
+    admit: Callable[[Path], bool] | None = None,
 ) -> Iterator[tuple[str, Path]]:
     """Reserve a lane; `rank` orders warm candidates (lower first) before LRU."""
     warm_wait_seconds = _nonnegative_wait_seconds(warm_wait_seconds)
@@ -1349,7 +1351,18 @@ def reserve_cargo_lane(
                     break
                 busy_reusable |= compatible or not compatible_paths
         if active_handle is not None:
-            break
+            admitted = False
+            try:
+                admitted = admit is None or admit(target_dir)
+            finally:
+                if not admitted:
+                    try:
+                        _release_binary_file_lock(active_handle)
+                    finally:
+                        active_handle.close()
+                        active_handle = None
+            if admitted:
+                break
         if not announced_wait:
             print(
                 f"waiting for a reusable Cargo lane for {base_lane!r}",
@@ -2565,6 +2578,21 @@ def _reuse_bundle(
     return destination, copies
 
 
+def _physical_memory_gib() -> int | None:
+    """Installed RAM, whole GiB so firmware reservations cannot split one host."""
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            kilobytes = ctypes.c_ulonglong()
+            if not ctypes.windll.kernel32.GetPhysicallyInstalledSystemMemory(ctypes.byref(kilobytes)):
+                return None
+            return round(kilobytes.value / 2**20)
+        return round(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30)
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
 def _rustc_identity(env: Mapping[str, str], cwd: Path) -> str | None:
     """`rustc -vV` as rustup resolves it from the build cwd (toolchain files)."""
     try:
@@ -2929,6 +2957,7 @@ def run_in_cargo_lane(
     record = {"command": list(command), "requestedLane": requested_lane,
               "exitCode": None, "cargoExitCode": None, "status": "running"}
     timing_evidence = None
+    resource_lease = None
     reuse_decisions: list[dict[str, object]] = []
     cache_reuse = {
         "frozenBinary": {"status": "not_requested", "decisions": reuse_decisions},
@@ -2996,6 +3025,7 @@ def run_in_cargo_lane(
                     name: _file_sha256(REPO_ROOT / name) for name in (
                         "scripts/build/rust_build_status.py",
                         "scripts/build/rust_build_status_support.py",
+                        "scripts/build/cargo_resources.py",
                         "scripts/build/rust_tool_env.py",
                         "scripts/common/process_owner.py",
                         "scripts/common/tool_versions.py",
@@ -3006,6 +3036,7 @@ def run_in_cargo_lane(
                     "architecture": platform.machine(),
                     "processor": platform.processor(),
                     "logicalProcessors": os.cpu_count(),
+                    "physicalMemoryGiB": _physical_memory_gib(),
                 },
                 "sourceUnchanged": None,
                 "captureMs": (time.perf_counter() - capture_started) * 1000,
@@ -3048,13 +3079,24 @@ def run_in_cargo_lane(
             max_active_lanes = max_active_lanes or max_active_lanes_per_base()
         else:
             record["sourceMirrorSkipped"] = skipped
+        admission = None
+        if os.name == "nt" and _inherited_lease(child_env) is None:
+            record["resources"] = {"schemaVersion": 1, "command": list(command), "status": "pending"}
+            resource_lease = BuildLease(child_env, True, record["resources"])
+            def admission(path):
+                resource_lease.cold = not _is_warm_lane_dir(path) or _read_lane_build_context(path) != build_context
+                return resource_lease.acquire(wait=False)
+        lane_wait_started = time.perf_counter()
         with reserve_cargo_lane(
             repo_root=owner_root, requested_lane=requested_lane, command=command,
             lane_root=lane_root, lock_timeout_seconds=lock_timeout_seconds,
             warm_wait_seconds=warm_wait_seconds, allow_cold_overflow=allow_cold_overflow,
             build_context=build_context, max_active_lanes=max_active_lanes,
-            source_identity=source_identity, rank=rank,
+            source_identity=source_identity, rank=rank, admit=admission,
         ) as (resolved_lane, target_dir):
+            record["laneAdmissionMs"] = (time.perf_counter() - lane_wait_started) * 1000
+            record["laneWaitMs"] = max(0, record["laneAdmissionMs"] - record.get("resources", {}).get("resourceWaitMs", 0))
+            cold_build = not _is_warm_lane_dir(target_dir) or _read_lane_build_context(target_dir) != build_context
             record.update(resolvedLane=resolved_lane, targetDir=str(target_dir))
             if os.name == "nt":
                 record["nativeOutputPathPreflight"] = {
@@ -3121,11 +3163,19 @@ def run_in_cargo_lane(
                         cause="no invocation-scoped compiler-cache receipt; shared cache counters cannot attribute this build",
                     )
                     cargo_started = time.perf_counter()
-                    code = run_owned(
+                    resource_options = {}
+                    runner = run_owned
+                    if os.name == "nt":
+                        record.setdefault("resources", {})
+                        runner = run_build
+                        resource_options = {"cold": cold_build, "resource_record": record["resources"],
+                                            "lane_wait_ms": record["laneWaitMs"], "lease": resource_lease}
+                    code = runner(
                         child_command, env=child_env, cwd=child_cwd,
                         prepare_sccache=True, check=False,
                         stdout=messages if messages_path is not None else sys.stdout,
                         stderr=sys.stderr,
+                        **resource_options,
                     ).returncode
                     record["cargoMs"] = (time.perf_counter() - cargo_started) * 1000
                 record["cargoExitCode"] = code
@@ -3237,6 +3287,9 @@ def run_in_cargo_lane(
         print("Build reuse: " + json.dumps({
             key: _cache_evidence_summary(value) for key, value in cache_reuse.items()
         }), file=sys.stderr)
+        if resource_lease is not None and not resource_lease.finished:
+            record["resources"].update(status="failed", error="build setup interrupted before compilation")
+            resource_lease.finish(quarantined=isinstance(sys.exception(), CleanupFailed))
         if timing_path is not None:
             if timing_evidence is not None:
                 capture_started = time.perf_counter()

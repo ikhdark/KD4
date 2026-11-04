@@ -106,6 +106,11 @@ pub async fn collect_git_info(cwd: &Path) -> Option<GitInfo> {
 /// Discover a small repository context for callers that naturally own it.
 /// Standalone callers should continue to use [`collect_git_info`].
 pub async fn discover_repository_context(cwd: &Path) -> Option<RepositoryContext> {
+    // Starting git costs 20-30 ms on Windows, on every new thread outside a
+    // repository. Only GIT_DIR can make it succeed without a marker on the path.
+    if get_git_repo_root(cwd).is_none() && std::env::var_os("GIT_DIR").is_none() {
+        return None;
+    }
     let output = run_git_command_with_timeout(
         &[
             "rev-parse",

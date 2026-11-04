@@ -427,13 +427,27 @@ struct ProcessEntry {
 }
 
 
-pub(crate) fn clamp_yield_time_for_readiness(yield_time_ms: u64, executor_ready: bool) -> u64 {
-    let yield_time_ms = if cfg!(windows) && !executor_ready {
-        yield_time_ms.max(WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS)
-    } else {
-        yield_time_ms
-    };
+pub(crate) fn clamp_initial_yield_time(yield_time_ms: u64) -> u64 {
     yield_time_ms.clamp(MIN_YIELD_TIME_MS, MAX_INITIAL_YIELD_TIME_MS)
+}
+
+/// Extra observation the first Windows command in an environment may receive
+/// beyond its requested (already clamped) yield. A cold shell can spend most of
+/// a 1 s request starting, so a still-silent process would otherwise yield an
+/// empty handle and cost a polling generation. The collector spends this only
+/// while the process has shown no output or is still printing; output followed
+/// by quiet, or exit, ends the wait at the requested time.
+pub(crate) fn cold_start_yield_allowance(
+    clamped_yield_time_ms: u64,
+    executor_ready: bool,
+) -> std::time::Duration {
+    if cfg!(windows) && !executor_ready {
+        std::time::Duration::from_millis(
+            WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS.saturating_sub(clamped_yield_time_ms),
+        )
+    } else {
+        std::time::Duration::ZERO
+    }
 }
 
 pub(crate) fn generate_chunk_id() -> String {

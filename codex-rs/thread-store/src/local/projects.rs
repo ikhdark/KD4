@@ -61,7 +61,12 @@ pub(super) async fn create_project(
     store: &LocalThreadStore,
     params: CreateProjectParams,
 ) -> ThreadStoreResult<CreatedProject> {
-    state(store)?
+    let state = state(store)?;
+    // Named threads must have rows; give ones still being indexed the chance to appear.
+    if !params.thread_ids.is_empty() {
+        state.await_thread_index().await;
+    }
+    state
         .create_project(
             params.name,
             params.roots.into_iter().map(state_root).collect(),

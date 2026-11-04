@@ -866,6 +866,18 @@ impl ThreadManager {
         &self,
         thread_id: ThreadId,
     ) -> CodexResult<Vec<ThreadId>> {
+        // Deletion and archive act on this list; a descendant missing from a partial
+        // index would be silently orphaned.
+        if let Some(store) = self.state.agent_graph_store()
+            && !store
+                .await_edge_coverage()
+                .await
+                .map_err(|err| CodexErr::Fatal(err.to_string()))?
+        {
+            return Err(CodexErr::InvalidRequest(
+                "thread index is still being built; retry shortly".to_string(),
+            ));
+        }
         self.state
             .reconciled_agent_subtree(thread_id, Vec::new())
             .await

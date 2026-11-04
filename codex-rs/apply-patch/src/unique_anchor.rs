@@ -1,6 +1,7 @@
 //! Exact bounded-span selection; preflight and conditional publication remain
 //! with the existing patch owner, rather than a separate editing tool.
 use crate::ApplyPatchError;
+use crate::SourceHashRef;
 use crate::UpdateFileChunk;
 use crate::UpdateLineKind;
 use codex_utils_path_uri::PathUri;
@@ -35,10 +36,10 @@ pub(crate) fn replace(
         .change_context
         .as_deref()
         .and_then(|context| context.strip_prefix("codex-anchor sha256:"))
-        .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .ok_or_else(|| invalid("expected @@ codex-anchor sha256:<whole-file source_sha256>"))?;
+        .ok_or_else(|| invalid(&format!("expected @@ codex-anchor {}", SourceHashRef::FORM)))?;
+    let hash = SourceHashRef::parse(hash).map_err(|error| invalid(&error.to_string()))?;
     let current = hex::encode(Sha256::digest(source.as_bytes()));
-    if !hash.eq_ignore_ascii_case(&current) {
+    if !hash.matches(&current) {
         return Err(ApplyPatchError::RevisionGuardMismatch(format!(
             "codex-anchor revision guard failed for {}: expected {hash}, current {current}. Re-read and reconcile before submitting a fresh patch.",
             path.inferred_native_path_string()

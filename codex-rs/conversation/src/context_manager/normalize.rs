@@ -24,6 +24,15 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
     insert_items_after(items, missing_outputs_to_insert);
 }
 
+/// For a hypothetical prompt: a call still executing legitimately has no output yet,
+/// which is only an invariant violation in a prompt that will actually be sent.
+pub(crate) fn pair_in_flight_calls_for_estimate(items: &mut std::sync::Arc<Vec<ResponseItem>>) {
+    let missing_outputs_to_insert = collect_missing_call_outputs(items, false);
+    if !missing_outputs_to_insert.is_empty() {
+        insert_items_after(std::sync::Arc::make_mut(items), missing_outputs_to_insert);
+    }
+}
+
 /// Insert after original indexes in ascending order, without repeatedly moving
 /// the history suffix. The common zero/one-insertion cases reuse the allocation.
 fn insert_items_after(items: &mut Vec<ResponseItem>, mut insertions: Vec<(usize, ResponseItem)>) {

@@ -93,6 +93,7 @@ mod stream_events_utils;
 pub use codex_tool_artifacts::image_generation_artifact_path;
 pub(crate) use codex_conversation::stable_context;
 pub(crate) use codex_turn_timing::startup_timing;
+pub use codex_turn_timing::startup_timing::StartupPhaseLog;
 mod unified_exec;
 pub mod windows_sandbox;
 pub use client::X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER;

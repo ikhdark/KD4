@@ -94,7 +94,8 @@ export class CodexExec {
   }
 
   async *run(args: CodexExecArgs): AsyncGenerator<string> {
-    const commandArgs: string[] = ["exec", "--experimental-json"];
+    // thread.ts consumes item.progress for streaming and for partial text on failure.
+    const commandArgs: string[] = ["exec", "--experimental-json", "--json-progress"];
 
     if (this.configOverrides) {
       for (const override of serializeConfigOverrides(this.configOverrides)) {

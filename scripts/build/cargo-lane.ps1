@@ -998,7 +998,11 @@ function Get-CargoLaneOwnedCommand {
     if ($command.CommandType -eq [Management.Automation.CommandTypes]::ExternalScript) {
         $owned = @((Get-Process -Id $PID).Path, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File") + $owned
     }
-    $prepareArgs = if ($PrepareSccache) { @("--prepare-sccache") } else { @() }
+    $prepareArgs = @(if ($PrepareSccache) { "--prepare-sccache" })
+    if ($PrepareSccache) {
+        $prepareArgs += @("--cargo-resources", "--cargo-resource-no-wait", "--lane-wait-ms", $laneWaitMs.ToString("R", [Globalization.CultureInfo]::InvariantCulture))
+        if ($coldBuild) { $prepareArgs += "--cargo-cold" }
+    }
     return @(
         $python.Source,
         (Join-Path $PSScriptRoot "../common/process_owner.py"),
@@ -1096,7 +1100,9 @@ $previousLaneTargetDir = $env:CODEX_CARGO_LANE_TARGET_DIR
 $didPushLocation = $false
 # OS observations may become idle while waiting for coordination. Reservation
 # rechecks their locks; only explicit administrative exclusions stay excluded.
+$laneWaitWatch = [Diagnostics.Stopwatch]::StartNew()
 $reservation = Acquire-CargoLaneReservation -LaneRoot $cargoLanesRoot -BaseLane $candidateLane -ActiveNames $excludedLaneNames -AllowColdOverflow:$parsedArgs.AllowColdOverflow -WarmWaitSeconds $parsedArgs.WarmWaitSeconds
+$laneWaitMs = $laneWaitWatch.Elapsed.TotalMilliseconds
 if ($null -eq $reservation) {
     [Console]::Error.WriteLine("Cargo lane '$candidateLane' is busy; no cold overflow was started. Required validation remains pending.")
     $status = @{
@@ -1113,6 +1119,7 @@ if ($null -eq $reservation) {
 try {
     $resolvedLane = $reservation.Lane
     $targetDir = $reservation.TargetDir
+    $coldBuild = -not (Test-CargoLaneWarm -Target $targetDir)
     Push-Location $rustRoot
     $didPushLocation = $true
     $commandArgs = @(Add-CargoTargetDirArgument -CommandArgs $commandArgs -TargetDir $targetDir)

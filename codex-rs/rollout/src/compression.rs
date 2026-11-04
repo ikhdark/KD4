@@ -857,7 +857,7 @@ impl RolloutLineReader {
 /// terminates that fragment in place. Emit a non-JSON record for invalid UTF-8 so
 /// callers count and skip it without losing later records. Lossy decoding could
 /// instead turn corrupted bytes inside a JSON string into apparently valid evidence.
-fn decode_rollout_line(mut line: Vec<u8>) -> String {
+pub(crate) fn decode_rollout_line(mut line: Vec<u8>) -> String {
     if line.last() == Some(&b'\n') {
         line.pop();
         if line.last() == Some(&b'\r') {
@@ -865,6 +865,33 @@ fn decode_rollout_line(mut line: Vec<u8>) -> String {
         }
     }
     String::from_utf8(line).unwrap_or_else(|_| "invalid UTF-8 rollout record".to_owned())
+}
+
+/// Blocking counterpart of [`existing_rollout_path`] for scans already off the executor.
+pub(crate) fn existing_rollout_path_blocking(path: &Path) -> Option<PathBuf> {
+    let plain_path = path::plain_rollout_path(path);
+    if std::fs::metadata(&plain_path).is_ok_and(|metadata| metadata.is_file()) {
+        return Some(plain_path);
+    }
+    let compressed_path = path::compressed_rollout_path(&plain_path);
+    std::fs::metadata(&compressed_path)
+        .is_ok_and(|metadata| metadata.is_file())
+        .then_some(compressed_path)
+}
+
+/// Blocking open with the same bounded representation-transition retry as
+/// [`open_rollout_line_reader`].
+pub(crate) fn open_rollout_file_with_retry(path: &Path) -> io::Result<File> {
+    for _ in 0..MAX_OPEN_RETRIES {
+        match File::open(path) {
+            Ok(file) => return Ok(file),
+            Err(error) if is_retryable_open_error(&error) => {
+                std::thread::sleep(OPEN_ROLLOUT_LINE_READER_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    File::open(path)
 }
 
 /// Hydrates a selected rollout for feedback on a blocking thread. Both raw
@@ -1050,7 +1077,7 @@ mod worker {
             if let Err(error) =
                 crate::payload_artifact::reclaim_payload_artifacts(&codex_home).await
             {
-                warn!(%error, "rollout payload reclamation incomplete; blobs retained");
+                warn!(%error, "rollout payload stage reclamation failed");
             }
             tokio::select! {
                 _ = stopped.changed() => break,

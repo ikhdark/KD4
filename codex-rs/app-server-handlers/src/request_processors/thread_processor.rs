@@ -1287,12 +1287,14 @@ impl ThreadRequestProcessor {
         if !dynamic_tools.is_empty() {
             validate_dynamic_tools(&dynamic_tools).map_err(invalid_request)?;
         }
+        let mut phases = codex_core::StartupPhaseLog::start("thread_start");
         let requested_cwd = typesafe_overrides.cwd.clone();
         let mut policy_generation = config_manager.policy_generation();
         let mut config = config_manager
             .load_with_overrides(config_overrides.clone(), typesafe_overrides.clone())
             .await
             .map_config_load_error()?;
+        phases.mark("config_load");
 
         // The user may have requested WorkspaceWrite or DangerFullAccess via
         // the command line, though in the process of deriving the Config, it
@@ -1315,16 +1317,27 @@ impl ThreadRequestProcessor {
                 .unwrap_or_else(|| config.cwd.clone());
             let current_cli_overrides = config_manager.current_cli_overrides();
             let cli_overrides_with_trust;
-            let cli_overrides_for_reload = if let Err(err) =
-                ConfigEditsBuilder::new(&listener_task_context.codex_home)
-                    .set_project_trust_level(trust_target.as_path(), TrustLevel::Trusted)
-                    .apply()
-                    .await
+            // A directory outside any project (no root marker, git checkout or
+            // project-local config) is trusted for this thread only. Persisting
+            // it rewrites the user's config.toml for every scratch cwd and would
+            // pre-approve project config created there later; upstream skips the
+            // write for the same reason (`is_projectless`).
+            let persisted = if config.config_layer_stack.is_projectless() {
+                false
+            } else if let Err(err) = ConfigEditsBuilder::new(&listener_task_context.codex_home)
+                .set_project_trust_level(trust_target.as_path(), TrustLevel::Trusted)
+                .apply()
+                .await
             {
                 warn!(
                     "failed to persist trusted project state for {}; continuing with in-memory trust for this thread: {err}",
                     trust_target.display()
                 );
+                false
+            } else {
+                true
+            };
+            let cli_overrides_for_reload = if !persisted {
                 let mut project = toml::map::Map::new();
                 project.insert(
                     "trust_level".to_string(),
@@ -1348,10 +1361,13 @@ impl ThreadRequestProcessor {
                 current_cli_overrides.as_slice()
             };
 
-            // The trust edit bypasses ConfigManager, and this reload repeats the
-            // first load's cache key; without invalidation it returns pre-trust config.
-            config_manager.invalidate_load_cache();
-            policy_generation = config_manager.policy_generation();
+            if persisted {
+                // The trust edit bypasses ConfigManager, and this reload repeats the
+                // first load's cache key; without invalidation it returns pre-trust
+                // config. The in-memory override changes the key, so it needs none.
+                config_manager.invalidate_load_cache();
+                policy_generation = config_manager.policy_generation();
+            }
             config = config_manager
                 .load_with_cli_overrides(
                     cli_overrides_for_reload,
@@ -1362,6 +1378,7 @@ impl ThreadRequestProcessor {
                 .await
                 .map_config_load_error()?;
         }
+        phases.mark("project_trust");
 
         if let Ok(Some(err)) =
             codex_core::check_execpolicy_for_warnings(&config.config_layer_stack).await
@@ -1378,6 +1395,7 @@ impl ThreadRequestProcessor {
             }
         }
 
+        phases.mark("execpolicy");
         let environments = environments.unwrap_or_else(|| {
             listener_task_context
                 .thread_manager
@@ -1418,6 +1436,26 @@ impl ThreadRequestProcessor {
         config_manager
             .validate_policy_generation(policy_generation)
             .map_config_load_error()?;
+        // Cover the thread's skill roots before Session::new loads skills. Edits
+        // made before a watcher covers a root are unobservable, so a snapshot taken
+        // earlier cannot be certified and the listener's own registration would
+        // discard it, rescanning on the first turn. Holding this lease across session
+        // creation makes the listener's registration find the roots already covered.
+        // It drops when this attempt returns, after the listener holds its own. A
+        // failure here is reported again by that registration.
+        let _skills_watch_lease = listener_task_context
+            .skills_watcher
+            .register_thread_config(
+                &config,
+                listener_task_context.thread_manager.as_ref(),
+                &environments,
+            )
+            .await
+            .unwrap_or_else(|err| {
+                tracing::debug!("skills watcher pre-registration failed: {err}");
+                Default::default()
+            });
+        phases.mark("skills_watch");
         let NewThread {
             thread_id,
             thread,
@@ -1463,6 +1501,7 @@ impl ThreadRequestProcessor {
             CodexErr::UnsupportedOperation(message) => method_not_found(message),
             err => internal_error(format!("error creating thread: {err}")),
         })?;
+        phases.mark("start_thread");
         let session_telemetry = thread.session_telemetry();
         if let Err(error) = config_manager
             .validate_policy_generation(policy_generation)

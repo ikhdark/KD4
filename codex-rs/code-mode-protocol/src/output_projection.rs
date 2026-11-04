@@ -353,7 +353,10 @@ fn routine_launch_receipt(receipt: &Value) -> Option<Value> {
 /// Code Mode printing may use references that are not native schema fields.
 /// Keep the native result and direct response's selector-binding contract intact.
 pub fn printed_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> {
-    let mut projected = model_visible_tool_result(tool, raw)?;
+    let routine = RoutineSuccess::of(tool, raw);
+    let complete_read = is_complete_read(tool, raw);
+    let mut projected = model_visible_tool_result(tool, raw)
+        .or_else(|| (routine.is_some() || complete_read).then(|| raw.clone()))?;
     // Only a single exact binding/result pair is unambiguous without an index
     // map. Parser diagnostics and merged/sorted extents remain explicit.
     if tool.namespace.is_none() && tool.name == "read_file"
@@ -374,7 +377,254 @@ pub fn printed_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> {
         binding.remove("resolved_selectors");
         binding.insert("result_index".into(), Value::from(0));
     }
+    if let (Some(routine), Some(object)) = (routine, projected.as_object_mut()) {
+        routine.compact(raw, object);
+    }
+    if tool.namespace.is_none()
+        && matches!(tool.name.as_str(), "read_file" | "read_tool_output")
+        && let Some(object) = projected.as_object_mut()
+    {
+        if complete_read {
+            compact_complete_read(raw, object);
+        }
+        // Print exact aliases once, without changing native/direct receipts.
+        // Only omit an alias when its matching primary field remains visible.
+        if raw["retained_artifact_complete"] == true
+            && object.get("canonical_bytes").is_some_and(Value::is_u64)
+            && object.get("retained_bytes") == object.get("canonical_bytes")
+        {
+            object.remove("retained_bytes");
+        }
+        if object.get("complete").is_some_and(Value::is_boolean)
+            && object.get("delivered_selection_complete") == object.get("complete")
+        {
+            object.remove("delivered_selection_complete");
+        }
+    }
     Some(projected)
+}
+
+fn is_complete_read(tool: &ToolName, raw: &Value) -> bool {
+    tool.namespace.is_none()
+        && matches!(tool.name.as_str(), "read_file" | "read_tool_output")
+        && raw["complete"] == true
+        && raw.get("tool_failure").is_none()
+        && raw["results"].as_array().is_some_and(|rows| {
+            !rows.is_empty()
+                && rows.iter().all(|row| row["status"] == "ok" && row["complete"] == true)
+        })
+}
+
+/// A delivered read prints its content and the identity later edits and recoveries use. Flags
+/// that only restate success go, and so do ranges that only restate the selector or the whole
+/// source. Scripts keep the native value, and a partial or failed read prints in full.
+fn compact_complete_read(raw: &Value, printed: &mut serde_json::Map<String, Value>) {
+    printed.remove("complete");
+    for key in ["file_complete", "retained_artifact_complete"] {
+        if raw[key] == true {
+            printed.remove(key);
+        }
+    }
+    if raw["environment_id"] == "local" {
+        printed.remove("environment_id");
+    }
+    if raw["file_complete"] == true {
+        printed.remove("canonical_bytes");
+    }
+    // Recovered log text is the evidence here; read_file keeps the hash patches anchor on.
+    if raw.get("source_sha256").is_none() {
+        printed.remove("canonical_sha256");
+    }
+    if raw["historical_authenticity"] == "unverified" {
+        printed.remove("historical_authenticity");
+    }
+    let whole_source = raw["file_complete"] == true
+        && raw["results"].as_array().is_some_and(|rows| rows.len() == 1);
+    let Some(rows) = printed.get_mut("results").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for row in rows.iter_mut().filter_map(Value::as_object_mut) {
+        row.remove("status");
+        row.remove("complete");
+        // Hydrated search ranges resolve against their parent, so those rows stay as they are.
+        if row.get("text").is_none() {
+            continue;
+        }
+        let selector = row.get("selector");
+        let whole_bytes = whole_source
+            && selector.is_some_and(|selector| {
+                selector["kind"] == "bytes"
+                    && selector["start"] == 0
+                    && selector["end"] == raw["canonical_bytes"]
+            });
+        if whole_bytes {
+            row.remove("selector");
+        }
+        row.remove("canonical_range");
+    }
+}
+
+/// A fully successful result whose print can drop what only matters when something went
+/// wrong: every call repeats these fields, and later requests carry each print. Scripts
+/// keep the whole native value, and any failure, partial or uncertain outcome prints in full.
+enum RoutineSuccess {
+    Command,
+    FinishedPoll,
+    RunningCommand,
+    Patch,
+    Listing,
+}
+
+impl RoutineSuccess {
+    fn of(tool: &ToolName, raw: &Value) -> Option<Self> {
+        let is_true = |key: &str| raw.get(key) == Some(&Value::Bool(true));
+        let is_empty = |key: &str| raw[key].as_array().is_some_and(Vec::is_empty);
+        // Listings arrive under either name or the inspect_files namespace; this field is theirs.
+        if raw.get("effective_walk_options").is_some() {
+            return (is_true("complete")
+                && raw["truncated"] == false
+                && raw["limits_clamped"] == false
+                && is_empty("errors")
+                && is_empty("unexplored"))
+                .then_some(Self::Listing);
+        }
+        if tool.namespace.is_some() {
+            return None;
+        }
+        match tool.name.as_str() {
+            "exec_command" | "write_stdin" => {
+                let healthy = raw.get("error").is_none_or(Value::is_null)
+                    && raw["stream_chunks_complete"] != false
+                    && raw["output_reduced"] != true;
+                let finished = raw["exit_code"] == 0
+                    && raw["execution_state"] == "exited"
+                    && raw.get("session_id").is_none_or(Value::is_null);
+                if !healthy {
+                    None
+                } else if raw["execution_state"] == "running" && raw["session_id"].is_number() {
+                    Some(Self::RunningCommand)
+                } else if !finished {
+                    None
+                } else if is_true("streams_complete") {
+                    Some(Self::Command)
+                } else {
+                    // The last poll shows only its own delta; the retained log holds the rest.
+                    (tool.name == "write_stdin"
+                        && is_true("retained_artifact_complete")
+                        && raw.get("recovery").is_some())
+                    .then_some(Self::FinishedPoll)
+                }
+            }
+            "apply_patch" => (is_true("success")
+                && is_true("changes_exact")
+                && raw["outcome"] == "committed"
+                && raw.get("tool_failure").is_none()
+                && raw.get("retry").is_none())
+                .then_some(Self::Patch),
+            _ => None,
+        }
+    }
+
+    fn compact(self, raw: &Value, printed: &mut serde_json::Map<String, Value>) {
+        let remove = |printed: &mut serde_json::Map<String, Value>, keys: &[&str]| {
+            for key in keys {
+                printed.remove(*key);
+            }
+        };
+        match self {
+            Self::Command | Self::FinishedPoll | Self::RunningCommand => {
+                remove(
+                    printed,
+                    &[
+                        "stream_ranges",
+                        "stream_chunks_complete",
+                        "current_chunk_display_complete",
+                        "cumulative_streams_complete",
+                        "retained_artifact_complete",
+                        "process_exited",
+                    ],
+                );
+                // Unusual launches keep their receipt.
+                if raw
+                    .get("environment_receipt")
+                    .and_then(routine_launch_receipt)
+                    .is_some()
+                {
+                    printed.remove("environment_receipt");
+                }
+                if matches!(self, Self::RunningCommand) {
+                    // The next poll or await needs the handle and its capabilities. The log
+                    // stays reachable by artifact id, and the terminal result names its route.
+                    remove(printed, &["exit_code", "output_reference", "raw_output_artifact_bytes"]);
+                } else {
+                    printed.remove("execution_state");
+                }
+                if matches!(self, Self::FinishedPoll) {
+                    // `recovery` is the one route to the whole log; these only restate it.
+                    remove(
+                        printed,
+                        &[
+                            "output_reference",
+                            "raw_output_artifact_id",
+                            "raw_output_artifact_bytes",
+                            "recovery_selector",
+                            "recovery_scope",
+                        ],
+                    );
+                } else if printed.get("output").and_then(Value::as_str).is_some_and(str::is_empty) {
+                    // Nothing was printed, so there is nothing to recover.
+                    printed.remove("output_reference");
+                }
+            }
+            Self::Patch => {
+                remove(printed, &["operation_id", "multi_file_atomic", "manifest"]);
+                let mut no_diagnostics = false;
+                if let Some(diagnostics) = printed
+                    .get_mut("diagnostics")
+                    .and_then(Value::as_array_mut)
+                {
+                    diagnostics.retain(|note| note["kind"] != "historical_reversal_check_skipped");
+                    no_diagnostics = diagnostics.is_empty();
+                }
+                if no_diagnostics {
+                    printed.remove("diagnostics");
+                }
+                if let Some(changes) = printed.get_mut("changes").and_then(Value::as_array_mut) {
+                    for change in changes.iter_mut().filter_map(Value::as_object_mut) {
+                        if change.get("move_path").is_some_and(Value::is_null) {
+                            change.remove("move_path");
+                        }
+                        if change.get("outcome").is_some_and(|outcome| outcome == "committed") {
+                            change.remove("outcome");
+                        }
+                        if change.get("diff_complete") == Some(&Value::Bool(true)) {
+                            remove(change, &["diff_complete", "diff_bytes", "diff_format"]);
+                        }
+                    }
+                }
+            }
+            Self::Listing => {
+                remove(
+                    printed,
+                    &[
+                        "effective_walk_options",
+                        "limits_clamped",
+                        "errors",
+                        "truncated",
+                        "unexplored",
+                        "continuation_policy",
+                    ],
+                );
+                // A filtered scope stays visible.
+                if raw.pointer("/effective_walk_options/apply_gitignore") == Some(&Value::Bool(true)) {
+                    printed.insert("gitignore_applied".into(), Value::Bool(true));
+                }
+            }
+        }
+        if printed.get("environment_id").is_some_and(|id| id == "local") {
+            printed.remove("environment_id");
+        }
+    }
 }
 
 /// Search coordinates and hydrated evidence remain inline. Only omit aliases

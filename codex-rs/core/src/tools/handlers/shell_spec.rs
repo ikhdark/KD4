@@ -124,7 +124,7 @@ pub(crate) fn create_exec_command_tool_for_policy(
         (
             "workdir".to_string(),
             JsonSchema::string(Some(
-                "Working directory for the command. Defaults to the turn cwd."
+                "Working directory; defaults to the session cwd, so omit it when working there."
                     .to_string(),
             )),
         ),
@@ -144,7 +144,7 @@ pub(crate) fn create_exec_command_tool_for_policy(
         (
             "yield_time_ms".to_string(),
             bounded_integer(
-                format!("Wait before yielding output. Inside `exec`, noninteractive commands default to {} ms so the host can finish the awaited command without model polling; to overlap it with other work, start it alongside the other calls with Promise.all in the same cell, and shorten the wait only when the command must outlive the cell. Otherwise defaults to 30000 ms for recognized validation, build, install, and discovery commands (including command chains), and 2000 ms for other commands ({} ms for interactive commands inside `exec`). Explicit values are clamped to 250-{} ms. On Windows, waits are floored to {} ms only while the executor is not ready; commands that finish sooner return immediately. Nested calls may yield up to 2000 ms before their wrapper deadline to return a live session handle.", super::unified_exec::NESTED_NONINTERACTIVE_EXEC_YIELD_TIME_MS, super::unified_exec::NESTED_EXEC_YIELD_TIME_MS, crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS, crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS),
+                format!("Wait before yielding output; inside `exec`, noninteractive commands default to {} ms so the host finishes them without model polling, so omit it unless the command must outlive the cell. To overlap it with other work, start it alongside the other calls with Promise.all in the same cell, and shorten the wait only when the command must outlive the cell. Otherwise defaults to 30000 ms for recognized validation, build, install, and discovery commands (including command chains), and 2000 ms for other commands ({} ms for interactive commands inside `exec`). Explicit values are clamped to 250-{} ms. On Windows, the first command in an environment may wait up to {} ms despite a shorter request, only while it has shown no output or is still printing; a command that finished, or went quiet after output, returns at the requested time. Nested calls may yield up to 2000 ms before their wrapper deadline to return a live session handle.", super::unified_exec::NESTED_NONINTERACTIVE_EXEC_YIELD_TIME_MS, super::unified_exec::NESTED_EXEC_YIELD_TIME_MS, crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS, crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS),
                 crate::unified_exec::MIN_YIELD_TIME_MS,
                 crate::unified_exec::MAX_INITIAL_YIELD_TIME_MS,
             ),
@@ -152,7 +152,7 @@ pub(crate) fn create_exec_command_tool_for_policy(
         (
             "max_output_tokens".to_string(),
             bounded_integer(
-                "Display cap for this result. Omit it: inside exec each result is already bounded by the cell limit with envelope reserve, independently of earlier prints, and direct calls are capped at 10000 tokens. Set it only to deliberately shrink a display. Zero returns only execution controls.".to_string(),
+                "Display cap for this result; omit it unless deliberately shrinking a display. Inside exec each result is already bounded by the cell limit with envelope reserve, independently of earlier prints, and direct calls are capped at 10000 tokens. Zero returns only execution controls.".to_string(),
                 0, usize::MAX as u64),
         ),
     ]);
@@ -450,7 +450,7 @@ pub(crate) fn create_shell_command_tool_for_policy(
         (
             "workdir".to_string(),
             JsonSchema::string(Some(
-                "Working directory for the command. Defaults to the turn cwd.".to_string(),
+                "Working directory; defaults to the session cwd, so omit it when working there.".to_string(),
             )),
         ),
         (
@@ -569,6 +569,14 @@ fn unified_exec_output_schema() -> Value {
             "stderr": {
                 "type": "string",
                 "description": "Exact UTF-8 stderr for this receipt's stream_ranges[1] when stream_chunks_complete is true; whole-command data only when streams_complete is true."
+            },
+            "retained_output": {
+                "type": "string",
+                "description": "Complete process-owned combined UTF-8 transcript, at most 4096 bytes, supplied when an empty terminal drain would otherwise require another read. Separate from output and per-pipe deltas; never append it to those streams. Larger, incomplete, binary or quiet output keeps its existing recovery route."
+            },
+            "retained_output_complete": {
+                "type": "boolean",
+                "description": "True only with an exact, closed, complete retained_output transcript; does not establish command success or durable artifact retention."
             },
             "stream_ranges": {
                 "type": "array", "minItems": 2, "maxItems": 2,
@@ -823,18 +831,12 @@ pub(crate) fn unified_exec_eager_output_schema() -> Value {
             "ExecCommandResult": {
                 "type": "object",
                 "properties": {
-                    "completion_recovered": {"type":"boolean"},
-                    "completion_provenance": {"type":"object", "additionalProperties":true},
-                    "polled_session_id": {"type":"integer", "description":"Historical process identity; not a live handle."},
                     "incarnation": {"type":"string"},
                     "output_reference": {"type":"object", "additionalProperties":true},
-                    "output_drained": {"type":["boolean","null"]},
                     "success": {"type":["boolean","null"], "description":"Retained terminal outcome; null remains unknown."},
-                    "compilation_evidence_reused": {"type":"boolean", "description":"Historical compilation proof, not a new process. No await_command; consult original_evidence."},
-                    "original_evidence": {"type":"object", "additionalProperties":true},
-                    "environment_receipt": {
+                    "session_capabilities": {
                         "type": "object",
-                        "description": "Redacted instrumented-root launch provenance; resolve exec_command for fields. Not a dependency snapshot or trace of commands launched by a shell.",
+                        "description": "Live handle capabilities: stdin, polling, close_stdin, interrupt, cancellation, incarnation, shutdown.",
                         "additionalProperties": true
                     },
                     "output": {
@@ -871,7 +873,7 @@ pub(crate) fn unified_exec_eager_output_schema() -> Value {
     });
     // Share the authoritative lifecycle field schemas, not the full result union.
     let full = unified_exec_output_schema();
-    for field in ["execution_state", "process_exited", "session_capabilities", "error"] {
+    for field in ["execution_state", "process_exited", "error"] {
         schema["$defs"]["ExecCommandResult"]["properties"][field] =
             full["properties"][field].clone();
     }
@@ -1010,8 +1012,8 @@ fn windows_shell_guidance() -> &'static str {
 Windows safety rules (apply when executing in a Windows environment, regardless of the host OS):
 - PowerShell and cmd do not expand wildcard paths for native `rg`. Search a literal parent directory with `--glob` instead, for example `rg -n "default_prompt:" skills --glob "**/agents/openai.yaml"`.
 - PowerShell `foreach` statements cannot feed a pipeline directly. Collect first: `$rows = foreach ($item in $items) { $item }; $rows | Out-String`.
-- Required PowerShell cmdlets must use `-ErrorAction Stop` (or a script-scoped stop policy); capture and check `$LASTEXITCODE` immediately after each required native command, before dependent work or success output. A final zero exit does not prove earlier steps succeeded. Guard genuinely optional paths explicitly rather than ignoring required failures.
-- For multiline Python or other interpreter code, prefer a literal PowerShell here-string piped to the selected interpreter's stdin over nested `-c` quoting. Keep diagnostic projections in named steps rather than deeply nested expressions.
+- In a multi-step PowerShell script, a failed native command or non-terminating cmdlet error does not stop later steps, and a final zero exit does not prove earlier ones succeeded: use `-ErrorAction Stop` on required cmdlets and check `$LASTEXITCODE` before dependent steps. Guard genuinely optional paths explicitly rather than ignoring required failures. A single command needs no guard; exit_code reports it.
+- For multiline Python or other interpreter code, pass it as one literal argument (`program` with `args:["-c", code]`), which needs no shell quoting. In shell source, prefer a literal PowerShell here-string piped to the selected interpreter's stdin over nested `-c` quoting. Keep diagnostic projections in named steps rather than deeply nested expressions.
 - For deletes and moves prefer `Remove-Item` / `Move-Item` with `-LiteralPath`; do not hand PowerShell-enumerated paths to `cmd /c` or another shell.
 - When using `Start-Process` to launch a background helper or service, pass `-WindowStyle Hidden` unless the user explicitly asked for a visible interactive window."#
 }
@@ -1031,6 +1033,20 @@ pub(crate) fn omit_windows_shell_guidance(spec: &mut ToolSpec) {
 
 fn filesystem_safety_guidance() -> &'static str {
     windows_shell_guidance()
+}
+
+/// Eager prompt projection of the exec_command contract. Every request repeats this text; the
+/// registered description keeps the complete search, Windows and launch guidance, which
+/// resolve_tool serves as sections.
+pub(crate) fn eager_exec_command_description(windows_environment: bool) -> String {
+    let windows = if windows_environment {
+        "\nWindows: PowerShell and cmd do not expand wildcards for native `rg`, so use --glob. Use `-LiteralPath` for deletes and moves, and `Start-Process -WindowStyle Hidden` for background helpers. Pass multiline interpreter code as one literal argument: `program` with `args:[\"-c\", code]`. In a multi-step PowerShell script a failed native command does not stop later steps: check `$LASTEXITCODE` before dependent steps. A single command needs no guard; exit_code reports it."
+    } else {
+        ""
+    };
+    format!(
+        "Runs an executable through `program`/`args`, or explicit shell source through `cmd` or `script_body`, and returns when it finishes; one that outlives its wait returns a live session_id instead. Do not restart a command while it is live or its effects are uncertain.\nWith a live session_id: `await await_command(r)` collects it to completion. Otherwise `await tools.write_stdin({{session_id:r.session_id, incarnation:r.session_capabilities.incarnation, ...}})`: chars sends input, empty chars with yield_time_ms polls, terminate:true stops the process tree and confirms cleanup, and event_filter:{{contains:[\"READY\"],timeout_ms:5000}} waits for a literal. Stop when a result has no session_id.\nSearch: read a known path directly. Find unknown filenames with `rg --files <literal-root> --glob '<pattern>'`, then use the returned paths; `rg -l` lists matching files and scoped `rg -n` shows matches. rg skips hidden and ignored files unless told otherwise; exit 1 means no matches, 2 a failed search. Prefer read_file selectors over shell paging.\nFilesystem safety: keep destructive operations in one shell, resolve recursive delete or move targets inside the intended directory first, and avoid unresolved variables or globs.{windows}\nLaunch dependent work only after its prerequisites succeeded.\nFor interactive stdin use tty or pipe_stdin. Those, login, stall_timeout_ms, and the full search, Windows and launch rules: `resolve_tool(\"exec_command\").section(\"arguments\")` and the other sections its `.description` lists."
+    )
 }
 
 fn rg_search_admission_guidance() -> &'static str {

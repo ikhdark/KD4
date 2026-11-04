@@ -91,7 +91,6 @@ pub use runtime::state_db_path;
 pub use telemetry::DbTelemetry;
 pub use telemetry::DbTelemetryHandle;
 pub use telemetry::install_process_db_telemetry;
-pub use telemetry::record_backfill_gate;
 pub use telemetry::record_fallback;
 
 /// Environment variable for overriding the SQLite state database home directory.

@@ -52,7 +52,8 @@ use crate::unified_exec::async_watcher::lagged_output_marker;
 use crate::unified_exec::async_watcher::spawn_exit_watcher;
 use crate::unified_exec::async_watcher::start_streaming_output;
 use crate::unified_exec::async_watcher::wait_for_process_output_drain;
-use crate::unified_exec::clamp_yield_time_for_readiness;
+use crate::unified_exec::clamp_initial_yield_time;
+use crate::unified_exec::cold_start_yield_allowance;
 use crate::unified_exec::generate_chunk_id;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
 use crate::unified_exec::process::OutputBuffer;
@@ -1275,8 +1276,8 @@ impl UnifiedExecProcessManager {
             None
         };
 
-        let yield_time_ms =
-            clamp_yield_time_for_readiness(request.yield_time_ms, executor_was_ready);
+        let yield_time_ms = clamp_initial_yield_time(request.yield_time_ms);
+        let cold_start_allowance = cold_start_yield_allowance(yield_time_ms, executor_was_ready);
         // Registration above already completed, so an initial launch that runs
         // out of nested budget here still returns a registered process id.
         let poll_bound = nested_poll_bound(context.source.nested_deadline());
@@ -1295,7 +1296,12 @@ impl UnifiedExecProcessManager {
             Some(bound) => (start + Duration::from_millis(yield_time_ms)).min(bound),
             None => start + Duration::from_millis(yield_time_ms),
         };
-        registration.observation_deadline = Some(deadline);
+        // Finalizers keep the full cold-start bound even when the wait below
+        // ends at the requested time.
+        registration.observation_deadline = Some(match poll_bound {
+            Some(bound) => (deadline + cold_start_allowance).min(bound),
+            None => deadline + cold_start_allowance,
+        });
         // A burst from a noninteractive command is progress, not completion.
         // Keep its existing observation window attached across quiet periods;
         // interactive terminals still yield promptly when a prompt is ready.
@@ -1310,6 +1316,7 @@ impl UnifiedExecProcessManager {
             deadline,
             poll_bound,
             quiet_period,
+            cold_start_allowance,
             &mut stall_handoff,
         )
         .await;
@@ -1828,6 +1835,7 @@ impl UnifiedExecProcessManager {
                 && !validation_launch
                 && process.validation().is_none())
             .then_some(INITIAL_OUTPUT_QUIET_PERIOD),
+            Duration::ZERO,
             &mut handoff,
         )
         .await;
@@ -2749,6 +2757,7 @@ impl UnifiedExecProcessManager {
         mut deadline: Instant,
         hard_deadline: Option<Instant>,
         quiet_period: Option<Duration>,
+        mut cold_start_allowance: Duration,
         handoff: &mut Option<std::pin::Pin<Box<tokio::sync::futures::OwnedNotified>>>,
     ) -> CollectedOutput {
         output_buffer.lock().await.begin_output_report();
@@ -2761,6 +2770,8 @@ impl UnifiedExecProcessManager {
         // Silence alone is not progress. Honor the requested deadline until
         // meaningful output starts the shorter quiet-period deadline.
         let mut early_yield_deadline = None;
+        // Newest output, which shows a cold shell is past startup.
+        let mut last_output_at: Option<Instant> = None;
         let wake_reason = loop {
             tokio::select! {
                 biased;
@@ -2801,6 +2812,9 @@ impl UnifiedExecProcessManager {
                 let meaningful = guard.collect_pending_output();
                 (arrived, meaningful && quiet_period.is_some(), closed)
             };
+            if output_arrived {
+                last_output_at = Some(Instant::now());
+            }
 
             if !output_arrived {
                 exit_signal_received |= cancellation_token.is_cancelled();
@@ -2816,6 +2830,19 @@ impl UnifiedExecProcessManager {
                 };
                 let remaining = effective_deadline.saturating_duration_since(Instant::now());
                 if remaining == Duration::ZERO {
+                    if effective_deadline >= deadline
+                        && !exit_signal_received
+                        && let Some(step) = Self::cold_start_extension(
+                            cold_start_allowance,
+                            last_output_at,
+                            deadline,
+                            hard_deadline,
+                        )
+                    {
+                        deadline += step;
+                        cold_start_allowance -= step;
+                        continue;
+                    }
                     break if effective_deadline < deadline {
                         ToolLifecycleWakeReason::Completed
                     } else {
@@ -2916,6 +2943,19 @@ impl UnifiedExecProcessManager {
                     });
                 }
                 if wake_reason == ToolLifecycleWakeReason::Timeout {
+                    if effective_deadline >= deadline
+                        && !exit_signal_received
+                        && let Some(step) = Self::cold_start_extension(
+                            cold_start_allowance,
+                            last_output_at,
+                            deadline,
+                            hard_deadline,
+                        )
+                    {
+                        deadline += step;
+                        cold_start_allowance -= step;
+                        continue;
+                    }
                     break if effective_deadline < deadline {
                         ToolLifecycleWakeReason::Completed
                     } else {
@@ -2927,7 +2967,10 @@ impl UnifiedExecProcessManager {
 
             if meaningful_output_arrived {
                 let quiet_deadline = Instant::now() + quiet_period.unwrap_or_default();
-                early_yield_deadline = Some(quiet_deadline.min(deadline));
+                // A quiet period may outlast the requested deadline within a
+                // cold start's allowance; the deadline itself extends to meet it.
+                early_yield_deadline =
+                    Some(quiet_deadline.min(deadline + cold_start_allowance));
             }
 
             exit_signal_received |= cancellation_token.is_cancelled();
@@ -2945,6 +2988,19 @@ impl UnifiedExecProcessManager {
                     .unwrap_or(deadline)
             };
             if Instant::now() >= effective_deadline {
+                if effective_deadline >= deadline
+                    && !exit_signal_received
+                    && let Some(step) = Self::cold_start_extension(
+                        cold_start_allowance,
+                        last_output_at,
+                        deadline,
+                        hard_deadline,
+                    )
+                {
+                    deadline += step;
+                    cold_start_allowance -= step;
+                    continue;
+                }
                 break if effective_deadline < deadline {
                     ToolLifecycleWakeReason::Completed
                 } else {
@@ -2974,7 +3030,37 @@ impl UnifiedExecProcessManager {
             stream_ranges: guard.pending_stream_ranges(),
             ranges,
             wake_reason,
-            observation_deadline: hard_deadline.map_or(deadline, |bound| deadline.min(bound)),
+            // Unspent cold-start allowance still bounds the finalizers, so
+            // ending the wait at the requested time does not shorten them.
+            observation_deadline: {
+                let bound_for_finalizers = deadline + cold_start_allowance;
+                hard_deadline.map_or(bound_for_finalizers, |bound| bound_for_finalizers.min(bound))
+            },
+        }
+    }
+
+    /// Windows cold-start protection for the first command in an environment:
+    /// how much of the unspent allowance to wait now that the requested
+    /// `deadline` has passed with the process alive. A shell that has shown no
+    /// output may still be starting, so it keeps the whole allowance. Output
+    /// still arriving within one quiet period may be about to end (shell exit
+    /// follows its last output), so wait out that period. A process that
+    /// printed and went quiet has proven the shell is up and yields now.
+    fn cold_start_extension(
+        allowance: Duration,
+        last_output_at: Option<Instant>,
+        deadline: Instant,
+        hard_deadline: Option<Instant>,
+    ) -> Option<Duration> {
+        if allowance.is_zero() || hard_deadline.is_some_and(|bound| deadline >= bound) {
+            return None;
+        }
+        match last_output_at {
+            None => Some(allowance),
+            Some(last_output_at) => (last_output_at + INITIAL_OUTPUT_QUIET_PERIOD)
+                .checked_duration_since(deadline)
+                .filter(|wait| !wait.is_zero())
+                .map(|wait| wait.min(allowance)),
         }
     }
 

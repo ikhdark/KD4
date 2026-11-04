@@ -1,6 +1,7 @@
 use codex_core_skills::AvailableSkills;
 use codex_core_skills::SKILLS_HOW_TO_USE;
 use codex_core_skills::render_available_skills_body;
+use codex_core_skills::rendered_skill_line_name;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_CLOSE_TAG;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
 
@@ -8,6 +9,7 @@ use super::ContextualUserFragment;
 
 pub const SKILLS_USAGE_INSTRUCTIONS_OPEN_TAG: &str = "<skills_usage_instructions>";
 const SKILLS_USAGE_INSTRUCTIONS_CLOSE_TAG: &str = "</skills_usage_instructions>";
+const MAX_SKILL_INDEX_BYTES: usize = 2048;
 
 /// Model-context fragment describing the skills available to Codex.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,9 +23,33 @@ impl AvailableSkillsInstructions {
         Self { body: render_available_skills_body(&skill_lines) }
     }
 
-    pub fn from_available_skills(_available_skills: &AvailableSkills) -> Self {
+    /// Names only: this sits in every request's shared prefix, and a visible index answers
+    /// "does a skill apply?" without a catalog probe on every task.
+    pub fn from_available_skills(available_skills: &AvailableSkills) -> Self {
+        let mut index = String::new();
+        let mut unlisted = available_skills.report.omitted_count;
+        for name in available_skills
+            .skill_lines
+            .iter()
+            .filter_map(|line| rendered_skill_line_name(line))
+        {
+            if index.len() + name.len() > MAX_SKILL_INDEX_BYTES {
+                unlisted += 1;
+                continue;
+            }
+            if !index.is_empty() {
+                index.push_str(", ");
+            }
+            index.push_str(name);
+        }
+        if unlisted > 0 {
+            let separator = if index.is_empty() { "" } else { ", and " };
+            index.push_str(&format!("{separator}{unlisted} more in skill:catalog"));
+        }
         Self {
-            body: "\n## Skills\nWhen the user names a skill or the task plausibly matches one, find it with a fixed-string search of the catalog, e.g. read_file(path=\"skill:catalog\", selectors=[{kind:\"search\", query:\"<keyword>\"}]), then read its full instructions. Do not read the whole catalog by default; use provider-specific discovery for other skill sources.\n".to_string(),
+            body: format!(
+                "\n## Skills\nAvailable: {index}.\nWhen the user names one or one clearly fits the requested workflow, read it with read_file(path=\"skill:<name>\") before acting. Otherwise do not look for skills; only when the user asks for a capability none of these names covers, read_file(path=\"skill:catalog\", selectors=[{{kind:\"search\", query:\"<keyword>\"}}]) searches their descriptions. Use provider-specific discovery for other skill sources.\n"
+            ),
         }
     }
 }

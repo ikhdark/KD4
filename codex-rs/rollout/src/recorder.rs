@@ -577,7 +577,7 @@ pub fn current_harness_build_info() -> codex_protocol::protocol::SessionBuildInf
         std::sync::LazyLock::new(|| {
             let mut build = initial_harness_build_info();
             build.executable_sha256 =
-                codex_utils_build_info::executable_sha256().map(str::to_owned);
+                codex_utils_build_info::executable_identity_sha256().map(str::to_owned);
             build
         });
     CURRENT.clone()
@@ -1206,9 +1206,7 @@ impl RolloutRecorder {
         F: FnMut(RolloutItem, usize),
     {
         trace!("Resuming rollout from {path:?}");
-        let mut thread_id: Option<ThreadId> = None;
-        let mut parse_errors = 0usize;
-        let mut last_record_partial = false;
+        let mut decoder = RolloutRecordDecoder::default();
         let mut reader = compression::open_rollout_line_reader(path).await?;
         if capture_payload_versions {
             reader.capture_payload_versions();
@@ -1216,100 +1214,19 @@ impl RolloutRecorder {
         if enroll_dependencies {
             reader.enroll_payload_dependencies();
         }
-        let mut saw_non_empty_line = false;
-        let mut record_number = 0usize;
         while let Some(line) = reader.next_line().await? {
             if line.trim().is_empty() {
                 continue;
             }
-            saw_non_empty_line = true;
-            last_record_partial = false;
-            record_number = record_number.saturating_add(1);
-            let mut v: Value = match serde_json::from_str(&line) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!("failed to parse line as JSON: {line:?}, error: {e}");
-                    parse_errors = parse_errors.saturating_add(1);
-                    last_record_partial = !reader.last_line_terminated() && e.is_eof();
-                    continue;
-                }
-            };
-            let is_v0 = match v.get("format_version") {
-                None => true,
-                Some(Value::Number(version)) => version.as_u64() == Some(0),
-                Some(_) => false,
-            };
-            if let Some(version) = v.get("format_version")
-                && version.as_u64() != Some(0)
-                && version.as_u64()
-                    != Some(u64::from(
-                        codex_protocol::protocol::CURRENT_ROLLOUT_FORMAT_VERSION,
-                    ))
-            {
-                return Err(IoError::new(
-                    ErrorKind::Unsupported,
-                    format!(
-                        "unsupported rollout format version {version} at record {record_number}"
-                    ),
-                ));
-            }
-            if is_v0 && migrate_v0_ghost_snapshot_rollout_line(&mut v) {
-                trace!("skipping legacy ghost_snapshot rollout line");
-                continue;
-            }
-
-            if thread_id.is_none() {
-                // Validate the small compatibility discriminator before consuming the JSON value.
-                // This preserves the unknown-mode guard without cloning the whole rollout line.
-                reject_unknown_thread_history_mode(&v)?;
-            }
-
-            // Secondary session metadata is provenance for a fork source, not
-            // the canonical thread's schema/operational history. Preserve the
-            // existing recoverable-gap treatment for that optional provenance.
-            let secondary_metadata = thread_id.is_some()
-                && v.get("type").and_then(Value::as_str) == Some("session_meta");
-            // Parse the rollout line structure
-            match serde_json::from_value::<RolloutLine>(v) {
-                Ok(rollout_line) => {
-                    let item = rollout_line.item;
-                    // Use the FIRST SessionMeta encountered in the file as the canonical
-                    // thread id and main session information. Keep all items intact.
-                    if thread_id.is_none()
-                        && let RolloutItem::SessionMeta(session_meta_line) = &item
-                    {
-                        thread_id = Some(session_meta_line.meta.id);
-                    }
-                    visit(item, record_number);
-                }
-                Err(e) => {
-                    if !secondary_metadata && e.to_string().contains("unknown variant") {
-                        return Err(IoError::new(
-                            ErrorKind::Unsupported,
-                            format!(
-                                "unsupported rollout representation at record {record_number}: {e}"
-                            ),
-                        ));
-                    }
-                    trace!("failed to parse rollout line: {e}");
-                    parse_errors = parse_errors.saturating_add(1);
-                }
+            if let Some(item) = decoder.decode(&line, reader.last_line_terminated())? {
+                visit(item, decoder.record_number);
             }
         }
-        if !saw_non_empty_line {
-            return Err(IoError::new(ErrorKind::InvalidData, "empty session file"));
-        }
-
-        // A damaged metadata payload must not hide an otherwise usable rollout.
-        let thread_id = thread_id.or_else(|| {
-            let (_, id) =
-                crate::list::parse_timestamp_uuid_from_filename(path.file_name()?.to_str()?)?;
-            ThreadId::from_string(&id.to_string()).ok()
-        });
+        let thread_id = decoder.finish(path)?;
         Ok((
             thread_id,
-            parse_errors,
-            usize::from(last_record_partial),
+            decoder.parse_errors,
+            usize::from(decoder.last_record_partial),
             reader.unresolved_payloads(),
             reader.take_payload_versions(),
         ))
@@ -1444,6 +1361,130 @@ impl RolloutRecorder {
                 IoError::other(format!("failed waiting for rollout shutdown: {e}"))
             })
         })?
+    }
+}
+
+/// Canonical decoding of one rollout JSONL record at a time, with its compatibility
+/// migrations and unsupported-format errors. Stateful so every reader, async or
+/// blocking, reports the same record numbers and thread identity.
+#[derive(Default)]
+pub(crate) struct RolloutRecordDecoder {
+    thread_id: Option<ThreadId>,
+    parse_errors: usize,
+    last_record_partial: bool,
+    saw_non_empty_line: bool,
+    record_number: usize,
+}
+
+impl RolloutRecordDecoder {
+    fn begin_record(&mut self) {
+        self.saw_non_empty_line = true;
+        self.last_record_partial = false;
+        self.record_number = self.record_number.saturating_add(1);
+    }
+
+    /// A record the caller classified as irrelevant still occupies its record slot.
+    pub(crate) fn note_undecoded_record(&mut self) {
+        self.begin_record();
+    }
+
+    /// A referenced body the caller could not read counts as a malformed record.
+    pub(crate) fn note_unreadable_record(&mut self) {
+        self.begin_record();
+        self.parse_errors = self.parse_errors.saturating_add(1);
+    }
+
+    pub(crate) fn parse_errors(&self) -> usize {
+        self.parse_errors
+    }
+
+    pub(crate) fn decode(
+        &mut self,
+        line: &str,
+        terminated: bool,
+    ) -> std::io::Result<Option<RolloutItem>> {
+        self.begin_record();
+        let record_number = self.record_number;
+        let mut v: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("failed to parse line as JSON: {line:?}, error: {e}");
+                self.parse_errors = self.parse_errors.saturating_add(1);
+                self.last_record_partial = !terminated && e.is_eof();
+                return Ok(None);
+            }
+        };
+        let is_v0 = match v.get("format_version") {
+            None => true,
+            Some(Value::Number(version)) => version.as_u64() == Some(0),
+            Some(_) => false,
+        };
+        if let Some(version) = v.get("format_version")
+            && version.as_u64() != Some(0)
+            && version.as_u64()
+                != Some(u64::from(
+                    codex_protocol::protocol::CURRENT_ROLLOUT_FORMAT_VERSION,
+                ))
+        {
+            return Err(IoError::new(
+                ErrorKind::Unsupported,
+                format!("unsupported rollout format version {version} at record {record_number}"),
+            ));
+        }
+        if is_v0 && migrate_v0_ghost_snapshot_rollout_line(&mut v) {
+            trace!("skipping legacy ghost_snapshot rollout line");
+            return Ok(None);
+        }
+
+        if self.thread_id.is_none() {
+            // Validate the small compatibility discriminator before consuming the JSON value.
+            // This preserves the unknown-mode guard without cloning the whole rollout line.
+            reject_unknown_thread_history_mode(&v)?;
+        }
+
+        // Secondary session metadata is provenance for a fork source, not
+        // the canonical thread's schema/operational history. Preserve the
+        // existing recoverable-gap treatment for that optional provenance.
+        let secondary_metadata =
+            self.thread_id.is_some() && v.get("type").and_then(Value::as_str) == Some("session_meta");
+        // Parse the rollout line structure
+        match serde_json::from_value::<RolloutLine>(v) {
+            Ok(rollout_line) => {
+                let item = rollout_line.item;
+                // Use the FIRST SessionMeta encountered in the file as the canonical
+                // thread id and main session information. Keep all items intact.
+                if self.thread_id.is_none()
+                    && let RolloutItem::SessionMeta(session_meta_line) = &item
+                {
+                    self.thread_id = Some(session_meta_line.meta.id);
+                }
+                Ok(Some(item))
+            }
+            Err(e) => {
+                if !secondary_metadata && e.to_string().contains("unknown variant") {
+                    return Err(IoError::new(
+                        ErrorKind::Unsupported,
+                        format!("unsupported rollout representation at record {record_number}: {e}"),
+                    ));
+                }
+                trace!("failed to parse rollout line: {e}");
+                self.parse_errors = self.parse_errors.saturating_add(1);
+                Ok(None)
+            }
+        }
+    }
+
+    pub(crate) fn finish(&self, path: &Path) -> std::io::Result<Option<ThreadId>> {
+        if !self.saw_non_empty_line {
+            return Err(IoError::new(ErrorKind::InvalidData, "empty session file"));
+        }
+
+        // A damaged metadata payload must not hide an otherwise usable rollout.
+        Ok(self.thread_id.or_else(|| {
+            let (_, id) =
+                crate::list::parse_timestamp_uuid_from_filename(path.file_name()?.to_str()?)?;
+            ThreadId::from_string(&id.to_string()).ok()
+        }))
     }
 }
 
@@ -1920,7 +1961,7 @@ impl RolloutWriterState {
             && build.executable_sha256.is_none()
         {
             build.executable_sha256 =
-                tokio::task::spawn_blocking(codex_utils_build_info::executable_sha256)
+                tokio::task::spawn_blocking(codex_utils_build_info::executable_identity_sha256)
                     .await
                     .ok()
                     .flatten()

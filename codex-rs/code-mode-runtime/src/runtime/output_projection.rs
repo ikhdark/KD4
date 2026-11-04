@@ -45,10 +45,32 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
     parseExact(source.baseline?.serialized ?? source.serialized);
   const lookup = projections.get.bind(projections);
   const set = projections.set.bind(projections);
+  const preserveFragmentReceipts = entry => {
+    if (entry.fragment && !entry.fragmentReceiptsRestored) {
+      // Whole-envelope printing may abbreviate success and source bounds. A
+      // separately selected row has no parent envelope to supply those facts.
+      // Restore only native receipt fields, before the existing mutation guards.
+      const restore = (display, original) => {
+        if (!display || typeof display !== 'object' || !original ||
+            typeof original !== 'object') return display;
+        const result = {...display};
+        for (const field of ['selector', 'status', 'complete', 'canonical_range']) {
+          if (descriptor(original, field))
+            result[field] = original[field];
+        }
+        return result;
+      };
+      entry.projected = entry.fragment === 'rows'
+        ? entry.projected.map((row, index) => restore(row, entry.original[index]))
+        : restore(entry.projected, entry.original);
+      entry.fragmentReceiptsRestored = true;
+    }
+    return entry;
+  };
   const get = value => {
     const entry = lookup(value);
     if (!entry || entry.disabled) return undefined;
-    if (!entry.lazy && !entry.recipeRoot) return entry;
+    if (!entry.lazy && !entry.recipeRoot) return preserveFragmentReceipts(entry);
     const root = entry.recipeRoot || entry;
     if (root.lazy) {
       root.projected = projectTool(root.serialized, root.namespace, root.toolName);
@@ -71,7 +93,7 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
       delete entry.recipeRoot;
       delete entry.path;
     }
-    return entry;
+    return preserveFragmentReceipts(entry);
   };
   // Display cloning must not erase native receipt identity before the normal
   // projector sees it. Mutated values and custom serializers still opt out.
@@ -193,6 +215,16 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
     return utf8Size(json) <= maxBytes ? json : null;
   }
   let canonicalSerialization = false;
+  // A native failure's message is its tool_failure as JSON, and a first attempt's history
+  // names only this call; both print with no new fact. Scripts keep the original fields.
+  function repeatsToolFailure(owner, key, value) {
+    if (key === 'message')
+      return owner instanceof NativeError && typeof value === 'string' &&
+        value.startsWith('{"tool_failure":') && Boolean(descriptor(owner, 'tool_failure'));
+    return key === 'operation_history' && value !== null && typeof value === 'object' &&
+      value.previous_attempt_count === 0 && (value.last_unsuccessful_attempt ?? null) === null &&
+      value.recovery_required !== true;
+  }
   // Display-only: retain native errors in scripts, but never print opaque {}.
   function errorProjection(error, remaining = 16384, controlsFirst = true) {
     const seen = new Set();
@@ -237,6 +269,7 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
           if (!field && value instanceof NativeError && key === 'name') {
             field = descriptor(prototype(value), key);
           }
+          if (field && 'value' in field && repeatsToolFailure(value, key, field.value)) continue;
           if (field) {
             // A caught graph Error goes through toJSON before the replacer.
             // Partition its existing budget instead of letting an early body
@@ -1187,7 +1220,7 @@ pub(super) fn tool_result_to_v8<'s>(
     let presentation = raw.is_object()
         && (tool.namespace.is_some() || tool.name.starts_with("mcp__")
             || matches!(tool.name.as_str(), "update_plan" | "apply_patch" | "read_file"
-                | "read_tool_output" | "exec_command" | "write_stdin"));
+                | "read_tool_output" | "exec_command" | "write_stdin" | "inspect_files" | "list_files"));
     let native = json_to_v8(scope, &serde_json::json!({
         "presentation": presentation,
         "callId": runtime_tool_call_id,

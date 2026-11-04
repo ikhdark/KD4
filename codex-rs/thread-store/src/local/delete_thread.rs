@@ -432,12 +432,8 @@ impl StagedThreadDelete<'_> {
                 projections.remove(thread_id);
             }
         }
-        let home = self.store.config.codex_home.clone();
-        // Release the deletion/publication exclusion before optional collection.
-        drop(self);
-        if let Err(error) = codex_rollout::reclaim_payload_artifacts(&home).await {
-            tracing::warn!(%error, "payload reclamation incomplete; unproven blobs retained");
-        }
+        // Payload blob collection is deferred by design, so deletion does not scan
+        // `rollout-payloads`; the compression worker reclaims abandoned stages.
     }
 }
 

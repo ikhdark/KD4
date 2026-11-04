@@ -217,6 +217,9 @@ pub struct ProjectDiscoveryContext {
     git_checkout_root: Option<AbsolutePathBuf>,
     git_trust_root: Option<AbsolutePathBuf>,
     active_project_lookup_keys: Option<Vec<String>>,
+    /// Whether an ancestor of `cwd` held one of `project_root_markers`. When the
+    /// loader did not record it, assume one was found (the conservative answer).
+    has_project_root_marker: bool,
     filesystem_identity: usize,
 }
 
@@ -236,6 +239,7 @@ impl ProjectDiscoveryContext {
             git_checkout_root,
             git_trust_root,
             active_project_lookup_keys: None,
+            has_project_root_marker: true,
             filesystem_identity: filesystem_identity(fs),
         }
     }
@@ -243,6 +247,15 @@ impl ProjectDiscoveryContext {
     pub fn with_active_project_lookup_keys(mut self, lookup_keys: Vec<String>) -> Self {
         self.active_project_lookup_keys = Some(lookup_keys);
         self
+    }
+
+    pub fn with_project_root_marker(mut self, has_project_root_marker: bool) -> Self {
+        self.has_project_root_marker = has_project_root_marker;
+        self
+    }
+
+    pub fn has_project_root_marker(&self) -> bool {
+        self.has_project_root_marker
     }
 
     pub fn matches(&self, cwd: &AbsolutePathBuf, fs: &dyn ExecutorFileSystem) -> bool {
@@ -381,6 +394,22 @@ impl ConfigLayerStack {
 
     pub fn project_discovery(&self) -> Option<&ProjectDiscoveryContext> {
         self.project_discovery.as_ref()
+    }
+
+    /// Whether discovery found no project root marker, no git checkout and no
+    /// project-local `.codex` layer for the cwd. Returns false when project
+    /// discovery was skipped. Mirrors upstream's `is_projectless`: a directory
+    /// outside any project must not have trust persisted for it, since that
+    /// would pre-approve project config created there later.
+    pub fn is_projectless(&self) -> bool {
+        self.project_discovery.as_ref().is_some_and(|discovery| {
+            !discovery.has_project_root_marker()
+                && discovery.git_checkout_root().is_none()
+                && !self
+                    .layers
+                    .iter()
+                    .any(|layer| matches!(layer.name, ConfigLayerSource::Project { .. }))
+        })
     }
 
     pub fn with_user_and_project_exec_policy_rules_ignored(

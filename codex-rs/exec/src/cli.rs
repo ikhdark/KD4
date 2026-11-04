@@ -67,6 +67,11 @@ pub struct Cli {
     )]
     pub json: bool,
 
+    /// With --json, also stream `item.progress` records (agent text, command output and MCP
+    /// progress deltas). Without it, JSONL carries only lifecycle and completed items.
+    #[arg(long = "json-progress", default_value_t = false, global = true)]
+    pub json_progress: bool,
+
     /// Specifies file where the last message from the agent should be written.
     #[arg(
         long = "output-last-message",

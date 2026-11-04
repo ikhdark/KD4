@@ -1363,8 +1363,10 @@ impl Session {
         };
         // One live canonical ledger owner, matching local rollout writer
         // admission. This also fences mutating startup recovery before loading.
+        let mut phases = crate::StartupPhaseLog::start("session_init");
         let storage_ownership =
             acquire_session_storage_ownership(config.codex_home.as_path(), thread_id).await?;
+        phases.mark("storage_ownership");
         let rollback_created_persistence_on_error = !config.ephemeral
             && matches!(
                 &initial_history,
@@ -1630,6 +1632,7 @@ impl Session {
             validate_config_lock_if_configured(&session_configuration),
             local_shell_fut,
         );
+        phases.mark("persistence_state_auth_mcp");
 
         let mut live_thread_init = thread_persistence_result.map_err(|e| {
             error!("failed to initialize thread persistence: {e:#}");
@@ -1691,6 +1694,7 @@ impl Session {
                 )
                 .await?;
             }
+            phases.mark("coordination");
             let mut post_session_configured_events = Vec::<Event>::new();
 
             for usage in config.features.legacy_feature_usages() {
@@ -1799,6 +1803,7 @@ impl Session {
                 mcp_servers.keys().map(String::as_str).collect(),
             );
 
+            phases.mark("warnings_telemetry");
             let shell_snapshot = if config.features.enabled(Feature::ShellSnapshot) {
                 ShellSnapshot::new(
                     config.codex_home.clone(),
@@ -1835,6 +1840,7 @@ impl Session {
                         otel.name = "session_init.thread_name_lookup",
                     )),
             );
+            phases.mark("environments");
             let git_workspace = GitWorkspaceCache::new();
             let initial_git_workspace = git_workspace
                 .snapshot_with_project_discovery(
@@ -1854,6 +1860,7 @@ impl Session {
                     },
                 )],
             );
+            phases.mark("git_workspace");
             let agents_md_manager = Arc::new(
                 AgentsMdManager::new(user_instructions).with_thread_id(thread_id.to_string()),
             );
@@ -1878,6 +1885,7 @@ impl Session {
                     error!("failed to load skill {}: {}", err.path.display(), err.message);
                 }
             }
+            phases.mark("agents_md_skills");
             session_configuration.thread_name = thread_name.clone();
             config_validation?;
             export_config_lock_if_configured(&session_configuration, thread_id).await?;
@@ -1911,9 +1919,11 @@ impl Session {
                     thread_id.to_string(),
                 );
             }
+            phases.mark("config_lock_state");
             let plugin_outcome = plugins_manager
                 .plugins_for_config(&config.plugins_config_input())
                 .await;
+            phases.mark("plugins");
             for warning in plugin_outcome.load_warnings() {
                 post_session_configured_events.push(Event {
                     id: INITIAL_SUBMIT_ID.to_owned(),
@@ -1928,7 +1938,8 @@ impl Session {
                 resolved_environments.single_local_environment(),
                 &session_configuration.session_source,
             )
-            .await;
+            .await
+            .map_err(|err| anyhow::Error::new(err).context("hook discovery worker failed"))?;
             for warning in hooks.startup_warnings() {
                 post_session_configured_events.push(Event {
                     id: INITIAL_SUBMIT_ID.to_owned(),
@@ -2132,6 +2143,7 @@ impl Session {
                 services,
                 next_internal_sub_id: AtomicU64::new(0),
             });
+            phases.mark("hooks_services");
             runtime_init.0 = Some(Arc::clone(&sess));
             sess.schedule_startup_transport_preconnect().await;
             // Dispatch the SessionConfiguredEvent first and then report any errors.
@@ -2230,6 +2242,7 @@ impl Session {
                     mcp_connection_manager,
                 )
                 .await?;
+            phases.mark("session_configured_mcp");
             sess.schedule_startup_prewarm().await;
             let session_start_source = match &initial_history {
                 InitialHistory::Resumed(_) => codex_hooks::SessionStartSource::Resume,

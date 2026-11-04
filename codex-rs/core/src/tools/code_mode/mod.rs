@@ -524,8 +524,18 @@ impl CodeModeService {
     }
 
     /// Starts the code-mode host before the first turn needs it so the first
-    /// cell does not pay for isolate and host startup.
+    /// cell does not pay for isolate and host startup. It also loads the model
+    /// tokenizer vocabulary, a per-process cost (about 70-90 ms measured
+    /// offline) that the first cell's result projection otherwise pays when its
+    /// output is too large for the byte shortcut. Neither runs cell code, takes
+    /// a cell id, or spends output budget.
     pub(crate) async fn prewarm(&self) -> Result<(), String> {
+        // Detached: the load completes even if this prewarm is cancelled. A
+        // projection that needs the vocabulary meanwhile waits on this single
+        // process-wide load rather than repeating it.
+        drop(tokio::task::spawn_blocking(
+            codex_utils_output_truncation::warm_model_tokenizer,
+        ));
         self.session().await.map(|_| ())
     }
 

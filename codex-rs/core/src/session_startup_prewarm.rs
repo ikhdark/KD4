@@ -12,6 +12,7 @@ use tracing::warn;
 use crate::client::ModelClientSession;
 use crate::config::Config;
 use crate::responses_metadata::CodexResponsesMetadata;
+use crate::responses_metadata::subagent_header_value;
 use crate::session::INITIAL_SUBMIT_ID;
 use crate::session::session::Session;
 use crate::session::turn::built_tools;
@@ -27,6 +28,12 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 
 const CODE_MODE_PREWARM_PHASE: &str = "code_mode_prewarm";
+/// Past the MCP snapshot deadline both router builds are subject to.
+const FIRST_TURN_ROUTER_WAIT: Duration = Duration::from_secs(3);
+/// A local MCP server finishes starting within milliseconds of the capture that
+/// spawns it. A router built just before that is rejected by the first turn and
+/// built again, so give fast servers this long to enter its catalog snapshot.
+const STARTUP_ROUTER_MCP_GRACE: Duration = Duration::from_millis(50);
 
 pub(crate) struct SessionStartupPrewarmHandle {
     task: AbortOnDropHandle<CodexResult<Option<ModelClientSession>>>,
@@ -55,17 +62,33 @@ enum StartupPreparedRouterState {
 /// a late speculative result can never leak into a later turn.
 pub(crate) struct StartupPreparedRouterCache {
     state: tokio::sync::Mutex<StartupPreparedRouterState>,
+    building: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl Default for StartupPreparedRouterCache {
     fn default() -> Self {
         Self {
             state: tokio::sync::Mutex::new(StartupPreparedRouterState::Open(None)),
+            building: Arc::new(tokio::sync::watch::channel(false).0),
         }
     }
 }
 
+/// Marks a speculative build as running, through every exit including abort.
+pub(crate) struct StartupRouterBuild(Arc<tokio::sync::watch::Sender<bool>>);
+
+impl Drop for StartupRouterBuild {
+    fn drop(&mut self) {
+        self.0.send_replace(false);
+    }
+}
+
 impl StartupPreparedRouterCache {
+    pub(crate) fn begin_build(&self) -> StartupRouterBuild {
+        self.building.send_replace(true);
+        StartupRouterBuild(Arc::clone(&self.building))
+    }
+
     pub(crate) async fn publish(&self, prepared: PreparedStartupRouter) {
         let mut state = self.state.lock().await;
         if let StartupPreparedRouterState::Open(slot) = &mut *state {
@@ -73,18 +96,21 @@ impl StartupPreparedRouterCache {
         }
     }
 
-    pub(crate) async fn take_for_first_turn(&self) -> Option<PreparedStartupRouter> {
+    /// A speculative build started before this turn and costs the same as the turn's own, so
+    /// a second build could only finish later while competing with it. `wait` is false when
+    /// the turn could not use the result anyway.
+    pub(crate) async fn take_for_first_turn(&self, wait: bool) -> Option<PreparedStartupRouter> {
+        if wait {
+            let mut building = self.building.subscribe();
+            let finished = building.wait_for(|building| !*building);
+            let _ = tokio::time::timeout(FIRST_TURN_ROUTER_WAIT, finished).await;
+        }
         let mut state = self.state.lock().await;
         match std::mem::replace(&mut *state, StartupPreparedRouterState::Closed) {
             StartupPreparedRouterState::Open(prepared) => prepared,
             StartupPreparedRouterState::Closed => None,
         }
     }
-}
-
-enum SessionStartupTransportResolution {
-    Ready(Box<ModelClientSession>),
-    Unavailable,
 }
 
 pub(crate) enum SessionStartupPrewarmResolution {
@@ -110,12 +136,6 @@ impl SessionStartupPrewarmHandle {
     pub(crate) async fn abort(self) {
         self.task.abort();
         let _ = self.task.await;
-    }
-
-    /// Whether first-turn handoff can still claim this transport. `resolve` cuts off an
-    /// unfinished prewarm, so a turn must not rely on it to supply the first socket.
-    pub(crate) fn is_finished(&self) -> bool {
-        self.task.is_finished()
     }
 
     #[instrument(name = "startup_prewarm.resolve", level = "trace", skip_all)]
@@ -252,24 +272,8 @@ impl SessionStartupTransportHandle {
         let _ = self.task.await;
     }
 
-    async fn resolve(self) -> SessionStartupTransportResolution {
-        match self.task.await {
-            Ok(Ok(client_session)) => {
-                SessionStartupTransportResolution::Ready(Box::new(client_session))
-            }
-            Ok(Err(err)) => {
-                warn!(
-                    "startup websocket preconnect failed; continuing with send-boundary fallback: {err:#}"
-                );
-                SessionStartupTransportResolution::Unavailable
-            }
-            Err(err) => {
-                warn!(
-                    "startup websocket preconnect join failed; continuing with send-boundary fallback: {err}"
-                );
-                SessionStartupTransportResolution::Unavailable
-            }
-        }
+    pub(crate) fn into_dial(self) -> AbortOnDropHandle<CodexResult<ModelClientSession>> {
+        self.task
     }
 }
 
@@ -303,12 +307,15 @@ impl Session {
         let config = self.get_config().await;
         let thread_config = self.thread_config_snapshot().await;
         let models_manager = Arc::clone(&self.services.models_manager);
-        let responses_metadata = CodexResponsesMetadata::new(
+        let mut responses_metadata = CodexResponsesMetadata::new(
             self.installation_id.clone(),
             self.thread_id.to_string(),
             self.thread_id.to_string(),
             self.current_window_id().await,
         );
+        // The first turn adopts this dial, whose handshake still identifies a spawned agent.
+        responses_metadata.subagent_header = subagent_header_value(&thread_config.session_source);
+        responses_metadata.parent_thread_id = thread_config.session_source.parent_thread_id();
         let task = tokio::spawn(async move {
             let _preconnect = startup_timing.begin_phase(StartupPhase::TransportPreconnect);
             // Resolve routing without building a turn context or waiting for tool discovery.
@@ -357,22 +364,15 @@ impl Session {
         let started_at = Instant::now();
         let startup_prewarm_session = Arc::clone(self);
         let cancellation = self.startup_cancellation.clone();
-        // HTTP authentication remains session-owned until shutdown. Preparing a
-        // router must neither wait for it nor abort it by dropping its handle.
-        let startup_transport = if self.services.model_client.startup_websocket_enabled() {
-            self.take_session_startup_transport().await
-        } else {
-            None
-        };
+        let router_build = self.startup_prepared_router.begin_build();
+        // The startup transport stays session-owned: the first turn adopts its dial,
+        // and cutting off this speculative preparation must not abort it.
         let startup_prewarm = tokio::spawn(async move {
+            let _router_build = router_build;
             let result = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => Ok(None),
-                result = schedule_startup_prewarm_inner(
-                startup_prewarm_session,
-                startup_transport,
-            )
-                => result,
+                result = schedule_startup_prewarm_inner(startup_prewarm_session) => result,
             };
             let status = match &result {
                 Ok(Some(_)) => "ready",
@@ -430,18 +430,6 @@ impl Session {
 
 }
 
-async fn resolve_startup_transport(
-    startup_transport: Option<SessionStartupTransportHandle>,
-) -> Option<ModelClientSession> {
-    match startup_transport {
-        Some(startup_transport) => match startup_transport.resolve().await {
-            SessionStartupTransportResolution::Ready(client_session) => Some(*client_session),
-            SessionStartupTransportResolution::Unavailable => None,
-        },
-        None => None,
-    }
-}
-
 fn code_mode_prewarm_enabled(turn: &crate::session::turn_context::TurnContext) -> bool {
     turn.code_mode_available
         && crate::tools::effective_tool_mode(turn)
@@ -450,7 +438,6 @@ fn code_mode_prewarm_enabled(turn: &crate::session::turn_context::TurnContext) -
 
 async fn schedule_startup_prewarm_inner(
     session: Arc<Session>,
-    startup_transport: Option<SessionStartupTransportHandle>,
 ) -> CodexResult<Option<ModelClientSession>> {
     let _preparation = session
         .startup_timing
@@ -487,6 +474,11 @@ async fn schedule_startup_prewarm_inner(
             .capture_step_context(Arc::clone(&startup_turn_context))
             .await?;
     }
+    let _ = tokio::time::timeout(
+        STARTUP_ROUTER_MCP_GRACE,
+        step_context.mcp.manager().wait_for_startup(),
+    )
+    .await;
     let startup_router = built_tools(
         session.as_ref(),
         &step_context,
@@ -511,13 +503,8 @@ async fn schedule_startup_prewarm_inner(
             .await;
     }
     drop(tools_preparation);
-    // Connection ownership is resolved only after the preparation scope above ends.
-    // Tool preparation is useful for every transport; only preconnect depends on websocket support.
-    if !session.services.model_client.startup_websocket_enabled() {
-        return Ok(None);
-    }
     // Startup is handshake-only. An optional generate=false request would
     // hold a ready socket until its response drained and force first-turn
     // handoff to discard it. Never transfer a socket with in-flight output.
-    Ok(resolve_startup_transport(startup_transport).await)
+    Ok(None)
 }

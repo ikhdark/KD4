@@ -115,7 +115,6 @@ use crate::session::turn_execution::SamplingConvergenceDecision;
 use crate::session::turn_execution::SamplingRequestSettledState;
 use crate::session::turn_execution::SamplingRequestSignalCollector;
 use crate::session::turn_execution::TurnExecutionControl;
-use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
 use crate::session_startup_prewarm::SessionStartupPrewarmResolution;
 use crate::stable_context::StableContextTarget;
 use crate::stable_context::filter_unchanged_stable_context_items;
@@ -397,28 +396,36 @@ pub(crate) fn run_turn(
         let mut client_session =
             prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
         client_session.set_turn_timing(Arc::clone(&turn_context.turn_timing_state));
-        // Startup-capable clients already have a speculative owner until the first send.
-        // Desktop attestation intentionally disables that path, but is available now.
-        // First-send handoff cuts off an unfinished prewarm, so only a finished one owns
-        // the first socket. Otherwise preconnect now rather than dial serially at dispatch.
-        let startup_owns_transport = sess.services.model_client.startup_websocket_enabled()
-            && sess
-                .state
-                .lock()
-                .await
-                .startup_prewarm
-                .as_ref()
-                .is_some_and(SessionStartupPrewarmHandle::is_finished);
-        if !startup_owns_transport {
-            let metadata = turn_context.turn_metadata_state.to_responses_metadata(
-                sess.installation_id.clone(),
-                sess.current_window_id().await,
-                CodexResponsesRequestKind::Turn,
-            );
+        // The first turn adopts the session's startup dial however far it has got, with a
+        // fresh dial behind it if that one fails or stalls. Desktop attestation disables
+        // that path but is available now, and later turns have no dial left: preconnect
+        // now rather than dial serially at dispatch.
+        let startup_transport = if sess.services.model_client.startup_websocket_enabled() {
+            sess.take_session_startup_transport().await
+        } else {
+            None
+        };
+        let metadata = turn_context.turn_metadata_state.to_responses_metadata(
+            sess.installation_id.clone(),
+            sess.current_window_id().await,
+            CodexResponsesRequestKind::Turn,
+        );
+        let service_tier = service_tier_for_sampling(&sess, &turn_context).await;
+        if let Some(startup_transport) = startup_transport {
+            client_session
+                .adopt_startup_preconnect(
+                    startup_transport.into_dial(),
+                    &turn_context.model_info,
+                    service_tier,
+                    &turn_context.session_telemetry,
+                    &metadata,
+                )
+                .await;
+        } else {
             client_session
                 .start_websocket_preconnect(
                     &turn_context.model_info,
-                    service_tier_for_sampling(&sess, &turn_context).await,
+                    service_tier,
                     &turn_context.session_telemetry,
                     &metadata,
                 )
@@ -3303,6 +3310,12 @@ fn stabilize_pending_turn_plan<'a>(
                 sess.capture_step_context(Arc::clone(turn_context))
             })
             .await?;
+            // A capture that published a runtime already made this plan stale;
+            // do not build a router only to discover that below.
+            if sess.services.planning_generation() != planning_generation {
+                last_retry_reason = "capturing the step published a new planning generation";
+                continue;
+            }
             let plan_build = Box::pin(build_pure_pending_turn_plan(
                 sess,
                 step_context,

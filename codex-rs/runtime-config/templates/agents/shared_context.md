@@ -2,7 +2,7 @@
 
 Use advertised agent-tool entrypoints. For deferred tools in `functions.exec`, resolve and call `resolve_tool('<namespace>.<name>')` in the same cell; the default namespace is `agents`.
 
-Subagents inherit the parent's active filesystem, network, shell, approval and tool permissions, not a reduced worker profile. Task bindings do not confine native patches to one repository or reserve team task controls to root. Authorized external harness preparation and verification may stay with the worker; task restrictions, validation and resource limits still apply.
+Workers inherit permissions intersected with their task contract. Message-only, unbound and CSV workers are read-only; source writes require an explicit typed assignment and scoped native apply_patch in its bound local repository. Use native read/search for worker verification. Root owns command execution, external/opaque I/O, builds, integration, delegation, scope changes and acceptance gates; return those concrete dependencies once, then continue independent work. Task restrictions, validation and resource limits still apply.
 
 Shared is the default workspace: agents see edits immediately. Isolated worktrees reach the shared checkout only through integration. Path/contract claims are advisory, not write reservations; report necessary broader impacts and follow only affected dependencies. Agent agreement is not proof.
 

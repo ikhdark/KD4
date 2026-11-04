@@ -15,6 +15,7 @@ use crate::parser::MOVE_TO_MARKER;
 use crate::parser::ParseError;
 use crate::parser::UPDATE_FILE_MARKER;
 use crate::parser::UpdateFileChunk;
+use crate::SourceHashRef;
 
 use Hunk::*;
 use ParseError::*;
@@ -238,15 +239,13 @@ impl StreamingPatchParser {
             }
             StreamingParserMode::GuardFile => {
                 let expected = trimmed.strip_prefix(EXPECT_MARKER).ok_or_else(||
-                    InvalidPatchError("Guard File must be followed by *** Expect: sha256:<64 hex characters> or *** Expect: absent".into()))?;
+                    InvalidPatchError(format!("Guard File must be followed by *** Expect: {} or *** Expect: absent", SourceHashRef::FORM)))?;
                 let expected_sha256 = if expected == "absent" {
                     None
-                } else if let Some(hash) = expected.strip_prefix("sha256:")
-                    && hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-                {
-                    Some(hash.to_ascii_lowercase())
+                } else if let Some(hash) = expected.strip_prefix("sha256:") {
+                    Some(SourceHashRef::parse(hash).map_err(|error| InvalidPatchError(format!("Revision guard: {error}, or absent")))?)
                 } else {
-                    return Err(InvalidPatchError("Revision guard requires sha256:<64 hex characters> or absent".into()));
+                    return Err(InvalidPatchError(format!("Revision guard requires {} or absent", SourceHashRef::FORM)));
                 };
                 let path = self.state.pending_guard.take().ok_or_else(||
                     InvalidPatchError("Revision guard is missing its path".into()))?;

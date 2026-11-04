@@ -736,6 +736,23 @@ impl ConfigManager {
         self.invalidate_load_cache_locked();
     }
 
+    /// Drops the coalesced config reads without advancing the policy generation.
+    ///
+    /// For background plugin refreshes only. A `Config` never embeds plugin
+    /// state (plugins resolve at use time through the plugins manager), so such
+    /// an event changes nothing that thread/start, resume, fork, config writes
+    /// or auth transitions admitted against. Advancing the generation would make
+    /// any of them roll back and retry. Anything that can change policy inputs
+    /// must use [`Self::invalidate_load_cache`] instead.
+    pub fn discard_cached_loads(&self) {
+        // Policy -> cache is the lock order; this takes the cache lock alone.
+        self.load_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ready
+            .clear();
+    }
+
     // Caller holds the policy publication write lock. Match the reader's
     // policy -> cache lock order, publishing the generation with its cleanup.
     fn invalidate_load_cache_locked(&self) {

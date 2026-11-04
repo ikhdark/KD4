@@ -179,8 +179,15 @@ pub(super) async fn built_tools_for_pending_turn(
     planning_generation: u64,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<Arc<ToolRouter>> {
-    let prepared = sess.startup_prepared_router.take_for_first_turn().await;
     let turn_context = step_context.turn.as_ref();
+    let prepared = {
+        let _router_build_timing_guard = turn_context
+            .turn_timing_state
+            .begin_local_phase(TurnLocalPhase::RouterBuild);
+        sess.startup_prepared_router
+            .take_for_first_turn(selected_skill_invocations.is_empty())
+            .await
+    };
     if selected_skill_invocations.is_empty()
         && let Some(prepared) = prepared
         && prepared.planning_generation == planning_generation
@@ -261,6 +268,7 @@ pub(crate) async fn built_tools(
     let _router_build_timing_guard = turn_context
         .turn_timing_state
         .begin_local_phase(TurnLocalPhase::RouterBuild);
+    let mut phases = crate::StartupPhaseLog::start("router_build");
     if turn_context.config.web_search_mode.value()
         != codex_protocol::config_types::WebSearchMode::Disabled
     {
@@ -276,6 +284,7 @@ pub(crate) async fn built_tools(
         .mcp_tool_snapshot()
         .or_cancel(cancellation_token)
         .await?;
+    phases.mark("mcp_snapshot");
     let mcp_tool_catalog_revision = mcp_tool_snapshot.revision;
     let all_mcp_tools = mcp_tool_snapshot.tools.as_slice();
     let loaded_plugins = sess
@@ -284,6 +293,7 @@ pub(crate) async fn built_tools(
         .plugins_for_config(&turn_context.config.plugins_config_input())
         .instrument(trace_span!("built_tools.load_plugins"))
         .await;
+    phases.mark("plugins");
     let extension_snapshot = extension_tool_surface_snapshot(sess);
     let extension_tool_executors = extension_snapshot.tools;
     let selected_skill_mcp_exposure = resolve_selected_skill_mcp_exposure(
@@ -334,6 +344,7 @@ pub(crate) async fn built_tools(
     );
     let mcp_tools = has_mcp_servers.then_some(mcp_tool_exposure.direct_tools);
     let deferred_mcp_tools = mcp_tool_exposure.deferred_tools;
+    phases.mark("exposure");
     // Index construction and concurrent cache-build waits can block. Keep them
     // off runtime workers so cancellation and other turns can still progress.
     let router_step = Arc::clone(step_context);
@@ -361,6 +372,7 @@ pub(crate) async fn built_tools(
             .map_err(|error| CodexErr::Fatal(format!("tool router build task failed: {error}")))?
             .map_err(CodexErr::InvalidRequest)?,
     );
+    phases.mark("router_task");
     step_context
         .turn
         .refresh_deferred_tool_capabilities(router.deferred_tool_capability_revisions());

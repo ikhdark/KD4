@@ -6,6 +6,7 @@
 //! This parser also accepts compatibility forms, including leading/trailing
 //! whitespace around patch markers and a shell heredoc wrapper.
 use crate::ApplyPatchArgs;
+use crate::SourceHashRef;
 use crate::streaming_parser::StreamingPatchParser;
 use codex_utils_path_uri::PathUri;
 use codex_utils_path_uri::PathUriParseError;
@@ -39,10 +40,11 @@ pub enum ParseError {
 use ParseError::*;
 
 /// A patch-wide precondition on raw file bytes, or on the path being absent.
+/// `expected_sha256` may be a hash prefix; compare it only with `matches`.
 #[derive(Debug, PartialEq, Clone)]
 pub struct FileRevisionGuard {
     pub path: PathBuf,
-    pub expected_sha256: Option<String>,
+    pub expected_sha256: Option<SourceHashRef>,
 }
 
 #[derive(Debug, PartialEq, Clone)]

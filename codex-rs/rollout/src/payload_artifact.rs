@@ -12,6 +12,7 @@ use std::path::PathBuf;
 const MAX_PAYLOAD_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const INLINE_BYTES: usize = 8 * 1024;
 pub(crate) const KIND: &str = "rollout_payload_artifact";
+pub(crate) const KIND_BYTES: &[u8] = KIND.as_bytes();
 /// Directory beside the session collections that holds referenced bodies.
 pub(crate) const PAYLOAD_DIRECTORY: &str = "rollout-payloads";
 const MAX_CONCURRENT_PAYLOAD_SYNCS: usize = 8;
@@ -372,19 +373,15 @@ pub(crate) fn lock_publication(path: &Path) -> io::Result<std::fs::File> {
 /// participates in retention ownership. Explicit resume paths can live outside
 /// the session directories, and older writers do not take the retention lock.
 /// Neither a bounded directory scan nor an age cutoff proves a blob is unused.
-/// Keep the optional-maintenance error explicit instead of reporting reclamation
-/// success while silently accumulating retained orphan bytes.
+/// Blobs are therefore retained by design, which is not a failure. Only
+/// abandoned private stage files are reclaimed; returns how many were removed.
 pub async fn reclaim_payload_artifacts(home: &Path) -> io::Result<usize> {
     let directory = home.join("rollout-payloads");
     tokio::task::spawn_blocking(move || {
         reclaim_abandoned_payload_stages(&directory, std::time::SystemTime::now())
     })
     .await
-    .map_err(io::Error::other)??;
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "payload collection deferred: complete rollout roots and publisher ownership are not established",
-    ))
+    .map_err(io::Error::other)?
 }
 
 const PAYLOAD_STAGE_PREFIX: &str = "payload-stage-v1-";

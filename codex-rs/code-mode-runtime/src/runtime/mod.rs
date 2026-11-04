@@ -725,11 +725,14 @@ impl EnabledToolCatalog {
                 {
                     // Rewrite only the generated declaration, not tool prose or
                     // canonical identity. Unknown contract layouts fail closed.
+                    // The declaration lives in the core; sections hold bare types.
                     let needle = format!("declare const tools: {{ {}(", tool.global_name);
-                    if let Some((before, rest)) = tool.description.rsplit_once(&needle)
+                    let core = codex_code_mode_protocol::contract_core(&tool.description);
+                    let sections = &tool.description[core.len()..];
+                    if let Some((before, rest)) = core.rsplit_once(&needle)
                         && let Some((body, after)) = rest.rsplit_once(" };")
                     {
-                        tool.description = format!("{before}declare const tools: {{ {namespace}: {{ {member}({body} }} }};{after}").into();
+                        tool.description = format!("{before}declare const tools: {{ {namespace}: {{ {member}({body} }} }};{after}{sections}").into();
                         presentation = qualified;
                     }
                 }
@@ -738,8 +741,10 @@ impl EnabledToolCatalog {
                 && let Some(short) = &short_aliases[index]
             {
                 let needle = format!("declare const tools: {{ {}(", tool.global_name);
-                if let Some((before, rest)) = tool.description.rsplit_once(&needle) {
-                    tool.description = format!("{before}declare const tools: {{ {short}({rest}").into();
+                let core = codex_code_mode_protocol::contract_core(&tool.description);
+                let sections = &tool.description[core.len()..];
+                if let Some((before, rest)) = core.rsplit_once(&needle) {
+                    tool.description = format!("{before}declare const tools: {{ {short}({rest}{sections}").into();
                     presentation = short.clone();
                 }
             }

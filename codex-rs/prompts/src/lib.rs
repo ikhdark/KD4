@@ -4,6 +4,7 @@ mod permissions_instructions;
 mod review_exit;
 mod review_request;
 
+pub use apply_patch::APPLY_PATCH_EAGER_INSTRUCTIONS;
 pub use apply_patch::APPLY_PATCH_TOOL_INSTRUCTIONS;
 pub use compact::COMPACTION_BASE_INSTRUCTIONS;
 pub use compact::INCREMENTAL_SUMMARIZATION_PROMPT;

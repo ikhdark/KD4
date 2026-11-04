@@ -3,6 +3,10 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 
+use super::contract_sections::ContractParts;
+use super::contract_sections::exceeds_whole_contract;
+use super::contract_sections::render_sectioned_contract;
+use super::contract_sections::sanitize_contract_text;
 use super::schema_ts::SharedFragments;
 use super::schema_ts::hoist_shared_fragments;
 use super::schema_ts::render_json_schema_to_typescript_recording;
@@ -162,8 +166,10 @@ fn render_tool_types(definition: &ToolDefinition) -> RenderedToolTypes {
 }
 
 fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String {
-    let mut description = definition.description.trim().to_string();
-    if let Some(guidance) = definition.namespace_description.as_deref().map(str::trim).filter(|text| !text.is_empty()) {
+    let prose = sanitize_contract_text(definition.description.trim());
+    let guidance = definition.namespace_description.as_deref().map(str::trim).filter(|text| !text.is_empty());
+    let mut description = prose.to_string();
+    if let Some(guidance) = guidance {
         description = format!("{guidance}\n\n{description}");
     }
     let input_name = match definition.kind {
@@ -178,7 +184,8 @@ fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String
     } = render_tool_types(definition);
     // Lazy resolution already returns this authoritative description. Retain
     // JSON only for projections that lost structure; ordinary tools do not pay
-    // for a second schema tree in every cell. Output recovery can page this text.
+    // for a second schema tree in every cell.
+    let mut schemas = Vec::new();
     for (label, schema, incomplete) in [
         (
             "input_schema",
@@ -197,6 +204,7 @@ fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String
             description.push_str(&format!(
                 "\n\nAuthoritative {label} (TypeScript projection incomplete):\n```json\n{schema}\n```"
             ));
+            schemas.push((label, schema.to_string()));
         }
     }
     // One shape reached from several properties, or from both the argument and
@@ -231,12 +239,33 @@ fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String
         render_code_mode_tool_declaration(
             &definition.name,
             input_name,
-            input_type,
-            output_type,
+            input_type.clone(),
+            output_type.clone(),
             false
         )
     );
-    format!("{description}\n\nexec tool declaration:\n```ts\n{declaration}\n```")
+    let whole = format!("{description}\n\nexec tool declaration:\n```ts\n{declaration}\n```");
+    if !exceeds_whole_contract(&whole) {
+        return sanitize_contract_text(&whole).into_owned();
+    }
+    let aliases = aliases
+        .iter()
+        .map(|alias| sanitize_contract_text(alias).into_owned())
+        .collect::<Vec<_>>();
+    render_sectioned_contract(ContractParts {
+        tool_name: &definition.name,
+        input_name,
+        guidance,
+        prose: &prose,
+        result_envelope: mcp_structured_content_schema(definition.output_schema.as_ref())
+            .is_some()
+            .then_some(MCP_RESULT_ENVELOPE),
+        aliases: &aliases,
+        input_type: &sanitize_contract_text(&input_type),
+        output_type: &sanitize_contract_text(&output_type),
+        output_schema: definition.output_schema.as_ref(),
+        schemas: &schemas,
+    })
 }
 
 /// Render one model-visible contract bundle. Shared shapes are named once across
@@ -323,7 +352,7 @@ pub fn render_code_mode_tool_bundle(definitions: &[ToolDefinition]) -> String {
     output
 }
 
-fn render_code_mode_tool_declaration(
+pub(super) fn render_code_mode_tool_declaration(
     tool_name: &str,
     input_name: &str,
     input_type: String,
@@ -341,7 +370,7 @@ fn render_code_mode_tool_declaration(
     )
 }
 
-fn mcp_structured_content_schema(output_schema: Option<&JsonValue>) -> Option<&JsonValue> {
+pub(super) fn mcp_structured_content_schema(output_schema: Option<&JsonValue>) -> Option<&JsonValue> {
     let output_schema = output_schema?;
     // Registration, rather than coincidental property names, establishes this
     // envelope and the independent reference root of its embedded payload schema.

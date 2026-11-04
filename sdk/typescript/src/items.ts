@@ -14,6 +14,7 @@ export type CommandExecutionItem = {
   command: string;
   /** Aggregated stdout and stderr captured while the command was running. */
   aggregated_output: string;
+  /** Omitted when byte-identical to `aggregated_output`. */
   stdout?: string;
   stderr?: string;
   output_metadata?: {

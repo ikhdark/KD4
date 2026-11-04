@@ -2456,10 +2456,14 @@ impl Session {
             mcp_runtime
                 .manager()
                 .set_permission_profile(updated.permission_profile());
-            if updates.environments.is_some() {
-                self.services
+            // A turn that restates the selected environments (exec always sends its
+            // cwd) must not invalidate the tool router built for them at startup.
+            if updates.environments.is_some()
+                && self
+                    .services
                     .turn_environments
-                    .update_selections(updated.environment_selections());
+                    .update_selections(updated.environment_selections())
+            {
                 self.services.advance_planning_generation(&mut state);
             }
             (previous_config, new_config, updated)
@@ -2590,13 +2594,26 @@ impl Session {
         }
         let environments = self.services.turn_environments.snapshot().await;
         let session_source = self.state.lock().await.session_configuration.session_source.clone();
-        let hooks = build_hooks_for_config(
+        let hooks = match build_hooks_for_config(
             config.as_ref(),
             self.services.plugins_manager.as_ref(),
             environments.single_local_environment(),
             &session_source,
         )
-        .await;
+        .await
+        {
+            Ok(hooks) => hooks,
+            Err(err) => {
+                // Runtime shutdown can cancel a queued blocking discovery job.
+                // Keep the accepted config and hooks intact on any join failure.
+                if err.is_cancelled() {
+                    tracing::debug!("hook discovery cancelled; retaining current runtime config");
+                } else {
+                    tracing::error!("hook discovery failed; retaining current runtime config: {err}");
+                }
+                return;
+            }
+        };
 
         let (previous_config, new_config) = {
             let mut state = self.state.lock().await;
@@ -8185,21 +8202,17 @@ pub(crate) fn plugin_refresh_trace_enabled() -> bool {
 }
 
 /// Builds the hook engine for one config snapshot, including any enabled plugin hooks.
-#[expect(
-    clippy::expect_used,
-    reason = "Hook discovery failure must not silently disable configured hooks"
-)]
 async fn build_hooks_for_config(
     config: &Config,
     plugins_manager: &PluginsManager,
     environment: Option<&TurnEnvironment>,
     session_source: &SessionSource,
-) -> Hooks {
+) -> std::result::Result<Hooks, tokio::task::JoinError> {
     // Opaque command/MCP hooks cannot enforce a worker's source-write contract.
     // Apply at construction AND refresh, including unbound/CSV subagents.
     if matches!(session_source, SessionSource::SubAgent(_)) {
         tracing::debug!("subagent hooks are root-owned; no opaque worker hooks admitted");
-        return Hooks::new(HooksConfig::default());
+        return Ok(Hooks::new(HooksConfig::default()));
     }
     let (hook_shell_program, hook_shell_argv) = environment
         .and_then(|environment| environment.shell.as_ref())
@@ -8228,9 +8241,7 @@ async fn build_hooks_for_config(
         shell_program: hook_shell_program,
         shell_args: hook_shell_argv,
     };
-    tokio::task::spawn_blocking(move || Hooks::new(hooks_config))
-        .await
-        .expect("hook discovery worker should complete")
+    tokio::task::spawn_blocking(move || Hooks::new(hooks_config)).await
 }
 
 

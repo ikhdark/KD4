@@ -3317,6 +3317,9 @@ struct WebsocketHistoryBaseline {
 /// response still streaming on it. Rotate at a request boundary before then.
 const WEBSOCKET_ROTATION_AGE: Duration = Duration::from_secs(55 * 60);
 const SPAWNED_AGENT_ATTESTATION_WAIT: Duration = Duration::from_millis(100);
+/// A startup dial usually lands within this long of the first turn. Past it the connect
+/// timeout is what remains (15 s by default), so the turn starts a dial of its own.
+const STARTUP_DIAL_HEDGE: Duration = Duration::from_millis(400);
 
 fn websocket_connection_expiring(connected_at: Option<Instant>, now: Instant) -> bool {
     connected_at.is_some_and(|connected_at| {
@@ -3329,6 +3332,9 @@ struct WebsocketSession {
     connection: Option<ApiWebSocketConnection>,
     /// Local transport lifetime identity, also present without startup capture.
     diagnostic_connection_id: Option<String>,
+    /// True only for the transport selected by startup-dial adoption, not a
+    /// fresh turn preconnect that also reports connection reuse at dispatch.
+    adopted_startup_dial: bool,
     startup_observation: Option<codex_turn_timing::startup_timing::StartupConnectionObservation>,
     /// When `connection` was established; drives rotation before the server's age limit.
     connected_at: Option<Instant>,
@@ -3707,9 +3713,8 @@ impl ModelClient {
     }
 
     fn prompt_cache_key(&self, metadata: &CodexResponsesMetadata) -> String {
-        // Match the session-id affinity sent on both transports. Child threads
-        // share the agent-tree session, not their distinct conversation IDs.
-        metadata.session_id.clone()
+        // Match the session-id affinity sent on both transports.
+        metadata.cache_affinity_id()
     }
 
     /// Attach before cloning, so regular and compaction sessions share the
@@ -4373,7 +4378,7 @@ impl ModelClient {
             headers.insert("x-client-request-id", header_value);
         }
         headers.extend(build_session_headers(
-            Some(responses_metadata.session_id.to_string()),
+            Some(responses_metadata.cache_affinity_id()),
             Some(responses_metadata.thread_id.to_string()),
         ));
         headers.extend(self.build_responses_compatibility_headers(responses_metadata));
@@ -4510,6 +4515,7 @@ impl ModelClientSession {
     fn reset_websocket_session(&mut self) {
         self.websocket_session.connection = None;
         self.websocket_session.diagnostic_connection_id = None;
+        self.websocket_session.adopted_startup_dial = false;
         if let Some(observation) = self.websocket_session.startup_observation.take() {
             observation.release("connection_reset");
         }
@@ -4630,7 +4636,7 @@ impl ModelClientSession {
         use_responses_lite: bool,
     ) -> ApiResponsesOptions {
         ApiResponsesOptions {
-            session_id: Some(responses_metadata.session_id.to_string()),
+            session_id: Some(responses_metadata.cache_affinity_id()),
             thread_id: Some(responses_metadata.thread_id.to_string()),
             session_source: Some(self.client.state.session_source.clone()),
             extra_headers: {
@@ -4948,12 +4954,55 @@ impl ModelClientSession {
         session_telemetry: &SessionTelemetry,
         responses_metadata: &CodexResponsesMetadata,
     ) {
+        if let Some(timing) = &self.turn_timing {
+            timing.record_startup_dial_outcome(
+                if self.client.startup_websocket_enabled() {
+                    "no_startup_dial"
+                } else {
+                    "startup_disabled"
+                },
+                false,
+            );
+        }
+        if !self.ready_for_websocket_preconnect().await {
+            return;
+        }
+        let dial = self.websocket_preconnect_dial(
+            model_info,
+            service_tier,
+            session_telemetry,
+            responses_metadata,
+        );
+        self.pending_websocket_preconnect =
+            Some(AbortOnDropHandle::new(tokio::spawn(dial.in_current_span())));
+    }
+
+    async fn ready_for_websocket_preconnect(&mut self) -> bool {
         if self.http_for_turn
             || !self.client.responses_websocket_enabled()
             || self.pending_websocket_preconnect.is_some()
         {
-            return;
+            return false;
         }
+        if let Some(connection) = self.websocket_session.connection.as_ref() {
+            if !websocket_connection_expiring(self.websocket_session.connected_at, Instant::now())
+                && !connection.is_closed().await
+            {
+                return false;
+            }
+            self.reset_websocket_session();
+        }
+        true
+    }
+
+    fn websocket_preconnect_dial(
+        &mut self,
+        model_info: &ModelInfo,
+        service_tier: Option<String>,
+        session_telemetry: &SessionTelemetry,
+        responses_metadata: &CodexResponsesMetadata,
+    ) -> impl std::future::Future<Output = Result<Option<WebsocketSession>>> + Send + 'static + use<>
+    {
         // A spawned agent's first turn can start before its thread is attached to an
         // attestation-capable client; the handshake needs that client.
         let state = &self.client.state;
@@ -4973,14 +5022,6 @@ impl ModelClientSession {
                     },
                 )
             });
-        if let Some(connection) = self.websocket_session.connection.as_ref() {
-            if !websocket_connection_expiring(self.websocket_session.connected_at, Instant::now())
-                && !connection.is_closed().await
-            {
-                return;
-            }
-            self.reset_websocket_session();
-        }
         let mut session = self.client.new_speculative_session();
         session.startup_timing = self.startup_timing.clone();
         // Share only passive telemetry. The speculative task still owns no
@@ -4991,42 +5032,125 @@ impl ModelClientSession {
         let model_info = model_info.clone();
         let session_telemetry = session_telemetry.clone();
         let responses_metadata = responses_metadata.clone();
+        async move {
+            // Dispatch awaits this task, so an attachment that is not imminent yields to
+            // the connect that dispatch performs anyway.
+            if let Some((provider, context)) = attestation_ready
+                && tokio::time::timeout(
+                    SPAWNED_AGENT_ATTESTATION_WAIT,
+                    provider.wait_until_ready(context),
+                )
+                .await
+                .is_err()
+            {
+                return Ok(None);
+            }
+            let result = session
+                .preconnect_websocket(
+                    &model_info,
+                    service_tier,
+                    &session_telemetry,
+                    &responses_metadata,
+                )
+                .await;
+            if result.as_ref().err().is_some_and(|error| match error {
+                CodexErr::ConnectionFailed(_) | CodexErr::RequestTimeout => true,
+                CodexErr::UnexpectedStatus(error) => error.status.is_server_error(),
+                _ => false,
+            }) {
+                *failure_setup
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    session.failed_websocket_setup;
+            }
+            result?;
+            Ok(Some(
+                std::mem::take(&mut session.websocket_session).into_transport_only(),
+            ))
+        }
+    }
+
+    /// Adopts the session's startup dial as this turn's preconnect, so the first dispatch waits
+    /// only for what remains of it instead of starting over. A dial that failed, or is still
+    /// unfinished after `STARTUP_DIAL_HEDGE`, gets a fresh dial of the turn's own, and the
+    /// first to connect serves the dispatch. A healthy transport wins over both.
+    pub async fn adopt_startup_preconnect(
+        &mut self,
+        mut startup_dial: AbortOnDropHandle<Result<ModelClientSession>>,
+        model_info: &ModelInfo,
+        service_tier: Option<String>,
+        session_telemetry: &SessionTelemetry,
+        responses_metadata: &CodexResponsesMetadata,
+    ) {
+        if !self.ready_for_websocket_preconnect().await {
+            if let Some(timing) = &self.turn_timing {
+                timing.record_startup_dial_outcome("preconnect_not_needed", false);
+            }
+            return;
+        }
+        if let Some(timing) = &self.turn_timing {
+            timing.record_startup_dial_outcome("awaiting_startup", false);
+        }
+        let fresh_dial = self.websocket_preconnect_dial(
+            model_info,
+            service_tier,
+            session_telemetry,
+            responses_metadata,
+        );
+        let turn_timing = self.turn_timing.clone();
         self.pending_websocket_preconnect = Some(AbortOnDropHandle::new(tokio::spawn(
             async move {
-                // Dispatch awaits this task, so an attachment that is not imminent yields to
-                // the connect that dispatch performs anyway.
-                if let Some((provider, context)) = attestation_ready
-                    && tokio::time::timeout(
-                        SPAWNED_AGENT_ATTESTATION_WAIT,
-                        provider.wait_until_ready(context),
-                    )
-                    .await
-                    .is_err()
+                tokio::pin!(fresh_dial);
+                let mut hedged = false;
+                let startup = match tokio::time::timeout(STARTUP_DIAL_HEDGE, &mut startup_dial).await
                 {
-                    return Ok(None);
+                    Ok(startup) => startup,
+                    Err(_) => {
+                        hedged = true;
+                        if let Some(timing) = &turn_timing {
+                            timing.record_startup_dial_outcome("hedging", true);
+                        }
+                        tokio::select! {
+                            startup = &mut startup_dial => startup,
+                            // Returning aborts the stalled dial.
+                            fresh = &mut fresh_dial => {
+                                if let Some(timing) = &turn_timing {
+                                    timing.record_startup_dial_outcome("fresh_after_hedge", true);
+                                }
+                                return fresh;
+                            },
+                        }
+                    }
+                };
+                match startup {
+                    Ok(Ok(mut startup_session)) => {
+                        startup_session.revoke_cache_publication();
+                        let mut adopted = std::mem::take(&mut startup_session.websocket_session);
+                        adopted.adopted_startup_dial = adopted.connection.is_some();
+                        if let Some(observation) = &adopted.startup_observation {
+                            observation.claimed();
+                        }
+                        if let Some(timing) = &turn_timing {
+                            timing.record_startup_dial_outcome("startup_adopted", hedged);
+                            timing.record_ready_startup_prewarm();
+                        }
+                        Ok(Some(adopted.into_transport_only()))
+                    }
+                    Ok(Err(error)) => {
+                        if let Some(timing) = &turn_timing {
+                            timing.record_startup_dial_outcome("startup_failed", hedged);
+                        }
+                        warn!(target: "codex_core::client", "startup websocket preconnect failed; dialing again: {error:#}");
+                        fresh_dial.await
+                    }
+                    Err(error) => {
+                        if let Some(timing) = &turn_timing {
+                            timing.record_startup_dial_outcome("startup_join_failed", hedged);
+                        }
+                        warn!(target: "codex_core::client", "startup websocket preconnect join failed; dialing again: {error}");
+                        fresh_dial.await
+                    }
                 }
-                let result = session
-                    .preconnect_websocket(
-                        &model_info,
-                        service_tier,
-                        &session_telemetry,
-                        &responses_metadata,
-                    )
-                    .await;
-                if result.as_ref().err().is_some_and(|error| match error {
-                    CodexErr::ConnectionFailed(_) | CodexErr::RequestTimeout => true,
-                    CodexErr::UnexpectedStatus(error) => error.status.is_server_error(),
-                    _ => false,
-                }) {
-                    *failure_setup
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        session.failed_websocket_setup;
-                }
-                result?;
-                Ok(Some(
-                    std::mem::take(&mut session.websocket_session).into_transport_only(),
-                ))
             }
             .in_current_span(),
         )));
@@ -5295,6 +5419,7 @@ impl ModelClientSession {
                 }
             };
             self.websocket_session.connection = Some(new_conn);
+            self.websocket_session.adopted_startup_dial = false;
             if let Some(observation) = self.websocket_session.startup_observation.take() {
                 observation.release("connection_replaced");
             }
@@ -6106,6 +6231,8 @@ impl ModelClientSession {
                         Arc::new(telemetry) as Arc<dyn WebsocketTelemetry>
                     });
             let startup_timing = self.startup_timing.clone();
+            let used_startup_dial = self.websocket_session.adopted_startup_dial;
+            let diagnostic_connection_id = self.websocket_session.diagnostic_connection_id.clone();
             let startup_connection_id = self.websocket_session.startup_observation.as_ref()
                 .map(|observation| observation.connection_id().to_owned());
             let stream_result = websocket_connection
@@ -6162,6 +6289,12 @@ impl ModelClientSession {
                                     &identity.physical_attempt_id,
                                     false,
                                     codex_turn_timing::retries::RetryRoute::Websocket,
+                                );
+                                timing.record_startup_dial_transport_attempt(
+                                    "websocket",
+                                    used_startup_dial,
+                                    diagnostic_connection_id.as_deref(),
+                                    &identity.physical_attempt_id,
                                 );
                             }
                             if let Some(identity) = &transport_identity {
@@ -7604,6 +7737,12 @@ impl RequestTelemetry for ApiTelemetry {
                     &physical_attempt_id,
                     context.retry_index > 0 || transport_attempt > 0,
                     codex_turn_timing::retries::RetryRoute::Http,
+                );
+                timing.record_startup_dial_transport_attempt(
+                    "http",
+                    false,
+                    None,
+                    &physical_attempt_id,
                 );
             }
             tracing::info!(target: "codex_core::client",
