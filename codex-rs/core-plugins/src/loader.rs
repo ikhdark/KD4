@@ -1013,7 +1013,10 @@ impl PluginSkillInventory {
         )
     }
 
-    fn resolve(self, skill_config_rules: &SkillConfigRules) -> ResolvedPluginSkills {
+    fn resolve(mut self, skill_config_rules: &SkillConfigRules) -> ResolvedPluginSkills {
+        codex_core_skills::config_rules::apply_skill_metadata_overrides(
+            &mut self.skills, skill_config_rules,
+        );
         let disabled_skill_paths = resolve_disabled_skill_paths(&self.skills, skill_config_rules);
         ResolvedPluginSkills {
             skills: self.skills,

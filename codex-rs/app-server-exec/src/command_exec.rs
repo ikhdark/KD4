@@ -87,6 +87,19 @@ impl OutputByteCap {
     }
 }
 
+pub(crate) async fn observe_process_exit(session: Arc<ProcessHandle>, exit_rx: oneshot::Receiver<i32>) -> i32 {
+    if let Some(code) = session.exit_code() { return code; }
+    if let Ok(code) = exit_rx.await { return code; }
+    tracing::error!(cleanup_pending = true, "native exit observer failed; retaining process ownership until confirmed exit");
+    loop {
+        if let Some(code) = session.exit_code() { return code; }
+        if let Err(error) = session.request_terminate() {
+            tracing::warn!(%error, "native exit recovery termination failed");
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 /// Validate command argv at an app-server request boundary.
 ///
 /// Execution managers only accept requests produced by those boundaries and
@@ -108,9 +121,46 @@ fn attach_connection_cancellation(
         .with_cancellation(connection_cancellation);
 }
 
+pub(crate) trait ConnectionSessionKey: Eq + std::hash::Hash {
+    fn connection_id(&self) -> ConnectionId;
+}
+
+/// Session ownership is indexed by connection so close never scans or clones
+/// another connection's process keys under the shared admission lock.
+pub(crate) struct ConnectionSessionMap<K, V> {
+    connections: HashMap<ConnectionId, HashMap<K, V>>,
+}
+
+impl<K, V> Default for ConnectionSessionMap<K, V> {
+    fn default() -> Self { Self { connections: HashMap::new() } }
+}
+
+impl<K: ConnectionSessionKey, V> ConnectionSessionMap<K, V> {
+    fn contains_key(&self, key: &K) -> bool { self.get(key).is_some() }
+    pub(crate) fn get(&self, key: &K) -> Option<&V> {
+        self.connections.get(&key.connection_id())?.get(key)
+    }
+    fn insert(&mut self, key: K, value: V) -> Option<V> {
+        self.connections.entry(key.connection_id()).or_default().insert(key, value)
+    }
+    pub(crate) fn entry(&mut self, key: K) -> std::collections::hash_map::Entry<'_, K, V> {
+        self.connections.entry(key.connection_id()).or_default().entry(key)
+    }
+    pub(crate) fn remove(&mut self, key: &K) -> Option<V> {
+        let connection_id = key.connection_id();
+        let entries = self.connections.get_mut(&connection_id)?;
+        let removed = entries.remove(key);
+        if entries.is_empty() { self.connections.remove(&connection_id); }
+        removed
+    }
+    pub(crate) fn remove_connection(&mut self, connection_id: ConnectionId) -> Vec<V> {
+        self.connections.remove(&connection_id).unwrap_or_default().into_values().collect()
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct CommandExecManager {
-    sessions: Arc<Mutex<HashMap<ConnectionProcessId, CommandExecSession>>>,
+    sessions: Arc<Mutex<ConnectionSessionMap<ConnectionProcessId, CommandExecSession>>>,
     run_tasks: tokio_util::task::TaskTracker,
     next_generated_process_id: Arc<AtomicI64>,
 }
@@ -118,7 +168,7 @@ pub(crate) struct CommandExecManager {
 impl Default for CommandExecManager {
     fn default() -> Self {
         Self {
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(Mutex::new(ConnectionSessionMap::default())),
             run_tasks: tokio_util::task::TaskTracker::new(),
             next_generated_process_id: Arc::new(AtomicI64::new(1)),
         }
@@ -129,6 +179,10 @@ impl Default for CommandExecManager {
 struct ConnectionProcessId {
     connection_id: ConnectionId,
     process_id: InternalProcessId,
+}
+
+impl ConnectionSessionKey for ConnectionProcessId {
+    fn connection_id(&self) -> ConnectionId { self.connection_id }
 }
 
 #[derive(Clone)]
@@ -185,7 +239,7 @@ struct RunCommandParams {
 }
 
 struct CommandTerminalCleanup {
-    sessions: Arc<Mutex<HashMap<ConnectionProcessId, CommandExecSession>>>,
+    sessions: Arc<Mutex<ConnectionSessionMap<ConnectionProcessId, CommandExecSession>>>,
     process_key: ConnectionProcessId,
 }
 
@@ -223,9 +277,17 @@ struct QueuedOutputDelivery {
 struct UndeliveredOutput {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    stdout_cap_reached: bool,
+    stderr_cap_reached: bool,
 }
 
 impl UndeliveredOutput {
+    fn note_cap(&mut self, stream: CommandExecOutputStream, cap_reached: bool) {
+        match stream {
+            CommandExecOutputStream::Stdout => self.stdout_cap_reached |= cap_reached,
+            CommandExecOutputStream::Stderr => self.stderr_cap_reached |= cap_reached,
+        }
+    }
     fn append(&mut self, stream: CommandExecOutputStream, bytes: &[u8]) {
         match stream {
             CommandExecOutputStream::Stdout => self.stdout.extend_from_slice(bytes),
@@ -234,8 +296,10 @@ impl UndeliveredOutput {
     }
 
     fn append_tail(&mut self, tail: Self) {
-        self.stdout.extend(tail.stdout);
-        self.stderr.extend(tail.stderr);
+        self.stdout_cap_reached |= tail.stdout_cap_reached;
+        self.stderr_cap_reached |= tail.stderr_cap_reached;
+        if self.stdout.is_empty() { self.stdout = tail.stdout; } else { self.stdout.extend(tail.stdout); }
+        if self.stderr.is_empty() { self.stderr = tail.stderr; } else { self.stderr.extend(tail.stderr); }
     }
 }
 
@@ -349,51 +413,9 @@ impl CommandExecManager {
                         (Some(delivery_relay), Some(process_id)) => {
                             let (tx_event, rx_event) =
                                 async_channel::bounded::<codex_protocol::protocol::Event>(1);
-                            let handle = tokio::spawn(async move {
-                                let mut delivery_relay = Some(delivery_relay);
-                                let mut undelivered = UndeliveredOutput::default();
-                                let mut stdout_cap = OutputByteCap::new(output_bytes_cap);
-                                let mut stderr_cap = OutputByteCap::new(output_bytes_cap);
-                                while let Ok(event) = rx_event.recv().await {
-                                    let EventMsg::ExecCommandOutputDelta(delta) = event.msg else {
-                                        continue;
-                                    };
-                                    let (stream, cap) = match delta.stream {
-                                        ExecOutputStream::Stdout => {
-                                            (CommandExecOutputStream::Stdout, &mut stdout_cap)
-                                        }
-                                        ExecOutputStream::Stderr => {
-                                            (CommandExecOutputStream::Stderr, &mut stderr_cap)
-                                        }
-                                    };
-                                    let (capped_chunk, cap_reached) = cap.accept(&delta.chunk);
-                                    if capped_chunk.is_empty() && !cap_reached {
-                                        continue;
-                                    }
-                                    let queued = if let Some(relay) = delivery_relay.as_ref() {
-                                        let delta_base64 = STANDARD.encode(capped_chunk);
-                                        let accounted_payload_bytes = accounted_output_delivery_bytes(&delta_base64, &process_id);
-                                        relay
-                                            .enqueue(
-                                                CommandExecOutputDeltaNotification {
-                                                    process_id: process_id.clone(),
-                                                    stream,
-                                                    delta_base64,
-                                                    cap_reached,
-                                                },
-                                                accounted_payload_bytes,
-                                            )
-                                            .is_ok()
-                                    } else {
-                                        false
-                                    };
-                                    if !queued {
-                                        delivery_relay = None;
-                                        undelivered.append(stream, capped_chunk);
-                                    }
-                                }
-                                undelivered
-                            });
+                            let handle = spawn_windows_output_relay(
+                                rx_event, delivery_relay, process_id, output_bytes_cap,
+                            );
                             let (stream, recovery) = StdoutStream::with_delivery_recovery(
                                 String::new(),
                                 String::new(),
@@ -423,8 +445,9 @@ impl CommandExecManager {
                 let undelivered = match undelivered.and_then(|mut output| {
                     output.append_tail(event_fallback?);
                     if let Some(recovery) = first_hop_recovery {
+                        let (stdout_cap_reached, stderr_cap_reached) = recovery.cap_reached();
                         let (stdout, stderr) = recovery.take_suffix();
-                        output.append_tail(UndeliveredOutput { stdout, stderr });
+                        output.append_tail(UndeliveredOutput { stdout, stderr, stdout_cap_reached, stderr_cap_reached });
                     }
                     Ok(output)
                 }) {
@@ -453,8 +476,12 @@ impl CommandExecManager {
                                         && !undelivered.stderr.is_empty())
                                     .then(|| STANDARD.encode(&undelivered.stderr)),
                                     // This legacy sandbox backend has no per-stream EOF receipt.
-                                    stdout_capture: None,
-                                    stderr_capture: None,
+                                    stdout_capture: undelivered.stdout_cap_reached.then_some(codex_app_server_protocol_types::ProcessOutputCaptureState {
+                                        reached_eof: false, cap_reached: true, drain_timed_out: false,
+                                    }),
+                                    stderr_capture: undelivered.stderr_cap_reached.then_some(codex_app_server_protocol_types::ProcessOutputCaptureState {
+                                        reached_eof: false, cap_reached: true, drain_timed_out: false,
+                                    }),
                                     stdout: if stream_stdout_stderr {
                                         bytes_to_string_smart(&undelivered.stdout)
                                     } else {
@@ -506,9 +533,6 @@ impl CommandExecManager {
         };
 
         let sessions = Arc::clone(&self.sessions);
-        let Some((program, args)) = command.split_first() else {
-            return Err(internal_error("validated command unexpectedly empty"));
-        };
         {
             let mut sessions = self.sessions.lock().await;
             rpc_gate
@@ -531,6 +555,11 @@ impl CommandExecManager {
                 })
                 .ok_or_else(|| invalid_request("connection is closed"))??;
         }
+        // Native spawn and handoff must survive cancellation of the RPC waiter.
+        let spawn_owner = tokio::spawn(async move {
+        let Some((program, args)) = command.split_first() else {
+            return Err(internal_error("validated command unexpectedly empty"));
+        };
         let spawned = if tty {
             codex_utils_pty::spawn_pty_process(
                 program,
@@ -550,7 +579,7 @@ impl CommandExecManager {
         let spawned = match spawned {
             Ok(spawned) => spawned,
             Err(err) => {
-                self.sessions.lock().await.remove(&process_key);
+                sessions.lock().await.remove(&process_key);
                 return Err(internal_error(format!("failed to spawn command: {err}")));
             }
         };
@@ -575,7 +604,9 @@ impl CommandExecManager {
             })
             .await;
         });
-        Ok(())
+        Ok::<_, JSONRPCErrorError>(())
+        });
+        spawn_owner.await.map_err(|err| internal_error(format!("command spawn owner failed: {err}")))?
     }
 
 
@@ -592,10 +623,9 @@ impl CommandExecManager {
             ));
         }
 
-        let delta = match params.delta_base64 {
-            Some(delta_base64) => decode_stdin_delta(&delta_base64)?,
-            None => Vec::new(),
-        };
+        if let Some(encoded) = params.delta_base64.as_deref() {
+            validate_stdin_delta_length(encoded)?;
+        }
 
         let target_process_id = ConnectionProcessId {
             connection_id: request_id.connection_id,
@@ -623,22 +653,24 @@ impl CommandExecManager {
                 "command/exec/write, command/exec/terminate, and command/exec/resize are not supported for windows sandbox processes",
             ));
         };
+        let busy = || invalid_request("command/exec stdin write queue is full; retry after a pending write completes");
+        let slot = write_slots.try_acquire_owned().map_err(|_| busy())?;
+        let write_permit = write_tx.try_reserve_owned().map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => busy(),
+            mpsc::error::TrySendError::Closed(_) => command_no_longer_running_error(&target_process_id.process_id),
+        })?;
+        let delta = params.delta_base64.as_deref().map(decode_stdin_delta).transpose()?.unwrap_or_default();
         let cancellation = rpc_gate.cancellation_token();
         // Admission stays in the same FIFO lane as command start and other writes.
         // Transfer the acknowledgement to the connection's owner under its close
         // fence, so blocked stdin cannot keep termination queued behind this RPC.
         drop(rpc_gate.spawn_with_commit(|| {
-            let busy = || invalid_request("command/exec stdin write queue is full; retry after a pending write completes");
-            let slot = write_slots.try_acquire_owned().map_err(|_| busy())?;
             let (response_tx, response_rx) = oneshot::channel();
-            write_tx.try_send(StdinWriteRequest {
+            write_permit.send(StdinWriteRequest {
                 delta,
                 close_stdin: params.close_stdin,
                 response_tx: Some(response_tx),
-            }).map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => busy(),
-                mpsc::error::TrySendError::Closed(_) => command_no_longer_running_error(&target_process_id.process_id),
-            })?;
+            });
             Ok::<_, JSONRPCErrorError>(async move {
                 // Count owners awaiting delivery as well as writes awaiting stdin.
                 let _slot = slot;
@@ -699,19 +731,7 @@ impl CommandExecManager {
 
     pub(crate) async fn connection_closed(&self, connection_id: ConnectionId) {
         let controls = {
-            let mut sessions = self.sessions.lock().await;
-            let process_ids = sessions
-                .keys()
-                .filter(|process_id| process_id.connection_id == connection_id)
-                .cloned()
-                .collect::<Vec<_>>();
-            let mut controls = Vec::with_capacity(process_ids.len());
-            for process_id in process_ids {
-                if let Some(control) = sessions.remove(&process_id) {
-                    controls.push(control);
-                }
-            }
-            controls
+            self.sessions.lock().await.remove_connection(connection_id)
         };
 
         for control in controls {
@@ -796,11 +816,13 @@ async fn run_command(params: RunCommandParams) {
         exit_rx,
     } = spawned;
     let session = Arc::new(session);
-    tokio::pin!(exit_rx);
+    let native_exit = observe_process_exit(Arc::clone(&session), exit_rx);
+    tokio::pin!(native_exit);
     let mut expiration_outcome = None;
     let mut termination_deadline = None;
     let mut termination_reported = false;
     let mut termination_error = None;
+    let mut termination_delivery: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>> = None;
     let (stdio_timeout_tx, stdio_timeout_rx) = watch::channel(false);
     let stdin_writer_handle = spawn_stdin_writer(
         Arc::clone(&session),
@@ -841,6 +863,41 @@ async fn run_command(params: RunCommandParams) {
 
     let exit_code = loop {
         tokio::select! {
+            biased;
+            exit = &mut native_exit => {
+                break if matches!(expiration_outcome, Some(ExecExpirationOutcome::TimedOut)) {
+                    EXEC_TIMEOUT_EXIT_CODE
+                } else { exit };
+            }
+            _ = async { if let Some(delivery) = termination_delivery.as_mut() { delivery.await; } },
+                if termination_delivery.is_some() => {
+                termination_delivery = None;
+            }
+            outcome = &mut expiration, if expiration_outcome.is_none() => {
+                if let Some(code) = session.exit_code() { break code; }
+                expiration_outcome = Some(outcome);
+                termination_error = session.request_terminate().err().map(|error| error.to_string());
+                termination_deadline = Some(tokio::time::Instant::now() + codex_app_server_rpc::outgoing_message::RESOURCE_DELIVERY_TIMEOUT);
+            }
+            _ = async {
+                if let Some(deadline) = termination_deadline {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }, if !termination_reported => {
+                // A failed kill remains retryable in ProcessHandle. Report an
+                // honest unknown outcome, but keep this run, process ID, native
+                // waiter and admission owned until exit is actually observed.
+                let retry_error = session.request_terminate().err().map(|error| error.to_string());
+                let mut error = internal_error("command expiration requested termination, but process exit is not confirmed; cleanup remains pending; do not repeat the command");
+                error.data = Some(serde_json::json!({
+                    "kind": "process_exit_unconfirmed", "cleanupPending": true,
+                    "terminationError": retry_error.or_else(|| termination_error.take()),
+                }));
+                termination_delivery = Some(Box::pin(outgoing.send_error(request_id.clone(), error)));
+                termination_reported = true;
+            }
             control = control_rx.recv(), if control_open => {
                 match control {
                     Some(CommandControlRequest { control, response_tx }) => {
@@ -862,39 +919,10 @@ async fn run_command(params: RunCommandParams) {
                     }
                 }
             }
-            outcome = &mut expiration, if expiration_outcome.is_none() => {
-                expiration_outcome = Some(outcome);
-                termination_error = session.request_terminate().err().map(|error| error.to_string());
-                termination_deadline = Some(tokio::time::Instant::now() + codex_app_server_rpc::outgoing_message::RESOURCE_DELIVERY_TIMEOUT);
-            }
-            _ = async {
-                if let Some(deadline) = termination_deadline {
-                    tokio::time::sleep_until(deadline).await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            }, if !termination_reported => {
-                // A failed kill remains retryable in ProcessHandle. Report an
-                // honest unknown outcome, but keep this run, process ID, native
-                // waiter and admission owned until exit is actually observed.
-                let retry_error = session.request_terminate().err().map(|error| error.to_string());
-                let mut error = internal_error("command expiration requested termination, but process exit is not confirmed; cleanup remains pending; do not repeat the command");
-                error.data = Some(serde_json::json!({
-                    "kind": "process_exit_unconfirmed", "cleanupPending": true,
-                    "terminationError": retry_error.or_else(|| termination_error.take()),
-                }));
-                outgoing.send_error(request_id.clone(), error).await;
-                termination_reported = true;
-            }
-            exit = &mut exit_rx => {
-                if matches!(expiration_outcome, Some(ExecExpirationOutcome::TimedOut)) {
-                    break EXEC_TIMEOUT_EXIT_CODE;
-                } else {
-                    break exit.unwrap_or(-1);
-                }
-            }
         }
     };
+    // Retain the identifier for delivery, but reject controls immediately.
+    drop(control_rx);
     if let Some(relay) = delivery_relay.as_ref() { relay.begin_settlement(); }
     stdin_writer_handle.abort();
     let _ = stdin_writer_handle.await;
@@ -941,22 +969,25 @@ async fn run_command(params: RunCommandParams) {
         output.append_tail(UndeliveredOutput {
             stdout: stdout?.bytes,
             stderr: stderr?.bytes,
+            ..UndeliveredOutput::default()
         });
         Ok(output)
     }) {
         Ok(output) => output,
         Err(err) => {
-            if !termination_reported { outgoing
-                .send_error(
-                    request_id,
-                    internal_error(format!("command output capture failed: {err}")),
-                )
-                .await; }
+            if termination_reported {
+                if let Some(delivery) = termination_delivery.take() { delivery.await; }
+            } else {
+                outgoing.send_error(request_id, internal_error(format!("command output capture failed: {err}"))).await;
+            }
             return;
         }
     };
 
-    if termination_reported { return; }
+    if termination_reported {
+        if let Some(delivery) = termination_delivery { delivery.await; }
+        return;
+    }
     outgoing
         .send_response(
             request_id,
@@ -973,6 +1004,75 @@ async fn run_command(params: RunCommandParams) {
             },
         )
         .await;
+}
+
+fn spawn_windows_output_relay(
+    events: async_channel::Receiver<codex_protocol::protocol::Event>,
+    relay: OutputDeliveryRelay,
+    process_id: String,
+    output_bytes_cap: Option<usize>,
+) -> tokio::task::JoinHandle<UndeliveredOutput> {
+    tokio::spawn(async move {
+        let capacity_changed = Arc::clone(&relay.capacity_changed);
+        let mut relay = Some(relay);
+        let mut pending = std::collections::VecDeque::<(CommandExecOutputStream, Vec<u8>, bool)>::new();
+        let mut undelivered = UndeliveredOutput::default();
+        let mut stdout_cap = OutputByteCap::new(output_bytes_cap);
+        let mut stderr_cap = OutputByteCap::new(output_bytes_cap);
+        let mut events_open = true;
+        loop {
+            let ready = Arc::clone(&capacity_changed).notified_owned();
+            tokio::pin!(ready);
+            ready.as_mut().enable();
+            if let Some((stream, bytes, cap_reached)) = pending.front() {
+                if let Some(delivery) = relay.as_ref() {
+                    let accounted = bytes.len().div_ceil(3).saturating_mul(4)
+                        .saturating_add(process_id.len()).saturating_add(OUTPUT_DELIVERY_EVENT_OVERHEAD_BYTES);
+                    if delivery.tx.is_closed() || accounted > OUTPUT_DELIVERY_MAX_QUEUED_BYTES {
+                        relay = None;
+                        continue;
+                    }
+                    if delivery.tx.capacity() > 0 && delivery.byte_budget.available_permits() >= accounted
+                        && delivery.enqueue(CommandExecOutputDeltaNotification {
+                            process_id: process_id.clone(), stream: *stream,
+                            delta_base64: STANDARD.encode(bytes), cap_reached: *cap_reached,
+                        }, accounted).is_ok()
+                    {
+                        pending.pop_front();
+                        continue;
+                    }
+                } else {
+                    let Some((stream, bytes, cap_reached)) = pending.pop_front() else { continue; };
+                    undelivered.append(stream, &bytes);
+                    undelivered.note_cap(stream, cap_reached);
+                    continue;
+                }
+            }
+            if !events_open && pending.is_empty() { break; }
+            tokio::select! {
+                _ = &mut ready, if !pending.is_empty() => {},
+                event = events.recv(), if events_open => {
+                    let Ok(event) = event else { events_open = false; continue; };
+                    let EventMsg::ExecCommandOutputDelta(delta) = event.msg else { continue; };
+                    let (stream, cap) = match delta.stream {
+                        ExecOutputStream::Stdout => (CommandExecOutputStream::Stdout, &mut stdout_cap),
+                        ExecOutputStream::Stderr => (CommandExecOutputStream::Stderr, &mut stderr_cap),
+                    };
+                    let (bytes, cap_reached) = cap.accept(&delta.chunk);
+                    undelivered.note_cap(stream, cap_reached);
+                    if bytes.is_empty() {
+                        if cap_reached { pending.push_back((stream, Vec::new(), true)); }
+                    } else {
+                        for (index, chunk) in bytes.chunks(OUTPUT_CHUNK_SIZE_HINT).enumerate() {
+                            pending.push_back((stream, chunk.to_vec(),
+                                cap_reached && (index + 1) * OUTPUT_CHUNK_SIZE_HINT >= bytes.len()));
+                        }
+                    }
+                }
+            }
+        }
+        undelivered
+    })
 }
 
 #[expect(
@@ -1030,6 +1130,10 @@ fn spawn_output_delivery_relay(
                 };
             }
             if delivery_failed {
+                // Publish terminal failure through the existing channel owner.
+                // Already-admitted chunks drain in order; later collectors keep
+                // raw bytes instead of another Base64 queue round trip.
+                rx.close();
                 let bytes = STANDARD
                     .decode(&queued.notification.delta_base64)
                     .expect("command output base64 is generated internally");
@@ -1084,7 +1188,7 @@ fn accounted_output_delivery_bytes(delta_base64: &str, process_id: &str) -> usiz
         .saturating_add(OUTPUT_DELIVERY_EVENT_OVERHEAD_BYTES)
 }
 
-fn coalesce_output_batch(
+pub(crate) fn coalesce_output_batch(
     mut chunk: Vec<u8>,
     output_rx: &mut mpsc::Receiver<Vec<u8>>,
     discard: bool,
@@ -1124,6 +1228,10 @@ fn spawn_process_output(
         // Every loop exit decides whether the pipe reached EOF.
         let reached_eof;
         loop {
+            if delivery_relay.as_ref().is_some_and(|relay| relay.tx.is_closed()) {
+                delivery_relay = None;
+                stream_output = false;
+            }
             let capacity_ready = Arc::clone(&capacity_changed).notified_owned();
             tokio::pin!(capacity_ready);
             capacity_ready.as_mut().enable();
@@ -1151,6 +1259,11 @@ fn spawn_process_output(
                             buffer.clear();
                             delivered_prefix = 0;
                             pending_cap_signal = false;
+                        } else if delivered_prefix >= buffer.len() - delivered_prefix {
+                            // Amortized compaction bounds consumed-prefix retention
+                            // by the pending suffix rather than total process output.
+                            buffer.drain(..delivered_prefix);
+                            delivered_prefix = 0;
                         }
                         continue;
                     }
@@ -1214,8 +1327,11 @@ fn spawn_process_output(
                 buffer.extend_from_slice(capped_chunk);
             }
         }
+        if delivered_prefix > 0 {
+            buffer.drain(..delivered_prefix);
+        }
         CapturedOutput {
-            bytes: buffer.split_off(delivered_prefix),
+            bytes: buffer,
             cap_reached: cap.truncated(),
             drain_timed_out,
             reached_eof,
@@ -1223,13 +1339,16 @@ fn spawn_process_output(
     })
 }
 
-pub(crate) fn decode_stdin_delta(delta_base64: &str) -> Result<Vec<u8>, JSONRPCErrorError> {
-    let max_bytes = codex_utils_pty::MAX_STDIN_CHUNK_BYTES;
-    // Bound the decoder allocation first, then check the exact decoded size
-    // (the final padded quartet can encode one, two, or three bytes).
-    if delta_base64.len() > max_bytes.div_ceil(3) * 4 {
+pub(crate) fn validate_stdin_delta_length(delta_base64: &str) -> Result<(), JSONRPCErrorError> {
+    if delta_base64.len() > codex_utils_pty::MAX_STDIN_CHUNK_BYTES.div_ceil(3) * 4 {
         return Err(invalid_params("stdin chunk exceeds the 4 MiB limit"));
     }
+    Ok(())
+}
+
+pub(crate) fn decode_stdin_delta(delta_base64: &str) -> Result<Vec<u8>, JSONRPCErrorError> {
+    let max_bytes = codex_utils_pty::MAX_STDIN_CHUNK_BYTES;
+    validate_stdin_delta_length(delta_base64)?;
     let delta = STANDARD
         .decode(delta_base64)
         .map_err(|err| invalid_params(format!("invalid deltaBase64: {err}")))?;

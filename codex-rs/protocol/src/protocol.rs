@@ -1253,6 +1253,7 @@ pub enum HookHandlerType {
     Command,
     Prompt,
     Agent,
+    McpTool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]

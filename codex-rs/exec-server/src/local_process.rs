@@ -836,7 +836,7 @@ impl LocalProcess {
         params: SignalParams,
         identity: Option<&ProcessStartIdentity>,
     ) -> Result<SignalResponse, JSONRPCErrorError> {
-        {
+        let session = {
             let process_map = self.inner.processes.lock().await;
             if identity.is_some_and(|identity| {
                 !process_map
@@ -848,19 +848,18 @@ impl LocalProcess {
                 ));
             }
             match process_map.get(&params.process_id) {
-                Some(ProcessEntry::Running(process)) => {
-                    if process.exit_code.is_some() {
-                        return Ok(SignalResponse {});
-                    }
-                    process
-                        .session
-                        .signal(pty_process_signal(params.signal))
-                        .map_err(|err| internal_error(format!("failed to signal process: {err}")))?
+                Some(ProcessEntry::Running(process)) if process.exit_code.is_none() => {
+                    Arc::clone(&process.session)
                 }
-                Some(ProcessEntry::Starting(_)) | None => {}
+                _ => return Ok(SignalResponse {}),
             }
-        }
-
+        };
+        // Signal can wait on the native terminator gate during tree cleanup.
+        // Retain this exact owner, not the global map or an async runtime worker.
+        tokio::task::spawn_blocking(move || session.signal(pty_process_signal(params.signal)))
+            .await
+            .map_err(|error| internal_error(format!("process signal worker failed: {error}")))?
+            .map_err(|err| internal_error(format!("failed to signal process: {err}")))?;
         Ok(SignalResponse {})
     }
 

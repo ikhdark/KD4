@@ -335,7 +335,7 @@ pub(super) fn parse_retry_after(
     } else {
         OffsetDateTime::from(httpdate::parse_http_date(retry_after).ok()?)
     };
-    (retry_at > received_at).then_some(retry_at)
+    Some(retry_at)
 }
 
 fn refresh_deferral(

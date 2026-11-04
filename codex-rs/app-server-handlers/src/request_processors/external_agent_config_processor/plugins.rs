@@ -3,7 +3,7 @@ use super::{ExternalAgentConfigRequestProcessor, failure, files};
 use codex_app_server_protocol_types::{ExternalAgentConfigImportTypeResult, ExternalAgentConfigMigrationItem, ExternalAgentConfigImportItemTypeSuccess, PluginsMigration};
 use codex_core_plugins::PluginInstallRequest;
 use codex_core_plugins::marketplace::find_marketplace_manifest_path;
-use codex_core_plugins::marketplace_add::{MarketplaceAddRequest, add_marketplace};
+use codex_core_plugins::marketplace_add::{MarketplaceAddRequest, add_marketplace_with_expected_name};
 use codex_config::ConfigLayerStackOrdering;
 
 fn configured_plugin_keys(config: &codex_core::config::Config) -> std::collections::HashSet<String> {
@@ -39,13 +39,7 @@ impl ExternalAgentConfigRequestProcessor {
             result.failures.push(failure(&item, "plugin_import", "plugins migration item is missing details".to_string(), None));
             return result;
         };
-        let home = self.codex_home.clone();
-        let selection = item.clone();
-        let sources = match tokio::task::spawn_blocking(move || files::plugin_sources(&home, &selection)).await {
-            Ok(Ok(sources)) => sources,
-            Ok(Err(err)) => { result.failures.push(failure(&item, "plugin_import", err.to_string(), None)); return result; },
-            Err(err) => { result.failures.push(failure(&item, "plugin_import", format!("marketplace source lookup failed: {err}"), None)); return result; },
-        };
+        let mut sources = None;
         let cwd = item.cwd.clone().filter(|cwd| !cwd.as_os_str().is_empty());
         let mut selected = std::collections::HashSet::new();
         for group in &details.plugins {
@@ -53,27 +47,43 @@ impl ExternalAgentConfigRequestProcessor {
                 group_failure(&mut result, &item, group, "plugin import cancelled".to_string());
                 continue;
             }
-            let Some(source) = sources.get(&group.marketplace_name) else {
-                group_failure(&mut result, &item, group, format!("external agent plugin marketplace source was not found or uses an unsupported source kind: {}", group.marketplace_name));
-                continue;
-            };
             let config = match self.config_manager.load_latest_config(cwd.clone()).await {
                 Ok(config) => config,
                 Err(err) => { group_failure(&mut result, &item, group, format!("failed to load config: {err}")); continue; },
             };
+            let configured = configured_plugin_keys(&config);
+            let remaining = group.plugin_names.iter().filter(|name| {
+                let id = format!("{name}@{}", group.marketplace_name);
+                !configured.contains(&id) && !selected.contains(&id)
+            }).cloned().collect::<Vec<_>>();
+            if remaining.is_empty() {
+                continue;
+            }
+            let mut pending_group = group.clone();
+            pending_group.plugin_names = remaining;
+            let group = &pending_group;
+            if sources.is_none() {
+                let home = self.codex_home.clone();
+                let selection = item.clone();
+                sources = Some(match tokio::task::spawn_blocking(move || files::plugin_sources(&home, &selection)).await {
+                    Ok(Ok(sources)) => sources,
+                    Ok(Err(err)) => { group_failure(&mut result, &item, group, err.to_string()); continue; },
+                    Err(err) => { group_failure(&mut result, &item, group, format!("marketplace source lookup failed: {err}")); continue; },
+                });
+            }
+            let Some(source) = sources.as_ref().and_then(|sources| sources.get(&group.marketplace_name)) else {
+                group_failure(&mut result, &item, group, format!("external agent plugin marketplace source was not found or uses an unsupported source kind: {}", group.marketplace_name));
+                continue;
+            };
             // Current marketplace policy validates source and requirements; the
             // current install owner stages files and config under one lifetime.
-            let added = match add_marketplace(self.codex_home.clone(), config.config_layer_stack.requirements().clone(), MarketplaceAddRequest {
+            let added = match add_marketplace_with_expected_name(self.codex_home.clone(), config.config_layer_stack.requirements().clone(), MarketplaceAddRequest {
                 source: source.source.clone(), ref_name: source.ref_name.clone(), sparse_paths: Vec::new(),
-            }).await {
+            }, group.marketplace_name.clone()).await {
                 Ok(added) => added,
                 Err(err) => { group_failure(&mut result, &item, group, err.to_string()); continue; },
             };
             self.config_manager.invalidate_load_cache();
-            if added.marketplace_name != group.marketplace_name {
-                group_failure(&mut result, &item, group, format!("marketplace source identifies as {:?}, not {:?}", added.marketplace_name, group.marketplace_name));
-                continue;
-            }
             let root = added.installed_root;
             let manifest = match tokio::task::spawn_blocking(move || find_marketplace_manifest_path(root.as_path())).await {
                 Ok(Some(manifest)) => manifest,

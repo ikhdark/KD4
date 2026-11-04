@@ -148,6 +148,7 @@ impl CodeModeWaitHandler {
                                 )
                                 .min(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL)
                         }),
+                        args.max_tokens.is_some(),
                     );
                 let effective_max_tokens = exec
                     .session

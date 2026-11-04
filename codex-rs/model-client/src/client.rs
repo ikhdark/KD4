@@ -1434,12 +1434,25 @@ struct ProviderObservations {
     response_id: Option<String>,
     response_service_tier: Option<String>,
     response_service_tier_invalid: bool,
+    // Preserve the contributing labels BEFORE collapsing disagreement to unknown.
+    // Fixed-size per-attempt inventory; overflow remains explicit, never a pass.
+    service_tier_observations: Vec<ProviderTierObservation>,
+    service_tier_observations_dropped: u64,
     created_at: Option<f64>,
     completed_at: Option<f64>,
     invalid: bool,
     safety_buffering_events: u64,
     first_safety_buffering_us: Option<u64>,
     phases: std::collections::BTreeMap<&'static str, ProviderPhaseReceipt>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ProviderTierObservation {
+    phase: &'static str,
+    at_us: u64,
+    response_id: Option<String>,
+    service_tier: Option<String>,
+    invalid: bool,
 }
 
 #[derive(Debug, Default)]
@@ -1525,6 +1538,18 @@ impl ModelAttemptClock {
             version: 1, ..Default::default()
         });
         evidence.invalid |= observation.invalid_source_fields || now_us == u64::MAX;
+        if observation.response_service_tier.is_some() || observation.response_service_tier_invalid {
+            if evidence.service_tier_observations.len() < 16 {
+                evidence.service_tier_observations.push(ProviderTierObservation {
+                    phase: observation.phase, at_us: now_us,
+                    response_id: observation.response_id.clone(),
+                    service_tier: observation.response_service_tier.clone(),
+                    invalid: observation.response_service_tier_invalid || observation.invalid_source_fields,
+                });
+            } else {
+                evidence.service_tier_observations_dropped = evidence.service_tier_observations_dropped.saturating_add(1);
+            }
+        }
         evidence.response_service_tier_invalid |= observation.response_service_tier_invalid;
         if let Some(tier) = observation.response_service_tier {
             if let Some(previous) = &evidence.response_service_tier {

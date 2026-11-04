@@ -33,6 +33,7 @@ use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::sqlite::SqliteJournalMode;
 use sqlx::sqlite::SqliteSynchronous;
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -1036,6 +1037,7 @@ impl LocalAgentTaskStore {
             r#"
 SELECT
     assignments.body_json AS assignment_body_json,
+    assignment_repositories.canonical_root AS repo_root,
     attempts.attempt_id,
     attempts.assignment_id,
     attempts.ordinal,
@@ -1045,6 +1047,7 @@ SELECT
     attempts.sealed_at
 FROM assignments
 JOIN attempts USING (assignment_id)
+JOIN assignment_repositories USING (assignment_id)
 WHERE assignments.assignment_id = ?
 ORDER BY attempts.ordinal DESC
 LIMIT 1
@@ -1058,8 +1061,10 @@ LIMIT 1
         let attempt_id = AttemptId::parse(row.get::<String, _>("attempt_id").as_str())?;
 
         Ok(AgentTaskAuthorization {
-            root_session_id: assignment.root_session_id,
+            root_session_id: assignment.root_session_id.clone(),
             admission_origin: assignment.admission_origin,
+            assignment,
+            repo_root: row.get("repo_root"),
             current_attempt: attempt_from_row(attempt_id, &row)?,
         })
     }
@@ -1695,6 +1700,7 @@ LIMIT 1
                 })
                 .collect();
         } else {
+            crate::require_write_contract(&assignment, attempt.amendment.as_ref())?;
             validate_criterion_results(&assignment, attempt.amendment.as_ref(), &draft)?;
             let assessments = source_inspection::assess_tx(
                 &mut transaction, &assignment, &attempt, &draft.criterion_results,
@@ -1702,9 +1708,12 @@ LIMIT 1
             ).await?;
             source_inspection::require_passed(&assessments, &draft.criterion_results, draft.status)?;
         }
-        if draft.status == AgentStatusClaim::Completed && !host_legacy_outcome {
-            validate_declared_changes_tx(&mut transaction, &assignment, &mut draft).await?;
-        }
+        let handoff_source_manifest = if draft.status == AgentStatusClaim::Completed && !host_legacy_outcome {
+            validate_declared_changes_tx(&mut transaction, &assignment, &attempt, &mut draft).await?
+        } else { None };
+        let dispatch_manifest_sha256 = if handoff_source_manifest.is_some() {
+            Some(crate::dispatch_manifest(&assignment, attempt.amendment.as_ref())?.sha256)
+        } else { None };
         let evidence_epoch = 0;
         let architecture_contract = seal_architecture_contract_for_receipt_tx(
             &mut transaction,
@@ -1728,6 +1737,8 @@ LIMIT 1
             evidence_epoch,
             // Seal-time bytes do not identify the inputs the producer observed.
             read_scope_fingerprint: None,
+            dispatch_manifest_sha256,
+            handoff_source_manifest,
             sealed_at: Utc::now(),
         };
         let state = receipt.status.attempt_state();
@@ -1780,7 +1791,7 @@ LIMIT 1
         &self,
         actor: TaskActor,
         assignment_id: AssignmentId,
-        amendment: AttemptAmendment,
+        mut amendment: AttemptAmendment,
         host_legacy_followup: bool,
     ) -> StoreResult<(Attempt, Option<AgentTaskBinding>)> {
         actor.require_root()?;
@@ -1831,6 +1842,13 @@ LIMIT 1
                 "a correction attempt requires a changes_requested review gate".to_string(),
             ));
         }
+        amendment.source_manifest = if !assignment.write_scope.is_empty() {
+            let root: String = sqlx::query_scalar("SELECT canonical_root FROM assignment_repositories WHERE assignment_id = ?")
+                .bind(assignment_id.to_string()).fetch_one(&mut *transaction).await?;
+            let scopes = assignment.write_scope.clone();
+            Some(tokio::task::spawn_blocking(move || crate::capture_source_manifest(Path::new(&root), &scopes))
+                .await.map_err(|error| StoreError::CorruptData(error.to_string()))??)
+        } else { None };
         let next = Attempt {
             attempt_id: AttemptId::new(),
             assignment_id,
@@ -1982,6 +2000,8 @@ LIMIT 1
             // A recovery receipt records an abandoned attempt, never a result
             // whose inputs were observed, so it is never reusable.
             read_scope_fingerprint: None,
+            dispatch_manifest_sha256: None,
+            handoff_source_manifest: None,
             sealed_at: Utc::now(),
         };
         sqlx::query("INSERT INTO receipts (attempt_id, assignment_id, status, body_json, sealed_at) VALUES (?, ?, ?, ?, ?)")
@@ -2670,6 +2690,8 @@ LIMIT 1
             evidence_epoch: current_epoch,
             // An abandoned assignment produced no observed result to reuse.
             read_scope_fingerprint: None,
+            dispatch_manifest_sha256: None,
+            handoff_source_manifest: None,
             sealed_at: now,
         };
         sqlx::query("INSERT INTO receipts (attempt_id, assignment_id, status, body_json, sealed_at) VALUES (?, ?, ?, ?, ?)")
@@ -3600,6 +3622,7 @@ impl LocalAgentTaskStore {
                     TaskActor::Root,
                     assignment_id,
                     AttemptAmendment {
+                        source_manifest: None,
                         reason: "plain-message follow-up turn".to_string(),
                         objective: None,
                         acceptance_criteria: None,
@@ -4367,6 +4390,15 @@ async fn validate_capsule_contract_tx(
     {
         return Err(StoreError::CorruptData("capsule does not match its original admitted contract".into()));
     }
+    if let Some(manifest) = &capsule.source_manifest {
+        manifest.verify()?;
+        if manifest.repository_id != assignment.repository_id || manifest.workspace_id != assignment.workspace_id
+            || capsule.workspace_manifest_hash != manifest.sha256 || capsule.source_manifest_error.is_some()
+            || (!assignment.write_scope.is_empty() && manifest.scopes != assignment.write_scope)
+        {
+            return Err(StoreError::InvalidTaskCapsule("source manifest does not match admitted repository/scopes".into()));
+        }
+    }
     Ok(())
 }
 
@@ -4997,10 +5029,9 @@ fn canonicalize_architecture_contract(
         "architecture required evidence",
         &mut contract.required_evidence,
     )?;
-    canonicalize_text_set(
-        "architecture prohibited change",
-        &mut contract.prohibited_changes,
-    )?;
+    contract.prohibited_changes = crate::normalize_write_prohibitions(repo_root, &contract.prohibited_changes)?;
+    contract.prohibited_changes.sort_by_key(|value| serde_json::to_string(value).unwrap_or_default());
+    contract.prohibited_changes.dedup();
     canonicalize_text_set("architecture contract claim", &mut contract.contract_claims)?;
     Ok(contract)
 }
@@ -5122,34 +5153,57 @@ async fn record_gate_verdict_tx(
 async fn validate_declared_changes_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     assignment: &Assignment,
+    attempt: &Attempt,
     draft: &mut ReceiptDraft,
-) -> StoreResult<()> {
+) -> StoreResult<Option<crate::SourceManifest>> {
     let canonical_root = sqlx::query_scalar::<_, String>(
         "SELECT canonical_root FROM assignment_repositories WHERE assignment_id = ?",
-    )
-    .bind(assignment.assignment_id.to_string())
-    .fetch_optional(&mut **transaction)
-    .await?
-    .ok_or(StoreError::RepositoryBindingMissing(
-        assignment.assignment_id,
-    ))?;
-    let repo_root = Path::new(&canonical_root);
+    ).bind(assignment.assignment_id.to_string()).fetch_optional(&mut **transaction).await?
+        .ok_or(StoreError::RepositoryBindingMissing(assignment.assignment_id))?;
     let mut declared = BTreeSet::new();
     for change in &mut draft.declared_changes {
         if change.summary.trim().is_empty() {
-            return Err(StoreError::InvalidAssignment(
-                "declared change summary cannot be empty".to_string(),
-            ));
+            return Err(StoreError::InvalidAssignment("declared change summary cannot be empty".into()));
         }
-        change.path = normalize_repo_path_async(repo_root, &change.path).await?;
+        change.path = normalize_repo_path_async(Path::new(&canonical_root), &change.path).await?;
         if !declared.insert(change.path.clone()) {
-            return Err(StoreError::InvalidAssignment(format!(
-                "duplicate declared change {}",
-                change.path
-            )));
+            return Err(StoreError::InvalidAssignment(format!("duplicate declared change {}", change.path)));
         }
     }
-    Ok(())
+    if assignment.write_scope.is_empty() {
+        if !declared.is_empty() {
+            return Err(StoreError::InvalidAssignment("read-only assignments cannot declare source changes".into()));
+        }
+        return Ok(None);
+    }
+    crate::require_write_contract(assignment, attempt.amendment.as_ref())?;
+    let before = crate::dispatch_manifest(assignment, attempt.amendment.as_ref())?;
+    let scopes = assignment.write_scope.clone();
+    let after = tokio::task::spawn_blocking(move ||
+        crate::capture_source_manifest(Path::new(&canonical_root), &scopes))
+        .await.map_err(|error| StoreError::CorruptData(error.to_string()))??;
+    let old = before.entries.iter().map(|entry|
+        (entry.path.clone(), entry.content_hash.clone())).collect::<BTreeMap<_, _>>();
+    let new = after.entries.iter().map(|entry|
+        (entry.path.clone(), entry.content_hash.clone())).collect::<BTreeMap<_, _>>();
+    let mut changed = BTreeSet::new();
+    for path in old.keys().chain(new.keys()).collect::<BTreeSet<_>>() {
+        let left = old.get(path).and_then(Option::as_ref);
+        let right = new.get(path).and_then(Option::as_ref);
+        if left == right { continue; }
+        let operation = match (left.is_some(), right.is_some()) {
+            (false, true) => crate::SourceWriteOperation::Create,
+            (true, false) => crate::SourceWriteOperation::Delete,
+            _ => crate::SourceWriteOperation::Update,
+        };
+        crate::authorize_source_write(assignment, attempt.amendment.as_ref(), path, operation)?;
+        changed.insert(path.clone());
+    }
+    if changed != declared {
+        return Err(StoreError::InvalidAssignment(format!(
+            "declared changes do not match the observed scoped dispatch-to-handoff delta; expected {changed:?}, declared {declared:?}; this comparison does not attribute edits to a worker")));
+    }
+    Ok(Some(after))
 }
 
 pub(crate) async fn heartbeat_typed_workspace_actor_tx(

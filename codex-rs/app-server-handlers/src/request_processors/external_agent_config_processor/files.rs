@@ -79,7 +79,7 @@ pub(super) fn detect(home: &Path, params: ExternalAgentConfigDetectParams) -> io
             }
         }
         if empty_text(&target_config_dir.join("hooks.json"))? {
-            let (names, _, _) = formats::hooks(&paths.source, target_config_dir)?;
+            let (names, _, _, _) = formats::hooks(&paths.source, target_config_dir)?;
             if !names.is_empty() {
                 items.push(item(ExternalAgentConfigMigrationItemType::Hooks, cwd.clone(),
                     Some(MigrationDetails { hooks: names.into_iter().map(|name| HookMigration { name }).collect(), ..Default::default() }),
@@ -238,6 +238,9 @@ fn import_item(home: &Path, item: &ExternalAgentConfigMigrationItem, cancellatio
                 let staging = tempfile::Builder::new().prefix(".skill-import-").tempdir_in(&paths.skills)?;
                 let staged = staging.path().join(&name);
                 copy_skill(&paths.source.join("skills").join(&name), &staged, cancellation)?;
+                if !staged.join("SKILL.md").is_file() || empty_text(&staged.join("SKILL.md"))? {
+                    return Err(invalid_data_error("skill entrypoint disappeared or became empty during import"));
+                }
                 let (target, _lock) = lock_target(&paths.skills.join(&name), cancellation)?;
                 if !target.try_exists()? {
                     check_cancel(cancellation)?;
@@ -270,7 +273,7 @@ fn import_item(home: &Path, item: &ExternalAgentConfigMigrationItem, cancellatio
         }
         Hooks => {
             let target_dir = paths.config.parent().ok_or_else(|| invalid_data_error("config has no parent"))?;
-            let (names, rendered, failures) = formats::hooks(&paths.source, target_dir)?;
+            let (names, rendered, failures, assets) = formats::hooks(&paths.source, target_dir)?;
             for (source, message) in failures {
                 result.failures.push(ExternalAgentConfigImportItemTypeFailure {
                     item_type: item.item_type, error_type: Some("unsupported_hook".to_string()),
@@ -282,7 +285,7 @@ fn import_item(home: &Path, item: &ExternalAgentConfigMigrationItem, cancellatio
                 let (target, _lock) = lock_target(&target_dir.join("hooks.json"), cancellation)?;
                 if empty_text(&target)? {
                     let was_missing = !target.try_exists()?;
-                    formats::copy_hook_scripts(&paths.source, target_dir, cancellation)?;
+                    assets.publish(target_dir, cancellation)?;
                     check_cancel(cancellation)?;
                     let published = if was_missing {
                         formats::publish_new_file(&target, rendered.as_bytes(), None)?
@@ -346,6 +349,7 @@ fn repo_root(cwd: &Path) -> io::Result<Option<PathBuf>> {
     if cwd.as_os_str().is_empty() { return Ok(None); }
     let mut current = if cwd.is_absolute() { cwd.to_path_buf() } else { std::env::current_dir()?.join(cwd) };
     if !current.try_exists()? { return Ok(None); }
+    current = fs::canonicalize(current)?;
     if current.is_file() { current.pop(); }
     let fallback = current.clone();
     loop {
@@ -359,7 +363,6 @@ fn settings(source: &Path) -> io::Result<Option<JsonValue>> {
     match read_json(&source.join("settings.local.json")) {
         Ok(Some(local)) => match base.as_mut() { Some(base) => merge_json(base, &local), None => base = Some(local) },
         Ok(None) => {},
-        Err(err) if err.kind() == io::ErrorKind::InvalidData => {},
         Err(err) => return Err(err),
     }
     Ok(base)
@@ -426,15 +429,14 @@ fn merge_missing(existing: &mut TomlValue, incoming: &TomlValue) -> io::Result<b
 }
 
 fn migrated_mcp(paths: &Paths, local_settings: Option<&JsonValue>) -> io::Result<(TomlValue, Vec<(String, String)>)> {
-    let fallback;
-    let effective = if paths.repo.is_some() && local_settings.is_none() {
-        fallback = match settings(&paths.external_home) {
-            Ok(settings) => settings,
-            Err(err) => { tracing::warn!(error = %err, "ignoring invalid external agent home settings during repo MCP migration"); None },
-        };
-        fallback.as_ref()
-    } else { local_settings };
-    build_mcp_config_from_external(&paths.root, Some(&paths.external_home), effective)
+    let mut effective = if paths.repo.is_some() { settings(&paths.external_home)? } else { None };
+    if let Some(local) = local_settings {
+        match effective.as_mut() {
+            Some(effective) => merge_json(effective, local),
+            None => effective = Some(local.clone()),
+        }
+    }
+    build_mcp_config_from_external(&paths.root, Some(&paths.external_home), effective.as_ref())
 }
 
 fn missing_mcp(existing: &TomlValue, incoming: &TomlValue) -> io::Result<Vec<String>> {
@@ -451,7 +453,9 @@ fn missing_skills(paths: &Paths) -> io::Result<Vec<String>> {
     let mut names = Vec::new();
     for entry in fs::read_dir(source)? {
         let entry = entry?;
-        if entry.file_type()?.is_dir() && !paths.skills.join(entry.file_name()).try_exists()? {
+        if entry.file_type()?.is_dir() && !paths.skills.join(entry.file_name()).try_exists()?
+            && entry.path().join("SKILL.md").is_file() && !empty_text(&entry.path().join("SKILL.md"))?
+        {
             names.push(entry.file_name().into_string().map_err(|_| invalid_data_error("skill name is not UTF-8"))?);
         }
     }
@@ -519,22 +523,9 @@ pub(super) fn lock_target(path: &Path, cancellation: &CancellationToken) -> io::
 }
 
 pub(super) fn rewrite_terms(content: &str) -> String {
-    let mut result = content.to_string();
-    for (needle, replacement) in [("claude.md", "AGENTS.md"), ("claude code", "Codex"), ("claude-code", "Codex"), ("claude_code", "Codex"), ("claudecode", "Codex"), ("claude", "Codex")] {
-        let lower = result.to_ascii_lowercase();
-        let bytes = result.as_bytes();
-        let word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
-        let mut next = String::with_capacity(result.len());
-        let mut emitted = 0;
-        for (start, _) in lower.match_indices(needle) {
-            let end = start + needle.len();
-            if (start == 0 || !word(bytes[start - 1])) && (end == bytes.len() || !word(bytes[end])) {
-                next.push_str(&result[emitted..start]); next.push_str(replacement); emitted = end;
-            }
-        }
-        next.push_str(&result[emitted..]); result = next;
-    }
-    result
+    // Prose, identifiers and executable literals share this input. Renaming a
+    // brand here cannot distinguish them safely; migration preserves the source.
+    content.to_string()
 }
 
 fn invalid_data_error(message: impl Into<String>) -> io::Error { io::Error::new(io::ErrorKind::InvalidData, message.into()) }
@@ -726,7 +717,10 @@ fn mcp_server_toml_table(
         }
         table.insert("command".to_string(), TomlValue::String(command));
         if let Some(args) = server_config.get("args") {
-            let args = json_string_vec(args);
+            let args = match args {
+                JsonValue::Array(values) => values.iter().map(json_string).collect::<Option<Vec<_>>>()?,
+                value => vec![json_string(value)?],
+            };
             if args.iter().any(|arg| contains_env_placeholder(arg)) {
                 return None;
             }

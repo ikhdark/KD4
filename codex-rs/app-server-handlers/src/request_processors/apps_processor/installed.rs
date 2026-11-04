@@ -38,6 +38,103 @@ const APPS_INSTALLED_TOOL_COUNT_METRIC: &str = "codex.apps.installed.tool_count"
 const CONNECTOR_RUNTIME_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl AppsRequestProcessor {
+    pub(super) async fn refresh_app_tools(
+        &self,
+        config: &Config,
+        auth: Option<CodexAuth>,
+    ) -> anyhow::Result<Vec<ToolInfo>> {
+        let mcp_manager = self.thread_manager.mcp_manager();
+        let mcp_config = mcp_manager.runtime_config(config).await;
+        let cache_key = mcp_config.codex_apps_tools_cache_key(auth.as_ref());
+        let mut mcp_servers = effective_mcp_servers(&mcp_config, auth.as_ref());
+        mcp_servers.retain(|name, _| name == CODEX_APPS_MCP_SERVER_NAME);
+        anyhow::ensure!(
+            !mcp_servers.is_empty(),
+            "host-owned MCP server '{CODEX_APPS_MCP_SERVER_NAME}' is not enabled"
+        );
+        let startup_timeout = mcp_servers
+            .get(CODEX_APPS_MCP_SERVER_NAME)
+            .and_then(|server| server.configured_config())
+            .and_then(|config| config.startup_timeout_sec)
+            .unwrap_or(CONNECTOR_RUNTIME_REFRESH_TIMEOUT);
+        let runtime_context = McpRuntimeContext::new(
+            self.thread_manager.environment_manager(),
+            config.cwd.to_path_buf(),
+        );
+        let auth_status_entries = compute_auth_statuses(
+            mcp_servers.iter(),
+            &config.codex_home,
+            config.mcp_oauth_credentials_store_mode,
+            config.auth_keyring_backend_kind(),
+            auth.as_ref(),
+            &runtime_context,
+        )
+        .await;
+        let (tx_event, rx_event) = unbounded();
+        drop(rx_event);
+        let cancellation_token = CancellationToken::new();
+        let codex_apps_auth_manager =
+            host_owned_codex_apps_enabled(&mcp_config, auth.as_ref())
+                .then(|| Arc::clone(&self.auth_manager));
+        let connection_manager = McpConnectionManager::new(
+            &mcp_servers,
+            config.mcp_oauth_credentials_store_mode,
+            config.auth_keyring_backend_kind(),
+            auth_status_entries,
+            &config.permissions.approval_policy,
+            APPS_INSTALLED_SUBMIT_ID.to_string(),
+            tx_event,
+            cancellation_token.clone(),
+            PermissionProfile::default(),
+            runtime_context,
+            mcp_config.codex_home.clone(),
+            mcp_manager.codex_apps_tools_cache(),
+            cache_key.clone(),
+            mcp_config.prefix_mcp_tool_names,
+            mcp_config.client_elicitation_capability.clone(),
+            /*supports_openai_form_elicitation*/ false,
+            tool_plugin_provenance(&mcp_config),
+            auth.as_ref(),
+            codex_apps_auth_manager,
+            /*elicitation_lifecycle*/ None,
+            codex_mcp::ElicitationRequestRouter::default(),
+            /*previous_manager*/ None,
+        )
+        .await;
+
+        let result = if connection_manager
+            .wait_for_server_ready(CODEX_APPS_MCP_SERVER_NAME, startup_timeout)
+            .await
+        {
+            if matches!(auth.as_ref(), Some(CodexAuth::Headers(_))) {
+                // Header credentials have no verified shared-cache
+                // identity. Use this connection's live catalog only.
+                Ok(connection_manager
+                    .list_all_tools_snapshot()
+                    .await
+                    .as_ref()
+                    .clone())
+            } else {
+                mcp_manager
+                    .codex_apps_tools_cache()
+                    .current_tools(config.codex_home.to_path_buf(), cache_key.clone())
+                    .await
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "hosted connector refresh completed without publishing tools"
+                        )
+                    })
+            }
+        } else {
+            Err(anyhow::anyhow!(
+                "failed to refresh tools for MCP server '{CODEX_APPS_MCP_SERVER_NAME}'"
+            ))
+        };
+        cancellation_token.cancel();
+        connection_manager.shutdown().await;
+        result
+    }
+
     pub(crate) async fn apps_installed(
         &self,
         params: AppsInstalledParams,
@@ -77,96 +174,7 @@ impl AppsRequestProcessor {
                 .current_tools(config.codex_home.to_path_buf(), cache_key.clone())
                 .await;
             let tools = if force_refresh && runtime_enabled {
-                let refresh_result = async {
-                    let mut mcp_servers = effective_mcp_servers(&mcp_config, auth.as_ref());
-                    mcp_servers.retain(|name, _| name == CODEX_APPS_MCP_SERVER_NAME);
-                    anyhow::ensure!(
-                        !mcp_servers.is_empty(),
-                        "host-owned MCP server '{CODEX_APPS_MCP_SERVER_NAME}' is not enabled"
-                    );
-                    let startup_timeout = mcp_servers
-                        .get(CODEX_APPS_MCP_SERVER_NAME)
-                        .and_then(|server| server.configured_config())
-                        .and_then(|config| config.startup_timeout_sec)
-                        .unwrap_or(CONNECTOR_RUNTIME_REFRESH_TIMEOUT);
-                    let runtime_context = McpRuntimeContext::new(
-                        self.thread_manager.environment_manager(),
-                        config.cwd.to_path_buf(),
-                    );
-                    let auth_status_entries = compute_auth_statuses(
-                        mcp_servers.iter(),
-                        &config.codex_home,
-                        config.mcp_oauth_credentials_store_mode,
-                        config.auth_keyring_backend_kind(),
-                        auth.as_ref(),
-                        &runtime_context,
-                    )
-                    .await;
-                    let (tx_event, rx_event) = unbounded();
-                    drop(rx_event);
-                    let cancellation_token = CancellationToken::new();
-                    let codex_apps_auth_manager =
-                        host_owned_codex_apps_enabled(&mcp_config, auth.as_ref())
-                            .then(|| Arc::clone(&self.auth_manager));
-                    let connection_manager = McpConnectionManager::new(
-                        &mcp_servers,
-                        config.mcp_oauth_credentials_store_mode,
-                        config.auth_keyring_backend_kind(),
-                        auth_status_entries,
-                        &config.permissions.approval_policy,
-                        APPS_INSTALLED_SUBMIT_ID.to_string(),
-                        tx_event,
-                        cancellation_token.clone(),
-                        PermissionProfile::default(),
-                        runtime_context,
-                        mcp_config.codex_home.clone(),
-                        mcp_manager.codex_apps_tools_cache(),
-                        cache_key.clone(),
-                        mcp_config.prefix_mcp_tool_names,
-                        mcp_config.client_elicitation_capability.clone(),
-                        /*supports_openai_form_elicitation*/ false,
-                        tool_plugin_provenance(&mcp_config),
-                        auth.as_ref(),
-                        codex_apps_auth_manager,
-                        /*elicitation_lifecycle*/ None,
-                        codex_mcp::ElicitationRequestRouter::default(),
-                        /*previous_manager*/ None,
-                    )
-                    .await;
-
-                    let result = if connection_manager
-                        .wait_for_server_ready(CODEX_APPS_MCP_SERVER_NAME, startup_timeout)
-                        .await
-                    {
-                        if matches!(auth.as_ref(), Some(CodexAuth::Headers(_))) {
-                            // Header credentials have no verified shared-cache
-                            // identity. Use this connection's live catalog only.
-                            Ok(connection_manager
-                                .list_all_tools_snapshot()
-                                .await
-                                .as_ref()
-                                .clone())
-                        } else {
-                            mcp_manager
-                                .codex_apps_tools_cache()
-                                .current_tools(config.codex_home.to_path_buf(), cache_key.clone())
-                                .await
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "hosted connector refresh completed without publishing tools"
-                                    )
-                                })
-                        }
-                    } else {
-                        Err(anyhow::anyhow!(
-                            "failed to refresh tools for MCP server '{CODEX_APPS_MCP_SERVER_NAME}'"
-                        ))
-                    };
-                    cancellation_token.cancel();
-                    connection_manager.shutdown().await;
-                    result
-                }
-                .await;
+                let refresh_result = self.refresh_app_tools(&config, auth.clone()).await;
 
                 match refresh_result {
                     Ok(tools) => {

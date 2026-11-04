@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 
 use codex_tools::JsonSchema;
-use codex_tools::JsonToolOutput;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
@@ -11,9 +10,9 @@ use serde_json::json;
 use crate::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
-use crate::tools::context::boxed_tool_output;
+use crate::tools::handlers::git_inspection::git_read_output;
+use crate::tools::handlers::git_inspection::prepare_git_read;
 use crate::tools::handlers::parse_arguments;
-use crate::tools::handlers::wait_for_tool_environment;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 
@@ -85,27 +84,13 @@ impl ToolExecutor<ToolInvocation> for GitStatusHandler {
             {
                 return Err(FunctionCallError::RespondToModel("wait_ms must be 0..300000; baseline requires wait_ms or include_ownership".into()));
             }
-            let environment = wait_for_tool_environment(
-                &invocation.step_context.environments,
+            let environment = prepare_git_read(
+                &invocation,
                 args.environment_id.as_deref(),
-                &invocation.cancellation_token,
+                "git_status",
+                "remote/restricted reads are unsupported",
             )
-            .await?
-            .ok_or_else(|| {
-                FunctionCallError::RespondToModel(
-                    "git_status requires a selected local environment".into(),
-                )
-            })?;
-            if environment.environment.is_remote()
-                || !invocation
-                    .step_context
-                    .turn
-                    .file_system_sandbox_policy()
-                    .has_full_disk_read_access()
-            {
-                return Err(FunctionCallError::RespondToModel("git_status requires a local environment with full disk read access; remote/restricted reads are unsupported".into()));
-            }
-            crate::tools::parallel::wait_for_workspace_baseline().await;
+            .await?;
             let cwd = environment
                 .cwd()
                 .to_abs_path()
@@ -135,13 +120,12 @@ impl ToolExecutor<ToolInvocation> for GitStatusHandler {
                     }
                 } => result.map_err(FunctionCallError::RespondToModel)?,
             };
-            let mut output = result;
-            output["environment_id"] = json!(environment.environment_id);
-            let output = JsonToolOutput::new(output);
-            crate::tools::context::ensure_exact_model_delivery(&output, &invocation).map_err(|_| {
-                FunctionCallError::RespondToModel("Git status exceeds the current model delivery budget; nothing was delivered. Use smaller max_files or narrower paths.".into())
-            })?;
-            Ok(boxed_tool_output(output))
+            git_read_output(
+                result,
+                &environment.environment_id,
+                &invocation,
+                || "Git status exceeds the current model delivery budget; nothing was delivered. Use smaller max_files or narrower paths.".into(),
+            )
         })
     }
 }

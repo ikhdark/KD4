@@ -28,7 +28,7 @@ pub struct SpawnAgentToolOptions {
 
 fn spawn_agent_default_guidance() -> String {
     format!(
-        "All subagents are generic and use `{DEFAULT_SPAWN_AGENT_MODEL}` with `{DEFAULT_SPAWN_AGENT_REASONING_EFFORT}` reasoning. Describe the job and its restrictions in `message`; there are no role, model, or reasoning overrides. If the built-in model is unavailable, the effective model or provider default is used with a supported reasoning effort."
+        "All subagents are generic and use `{DEFAULT_SPAWN_AGENT_MODEL}` with `{DEFAULT_SPAWN_AGENT_REASONING_EFFORT}` reasoning. Use `message` for read-only tasks or `assignment` for writable workers; there are no role, model, or reasoning overrides. If the built-in model is unavailable, the effective model or provider default is used with a supported reasoning effort."
     )
 }
 
@@ -82,6 +82,7 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
             one_of: Some(
                 SPAWN_AGENT_V2_MESSAGE_FIELDS
                     .into_iter()
+                    .chain(std::iter::once("assignment"))
                     .map(|field| JsonSchema {
                         required: Some(vec![field.to_string()]),
                         ..JsonSchema::object(BTreeMap::new(), None, None)
@@ -142,7 +143,7 @@ pub fn create_send_message_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "send_message".to_string(),
-        description: "Queue a message for a child or peer, or the same message for explicit targets, without starting a new turn. Sub-agents cannot message ancestors: finish with one final answer including any blockers; the host reports the terminal outcome automatically. Do not send progress updates or request acknowledgment. Use followup_task for new assignments, corrections requiring action, or urgent work that must start."
+        description: "Queue a message for a child or peer, or the same message for explicit targets, without starting a new turn. Batches return success, partial_success or failed with accepted_targets, failed_targets and per-recipient acknowledgments/failures; partial outcomes remain data, not permission to resend accepted recipients. Sub-agents cannot message ancestors: use publish_agent_partial_result for nonterminal evidence or dependencies when assigned a typed task; otherwise include blockers in the final answer for host delivery. Do not send routine progress or request acknowledgment. Use followup_task for new assignments, corrections requiring action, or urgent work that must start."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -551,6 +552,7 @@ fn agent_previous_status_output_schema(previous_status_description: &str) -> Val
 
 fn spawn_agent_common_properties_v2() -> BTreeMap<String, JsonSchema> {
     BTreeMap::from([
+        ("assignment".into(), writable_assignment_schema()),
         (
             "independent_verification".to_string(),
             JsonSchema::boolean(Some("Default false. Declare intentionally independent verification rather than redundant implementation. Changes advisory overlap classification only, not permissions, runtime profile or acceptance.".into())),
@@ -558,7 +560,7 @@ fn spawn_agent_common_properties_v2() -> BTreeMap<String, JsonSchema> {
         (
             "message".to_string(),
             JsonSchema::string(Some(
-                "Complete, self-contained task with the needed paths, facts, restrictions, evidence references and stop condition, not a copied transcript. The new agent sees none of this conversation unless `fork_turns` is set. Admitted with a repository-wide diagnostic claim that records coordination risk without blocking overlapping work."
+                "Self-contained read-only task with facts, paths, restrictions, evidence references and stop condition. Message text never grants write authority; writable work requires assignment."
                     .to_string(),
             )),
         ),
@@ -605,6 +607,49 @@ pub fn criterion_evidence_policy_schema() -> JsonSchema {
     ]), Some(vec!["kind".into()]), Some(false.into()))
 }
 
+fn writable_assignment_schema() -> JsonSchema {
+    let scope = JsonSchema::object(BTreeMap::from([
+        ("path".into(), JsonSchema::string(None)),
+        ("recursive".into(), JsonSchema::boolean(None)),
+    ]), Some(vec!["path".into(), "recursive".into()]), Some(false.into()));
+    let scopes = JsonSchema::array(scope, None);
+    let mut policy = criterion_evidence_policy_schema();
+    policy.required = Some(vec!["kind".into(), "required_evidence".into(), "freshness".into()]);
+    if let Some(properties) = &mut policy.properties {
+        properties.insert("kind".into(), JsonSchema::string_enum(vec![json!("source_inspection")],
+            Some("Writable workers require owned source evidence; root owns execution/integration checks.".into())));
+    }
+    let criterion = JsonSchema::object(BTreeMap::from([
+        ("id".into(), JsonSchema::string(None)),
+        ("text".into(), JsonSchema::string(None)),
+        ("evidence_policy".into(), policy),
+    ]), Some(vec!["id".into(), "text".into(), "evidence_policy".into()]), Some(false.into()));
+    let paths = JsonSchema::object(BTreeMap::from([
+        ("kind".into(), JsonSchema::string_enum(vec![json!("paths")], None)),
+        ("scopes".into(), scopes.clone()),
+    ]), Some(vec!["kind".into(), "scopes".into()]), Some(false.into()));
+    let operations = JsonSchema::object(BTreeMap::from([
+        ("kind".into(), JsonSchema::string_enum(vec![json!("create"), json!("delete"), json!("move")], None)),
+    ]), Some(vec!["kind".into()]), Some(false.into()));
+    let strings = JsonSchema::array(JsonSchema::string(None), None);
+    JsonSchema {
+        description: Some("Required for writable workers, mutually exclusive with message. Declare exact write scopes, typed path/create/delete/move prohibitions, nonempty assignment-specific criteria with owned source-inspection policies, required evidence, and stop condition. Source manifests and complete observed handoff deltas are verified; missing/invalid/oversized capture rejects launch. Opaque commands, external IO and nested delegation cannot enforce this footprint; the root owns builds and integration. Historical evidence is never promoted to current correctness.".into()),
+        ..JsonSchema::object(BTreeMap::from([
+            ("objective".into(), JsonSchema::string(None)),
+            ("acceptance_criteria".into(), JsonSchema::array(criterion, None)),
+            ("read_scope".into(), scopes.clone()),
+            ("write_scope".into(), scopes),
+            ("stop_condition".into(), JsonSchema::string(None)),
+            ("required_evidence".into(), strings.clone()),
+            ("prohibited_changes".into(), JsonSchema::array(JsonSchema::one_of(vec![paths, operations], None), None)),
+            ("risk_hints".into(), strings.clone()),
+            ("contract_claims".into(), strings.clone()),
+            ("dependencies".into(), strings),
+            ("workspace_strategy".into(), JsonSchema::string_enum(vec![json!("shared"), json!("isolated")], None)),
+        ]), Some(vec!["objective".into(), "acceptance_criteria".into(), "read_scope".into(), "write_scope".into(), "stop_condition".into(), "required_evidence".into(), "prohibited_changes".into()]), Some(false.into()))
+    }
+}
+
 
 
 fn hide_spawn_agent_metadata_options(properties: &mut BTreeMap<String, JsonSchema>) {
@@ -628,11 +673,11 @@ The spawned agent receives a durable task binding.
 Only call this tool for a concrete, bounded subtask that can run independently alongside useful local work; otherwise continue locally.
 Apply the base instructions for audit/review scope, verification, validation, and completion, and applicable assignment restrictions.
 Fit assignments to actual worker context, reserving reasoning/evidence/reporting space; partition by cohesive subsystems and execution paths, not just file size.
-The `message` must include the task type, intended read/write scope, category inclusions/exclusions, detection criteria, conversation-only user restrictions, required evidence, and stop condition. Give task-specific deltas, not copies of inherited project instructions, permissions or base policy. Read-only tasks remain read-only by instruction; no specialized profile is selected.
+The read-only `message` must include task type, scope, exclusions, detection criteria, user restrictions, evidence and stop condition. Writable work requires `assignment` with explicit write scopes, typed prohibitions and criterion-specific source evidence policies. Never infer write authority from natural-language messages. Native source acquisition is not semantic acceptance; root owns execution and integration.
 Launch authorized independent assignments in the same batch, not a serial spawn loop. In exec, use bounded Promise.allSettled and retain every success and failure; failed siblings do not justify respawning successes.
 Sequence only real dependencies or shared-resource conflicts. Integrate completions with the next substantive step/final, not an acknowledgment-only model round.
 It can message its children and peers, but cannot message ancestors. Its final answer and terminal outcome are delivered to its parent automatically when it finishes.
-Supply `message` (or its `prompt`/`instructions` alias). Each task is durably tracked with a repository-wide diagnostic claim and returns an `assignment_id` and `overlap_warnings` identifying active task/attempt/worker IDs. These compare effective contracts, declared scopes and deliverables before launch and are advisory, not proof of redundancy or grounds to reject/reuse work. Set independent_verification:true for intentional independent checking; resemblance alone never blocks assignment. The host records the final outcome automatically, without a role-specific receipt workflow.
+Supply exactly one of read-only `message` (or its aliases) or writable `assignment`. Invalid writable contracts are rejected before execution. Message-only workers have native read/search and communication, never opaque execution or source writes. Writable workers use the scope-checked patch owner, submit native assignment-specific evidence and an exact scoped change declaration; root independently reviews acceptance. Spawn returns durable assignment/attempt identities and advisory overlap warnings, never redundancy or completion proof.
 
 Omitted `fork_turns` and `fork_turns="none"` create a lineage-preserving TaskCapsule fork: the capsule is the sole structured bootstrap and no parent conversation or conversation-derived capability selection is inherited. Integers from 1 through 5 retain bounded history. `fork_turns="all"` is disabled by default and is only available with the configuration escape hatch."#
     );

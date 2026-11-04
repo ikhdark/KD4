@@ -18,6 +18,9 @@ Publishing or republishing requires explicit permission.
 | Python CLI runtime package | [Runtime packaging](sdk/python-runtime/README.md) |
 | Configuration | [Layer loader](codex-rs/config/src/loader/README.md), [schema generation](codex-rs/core/src/config/schema.md) |
 | Harness instructions and tool delivery | [Instruction architecture](codex-rs/core/instruction-architecture.md) |
+| Rust workspace owners and process boundaries | [Rust navigation](codex-rs/README.md) |
+| Core runtime ownership and request flow | [Core navigation](codex-rs/core/README.md) |
+| App-server protocol types, projections and schemas | [Protocol navigation](codex-rs/app-server-protocol/README.md) |
 | Turn timing | [Critical-path timing](codex-rs/core/critical-path-timing.md), [response-start timing](codex-rs/core/response-start-timing.md) |
 | App-server queue | [Thread queue](codex-rs/app-server/THREAD_QUEUE.md) |
 | Execution service | [Exec server](codex-rs/exec-server/README.md) |

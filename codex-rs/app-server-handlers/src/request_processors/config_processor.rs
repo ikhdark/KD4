@@ -230,7 +230,7 @@ impl ConfigRequestProcessor {
         self.handle_config_mutation();
         self.emit_plugin_toggle_events(pending_changes).await;
         if reload_user_config {
-            self.reload_user_config(&refreshed_features).await;
+            self.reload_user_config(&refreshed_features).await?;
         }
         Ok(response)
     }
@@ -262,17 +262,21 @@ impl ConfigRequestProcessor {
             .filter_map(|name| user_settable_feature_for_key(name))
             .collect::<Vec<_>>();
 
+        // Resolve the fallible base configuration before publishing overrides.
+        // The owner rechecks this generation under its publication lock.
+        let generation = self.config_manager.policy_generation();
+        self.load_latest_config(/*fallback_cwd*/ None).await?;
         self.config_manager
-            .extend_runtime_feature_enablement(
+            .extend_runtime_feature_enablement_for_generation(
+                generation,
                 enablement
                     .iter()
                     .map(|(name, enabled)| (name.clone(), *enabled)),
             )
-            .map_err(|_| internal_error("failed to update feature enablement"))?;
+            .map_config_load_error()?;
         self.handle_config_mutation();
 
-        self.load_latest_config(/*fallback_cwd*/ None).await?;
-        self.reload_user_config(&refreshed_features).await;
+        self.reload_user_config(&refreshed_features).await?;
 
         Ok(ExperimentalFeatureEnablementSetResponse { enablement })
     }
@@ -281,15 +285,15 @@ impl ConfigRequestProcessor {
         clippy::await_holding_invalid_type,
         reason = "The runtime-refresh owner spans per-thread config capture and publication"
     )]
-    async fn reload_user_config(&self, refreshed_features: &[Feature]) {
+    async fn reload_user_config(&self, refreshed_features: &[Feature]) -> Result<(), JSONRPCErrorError> {
         let _refresh_guard = self.config_manager.lock_runtime_refresh().await;
         let thread_ids = self.thread_manager.list_thread_ids().await;
         // handle_config_mutation already invalidated the shared discovery state.
         // Do not let one refreshed thread evict another's newly loaded plugins.
-        futures::stream::iter(thread_ids)
-            .for_each_concurrent(5, |thread_id| async move {
+        let failures = futures::stream::iter(thread_ids)
+            .map(|thread_id| async move {
                 let Ok(thread) = self.thread_manager.get_thread(thread_id).await else {
-                    return;
+                    return None;
                 };
                 let current_config = thread.config().await;
                 let next_config = match self
@@ -302,7 +306,7 @@ impl ConfigRequestProcessor {
                         tracing::warn!(
                             "failed to rebuild thread config for runtime refresh: {err}"
                         );
-                        return;
+                        return Some((thread_id.to_string(), err.to_string()));
                     }
                 };
                 thread
@@ -311,8 +315,22 @@ impl ConfigRequestProcessor {
                         refreshed_features,
                     )
                     .await;
+                None
             })
+            .buffer_unordered(5)
+            .filter_map(|failure| async move { failure })
+            .collect::<Vec<_>>()
             .await;
+        if !failures.is_empty() {
+            let mut error = internal_error("configuration committed, but some loaded threads could not be refreshed; retry the refresh");
+            error.data = Some(json!({
+                "reason": "runtimeRefreshIncomplete",
+                "configurationCommitted": true,
+                "failedThreads": failures.into_iter().map(|(thread_id, message)| json!({"threadId": thread_id, "message": message})).collect::<Vec<_>>(),
+            }));
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn emit_plugin_toggle_events(

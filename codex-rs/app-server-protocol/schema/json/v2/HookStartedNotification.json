@@ -32,7 +32,8 @@
       "enum": [
         "command",
         "prompt",
-        "agent"
+        "agent",
+        "mcpTool"
       ],
       "type": "string"
     },

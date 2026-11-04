@@ -785,7 +785,6 @@
       "additionalProperties": false,
       "properties": {
         "default": {
-          "format": "double",
           "type": [
             "number",
             "null"
@@ -798,14 +797,12 @@
           ]
         },
         "maximum": {
-          "format": "double",
           "type": [
             "number",
             "null"
           ]
         },
         "minimum": {
-          "format": "double",
           "type": [
             "number",
             "null"
@@ -972,19 +969,40 @@
       "type": "string"
     },
     "McpElicitationTitledEnumItems": {
-      "additionalProperties": false,
-      "properties": {
-        "anyOf": {
-          "items": {
-            "$ref": "#/definitions/McpElicitationConstOption"
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "anyOf": {
+              "items": {
+                "$ref": "#/definitions/McpElicitationConstOption"
+              },
+              "type": "array"
+            }
           },
-          "type": "array"
+          "required": [
+            "anyOf"
+          ],
+          "title": "AnyOfMcpElicitationTitledEnumItems",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "oneOf": {
+              "items": {
+                "$ref": "#/definitions/McpElicitationConstOption"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "oneOf"
+          ],
+          "title": "OneOfMcpElicitationTitledEnumItems",
+          "type": "object"
         }
-      },
-      "required": [
-        "anyOf"
-      ],
-      "type": "object"
+      ]
     },
     "McpElicitationTitledMultiSelectEnumSchema": {
       "additionalProperties": false,
@@ -1507,9 +1525,12 @@
         },
         {
           "format": "int64",
+          "maximum": 9007199254740991.0,
+          "minimum": -9007199254740991.0,
           "type": "integer"
         }
-      ]
+      ],
+      "description": "A request identifier. Numeric IDs must be integers in the inclusive range -9007199254740991 to 9007199254740991 (JavaScript safe integers). Use a string ID outside this range to preserve identity in JavaScript clients."
     },
     "RequestPermissionProfile": {
       "additionalProperties": false,
@@ -1541,7 +1562,7 @@
       "type": "string"
     },
     "ToolRequestUserInputOption": {
-      "description": "EXPERIMENTAL. Defines a single selectable option for request_user_input.",
+      "description": "Defines a single selectable option for request_user_input.",
       "properties": {
         "description": {
           "type": "string"
@@ -1557,7 +1578,7 @@
       "type": "object"
     },
     "ToolRequestUserInputParams": {
-      "description": "EXPERIMENTAL. Params sent with a request_user_input event.",
+      "description": "Params sent with a request_user_input event.",
       "properties": {
         "autoResolutionMs": {
           "default": null,
@@ -1593,7 +1614,7 @@
       "type": "object"
     },
     "ToolRequestUserInputQuestion": {
-      "description": "EXPERIMENTAL. Represents one request_user_input question and its required options.",
+      "description": "Represents one request_user_input question and its required options.",
       "properties": {
         "header": {
           "type": "string"
@@ -1879,7 +1900,7 @@
       "type": "object"
     },
     {
-      "description": "EXPERIMENTAL - Request input from the user for a tool call.",
+      "description": "Request input from the user for a tool call.",
       "properties": {
         "id": {
           "$ref": "#/definitions/RequestId"

@@ -10,6 +10,18 @@ pub(crate) async fn resolve_agent_target(
     turn: &Arc<TurnContext>,
     target: &str,
 ) -> Result<ThreadId, FunctionCallError> {
+    // Reject malformed named paths before root registration or any durable
+    // agent rehydration. Runtime/rehydration failures below stay uncertain.
+    if ThreadId::from_string(target).is_err() {
+        turn.session_source.get_agent_path()
+            .unwrap_or_else(codex_protocol::AgentPath::root)
+            .resolve(target)
+            .map_err(|message| FunctionCallError::structured(
+                codex_protocol::tool_failure::ToolFailure::no_effects(
+                    codex_protocol::tool_failure::ToolFailureCode::Failed, message,
+                ),
+            ))?;
+    }
     register_session_root(session, turn);
     // Compact UUIDs overlap the valid task-name grammar. Named aliases win in
     // the caller's scope; a hyphenated UUID always selects the concrete ID.

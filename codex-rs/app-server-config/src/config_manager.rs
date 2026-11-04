@@ -171,9 +171,36 @@ impl ConfigManager {
     where
         I: IntoIterator<Item = (String, bool)>,
     {
+        self.extend_runtime_feature_enablement_inner(None, enablement).map_err(|_| ())
+    }
+
+    pub fn extend_runtime_feature_enablement_for_generation<I>(
+        &self,
+        generation: u64,
+        enablement: I,
+    ) -> std::io::Result<()>
+    where
+        I: IntoIterator<Item = (String, bool)>,
+    {
+        self.extend_runtime_feature_enablement_inner(Some(generation), enablement)
+    }
+
+    fn extend_runtime_feature_enablement_inner<I>(
+        &self,
+        generation: Option<u64>,
+        enablement: I,
+    ) -> std::io::Result<()>
+    where
+        I: IntoIterator<Item = (String, bool)>,
+    {
         // Evaluate caller-controlled iteration before taking the publication lock.
         // If it panics, neither the published map nor the cache generation changes.
         let enablement = enablement.into_iter().collect::<BTreeMap<_, _>>();
+        let _policy = self.cloud_config_bundle.write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if generation.is_some_and(|generation| generation != self.policy_generation()) {
+            return Err(std::io::Error::other(ConfigGenerationChanged));
+        }
         let mut runtime_feature_enablement = self
             .runtime_feature_enablement
             .write()
@@ -186,7 +213,7 @@ impl ConfigManager {
         }
         *runtime_feature_enablement = next;
         drop(runtime_feature_enablement);
-        self.invalidate_load_cache();
+        self.invalidate_load_cache_locked();
         Ok(())
     }
 
@@ -207,7 +234,7 @@ impl ConfigManager {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = std::mem::replace(&mut *guard, loader);
-        self.invalidate_load_cache();
+        self.invalidate_load_cache_locked();
         drop(guard);
         // Loader-owned values may have destructors; never run them while a
         // publication lock is held or before the new value invalidates the cache.
@@ -218,13 +245,16 @@ impl ConfigManager {
         &self,
         thread_config_loader: Arc<dyn ThreadConfigLoader>,
     ) {
+        let policy = self.cloud_config_bundle.write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut guard = self
             .thread_config_loader
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = std::mem::replace(&mut *guard, thread_config_loader);
+        self.invalidate_load_cache_locked();
         drop(guard);
-        self.invalidate_load_cache();
+        drop(policy);
         drop(previous);
     }
 
@@ -250,23 +280,28 @@ impl ConfigManager {
                 let _ = self.with_current_policy(generation, || {
                     set_default_client_residency_requirement(config.enforce_residency.value());
                 });
-                if self.validate_policy_generation(generation).is_ok()
-                    && let Some((handle, epoch)) = policy_target
-                {
-                    let denied = config
-                        .config_layer_stack
-                        .requirements()
-                        .allow_remote_control
-                        .as_ref()
-                        .is_some_and(|requirement| !requirement.value);
-                    handle.update_policy(
-                        epoch,
-                        if denied {
-                            RemoteControlPolicy::DisabledByRequirements
-                        } else {
-                            RemoteControlPolicy::Allowed
-                        },
-                    );
+                if let Some((handle, epoch)) = policy_target {
+                    // update_policy owns its auth-epoch fence. Hold only the
+                    // configuration publication fence here, avoiding recursive
+                    // acquisition of the auth lock inside publish_if_current.
+                    let _policy = self.cloud_config_bundle.read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if self.policy_generation() == generation {
+                        let denied = config
+                            .config_layer_stack
+                            .requirements()
+                            .allow_remote_control
+                            .as_ref()
+                            .is_some_and(|requirement| !requirement.value);
+                        handle.update_policy(
+                            epoch,
+                            if denied {
+                                RemoteControlPolicy::DisabledByRequirements
+                            } else {
+                                RemoteControlPolicy::Allowed
+                            },
+                        );
+                    }
                 }
             }
             Err(err) => warn!(
@@ -291,7 +326,7 @@ impl ConfigManager {
         self.with_current_policy(generation, || ())
     }
 
-    fn with_current_policy<T>(
+    pub(crate) fn with_current_policy<T>(
         &self,
         generation: u64,
         publish: impl FnOnce() -> T,
@@ -334,6 +369,7 @@ impl ConfigManager {
         shutdown: tokio_util::sync::CancellationToken,
     ) {
         let mut auth_changes = auth_manager.auth_change_receiver();
+        let mut retry_delay = Duration::from_secs(1);
         loop {
             if self.remote_control_policy_recheck_pending() {
                 tokio::select! {
@@ -345,9 +381,15 @@ impl ConfigManager {
                     ) => {}
                 }
             }
-            // A failed re-check leaves remote control held; the next auth change retries it.
+            let pending = self.remote_control_policy_recheck_pending();
+            if !pending {
+                retry_delay = Duration::from_secs(1);
+            }
             tokio::select! {
                 () = shutdown.cancelled() => return,
+                () = tokio::time::sleep(retry_delay), if pending => {
+                    retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
+                }
                 changed = auth_changes.changed() => {
                     if changed.is_err() {
                         return;
@@ -410,6 +452,7 @@ impl ConfigManager {
         &self,
         thread_config: &Config,
     ) -> std::io::Result<Config> {
+        let generation = self.policy_generation();
         let refreshed_config = self
             .load_latest_config(Some(thread_config.cwd.to_path_buf()))
             .await?;
@@ -418,7 +461,7 @@ impl ConfigManager {
             .await?;
         self.apply_runtime_feature_enablement(&mut config);
         self.apply_arg0_paths(&mut config);
-        Ok(config)
+        self.with_current_policy(generation, || config)
     }
 
     pub async fn load_default_config(&self) -> std::io::Result<Config> {
@@ -507,7 +550,10 @@ impl ConfigManager {
                 ));
             }
         }
-        if let Some(value) = request_overrides.remove("bypass_hook_trust") {
+        let reserved_key = keys.iter().find_map(|(key, path)| {
+            (path.as_slice() == ["bypass_hook_trust"]).then(|| (*key).clone())
+        });
+        if let Some(value) = reserved_key.and_then(|key| request_overrides.remove(&key)) {
             typesafe_overrides.bypass_hook_trust = Some(value.as_bool().ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -538,7 +584,7 @@ impl ConfigManager {
             return self.with_current_policy(generation, || config);
         }
 
-        let flight = {
+        let flight = self.with_current_policy(generation, || {
             let mut cache = self
                 .load_cache
                 .write()
@@ -559,7 +605,7 @@ impl ConfigManager {
                 }
                 gate
             }
-        };
+        })?;
         let _flight = flight.lock().await;
         self.validate_policy_generation(generation)?;
         if let Some(config) = self.cached_config(&cache_key, generation) {
@@ -631,9 +677,9 @@ impl ConfigManager {
         &self,
         cwd: Option<AbsolutePathBuf>,
     ) -> std::io::Result<ConfigLayerStack> {
-        let thread_config_loader = self.current_thread_config_loader();
         let generation = self.policy_generation();
         self.validate_policy_generation(generation)?;
+        let thread_config_loader = self.current_thread_config_loader();
         let loader = self.current_cloud_config_bundle().for_load();
         let layers = load_config_layers_state(
             LOCAL_FS.as_ref(),
@@ -685,11 +731,19 @@ impl ConfigManager {
     }
 
     pub fn invalidate_load_cache(&self) {
+        let _policy = self.cloud_config_bundle.write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.invalidate_load_cache_locked();
+    }
+
+    // Caller holds the policy publication write lock. Match the reader's
+    // policy -> cache lock order, publishing the generation with its cleanup.
+    fn invalidate_load_cache_locked(&self) {
+        let mut cache = self.load_cache.write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.load_generation.fetch_add(1, Ordering::AcqRel);
-        if let Ok(mut cache) = self.load_cache.write() {
-            cache.ready.clear();
-            cache.flights.clear();
-        }
+        cache.ready.clear();
+        cache.flights.clear();
     }
 
 
@@ -719,6 +773,9 @@ fn apply_runtime_feature_enablement(
     config: &mut Config,
     runtime_feature_enablement: &BTreeMap<String, bool>,
 ) {
+    if runtime_feature_enablement.is_empty() {
+        return;
+    }
     let protected_features = protected_feature_keys(&config.config_layer_stack);
     for (name, enabled) in runtime_feature_enablement {
         if protected_features.contains(name) {
@@ -742,6 +799,9 @@ fn apply_runtime_feature_enablement_to_features(
     config_layer_stack: &ConfigLayerStack,
     runtime_feature_enablement: &BTreeMap<String, bool>,
 ) {
+    if runtime_feature_enablement.is_empty() {
+        return;
+    }
     let protected_features = protected_feature_keys(config_layer_stack);
     for (name, enabled) in runtime_feature_enablement {
         if protected_features.contains(name) {

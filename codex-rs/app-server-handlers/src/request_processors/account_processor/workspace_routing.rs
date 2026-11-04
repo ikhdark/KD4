@@ -6,13 +6,13 @@ use codex_config::ResidencyRequirement;
 use std::time::Duration;
 
 impl AccountRequestProcessor {
-    pub(super) async fn workspace_routing(&self) -> Option<WorkspaceRouting> {
+    pub(super) async fn workspace_routing(&self, config: &super::Config) -> Option<WorkspaceRouting> {
         let auth = self.auth_manager.auth_cached()?;
         if !auth.is_chatgpt_auth() {
             return None;
         }
         let account_id = auth.get_account_id().filter(|id| !id.is_empty())?;
-        let client = self.backend_client_for_auth(&auth);
+        let client = self.backend_client_for_auth(&auth, config);
         let accounts = match tokio::time::timeout(
             Duration::from_secs(10),
             client.get_accounts_check(),
@@ -42,8 +42,8 @@ impl AccountRequestProcessor {
             .find(|account| account.id == account_id)?;
         routing_from_account(
             account,
-            &self.config.chatgpt_base_url,
-            self.config.enforce_residency.value(),
+            &config.chatgpt_base_url,
+            config.enforce_residency.value(),
             auth.is_fedramp_account(),
         )
     }

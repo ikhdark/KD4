@@ -9,7 +9,8 @@ use std::path::Path;
 use std::path::PathBuf;
 
 /// Coarse capability class used before dispatching a typed-agent tool call.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum TypedToolClass {
     AgentCommunication,
     OwnTask,
@@ -20,6 +21,22 @@ pub(crate) enum TypedToolClass {
     StructuredEdit,
     DynamicExternal,
     Unknown,
+}
+
+impl TypedToolClass {
+    /// Discovery labels describe the existing class, never grant authority.
+    pub(crate) fn native_capability_group(self) -> Option<&'static str> {
+        match self {
+            Self::AgentCommunication => Some("Native agent communication"),
+            Self::OwnTask => Some("Native task state"),
+            Self::RootTaskControl => Some("Native task control"),
+            Self::ReadSearch => Some("Native read/search"),
+            Self::CodeModeControl => Some("Native orchestration"),
+            Self::Shell => Some("Native shell/process execution"),
+            Self::StructuredEdit => Some("Native structured edits"),
+            Self::DynamicExternal | Self::Unknown => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -226,6 +243,56 @@ fn canonical_repository_root(repo_root: &Path) -> Result<PathBuf, CapabilityPoli
         path: repo_root.to_string_lossy().into_owned(),
         reason: error.to_string(),
     })
+}
+
+/// Classes come from host registration, not task prose. Opaque execution cannot
+/// prove source confinement; writable workers use the scope-checked patch owner.
+pub(crate) fn authorize_assignment_tool(
+    authorization: Option<&codex_agent_task_store::AgentTaskAuthorization>,
+    class: TypedToolClass,
+    semantic_name: &str,
+    payload: &crate::tools::context::ToolPayload,
+) -> Result<(), crate::FunctionCallError> {
+
+    let refused = |reason: &str| crate::FunctionCallError::RequiredOperationBlocked(
+        format!("{semantic_name}: {reason}"));
+    if matches!(semantic_name, "spawn_agent" | "followup_task") {
+        return Err(refused("workers cannot delegate execution authority; ask the root to admit the assignment"));
+    }
+    match class {
+        TypedToolClass::ReadSearch | TypedToolClass::AgentCommunication
+        | TypedToolClass::CodeModeControl => Ok(()),
+        TypedToolClass::OwnTask => {
+            let grouped_gate = semantic_name == "agent_task" && match payload {
+                crate::tools::context::ToolPayload::Function { arguments, .. } =>
+                    serde_json::from_str::<serde_json::Value>(arguments).ok()
+                        .and_then(|value| value.get("operation").and_then(|value| value.as_str()).map(str::to_owned))
+                        .is_some_and(|operation| operation == "set_gate"),
+                _ => true,
+            };
+            if semantic_name == "set_agent_gate" || grouped_gate {
+                Err(refused("workers cannot seal acceptance gates; the root must independently review their receipts"))
+            } else { Ok(()) }
+        }
+        TypedToolClass::StructuredEdit if semantic_name == "apply_patch" => {
+            let authorization = authorization.ok_or_else(||
+                refused("unbound subagents are read-only; admit an explicit typed writable assignment"))?;
+            codex_agent_task_store::require_write_contract(&authorization.assignment,
+                authorization.current_attempt.amendment.as_ref())
+                .map_err(|error| refused(&error.to_string()))?;
+            codex_agent_task_store::dispatch_manifest(&authorization.assignment,
+                authorization.current_attempt.amendment.as_ref())
+                .map_err(|error| refused(&error.to_string()))?;
+            if authorization.assignment.write_scope.is_empty() {
+                return Err(refused("message-only/read-only assignments cannot write source"));
+            }
+            Ok(())
+        }
+        TypedToolClass::RootTaskControl => Err(refused(
+            "subagents cannot create or broaden execution contracts; ask the root to admit work explicitly")),
+        _ => Err(refused(
+            "this execution/IO tool cannot enforce the worker's write contract; use native read/search or scoped apply_patch, with root-owned builds/integration")),
+    }
 }
 
 fn invalid_path(path: &str, reason: impl Into<String>) -> CapabilityPolicyError {

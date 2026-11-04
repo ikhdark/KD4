@@ -12,6 +12,7 @@ use std::fs::File;
 use std::io;
 use std::io::BufRead;
 use std::io::BufReader;
+use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -19,6 +20,10 @@ const NOTE_MAX_LEN: usize = 2_000;
 const TOOL_NAME_MAX_LEN: usize = 120;
 const TOOL_ID_MAX_LEN: usize = 200;
 const TOOL_RESULT_MAX_LEN: usize = 4_000;
+const SESSION_MAX_INPUT_BYTES: usize = 256 * 1024 * 1024;
+const SESSION_MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
+const SESSION_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+const SESSION_MAX_MESSAGES: usize = 100_000;
 const EXTERNAL_AGENT_TOOL_CALL_TAG: &str = "external_agent_tool_call";
 const EXTERNAL_AGENT_TOOL_RESULT_TAG: &str = "external_agent_tool_result";
 
@@ -44,25 +49,18 @@ pub fn summarize_session(path: &Path) -> io::Result<Option<SessionSummary>> {
     let mut saw_user_message = false;
     let mut saw_timestamp = false;
     let mut line = String::new();
+    let mut input_bytes = 0;
 
     loop {
         line.clear();
-        if reader.read_line(&mut line)? == 0 {
+        if read_session_line(&mut reader, &mut line, &mut input_bytes)? == 0 {
             break;
         }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let Ok(mut record) = serde_json::from_str::<JsonValue>(trimmed) else {
-            continue;
-        };
-        if cwd.is_none() {
-            cwd = record
-                .get("cwd")
-                .and_then(JsonValue::as_str)
-                .map(PathBuf::from);
-        }
+        let mut record = serde_json::from_str::<JsonValue>(trimmed).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("invalid session JSON record: {error}")))?;
         if let Some(title) = custom_title_from_record(&record) {
             custom_title = Some(title.to_string());
         }
@@ -72,6 +70,7 @@ pub fn summarize_session(path: &Path) -> io::Result<Option<SessionSummary>> {
         let Some(role) = conversation_message_role(&record) else {
             continue;
         };
+        select_conversation_cwd(&record, &mut cwd)?;
         if role == MessageRole::User {
             saw_user_message = true;
             if fallback_title.is_none()
@@ -121,10 +120,12 @@ pub(super) fn read_session_import(path: &Path, cancellation: &tokio_util::sync::
     let mut messages = Vec::new();
     let mut line = String::new();
     let mut hasher = Sha256::new();
+    let mut input_bytes = 0;
+    let mut message_bytes = 0usize;
     loop {
         super::super::files::check_cancel(cancellation)?;
         line.clear();
-        if reader.read_line(&mut line)? == 0 {
+        if read_session_line(&mut reader, &mut line, &mut input_bytes)? == 0 {
             break;
         }
         hasher.update(line.as_bytes());
@@ -132,14 +133,9 @@ pub(super) fn read_session_import(path: &Path, cancellation: &tokio_util::sync::
         if trimmed.is_empty() {
             continue;
         }
-        let Ok(mut record) = serde_json::from_str::<JsonValue>(trimmed) else {
-            continue;
-        };
-        if cwd.is_none() {
-            cwd = record
-                .get("cwd")
-                .and_then(JsonValue::as_str)
-                .map(PathBuf::from);
+        let mut record = serde_json::from_str::<JsonValue>(trimmed).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("invalid session JSON record: {error}")))?;
+        if conversation_message_role(&record).is_some() {
+            select_conversation_cwd(&record, &mut cwd)?;
         }
         if let Some(title) = custom_title_from_record(&record) {
             custom_title = Some(title.to_string());
@@ -148,6 +144,10 @@ pub(super) fn read_session_import(path: &Path, cancellation: &tokio_util::sync::
             ai_title = Some(title.to_string());
         }
         if let Some(message) = conversation_message_from_owned_record(&mut record) {
+            message_bytes = message_bytes.saturating_add(message.text.len());
+            if messages.len() >= SESSION_MAX_MESSAGES || message_bytes > SESSION_MAX_MESSAGE_BYTES {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "session conversation exceeds the import resource budget"));
+            }
             messages.push(message);
         }
     }
@@ -158,6 +158,25 @@ pub(super) fn read_session_import(path: &Path, cancellation: &tokio_util::sync::
         messages,
         content_sha256: hex::encode(hasher.finalize()),
     })
+}
+
+fn read_session_line(reader: &mut impl BufRead, line: &mut String, input_bytes: &mut usize) -> io::Result<usize> {
+    let bytes = reader.take(SESSION_MAX_RECORD_BYTES as u64 + 1).read_line(line)?;
+    *input_bytes = input_bytes.saturating_add(bytes);
+    if bytes > SESSION_MAX_RECORD_BYTES || *input_bytes > SESSION_MAX_INPUT_BYTES {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "session input exceeds the import resource budget"));
+    }
+    Ok(bytes)
+}
+
+fn select_conversation_cwd(record: &JsonValue, cwd: &mut Option<PathBuf>) -> io::Result<()> {
+    let Some(path) = record.get("cwd").and_then(JsonValue::as_str).map(PathBuf::from) else { return Ok(()); };
+    let path = std::fs::canonicalize(&path).unwrap_or(path);
+    if cwd.as_ref().is_some_and(|existing| existing != &path) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "main conversation contains conflicting working directories"));
+    }
+    *cwd = Some(path);
+    Ok(())
 }
 
 fn custom_title_from_record(record: &JsonValue) -> Option<&str> {

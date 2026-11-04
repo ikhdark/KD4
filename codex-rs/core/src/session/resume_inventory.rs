@@ -11,6 +11,41 @@ use std::path::Path;
 
 pub(crate) use codex_conversation::RESUME_STATE_LOCATOR as LOCATOR;
 
+/// Selection is read-only and conjunctive; it never creates a control grant.
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResumeInventoryFilter {
+    pub parent_cell_id: Option<String>,
+    pub call_id: Option<String>,
+    pub artifact_id: Option<String>,
+    #[serde(default)]
+    pub unresolved_only: bool,
+}
+
+impl ResumeInventoryFilter {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        for value in [&self.parent_cell_id, &self.call_id, &self.artifact_id].into_iter().flatten() {
+            if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
+                return Err("resume_filter identities must be nonempty, at most 512 bytes and contain no control characters".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn has_identity(&self) -> bool {
+        self.parent_cell_id.is_some() || self.call_id.is_some() || self.artifact_id.is_some()
+    }
+
+    fn matches(&self, record: &Value) -> bool {
+        self.parent_cell_id.as_deref().is_none_or(|id| record["parent_cell_id"].as_str() == Some(id))
+            && self.call_id.as_deref().is_none_or(|id| record["call_id"].as_str() == Some(id)
+                || record["parent_call_id"].as_str() == Some(id))
+            && self.artifact_id.as_deref().is_none_or(|id| record["raw_output_artifact_id"].as_str() == Some(id))
+            && (!self.unresolved_only || (!record["terminal_receipt"].is_object()
+                && record["current_status"] != "exited" && record["status"] != "exited"))
+    }
+}
+
 fn checkpoint_records(item: &ResponseItem, index: usize, records: &mut BTreeMap<String, Value>) {
     let Some(inventory) = crate::unified_exec::process_inventory::recorded_inventory(item) else {
         return;
@@ -63,6 +98,18 @@ fn command_records(items: &[RolloutItem]) -> BTreeMap<String, Value> {
         let key = format!("command:{}:{}:{}", command.id,
             command.process_id.as_deref().unwrap_or("unknown"),
             metadata.and_then(|metadata| metadata.incarnation.as_deref()).unwrap_or("unknown"));
+        if command.execution_id.is_some()
+            && metadata.and_then(|metadata| metadata.incarnation.as_deref()).is_some()
+        {
+            let unknown_key = format!("command:{}:{}:unknown", command.id,
+                command.process_id.as_deref().unwrap_or("unknown"));
+            if records.get(&unknown_key).is_some_and(|record: &Value| {
+                record["execution_id"] == json!(command.execution_id)
+                    && !record["terminal_receipt"].is_object()
+            }) {
+                records.remove(&unknown_key);
+            }
+        }
         let previous = records.get(&key).and_then(|record: &Value| record.get("terminal_receipt"))
             .filter(|receipt| receipt.is_object()).cloned();
         if previous.is_some() && metadata.is_none_or(|metadata| !metadata.process_exited) {
@@ -212,6 +259,7 @@ impl Session {
         &self,
         home: &Path,
         active_turn: &str,
+        filter: Option<&ResumeInventoryFilter>,
     ) -> Result<String, String> {
         let path = self
             .current_rollout_path()
@@ -222,7 +270,7 @@ impl Session {
             .await
             .map_err(|error| error.to_string())?;
         let active_turn = active_turn.to_string();
-        let (mut records, unresolved_invocations) = tokio::task::spawn_blocking(move || {
+        let (mut records, mut unresolved_invocations) = tokio::task::spawn_blocking(move || {
             let records = command_records(&items);
             // In-flight calls in this turn still have their original owner.
             // Do not classify the inventory call itself as a lost result.
@@ -252,6 +300,19 @@ impl Session {
         for record in records.values_mut() {
             reconcile(record, &owners);
         }
+        let total_operations = records.len();
+        if let Some(filter) = filter {
+            records.retain(|_, record| filter.matches(record));
+            unresolved_invocations.retain(|record| filter.matches(record));
+            owners.retain(|owner| {
+                (!filter.unresolved_only || owner["status"] != "exited")
+                    && (!filter.has_identity() || filter.matches(owner)
+                        || records.values().any(|record| record["session_id"].is_number()
+                            && record["session_id"] == owner["session_id"]
+                            && record["incarnation"].is_string()
+                            && record["incarnation"] == owner["incarnation"]))
+            });
+        }
         let history = self.clone_history().await;
         let mut references = history
             .tool_history_state_ref()
@@ -263,6 +324,19 @@ impl Session {
             if let Some(id) = record["raw_output_artifact_id"].as_str() {
                 references.entry(id.to_string()).or_insert(None);
             }
+        }
+        if let Some(filter) = filter {
+            references.retain(|id, _| {
+                filter.artifact_id.as_deref().is_none_or(|expected| id == expected)
+                    && (filter.artifact_id.is_some() && filter.parent_cell_id.is_none()
+                        && filter.call_id.is_none() && !filter.unresolved_only
+                        || filter.parent_cell_id.is_none() && !filter.unresolved_only
+                            && filter.call_id.as_deref().is_some_and(|call|
+                                history.tool_history_state_ref().retention_recovery_obligation(id)
+                                    ["origin_call_id"].as_str() == Some(call))
+                        || records.values().chain(owners.iter())
+                            .any(|record| record["raw_output_artifact_id"].as_str() == Some(id.as_str())))
+            });
         }
         let mut evidence = Vec::new();
         for (id, expected) in references {
@@ -288,9 +362,10 @@ impl Session {
             evidence.push(audit);
         }
         let records = records.into_values().collect::<Vec<_>>();
-        let inventory = json!({
+        let mut inventory = json!({
             "kind": "resume_state_inventory", "version": 1,
             "observed_at": chrono::Utc::now().to_rfc3339(),
+            "selection": filter, "unfiltered_durable_operations": total_operations,
             "scope": "retained durable command lifecycle/process checkpoints and unmatched prior-turn invocations, current process owner, and history/command artifact references; omitted historical records and unrecorded effects remain unknown",
             "observation": "non_atomic_point_in_time; no output consumed, content examined, control granted, termination inferred or work restarted",
             "rollout_parse_errors": parse_errors, "rollout_parse_complete": parse_errors == 0,
@@ -303,6 +378,48 @@ impl Session {
             "operations": records, "current_process_owner": owners,
             "retained_evidence": evidence, "unresolved_invocations": unresolved_invocations,
             "recovery": "Use original owner-issued handles/capabilities and retained evidence recipes. Missing/stale ownership is not exit, failure, non-execution or permission to retry. Live Code Mode cells are not reconstructed from script text; use their originating exec/wait owner.",
+        });
+        // Keep the complete immutable inventory recoverable, but default to
+        // bounded identities and exact pointers, never historical output bodies.
+        let operations = inventory["operations"].as_array().into_iter().flatten()
+            .enumerate().filter(|(_, record)| filter.is_some() || record["outcome"] != "durable_terminal_receipt")
+            .take(32).map(|(index, record)| json!({
+                "pointer": format!("/operations/{index}"),
+                "call_id": record["call_id"], "session_id": record["session_id"],
+                "incarnation": record["incarnation"], "outcome": record["outcome"],
+                "owner_verification": record["owner_verification"],
+                "parent_cell_id": record["parent_cell_id"],
+                "raw_output_artifact_id": record["raw_output_artifact_id"],
+                "terminal_receipt": record["terminal_receipt"],
+            })).collect::<Vec<_>>();
+        let invocations = inventory["unresolved_invocations"].as_array().into_iter().flatten()
+            .enumerate().take(32).map(|(index, _)| json!({
+                "pointer": format!("/unresolved_invocations/{index}"),
+            })).collect::<Vec<_>>();
+        let owners = inventory["current_process_owner"].as_array().into_iter().flatten()
+            .enumerate().filter(|(_, owner)| owner["status"] != "exited")
+            .take(32).map(|(index, owner)| json!({
+                "pointer": format!("/current_process_owner/{index}"),
+                "session_id": owner["session_id"], "incarnation": owner["incarnation"],
+                "status": owner["status"], "shutdown": owner["shutdown"],
+                "verified_live": owner["verified_live"],
+            })).collect::<Vec<_>>();
+        let evidence = inventory["retained_evidence"].as_array().into_iter().flatten()
+            .enumerate().take(32).map(|(index, evidence)| json!({
+                "pointer": format!("/retained_evidence/{index}"),
+                "reference": evidence["recorded_reference"],
+                "identity_matches_record": evidence["identity_matches_record"],
+            })).collect::<Vec<_>>();
+        inventory["outstanding"] = json!({
+            "kind": "resume_state_summary", "version": 1,
+            "observed_at": inventory["observed_at"], "counts": inventory["counts"],
+            "selection": inventory["selection"], "unfiltered_durable_operations": total_operations,
+            "observation": inventory["observation"],
+            "rollout_parse_complete": inventory["rollout_parse_complete"],
+            "operations": operations, "unresolved_invocations": invocations,
+            "retained_evidence": evidence,
+            "current_process_owner": owners, "limit_per_group": 32,
+            "recovery": "Use read_tool_output on this read's retained artifact with the exact JSON pointers above. For remaining rows use structured selectors over /operations, /unresolved_invocations, /current_process_owner or /retained_evidence; do not reconstruct the inventory to page it. Counts include omitted rows. No new control authority is granted.",
         });
         serde_json::to_string_pretty(&inventory).map_err(|error| error.to_string())
     }

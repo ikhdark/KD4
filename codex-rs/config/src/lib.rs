@@ -117,6 +117,7 @@ pub use diagnostics::format_config_error;
 pub use diagnostics::format_config_error_with_source;
 pub use diagnostics::io_error_from_config_error;
 pub use fingerprint::version_for_toml;
+pub use fingerprint::version_for_json;
 pub use hook_config::HookEventsToml;
 pub use hook_config::HookHandlerConfig;
 pub use hook_config::HookRunScope;

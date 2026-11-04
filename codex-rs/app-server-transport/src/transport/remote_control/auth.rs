@@ -106,13 +106,17 @@ pub(super) async fn recover_remote_control_auth(
 
         let mode = auth_recovery.mode_name();
         let step = auth_recovery.step_name();
-        let auth_change_revision_before_recovery = *auth_change_rx.borrow();
+        let (auth_change_revision_before_recovery, unread_before_recovery) = {
+            let revision = auth_change_rx.borrow();
+            (*revision, auth_change_rx.has_changed().unwrap_or(true))
+        };
         match auth_recovery.next_with_auth(&rejected_auth.auth).await {
             Ok(step_result) => {
                 if step_result.auth_state_changed() == Some(true) {
                     mark_recovery_auth_change_seen(
                         auth_change_rx,
                         auth_change_revision_before_recovery,
+                        unread_before_recovery,
                     );
                 }
                 info!(
@@ -136,9 +140,12 @@ pub(super) async fn recover_remote_control_auth(
 pub(super) fn mark_recovery_auth_change_seen(
     auth_change_rx: &mut watch::Receiver<u64>,
     auth_change_revision_before_recovery: u64,
+    unread_before_recovery: bool,
 ) {
     let auth_change_revision_after_recovery = *auth_change_rx.borrow_and_update();
-    if auth_change_revision_after_recovery != auth_change_revision_before_recovery.wrapping_add(1) {
+    if unread_before_recovery
+        || auth_change_revision_after_recovery != auth_change_revision_before_recovery.wrapping_add(1)
+    {
         // Recovery updated the same watch that wakes the outer reconnect
         // loop. Mark only that single revision seen; if more revisions
         // arrived while recovery was in flight, leave them pending so the

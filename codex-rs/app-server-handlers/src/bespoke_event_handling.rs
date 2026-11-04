@@ -75,7 +75,6 @@ use codex_app_server_protocol_types::TurnStartedNotification;
 use codex_app_server_protocol_types::TurnStatus;
 use codex_app_server_protocol_types::TurnTiming;
 use codex_app_server_protocol_types::WarningNotification;
-use codex_app_server_protocol_types::command_display_string;
 use codex_app_server_protocol_projection::item_event_to_server_notification;
 use codex_core::CodexThread;
 use codex_core::ThreadManager;
@@ -408,7 +407,7 @@ pub(crate) async fn apply_bespoke_event_handling(
             {
                 CommandExecutionApprovalPresentation::Network(network_approval_context)
             } else {
-                let command_string = command_display_string(&command);
+                let command_string = codex_app_server_protocol_types::command_display_string_for_path_uri(&command, &completion_cwd);
                 let completion_item = CommandExecutionCompletionItem {
                     command: command_string,
                     cwd: completion_cwd.into(),
@@ -609,10 +608,6 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
             let requested_permissions = request.permissions.clone();
             let config_snapshot = conversation.config_snapshot().await;
-            let request_cwd = request
-                .cwd
-                .clone()
-                .unwrap_or_else(|| config_snapshot.cwd().clone());
             let request_cwd_uri = if let Some(cwd_uri) = request
                 .cwd_uri
                 .clone()
@@ -620,12 +615,30 @@ pub(crate) async fn apply_bespoke_event_handling(
             {
                 cwd_uri
             } else {
-                config_snapshot
-                    .environment_selections()
-                    .first()
-                    .map(|environment| environment.cwd.clone())
-                    .unwrap_or_else(|| PathUri::from_abs_path(config_snapshot.cwd()))
+                let environments = config_snapshot.environment_selections();
+                let mut matching = environments.iter().filter(|environment| {
+                    request.environment_id.as_deref().is_none_or(|id| id == environment.environment_id)
+                });
+                match (matching.next(), matching.next()) {
+                    (Some(environment), None) => environment.cwd.clone(),
+                    (None, None) if request.environment_id.is_none() && environments.is_empty() =>
+                        PathUri::from_abs_path(config_snapshot.cwd()),
+                    _ => {
+                        error!("permission request has no unambiguous environment working directory");
+                        let _ = conversation.submit(Op::RequestPermissionsResponse {
+                            id: request.call_id,
+                            response: CoreRequestPermissionsResponse {
+                                permissions: Default::default(),
+                                scope: CorePermissionGrantScope::Turn,
+                            },
+                        }).await;
+                        return;
+                    }
+                }
             };
+            let request_cwd = request.cwd.clone()
+                .or_else(|| request_cwd_uri.to_abs_path().ok())
+                .unwrap_or_else(|| config_snapshot.cwd().clone());
             let params = PermissionsRequestApprovalParams {
                 thread_id: conversation_id.to_string(),
                 turn_id: request.turn_id.clone(),
@@ -791,14 +804,15 @@ pub(crate) async fn apply_bespoke_event_handling(
         EventMsg::ViewImageToolCall(_) => {}
         EventMsg::ItemStarted(event) => {
             let should_emit = match &event.item {
-                // Approval flows can emit the command start notification before core
-                // emits the canonical item. Reuse the same set to suppress that duplicate.
+                // An approval placeholder is not a canonical start: execution
+                // identity and lineage only become available on this event.
                 CoreTurnItem::CommandExecution(item) => thread_state
                     .lock()
                     .await
                     .turn_summary_for_mut(&event.turn_id)
                     .is_none_or(|summary| {
-                        summary.command_execution_started.insert(item.id.clone())
+                        summary.command_execution_started.insert(item.id.clone());
+                        summary.command_execution_canonical_started.insert(item.id.clone())
                     }),
                 _ => true,
             };
@@ -907,15 +921,13 @@ pub(crate) async fn apply_bespoke_event_handling(
         }
         // If this is a TurnAborted, reply to any pending interrupt requests.
         EventMsg::TurnAborted(turn_aborted_event) => {
-            if thread_state
+            let is_current = thread_state
                 .lock()
                 .await
-                .is_current_summary_turn(&event_turn_id)
-            {
+                .is_current_summary_turn(&event_turn_id);
+            let reason = turn_aborted_event.reason.clone();
+            if is_current {
                 outgoing.abort_pending_server_requests().await;
-                thread_watch_manager
-                    .note_turn_aborted(&conversation_id.to_string(), &turn_aborted_event.reason)
-                    .await;
             }
             respond_to_pending_interrupts(&thread_state, &outgoing, &event_turn_id).await;
             handle_turn_interrupted(
@@ -926,6 +938,12 @@ pub(crate) async fn apply_bespoke_event_handling(
                 &thread_state,
             )
             .await;
+            // Preserve the same terminal-receipt barrier as normal completion.
+            if is_current {
+                thread_watch_manager
+                    .note_turn_aborted(&conversation_id.to_string(), &reason)
+                    .await;
+            }
         }
         EventMsg::ThreadRolledBack(_rollback_event) => {
             let pending = {
@@ -1130,6 +1148,7 @@ async fn apply_canonical_item_completed_side_effects(
         CoreTurnItem::CommandExecution(item) => {
             if let Some(summary) = thread_state.lock().await.turn_summary_for_mut(turn_id) {
                 summary.command_execution_started.remove(&item.id);
+                summary.command_execution_canonical_started.remove(&item.id);
             }
         }
         CoreTurnItem::SubAgentActivity(activity)

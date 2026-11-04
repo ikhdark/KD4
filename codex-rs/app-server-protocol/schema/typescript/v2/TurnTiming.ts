@@ -77,11 +77,11 @@ performanceObservations?: unknown,
  * Content identity of tracked and non-ignored untracked files captured
  * before this turn's tools ran. Absent means capture was unavailable.
  */
-checkoutSnapshotSha256?: string, schemaVersion: number, profileValid: boolean, classificationComplete: boolean, startedAtUnixMs: number | null, completedAtUnixMs: number | null, inclusiveDurationNs: bigint, inclusiveDurationMs: bigint,
+checkoutSnapshotSha256?: string, schemaVersion: number, profileValid: boolean, classificationComplete: boolean, startedAtUnixMs: number | null, completedAtUnixMs: number | null, inclusiveDurationNs: number, inclusiveDurationMs: number,
 /**
  * Inclusive duration minus only the interactive-only wait partition.
  */
-machineDurationNs: bigint, machineDurationMs: bigint, exclusive: TurnTimingExclusive, unions: TurnTimingUnions, local: TurnTimingLocal, milestones: TurnTimingMilestones, counters: TurnTimingCounters,
+machineDurationNs: number, machineDurationMs: number, exclusive: TurnTimingExclusive, unions: TurnTimingUnions, local: TurnTimingLocal, milestones: TurnTimingMilestones, counters: TurnTimingCounters,
 /**
  * Legacy timings from the retired turn-finalization pipeline.
  * Absent or null means not measured; current runtimes omit this field.

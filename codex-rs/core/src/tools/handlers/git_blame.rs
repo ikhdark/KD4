@@ -3,7 +3,6 @@ use std::collections::BTreeMap;
 use codex_git_utils::BlameSource;
 use codex_git_utils::MAX_BLAME_LINES;
 use codex_tools::JsonSchema;
-use codex_tools::JsonToolOutput;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
@@ -13,9 +12,9 @@ use serde_json::json;
 use crate::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
-use crate::tools::context::boxed_tool_output;
+use crate::tools::handlers::git_inspection::git_read_output;
+use crate::tools::handlers::git_inspection::prepare_git_read;
 use crate::tools::handlers::parse_arguments;
-use crate::tools::handlers::wait_for_tool_environment;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 
@@ -95,27 +94,13 @@ impl ToolExecutor<ToolInvocation> for GitBlameHandler {
                     "git_blame requires 1-{MAX_BLAME_LINES} lines in a one-based inclusive range"
                 )));
             }
-            let environment = wait_for_tool_environment(
-                &invocation.step_context.environments,
+            let environment = prepare_git_read(
+                &invocation,
                 args.environment_id.as_deref(),
-                &invocation.cancellation_token,
+                "git_blame",
+                "remote/restricted Git reads are not supported",
             )
-            .await?
-            .ok_or_else(|| {
-                FunctionCallError::RespondToModel(
-                    "git_blame requires a selected local environment".into(),
-                )
-            })?;
-            if environment.environment.is_remote()
-                || !invocation
-                    .step_context
-                    .turn
-                    .file_system_sandbox_policy()
-                    .has_full_disk_read_access()
-            {
-                return Err(FunctionCallError::RespondToModel("git_blame requires a local environment with full disk read access; remote/restricted Git reads are not supported".into()));
-            }
-            crate::tools::parallel::wait_for_workspace_baseline().await;
+            .await?;
             let cwd = environment
                 .cwd()
                 .to_abs_path()
@@ -129,16 +114,14 @@ impl ToolExecutor<ToolInvocation> for GitBlameHandler {
                 result = codex_git_utils::blame_range(cwd.to_path_buf(), args.path,
                     args.revision.unwrap_or_else(|| "HEAD".into()), source, args.start, args.end) => result.map_err(FunctionCallError::RespondToModel)?,
             };
-            let mut output = serde_json::to_value(result)
+            let output = serde_json::to_value(result)
                 .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
-            output["environment_id"] = json!(environment.environment_id);
-            let output = JsonToolOutput::new(output);
-            crate::tools::context::ensure_exact_model_delivery(&output, &invocation).map_err(
-                |_| {
-                    FunctionCallError::RespondToModel("git_blame result exceeds the current model delivery budget; nothing was delivered. Request a smaller line range.".into())
-                },
-            )?;
-            Ok(boxed_tool_output(output))
+            git_read_output(
+                output,
+                &environment.environment_id,
+                &invocation,
+                || "git_blame result exceeds the current model delivery budget; nothing was delivered. Request a smaller line range.".into(),
+            )
         })
     }
 }

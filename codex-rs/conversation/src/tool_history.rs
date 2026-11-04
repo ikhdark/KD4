@@ -1232,12 +1232,16 @@ pub fn pressure_retirement_checkpoint(
 ) -> ResponseItem {
     let receipts = call_ids
         .iter()
-        .map(|call_id| (call_id.clone(), serde_json::json!({})))
+        .map(|call_id| (call_id.clone(), serde_json::json!({"via": "call_id_lookup"})))
         .collect::<serde_json::Map<_, _>>();
     let payload = serde_json::json!({
         "source": PRESSURE_RETIREMENT_SOURCE,
         "trigger": trigger.as_str(),
-        "note": "The runtime replaced these consumed tool results with recovery pins to keep the context window under its limit. Each pin names its artifact; read_tool_output recovers exact bytes when they are needed again.",
+        "recovery_lookup": {"tool": "read_file", "path": "context:resume-state",
+            "filter_field": "resume_filter.call_id", "key_source": "receipts object key",
+            "scope": "lookup keys, not independently authenticated artifact or semantic-review receipts"},
+        "note": "The runtime retired consumed tool results to exact recovery pins. Receipts below name call lookup keys, not artifact identities. Use their filtered resume-state route; missing durable evidence remains explicitly unresolved. Retirement is not semantic review or task completion.",
+        "budget_rule": "Routine recoverable retirement (proactive or context_limit) is uncounted. Only compaction/summarization or retirement beyond kept generations spends a spawned agent context event; the sampling budget notice reports its authoritative count.",
         "receipts": receipts,
     });
     ResponseItem::Message {

@@ -29,6 +29,19 @@ function Set-CodexRustSccacheEnvironment {
     $env:SCCACHE_CACHE_SIZE = Get-CodexRustSccacheCacheSize
 }
 
+function Set-CodexRustDirectCompilerEnvironment {
+    foreach ($name in @("RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER")) {
+        $value = [Environment]::GetEnvironmentVariable($name, "Process")
+        if ($null -eq $value) {
+            $value = [Environment]::GetEnvironmentVariable("CARGO_BUILD_$name", "Process")
+        }
+        if ($null -eq $value -or [IO.Path]::GetFileNameWithoutExtension($value) -ieq "sccache") {
+            # An empty override also disables Cargo's configured wrapper.
+            Set-Item -Path "Env:$name" -Value ""
+        }
+    }
+}
+
 function ConvertTo-CodexRustByteSize {
     param(
         [string]$Value
@@ -104,33 +117,9 @@ function Ensure-CodexRustSccacheServer {
         [string]$RepoRoot
     )
 
-    if (-not (Get-Command sccache -ErrorAction SilentlyContinue)) {
-        return
-    }
-
-    Set-CodexRustSccacheEnvironment -RepoRoot $RepoRoot
-    # Windows PowerShell 5.1 turns redirected native stderr into terminating
-    # errors while $ErrorActionPreference is "Stop", which would bypass the
-    # graceful $LASTEXITCODE fallbacks below.
-    $oldErrorActionPreference = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    try {
-        $stats = @(sccache --show-stats 2>$null)
-        if ($LASTEXITCODE -ne 0) {
-            return
-        }
-        if (Test-CodexRustSccacheStatsCacheSize -Stats $stats) {
-            return
-        }
-
-        # A cache-size mismatch does not establish that the shared server is
-        # idle. Leave other lanes' compilations alone; only the explicit
-        # sccache-restart maintenance command may stop the server.
-        Write-Warning ('the running sccache server reports max cache size {0}, but the configured size is {1}; run "just sccache-restart" when builds are idle to apply it.' -f (Get-CodexRustSccacheStatsMaxCacheSize -Stats $stats), (Get-CodexRustSccacheCacheSize))
-    }
-    finally {
-        $ErrorActionPreference = $oldErrorActionPreference
-    }
+    # Legacy publisher entrypoint: direct compilation must not contact or
+    # auto-start the shared cache, even to query statistics.
+    Set-CodexRustDirectCompilerEnvironment
 }
 
 function Get-CodexRustLldLinkPath {

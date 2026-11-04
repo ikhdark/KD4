@@ -6,10 +6,10 @@ use super::protocol::ServerEvent;
 use super::protocol::StreamId;
 use base64::DecodeSliceError;
 use base64::Engine;
-use codex_app_server_protocol_types::JSONRPCMessage;
 use std::collections::HashMap;
 use std::io;
 use std::io::ErrorKind;
+use std::sync::Arc;
 use tokio::time::Instant;
 use tracing::warn;
 
@@ -40,11 +40,15 @@ struct ClientSegmentMetadata {
 #[derive(Default)]
 pub(super) struct ClientSegmentReassembler {
     assemblies: HashMap<(ClientId, StreamId), ClientSegmentAssembly>,
+    // A socket can end after its last chunk but before application admission.
+    // Retain completion custody across reconnect until the receive frontier commits.
+    completed: HashMap<(ClientId, StreamId, u64), Arc<Vec<u8>>>,
     reserved_bytes: usize,
 }
 
 pub(super) enum ClientSegmentObservation {
     Forward(Box<ClientEnvelope>),
+    Reassembled(Box<ClientEnvelope>, Arc<Vec<u8>>),
     Pending,
     Dropped,
 }
@@ -87,6 +91,9 @@ impl ClientSegmentReassembler {
             );
             return ClientSegmentObservation::Dropped;
         };
+        if let Some(raw) = self.completed.get(&(envelope.client_id.clone(), stream_id.clone(), metadata.seq_id)) {
+            return ClientSegmentObservation::Reassembled(Box::new(envelope), raw.clone());
+        }
         if self.should_ignore_chunk(&envelope.client_id, &stream_id, metadata.seq_id, segment_id) {
             return ClientSegmentObservation::Dropped;
         }
@@ -124,6 +131,9 @@ impl ClientSegmentReassembler {
 
         let now = Instant::now();
         let key = (envelope.client_id.clone(), stream_id.clone());
+        if segment_id == 0 && self.assemblies.get(&key).is_some_and(|assembly| assembly.metadata != metadata) {
+            self.remove_assembly(&envelope.client_id, &stream_id);
+        }
         if !self.assemblies.contains_key(&key) {
             if segment_id != 0
                 || message_size_bytes
@@ -132,6 +142,9 @@ impl ClientSegmentReassembler {
                 return ClientSegmentObservation::Dropped;
             }
             self.evict_assemblies_if_full();
+            if self.assemblies.len() + self.completed.len() >= REMOTE_CONTROL_SEGMENT_ASSEMBLY_MAX_COUNT {
+                return ClientSegmentObservation::Dropped;
+            }
             // Reserve the declared final size, not just the currently decoded
             // prefix. Independent streams share the existing aggregate ceiling.
             self.reserved_bytes += message_size_bytes;
@@ -194,16 +207,7 @@ impl ClientSegmentReassembler {
                             );
                             AssemblyUpdate::Drop
                         } else {
-                            match serde_json::from_slice::<JSONRPCMessage>(&assembly.raw) {
-                                Ok(message) => AssemblyUpdate::Complete(message),
-                                Err(err) => {
-                                    warn!(
-                                        client_id = envelope.client_id.0.as_str(),
-                                        "dropping invalid reassembled remote-control client envelope: {err}"
-                                    );
-                                    AssemblyUpdate::Drop
-                                }
-                            }
+                            AssemblyUpdate::Complete(Arc::new(std::mem::take(&mut assembly.raw)))
                         }
                     }
                     Err(DecodeSliceError::OutputSliceTooSmall) => {
@@ -231,12 +235,11 @@ impl ClientSegmentReassembler {
                 self.remove_assembly(&envelope.client_id, &stream_id);
                 ClientSegmentObservation::Dropped
             }
-            AssemblyUpdate::Complete(message) => {
-                self.remove_assembly(&envelope.client_id, &stream_id);
-                ClientSegmentObservation::Forward(Box::new(ClientEnvelope {
-                    event: ClientEvent::ClientMessage { message },
-                    ..envelope
-                }))
+            AssemblyUpdate::Complete(raw) => {
+                // Transfer the reservation; completed bytes are still retained.
+                self.assemblies.remove(&key);
+                self.completed.insert((key.0, key.1, metadata.seq_id), raw.clone());
+                ClientSegmentObservation::Reassembled(Box::new(envelope), raw)
             }
         }
     }
@@ -254,8 +257,24 @@ impl ClientSegmentReassembler {
         });
     }
 
+    pub(super) fn commit_completed(&mut self, client_id: &ClientId, stream_id: &StreamId, seq_id: u64) {
+        if let Some(raw) = self.completed.remove(&(client_id.clone(), stream_id.clone(), seq_id)) {
+            self.reserved_bytes -= raw.len();
+        }
+    }
+
+    pub(super) fn invalidate_incomplete_stream(&mut self, client_id: &ClientId, stream_id: &StreamId) {
+        self.remove_assembly(client_id, stream_id);
+    }
+
     pub(super) fn invalidate_stream(&mut self, client_id: &ClientId, stream_id: &StreamId) {
         self.remove_assembly(client_id, stream_id);
+        self.completed.retain(|(client, stream, _), raw| {
+            if client == client_id && stream == stream_id {
+                self.reserved_bytes -= raw.len();
+                false
+            } else { true }
+        });
     }
 
     pub(super) fn invalidate_client(&mut self, client_id: &ClientId) {
@@ -268,6 +287,12 @@ impl ClientSegmentReassembler {
         for (client, stream) in keys {
             self.remove_assembly(&client, &stream);
         }
+        self.completed.retain(|(client, _, _), raw| {
+            if client == client_id {
+                self.reserved_bytes -= raw.len();
+                false
+            } else { true }
+        });
     }
 
     pub(super) fn should_ignore_chunk(
@@ -280,7 +305,7 @@ impl ClientSegmentReassembler {
         self.assemblies
             .get(&(client_id.clone(), stream_id.clone()))
             .is_some_and(|assembly| {
-                seq_id < assembly.metadata.seq_id
+                (seq_id < assembly.metadata.seq_id && segment_id != 0)
                     || (seq_id == assembly.metadata.seq_id && segment_id < assembly.next_segment_id)
             })
     }
@@ -295,7 +320,7 @@ impl ClientSegmentReassembler {
     }
 
     fn evict_assemblies_if_full(&mut self) {
-        while self.assemblies.len() >= REMOTE_CONTROL_SEGMENT_ASSEMBLY_MAX_COUNT {
+        while self.assemblies.len() + self.completed.len() >= REMOTE_CONTROL_SEGMENT_ASSEMBLY_MAX_COUNT {
             let Some((client_id, stream_id)) = self
                 .assemblies
                 .iter()
@@ -313,7 +338,7 @@ enum AssemblyUpdate {
     Pending,
     Ignore,
     Drop,
-    Complete(JSONRPCMessage),
+    Complete(Arc<Vec<u8>>),
 }
 
 impl ClientSegmentMetadata {

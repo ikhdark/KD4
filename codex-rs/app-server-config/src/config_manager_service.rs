@@ -23,7 +23,6 @@ use codex_config::is_multi_agent_v2_feature_path;
 use codex_config::merge_owned_config_values;
 use codex_config::normalize_multi_agent_v2_feature_value;
 use codex_core::config::deserialize_config_toml_with_base;
-use codex_core::config::edit::ConfigApplyOutcome;
 use codex_core::config::edit::ConfigEdit;
 use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core::config::resolve_configured_features;
@@ -233,24 +232,10 @@ impl ConfigManager {
         // while the atomic writer compares the raw TOML under its file lock.
         // Feature normalization preserves intent against the latest document.
         // Reject an intervening write rather than validate/report an older view.
-        let preserves_feature_intent = edits.iter().any(|(key_path, value, _)| {
-            parse_key_path(key_path).is_ok_and(|segments| match segments.as_slice() {
-                [features, feature, ..] => {
-                    features == "features" && feature == "multi_agent_v2"
-                }
-                [features] if features == "features" => value
-                    .as_object()
-                    .is_some_and(|features| features.contains_key("multi_agent_v2")),
-                _ => false,
-            })
-        });
-        let writer_expected_version = if expected_version.is_some() || preserves_feature_intent {
-            Some(codex_config::version_for_toml(
-                &read_raw_user_config(&provided_path).await?,
-            ))
-        } else {
-            None
-        };
+        let writer_expected_version = Some(codex_config::version_for_toml(
+            &read_raw_user_config(&provided_path).await?,
+        ));
+        let policy_generation = self.policy_generation();
         let layers = self
             .load_thread_agnostic_config()
             .await
@@ -344,6 +329,8 @@ impl ConfigManager {
             parsed_segments.push(semantic_segments);
         }
 
+        // Plain decoding additionally rejects relative AbsolutePathBuf values;
+        // retain that API validation rather than silently broaden accepted input.
         validate_config(&user_config).map_err(|err| {
             ConfigManagerError::write(
                 ConfigWriteErrorCode::ConfigValidationError,
@@ -378,29 +365,35 @@ impl ConfigManager {
             )
         })?;
 
-        let apply_outcome = ConfigEditsBuilder::for_config_path(provided_path.as_path())
+        let builder = ConfigEditsBuilder::for_config_path(provided_path.as_path())
             .with_edits(config_edits)
-            .with_expected_version(writer_expected_version)
-            .apply_with_outcome()
+            .with_expected_version(writer_expected_version);
+        let manager = self.clone();
+        // Keep policy publication fenced through the existing locked writer.
+        // This synchronous guard lives on the blocking owner, never across an
+        // async suspension or on the RPC caller's cancellation lifetime.
+        let committed_config = tokio::task::spawn_blocking(move || {
+            manager.with_current_policy(policy_generation, || builder.apply_blocking_with_config())
+        })
             .await
+            .map_err(|err| ConfigManagerError::io("config persistence task failed", std::io::Error::other(err)))?
+            .map_err(|err| ConfigManagerError::io("configuration policy changed before commit", err))?
             .map_err(|err| ConfigManagerError::anyhow("failed to persist config.toml", err))?;
-        if apply_outcome == ConfigApplyOutcome::VersionConflict {
+        let Some(committed_config) = committed_config else {
             return Err(ConfigManagerError::write(
                 ConfigWriteErrorCode::ConfigVersionConflict,
                 "Configuration was modified since last read. Fetch latest version and retry.",
             ));
-        }
+        };
 
         // Successful writes must be visible to the next per-cwd read, even
         // when no live thread exists to receive a runtime config refresh.
         self.invalidate_load_cache();
 
-        // Report the persisted effective layer, not a projection that may differ
-        // after migration or an intervening writer's independent changes.
-        let updated_layers = self
-            .load_thread_agnostic_config()
-            .await
-            .map_err(|err| ConfigManagerError::io("failed to reload written configuration", err))?;
+        // The locked writer captured the exact serialized commit, including
+        // implicit empty-table removal. No unlocked or fallible reload follows.
+        let committed_version = codex_config::version_for_toml(&committed_config);
+        let updated_layers = layers.with_user_config(&provided_path, committed_config);
         let effective = updated_layers.effective_config();
         let overridden = first_overridden_edit(&updated_layers, &effective, &parsed_segments);
         let status = overridden
@@ -410,16 +403,7 @@ impl ConfigManager {
 
         Ok(ConfigWriteResponse {
             status,
-            version: updated_layers
-                .get_active_user_layer()
-                .ok_or_else(|| {
-                    ConfigManagerError::write(
-                        ConfigWriteErrorCode::UserLayerNotFound,
-                        "user layer not found in updated layers",
-                    )
-                })?
-                .version
-                .clone(),
+            version: committed_version,
             file_path: provided_path,
             overridden_metadata: overridden,
         })
@@ -485,6 +469,11 @@ fn parse_value(value: JsonValue) -> Result<Option<TomlValue>, String> {
 }
 
 pub fn parse_key_path(path: &str) -> Result<Vec<String>, String> {
+    const MAX_KEY_PATH_BYTES: usize = 4096;
+    const MAX_KEY_PATH_SEGMENTS: usize = 64;
+    if path.len() > MAX_KEY_PATH_BYTES {
+        return Err(format!("keyPath must not exceed {MAX_KEY_PATH_BYTES} bytes"));
+    }
     if path.trim().is_empty() {
         return Err("keyPath must not be empty".to_string());
     }
@@ -493,14 +482,21 @@ pub fn parse_key_path(path: &str) -> Result<Vec<String>, String> {
     let mut segment = String::new();
     let mut chars = path.chars();
     let mut quoted = false;
+    let mut quote_closed = false;
 
     // Split on dots unless they appear inside a quoted segment. Bare segments
     // intentionally stay permissive so existing paths like `sample@catalog`
     // remain valid.
     while let Some(ch) = chars.next() {
+        if quote_closed && ch != '.' {
+            return Err("quoted keyPath segment must be followed by a dot or end of input".to_string());
+        }
         match ch {
             '"' if segment.is_empty() && !quoted => quoted = true,
-            '"' if quoted => quoted = false,
+            '"' if quoted => {
+                quoted = false;
+                quote_closed = true;
+            }
             '\\' if quoted => {
                 // Quoted segments may escape punctuation that would otherwise
                 // participate in parsing, such as `.` or `"`.
@@ -514,6 +510,10 @@ pub fn parse_key_path(path: &str) -> Result<Vec<String>, String> {
                     return Err("keyPath segments must not be empty".to_string());
                 }
                 segments.push(std::mem::take(&mut segment));
+                if segments.len() >= MAX_KEY_PATH_SEGMENTS {
+                    return Err(format!("keyPath must not exceed {MAX_KEY_PATH_SEGMENTS} segments"));
+                }
+                quote_closed = false;
             }
             '"' => return Err("invalid quoted keyPath segment".to_string()),
             _ => segment.push(ch),
@@ -542,6 +542,22 @@ fn apply_merge(
     value: Option<&TomlValue>,
     strategy: MergeStrategy,
 ) -> Result<bool, MergeError> {
+    // Reads support array indices, but this write API only mutates table keys.
+    // Reject traversal before the special table-upsert path can normalize an
+    // array into a different tree and before no-op elimination can hide it.
+    let mut ancestor = &*root;
+    for segment in segments {
+        match ancestor {
+            TomlValue::Array(_) => return Err(MergeError::Validation(
+                "array-element keyPath mutations are not supported; replace the array instead".to_string(),
+            )),
+            TomlValue::Table(table) => match table.get(segment) {
+                Some(next) => ancestor = next,
+                None => break,
+            },
+            _ => break,
+        }
+    }
     let Some(value) = value else {
         return clear_path(root, segments);
     };
@@ -589,12 +605,7 @@ fn apply_merge(
                     .or_insert_with(|| TomlValue::Table(toml::map::Map::new()));
             }
             _ => {
-                *current = TomlValue::Table(toml::map::Map::new());
-                if let TomlValue::Table(table) = current {
-                    current = table
-                        .entry(segment.clone())
-                        .or_insert_with(|| TomlValue::Table(toml::map::Map::new()));
-                }
+                return Err(MergeError::Validation("cannot set value on non-table parent".to_string()));
             }
         }
     }
@@ -638,11 +649,19 @@ fn clear_path(root: &mut TomlValue, segments: &[String]) -> Result<bool, MergeEr
                 };
                 current = next;
             }
+            TomlValue::Array(_) => return Err(MergeError::Validation(
+                "array-element keyPath mutations are not supported; replace the array instead".to_string(),
+            )),
             _ => return Ok(false),
         }
     }
 
     let Some(parent) = current.as_table_mut() else {
+        if current.is_array() {
+            return Err(MergeError::Validation(
+                "array-element keyPath mutations are not supported; replace the array instead".to_string(),
+            ));
+        }
         return Ok(false);
     };
 
@@ -761,6 +780,16 @@ fn compute_override_metadata(
     let user_value = value_at_semantic_path(&user_layer.config, segments);
     let effective_value = value_at_semantic_path(effective, segments);
 
+    // Table merges inherit unrelated lower-precedence leaves. Only requested
+    // user leaves that actually differ can be overridden, not the whole table.
+    if let Some(TomlValue::Table(table)) = user_value {
+        return table.keys().find_map(|key| {
+            let mut leaf = segments.to_vec();
+            leaf.push(key.clone());
+            compute_override_metadata(layers, effective, &leaf)
+        });
+    }
+
     if user_value.is_some() && user_value == effective_value {
         return None;
     }
@@ -799,6 +828,11 @@ fn find_effective_layer(
     segments: &[String],
 ) -> Option<ConfigLayerMetadata> {
     for layer in layers.layers_high_to_low() {
+        // Clearing a user key intentionally exposes lower-precedence defaults.
+        // Neither those defaults nor the user layer itself is an overrider.
+        if matches!(layer.name, ConfigLayerSource::User { .. }) {
+            break;
+        }
         if let Some(meta) = value_at_semantic_path(&layer.config, segments).map(|_| layer.metadata()) {
             return Some(meta);
         }

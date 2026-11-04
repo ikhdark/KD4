@@ -7,17 +7,17 @@ export type TurnTimingDiagnosticTokenAggregate = { coverage?: TokenUsageCoverage
 /**
  * Expected physical usage reports; absent in legacy aggregates.
  */
-expectedUsageCount?: bigint,
+expectedUsageCount?: number,
 /**
  * Attributable reports observed. Totals are lower bounds unless equal to expected.
  */
-observedUsageCount?: bigint, logicalGenerations: number, inputTokens: bigint, cachedInputTokens: bigint,
+observedUsageCount?: number, logicalGenerations: number, inputTokens: number, cachedInputTokens: number,
 /**
  * Same provider remainder as the per-request canonical field. Retained
  * window only when TurnTiming.model_request_history_truncated is true.
  */
-outputExcludingReportedReasoningTokens?: bigint,
+outputExcludingReportedReasoningTokens?: number,
 /**
  * Deprecated compatibility remainder; never add it to the canonical field.
  */
-visibleOutputTokens: bigint, reasoningTokens: bigint, totalTokens: bigint, };
+visibleOutputTokens: number, reasoningTokens: number, totalTokens: number, };

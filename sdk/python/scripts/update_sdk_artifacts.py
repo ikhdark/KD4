@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import ast
 import importlib.util
 import json
 import os
@@ -650,18 +651,70 @@ def _normalize_nullable_typed_maps(schema: Any) -> None:
 def _normalize_open_ended_error_enum(definition: dict[str, Any]) -> None:
     variants = definition.pop("oneOf", definition.get("anyOf", []))
     definition["anyOf"] = [
-        variant
-        for variant in variants
-        if "enum" in variant or "properties" in variant
+        variant for variant in variants if "enum" in variant or "properties" in variant
     ]
     object_fallback = {"type": "object", "additionalProperties": {}}
     if object_fallback not in definition["anyOf"]:
         definition["anyOf"].append(object_fallback)
 
 
+def _legacy_goal_contract() -> tuple[dict[str, Any], dict[str, str]]:
+    """Load the SDK-only contract for the explicitly supported older runtime."""
+    path = Path(__file__).with_name("compatibility") / "thread_goals.cli-0.149.0.json"
+    contract = json.loads(path.read_text(encoding="utf-8"))
+    if contract.get("schema_version") != 1 or contract.get("runtime_version") != "0.149.0":
+        raise RuntimeError(f"Unsupported legacy Goal contract: {path}")
+    definitions = contract.get("definitions")
+    notifications = contract.get("notifications")
+    if not isinstance(definitions, dict) or not definitions or not isinstance(notifications, dict):
+        raise RuntimeError(f"Invalid legacy Goal contract: {path}")
+    if any(
+        not name.startswith("ThreadGoal") or not isinstance(value, dict)
+        for name, value in definitions.items()
+    ):
+        raise RuntimeError("Legacy Goal definitions must remain scoped to ThreadGoal models")
+
+    def require_refs(value: Any) -> None:
+        if isinstance(value, list):
+            for item in value:
+                require_refs(item)
+        elif isinstance(value, dict):
+            ref = value.get("$ref")
+            if ref is not None and ref not in {
+                f"#/definitions/{name}" for name in (*definitions, "RequestId")
+            }:
+                raise RuntimeError(f"Unsupported legacy Goal schema reference: {ref}")
+            for item in value.values():
+                require_refs(item)
+
+    require_refs(definitions)
+    for method, model in notifications.items():
+        if not method.startswith("thread/goal/") or model not in definitions:
+            raise RuntimeError(f"Invalid legacy Goal notification: {method}")
+    return definitions, notifications
+
+
+def _merge_legacy_goal_definitions(schema: dict[str, Any]) -> None:
+    """Retain Python models, never re-register retired current-server methods."""
+    definitions = schema.get("definitions")
+    if not isinstance(definitions, dict):
+        raise RuntimeError("Schema bundle is missing definitions")
+    legacy, _ = _legacy_goal_contract()
+    collisions = sorted(definitions.keys() & legacy.keys())
+    if collisions:
+        raise RuntimeError(
+            "Current schema collides with the versioned legacy Goal contract; "
+            "reconcile compatibility before generation: " + ", ".join(collisions)
+        )
+    # Standalone definitions preserve public helper types. Deliberately leave
+    # ClientRequest/ServerNotification unions and Rust schema files untouched.
+    definitions.update(legacy)
+
+
 def _normalized_schema_bundle_text(schema_dir: Path) -> str:
     """Normalize the schema bundle before feeding it to the Python type generator."""
     schema = json.loads(schema_bundle_path(schema_dir).read_text())
+    _merge_legacy_goal_definitions(schema)
     _make_chatgpt_account_email_nullable(schema)
     _normalize_nullable_typed_maps(schema)
     definitions = schema.get("definitions", {})
@@ -724,7 +777,30 @@ def generate_v2_all(schema_dir: Path) -> None:
     _require_nullable_chatgpt_account_email(out_path)
     _preserve_retained_wire_contracts(out_path)
     _preserve_open_error_enum(out_path, schema_dir)
+    _discriminate_thread_items(out_path)
     _normalize_generated_timestamps(out_path)
+
+
+def _discriminate_thread_items(out_path: Path) -> None:
+    """Dispatch the protocol's tagged items without changing their wire literals."""
+    # The pinned codegen rewrites inline-variant literals when given a schema
+    # discriminator. Annotate its completed union instead, preserving every model.
+    content = out_path.read_text()
+    pattern = r"(^class ThreadItem\(\n.*?^    root: )\((.*?)^    \)"
+    content, count = re.subn(
+        pattern,
+        lambda match: (
+            match[1]
+            + "Annotated["
+            + match[2].rstrip()
+            + ',\n        Field(discriminator="type"),\n    ]'
+        ),
+        content,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    if count != 1:
+        raise RuntimeError("Expected one generated ThreadItem root union")
+    out_path.write_text(content)
 
 
 def _preserve_open_error_enum(out_path: Path, schema_dir: Path) -> None:
@@ -736,10 +812,12 @@ def _preserve_open_error_enum(out_path: Path, schema_dir: Path) -> None:
     class_end = source.find("\n\nclass ", class_start)
     if class_end == -1:
         class_end = len(source)
-    class_source = source[class_start:class_end].replace(
-        "class CodexErrorInfoValue(Enum):", "class CodexErrorInfoValue(str, Enum):", 1
-    ).rstrip()
-    class_source += '''
+    class_source = (
+        source[class_start:class_end]
+        .replace("class CodexErrorInfoValue(Enum):", "class CodexErrorInfoValue(str, Enum):", 1)
+        .rstrip()
+    )
+    class_source += """
 
     @classmethod
     def _missing_(cls, value: object) -> CodexErrorInfoValue | None:
@@ -749,9 +827,11 @@ def _preserve_open_error_enum(out_path: Path, schema_dir: Path) -> None:
         member._name_ = value
         member._value_ = value
         return member
-'''
+"""
     source = source[:class_start] + class_source + source[class_end:]
-    definition = json.loads(schema_bundle_path(schema_dir).read_text())["definitions"]["CodexErrorInfo"]
+    definition = json.loads(schema_bundle_path(schema_dir).read_text())["definitions"][
+        "CodexErrorInfo"
+    ]
     variants = definition.get("anyOf", definition.get("oneOf", []))
     unit_tags = []
     models = []
@@ -764,7 +844,7 @@ def _preserve_open_error_enum(out_path: Path, schema_dir: Path) -> None:
                 raise RuntimeError("Invalid CodexErrorInfo model name")
             models.append((next(iter(properties)), model))
     model_map = "\n".join(f"            {tag!r}: {model}," for tag, model in models)
-    validator = f'''
+    validator = f"""
 
     @model_validator(mode="before")
     @classmethod
@@ -783,7 +863,7 @@ def _preserve_open_error_enum(out_path: Path, schema_dir: Path) -> None:
         elif isinstance(value, str) and value in known_models:
             raise ValueError("invalid payload for known error variant")
         return value
-'''
+"""
     class_start = source.find("class CodexErrorInfo(")
     if class_start == -1:
         raise RuntimeError("Generated SDK is missing CodexErrorInfo")
@@ -805,7 +885,10 @@ def _preserve_retained_wire_contracts(out_path: Path) -> None:
         count=1,
     )
     canonical = 'alias="continuationAfterTruncationCount",'
-    compatible = canonical + '\n            validation_alias=AliasChoices(\n                "continuationAfterTruncationCount",\n                "truncationInducedContinuationCount",\n            ),'
+    compatible = (
+        canonical
+        + '\n            validation_alias=AliasChoices(\n                "continuationAfterTruncationCount",\n                "truncationInducedContinuationCount",\n            ),'
+    )
     if canonical in content and "validation_alias=AliasChoices(" not in content:
         content = content.replace(canonical, compatible, 1)
     if "AliasChoices(" in content and "from pydantic import AliasChoices," not in content:
@@ -826,15 +909,15 @@ def _preserve_retained_wire_contracts(out_path: Path) -> None:
         raise RuntimeError("Unsupported generated ThreadSource wire model")
     helpers = ""
     if "class ThreadSourceValue(Enum):" not in content:
-        helpers += '''class ThreadSourceValue(Enum):
+        helpers += """class ThreadSourceValue(Enum):
     user = "User"
     subagent = "Subagent"
     memory_consolidation = "MemoryConsolidation"
 
 
-'''
+"""
     if "class FeatureThreadSource(BaseModel):" not in content:
-        helpers += '''class FeatureThreadSource(BaseModel):
+        helpers += """class FeatureThreadSource(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
         populate_by_name=True,
@@ -842,8 +925,8 @@ def _preserve_retained_wire_contracts(out_path: Path) -> None:
     feature: Annotated[str, Field(alias="Feature")]
 
 
-'''
-    compatible_source = '''class ThreadSource(RootModel[ThreadSourceValue | FeatureThreadSource | str]):
+"""
+    compatible_source = """class ThreadSource(RootModel[ThreadSourceValue | FeatureThreadSource | str]):
     model_config = ConfigDict(
         populate_by_name=True,
     )
@@ -851,7 +934,7 @@ def _preserve_retained_wire_contracts(out_path: Path) -> None:
     root: Annotated[
         ThreadSourceValue | FeatureThreadSource | str, Field(union_mode="left_to_right")
     ]
-'''
+"""
     content = content[: match.start()] + helpers + compatible_source + content[match.end() :]
     out_path.write_text(content)
 
@@ -912,6 +995,22 @@ def _notification_specs(schema_dir: Path) -> list[tuple[str, str]]:
             continue
         specs.append((method, class_name))
 
+    _, legacy_notifications = _legacy_goal_contract()
+    current_methods = {
+        method
+        for variant in one_of
+        for method in variant.get("properties", {}).get("method", {}).get("enum", [])
+    }
+    collisions = sorted(current_methods & legacy_notifications.keys())
+    if collisions:
+        raise RuntimeError(
+            "Current notification methods collide with the legacy Goal contract: "
+            + ", ".join(collisions)
+        )
+    for method, class_name in legacy_notifications.items():
+        if f"class {class_name}(" not in generated_source:
+            raise RuntimeError(f"Missing generated legacy Goal payload: {class_name}")
+        specs.append((method, class_name))
     specs.sort()
     return specs
 
@@ -922,6 +1021,7 @@ def _notification_turn_id_specs(
 ) -> tuple[list[str], list[str]]:
     """Classify notification payloads by where their turn id is carried."""
     server_notifications = json.loads((schema_dir / "ServerNotification.json").read_text())
+    _merge_legacy_goal_definitions(server_notifications)
     definitions = server_notifications.get("definitions", {})
     if not isinstance(definitions, dict):
         return ([], [])
@@ -1076,10 +1176,11 @@ def _annotation_to_source(annotation: Any) -> str:
     return repr(annotation)
 
 
-def _load_public_fields(class_name: str, *, exclude: set[str] | None = None) -> list[PublicFieldSpec]:
+def _load_public_fields(
+    module: types.ModuleType, class_name: str, *, exclude: set[str] | None = None
+) -> list[PublicFieldSpec]:
     """Load generated model fields used to render the ergonomic public methods."""
     exclude = exclude or set()
-    module = _load_generated_v2_all_module()
     model = getattr(module, class_name)
     fields: list[PublicFieldSpec] = []
     for name, field in model.model_fields.items():
@@ -1443,24 +1544,31 @@ def generate_public_api_flat_methods() -> None:
     if src_dir_str not in sys.path:
         sys.path.insert(0, src_dir_str)
 
+    # One fresh module per generation, not five rebuilds of every Pydantic model.
+    # Do not cache across invocations: the generated file may have changed.
+    module = _load_generated_v2_all_module()
     approval_fields = {"approval_policy"}
     thread_start_fields = _load_public_fields(
+        module,
         "ThreadStartParams",
         exclude=approval_fields,
     )
     thread_start_fields = _replace_public_sandbox_field(thread_start_fields, wire_name="sandbox")
-    thread_list_fields = _load_public_fields("ThreadListParams")
+    thread_list_fields = _load_public_fields(module, "ThreadListParams")
     thread_resume_fields = _load_public_fields(
+        module,
         "ThreadResumeParams",
         exclude={"thread_id", *approval_fields},
     )
     thread_resume_fields = _replace_public_sandbox_field(thread_resume_fields, wire_name="sandbox")
     thread_fork_fields = _load_public_fields(
+        module,
         "ThreadForkParams",
         exclude={"thread_id", *approval_fields},
     )
     thread_fork_fields = _replace_public_sandbox_field(thread_fork_fields, wire_name="sandbox")
     turn_start_fields = _load_public_fields(
+        module,
         "TurnStartParams",
         # Keep the wire model current without exposing this app-server field
         # through the ergonomic Python API yet.
@@ -1512,6 +1620,47 @@ def prepare_generated_package() -> None:
     (generated_dir / "__init__.py").write_text(GENERATED_PACKAGE_INIT)
 
 
+def _require_retained_generated_imports(package: Path, generated: Path) -> None:
+    """Reject regeneration that removes names imported by retained SDK consumers."""
+    modules = {"v2_all", "notification_registry"}
+    exports: dict[str, set[str]] = {}
+    for module in modules:
+        tree = ast.parse((generated / f"{module}.py").read_text(encoding="utf-8"))
+        names: set[str] = set()
+        for node in tree.body:
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                names.add(node.name)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                names.update(alias.asname or alias.name for alias in node.names)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                names.update(target.id for target in targets if isinstance(target, ast.Name))
+        exports[module] = names
+
+    missing: list[str] = []
+    for consumer in sorted(package.rglob("*.py")):
+        if "generated" in consumer.relative_to(package).parts:
+            continue
+        tree = ast.parse(consumer.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or node.module is None:
+                continue
+            prefix = "generated." if node.level == 1 else "openai_codex.generated."
+            if not node.module.startswith(prefix):
+                continue
+            module = node.module.removeprefix(prefix)
+            if module not in modules:
+                continue
+            for alias in node.names:
+                if alias.name != "*" and alias.name not in exports[module]:
+                    missing.append(f"{consumer.relative_to(package)}: {module}.{alias.name}")
+    if missing:
+        raise RuntimeError(
+            "Generated schema removes names imported by retained SDK consumers; "
+            "resolve schema/API compatibility before publication: " + "; ".join(missing)
+        )
+
+
 def generate_types_from_schema_dir(schema_dir: Path) -> None:
     """Regenerate every SDK artifact derived from an existing schema directory."""
     schema_dir = schema_dir.resolve()
@@ -1561,6 +1710,9 @@ def generate_types_from_schema_dir(schema_dir: Path) -> None:
             raise RuntimeError(
                 "Python generated inputs were edited during generation; refusing to overwrite concurrent work"
             )
+        _require_retained_generated_imports(
+            destination / "src/openai_codex", staged_package / "generated"
+        )
         _publish_staged_paths(pairs)
 
 

@@ -1885,23 +1885,7 @@
     },
     "SkillConfig": {
       "additionalProperties": false,
-      "properties": {
-        "enabled": {
-          "type": "boolean"
-        },
-        "name": {
-          "description": "Name-based selector.",
-          "type": "string"
-        },
-        "path": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/AbsolutePathBuf"
-            }
-          ],
-          "description": "Path-based selector."
-        }
-      },
+      "properties": {"description_override":{"description":"Local catalog applicability text; does not modify the provider's skill file.","type":"string"},"enabled":{"type":"boolean"},"name":{"description":"Name-based selector.","type":"string"},"path":{"allOf":[{"$ref":"#/definitions/AbsolutePathBuf"}],"description":"Path-based selector."}},
       "required": [
         "enabled"
       ],

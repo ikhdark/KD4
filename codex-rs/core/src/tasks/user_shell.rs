@@ -622,6 +622,8 @@ async fn collect_remote_user_shell_output(
     let mut exit_code = None;
     let mut closed = false;
     let mut output_gap = false;
+    let mut pending_stdout_delta = Vec::new();
+    let mut pending_stderr_delta = Vec::new();
 
     loop {
         let response = process
@@ -635,7 +637,12 @@ async fn collect_remote_user_shell_output(
         if let Some(failure) = response.failure {
             return Err(UserShellExecError::Failed(failure));
         }
-        output_gap |= response.output_gap.is_some();
+        if response.output_gap.is_some() {
+            // Do not join a partial codepoint to unrelated bytes after a gap.
+            emit_remote_user_shell_delta(session, turn_context, call_id, ExecOutputStream::Stdout, &mut pending_stdout_delta, true).await;
+            emit_remote_user_shell_delta(session, turn_context, call_id, ExecOutputStream::Stderr, &mut pending_stderr_delta, true).await;
+            output_gap = true;
+        }
         let drained = response.chunks.is_empty();
         for chunk in response.chunks {
             after_seq = Some(chunk.seq);
@@ -651,16 +658,13 @@ async fn collect_remote_user_shell_output(
                 }
             };
             aggregated.push_chunk(&bytes);
-            session
-                .send_event(
-                    turn_context,
-                    EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
-                        call_id: call_id.to_string(),
-                        stream,
-                        chunk: bytes,
-                    }),
-                )
-                .await;
+            let pending = if matches!(stream, ExecOutputStream::Stderr) {
+                &mut pending_stderr_delta
+            } else {
+                &mut pending_stdout_delta
+            };
+            pending.extend_from_slice(&bytes);
+            emit_remote_user_shell_delta(session, turn_context, call_id, stream, pending, false).await;
         }
         after_seq = response.next_seq.checked_sub(1).or(after_seq);
         exit_code = response.exit_code.or(exit_code);
@@ -668,6 +672,8 @@ async fn collect_remote_user_shell_output(
         // Process closure does not imply that this bounded read returned its
         // final page. Preserve the original caller's cancellation/deadline.
         if closed && drained {
+            emit_remote_user_shell_delta(session, turn_context, call_id, ExecOutputStream::Stdout, &mut pending_stdout_delta, true).await;
+            emit_remote_user_shell_delta(session, turn_context, call_id, ExecOutputStream::Stderr, &mut pending_stderr_delta, true).await;
             let loss_notice = if output_gap {
                 b"\n[remote executor output was lost; retained output is incomplete]\n".as_slice()
             } else {
@@ -690,6 +696,26 @@ async fn collect_remote_user_shell_output(
             });
         }
     }
+}
+
+async fn emit_remote_user_shell_delta(
+    session: &Session,
+    turn_context: &TurnContext,
+    call_id: &str,
+    stream: ExecOutputStream,
+    pending: &mut Vec<u8>,
+    flush_incomplete: bool,
+) {
+    let mut remaining = pending.as_slice();
+    while let Some(prefix) = crate::unified_exec::head_tail_buffer::split_valid_utf8_prefix_with_max(
+        &mut remaining, 64 * 1024, flush_incomplete,
+    ) {
+        session.send_event(turn_context, EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+            call_id: call_id.to_string(), stream: stream.clone(), chunk: prefix.to_vec(),
+        })).await;
+    }
+    let consumed = pending.len() - remaining.len();
+    pending.drain(..consumed);
 }
 
 async fn send_user_shell_error(session: &Session, turn_context: &TurnContext, message: &str) {

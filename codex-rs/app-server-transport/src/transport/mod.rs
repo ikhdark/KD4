@@ -26,14 +26,23 @@ pub const CHANNEL_CAPACITY: usize = 128;
 pub const CONTROL_INGRESS_RESERVE: usize = 64;
 pub const INGRESS_CAPACITY: usize = CHANNEL_CAPACITY + CONTROL_INGRESS_RESERVE;
 
-/// Reserve atomically before checking the remaining ordinary allowance. A
-/// concurrent sender cannot consume the last control cell between check/send.
+/// Serialize the capacity check and reservation for cooperating producers.
+/// Ordinary senders must never transiently borrow a protected control cell.
 pub fn try_send_with_control_reserve<T>(
     sender: &mpsc::Sender<T>,
     message: T,
     control: bool,
     reserve: usize,
 ) -> Result<(), mpsc::error::TrySendError<T>> {
+    static ADMISSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _admission = ADMISSION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let reserve = reserve.min(sender.max_capacity().saturating_sub(1));
+    if sender.is_closed() {
+        return Err(mpsc::error::TrySendError::Closed(message));
+    }
+    if !control && sender.capacity() <= reserve {
+        return Err(mpsc::error::TrySendError::Full(message));
+    }
     let permit = match sender.try_reserve() {
         Ok(permit) => permit,
         Err(mpsc::error::TrySendError::Full(())) => {
@@ -43,11 +52,6 @@ pub fn try_send_with_control_reserve<T>(
             return Err(mpsc::error::TrySendError::Closed(message));
         }
     };
-    // Legacy callers with a single cell still have ordinary admission.
-    let reserve = reserve.min(sender.max_capacity().saturating_sub(1));
-    if !control && sender.capacity() < reserve {
-        return Err(mpsc::error::TrySendError::Full(message));
-    }
     permit.send(message);
     Ok(())
 }
@@ -208,6 +212,8 @@ pub enum TransportEvent {
     IncomingMessage {
         connection_id: ConnectionId,
         message: JSONRPCMessage,
+        // Released after the shared dispatcher transfers or consumes this message.
+        _ingress_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     },
 }
 
@@ -248,22 +254,46 @@ async fn enqueue_incoming_message(
     connection_id: ConnectionId,
     message: JSONRPCMessage,
 ) -> bool {
+    enqueue_incoming_message_with_admission(transport_event_tx, writer, connection_id, message).await.0
+}
+
+async fn enqueue_incoming_message_with_admission(
+    transport_event_tx: &mpsc::Sender<TransportEvent>,
+    writer: &mpsc::Sender<QueuedOutgoingMessage>,
+    connection_id: ConnectionId,
+    message: JSONRPCMessage,
+) -> (bool, bool) {
+    use std::sync::{Arc, LazyLock};
+    use tokio::sync::Semaphore;
+    const BYTE_BUDGET: usize = 128 * 1024 * 1024;
+    // Shared by every external connection; ordinary traffic cannot borrow the
+    // control byte budget any more than it can borrow reserved channel cells.
+    static ORDINARY_BYTES: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(BYTE_BUDGET)));
+    static CONTROL_BYTES: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(BYTE_BUDGET)));
     let control = ingress_message_is_control(&message);
+    let bytes = serialized_request_bytes_up_to(&message, BYTE_BUDGET);
+    let budget = if control { &CONTROL_BYTES } else { &ORDINARY_BYTES };
+    let permit = u32::try_from(bytes.max(1)).ok()
+        .filter(|_| bytes <= BYTE_BUDGET)
+        .and_then(|bytes| Arc::clone(budget).try_acquire_many_owned(bytes).ok());
+    let admitted_bytes = permit.is_some();
     let event = TransportEvent::IncomingMessage {
         connection_id,
         message,
+        _ingress_permit: permit,
     };
-    match try_send_with_control_reserve(
-        transport_event_tx,
-        event,
-        control,
-        ingress_reserve(transport_event_tx),
-    ) {
-        Ok(()) => true,
-        Err(mpsc::error::TrySendError::Closed(_)) => false,
+    let result = if admitted_bytes {
+        try_send_with_control_reserve(transport_event_tx, event, control, ingress_reserve(transport_event_tx))
+    } else {
+        Err(mpsc::error::TrySendError::Full(event))
+    };
+    match result {
+        Ok(()) => (true, true),
+        Err(mpsc::error::TrySendError::Closed(_)) => (false, false),
         Err(mpsc::error::TrySendError::Full(TransportEvent::IncomingMessage {
             connection_id,
             message: JSONRPCMessage::Request(request),
+            ..
         })) => {
             let overload_error = OutgoingMessage::Error(OutgoingError {
                 id: request.id,
@@ -273,14 +303,14 @@ async fn enqueue_incoming_message(
                 ),
             });
             match writer.try_send(QueuedOutgoingMessage::new(overload_error)) {
-                Ok(()) => true,
-                Err(mpsc::error::TrySendError::Closed(_)) => false,
+                Ok(()) => (true, false),
+                Err(mpsc::error::TrySendError::Closed(_)) => (false, false),
                 Err(mpsc::error::TrySendError::Full(_overload_error)) => {
                     warn!(
                         "closing connection {:?}: outbound queue cannot accept overload response",
                         connection_id
                     );
-                    false
+                    (false, false)
                 }
             }
         }
@@ -290,7 +320,7 @@ async fn enqueue_incoming_message(
             // connection rather than borrowing the interrupt reserve or blocking
             // the reader behind an unreserved send.
             warn!("closing connection {connection_id:?}: ingress cannot accept required message");
-            false
+            (false, false)
         }
     }
 }

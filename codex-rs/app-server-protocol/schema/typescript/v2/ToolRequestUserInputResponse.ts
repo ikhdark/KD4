@@ -5,9 +5,9 @@ import type { RequestUserInputDisposition } from "../RequestUserInputDisposition
 import type { ToolRequestUserInputAnswer } from "./ToolRequestUserInputAnswer";
 
 /**
- * EXPERIMENTAL. Response payload mapping question ids to answers.
+ * Response payload mapping question ids to answers.
  */
-export type ToolRequestUserInputResponse = { answers: { [key in string]?: ToolRequestUserInputAnswer }, interrupted: boolean,
+export type ToolRequestUserInputResponse = { answers: { [key in string]: ToolRequestUserInputAnswer }, interrupted: boolean,
 /**
  * Absent for legacy clients. Timeout, skip and transport failure never imply approval.
  */

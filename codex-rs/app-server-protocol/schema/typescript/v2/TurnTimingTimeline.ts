@@ -13,7 +13,7 @@ clockDomainId: string | null,
 /**
  * Turn start in the named process domain; intervals below are turn-relative.
  */
-startedAtNs: bigint, durationNs: bigint, intervals: Array<TurnTimingActivityInterval>,
+startedAtNs: number, durationNs: number, intervals: Array<TurnTimingActivityInterval>,
 /**
  * Observed await suspensions and explicit dependency edges, not a complete
  * task DAG. Absence is legacy unknown; idle time is never a blocking wait.
@@ -24,7 +24,7 @@ blocking?: TurnTimingBlockingEvidence,
  * Order inside a summary is unknown. Checkpoints carry the entire current
  * suffix, replacing (not appending to) the preceding coarse snapshot.
  */
-coarseIntervals?: Array<TurnTimingActivitySummary>, droppedIntervals: bigint, coverageComplete: boolean,
+coarseIntervals?: Array<TurnTimingActivitySummary>, droppedIntervals: number, coverageComplete: boolean,
 /**
  * Complete elapsed coverage including coarse summaries, not exact ordering.
  * Absent for legacy records; independent of exact `coverage_complete`.

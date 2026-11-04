@@ -101,6 +101,8 @@ impl SkillPolicy {
 pub struct SkillError {
     pub path: AbsolutePathBuf,
     pub message: String,
+    /// Optional metadata was ignored while the skill itself loaded successfully.
+    pub is_warning: bool,
 }
 
 #[derive(Debug, Clone, Default)]

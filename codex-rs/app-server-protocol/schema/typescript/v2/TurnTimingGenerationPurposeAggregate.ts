@@ -8,27 +8,27 @@ export type TurnTimingGenerationPurposeAggregate = { coverage?: TokenUsageCovera
 /**
  * Expected physical usage reports; absent in legacy aggregates.
  */
-expectedUsageCount?: bigint,
+expectedUsageCount?: number,
 /**
  * Attributable reports observed. Totals are lower bounds unless equal to expected.
  */
-observedUsageCount?: bigint, purpose: TurnTimingGenerationPurpose, generations: number, modelStreamWaitNs: bigint,
+observedUsageCount?: number, purpose: TurnTimingGenerationPurpose, generations: number, modelStreamWaitNs: number,
 /**
  * Sum of dispatch-to-first-actionable-output latency for requests where
  * an actionable output was observed.
  */
-decisionLatencyNs: bigint, decisionReadyRequests: number, toolCalls: number,
+decisionLatencyNs: number, decisionReadyRequests: number, toolCalls: number,
 /**
  * Sum of per-generation unioned tool-active durations. Parallel tools
  * within one generation are not double-counted.
  */
-toolActiveUnionNs: bigint, outputTokens: bigint, reasoningOutputTokens: bigint, inputTokens: bigint, cachedInputTokens: bigint,
+toolActiveUnionNs: number, outputTokens: number, reasoningOutputTokens: number, inputTokens: number, cachedInputTokens: number,
 /**
  * Provider remainder, not visible/final text. Completeness also requires
  * TurnTiming.model_request_history_truncated == Some(false).
  */
-outputExcludingReportedReasoningTokens?: bigint,
+outputExcludingReportedReasoningTokens?: number,
 /**
  * Deprecated compatibility remainder; never add it to the canonical field.
  */
-visibleOutputTokens: bigint, totalTokens: bigint, };
+visibleOutputTokens: number, totalTokens: number, };

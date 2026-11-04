@@ -20,6 +20,7 @@ pub enum SkillConfigRuleSelector {
 pub struct SkillConfigRule {
     pub selector: SkillConfigRuleSelector,
     pub enabled: bool,
+    pub description_override: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -61,11 +62,34 @@ pub fn skill_config_rules_from_stack(config_layer_stack: &ConfigLayerStack) -> S
             entries.push(SkillConfigRule {
                 selector,
                 enabled: entry.enabled,
+                description_override: entry.description_override.and_then(|description| {
+                    let description = description.split_whitespace().collect::<Vec<_>>().join(" ");
+                    if description.is_empty() || description.len() > 4096 {
+                        warn!("ignoring empty or oversized skill description override");
+                        None
+                    } else {
+                        Some(description)
+                    }
+                }),
             });
         }
     }
 
     SkillConfigRules { entries }
+}
+
+/// Apply after loading provider metadata, before either catalog is projected.
+/// Rules already participate in the existing snapshot cache identity.
+pub fn apply_skill_metadata_overrides(skills: &mut [SkillMetadata], rules: &SkillConfigRules) {
+    for skill in skills {
+        let rule = rules.entries.iter().rev().find(|entry| match &entry.selector {
+            SkillConfigRuleSelector::Name(name) => skill.name == *name,
+            SkillConfigRuleSelector::Path(path) => skill.path_to_skills_md == *path,
+        });
+        if let Some(description) = rule.and_then(|entry| entry.description_override.as_ref()) {
+            skill.description = description.clone();
+        }
+    }
 }
 
 pub fn resolve_disabled_skill_paths(

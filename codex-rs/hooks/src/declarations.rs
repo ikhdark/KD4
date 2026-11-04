@@ -30,11 +30,16 @@ impl HookKeyBuilder {
                 .map(str::to_owned),
             hooks: vec![handler.clone()],
         };
-        let identity = TomlValue::try_from(identity).map_err(|err| err.to_string())?;
+        let version = if matches!(handler, HookHandlerConfig::McpTool { .. }) {
+            // MCP inputs include JSON null/arrays that TOML cannot represent.
+            codex_config::version_for_json(&serde_json::to_value(&identity).map_err(|err| err.to_string())?)
+        } else {
+            version_for_toml(&TomlValue::try_from(identity).map_err(|err| err.to_string())?)
+        };
         let base = format!(
             "{key_source}:{}:v2:{}",
             crate::hook_event_key_label(event_name),
-            version_for_toml(&identity),
+            version,
         );
         let occurrence = self.occurrences.entry(base.clone()).or_default();
         let key = format!("{base}:{occurrence}");

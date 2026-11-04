@@ -55,24 +55,63 @@ pub(crate) struct QueuedConnectionRequest {
 pub(crate) struct ConnectionRequestIngress {
     sender: mpsc::Sender<QueuedConnectionRequest>,
     bytes: Arc<tokio::sync::Semaphore>,
+    control_bytes: Arc<tokio::sync::Semaphore>,
 }
+
+const CONNECTION_REQUEST_CAPACITY: usize = 64;
+const CONNECTION_CONTROL_CAPACITY: usize = 8;
+const CONNECTION_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+const CONNECTION_CONTROL_BYTES: usize = 64 * 1024;
 
 impl ConnectionRequestIngress {
     pub(crate) fn channel() -> (Self, mpsc::Receiver<QueuedConnectionRequest>) {
-        let (sender, receiver) = mpsc::channel(64);
-        (Self { sender, bytes: Arc::new(tokio::sync::Semaphore::new(16 * 1024 * 1024)) }, receiver)
+        let (sender, receiver) =
+            mpsc::channel(CONNECTION_REQUEST_CAPACITY + CONNECTION_CONTROL_CAPACITY);
+        (Self {
+            sender,
+            bytes: Arc::new(tokio::sync::Semaphore::new(CONNECTION_REQUEST_BYTES)),
+            control_bytes: Arc::new(tokio::sync::Semaphore::new(
+                CONNECTION_CONTROL_CAPACITY * CONNECTION_CONTROL_BYTES,
+            )),
+        }, receiver)
     }
 
-    pub(crate) fn try_send(&self, request: JSONRPCRequest) -> bool {
-        const LIMIT: usize = 16 * 1024 * 1024;
-        let bytes = codex_app_server_transport::serialized_request_bytes_up_to(&request, LIMIT);
-        if bytes > LIMIT {
-            return false;
-        }
-        let Ok(credit) = Arc::clone(&self.bytes).try_acquire_many_owned(bytes.max(1) as u32) else {
-            return false;
+    pub(crate) fn try_send(
+        &self,
+        request: JSONRPCRequest,
+    ) -> Result<(), mpsc::error::TrySendError<JSONRPCRequest>> {
+        // Reserve a slot before sizing a payload that may already be rejected.
+        let slot = match self.sender.try_reserve() {
+            Ok(slot) => slot,
+            Err(mpsc::error::TrySendError::Full(())) =>
+                return Err(mpsc::error::TrySendError::Full(request)),
+            Err(mpsc::error::TrySendError::Closed(())) =>
+                return Err(mpsc::error::TrySendError::Closed(request)),
         };
-        self.sender.try_send(QueuedConnectionRequest { request, _credit: credit }).is_ok()
+        let control_bytes = codex_app_server_protocol_types::client_request_is_control(&request.method)
+            .then(|| codex_app_server_transport::serialized_request_bytes_up_to(
+                &request, CONNECTION_CONTROL_BYTES,
+            ));
+        let control = control_bytes.is_some_and(|bytes| bytes <= CONNECTION_CONTROL_BYTES);
+        if !control && self.sender.capacity() < CONNECTION_CONTROL_CAPACITY {
+            return Err(mpsc::error::TrySendError::Full(request));
+        }
+        let (bytes, budget) = if control {
+            (control_bytes.unwrap_or(CONNECTION_CONTROL_BYTES), &self.control_bytes)
+        } else {
+            (codex_app_server_transport::serialized_request_bytes_up_to(
+                &request, CONNECTION_REQUEST_BYTES,
+            ), &self.bytes)
+        };
+        let limit = if control { CONNECTION_CONTROL_BYTES } else { CONNECTION_REQUEST_BYTES };
+        if bytes > limit {
+            return Err(mpsc::error::TrySendError::Full(request));
+        }
+        let Ok(credit) = Arc::clone(budget).try_acquire_many_owned(bytes.max(1) as u32) else {
+            return Err(mpsc::error::TrySendError::Full(request));
+        };
+        slot.send(QueuedConnectionRequest { request, _credit: credit });
+        Ok(())
     }
 }
 
@@ -138,12 +177,21 @@ pub(crate) struct OutboundConnectionState {
     disconnect_sender: Option<CancellationToken>,
     transport_shutdown: CancellationToken,
     is_stdio: bool,
+    is_in_process: bool,
     stdio_delivery: Option<StdioDelivery>,
 }
 
+struct StdioStagedMessage {
+    message: QueuedOutgoingMessage,
+    credit: tokio::sync::OwnedSemaphorePermit,
+    oversized: bool,
+}
+
 struct StdioDelivery {
-    sender: mpsc::Sender<Arc<Mutex<Option<QueuedOutgoingMessage>>>>,
-    tail: Weak<Mutex<Option<QueuedOutgoingMessage>>>,
+    sender: mpsc::Sender<Arc<Mutex<Option<StdioStagedMessage>>>>,
+    tail: Weak<Mutex<Option<StdioStagedMessage>>>,
+    bytes: Arc<tokio::sync::Semaphore>,
+    oversized_frames: Arc<tokio::sync::Semaphore>,
 }
 
 const STDIO_DELIVERY_BYTES: usize = 16 * 1024 * 1024;
@@ -151,18 +199,33 @@ const STDIO_COALESCED_TEXT_BYTES: usize = 64 * 1024;
 
 impl StdioDelivery {
     fn try_send(&mut self, message: QueuedOutgoingMessage) -> bool {
+        // Charge typed payload before staging, not after dequeue. Legal large
+        // frames use a separate single-frame allowance through physical flush;
+        // ordinary following frames still have their bounded byte budget.
+        let size = codex_app_server_transport::serialized_request_bytes_up_to(
+            &message.message, STDIO_DELIVERY_BYTES,
+        );
+        let oversized = size > STDIO_DELIVERY_BYTES;
+        let credit = if oversized {
+            Arc::clone(&self.oversized_frames).try_acquire_owned()
+        } else {
+            Arc::clone(&self.bytes).try_acquire_many_owned(size.max(1) as u32)
+        };
+        let Ok(credit) = credit else { return false; };
         // mpsc does not expose a mutable queued tail. The handoff node permits
         // adjacent text to append only until the existing consumer takes it.
         // No lock survives encoding, a capacity wait or a physical write.
         if let Some(tail) = self.tail.upgrade() {
             let Ok(mut queued) = tail.lock() else { return false; };
             if let Some(queued) = queued.as_mut()
-                && coalesce_stdio_text(queued, &message)
+                && !oversized && !queued.oversized
+                && coalesce_stdio_text(&mut queued.message, &message)
             {
+                queued.credit.merge(credit);
                 return true;
             }
         }
-        let queued = Arc::new(Mutex::new(Some(message)));
+        let queued = Arc::new(Mutex::new(Some(StdioStagedMessage { message, credit, oversized })));
         if self.sender.try_send(Arc::clone(&queued)).is_err() {
             return false;
         }
@@ -226,12 +289,22 @@ impl OutboundConnectionState {
             disconnect_sender,
             transport_shutdown,
             is_stdio,
+            is_in_process: false,
             stdio_delivery: None,
         }
     }
 
     pub(crate) fn with_stdio_delivery(mut self) -> Self {
         self.is_stdio = true;
+        self
+    }
+
+    pub(crate) fn close_delivery(&mut self) {
+        self.stdio_delivery.take();
+    }
+
+    pub(crate) fn with_in_process_delivery(mut self) -> Self {
+        self.is_in_process = true;
         self
     }
 
@@ -305,11 +378,15 @@ async fn send_message_to_connection(
     message: OutgoingMessage,
     write_complete_tx: Option<OutgoingWriteReceipt>,
     notification_prechecked: bool,
+    delivery_tasks: &mut tokio::task::JoinSet<()>,
 ) -> bool {
     let Some(connection_state) = connections.get_mut(&connection_id) else {
         warn!("dropping message for disconnected connection: {connection_id:?}");
         return false;
     };
+    if connection_state.is_disconnected() {
+        return disconnect_connection(connections, connection_id);
+    }
     let message = filter_outgoing_message_for_connection(connection_state, message);
     if !notification_prechecked && should_skip_notification_for_connection(connection_state, &message) {
         if let Some(receipt) = write_complete_tx
@@ -326,7 +403,17 @@ async fn send_message_to_connection(
         encoded_json: None,
         write_complete_tx: write_complete_tx.map(|receipt| receipt.writer),
     };
-    if !connection_state.is_stdio {
+    if connection_state.is_in_process {
+        // This is a dedicated single-connection response owner. Waiting here
+        // cannot stall the independent client/reply dispatcher or other clients.
+        let shutdown = connection_state.transport_shutdown.clone();
+        let delivered = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => false,
+            result = writer.send(queued_message) => result.is_ok(),
+        };
+        if delivered { false } else { disconnect_connection(connections, connection_id) }
+    } else if !connection_state.is_stdio {
         match writer.try_send(queued_message) {
             Ok(()) => false,
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -348,14 +435,14 @@ async fn send_message_to_connection(
             return disconnect_connection(connections, connection_id);
         }
         let delivery = connection_state.stdio_delivery.get_or_insert_with(|| {
-            // Preserve the existing 128-node limit. Coalesced text is at most
-            // 64 KiB/node (8 MiB total), below the 16-MiB delivery-byte budget.
-            // Individually larger legal frames still use the streaming owner.
             let (sender, mut receiver) =
-                mpsc::channel::<Arc<Mutex<Option<QueuedOutgoingMessage>>>>(128);
+                mpsc::channel::<Arc<Mutex<Option<StdioStagedMessage>>>>(128);
+            let bytes = Arc::new(tokio::sync::Semaphore::new(STDIO_DELIVERY_BYTES));
+            let oversized_frames = Arc::new(tokio::sync::Semaphore::new(1));
+            let drained_bytes = Arc::clone(&bytes);
+            let drained_oversized = Arc::clone(&oversized_frames);
             let shutdown = shutdown.clone();
-            tokio::spawn(async move {
-                let bytes = Arc::new(tokio::sync::Semaphore::new(STDIO_DELIVERY_BYTES));
+            delivery_tasks.spawn(async move {
                 loop {
                     let next = tokio::select! {
                         biased;
@@ -369,7 +456,7 @@ async fn send_message_to_connection(
                         Ok(mut queued) => queued.take(),
                         Err(_) => { shutdown.cancel(); break; }
                     };
-                    let Some(mut message) = message else {
+                    let Some(StdioStagedMessage { mut message, credit, .. }) = message else {
                         shutdown.cancel();
                         break;
                     };
@@ -396,19 +483,8 @@ async fn send_message_to_connection(
                             "streaming stdio output larger than the staging budget"
                         );
                     }
-                    // The writer holds credit through physical write/flush. Wait
-                    // here, not in the shared router, so a legal large frame can
-                    // follow earlier frames and later frames remain ordered.
-                    let credit = tokio::select! {
-                        biased;
-                        _ = shutdown.cancelled() => break,
-                        credit = Arc::clone(&bytes).acquire_many_owned(
-                            encoded_bytes.clamp(1, STDIO_DELIVERY_BYTES) as u32,
-                        ) => match credit {
-                            Ok(credit) => credit,
-                            Err(_) => { shutdown.cancel(); break; }
-                        },
-                    };
+                    // Carry staging credit into the writer rather than releasing
+                    // it on dequeue. This includes validated oversized frames.
                     if let Some(encoded) = &mut message.encoded_json {
                         encoded.delivery_credit = Some(credit);
                     }
@@ -420,8 +496,18 @@ async fn send_message_to_connection(
                         }
                     }
                 }
+                // Closing staging is not a physical-delivery barrier. Wait for
+                // the writer-held credits before reporting this owner retired.
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => {}
+                    _ = async {
+                        let _bytes = drained_bytes.acquire_many(STDIO_DELIVERY_BYTES as u32).await;
+                        let _oversized = drained_oversized.acquire().await;
+                    } => {}
+                }
             });
-            StdioDelivery { sender, tail: Weak::new() }
+            StdioDelivery { sender, tail: Weak::new(), bytes, oversized_frames }
         });
         let sent = delivery.try_send(queued_message);
         if sent {
@@ -461,6 +547,7 @@ fn filter_outgoing_message_for_connection(
 pub(crate) async fn route_outgoing_envelope(
     connections: &mut HashMap<ConnectionId, OutboundConnectionState>,
     envelope: OutgoingEnvelope,
+    delivery_tasks: &mut tokio::task::JoinSet<()>,
 ) {
     let notification_prechecked = matches!(&envelope, OutgoingEnvelope::Broadcast { .. });
     let target_connection_ids = target_connection_ids(connections, &envelope);
@@ -496,6 +583,7 @@ pub(crate) async fn route_outgoing_envelope(
             outgoing,
             write_complete_tx.take(),
             notification_prechecked,
+            delivery_tasks,
         )
         .await;
     }

@@ -173,6 +173,17 @@ pub enum HookHandlerConfig {
         #[serde(default, rename = "statusMessage")]
         status_message: Option<String>,
     },
+    #[serde(rename = "mcp_tool")]
+    McpTool {
+        server: String,
+        tool: String,
+        #[serde(default)]
+        input: serde_json::Map<String, serde_json::Value>,
+        #[serde(default, rename = "timeout")]
+        timeout_sec: Option<u64>,
+        #[serde(default, rename = "statusMessage")]
+        status_message: Option<String>,
+    },
     #[serde(rename = "prompt")]
     Prompt {},
     #[serde(rename = "agent")]

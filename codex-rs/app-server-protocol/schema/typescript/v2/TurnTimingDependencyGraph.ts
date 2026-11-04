@@ -6,4 +6,4 @@ import type { TurnTimingDependencyNode } from "./TurnTimingDependencyNode";
 /**
  * Bounded native task envelopes, not a prediction of achievable savings.
  */
-export type TurnTimingDependencyGraph = { schemaVersion: number, complete: boolean, includesDescendants: boolean, clockDomainId: string | null, startedAtNs: bigint, durationNs: bigint, startNode: string, finishNode: string, nodes: Array<TurnTimingDependencyNode>, unavailableReasons: Array<string>, };
+export type TurnTimingDependencyGraph = { schemaVersion: number, complete: boolean, includesDescendants: boolean, clockDomainId: string | null, startedAtNs: number, durationNs: number, startNode: string, finishNode: string, nodes: Array<TurnTimingDependencyNode>, unavailableReasons: Array<string>, };

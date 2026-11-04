@@ -56,6 +56,7 @@ pub(super) async fn send_thread_token_usage_update_to_connection(
 ///
 /// The id is preferred when it still appears in the rebuilt thread. The position is a
 /// fallback for histories whose implicit turn ids are regenerated during reconstruction.
+#[derive(PartialEq, Eq)]
 struct TokenUsageTurnOwner {
     id: String,
     position: Option<usize>,
@@ -68,8 +69,9 @@ pub(super) struct TokenUsageReplaySnapshot {
 
 #[derive(Default)]
 pub(super) struct TokenUsageReplay {
-    turn_owner: Option<TokenUsageTurnOwner>,
-    info: Option<TokenUsageInfo>,
+    // Keep one latest historical snapshot per retained turn. Rollback can
+    // remove the newest turn without erasing an earlier surviving snapshot.
+    snapshots: Vec<(Option<TokenUsageTurnOwner>, TokenUsageInfo)>,
 }
 
 impl TokenUsageReplay {
@@ -77,18 +79,25 @@ impl TokenUsageReplay {
         if let RolloutItem::EventMsg(EventMsg::TokenCount(event)) = item
             && let Some(info) = &event.info
         {
-            self.info = Some(info.clone());
-            self.turn_owner = builder.active_turn_id().map(|id| TokenUsageTurnOwner {
+            let owner = builder.active_turn_id().map(|id| TokenUsageTurnOwner {
                 id: id.to_string(),
                 position: builder.active_turn_position(),
             });
+            if let Some((previous, value)) = self.snapshots.last_mut()
+                && previous == &owner
+            {
+                *value = info.clone();
+            } else {
+                self.snapshots.push((owner, info.clone()));
+            }
         }
     }
 
     pub(super) fn into_snapshot(self, turns: &[Turn]) -> Option<TokenUsageReplaySnapshot> {
+        let (owner, info) = self.snapshots.into_iter().last()?;
         Some(TokenUsageReplaySnapshot {
-            turn_id: self.turn_owner?.resolve(turns)?,
-            info: self.info?,
+            turn_id: owner?.resolve(turns)?,
+            info,
         })
     }
 }
@@ -116,18 +125,16 @@ pub(super) fn build_turns_with_token_usage_replay(
         if is_persisted_rollout_item(item, ThreadHistoryMode::Legacy) {
             token_usage_replay.observe_rollout_item(&builder, item);
             builder.handle_rollout_item(item);
-            if matches!(item, RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_)))
-                && token_usage_replay.turn_owner.as_ref().is_some_and(|owner| {
-                    owner.position.is_some_and(|position| {
-                        builder
-                            .active_turn_position()
-                            .is_none_or(|last| position > last)
-                    })
-                })
-            {
+            if matches!(item, RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_))) {
                 // A removed turn's position may be reused by a later turn.
-                // Invalidate before that happens rather than relabeling its usage.
-                token_usage_replay = TokenUsageReplay::default();
+                // Prune before reuse, retaining only attributable survivors.
+                token_usage_replay.snapshots.retain(|(owner, _)| {
+                    owner.as_ref().is_some_and(|owner| {
+                        owner.position.is_some_and(|position| {
+                            builder.active_turn_position().is_some_and(|last| position <= last)
+                        })
+                    })
+                });
             }
         }
     }

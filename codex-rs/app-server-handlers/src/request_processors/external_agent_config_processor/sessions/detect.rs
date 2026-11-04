@@ -19,12 +19,13 @@ pub fn detect_recent_sessions(
     if !projects_root.is_dir() {
         return Ok(Vec::new());
     }
+    let projects_root = fs::canonicalize(projects_root)?;
 
     let now = now_unix_seconds();
     let ledger = load_import_ledger(codex_home)?;
     let imported_hashes = ledger.imported_hashes_by_source();
     let mut file_candidates = Vec::new();
-    for project_entry in fs::read_dir(projects_root)? {
+    for project_entry in fs::read_dir(&projects_root)? {
         let Ok(project_entry) = project_entry else {
             continue;
         };
@@ -72,12 +73,16 @@ pub fn detect_recent_sessions(
         },
     );
     let mut migrations = Vec::new();
+    let mut seen_sources = std::collections::HashSet::new();
     for (_modified_at, path) in file_candidates {
         // Resolve only candidates reached before the result limit, but still use
         // canonical identities for every ledger lookup.
         let Ok(source_path) = fs::canonicalize(&path) else {
             continue;
         };
+        if !source_path.starts_with(&projects_root) || !seen_sources.insert(source_path.clone()) {
+            continue;
+        }
         // Content identity, not modification time, decides whether this version was imported.
         if let Some(hashes) = imported_hashes.get(source_path.as_path()) {
             match session_content_sha256(&source_path) {
@@ -86,7 +91,7 @@ pub fn detect_recent_sessions(
                 Err(_) => continue,
             }
         }
-        let Ok(Some(summary)) = summarize_session(&path) else {
+        let Ok(Some(summary)) = summarize_session(&source_path) else {
             continue;
         };
         let migration = summary.migration;

@@ -3,7 +3,6 @@ use tracing::Instrument;
 use super::AbsolutePathBuf;
 use super::AdditionalContextEntry;
 use super::AdditionalContextKind;
-use super::AgentStatus;
 use super::AnalyticsEventsClient;
 use super::AnalyticsJsonRpcError;
 use super::Arc;
@@ -285,14 +284,45 @@ fn in_flight_task_capacity_error() -> JSONRPCErrorError {
     )
 }
 
+struct TurnStartPreparationGuard {
+    manager: ThreadStateManager,
+    background_tasks: TaskTracker,
+    thread_id: ThreadId,
+    turn_id: String,
+    armed: bool,
+}
+
+impl TurnStartPreparationGuard {
+    fn disarm(&mut self) { self.armed = false; }
+}
+
+impl Drop for TurnStartPreparationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let manager = self.manager.clone();
+            let thread_id = self.thread_id;
+            let turn_id = self.turn_id.clone();
+            self.background_tasks.spawn(async move {
+                manager.release_turn_start(thread_id, &turn_id).await;
+            });
+        }
+    }
+}
+
+enum TurnStartAdmission {
+    Claimed(TurnStartPreparationGuard),
+    Replay(String),
+}
+
 async fn claim_turn_start_before_connection_updates<F, Fut>(
     thread_state_manager: &ThreadStateManager,
+    background_tasks: &TaskTracker,
     task_fingerprint: Option<&str>,
     thread_id: ThreadId,
     turn_id: &str,
     client_submission: Option<(&str, &str)>,
     apply_connection_updates: F,
-) -> Result<Option<String>, JSONRPCErrorError>
+) -> Result<TurnStartAdmission, JSONRPCErrorError>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<(), JSONRPCErrorError>>,
@@ -302,7 +332,7 @@ where
         .await
     {
         crate::thread_state::TurnStartClaim::Claimed => {}
-        crate::thread_state::TurnStartClaim::Replay(original) => return Ok(Some(original)),
+        crate::thread_state::TurnStartClaim::Replay(original) => return Ok(TurnStartAdmission::Replay(original)),
         crate::thread_state::TurnStartClaim::SubmissionConflict => {
             return Err(invalid_request("clientUserMessageId was already used with different turn/start contents"));
         }
@@ -317,14 +347,21 @@ where
         }
     }
 
+    // Until submission begins, a panic or dropped future owns no core turn.
+    // Release only that preparation claim, on the existing shutdown tracker.
+    let mut preparation = TurnStartPreparationGuard {
+        manager: thread_state_manager.clone(), background_tasks: background_tasks.clone(),
+        thread_id, turn_id: turn_id.to_owned(), armed: true,
+    };
     if let Err(error) = apply_connection_updates().await {
+        preparation.disarm();
         thread_state_manager
             .release_turn_start(thread_id, turn_id)
             .await;
         return Err(error);
     }
 
-    Ok(None)
+    Ok(TurnStartAdmission::Claimed(preparation))
 }
 
 async fn release_turn_start_after_submission_error(
@@ -678,17 +715,18 @@ impl TurnRequestProcessor {
     pub(super) async fn start_queued_turn(
         &self,
         request_id: ConnectionRequestId,
-        params: TurnStartParams,
+        mut params: TurnStartParams,
         client_name: Option<String>,
         client_version: Option<String>,
         supports_openai_form_elicitation: bool,
         turn_id: String,
     ) -> Result<TurnStartResponse, JSONRPCErrorError> {
         Self::validate_queue_input(&params.input)?;
+        let additional_context = map_additional_context(params.additional_context.take())?;
         self.turn_start_inner(
             request_id,
             params,
-            IndexMap::new(),
+            additional_context,
             (client_name, client_version),
             supports_openai_form_elicitation,
             Some(turn_id),
@@ -721,91 +759,82 @@ impl TurnRequestProcessor {
         if params.raw_text.trim().is_empty() {
             return Err(invalid_request("bug report text must not be empty"));
         }
-        // Loading is validation only: no turn is created and the thread is not
-        // changed or waited on. The report's lifecycle belongs to SQLite.
         let (_, thread) = self.load_thread(&params.thread_id).await?;
         let snapshot = thread.config_snapshot().await;
-        let models_manager = self.thread_manager.get_models_manager();
-        let model_info = models_manager
-            .get_model_info(
-                snapshot.model.as_str(),
-                &self.config.to_models_manager_config(),
-            )
-            .await;
-        let provider = self
-            .config
-            .model_providers
-            .get(&snapshot.model_provider_id)
-            .cloned()
-            .ok_or_else(|| internal_error("thread model provider is not configured"))?;
-        let classifier = BugClassifierContext {
-            auth_manager: Arc::clone(&self.auth_manager),
-            config: Arc::clone(&self.config),
-            provider,
-            provider_id: snapshot.model_provider_id.clone(),
-            requested_model: snapshot.model.clone(),
-            model_info,
-            session_source: snapshot.session_source.clone(),
-            originator: snapshot.originator.clone(),
-            shutdown: self.bug_worker_shutdown.clone(),
-        };
         let selected_environment = snapshot.environment_selections().first();
-        // Only attach local Git evidence when the reported environment is local.
         let local_cwd = match selected_environment {
-            Some(selection) => self
-                .thread_manager
-                .environment_manager()
+            Some(selection) => self.thread_manager.environment_manager()
                 .get_environment(&selection.environment_id)
                 .filter(|environment| !environment.is_remote())
                 .and_then(|_| selection.cwd.to_abs_path().ok()),
             None => Some(snapshot.cwd().clone()),
         };
-        let cwd = local_cwd
-            .as_ref()
+        let cwd = local_cwd.as_ref()
             .map(|cwd| cwd.to_string_lossy().into_owned())
             .or_else(|| selected_environment.map(|selection| selection.cwd.to_string()))
             .unwrap_or_else(|| snapshot.cwd().to_string_lossy().into_owned());
-        let (repository_root, git_commit) = if let Some(cwd) = local_cwd {
-            (
-                codex_git_utils::get_git_repo_root(cwd.as_path())
-                    .map(|path| path.to_string_lossy().into_owned()),
-                codex_git_utils::get_head_commit_hash(cwd.as_path())
-                    .await
-                    .map(|sha| sha.0),
-            )
-        } else {
-            (None, None)
-        };
-        let store = BugStore::open(self.config.sqlite_home.as_path())
-            .await
+        let store = BugStore::open(self.config.sqlite_home.as_path()).await
             .map_err(|_| internal_error("failed to persist bug report"))?;
-        let created = store
-            .create(StateBugCreateParams {
-                raw_text: &params.raw_text,
-                thread_id: &params.thread_id,
-                cwd: Some(&cwd),
-                repository_root: repository_root.as_deref(),
-                git_commit: git_commit.as_deref(),
-            })
-            .await
-            .map_err(|_| internal_error("failed to persist bug report"))?;
+        // Raw evidence is durable before provider discovery or Git enrichment.
+        let created = store.create(StateBugCreateParams {
+            raw_text: &params.raw_text, thread_id: &params.thread_id, cwd: Some(&cwd),
+            repository_root: None, git_commit: None,
+        }).await.map_err(|_| internal_error("failed to persist bug report"))?;
         let response = BugCreateResponse {
-            id: created.id,
-            display_id: created.display_id,
-            status: "pending".to_string(),
-            durable_save_result: true,
+            id: created.id, display_id: created.display_id,
+            status: "pending".to_string(), durable_save_result: true,
         };
-        let created_id = created.id;
-        tokio::spawn(async move {
-            let Ok(Some(new_claim)) = store.claim_by_id(created_id).await else {
-                return;
+        let processor = self.clone();
+        self.background_tasks.spawn(async move {
+            if processor.bug_worker_shutdown.is_cancelled() { return; }
+            if let Some(cwd) = local_cwd {
+                let repository_root = codex_git_utils::get_git_repo_root(cwd.as_path())
+                    .map(|path| path.to_string_lossy().into_owned());
+                let git_commit = codex_git_utils::get_head_commit_hash(cwd.as_path()).await.map(|sha| sha.0);
+                if let Err(error) = store.enrich_git_context(created.id, repository_root.as_deref(), git_commit.as_deref()).await {
+                    tracing::warn!(bug_id = created.id, %error, "could not enrich durable bug report");
+                }
+            }
+            let Some(classifier) = processor.bug_classifier_context(thread.as_ref()).await else {
+                return; // Keep the raw report pending when its provider is unavailable.
             };
+            let Ok(Some(new_claim)) = store.claim_by_id(created.id).await else { return; };
             classify_bug_claim(&store, &classifier, new_claim).await;
-            if let Ok(Some(older_claim)) = store.claim_next_older(created_id).await {
-                classify_bug_claim(&store, &classifier, older_claim).await;
+            if let Ok(Some(older_claim)) = store.claim_next_older(created.id).await {
+                // The retry queue is global. Never reuse another thread's routing.
+                let context = match processor.load_thread(&older_claim.thread_id).await {
+                    Ok((_, thread)) => processor.bug_classifier_context(thread.as_ref()).await,
+                    Err(_) => None,
+                };
+                if let Some(context) = context {
+                    classify_bug_claim(&store, &context, older_claim).await;
+                } else {
+                    let receipt = BugAttemptReceipt {
+                        dispatched: Some(false), outcome: "provider_context_unavailable".into(),
+                        ..Default::default()
+                    };
+                    if store.record_attempt_receipt(&older_claim, &receipt).await.is_ok() {
+                        let _ = store.release_failure(older_claim.id, &older_claim.claim_token, BugFailureCategory::Provider).await;
+                    }
+                }
             }
         });
         Ok(Some(response.into()))
+    }
+
+    async fn bug_classifier_context(&self, thread: &CodexThread) -> Option<BugClassifierContext> {
+        let snapshot = thread.config_snapshot().await;
+        let provider = self.config.model_providers.get(&snapshot.model_provider_id)?.clone();
+        let model_info = self.thread_manager.get_models_manager().get_model_info(
+            snapshot.model.as_str(), &self.config.to_models_manager_config(),
+        ).await;
+        Some(BugClassifierContext {
+            auth_manager: Arc::clone(&self.auth_manager), config: Arc::clone(&self.config),
+            provider, provider_id: snapshot.model_provider_id.clone(),
+            requested_model: snapshot.model.clone(), model_info,
+            session_source: snapshot.session_source.clone(), originator: snapshot.originator.clone(),
+            shutdown: self.bug_worker_shutdown.clone(),
+        })
     }
 
     fn track_error_response(
@@ -981,7 +1010,7 @@ impl TurnRequestProcessor {
                 turn.duration_ms = event.duration_ms;
                 turn.timing = event.timing;
             }
-            _ if active.is_some() || self.thread_state_manager.pending_turn_start_id(thread_id).await.as_deref() == Some(&turn_id) => {}
+            _ if active.is_some() || thread.active_turn_id().await.as_deref() == Some(&turn_id) => {}
             _ => {
                 let mut error = invalid_request("the original submission outcome is uncertain; it was not executed again");
                 error.data = Some(serde_json::json!({"reason": "submissionOutcomeUnknown", "turnId": turn_id}));
@@ -1180,8 +1209,9 @@ impl TurnRequestProcessor {
                     // Admission must precede connection capability mutations. Duplicate or overloaded turns
                     // are rejected without changing shared thread or MCP state, and a failed capability update
                     // releases the claim so the request can be retried.
-                    let replay = claim_turn_start_before_connection_updates(
+                    let admission = claim_turn_start_before_connection_updates(
                         &processor.thread_state_manager,
+                        &processor.background_tasks,
                         task_fingerprint.as_deref(),
                         thread_id,
                         &turn_id,
@@ -1210,15 +1240,22 @@ impl TurnRequestProcessor {
                     .inspect_err(|_| {
                         processor.track_error_response(&request_id, /*error_type*/ None);
                     })?;
-                    if let Some(original) = replay { return Ok(original); }
+                    let mut preparation = match admission {
+                        TurnStartAdmission::Replay(original) => return Ok(original),
+                        TurnStartAdmission::Claimed(preparation) => preparation,
+                    };
                     if let (Some(client_id), Some(fingerprint)) = (&client_user_message_id, &submission_fingerprint) {
                         let original = match thread.reserve_start_input_receipt(client_id, fingerprint, &turn_id).await {
                             Ok(original) => original,
-                            Err(error) => return Err(release_turn_start_after_submission_error(
-                                &processor.thread_state_manager, thread_id, &turn_id, error,
-                            ).await),
+                            Err(error) => {
+                                preparation.disarm();
+                                return Err(release_turn_start_after_submission_error(
+                                    &processor.thread_state_manager, thread_id, &turn_id, error,
+                                ).await);
+                            }
                         };
                         if original != turn_id {
+                            preparation.disarm();
                             processor.thread_state_manager.release_turn_start(thread_id, &turn_id).await;
                             return Ok(original);
                         }
@@ -1245,6 +1282,9 @@ impl TurnRequestProcessor {
                         ),
                     );
                     let request_trace_context = processor.request_trace_context(&request_id).await;
+                    // From this point core may own input even if its acknowledgement
+                    // is lost. Never let panic cleanup release an uncertain execution.
+                    preparation.disarm();
                     if let Err(err) = thread
                         .submit_user_input_with_reserved_turn_id_and_cancellation(
                             turn_id.clone(),
@@ -1285,7 +1325,16 @@ impl TurnRequestProcessor {
                 .instrument(tracing::Span::current()),
             )
             .await
-            .map_err(|error| internal_error(format!("turn submission task failed: {error}")))??;
+            .map_err(|error| {
+                // Preparation-only claims have an owned drop cleanup. Once
+                // submission begins, a lost acknowledgement is not proof that
+                // core rejected input; preserve its admission fence and identity.
+                let mut rpc = internal_error(format!("turn submission task failed; execution outcome may be unknown: {error}"));
+                rpc.data = Some(serde_json::json!({
+                    "reason": "submissionOutcomeUnknown", "turnId": requested_turn_id,
+                }));
+                rpc
+            })??;
 
         if turn_id != requested_turn_id {
             return self.replay_turn_start(&request_id, thread_id, thread.as_ref(), turn_id).await;
@@ -1662,6 +1711,7 @@ impl TurnRequestProcessor {
         &self,
         request_id: &ConnectionRequestId,
         params: TurnInterruptParams,
+        queue: &super::ThreadQueueRequestProcessor,
     ) -> Result<Option<TurnInterruptResponse>, JSONRPCErrorError> {
         let TurnInterruptParams { thread_id, turn_id } = params;
         let is_startup_interrupt = turn_id.is_empty();
@@ -1692,21 +1742,19 @@ impl TurnRequestProcessor {
                     internal_error(format!("failed to interrupt startup turn: {error}"))
                 })?;
             }
+            queue.pause_with_result(thread_uuid).await?;
             return Ok(Some(TurnInterruptResponse {}));
         }
 
         // Record turn interrupts so we can reply when TurnAborted arrives.
         let interrupt_reservation = {
             let thread_state = self.thread_state_manager.thread_state(thread_uuid).await;
-            let is_running = matches!(thread.agent_status().await, AgentStatus::Running);
+            let core_turn_id = thread.active_turn_id().await;
             let reservation = {
                 let mut thread_state = thread_state.lock().await;
-                let latest_turn = thread_state.active_turn_snapshot();
                 validate_turn_interrupt_target(
-                    latest_turn
-                        .as_ref()
-                        .map(|turn| (turn.id.as_str(), &turn.status)),
-                    is_running,
+                    core_turn_id.as_deref().map(|id| (id, &TurnStatus::InProgress)),
+                    core_turn_id.is_some(),
                     &turn_id,
                 )?;
                 thread_state.reserve_interrupt(request_id.clone(), turn_id.clone())
@@ -1800,6 +1848,8 @@ struct ValidatedBugClassification {
 #[derive(Clone, Copy, Debug)]
 enum BugClassificationFailure {
     Cancelled,
+    DeadlineExceeded,
+    InputTooLarge,
     Provider,
     MalformedOutput,
     Schema,
@@ -1810,6 +1860,10 @@ impl BugClassificationFailure {
     fn category(self) -> BugFailureCategory {
         match self {
             Self::Cancelled => BugFailureCategory::Cancelled,
+            // Keep the persisted coarse category compatible with the existing
+            // schema; the immutable attempt receipt records the exact outcome.
+            Self::DeadlineExceeded => BugFailureCategory::Provider,
+            Self::InputTooLarge => BugFailureCategory::Schema,
             Self::Provider => BugFailureCategory::Provider,
             Self::MalformedOutput => BugFailureCategory::MalformedOutput,
             Self::Schema => BugFailureCategory::Schema,
@@ -1826,11 +1880,16 @@ async fn classify_bug_claim(store: &BugStore, context: &BugClassifierContext, cl
         dispatched: Some(false),
         ..Default::default()
     };
-    let result = classify_bug_report(context, &claim, &mut receipt).await;
+    let result = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(claim.work_deadline),
+        classify_bug_report(context, &claim, &mut receipt),
+    ).await.unwrap_or(Err(BugClassificationFailure::DeadlineExceeded));
     receipt.duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
     receipt.outcome = match &result {
         Ok(_) => "classified",
         Err(BugClassificationFailure::Cancelled) => "cancelled",
+        Err(BugClassificationFailure::DeadlineExceeded) => "deadline_exceeded",
+        Err(BugClassificationFailure::InputTooLarge) => "input_too_large",
         Err(BugClassificationFailure::Provider) => "provider_error",
         Err(BugClassificationFailure::MalformedOutput) => "malformed_output",
         Err(BugClassificationFailure::Schema) => "schema_error",
@@ -1880,6 +1939,18 @@ async fn classify_bug_report(
     receipt: &mut BugAttemptReceipt,
 ) -> Result<ValidatedBugClassification, BugClassificationFailure> {
     let raw_text = &claim.raw_text;
+    if std::time::Instant::now() >= claim.work_deadline {
+        return Err(BugClassificationFailure::DeadlineExceeded);
+    }
+    // Bytes conservatively upper-bound text tokens; reserve at least half of
+    // the known context for instructions/schema/output. Never excerpt raw
+    // evidence: grounded offsets continue to address the unchanged report.
+    let input_budget = context.model_info.context_window
+        .and_then(|window| usize::try_from(window).ok())
+        .map(|window| window / 2).unwrap_or(4096).min(128 * 1024);
+    if raw_text.len() > input_budget {
+        return Err(BugClassificationFailure::InputTooLarge);
+    }
     let classifier_thread_id =
         ThreadId::from_string(&claim.attempt_id).map_err(|_| BugClassificationFailure::Provider)?;
     let agent_identity_policy = if context.config.features.enabled(Feature::UseAgentIdentity) {
@@ -1985,12 +2056,17 @@ async fn consume_bug_classification_stream(
                     receipt.terminal_observed = true;
                     receipt.dispatched = Some(true);
                 }
-                receipt.response_id = error.terminal_response_id().map(str::to_owned);
+                if let Some(response_id) = error.terminal_response_id() {
+                    receipt.response_id = Some(response_id.to_owned());
+                    receipt.terminal_observed = true;
+                    receipt.dispatched = Some(true);
+                }
                 return Err(BugClassificationFailure::Provider);
             }
         };
         match event {
             ResponseEvent::OutputItemDone(item) => {
+                receipt.dispatched = Some(true);
                 if matches!(item, ResponseItem::Reasoning { .. }) {
                     continue;
                 }

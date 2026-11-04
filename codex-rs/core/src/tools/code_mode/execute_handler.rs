@@ -273,6 +273,28 @@ impl CodeModeExecuteHandler {
         })
     }
 
+    pub(crate) fn with_native_catalog_policy(
+        mut self,
+        registered: &[crate::tools::registry::RegisteredTool],
+    ) -> Self {
+        for definition in Arc::make_mut(&mut self.enabled_tools) {
+            let Some(tool) = registered.iter().find(|tool| tool.tool_name() == &definition.tool_name)
+                .filter(|tool| tool.authorization_class() != TypedToolClass::DynamicExternal) else { continue; };
+            let operations = tool.runtime().operation_routes();
+            let compatibility = tool.exposure() == crate::tools::registry::ToolExposure::Compatibility;
+            if compatibility || !operations.is_empty() {
+                // Retain only a producer-owned schema annotation, not the large
+                // schema trees already rendered into the immutable description.
+                // Extensions cannot inject this policy through their input schema:
+                // new_with_input_schemas clears schemas before this native pass.
+                definition.input_schema = Some(serde_json::json!({
+                    "x-codex-native-routing-v1": { "compatibility": compatibility, "operations": operations }
+                }));
+            }
+        }
+        self
+    }
+
     fn catalog_with_timeouts(
         &self,
         tool_timeouts: &HashMap<ToolName, u64>,
@@ -456,6 +478,7 @@ impl CodeModeExecuteHandler {
                         )
                         .min(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL),
                 ),
+                max_output_tokens.is_some(),
             );
         // Establish cleanup ownership before opening dispatch.
         let dispatch_lease = CellDispatchLease::new(Arc::clone(&exec.session), cell_id.clone());

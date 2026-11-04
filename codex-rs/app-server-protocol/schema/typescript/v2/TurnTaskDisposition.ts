@@ -5,4 +5,4 @@
 /**
  * Host assessment of a finite declared contract, not all natural-language intent.
  */
-export type TurnTaskDisposition = { schema_version: number, plan_revision: string | null, input_revision: string | null, mutation_revision: bigint, request_state: string, artifact_state: string, terminal_action: string, unmet_obligations: Array<string>, evidence_refs: Array<string>, authority: string, };
+export type TurnTaskDisposition = { schema_version: number, plan_revision: string | null, input_revision: string | null, mutation_revision: number, request_state: string, artifact_state: string, terminal_action: string, unmet_obligations: Array<string>, evidence_refs: Array<string>, authority: string, };

@@ -25,6 +25,13 @@
       ],
       "type": "object"
     },
+    "ApprovalsReviewer": {
+      "description": "Approval reviewer reported to API clients. This build supports user review only.",
+      "enum": [
+        "user"
+      ],
+      "type": "string"
+    },
     "AskForApproval": {
       "oneOf": [
         {
@@ -636,6 +643,15 @@
         "approvalPolicy": {
           "$ref": "#/definitions/AskForApproval"
         },
+        "approvalsReviewer": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ApprovalsReviewer"
+            }
+          ],
+          "default": "user",
+          "description": "Reviewer currently used for approval requests on this thread."
+        },
         "collaborationMode": {
           "$ref": "#/definitions/CollaborationMode"
         },
@@ -696,8 +712,7 @@
               "type": "null"
             }
           ]
-        },
-        "approvalsReviewer": {"allOf":[{"$ref":"#/definitions/ApprovalsReviewer"}],"default":"user","description":"Reviewer currently used for approval requests on this thread."}
+        }
       },
       "required": [
         "approvalPolicy",
@@ -708,8 +723,7 @@
         "sandboxPolicy"
       ],
       "type": "object"
-    },
-    "ApprovalsReviewer": {"description":"Approval reviewer reported to API clients. This build supports user review only.","enum":["user"],"type":"string"}
+    }
   },
   "properties": {
     "threadId": {

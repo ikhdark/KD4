@@ -507,13 +507,17 @@ pub async fn resolve_command_launch_analysis_with_shell(
         let long_running = matches!(classification, ValidationClassification::Validation { .. })
             || prefers_long_observation_wait(&invocation);
         // Reuse the authoritative policy/selection owner, but admit coverage
-        // only for direct Cargo and the authenticated check-lane entrypoint.
+        // only for direct Cargo and authenticated managed entrypoints.
         // Shells, arbitrary wrappers and other flag changes keep exact keys.
         let compilation_check = if let CommandInvocation::Argv { program, args } = &invocation {
             let binary = program.rsplit(['/', '\\']).next().unwrap_or(program)
                 .to_ascii_lowercase();
             let binary = binary.strip_suffix(".exe").unwrap_or(&binary);
-            let supported = binary == "cargo" || binary == "just"
+            let managed_lane = codex_shell_command::validation::is_python_launcher(binary)
+                && runners.iter().any(|runner| runner.matches(program, args)
+                    && runner.admission_runner.as_deref() == Some("rust_build_status")
+                    && runner.passthrough_after.as_deref() == Some("--"));
+            let supported = binary == "cargo" || managed_lane || binary == "just"
                 && args.first().is_some_and(|arg| arg == "check-lane")
                 && runners.iter().any(|runner| runner.matches(program, args)
                     && runner.admission_runner.as_deref() == Some("rust_build_status")
@@ -522,14 +526,11 @@ pub async fn resolve_command_launch_analysis_with_shell(
             if supported && policy == ValidationPolicyClassification::TargetedCompilation {
                 let command = std::iter::once(program.clone()).chain(args.iter().cloned())
                     .collect::<Vec<_>>();
-                let launch = std::iter::once(program.clone())
-                    .chain(args.iter().filter(|arg| arg.as_str() != "--locked").cloned())
-                    .collect::<Vec<_>>();
-                serde_json::to_string(&(launch, compilation_source_selection(&selection))).ok()
-                    .map(|identity| (command, CompilationCheckScope {
-                        identity,
-                        locked: args.iter().any(|arg| arg == "--locked"),
-                    }))
+                compilation_completion_args(args, managed_lane).and_then(|(args, locked)| {
+                    let launch = std::iter::once(program.clone()).chain(args).collect::<Vec<_>>();
+                    serde_json::to_string(&(launch, compilation_source_selection(&selection))).ok()
+                        .map(|identity| (command, CompilationCheckScope { identity, locked }))
+                })
             } else { None }
         } else { None };
         let validation = (declared.is_some()
@@ -546,6 +547,35 @@ pub async fn resolve_command_launch_analysis_with_shell(
     .unwrap_or_default()
 }
 
+
+// Receipt destinations do not change the compilation obligation. Only the
+// authenticated run-lane prefix may omit them; Cargo operands stay literal.
+fn compilation_completion_args(args: &[String], managed_lane: bool) -> Option<(Vec<String>, bool)> {
+    let separator = if managed_lane { args.iter().position(|arg| arg == "--")? } else { 0 };
+    let mut launch = Vec::new();
+    let mut locked = false;
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        if managed_lane && index < separator {
+            if arg == "--timing-json" {
+                if index + 1 >= separator { return None; }
+                index += 2;
+                continue;
+            }
+            if arg.starts_with("--timing-json=") {
+                index += 1;
+                continue;
+            }
+        }
+        if (!managed_lane || index > separator) && arg == "--locked" {
+            locked = true;
+        } else {
+            launch.push(arg.clone());
+        }
+        index += 1;
+    }
+    Some((launch, locked))
+}
 
 pub async fn analyze_validation_policy_with_shell(
     invocation: &CommandInvocation,

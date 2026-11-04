@@ -4011,7 +4011,9 @@ Write-ProofLine "sourceSha256" $sourceSha256
 Write-ProofLine "sourceCodeModeHostSha256" $sourceCodeModeHostSha256
 Write-ProofLine "sourceWindowsSandboxSetupSha256" $sourceWindowsSandboxSetupSha256
 Write-ProofLine "sourceCommandRunnerSha256" $sourceCommandRunnerSha256
-$finalBuildInputSnapshot = if ($SkipBuild -or $sourceBuildStampMustRemainValid) {
+# Manifest bundles have their own version/target/digest proof; local Cargo
+# inputs and build stamps cannot qualify (or invalidate) those external bytes.
+$finalBuildInputSnapshot = if ($null -eq $sourceBundle -and ($SkipBuild -or $sourceBuildStampMustRemainValid)) {
     Get-LocalPublishBuildInputSnapshot -RepoRoot $repoRoot
 }
 else {
@@ -4045,7 +4047,7 @@ Write-ProofLine "commandRunnerTargetBeforeLastWriteUtc" (Format-UtcTimestamp $co
 $sourceBuildFreshnessProvenByStamp = $false
 $sourceBuildStampInvalidated = $false
 $sourceBuildStaleByStamp = $false
-if ($SkipBuild -or $sourceBuildStampMustRemainValid) {
+if ($null -eq $sourceBundle -and ($SkipBuild -or $sourceBuildStampMustRemainValid)) {
     $finalBuildStampDecision = Get-AutoSkipBuildDecision `
         -RepoRoot $repoRoot `
         -StampPath $buildStampPath `

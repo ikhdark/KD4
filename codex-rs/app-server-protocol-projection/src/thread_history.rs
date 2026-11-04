@@ -1,18 +1,6 @@
-use codex_app_server_protocol_types::build_command_execution_begin_item;
-use codex_app_server_protocol_types::build_command_execution_end_item;
-use codex_app_server_protocol_types::build_file_change_approval_request_item;
-use codex_app_server_protocol_types::build_file_change_begin_item;
-use codex_app_server_protocol_types::build_file_change_end_item;
 use codex_app_server_protocol_types::review_output_text;
-use codex_app_server_protocol_types::CollabAgentState;
 use codex_app_server_protocol_types::CollabAgentTool;
 use codex_app_server_protocol_types::CollabAgentToolCallStatus;
-use codex_app_server_protocol_types::DynamicToolCallOutputContentItem;
-use codex_app_server_protocol_types::DynamicToolCallStatus;
-use codex_app_server_protocol_types::McpToolCallAppContext;
-use codex_app_server_protocol_types::McpToolCallError;
-use codex_app_server_protocol_types::McpToolCallResult;
-use codex_app_server_protocol_types::McpToolCallStatus;
 use codex_app_server_protocol_types::SurfacedToolResult;
 use codex_app_server_protocol_types::ThreadItem;
 use codex_app_server_protocol_types::Turn;
@@ -22,44 +10,35 @@ use codex_app_server_protocol_types::TurnItemsView;
 use codex_app_server_protocol_types::TurnStatus;
 use codex_app_server_protocol_types::TurnTiming;
 use codex_app_server_protocol_types::UserInput;
-use codex_app_server_protocol_types::WebSearchItem;
 use codex_app_server_protocol_types::web_search_action_from_core;
-use codex_extension_items::image_generation::ImageGenerationItem;
 use codex_protocol::items::parse_hook_prompt_message;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::protocol::AgentReasoningEvent;
 use codex_protocol::protocol::AgentReasoningRawContentEvent;
-use codex_protocol::protocol::AgentStatus;
-use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::ContextCompactedEvent;
-use codex_protocol::protocol::DynamicToolCallResponseEvent;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::ExecCommandBeginEvent;
-use codex_protocol::protocol::ExecCommandEndEvent;
-use codex_protocol::protocol::ImageGenerationBeginEvent;
-use codex_protocol::protocol::ImageGenerationEndEvent;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
-use codex_protocol::protocol::McpToolCallBeginEvent;
-use codex_protocol::protocol::McpToolCallEndEvent;
-use codex_protocol::protocol::PatchApplyBeginEvent;
-use codex_protocol::protocol::PatchApplyEndEvent;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
-use codex_protocol::protocol::ViewImageToolCallEvent;
-use codex_protocol::protocol::WebSearchBeginEvent;
-use codex_protocol::protocol::WebSearchEndEvent;
-use indexmap::IndexSet;
 use std::collections::HashMap;
 use tracing::warn;
 use uuid::Uuid;
 
+mod changes;
+mod collaboration;
+mod tools;
+
+use changes::ThreadHistoryChangeAccumulator;
+pub use changes::ThreadHistoryChangeSet;
+pub use changes::ThreadHistoryItemChange;
+pub use changes::ThreadHistoryTurnChange;
 
 /// Convert persisted [`RolloutItem`] entries into a sequence of [`Turn`] values.
 ///
@@ -112,122 +91,16 @@ pub fn build_turns_from_rollout_items_with_items_view<'a>(
 
 
 
-/// A materialized `ThreadItem` snapshot that changed while handling one input.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ThreadHistoryItemChange {
-    pub turn_id: String,
-    pub item: ThreadItem,
-}
-
-/// Lightweight turn metadata snapshot for projectors that track turn status without
-/// re-reading the full item list.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ThreadHistoryTurnChange {
-    pub turn_id: String,
-    pub status: TurnStatus,
-    pub error: Option<TurnError>,
-    pub started_at: Option<i64>,
-    pub completed_at: Option<i64>,
-    pub duration_ms: Option<i64>,
-    pub timing: Option<TurnTiming>,
-    pub surfaced_result: Option<SurfacedToolResult>,
-}
-
-/// Incremental changes produced by opt-in `ThreadHistoryBuilder` handlers.
-#[derive(Debug, Default, Clone, PartialEq)]
-pub struct ThreadHistoryChangeSet {
-    pub changed_items: Vec<ThreadHistoryItemChange>,
-    pub changed_turns: Vec<ThreadHistoryTurnChange>,
-    pub removed_turn_ids: Vec<String>,
-}
-
-impl ThreadHistoryChangeSet {
-    pub fn is_empty(&self) -> bool {
-        self.changed_items.is_empty()
-            && self.changed_turns.is_empty()
-            && self.removed_turn_ids.is_empty()
-    }
-}
-
-impl ThreadHistoryTurnChange {
-    fn from_pending_turn(turn: &PendingTurn) -> Self {
-        Self {
-            turn_id: turn.id.clone(),
-            status: turn.status.clone(),
-            error: turn.error.clone(),
-            started_at: turn.started_at,
-            completed_at: turn.completed_at,
-            duration_ms: turn.duration_ms,
-            timing: turn.timing.clone(),
-            surfaced_result: turn.surfaced_result.clone(),
-        }
-    }
-
-    fn from_turn(turn: &Turn) -> Self {
-        Self {
-            turn_id: turn.id.clone(),
-            status: turn.status.clone(),
-            error: turn.error.clone(),
-            started_at: turn.started_at,
-            completed_at: turn.completed_at,
-            duration_ms: turn.duration_ms,
-            timing: turn.timing.clone(),
-            surfaced_result: turn.surfaced_result.clone(),
-        }
-    }
-}
-
-/// Track positions while reducing a batch, then copy each final snapshot once.
-/// Ordered sets preserve first-change order; rollback removes invalid positions.
-#[derive(Default)]
-struct ThreadHistoryChangeAccumulator {
-    changed_items: IndexSet<(usize, usize)>,
-    changed_turns: IndexSet<usize>,
-    removed_turn_ids: IndexSet<String>,
-}
-
-impl ThreadHistoryChangeAccumulator {
-    #[expect(
-        clippy::expect_used,
-        reason = "The accumulator records live turn positions and rollback removes invalid positions before finishing"
-    )]
-    fn finish(self, builder: &ThreadHistoryBuilder) -> ThreadHistoryChangeSet {
-        let changed_items = self
-            .changed_items
-            .into_iter()
-            .map(|(turn_index, item_index)| {
-                let (turn_id, items) = if turn_index == builder.turns.len() {
-                    let turn = builder.current_turn.as_ref().expect("changed current turn");
-                    (&turn.id, &turn.items)
-                } else {
-                    let turn = &builder.turns[turn_index];
-                    (&turn.id, &turn.items)
-                };
-                ThreadHistoryItemChange {
-                    turn_id: turn_id.clone(),
-                    item: items[item_index].clone(),
-                }
-            })
-            .collect();
-        let changed_turns = self
-            .changed_turns
-            .into_iter()
-            .map(|turn_index| {
-                if turn_index == builder.turns.len() {
-                    ThreadHistoryTurnChange::from_pending_turn(
-                        builder.current_turn.as_ref().expect("changed current turn"),
-                    )
-                } else {
-                    ThreadHistoryTurnChange::from_turn(&builder.turns[turn_index])
-                }
-            })
-            .collect();
-        ThreadHistoryChangeSet {
-            changed_items,
-            changed_turns,
-            removed_turn_ids: self.removed_turn_ids.into_iter().collect(),
-        }
-    }
+enum LegacyItemMirror {
+    ContextCompaction,
+    Item(ThreadItem),
+    Reasoning {
+        summary: std::vec::IntoIter<String>,
+        content: std::vec::IntoIter<String>,
+    },
+    FileChange(String),
+    McpToolCall(String),
+    ImageGeneration(String),
 }
 
 pub struct ThreadHistoryBuilder {
@@ -235,13 +108,16 @@ pub struct ThreadHistoryBuilder {
     turns: Vec<Turn>,
     current_turn: Option<PendingTurn>,
     next_item_index: i64,
-    pending_legacy_item_mirror: Option<ThreadItem>,
+    pending_legacy_item_mirror: Option<LegacyItemMirror>,
     pending_legacy_user_mirror: Option<UserMessageEvent>,
     rollback_eligible_turn_ids: std::collections::HashSet<String>,
     legacy_inter_agent_mail: codex_context_fragments::LegacyInterAgentMailReader,
     // Remember only removed wait identities so end-only legacy compatibility
     // cannot resurrect an operation that an explicit rollback discarded.
     rolled_back_wait_ids: std::collections::HashSet<String>,
+    rolled_back_turn_ids: std::collections::HashSet<String>,
+    retained_turn_override: Option<String>,
+    replaying_rollout_item: bool,
     current_rollout_index: usize,
     next_rollout_index: usize,
     active_change_set: Option<ThreadHistoryChangeAccumulator>,
@@ -254,6 +130,29 @@ impl Default for ThreadHistoryBuilder {
 }
 
 impl ThreadHistoryBuilder {
+    /// Identity of unscoped completions retained by live history's external index.
+    pub fn legacy_tool_end_call_id(event: &EventMsg) -> Option<&str> {
+        Self::legacy_collab_end_identity(event).map(|(id, _)| id).or_else(|| match event {
+            EventMsg::McpToolCallEnd(value) => Some(value.call_id.as_str()),
+            EventMsg::WebSearchEnd(value) => Some(value.call_id.as_str()),
+            EventMsg::ImageGenerationEnd(value) => Some(value.call_id.as_str()),
+            _ => None,
+        })
+    }
+
+    pub fn legacy_tool_end_matches(event: &EventMsg, item: &ThreadItem) -> bool {
+        if let Some((call_id, operation)) = Self::legacy_collab_end_identity(event) {
+            return matches!(item, ThreadItem::CollabAgentToolCall { id, tool, .. }
+                if id == call_id && *tool == operation);
+        }
+        match (event, item) {
+            (EventMsg::McpToolCallEnd(value), ThreadItem::McpToolCall { id, .. }) => id == &value.call_id,
+            (EventMsg::WebSearchEnd(value), ThreadItem::WebSearch(item)) => item.id == value.call_id,
+            (EventMsg::ImageGenerationEnd(value), ThreadItem::ImageGeneration(item)) => item.id == value.call_id,
+            _ => false,
+        }
+    }
+
     /// Legacy ends have no turn ID; every collaboration family needs the same
     /// retained-owner and rollback checks as Wait.
     pub fn legacy_collab_end_identity(event: &EventMsg) -> Option<(&str, CollabAgentTool)> {
@@ -280,6 +179,9 @@ impl ThreadHistoryBuilder {
             rollback_eligible_turn_ids: std::collections::HashSet::new(),
             legacy_inter_agent_mail: Default::default(),
             rolled_back_wait_ids: std::collections::HashSet::new(),
+            rolled_back_turn_ids: std::collections::HashSet::new(),
+            retained_turn_override: None,
+            replaying_rollout_item: false,
             current_rollout_index: 0,
             next_rollout_index: 0,
             active_change_set: None,
@@ -401,20 +303,38 @@ impl ThreadHistoryBuilder {
         }
         // Core emits the legacy compatibility event immediately after its canonical item.
         // Consume only that mirror; later messages and compactions remain distinct items.
-        if let Some(item) = self.pending_legacy_item_mirror.take() {
-            let is_mirror = match (&item, event) {
-                (ThreadItem::AgentMessage { text, phase, .. }, EventMsg::AgentMessage(payload)) => {
+        if let Some(mut item) = self.pending_legacy_item_mirror.take() {
+            let is_mirror = match (&mut item, event) {
+                (LegacyItemMirror::Item(ThreadItem::AgentMessage { text, phase, .. }), EventMsg::AgentMessage(payload)) => {
                     payload.message == *text && payload.phase == *phase
                 }
-                (ThreadItem::ContextCompaction { .. }, EventMsg::ContextCompacted(_)) => true,
-                (ThreadItem::WebSearch(item), EventMsg::WebSearchEnd(payload)) => {
+                (LegacyItemMirror::ContextCompaction, EventMsg::ContextCompacted(_)) => true,
+                (LegacyItemMirror::Item(ThreadItem::WebSearch(item)), EventMsg::WebSearchEnd(payload)) => {
                     item.id == payload.call_id
                         && item.query == payload.query
                         && item.action == Some(web_search_action_from_core(payload.action.clone()))
                 }
+                (LegacyItemMirror::Reasoning { summary, .. }, EventMsg::AgentReasoning(payload))
+                    if summary.as_slice().first().is_some_and(|text| text == &payload.text) =>
+                {
+                    summary.next();
+                    true
+                }
+                (LegacyItemMirror::Reasoning { summary, content }, EventMsg::AgentReasoningRawContent(payload))
+                    if summary.len() == 0 && content.as_slice().first().is_some_and(|text| text == &payload.text) =>
+                {
+                    content.next();
+                    true
+                }
+                (LegacyItemMirror::FileChange(id), EventMsg::PatchApplyEnd(payload)) => id.as_str() == payload.call_id.as_str(),
+                (LegacyItemMirror::McpToolCall(id), EventMsg::McpToolCallEnd(payload)) => id.as_str() == payload.call_id.as_str(),
+                (LegacyItemMirror::ImageGeneration(id), EventMsg::ImageGenerationEnd(payload)) => id.as_str() == payload.call_id.as_str(),
                 _ => false,
             };
             if is_mirror {
+                if matches!(&item, LegacyItemMirror::Reasoning { summary, content } if summary.len() > 0 || content.len() > 0) {
+                    self.pending_legacy_item_mirror = Some(item);
+                }
                 return;
             }
         }
@@ -545,12 +465,7 @@ impl ThreadHistoryBuilder {
     ) -> ThreadHistoryChangeSet {
         assert!(
             Self::scoped_event_turn_id(event) == Some(turn.id.as_str())
-                || Self::legacy_collab_end_identity(event).is_some_and(|(call_id, operation)| turn
-                    .items
-                    .iter()
-                    .any(|item| matches!(item,
-                    ThreadItem::CollabAgentToolCall { id, tool, .. }
-                    if id == call_id && *tool == operation)))
+                || turn.items.iter().any(|item| Self::legacy_tool_end_matches(event, item))
         );
         assert!(!self.contains_turn(&turn.id));
         let items = std::mem::take(&mut turn.items);
@@ -558,7 +473,9 @@ impl ThreadHistoryBuilder {
         retained.items = items;
         let position = self.turns.len();
         self.turns.push(retained);
+        self.retained_turn_override = Some(turn.id.clone());
         let changes = self.handle_event_with_changes(event);
+        self.retained_turn_override = None;
         *turn = self.turns.remove(position);
         changes
     }
@@ -566,6 +483,7 @@ impl ThreadHistoryBuilder {
     pub fn handle_rollout_item(&mut self, item: &RolloutItem) {
         self.current_rollout_index = self.next_rollout_index;
         self.next_rollout_index += 1;
+        self.replaying_rollout_item = true;
         let legacy_inter_agent_mail = self.legacy_inter_agent_mail.observe(item).is_some();
         match item {
             RolloutItem::EventMsg(event) => self.handle_event(event),
@@ -587,6 +505,7 @@ impl ThreadHistoryBuilder {
             | RolloutItem::AdditionalContextState { .. }
             | RolloutItem::SessionMeta(_) => {}
         }
+        self.replaying_rollout_item = false;
     }
 
     /// Handles a rollout item and returns the materialized items or turn metadata
@@ -787,21 +706,42 @@ impl ThreadHistoryBuilder {
             self.pending_legacy_user_mirror = Some(item.as_legacy_user_message_event());
             return;
         }
+        // Paginated rollouts persist canonical completions, not their live-only
+        // compatibility events. Materialize these families and suppress only
+        // the immediately following legacy mirror(s) in mixed/live streams.
+        let mirror = match &payload.item {
+            codex_protocol::items::TurnItem::Reasoning(item) => Some(LegacyItemMirror::Reasoning {
+                summary: item.summary_text.clone().into_iter(),
+                content: item.raw_content.clone().into_iter(),
+            }),
+            codex_protocol::items::TurnItem::FileChange(item) => Some(LegacyItemMirror::FileChange(item.id.clone())),
+            codex_protocol::items::TurnItem::McpToolCall(item) => Some(LegacyItemMirror::McpToolCall(item.id.clone())),
+            codex_protocol::items::TurnItem::ImageGeneration(item) => Some(LegacyItemMirror::ImageGeneration(item.id.clone())),
+            _ => None,
+        };
+        if let Some(mirror) = mirror {
+            let item = self.materialize_item(&payload.item);
+            self.upsert_item_in_turn_id(&payload.turn_id, item);
+            self.pending_legacy_item_mirror = Some(mirror);
+            return;
+        }
         if matches!(
             &payload.item,
             codex_protocol::items::TurnItem::AgentMessage(_)
                 | codex_protocol::items::TurnItem::ContextCompaction(_)
+                | codex_protocol::items::TurnItem::WebSearch(_)
                 | codex_protocol::items::TurnItem::Extension(
                     codex_extension_items::ExtensionItem::WebSearch(_)
                 )
         ) {
             let item = self.materialize_item(&payload.item);
             if !matches!(&item, ThreadItem::AgentMessage { text, .. } if text.is_empty()) {
-                self.upsert_item_in_turn_id(&payload.turn_id, item.clone());
-                if self.contains_turn(&payload.turn_id) {
-                    self.pending_legacy_item_mirror = (!matches!(item,
-                        ThreadItem::AgentMessage { interruption: Some(_), .. })).then_some(item);
-                }
+                self.pending_legacy_item_mirror = match &item {
+                    ThreadItem::ContextCompaction { .. } => Some(LegacyItemMirror::ContextCompaction),
+                    ThreadItem::AgentMessage { interruption: Some(_), .. } => None,
+                    _ => Some(LegacyItemMirror::Item(item.clone())),
+                };
+                self.upsert_item_in_turn_id(&payload.turn_id, item);
             }
         } else {
             self.handle_materialized_item_lifecycle(&payload.turn_id, &payload.item);
@@ -841,6 +781,8 @@ impl ThreadHistoryBuilder {
         };
 
         if should_upsert {
+            let current_owner = turn_id.is_empty().then(|| self.ensure_turn().id.clone());
+            let turn_id = current_owner.as_deref().unwrap_or(turn_id);
             if matches!(item, codex_protocol::items::TurnItem::UserMessage(_))
                 && self.contains_turn(turn_id)
             {
@@ -853,643 +795,6 @@ impl ThreadHistoryBuilder {
                 self.upsert_item_in_turn_id(turn_id, item);
             }
         }
-    }
-
-    fn handle_web_search_begin(&mut self, payload: &WebSearchBeginEvent) {
-        if self.current_turn_has_item(&payload.call_id) {
-            return;
-        }
-        let item = ThreadItem::WebSearch(WebSearchItem {
-            status: None,
-            error: None,
-            id: payload.call_id.clone(),
-            query: String::new(),
-            action: None,
-        });
-        self.upsert_item_in_current_turn(item);
-    }
-
-    fn handle_web_search_end(&mut self, payload: &WebSearchEndEvent) {
-        let item = ThreadItem::WebSearch(WebSearchItem {
-            status: None,
-            error: None,
-            id: payload.call_id.clone(),
-            query: payload.query.clone(),
-            action: Some(web_search_action_from_core(payload.action.clone())),
-        });
-        self.upsert_item_in_current_turn(item);
-    }
-
-    fn handle_exec_command_begin(&mut self, payload: &ExecCommandBeginEvent) {
-        if self.omit_tool_payloads {
-            self.upsert_item_in_turn_id(&payload.turn_id, Self::omitted_tool_item(payload.call_id.clone()));
-            return;
-        }
-        let item = build_command_execution_begin_item(payload);
-        self.upsert_item_in_turn_id(&payload.turn_id, item);
-    }
-
-    fn handle_exec_command_end(&mut self, payload: &ExecCommandEndEvent) {
-        if self.omit_tool_payloads {
-            self.upsert_item_in_turn_id(&payload.turn_id, Self::omitted_tool_item(payload.call_id.clone()));
-            return;
-        }
-        let item = build_command_execution_end_item(payload);
-        // Command completions can arrive out of order. Unified exec may return
-        // while a PTY is still running, then emit ExecCommandEnd later from a
-        // background exit watcher when that process finally exits. By then, a
-        // newer user turn may already have started. Route by event turn_id so
-        // replay preserves the original turn association.
-        self.upsert_item_in_turn_id(&payload.turn_id, item);
-    }
-
-    fn handle_apply_patch_approval_request(&mut self, payload: &ApplyPatchApprovalRequestEvent) {
-        let item = if self.omit_tool_payloads {
-            Self::omitted_tool_item(payload.call_id.clone())
-        } else {
-            build_file_change_approval_request_item(payload)
-        };
-        if payload.turn_id.is_empty() {
-            self.upsert_item_in_current_turn(item);
-        } else {
-            self.upsert_item_in_turn_id(&payload.turn_id, item);
-        }
-    }
-
-    fn handle_patch_apply_begin(&mut self, payload: &PatchApplyBeginEvent) {
-        let item = if self.omit_tool_payloads {
-            Self::omitted_tool_item(payload.call_id.clone())
-        } else {
-            build_file_change_begin_item(payload)
-        };
-        if payload.turn_id.is_empty() {
-            self.upsert_item_in_current_turn(item);
-        } else {
-            self.upsert_item_in_turn_id(&payload.turn_id, item);
-        }
-    }
-
-    fn handle_patch_apply_end(&mut self, payload: &PatchApplyEndEvent) {
-        let item = if self.omit_tool_payloads {
-            Self::omitted_tool_item(payload.call_id.clone())
-        } else {
-            build_file_change_end_item(payload)
-        };
-        if payload.turn_id.is_empty() {
-            self.upsert_item_in_current_turn(item);
-        } else {
-            self.upsert_item_in_turn_id(&payload.turn_id, item);
-        }
-    }
-
-    fn handle_dynamic_tool_call_request(
-        &mut self,
-        payload: &codex_protocol::dynamic_tools::DynamicToolCallRequest,
-    ) {
-        if self.omit_tool_payloads {
-            let item = Self::omitted_tool_item(payload.call_id.clone());
-            if payload.turn_id.is_empty() {
-                self.upsert_item_in_current_turn(item);
-            } else {
-                self.upsert_item_in_turn_id(&payload.turn_id, item);
-            }
-            return;
-        }
-        let item = ThreadItem::DynamicToolCall {
-            id: payload.call_id.clone(),
-            namespace: payload.namespace.clone(),
-            tool: payload.tool.clone(),
-            arguments: payload.arguments.clone(),
-            status: DynamicToolCallStatus::InProgress,
-            content_items: None,
-            success: None,
-            error: None,
-            duration_ms: None,
-        };
-        if payload.turn_id.is_empty() {
-            self.upsert_item_in_current_turn(item);
-        } else {
-            self.upsert_item_in_turn_id(&payload.turn_id, item);
-        }
-    }
-
-    fn handle_dynamic_tool_call_response(&mut self, payload: &DynamicToolCallResponseEvent) {
-        if self.omit_tool_payloads {
-            let item = Self::omitted_tool_item(payload.call_id.clone());
-            if payload.turn_id.is_empty() {
-                self.upsert_item_in_current_turn(item);
-            } else {
-                self.upsert_item_in_turn_id(&payload.turn_id, item);
-            }
-            return;
-        }
-        let status = if payload.success {
-            DynamicToolCallStatus::Completed
-        } else {
-            DynamicToolCallStatus::Failed
-        };
-        let duration_ms = i64::try_from(payload.duration.as_millis()).ok();
-        let item = ThreadItem::DynamicToolCall {
-            id: payload.call_id.clone(),
-            namespace: payload.namespace.clone(),
-            tool: payload.tool.clone(),
-            arguments: payload.arguments.clone(),
-            status,
-            content_items: Some(convert_dynamic_tool_content_items(&payload.content_items)),
-            success: Some(payload.success),
-            error: payload.error.clone(),
-            duration_ms,
-        };
-        if payload.turn_id.is_empty() {
-            self.upsert_item_in_current_turn(item);
-        } else {
-            self.upsert_item_in_turn_id(&payload.turn_id, item);
-        }
-    }
-
-    fn handle_mcp_tool_call_begin(&mut self, payload: &McpToolCallBeginEvent) {
-        if self.omit_tool_payloads {
-            self.upsert_item_in_current_turn(Self::omitted_tool_item(payload.call_id.clone()));
-            return;
-        }
-        let item = ThreadItem::McpToolCall {
-            id: payload.call_id.clone(),
-            server: payload.invocation.server.clone(),
-            tool: payload.invocation.tool.clone(),
-            status: McpToolCallStatus::InProgress,
-            arguments: payload
-                .invocation
-                .arguments
-                .clone()
-                .unwrap_or(serde_json::Value::Null),
-            app_context: payload
-                .connector_id
-                .clone()
-                .map(|connector_id| McpToolCallAppContext {
-                    connector_id,
-                    link_id: payload.link_id.clone(),
-                    resource_uri: payload.mcp_app_resource_uri.clone(),
-                    app_name: payload.app_name.clone(),
-                    template_id: payload.template_id.clone(),
-                    action_name: payload.action_name.clone(),
-                }),
-            mcp_app_resource_uri: payload.mcp_app_resource_uri.clone(),
-            plugin_id: payload.plugin_id.clone(),
-            result: None,
-            error: None,
-            duration_ms: None,
-        };
-        self.upsert_item_in_current_turn(item);
-    }
-
-    fn handle_mcp_tool_call_end(&mut self, payload: &McpToolCallEndEvent) {
-        if self.omit_tool_payloads {
-            self.upsert_item_in_current_turn(Self::omitted_tool_item(payload.call_id.clone()));
-            return;
-        }
-        let status = if payload.is_success() {
-            McpToolCallStatus::Completed
-        } else {
-            McpToolCallStatus::Failed
-        };
-        let duration_ms = i64::try_from(payload.duration.as_millis()).ok();
-        let (result, error) = match &payload.result {
-            Ok(value) => (
-                Some(Box::new(McpToolCallResult {
-                    content: value.content.clone(),
-                    structured_content: value.structured_content.clone(),
-                    meta: value.meta.clone(),
-                })),
-                None,
-            ),
-            Err(message) => (
-                None,
-                Some(McpToolCallError {
-                    message: message.clone(),
-                }),
-            ),
-        };
-        let item = ThreadItem::McpToolCall {
-            id: payload.call_id.clone(),
-            server: payload.invocation.server.clone(),
-            tool: payload.invocation.tool.clone(),
-            status,
-            arguments: payload
-                .invocation
-                .arguments
-                .clone()
-                .unwrap_or(serde_json::Value::Null),
-            app_context: payload
-                .connector_id
-                .clone()
-                .map(|connector_id| McpToolCallAppContext {
-                    connector_id,
-                    link_id: payload.link_id.clone(),
-                    resource_uri: payload.mcp_app_resource_uri.clone(),
-                    app_name: payload.app_name.clone(),
-                    template_id: payload.template_id.clone(),
-                    action_name: payload.action_name.clone(),
-                }),
-            mcp_app_resource_uri: payload.mcp_app_resource_uri.clone(),
-            plugin_id: payload.plugin_id.clone(),
-            result,
-            error,
-            duration_ms,
-        };
-        self.upsert_item_in_current_turn(item);
-    }
-
-    fn handle_view_image_tool_call(&mut self, payload: &ViewImageToolCallEvent) {
-        let item = ThreadItem::ImageView {
-            environment: payload.environment.clone(),
-            id: payload.call_id.clone(),
-            path: payload.path.clone().into(),
-        };
-        self.upsert_item_in_current_turn(item);
-    }
-
-    fn handle_image_generation_begin(&mut self, payload: &ImageGenerationBeginEvent) {
-        if self.current_turn_has_item(&payload.call_id) {
-            return;
-        }
-        let item = ThreadItem::ImageGeneration(ImageGenerationItem {
-            id: payload.call_id.clone(),
-            status: String::new(),
-            revised_prompt: None,
-            result: None,
-            error: None,
-            saved_path: None,
-            provider_usage: None,
-        });
-        self.upsert_item_in_current_turn(item);
-    }
-
-    fn handle_image_generation_end(&mut self, payload: &ImageGenerationEndEvent) {
-        if self.omit_tool_payloads {
-            self.upsert_item_in_current_turn(Self::omitted_tool_item(payload.call_id.clone()));
-            return;
-        }
-        // Legacy ends cannot express usage. Keep the same turn/call's receipt,
-        // without copying or comparing image bytes or suppressing later updates.
-        let provider_usage = self.current_turn.as_ref().and_then(|turn| {
-            let index = *turn.item_indexes.get(&payload.call_id)?;
-            match &turn.items[index] {
-                ThreadItem::ImageGeneration(item) => item.provider_usage.clone(),
-                _ => None,
-            }
-        });
-        let item = ThreadItem::ImageGeneration(ImageGenerationItem {
-            id: payload.call_id.clone(),
-            status: payload.status.clone(),
-            revised_prompt: payload.revised_prompt.clone(),
-            result: payload.result.clone(),
-            error: payload.error.clone(),
-            saved_path: payload.saved_path.clone(),
-            provider_usage,
-        });
-        self.upsert_item_in_current_turn(item);
-    }
-
-    fn handle_collab_agent_spawn_begin(
-        &mut self,
-        payload: &codex_protocol::protocol::CollabAgentSpawnBeginEvent,
-    ) {
-        if self.omit_tool_payloads {
-            self.upsert_item_in_current_turn(Self::omitted_collab_item(&payload.call_id, CollabAgentTool::SpawnAgent, CollabAgentToolCallStatus::InProgress));
-            return;
-        }
-        let item = ThreadItem::CollabAgentToolCall {
-            id: payload.call_id.clone(),
-            tool: CollabAgentTool::SpawnAgent,
-            status: CollabAgentToolCallStatus::InProgress,
-            sender_thread_id: payload.sender_thread_id.to_string(),
-            receiver_thread_ids: Vec::new(),
-            prompt: Some(payload.prompt.clone()),
-            model: payload.model.clone(),
-            reasoning_effort: payload.reasoning_effort.clone(),
-            agents_states: HashMap::new(),
-        };
-        self.upsert_item_in_current_turn(item);
-    }
-
-    fn handle_collab_agent_spawn_end(
-        &mut self,
-        payload: &codex_protocol::protocol::CollabAgentSpawnEndEvent,
-    ) {
-        let has_receiver = payload.new_thread_id.is_some();
-        let status = match &payload.status {
-            AgentStatus::Errored(_) | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
-            _ if has_receiver => CollabAgentToolCallStatus::Completed,
-            _ => CollabAgentToolCallStatus::Failed,
-        };
-        if self.omit_tool_payloads {
-            self.upsert_item_in_current_turn(Self::omitted_collab_item(&payload.call_id, CollabAgentTool::SpawnAgent, status));
-            return;
-        }
-        let (receiver_thread_ids, agents_states) = match &payload.new_thread_id {
-            Some(id) => {
-                let receiver_id = id.to_string();
-                let received_status = CollabAgentState::from(payload.status.clone());
-                (
-                    vec![receiver_id.clone()],
-                    [(receiver_id, received_status)].into_iter().collect(),
-                )
-            }
-            None => (Vec::new(), HashMap::new()),
-        };
-        self.upsert_item_in_current_turn(ThreadItem::CollabAgentToolCall {
-            id: payload.call_id.clone(),
-            tool: CollabAgentTool::SpawnAgent,
-            status,
-            sender_thread_id: payload.sender_thread_id.to_string(),
-            receiver_thread_ids,
-            prompt: Some(payload.prompt.clone()),
-            model: payload.model.clone(),
-            reasoning_effort: payload.reasoning_effort.clone(),
-            agents_states,
-        });
-    }
-
-    fn handle_collab_agent_interaction_begin(
-        &mut self,
-        payload: &codex_protocol::protocol::CollabAgentInteractionBeginEvent,
-    ) {
-        if self.omit_tool_payloads {
-            self.upsert_item_in_current_turn(Self::omitted_collab_item(&payload.call_id, CollabAgentTool::SendInput, CollabAgentToolCallStatus::InProgress));
-            return;
-        }
-        let item = ThreadItem::CollabAgentToolCall {
-            id: payload.call_id.clone(),
-            tool: CollabAgentTool::SendInput,
-            status: CollabAgentToolCallStatus::InProgress,
-            sender_thread_id: payload.sender_thread_id.to_string(),
-            receiver_thread_ids: vec![payload.receiver_thread_id.to_string()],
-            prompt: Some(payload.prompt.clone()),
-            model: None,
-            reasoning_effort: None,
-            agents_states: HashMap::new(),
-        };
-        self.upsert_item_in_current_turn(item);
-    }
-
-    fn handle_collab_agent_interaction_end(
-        &mut self,
-        payload: &codex_protocol::protocol::CollabAgentInteractionEndEvent,
-    ) {
-        let status = match &payload.status {
-            AgentStatus::Errored(_) | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
-            _ => CollabAgentToolCallStatus::Completed,
-        };
-        if self.omit_tool_payloads {
-            self.upsert_item_in_current_turn(Self::omitted_collab_item(&payload.call_id, CollabAgentTool::SendInput, status));
-            return;
-        }
-        let receiver_id = payload.receiver_thread_id.to_string();
-        let received_status = CollabAgentState::from(payload.status.clone());
-        self.upsert_item_in_current_turn(ThreadItem::CollabAgentToolCall {
-            id: payload.call_id.clone(),
-            tool: CollabAgentTool::SendInput,
-            status,
-            sender_thread_id: payload.sender_thread_id.to_string(),
-            receiver_thread_ids: vec![receiver_id.clone()],
-            prompt: Some(payload.prompt.clone()),
-            model: None,
-            reasoning_effort: None,
-            agents_states: [(receiver_id, received_status)].into_iter().collect(),
-        });
-    }
-
-    fn handle_sub_agent_activity(
-        &mut self,
-        payload: &codex_protocol::protocol::SubAgentActivityEvent,
-    ) {
-        self.upsert_item_in_current_turn(ThreadItem::SubAgentActivity {
-            id: payload.event_id.clone(),
-            kind: payload.kind.into(),
-            agent_thread_id: payload.agent_thread_id.to_string(),
-            agent_path: String::from(payload.agent_path.clone()),
-        });
-    }
-
-    fn handle_collab_waiting_begin(
-        &mut self,
-        payload: &codex_protocol::protocol::CollabWaitingBeginEvent,
-    ) {
-        if self.omit_tool_payloads {
-            self.upsert_item_in_current_turn(Self::omitted_collab_item(&payload.call_id, CollabAgentTool::Wait, CollabAgentToolCallStatus::InProgress));
-            return;
-        }
-        let item = ThreadItem::CollabAgentToolCall {
-            id: payload.call_id.clone(),
-            tool: CollabAgentTool::Wait,
-            status: CollabAgentToolCallStatus::InProgress,
-            sender_thread_id: payload.sender_thread_id.to_string(),
-            receiver_thread_ids: payload
-                .receiver_thread_ids
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-            prompt: None,
-            model: None,
-            reasoning_effort: None,
-            agents_states: HashMap::new(),
-        };
-        self.upsert_item_in_current_turn(item);
-    }
-
-    fn handle_collab_waiting_end(
-        &mut self,
-        payload: &codex_protocol::protocol::CollabWaitingEndEvent,
-    ) {
-        // Modern item events carry an explicit terminal outcome that this legacy
-        // event cannot represent (for example, a failed wait with no receivers).
-        // A terminal snapshot also covers waits reconciled by TurnAborted.
-        let wait_status = |item: &ThreadItem| match item {
-            ThreadItem::CollabAgentToolCall {
-                id,
-                tool: CollabAgentTool::Wait,
-                status,
-                ..
-            } if id == &payload.call_id => Some(status.clone()),
-            _ => None,
-        };
-        let current_owner = self.current_turn.as_ref().and_then(|turn| {
-            turn.item_indexes.get(&payload.call_id).and_then(|&index| {
-                wait_status(&turn.items[index]).map(|status| (turn.id.clone(), status))
-            })
-        });
-        let owner = if current_owner.is_some() {
-            current_owner
-        } else {
-            let mut owners = self.turns.iter().filter_map(|turn| {
-                turn.items
-                    .iter()
-                    .find_map(&wait_status)
-                    .map(|status| (turn.id.clone(), status))
-            });
-            let first = owners.next();
-            // An unscoped legacy event cannot disambiguate reused historical IDs.
-            if owners.next().is_some() {
-                return;
-            }
-            first
-        };
-        if owner.is_none() && self.rolled_back_wait_ids.contains(&payload.call_id) {
-            return;
-        }
-        if owner
-            .as_ref()
-            .is_some_and(|(_, status)| *status != CollabAgentToolCallStatus::InProgress)
-        {
-            return;
-        }
-        let status = if payload
-            .statuses
-            .values()
-            .any(|status| matches!(status, AgentStatus::Errored(_) | AgentStatus::NotFound))
-        {
-            CollabAgentToolCallStatus::Failed
-        } else {
-            CollabAgentToolCallStatus::Completed
-        };
-        if self.omit_tool_payloads {
-            let item = Self::omitted_collab_item(&payload.call_id, CollabAgentTool::Wait, status);
-            if let Some((turn_id, _)) = owner {
-                self.upsert_item_in_turn_id(&turn_id, item);
-            } else {
-                self.upsert_item_in_current_turn(item);
-            }
-            return;
-        }
-        let mut receiver_thread_ids: Vec<String> =
-            payload.statuses.keys().map(ToString::to_string).collect();
-        receiver_thread_ids.sort();
-        let agents_states = payload
-            .statuses
-            .iter()
-            .map(|(id, status)| (id.to_string(), CollabAgentState::from(status.clone())))
-            .collect();
-        let item = ThreadItem::CollabAgentToolCall {
-            id: payload.call_id.clone(),
-            tool: CollabAgentTool::Wait,
-            status,
-            sender_thread_id: payload.sender_thread_id.to_string(),
-            receiver_thread_ids,
-            prompt: None,
-            model: None,
-            reasoning_effort: None,
-            agents_states,
-        };
-        if let Some((turn_id, _)) = owner {
-            self.upsert_item_in_turn_id(&turn_id, item);
-        } else {
-            self.upsert_item_in_current_turn(item);
-        }
-    }
-
-    fn handle_collab_close_begin(
-        &mut self,
-        payload: &codex_protocol::protocol::CollabCloseBeginEvent,
-    ) {
-        if self.omit_tool_payloads {
-            self.upsert_item_in_current_turn(Self::omitted_collab_item(&payload.call_id, CollabAgentTool::CloseAgent, CollabAgentToolCallStatus::InProgress));
-            return;
-        }
-        let item = ThreadItem::CollabAgentToolCall {
-            id: payload.call_id.clone(),
-            tool: CollabAgentTool::CloseAgent,
-            status: CollabAgentToolCallStatus::InProgress,
-            sender_thread_id: payload.sender_thread_id.to_string(),
-            receiver_thread_ids: vec![payload.receiver_thread_id.to_string()],
-            prompt: None,
-            model: None,
-            reasoning_effort: None,
-            agents_states: HashMap::new(),
-        };
-        self.upsert_item_in_current_turn(item);
-    }
-
-    fn handle_collab_close_end(&mut self, payload: &codex_protocol::protocol::CollabCloseEndEvent) {
-        let status = match &payload.status {
-            AgentStatus::Errored(_) | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
-            _ => CollabAgentToolCallStatus::Completed,
-        };
-        if self.omit_tool_payloads {
-            self.upsert_item_in_current_turn(Self::omitted_collab_item(&payload.call_id, CollabAgentTool::CloseAgent, status));
-            return;
-        }
-        let receiver_id = payload.receiver_thread_id.to_string();
-        let agents_states = [(
-            receiver_id.clone(),
-            CollabAgentState::from(payload.status.clone()),
-        )]
-        .into_iter()
-        .collect();
-        self.upsert_item_in_current_turn(ThreadItem::CollabAgentToolCall {
-            id: payload.call_id.clone(),
-            tool: CollabAgentTool::CloseAgent,
-            status,
-            sender_thread_id: payload.sender_thread_id.to_string(),
-            receiver_thread_ids: vec![receiver_id],
-            prompt: None,
-            model: None,
-            reasoning_effort: None,
-            agents_states,
-        });
-    }
-
-    fn handle_collab_resume_begin(
-        &mut self,
-        payload: &codex_protocol::protocol::CollabResumeBeginEvent,
-    ) {
-        if self.omit_tool_payloads {
-            self.upsert_item_in_current_turn(Self::omitted_collab_item(&payload.call_id, CollabAgentTool::ResumeAgent, CollabAgentToolCallStatus::InProgress));
-            return;
-        }
-        let item = ThreadItem::CollabAgentToolCall {
-            id: payload.call_id.clone(),
-            tool: CollabAgentTool::ResumeAgent,
-            status: CollabAgentToolCallStatus::InProgress,
-            sender_thread_id: payload.sender_thread_id.to_string(),
-            receiver_thread_ids: vec![payload.receiver_thread_id.to_string()],
-            prompt: None,
-            model: None,
-            reasoning_effort: None,
-            agents_states: HashMap::new(),
-        };
-        self.upsert_item_in_current_turn(item);
-    }
-
-    fn handle_collab_resume_end(
-        &mut self,
-        payload: &codex_protocol::protocol::CollabResumeEndEvent,
-    ) {
-        let status = match &payload.status {
-            AgentStatus::Errored(_) | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
-            _ => CollabAgentToolCallStatus::Completed,
-        };
-        if self.omit_tool_payloads {
-            self.upsert_item_in_current_turn(Self::omitted_collab_item(&payload.call_id, CollabAgentTool::ResumeAgent, status));
-            return;
-        }
-        let receiver_id = payload.receiver_thread_id.to_string();
-        let agents_states = [(
-            receiver_id.clone(),
-            CollabAgentState::from(payload.status.clone()),
-        )]
-        .into_iter()
-        .collect();
-        self.upsert_item_in_current_turn(ThreadItem::CollabAgentToolCall {
-            id: payload.call_id.clone(),
-            tool: CollabAgentTool::ResumeAgent,
-            status,
-            sender_thread_id: payload.sender_thread_id.to_string(),
-            receiver_thread_ids: vec![receiver_id],
-            prompt: None,
-            model: None,
-            reasoning_effort: None,
-            agents_states,
-        });
     }
 
     fn handle_context_compacted(&mut self, _payload: &ContextCompactedEvent) {
@@ -1550,7 +855,7 @@ impl ThreadHistoryBuilder {
     }
 
     fn upsert_review_mode_item(&mut self, turn_id: Option<&str>, item: ThreadItem) {
-        let Some(turn_id) = turn_id else {
+        let Some(turn_id) = turn_id.filter(|id| !id.is_empty()) else {
             self.upsert_item_in_current_turn(item);
             return;
         };
@@ -1559,6 +864,11 @@ impl ThreadHistoryBuilder {
             .as_ref()
             .is_some_and(|turn| turn.id == turn_id);
         if !current_turn_matches && !self.turns.iter().any(|turn| turn.id == turn_id) {
+            if self.rolled_back_turn_ids.contains(turn_id)
+                || self.current_turn.as_ref().is_some_and(|turn| turn.opened_explicitly)
+            {
+                return;
+            }
             self.finish_current_turn();
             let turn = self.new_turn(Some(turn_id.to_string()));
             self.record_changed_turn(self.turns.len());
@@ -1798,6 +1108,8 @@ impl ThreadHistoryBuilder {
 
         for turn in &self.turns[retained_len..] {
             self.rollback_eligible_turn_ids.remove(&turn.id);
+            self.rolled_back_turn_ids.insert(turn.id.clone());
+            self.rolled_back_wait_ids.extend(turn.items.iter().map(|item| item.id().to_string()));
         }
         self.turns.truncate(retained_len);
 
@@ -1823,7 +1135,7 @@ impl ThreadHistoryBuilder {
 
     fn new_turn(&mut self, id: Option<String>) -> PendingTurn {
         let id = id.unwrap_or_else(|| {
-            if self.next_rollout_index == 0 {
+            if !self.replaying_rollout_item {
                 Uuid::now_v7().to_string()
             } else {
                 format!("rollout-{}", self.current_rollout_index)
@@ -1874,6 +1186,10 @@ impl ThreadHistoryBuilder {
     }
 
     fn upsert_item_in_turn_id(&mut self, turn_id: &str, item: ThreadItem) {
+        if turn_id.is_empty() {
+            self.upsert_item_in_current_turn(item);
+            return;
+        }
         if let Some(turn) = self.current_turn.as_mut().filter(|turn| turn.id == turn_id) {
             let index = turn.upsert_item(item);
             self.record_changed_item(self.turns.len(), index);
@@ -1906,21 +1222,19 @@ impl ThreadHistoryBuilder {
                 } if candidate_id == id && candidate_tool == tool => Some(status.clone()),
                 _ => None,
             };
-            let current = self.current_turn.as_ref().and_then(|turn| {
+            let current = self.current_turn.as_ref().filter(|turn| self.retained_turn_override.as_ref().is_none_or(|id| id == &turn.id)).and_then(|turn| {
                 turn.item_indexes
                     .get(id)
                     .and_then(|&index| status_of(&turn.items[index]))
                     .map(|status| (turn.id.clone(), status))
             });
-            let owner = if current.is_some() {
-                current
-            } else {
-                let mut owners = self.turns.iter().filter_map(|turn| {
+            let owner = {
+                let mut owners = current.into_iter().chain(self.turns.iter().filter(|turn| self.retained_turn_override.as_ref().is_none_or(|id| id == &turn.id)).filter_map(|turn| {
                     turn.items
                         .iter()
                         .find_map(&status_of)
                         .map(|status| (turn.id.clone(), status))
-                });
+                }));
                 let first = owners.next();
                 if owners.next().is_some() {
                     return;
@@ -1941,6 +1255,36 @@ impl ThreadHistoryBuilder {
         }
         let index = self.ensure_turn().upsert_item(item);
         self.record_changed_item(self.turns.len(), index);
+    }
+
+    /// Resolve unscoped legacy tool completions without contaminating a newer turn.
+    fn upsert_legacy_tool_end(&mut self, mut item: ThreadItem) {
+        let id = item.id();
+        let matches = |candidate: &ThreadItem| candidate.id() == id
+            && (std::mem::discriminant(candidate) == std::mem::discriminant(&item)
+                || self.omit_tool_payloads);
+        let mut owners = self.current_turn.iter().filter(|turn| self.retained_turn_override.as_ref().is_none_or(|id| id == &turn.id)).filter(|turn| turn.items.iter().any(&matches))
+            .map(|turn| turn.id.clone())
+            .chain(self.turns.iter().filter(|turn| self.retained_turn_override.as_ref().is_none_or(|id| id == &turn.id)).filter(|turn| turn.items.iter().any(&matches)).map(|turn| turn.id.clone()));
+        let owner = owners.next();
+        if owners.next().is_some() || (owner.is_none() && self.rolled_back_wait_ids.contains(id)) {
+            return;
+        }
+        if let Some(turn_id) = owner {
+            if let ThreadItem::ImageGeneration(new) = &mut item
+                && new.provider_usage.is_none()
+            {
+                let previous = self.current_turn.as_ref().filter(|turn| turn.id == turn_id)
+                    .map(|turn| &turn.items)
+                    .or_else(|| self.turns.iter().find(|turn| turn.id == turn_id).map(|turn| &turn.items));
+                if let Some(ThreadItem::ImageGeneration(old)) = previous.and_then(|items| items.iter().find(|old| old.id() == new.id)) {
+                    new.provider_usage = old.provider_usage.clone();
+                }
+            }
+            self.upsert_item_in_turn_id(&turn_id, item);
+        } else {
+            self.upsert_item_in_current_turn(item);
+        }
     }
 
     /// Legacy begin events carry only a call id. Extension tools emit their canonical
@@ -2016,14 +1360,6 @@ impl ThreadHistoryBuilder {
         ThreadItem::Plan { id, text: String::new() }
     }
 
-    fn omitted_collab_item(id: &str, tool: CollabAgentTool, status: CollabAgentToolCallStatus) -> ThreadItem {
-        ThreadItem::CollabAgentToolCall {
-            id: id.to_string(), tool, status, sender_thread_id: String::new(),
-            receiver_thread_ids: Vec::new(), prompt: None, model: None,
-            reasoning_effort: None, agents_states: HashMap::new(),
-        }
-    }
-
     fn materialize_item(&self, item: &codex_protocol::items::TurnItem) -> ThreadItem {
         use codex_protocol::items::TurnItem as CoreItem;
         if !self.omit_tool_payloads {
@@ -2050,16 +1386,6 @@ impl ThreadHistoryBuilder {
             _ => Self::omitted_tool_item(item.id()),
         }
     }
-}
-
-fn convert_dynamic_tool_content_items(
-    items: &[codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem],
-) -> Vec<DynamicToolCallOutputContentItem> {
-    items
-        .iter()
-        .cloned()
-        .map(DynamicToolCallOutputContentItem::from)
-        .collect()
 }
 
 fn replace_turn_item(existing: &mut ThreadItem, mut item: ThreadItem) {

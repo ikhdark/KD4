@@ -259,20 +259,53 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
         }
     }
     omit_first_attempt_history(&mut projected);
+    if local_text_tool {
+        omit_first_failure_history(&mut projected);
+    }
     (raw_text || mcp_text || projected != *object).then_some(Value::Object(projected))
+}
+
+/// Apply the same display-only retry-memory rule to an uncaught native error.
+/// The bridge's Error message/property and original tool receipt stay intact.
+pub fn model_visible_error_text(text: &str) -> Option<String> {
+    let (line, tail) = text.split_once('\n').map_or((text, None), |(line, tail)| (line, Some(tail)));
+    let mut envelope: Value = serde_json::from_str(line.strip_prefix("Error: ")?).ok()?;
+    let object = envelope.as_object_mut()?;
+    if object.len() != 1 {
+        return None;
+    }
+    serde_json::from_value::<codex_protocol::tool_failure::ToolFailure>(
+        object.get("tool_failure")?.clone(),
+    ).ok()?;
+    if !omit_first_failure_history(object) {
+        return None;
+    }
+    let mut projected = format!("Error: {envelope}");
+    if let Some(tail) = tail {
+        projected.push('\n');
+        projected.push_str(tail);
+    }
+    Some(projected)
+}
+
+/// Reuse the display rule on an already-decoded, owned native failure envelope.
+pub fn omit_first_failure_history(projected: &mut serde_json::Map<String, Value>) -> bool {
+    projected.get_mut("tool_failure")
+        .and_then(|failure| failure.get_mut("details"))
+        .and_then(Value::as_object_mut)
+        .is_some_and(omit_first_attempt_history)
 }
 
 /// Retry memory exists to surface earlier outcomes for identical input. A
 /// first attempt has none, so its advisory repeats only this call's identity
 /// and fixed policy text. Scripts and harness fingerprints keep the native field.
-fn omit_first_attempt_history(projected: &mut serde_json::Map<String, Value>) {
-    if projected.get("operation_history").is_some_and(|history| {
+fn omit_first_attempt_history(projected: &mut serde_json::Map<String, Value>) -> bool {
+    let omit = projected.get("operation_history").is_some_and(|history| {
         history["previous_attempt_count"] == 0
             && history["last_unsuccessful_attempt"].is_null()
             && history["recovery_required"] != true
-    }) {
-        projected.remove("operation_history");
-    }
+    });
+    omit && projected.remove("operation_history").is_some()
 }
 
 /// Keep each instrumented root's created executable and prepared shell startup.

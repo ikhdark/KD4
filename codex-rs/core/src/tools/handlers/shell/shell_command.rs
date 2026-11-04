@@ -20,6 +20,7 @@ use crate::session::turn_context::TurnEnvironment;
 use crate::shell::Shell;
 use crate::shell::ShellType;
 use crate::shell::get_shell;
+use crate::shell::resolve_use_login_shell;
 use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -111,19 +112,6 @@ impl ShellCommandHandler {
         Self { options }
     }
 
-    pub(super) fn resolve_use_login_shell(
-        login: Option<bool>,
-        allow_login_shell: bool,
-    ) -> Result<bool, FunctionCallError> {
-        if !allow_login_shell && login == Some(true) {
-            return Err(FunctionCallError::RespondToModel(
-                "login shell is disabled by config; omit `login` or set it to false.".to_string(),
-            ));
-        }
-
-        Ok(login.unwrap_or(allow_login_shell))
-    }
-
     pub(super) fn to_exec_params_with_shell(
         params: &ShellCommandToolCallParams,
         invocation: &CommandInvocation,
@@ -133,7 +121,8 @@ impl ShellCommandHandler {
         allow_login_shell: bool,
         shell: &Shell,
     ) -> Result<ExecParams, FunctionCallError> {
-        let use_login_shell = Self::resolve_use_login_shell(params.login, allow_login_shell)?;
+        let use_login_shell = resolve_use_login_shell(params.login, allow_login_shell)
+            .map_err(FunctionCallError::RespondToModel)?;
         let command = invocation.to_exec_args(shell, use_login_shell)?;
 
         let mut env = create_env(
@@ -302,7 +291,8 @@ impl ShellCommandHandler {
         )?;
         let prefix_rule = params.prefix_rule.clone();
         let allow_login_shell = turn.config.permissions.allow_login_shell;
-        let use_login_shell = Self::resolve_use_login_shell(params.login, allow_login_shell)?;
+        let use_login_shell = resolve_use_login_shell(params.login, allow_login_shell)
+            .map_err(FunctionCallError::RespondToModel)?;
         let session_shell = session
             .shell_for_environment(&turn_environment)
             .await

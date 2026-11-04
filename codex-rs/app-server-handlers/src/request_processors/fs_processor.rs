@@ -40,6 +40,8 @@ use std::sync::Arc;
 const MAX_READ_FILE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_WRITE_FILE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_WRITE_FILE_BASE64_BYTES: usize = MAX_WRITE_FILE_BYTES.div_ceil(3) * 4;
+const MAX_READ_DIRECTORY_ENTRIES: usize = 10_000;
+const MAX_READ_DIRECTORY_NAME_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct FsRequestProcessor {
@@ -160,6 +162,12 @@ impl FsRequestProcessor {
             .read_directory(&path, /*sandbox*/ None)
             .await
             .map_err(map_fs_error)?;
+        if entries.len() > MAX_READ_DIRECTORY_ENTRIES
+            || entries.iter().try_fold(0usize, |bytes, entry| bytes.checked_add(entry.file_name.len()))
+                .is_none_or(|bytes| bytes > MAX_READ_DIRECTORY_NAME_BYTES)
+        {
+            return Err(invalid_request("fs/readDirectory exceeds the directory response budget"));
+        }
         Ok(FsReadDirectoryResponse {
             entries: entries
                 .into_iter()

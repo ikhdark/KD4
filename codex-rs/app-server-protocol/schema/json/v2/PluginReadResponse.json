@@ -6,7 +6,7 @@
       "type": "string"
     },
     "AppSummary": {
-      "description": "EXPERIMENTAL - app metadata summary for plugin responses.",
+      "description": "App metadata summary for plugin responses.",
       "properties": {
         "category": {
           "type": [

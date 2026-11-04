@@ -8,21 +8,28 @@ pub fn create_list_mcp_resources_tool() -> ToolSpec {
         (
             "server".to_string(),
             JsonSchema::string(Some(
-                "MCP server name. Omit to list resources from every configured server.".to_string(),
+                "MCP server name. Omit to list the selected resource kind from every configured server.".to_string(),
             )),
         ),
         (
             "cursor".to_string(),
             JsonSchema::string(Some(
-                "Opaque cursor for an explicit single-server page. Omit to collect all bounded pages from the selected server or servers. A cursor requires `server`."
+                "Opaque cursor for an explicit single-server page. Omit to collect all bounded pages from the selected server or servers. A cursor requires `server` and must come from the same resource kind."
                     .to_string(),
             )),
+        ),
+        (
+            "kind".to_string(),
+            JsonSchema::string_enum(
+                vec![serde_json::json!("resources"), serde_json::json!("templates")],
+                Some("Catalog to list: `resources` (default) returns concrete resources; `templates` returns parameterized URI templates under `resourceTemplates`. Cursors are specific to one server and kind.".to_string()),
+            ),
         ),
     ]);
 
     ToolSpec::Function(ResponsesApiTool {
         name: "list_mcp_resources".to_string(),
-        description: "Lists resources provided by MCP servers, such as files, database schemas, or application-specific information. Use a known relevant resource for the requested source and scope. Do not list resources as a prerequisite for public web research or tool discovery. If an aggregate response includes `remainingServers`, those servers were omitted from the inline preview. Recover their retained entries with read_tool_output using the supplied artifact before listing them again. Use each server's cursor only to fetch pages not yet collected.".to_string(),
+        description: "Lists resources (default), or parameterized URI templates with `kind: \"templates\"`, provided by MCP servers. Use a known relevant resource or template for the requested source and scope. Do not list entries as a prerequisite for public web research or tool discovery. If an aggregate response includes `remainingServers`, those servers were omitted from the inline preview. Recover their retained entries with read_tool_output using the supplied artifact before listing them again. Use each server's cursor only to fetch pages not yet collected.".to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),

@@ -822,12 +822,15 @@ pub(super) async fn shutdown_unpublished_session(sess: &Arc<Session>) {
     sess.services.turn_environments.shutdown();
     // Independent services drain concurrently: a blocked snapshot write must
     // not keep a speculative socket, code-mode lease or MCP client alive.
-    let (_, _, code_mode, _) = tokio::join!(
+    let (_, processes, code_mode, _) = tokio::join!(
         sess.services.turn_environments.finish_shutdown(),
         sess.services.unified_exec_manager.terminate_all_processes(),
         sess.services.code_mode_service.shutdown(),
         sess.services.shutdown_mcp_managers(),
     );
+    if let Err(error) = processes {
+        warn!(%error, "unpublished process cleanup remains unconfirmed");
+    }
     if let Err(error) = code_mode {
         warn!(%error, "failed to close unpublished code-mode session");
     }
@@ -871,21 +874,21 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) -> RuntimeShutdown {
     }
     // Match unpublished cleanup only after the admission/producer barrier has
     // actually drained. On uncertain finalization retain the conservative order.
-    let (snapshot, code_mode) = if admission_incomplete || abort_incomplete || terminal_incomplete {
+    let (snapshot, processes, code_mode) = if admission_incomplete || abort_incomplete || terminal_incomplete {
         let snapshot = tokio::time::timeout_at(
             terminal_deadline,
             sess.services.turn_environments.finish_shutdown(),
         )
         .await;
-        sess.services
+        let processes = sess.services
             .unified_exec_manager
             .terminate_all_processes()
             .await;
         let code_mode = sess.services.code_mode_service.shutdown().await;
         sess.services.shutdown_mcp_managers().await;
-        (snapshot, code_mode)
+        (snapshot, processes, code_mode)
     } else {
-        let (snapshot, _, code_mode, _) = tokio::join!(
+        let (snapshot, processes, code_mode, _) = tokio::join!(
             tokio::time::timeout_at(
                 terminal_deadline,
                 sess.services.turn_environments.finish_shutdown()
@@ -894,7 +897,7 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) -> RuntimeShutdown {
             sess.services.code_mode_service.shutdown(),
             sess.services.shutdown_mcp_managers(),
         );
-        (snapshot, code_mode)
+        (snapshot, processes, code_mode)
     };
     if snapshot.is_err() {
         warn!("timed out waiting for remote snapshot cleanup during session shutdown");
@@ -902,7 +905,8 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) -> RuntimeShutdown {
     if let Err(err) = code_mode {
         warn!("failed to shutdown code mode session: {err}");
     }
-    // Every tool-producing owner above is joined before the final checkpoint.
+    // Accepted cleanup can remain owned and pending; do not turn that into a
+    // confirmed shutdown merely because the final checkpoint can be flushed.
     let tool_history_flush = tokio::time::timeout(
         TOOL_HISTORY_SHUTDOWN_FLUSH_TIMEOUT,
         sess.flush_tool_history_persistence(),
@@ -917,10 +921,14 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) -> RuntimeShutdown {
                 .to_string(),
         )),
     };
-    let mandatory_error =
-        (admission_incomplete || abort_incomplete || terminal_incomplete).then(||
-            "turn finalization did not complete before the shutdown deadline; accepted history writes remain owned, but durability is unconfirmed".to_string(),
-        );
+    let mut mandatory_errors = Vec::new();
+    if admission_incomplete || abort_incomplete || terminal_incomplete {
+        mandatory_errors.push("turn finalization did not complete before the shutdown deadline; accepted history writes remain owned, but durability is unconfirmed".to_string());
+    }
+    if let Err(error) = processes {
+        mandatory_errors.push(error);
+    }
+    let mandatory_error = (!mandatory_errors.is_empty()).then(|| mandatory_errors.join("; "));
     let error = persistence_error.or_else(|| mandatory_error.clone().map(CodexErr::Fatal));
     RuntimeShutdown {
         error,
@@ -944,6 +952,15 @@ async fn shutdown_thread_persistence(
             let mut history_retired = false;
             let mut retry_delay = Duration::from_secs(1);
             loop {
+                // A returned shutdown error is not process-tree confirmation.
+                // Keep the writer and resource locks fenced while the same
+                // retained process owners reconcile a failed termination.
+                if let Err(error) = sess.services.unified_exec_manager.terminate_all_processes().await {
+                    warn!(%error, "owned process cleanup remains unconfirmed; retaining thread persistence");
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
+                    continue;
+                }
                 // Do not close the thread writer while a retryable history
                 // checkpoint can still require its durable rollout barrier.
                 let history = if history_retired {

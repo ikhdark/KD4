@@ -135,16 +135,16 @@ impl ExternalAgentConfigRequestProcessor {
         async_items: Vec<ExternalAgentConfigMigrationItem>,
     ) {
         for result in &item_type_results {
-            let _ = tokio::time::timeout(RESOURCE_DELIVERY_TIMEOUT,
-                self.outgoing.send_server_notification(
+            // Progress is advisory; the bounded outgoing owner may coalesce it
+            // under backpressure. Work and durable completion must not wait.
+            let _ = self.outgoing.try_send_server_notification(
                     ServerNotification::ExternalAgentConfigImportProgress(
                         ExternalAgentConfigImportProgressNotification {
                             import_id: import_id.clone(),
                             item_type_results: vec![result.clone()],
                         },
                     ),
-                ),
-            ).await;
+                );
         }
         for item in async_items {
             let result = match item.item_type {
@@ -152,11 +152,9 @@ impl ExternalAgentConfigRequestProcessor {
                 ExternalAgentConfigMigrationItemType::Sessions => self.import_session_item(item).await,
                 _ => unreachable!("foreground item reached background import"),
             };
-            let _ = tokio::time::timeout(RESOURCE_DELIVERY_TIMEOUT,
-                self.outgoing.send_server_notification(ServerNotification::ExternalAgentConfigImportProgress(
+            let _ = self.outgoing.try_send_server_notification(ServerNotification::ExternalAgentConfigImportProgress(
                     ExternalAgentConfigImportProgressNotification { import_id: import_id.clone(), item_type_results: vec![result.clone()] },
-                )),
-            ).await;
+                ));
             item_type_results.push(result);
         }
         let mut grouped: Vec<ExternalAgentConfigImportTypeResult> = Vec::new();

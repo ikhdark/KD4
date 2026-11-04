@@ -903,6 +903,57 @@ def source_lane_name(base_lane: str, source_identity: str) -> str:
     return _safe_lane_name(f"{_safe_lane_name(base_lane)}-ws-{source_key}")
 
 
+def cargo_lane_native_output_path(
+    target_dir: Path, command: Sequence[str], build_context: Mapping[str, object] | None = None,
+) -> Path:
+    """Representative longest MSVC assembler output, including cross-target layout."""
+    context = build_context or cargo_build_context(REPO_ROOT, command, os.environ)
+    options = list(context.get("options", []))
+    profile = "debug"
+    targets = []
+    for index, option in enumerate(options[:-1]):
+        if option == "--profile":
+            selected = options[index + 1]
+            profile = {"dev": "debug", "test": "debug", "bench": "release"}.get(selected, selected)
+        elif option == "--target":
+            targets.append(options[index + 1])
+    if not targets:
+        target = context.get("environment", {}).get("CARGO_BUILD_TARGET")
+        if target:
+            targets.append(target)
+    prefixes = [target_dir / profile]
+    for target in targets:
+        name = Path(target).stem if target.endswith(".json") else target
+        prefixes.append(target_dir / name / profile)
+    suffix = Path("build") / ("blake3-" + "f" * 16) / "out" / (
+        "f" * 16 + "-blake3_sse41_x86-64_windows_msvc.o"
+    )
+    return max((prefix / suffix for prefix in prefixes), key=lambda path: len(str(path).encode("utf-16-le")))
+
+
+def cargo_lane_root_for_build(
+    repo_root: Path, lane_root: Path | None, base_lane: str, command: Sequence[str],
+    build_context: Mapping[str, object] | None = None,
+) -> Path:
+    """Select a private short default, or reject an explicit overlong root before Cargo."""
+    root = _checked_cargo_lanes_path(lane_root or cargo_lanes_root(repo_root))
+    if os.name != "nt":
+        return root
+    def fits(candidate):
+        output = cargo_lane_native_output_path(candidate / (base_lane + "-65"), command, build_context)
+        return len(str(output).encode("utf-16-le")) // 2 < 260
+    if not fits(root) and root == default_cargo_lanes_root(repo_root) and not os.environ.get("CODEX_CARGO_LANES_ROOT", "").strip():
+        checkout = hashlib.sha256(source_root_identity(repo_root).encode("utf-8")).hexdigest()[:12]
+        root = _checked_cargo_lanes_path(Path.home() / ".kd4-lanes" / checkout)
+    if not fits(root):
+        output = cargo_lane_native_output_path(root / (base_lane + "-65"), command, build_context)
+        raise CargoLanesRootValidationError(
+            f"native assembler output path exceeds the Windows 259 UTF-16-unit budget: {output}; "
+            "use a shorter --lanes-root/-LanesRoot and lane name; the lane owner initializes its ownership marker"
+        )
+    return root
+
+
 def _cargo_profile_options(command: Sequence[str]) -> list[str]:
     """Cargo artifact profile only; never Nextest policy or program arguments."""
     if len(command) >= 4 and Path(command[0]).stem.lower() == "rustup" and command[1] == "run":
@@ -1222,16 +1273,15 @@ def reserve_cargo_lane(
     if max_active_lanes is not None and max_active_lanes < 1:
         raise ValueError("max active lanes must be at least 1")
     explicit = requested_lane != "auto"
-    root = initialize_cargo_lanes_root(
-        repo_root,
-        lane_root if lane_root is not None else cargo_lanes_root(repo_root),
-    )
     # Relative dep-info cannot authenticate a legacy or another checkout's
     # backdated sources. All roots, including the default, need custody.
     base_lane = source_lane_name(
         requested_lane if explicit else _auto_lane_base(command),
         source_identity or source_root_identity(repo_root),
     )
+    root = initialize_cargo_lanes_root(repo_root, cargo_lane_root_for_build(
+        repo_root, lane_root, base_lane, command, build_context,
+    ))
     active_handle: BinaryIO | None = None
     target_dir: Path | None = None
     resolved_lane: str | None = None
@@ -2079,11 +2129,43 @@ def source_mirrors_root(env: Mapping[str, str] = os.environ) -> Path:
     return ((Path(base) if base else Path.home() / ".cache") / "codex-kd" / "lane-sources").absolute()
 
 
-def source_tree_files(root: Path) -> dict[str, Path]:
+def _internal_source_link(root: Path, path: Path) -> Path:
+    """Materialize only a direct file symlink to a root-owned regular file."""
+    observation = os.lstat(path)
+    if not stat.S_ISLNK(observation.st_mode):
+        raise ValueError(f"source reparse point is not a file symlink: {path}")
+    link = Path(os.readlink(path))
+    if link.is_absolute() or link.drive:
+        raise ValueError(f"source link must be relative: {path}")
+    root = root.absolute()
+    target = Path(os.path.abspath(path.parent / link))
+    try:
+        parts = target.relative_to(root).parts
+    except ValueError as error:
+        raise ValueError(f"source link escapes its root: {path}") from error
+    current = root
+    for part in ("", *parts):
+        current = current / part
+        state = os.lstat(current)
+        if _observation_is_indirect(state):
+            raise ValueError(f"source link target has an indirect ancestor: {current}")
+    if not stat.S_ISREG(state.st_mode):
+        raise ValueError(f"source link target is not a regular file: {path}")
+    current_observation = os.lstat(path)
+    stable_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if any(getattr(current_observation, field) != getattr(observation, field) for field in stable_fields):
+        raise ValueError(f"source link changed during admission: {path}")
+    return target
+
+
+def source_tree_files(
+    root: Path, *, materialize_internal_file_links: bool = False,
+) -> dict[str, Path]:
     """Compiled-input files below a source root, keyed by POSIX relative path.
 
     Cargo target directories (CACHEDIR.TAG, codex-rs/target) and VCS/package
-    caches are skipped. Links are refused: their content is not root-owned.
+    caches are skipped. Links remain refused by default. The explicit mirror-only
+    mode accepts relative file symlinks only after validating every target ancestor.
     """
     files: dict[str, Path] = {}
     pending: list[tuple[Path, str]] = []
@@ -2105,6 +2187,9 @@ def source_tree_files(root: Path) -> dict[str, Path]:
                 relative = f"{prefix}{entry.name}"
                 observation = entry.stat(follow_symlinks=False)
                 if _observation_is_indirect(observation):
+                    if materialize_internal_file_links:
+                        files[relative] = _internal_source_link(root, Path(entry.path))
+                        continue
                     raise ValueError(f"source tree contains a link or junction: {entry.path}")
                 if stat.S_ISDIR(observation.st_mode):
                     if not (
@@ -2136,15 +2221,17 @@ class _SourceManifest:
         return {"sha256": digest.hexdigest(), "files": len(self.entries), "bytes": self.bytes}
 
 
-def _source_manifest(root: Path) -> _SourceManifest:
+def _source_manifest(root: Path, *, materialize_internal_file_links: bool = False) -> _SourceManifest:
     manifest = _SourceManifest()
-    for relative, path in source_tree_files(root).items():
+    for relative, path in source_tree_files(
+        root, materialize_internal_file_links=materialize_internal_file_links,
+    ).items():
         manifest.add(relative, path.read_bytes())
     return manifest
 
 
-def source_tree_manifest(root: Path) -> dict[str, object]:
-    return _source_manifest(root).summary()
+def source_tree_manifest(root: Path, *, materialize_internal_file_links: bool = False) -> dict[str, object]:
+    return _source_manifest(root, materialize_internal_file_links=materialize_internal_file_links).summary()
 
 
 def _manifest_sha256(entries: Mapping[str, str]) -> str:
@@ -2160,7 +2247,8 @@ def _posix_parents(relative: str) -> Iterator[str]:
 
 
 def sync_source_mirror(
-    source_root: Path, mirror_root: Path, *, not_before_ns: int = 0
+    source_root: Path, mirror_root: Path, *, not_before_ns: int = 0,
+    materialize_internal_file_links: bool = False,
 ) -> dict[str, object]:
     """Make the mirror's compiled inputs equal the source's by content.
 
@@ -2169,7 +2257,7 @@ def sync_source_mirror(
     than every artifact compiled from earlier mirror content.
     """
     started = time.perf_counter()
-    source = source_tree_files(source_root)
+    source = source_tree_files(source_root, materialize_internal_file_links=materialize_internal_file_links)
     mirror_root.mkdir(parents=True, exist_ok=True)
     existing = source_tree_files(mirror_root)
     removed = 0
@@ -2813,6 +2901,7 @@ def run_in_cargo_lane(
     freeze_bundle_dir: Path | None = None,
     record_link_crates: Sequence[str] = (),
     rebuild: bool = False,
+    materialize_internal_file_links: bool = False,
 ) -> int:
     """Reuse a compatible warm build directory and run the command once.
 
@@ -2824,6 +2913,8 @@ def run_in_cargo_lane(
         raise ValueError("run-lane requires a command after --")
     if source_mirror not in SOURCE_MIRROR_MODES:
         raise ValueError(f"unknown source mirror mode {source_mirror!r}")
+    if materialize_internal_file_links and source_mirror != "always":
+        raise ValueError("internal file links require --source-mirror always")
     if record_link_crates:
         if freeze_bundle_dir is None or any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) for name in record_link_crates):
             raise ValueError("--record-link-crate needs crate names and an explicit --freeze-bundle")
@@ -2866,6 +2957,8 @@ def run_in_cargo_lane(
         child_env.setdefault("RUST_MIN_STACK", RUST_MIN_STACK_BYTES)
         cache_reuse["compilerCache"]["configuredWrapper"] = child_env.get("RUSTC_WRAPPER")
         build_context = cargo_build_context(repo_root, command, child_env)
+        if materialize_internal_file_links:
+            build_context["sourceMaterialization"] = "verified_relative_internal_file_links"
         mirrors_root = source_mirrors_root()
         skipped = _source_mirror_skip_reason(
             source_mirror, command=command, repo_root=repo_root, external=external,
@@ -2888,7 +2981,7 @@ def run_in_cargo_lane(
             or skipped is None
             or (external and not (repo_root / ".git").exists())
         )
-        source = _source_manifest(repo_root) if freeze else None
+        source = _source_manifest(repo_root, materialize_internal_file_links=materialize_internal_file_links) if freeze else None
         capture_started = time.perf_counter()
         rustc = _rustc_identity(child_env, Path.cwd()) if freeze or stream is not None else None
         if stream is not None:
@@ -2961,6 +3054,11 @@ def run_in_cargo_lane(
             source_identity=source_identity, rank=rank,
         ) as (resolved_lane, target_dir):
             record.update(resolvedLane=resolved_lane, targetDir=str(target_dir))
+            if os.name == "nt":
+                record["nativeOutputPathPreflight"] = {
+                    "representativeOutput": str(cargo_lane_native_output_path(target_dir, command, build_context)),
+                    "maxUtf16Units": 259,
+                }
             record["sourceRoot"] = source_root_identity(repo_root)
             print(f"Cargo lane {resolved_lane}: {target_dir}", file=sys.stderr)
             build_root, child_cwd, state_path = repo_root, None, None
@@ -2975,6 +3073,7 @@ def run_in_cargo_lane(
                 mirror = sync_source_mirror(
                     repo_root, build_root,
                     not_before_ns=not_before_ns if isinstance(not_before_ns, int) else 0,
+                    materialize_internal_file_links=materialize_internal_file_links,
                 )
                 mirror_entries = mirror.pop("entries")
                 record["sourceMirror"] = mirror
@@ -3022,7 +3121,6 @@ def run_in_cargo_lane(
                     cargo_started = time.perf_counter()
                     code = run_owned(
                         child_command, env=child_env, cwd=child_cwd,
-                        creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0),
                         prepare_sccache=True, check=False,
                         stdout=messages if messages_path is not None else sys.stdout,
                         stderr=sys.stderr,
@@ -3142,7 +3240,8 @@ def run_in_cargo_lane(
                 capture_started = time.perf_counter()
                 try:
                     timing_evidence["sourceUnchanged"] = (
-                        source_tree_manifest(repo_root) == timing_evidence["sourceManifest"]
+                        source_tree_manifest(repo_root, materialize_internal_file_links=materialize_internal_file_links)
+                        == timing_evidence["sourceManifest"]
                     )
                 except OSError as error:
                     timing_evidence["sourceObservationError"] = str(error)
@@ -3807,6 +3906,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     run_lane_parser.add_argument("--lane", required=True)
     run_lane_parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
+    run_lane_parser.add_argument(
+        "--materialize-internal-file-links", action="store_true",
+        help="With --source-mirror always, materialize verified relative internal file symlinks; never directories, junctions or external targets.",
+    )
     run_lane_parser.add_argument("--lanes-root", type=Path)
     run_lane_parser.add_argument(
         "--warm-wait-seconds",
@@ -3977,6 +4080,7 @@ def main(argv: list[str] | None = None) -> int:
                 freeze_bundle_dir=args.freeze_bundle,
                 record_link_crates=args.record_link_crate,
                 rebuild=args.rebuild,
+                materialize_internal_file_links=args.materialize_internal_file_links,
             )
         elif args.command == "find-bundle":
             command_args = list(args.command_args)

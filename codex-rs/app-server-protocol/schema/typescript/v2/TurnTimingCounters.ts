@@ -40,7 +40,7 @@ executedValidationCount: number,
 /**
  * Total wall-clock nanoseconds spent in validation commands that executed.
  */
-executedValidationDurationNs: bigint,
+executedValidationDurationNs: number,
 /**
  * Ready startup prewarms observed by the first model request.
  */
@@ -54,7 +54,7 @@ toolOutputBudgetDropCount: number,
 /**
  * Tokens those dropped results would have occupied.
  */
-toolOutputBudgetDroppedTokenCount: bigint,
+toolOutputBudgetDroppedTokenCount: number,
 /**
  * Bounded to the stable purpose enum's cardinality.
  */
@@ -68,7 +68,15 @@ waitGenerationsWithSameRevisionCount: number, planningGenerationCount: number, p
  * Bounded detail loss; diagnostics derived from request rows cover only
  * retained detail when either eviction counter is nonzero.
  */
-modelRequestDetailEvictionCount: number, physicalAttemptDetailEvictionCount: number, modelRequestCount: number, modelRetryCount: number, modelFallbackCount: number, toolCallCount: number, approvalWaitCount: number, permissionWaitCount: number, userInputWaitCount: number, mcpElicitationWaitCount: number, waitOnlyGenerationCount: number, internallyDrainedWaitCount: number, noProgressDirectiveCount: number, provenLoopActivationCount: number, toolRouterReuseCount: number, toolRouterRebuildCount: number, projectionSourceDependenciesReuseCount: number, projectionSourceDependenciesFallbackCount: number, toolOutputTruncationCount: number, toolOutputProjectedTokenCount: bigint, toolOutputArtifactRereadCount: number, toolOutputCanonicalByteCount: bigint, toolOutputCanonicalTokenCount: bigint, toolOutputModelByteCount: bigint, toolOutputModelTokenCount: bigint, toolOutputArtifactCreationCount: number, toolOutputArtifactReuseCount: number, toolOutputProjectionTruncationCount: number, toolOutputOmittedSectionCount: bigint, toolOutputRecoveryCallCount: number,
+modelRequestDetailEvictionCount: number, physicalAttemptDetailEvictionCount: number, modelRequestCount: number,
+/**
+ * Schema 37+: unique physical retry/fallback transport entries, not plans.
+ */
+modelRetryCount: number,
+/**
+ * Schema 37+: unique fallback entries. A subset of model_retry_count.
+ */
+modelFallbackCount: number, toolCallCount: number, approvalWaitCount: number, permissionWaitCount: number, userInputWaitCount: number, mcpElicitationWaitCount: number, waitOnlyGenerationCount: number, internallyDrainedWaitCount: number, noProgressDirectiveCount: number, provenLoopActivationCount: number, toolRouterReuseCount: number, toolRouterRebuildCount: number, projectionSourceDependenciesReuseCount: number, projectionSourceDependenciesFallbackCount: number, toolOutputTruncationCount: number, toolOutputProjectedTokenCount: number, toolOutputArtifactRereadCount: number, toolOutputCanonicalByteCount: number, toolOutputCanonicalTokenCount: number, toolOutputModelByteCount: number, toolOutputModelTokenCount: number, toolOutputArtifactCreationCount: number, toolOutputArtifactReuseCount: number, toolOutputProjectionTruncationCount: number, toolOutputOmittedSectionCount: number, toolOutputRecoveryCallCount: number,
 /**
  * Recovery transactions performed inside code-mode cells, without a
  * separate provider tool-result generation.

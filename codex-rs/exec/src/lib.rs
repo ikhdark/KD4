@@ -207,7 +207,7 @@ impl RequestIdSequencer {
     fn next(&mut self) -> RequestId {
         let id = self.next;
         self.next += 1;
-        RequestId::Integer(id)
+        RequestId::from(id)
     }
 }
 

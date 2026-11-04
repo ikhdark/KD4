@@ -22,6 +22,7 @@ pub const SKILL_DESCRIPTIONS_REMOVED_WARNING_PREFIX: &str =
     "Exceeded skills context budget. All skill descriptions were removed and";
 pub const SKILLS_INTRO_WITH_ABSOLUTE_PATHS: &str = "Load full instructions through the skill locator. For omitted or newly relevant host skills, search read_file(path=\"skill:catalog\") before assuming a capability is unavailable. For other sources, use their provider-specific discovery routes.";
 pub const SKILLS_HOW_TO_USE: &str = r###"- Use the smallest skill set named by the user or clearly matched by the task. Announce each skill on first use in the conversation, state ordering when needed, and reassess relevance on later turns without repeating the announcement.
+- Match skills to the requested workflow, not incidental file formats or ordinary tool operations. Routine file reads, JSON/CSV transformations and command/session management do not by themselves require catalog searches; use native tools directly unless the user names a skill or the outcome needs a specialized workflow.
 - Before task actions, the main agent must read each selected `SKILL.md` completely. Do not delegate that reading or interpretation.
 - Load `skill:` locators with `read_file`, and file, environment, orchestrator, or custom resources through their stated provider; resolve relative references from the skill source.
 - Read task-required linked instructions with the same mechanism, load only relevant variants, and reuse supplied scripts, templates, and assets.

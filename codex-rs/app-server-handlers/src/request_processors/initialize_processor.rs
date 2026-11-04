@@ -1,6 +1,6 @@
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
+
 
 use axum::http::HeaderValue;
 use codex_analytics::AppServerRpcTransport;
@@ -41,6 +41,7 @@ pub(crate) struct InitializeRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     analytics_events_client: AnalyticsEventsClient,
     config: Arc<Config>,
+    config_manager: crate::config_manager::ConfigManager,
     config_warnings: Arc<Vec<ConfigWarningNotification>>,
     rpc_transport: AppServerRpcTransport,
     experimental_api_mode: Arc<Mutex<Option<bool>>>,
@@ -51,6 +52,7 @@ impl InitializeRequestProcessor {
         outgoing: Arc<OutgoingMessageSender>,
         analytics_events_client: AnalyticsEventsClient,
         config: Arc<Config>,
+        config_manager: crate::config_manager::ConfigManager,
         config_warnings: Vec<ConfigWarningNotification>,
         rpc_transport: AppServerRpcTransport,
     ) -> Self {
@@ -58,6 +60,7 @@ impl InitializeRequestProcessor {
             outgoing,
             analytics_events_client,
             config,
+            config_manager,
             config_warnings: Arc::new(config_warnings),
             rpc_transport,
             experimental_api_mode: Arc::new(Mutex::new(None)),
@@ -83,6 +86,15 @@ impl InitializeRequestProcessor {
             return Err(invalid_request("Already initialized"));
         }
 
+        if params.capabilities.as_ref()
+            .and_then(|capabilities| capabilities.opt_out_notification_methods.as_ref())
+            .is_some_and(|methods| methods.len() > 256 || methods.iter().any(|method| method.len() > 1024))
+        {
+            return Err(invalid_request("initialize notification opt-outs exceed the count or method-size limit"));
+        }
+        // Snapshot runtime features before any initialization side effects.
+        let current_config = self.config_manager.load_latest_config(None).await
+            .map_err(|error| super::internal_error(format!("failed to load initialize configuration: {error}")))?;
         let analytics_initialize_params = params.clone();
         let capabilities = params.capabilities.unwrap_or_default();
         let experimental_api_enabled = capabilities.experimental_api;
@@ -186,8 +198,7 @@ impl InitializeRequestProcessor {
         } else {
             get_codex_user_agent()
         };
-        let mut enabled_features: Vec<_> = self
-            .config
+        let mut enabled_features: Vec<_> = current_config
             .features
             .enabled_features()
             .into_iter()
@@ -240,12 +251,9 @@ impl InitializeRequestProcessor {
             }
         });
 
-        if let Some(outbound_initialized) = outbound_initialized {
-            outbound_initialized.store(true, Ordering::Release);
-            return Ok(true);
-        }
-
-        Ok(false)
+        // Readiness and live bookkeeping are published together by the caller
+        // under the connection's terminal admission fence.
+        Ok(outbound_initialized.is_some())
     }
 
     pub(crate) async fn send_initialize_notifications_to_connection(

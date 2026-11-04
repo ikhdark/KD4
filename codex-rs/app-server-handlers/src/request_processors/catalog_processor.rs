@@ -51,6 +51,7 @@ use super::workspace_settings;
 use codex_core::config::permission_profile_catalog;
 use codex_models_manager::manager::SharedModelsManager;
 use futures::StreamExt;
+use sha2::Digest;
 
 #[derive(Clone)]
 pub(crate) struct CatalogRequestProcessor {
@@ -384,14 +385,14 @@ impl CatalogRequestProcessor {
     async fn resolve_cwd_config(
         &self,
         cwd: &Path,
-    ) -> Result<(AbsolutePathBuf, ConfigLayerStack), String> {
+    ) -> Result<(AbsolutePathBuf, ConfigLayerStack), JSONRPCErrorError> {
         let cwd_abs =
-            AbsolutePathBuf::relative_to_current_dir(cwd).map_err(|err| err.to_string())?;
+            AbsolutePathBuf::relative_to_current_dir(cwd).map_err(|err| invalid_params(err.to_string()))?;
         let config_layer_stack = self
             .config_manager
             .load_config_layers_for_cwd(cwd_abs.clone())
             .await
-            .map_err(|err| err.to_string())?;
+            .map_config_load_error()?;
 
         Ok((cwd_abs, config_layer_stack))
     }
@@ -434,21 +435,21 @@ impl CatalogRequestProcessor {
         let models = snapshot
             .iter()
             .filter(|preset| hidden || preset.show_in_picker)
-            .cloned()
-            .map(crate::models::model_from_preset)
             .collect::<Vec<_>>();
         let total = models.len();
         let mut pagination = pagination
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pagination.bind(models_manager, snapshot, identity);
+        pagination.bind(models_manager, Arc::clone(&snapshot), identity);
         let start = pagination.start(cursor.as_deref(), hidden, total)?;
 
         let effective_limit = limit.unwrap_or(total as u32).max(1) as usize;
         let effective_limit = effective_limit.min(total);
 
         let end = start.saturating_add(effective_limit).min(total);
-        let items = models[start..end].to_vec();
+        let items = models[start..end].iter()
+            .map(|preset| crate::models::model_from_preset((*preset).clone()))
+            .collect();
         let next_cursor = if end < total {
             Some(pagination.cursor(hidden, end))
         } else {
@@ -591,13 +592,13 @@ impl CatalogRequestProcessor {
         params: PermissionProfileListParams,
     ) -> Result<PermissionProfileListResponse, JSONRPCErrorError> {
         let PermissionProfileListParams { cursor, limit, cwd } = params;
+        let cwd_identity = cwd.clone();
         let config_layer_stack = match cwd {
             Some(cwd) => {
                 let cwd = PathBuf::from(cwd);
                 let (_, config_layer_stack) = self
                     .resolve_cwd_config(&cwd)
-                    .await
-                    .map_err(|err| internal_error(format!("failed to reload config: {err}")))?;
+                    .await?;
                 config_layer_stack
             }
             None => self
@@ -616,12 +617,16 @@ impl CatalogRequestProcessor {
             })
             .collect::<Vec<_>>();
         let total = profiles.len();
+        let identity = hex::encode(sha2::Sha256::digest(serde_json::to_vec(&(&cwd_identity, &profiles))
+            .map_err(|error| internal_error(error.to_string()))?));
         let effective_limit = limit.unwrap_or(total as u32).max(1) as usize;
         let effective_limit = effective_limit.min(total);
         let start = match cursor {
-            Some(cursor) => cursor
-                .parse::<usize>()
-                .map_err(|_| invalid_request(format!("invalid cursor: {cursor}")))?,
+            Some(cursor) => {
+                let (snapshot, offset) = cursor.split_once(':').ok_or_else(|| invalid_request("invalid permission profile cursor; restart pagination"))?;
+                if snapshot != identity { return Err(invalid_request("permission profiles changed; restart pagination")); }
+                offset.parse::<usize>().map_err(|_| invalid_request("invalid permission profile cursor"))?
+            }
             None => 0,
         };
 
@@ -633,7 +638,7 @@ impl CatalogRequestProcessor {
 
         let end = start.saturating_add(effective_limit).min(total);
         let data = profiles[start..end].to_vec();
-        let next_cursor = (end < total).then_some(end.to_string());
+        let next_cursor = (end < total).then(|| format!("{identity}:{end}"));
 
         Ok(PermissionProfileListResponse { data, next_cursor })
     }
@@ -697,7 +702,7 @@ impl CatalogRequestProcessor {
                                     skills: Vec::new(),
                                     errors: vec![codex_app_server_protocol_types::SkillErrorInfo {
                                         path: error_path,
-                                        message,
+                                        message: message.message,
                                     }],
                                 },
                             );
@@ -909,6 +914,8 @@ impl CatalogRequestProcessor {
             name,
             enabled,
         } = params;
+        let selected_path = path.clone();
+        let selected_name = name.clone();
         let edit = match (path, name) {
             (Some(path), None) => ConfigEdit::SetSkillConfig {
                 path: path.into_path_buf(),
@@ -928,16 +935,35 @@ impl CatalogRequestProcessor {
             .with_edits(edits)
             .apply()
             .await
-            .map(|()| {
-                // This edit bypasses ConfigManager, so publish it to the next read.
-                self.config_manager.invalidate_load_cache();
-                self.thread_manager.plugins_manager().clear_cache();
-                self.thread_manager.skills_service().clear_cache();
-                SkillsConfigWriteResponse {
-                    effective_enabled: enabled,
-                }
-            })
-            .map_err(|err| internal_error(format!("failed to update skill settings: {err}")))
+            .map_err(|err| internal_error(format!("failed to update skill settings: {err}")))?;
+        // Writing a lower-precedence setting does not establish effective policy.
+        self.config_manager.invalidate_load_cache();
+        self.thread_manager.plugins_manager().clear_cache();
+        self.thread_manager.skills_service().clear_cache();
+        let reloaded = self.skills_list_response(SkillsListParams {
+            cwds: Vec::new(),
+            force_reload: false,
+        }).await.map_err(|mut error| {
+            let data = error.data.get_or_insert_with(|| serde_json::json!({}));
+            if let Some(object) = data.as_object_mut() {
+                object.insert("configurationCommitted".to_string(), serde_json::json!(true));
+            }
+            error
+        })?;
+        let mut matching = reloaded.data.iter().flat_map(|entry| &entry.skills).filter(|skill| {
+            selected_path.as_ref().is_some_and(|path| &skill.path == path)
+                || selected_name.as_ref().is_some_and(|name| &skill.name == name)
+        });
+        let partial_error = || {
+            let mut error = internal_error("skill setting saved, but its effective state is unavailable or differs across sources");
+            error.data = Some(serde_json::json!({"reason": "effectiveSkillStateUnavailable", "configurationCommitted": true}));
+            error
+        };
+        let effective_enabled = matching.next().ok_or_else(partial_error)?.enabled;
+        if matching.any(|skill| skill.enabled != effective_enabled) {
+            return Err(partial_error());
+        }
+        Ok(SkillsConfigWriteResponse { effective_enabled })
     }
 }
 

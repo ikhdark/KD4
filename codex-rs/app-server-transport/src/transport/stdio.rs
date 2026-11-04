@@ -1,7 +1,7 @@
 use super::CHANNEL_CAPACITY;
 use super::ConnectionOrigin;
 use super::TransportEvent;
-use super::enqueue_incoming_message;
+use super::enqueue_incoming_message_with_admission;
 use super::next_connection_id;
 use crate::outgoing_message::OutgoingMessage;
 use crate::outgoing_message::QueuedOutgoingMessage;
@@ -309,21 +309,21 @@ where
                             continue;
                         }
                     };
-                    if initialize_client_name_tx.is_some()
-                        && let Some(client_name) = stdio_initialize_client_name(&message)
-                        && let Some(initialize_client_name_tx) = initialize_client_name_tx.take()
-                    {
-                        let _ = initialize_client_name_tx.send(client_name);
-                    }
-                    let forwarded = tokio::select! {
+                    let client_name = stdio_initialize_client_name(&message);
+                    let (forwarded, admitted) = tokio::select! {
                         _ = cancellation_for_reader.cancelled() => break,
-                        forwarded = enqueue_incoming_message(
+                        forwarded = enqueue_incoming_message_with_admission(
                             &transport_event_tx_for_reader,
                             &writer_tx_for_reader,
                             connection_id,
                             message,
                         ) => forwarded,
                     };
+                    if admitted && let Some(client_name) = client_name
+                        && let Some(sender) = initialize_client_name_tx.take()
+                    {
+                        let _ = sender.send(client_name);
+                    }
                     if !forwarded {
                         break;
                     }

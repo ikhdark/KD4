@@ -37,10 +37,11 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct CommandShell {
     pub program: String,
     pub args: Vec<String>,
+    pub mcp_executor: Option<Arc<dyn crate::mcp::HookMcpExecutor>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +49,7 @@ pub(crate) struct ConfiguredHandler {
     pub event_name: codex_protocol::protocol::HookEventName,
     pub matcher: Option<crate::events::common::HookMatcher>,
     pub command: String,
+    pub mcp_tool: Option<crate::mcp::McpHookTarget>,
     pub timeout_sec: u64,
     pub status_message: Option<String>,
     pub source_path: AbsolutePathBuf,
@@ -226,6 +228,11 @@ impl ClaudeHooksEngine {
             once_per: discovered.once_per,
             scoped_runs: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    pub(crate) fn with_mcp_executor(mut self, executor: Arc<dyn crate::mcp::HookMcpExecutor>) -> Self {
+        self.shell.mcp_executor = Some(executor);
+        self
     }
 
     /// Shares `once_per` run history with the engine this one replaces.

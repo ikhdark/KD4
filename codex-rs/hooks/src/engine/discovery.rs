@@ -522,126 +522,128 @@ fn append_matcher_groups(
                     continue;
                 }
             };
-            match handler {
-                HookHandlerConfig::Command {
-                    command,
-                    command_windows,
-                    timeout_sec,
-                    r#async,
-                    status_message,
-                } => {
+            let (command, mcp_tool, timeout_sec, status_message, normalized_handler, handler_type) = match handler {
+                HookHandlerConfig::Command { command, command_windows, timeout_sec, r#async, status_message } => {
                     let command = command_for_platform(command, command_windows, cfg!(windows));
                     if r#async {
-                        warnings.push(format!(
-                            "skipping async hook in {}: async hooks are not supported yet",
-                            source.path.display()
-                        ));
+                        warnings.push(format!("skipping async hook in {}: async hooks are not supported yet", source.path.display()));
                         continue;
                     }
                     if command.trim().is_empty() {
-                        warnings.push(format!(
-                            "skipping empty hook command in {}",
-                            source.path.display()
-                        ));
+                        warnings.push(format!("skipping empty hook command in {}", source.path.display()));
                         continue;
                     }
-                    let timeout_sec = if event_name == HookEventName::Interrupt {
-                        let timeout_sec = timeout_sec.unwrap_or(1).max(1);
-                        if timeout_sec > 3 {
-                            warnings.push(format!(
-                                "clamping Interrupt hook timeout to 3s in {}",
-                                source.path.display()
-                            ));
-                        }
-                        timeout_sec.min(3)
-                    } else {
-                        timeout_sec.unwrap_or(600).max(1)
+                    let timeout_sec = normalized_timeout(event_name, timeout_sec, &source.path, warnings);
+                    let normalized = HookHandlerConfig::Command {
+                        command: command.clone(), command_windows: None, timeout_sec: Some(timeout_sec),
+                        r#async, status_message: status_message.clone(),
                     };
-                    let normalized_handler = HookHandlerConfig::Command {
-                        command: command.clone(),
-                        command_windows: None,
-                        timeout_sec: Some(timeout_sec),
-                        r#async,
-                        status_message: status_message.clone(),
-                    };
-                    let current_hash = command_hook_hash(event_name, matcher, normalized_handler);
-                    // A legacy trusted hash identifies the original handler even
-                    // after it moves. A bare positional disablement cannot do so;
-                    // keep unresolved hooks paused until the user saves v2 state.
-                    let legacy_state = legacy_states
-                        .iter()
-                        .copied()
-                        .filter(|state| state.trusted_hash.as_deref() == Some(&current_hash))
-                        .min_by_key(|state| state.enabled != Some(false));
-                    let unresolved_legacy_state = HookStateToml {
-                        enabled: Some(false),
-                        trusted_hash: None,
-                        once_per: None,
-                    };
-                    let mut state = source.hook_states.get(&key).or(legacy_state);
-                    if state.is_none() && ambiguous_legacy_disablement && !source.is_managed {
-                        state = Some(&unresolved_legacy_state);
-                        if !warned_about_legacy_disablement {
-                            warnings.push(format!(
-                                "legacy disabled {} hook state in {} has no identity hash; unresolved hooks are paused until their enabled state is saved again",
-                                crate::hook_event_key_label(event_name),
-                                source.path.display(),
-                            ));
-                            warned_about_legacy_disablement = true;
-                        }
-                    }
-                    let enabled = hook_enabled(source.is_managed, state);
-                    let trusted_hash = hook_trusted_hash(source.is_managed, state);
-                    let trust_status =
-                        hook_trust_status(source.is_managed, &current_hash, trusted_hash);
-                    hook_entries.push(HookListEntry {
-                        key,
-                        event_name,
-                        handler_type: HookHandlerType::Command,
-                        matcher: matcher.map(ToOwned::to_owned),
-                        command: Some(command.clone()),
-                        timeout_sec,
-                        status_message: status_message.clone(),
-                        source_path: source.path.clone(),
-                        source: source.source,
-                        plugin_id: source.plugin_id.clone(),
-                        display_order: *display_order,
-                        enabled,
-                        is_managed: source.is_managed,
-                        current_hash,
-                        trust_status,
-                    });
-                    if enabled
-                        && (source.bypass_hook_trust
-                            || matches!(
-                                trust_status,
-                                HookTrustStatus::Managed | HookTrustStatus::Trusted
-                            ))
-                    {
-                        handlers.push(ConfiguredHandler {
-                            event_name,
-                            matcher: compiled_matcher.clone(),
-                            command,
-                            timeout_sec,
-                            status_message,
-                            source_path: source.path.clone(),
-                            source: source.source,
-                            display_order: *display_order,
-                            env: source.env.clone(),
-                        });
-                    }
-                    *display_order += 1;
+                    (command, None, timeout_sec, status_message, normalized, HookHandlerType::Command)
                 }
-                HookHandlerConfig::Prompt {} => warnings.push(format!(
-                    "skipping prompt hook in {}: prompt hooks are not supported yet",
-                    source.path.display()
-                )),
-                HookHandlerConfig::Agent {} => warnings.push(format!(
-                    "skipping agent hook in {}: agent hooks are not supported yet",
-                    source.path.display()
-                )),
+                HookHandlerConfig::McpTool { server, tool, input, timeout_sec, status_message } => {
+                    if server.trim().is_empty() || tool.trim().is_empty() {
+                        warnings.push(format!("skipping MCP hook with an empty server/tool in {}", source.path.display()));
+                        continue;
+                    }
+                    let timeout_sec = normalized_timeout(event_name, timeout_sec, &source.path, warnings);
+                    let normalized = HookHandlerConfig::McpTool {
+                        server: server.clone(), tool: tool.clone(), input: input.clone(),
+                        timeout_sec: Some(timeout_sec), status_message: status_message.clone(),
+                    };
+                    let display = format!("{server}/{tool}");
+                    let target = crate::mcp::McpHookTarget { server, tool, input };
+                    (display, Some(target), timeout_sec, status_message, normalized, HookHandlerType::McpTool)
+                }
+                HookHandlerConfig::Prompt {} => {
+                    warnings.push(format!("skipping prompt hook in {}: prompt hooks are not supported yet", source.path.display()));
+                    continue;
+                }
+                HookHandlerConfig::Agent {} => {
+                    warnings.push(format!("skipping agent hook in {}: agent hooks are not supported yet", source.path.display()));
+                    continue;
+                }
+            };
+            let current_hash = command_hook_hash(event_name, matcher, normalized_handler);
+            // A legacy trusted hash identifies the original handler even
+            // after it moves. A bare positional disablement cannot do so;
+            // keep unresolved hooks paused until the user saves v2 state.
+            let legacy_state = legacy_states
+                .iter()
+                .copied()
+                .filter(|state| state.trusted_hash.as_deref() == Some(&current_hash))
+                .min_by_key(|state| state.enabled != Some(false));
+            let unresolved_legacy_state = HookStateToml {
+                enabled: Some(false),
+                trusted_hash: None,
+                once_per: None,
+            };
+            let mut state = source.hook_states.get(&key).or(legacy_state);
+            if state.is_none() && ambiguous_legacy_disablement && !source.is_managed {
+                state = Some(&unresolved_legacy_state);
+                if !warned_about_legacy_disablement {
+                    warnings.push(format!(
+                        "legacy disabled {} hook state in {} has no identity hash; unresolved hooks are paused until their enabled state is saved again",
+                        crate::hook_event_key_label(event_name),
+                        source.path.display(),
+                    ));
+                    warned_about_legacy_disablement = true;
+                }
             }
+            let enabled = hook_enabled(source.is_managed, state);
+            let trusted_hash = hook_trusted_hash(source.is_managed, state);
+            let trust_status =
+                hook_trust_status(source.is_managed, &current_hash, trusted_hash);
+            hook_entries.push(HookListEntry {
+                key,
+                event_name,
+                handler_type,
+                matcher: matcher.map(ToOwned::to_owned),
+                command: Some(command.clone()),
+                timeout_sec,
+                status_message: status_message.clone(),
+                source_path: source.path.clone(),
+                source: source.source,
+                plugin_id: source.plugin_id.clone(),
+                display_order: *display_order,
+                enabled,
+                is_managed: source.is_managed,
+                current_hash,
+                trust_status,
+            });
+            if enabled
+                && (source.bypass_hook_trust
+                    || matches!(
+                        trust_status,
+                        HookTrustStatus::Managed | HookTrustStatus::Trusted
+                    ))
+            {
+                handlers.push(ConfiguredHandler {
+                    event_name,
+                    matcher: compiled_matcher.clone(),
+                    command,
+                    mcp_tool,
+                    timeout_sec,
+                    status_message,
+                    source_path: source.path.clone(),
+                    source: source.source,
+                    display_order: *display_order,
+                    env: source.env.clone(),
+                });
+            }
+            *display_order += 1;
         }
+    }
+}
+
+fn normalized_timeout(event: HookEventName, requested: Option<u64>, source: &AbsolutePathBuf, warnings: &mut Vec<String>) -> u64 {
+    if event == HookEventName::Interrupt {
+        let timeout = requested.unwrap_or(1).max(1);
+        if timeout > 3 {
+            warnings.push(format!("clamping Interrupt hook timeout to 3s in {}", source.display()));
+        }
+        timeout.min(3)
+    } else {
+        requested.unwrap_or(600).max(1)
     }
 }
 
@@ -667,6 +669,10 @@ fn command_hook_hash(
         event_name: crate::hook_event_key_label(event_name),
         group,
     };
+    if identity.group.hooks.iter().any(|handler| matches!(handler, HookHandlerConfig::McpTool { .. })) {
+        let value = serde_json::to_value(&identity).unwrap_or_else(|_| unreachable!("JSON hook identity"));
+        return codex_config::version_for_json(&value);
+    }
     let Ok(value) = TomlValue::try_from(identity) else {
         unreachable!("normalized hook identity should serialize to TOML");
     };

@@ -603,6 +603,7 @@ async fn load_skills_under_root(
         outcome.errors.push(SkillError {
             path: root.clone(),
             message: warning,
+            is_warning: false,
         });
     }
     // Empty and missing roots cannot inherit a skill namespace. Preserve scan
@@ -697,7 +698,7 @@ async fn load_skills_under_root(
         match result {
             Ok(skill) => outcome.skills.push(skill),
             Err(err) if scope != SkillScope::System => {
-                outcome.errors.push(SkillError { path, message: err })
+                outcome.errors.push(SkillError { path, message: err, is_warning: false })
             }
             Err(_) => {}
         }
@@ -746,6 +747,7 @@ async fn parse_skill_file(
             .map(|message| SkillError {
                 path: skill_dir.join("agents/openai.yaml"),
                 message,
+                is_warning: true,
             })
             .collect()
     } else {

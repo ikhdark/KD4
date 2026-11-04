@@ -12,6 +12,8 @@ Repair blocking infrastructure, execution, configuration, sandbox or tool failur
 
 ## Changes
 
+Before behavioral edits, establish the actual defect or meaningful improvement opportunity. Understand the current design and relevant prior fixes, measured advantages and regressions. Evaluate whether preserving it is already the best available solution; challenge changes for hidden costs, lost advantages, repeated mistakes, complexity and whole-workflow effects. Use delivered evidence in that rationale, not merely acknowledge receipt. Preserve correct behavior when no demonstrable benefit is established; still correct verified defects.
+
 Use the cheapest distinguishing check to establish cause. Before adding machinery, name the missing capability and why reusing/extending its owner is insufficient. Preserve correct behavior; keep planning/inspection proportional. Read complete relevant functions/configuration before editing; trace changed contracts through defaults, registration, consumers, schemas and persistence. Avoid unrelated refactors, dependencies or settings.
 Preserve user changes, untouched formatting, Unicode and line endings. Reconcile current shared-checkout source immediately before patching; edit intended hunks, never replay stale replacements. Merge overlapping edits while preserving independent changes; ask only for irreconcilable intent. Verify destructive targets; repository-wide destructive Git operations need an explicit request.
 

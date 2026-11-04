@@ -314,6 +314,14 @@ pub(crate) struct QueueOrigin {
     pub(crate) supports_openai_form_elicitation: bool,
 }
 
+#[derive(Default)]
+struct QueueOrigins {
+    submissions: HashMap<ThreadId, HashMap<String, QueueOrigin>>,
+    // A failed storage retirement must still fence late capability admission.
+    // The next successful queue-lock owner completes this in-memory retirement.
+    retiring: HashSet<ThreadId>,
+}
+
 #[derive(Clone)]
 pub(crate) struct ThreadQueueRequestProcessor {
     state_db: Option<StateDbHandle>,
@@ -325,7 +333,7 @@ pub(crate) struct ThreadQueueRequestProcessor {
     turn_processor: TurnRequestProcessor,
     background_tasks: TaskTracker,
     // Connection capabilities are never persisted or reused across restarts.
-    origins: Arc<StdMutex<HashMap<ThreadId, HashMap<String, QueueOrigin>>>>,
+    origins: Arc<StdMutex<QueueOrigins>>,
     notification_revisions: Arc<StdMutex<HashMap<ThreadId, std::sync::Weak<Mutex<u64>>>>>,
 }
 
@@ -357,57 +365,57 @@ impl ThreadQueueRequestProcessor {
 
     fn origin(&self, id: ThreadId, submission_id: &str) -> Option<QueueOrigin> {
         self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&id)?.get(submission_id).cloned()
+            .submissions.get(&id)?.get(submission_id).cloned()
     }
 
     async fn insert_origin(&self, id: ThreadId, submission_id: String, origin: QueueOrigin) -> bool {
         self.thread_state_manager.with_live_connection(origin.request_id.connection_id, || {
-            self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-                .entry(id).or_default().insert(submission_id, origin);
-        }).await.is_some()
+            let mut origins = self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if origins.retiring.contains(&id) { return false; }
+            origins.submissions.entry(id).or_default().insert(submission_id, origin);
+            true
+        }).await == Some(true)
     }
 
     fn remove_origin(&self, id: ThreadId, submission_id: &str) {
         let mut origins = self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(submissions) = origins.get_mut(&id) {
+        if let Some(submissions) = origins.submissions.get_mut(&id) {
             submissions.remove(submission_id);
-            if submissions.is_empty() { origins.remove(&id); }
+            if submissions.is_empty() { origins.submissions.remove(&id); }
         }
     }
 
     fn has_origins(&self, id: ThreadId) -> bool {
-        self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&id)
+        self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner).submissions.contains_key(&id)
     }
 
-    /// Called only after the runtime is unregistered. The existing queue lock
-    /// joins any in-flight origin publication before retiring its capabilities;
-    /// durable pending prompts are left intact for explicit recovery.
+    /// Fence capabilities immediately, then join any admitted publisher once.
+    /// Storage failure leaves a fail-closed marker for the next lock owner,
+    /// rather than retaining global lifecycle admission in an infinite retry.
     pub(super) async fn retire_thread(&self, id: ThreadId) {
         if self.state_db.is_none() { return; }
-        let _guard = loop {
-            match self.lock(id).await {
-                Ok(guard) => break guard,
-                Err(error) => {
-                    tracing::warn!(%id, error = %error.message, "queue retirement lock failed; retaining cleanup owner");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            }
-        };
-        self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id);
+        {
+            let mut origins = self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            origins.retiring.insert(id);
+            origins.submissions.remove(&id);
+        }
+        if let Err(error) = self.lock(id).await {
+            tracing::warn!(%id, error = %error.message, "queue retirement incomplete; capabilities fenced until the next queue admission");
+        }
     }
 
     pub(super) async fn retire_thread_connection(&self, id: ThreadId, connection_id: ConnectionId) {
         let _guard = self.lock(id).await.ok();
         let mut origins = self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(submissions) = origins.get_mut(&id) {
+        if let Some(submissions) = origins.submissions.get_mut(&id) {
             submissions.retain(|_, origin| origin.request_id.connection_id != connection_id);
-            if submissions.is_empty() { origins.remove(&id); }
+            if submissions.is_empty() { origins.submissions.remove(&id); }
         }
     }
 
     pub(super) async fn retire_connection(&self, connection_id: ConnectionId) {
         self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|_, submissions| {
+            .submissions.retain(|_, submissions| {
                 submissions.retain(|_, origin| origin.request_id.connection_id != connection_id);
                 !submissions.is_empty()
             });
@@ -498,7 +506,11 @@ impl ThreadQueueRequestProcessor {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 match file.try_lock() {
-                    Ok(()) => return Ok((file, publication)),
+                    Ok(()) => {
+                        let mut origins = self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if origins.retiring.remove(&id) { origins.submissions.remove(&id); }
+                        return Ok((file, publication));
+                    }
                     Err(TryLockError::WouldBlock) => {
                         tokio::time::sleep(Duration::from_millis(10)).await
                     }
@@ -761,17 +773,19 @@ impl ThreadQueueRequestProcessor {
             // owner before clearing its in-memory connection capabilities.
             self.insert_origin(id, queued_submission.id.clone(), origin.clone()).await;
         }
-        drop(guard);
-        if added {
-            self.changed(id, queue.revision, publication).await;
-        }
         // The client must see acceptance before a fast automatic start removes the entry.
+        // Retain per-thread queue admission through response enqueue: unrelated
+        // completion kicks must not claim this add before its acknowledgment.
         self.outgoing
             .send_response(
                 origin.request_id,
                 ThreadQueueAddResponse { queued_submission },
             )
             .await;
+        drop(guard);
+        if added {
+            self.changed(id, queue.revision, publication).await;
+        }
         if let Ok(thread) = self.thread_manager.get_thread(id).await
             && !matches!(thread.agent_status().await, AgentStatus::Running)
         {
@@ -1051,24 +1065,38 @@ impl ThreadQueueRequestProcessor {
             Err(error) => {
                 // The acknowledgement can fail after installation. Recovery,
                 // not a blind retry, decides whether input was actually recorded.
+                drop(guard);
+                self.changed(id, queue.revision, publication).await;
+                let processor = self.clone();
+                self.background_tasks.spawn(async move {
+                    if let Err(error) = processor.mutate(id, |_| Ok(((), false))).await {
+                        tracing::warn!(%id, error = %error.message, "queued start recovery remains pending");
+                    }
+                });
                 Err(error)
             }
         }
     }
 
     pub(super) async fn pause(&self, id: ThreadId) {
+        if let Err(error) = self.pause_with_result(id).await {
+            tracing::warn!(%id, error = %error.message, "failed to pause thread queue");
+        }
+    }
+
+    pub(super) async fn pause_with_result(&self, id: ThreadId) -> Result<(), JSONRPCErrorError> {
         let Some(db) = self.state_db.as_ref() else {
-            return;
+            return Ok(());
         };
         if let Ok(thread) = self.thread_manager.get_thread(id).await
             && thread.rollout_path().is_none()
         {
-            return;
+            return Ok(());
         }
         self.origins
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&id);
+            .submissions.remove(&id);
         // This runs before the listener forwards every interrupted or failed
         // turn. Without queued prompts there is nothing to protect: skip the
         // lock file, queue write, and change notification.
@@ -1082,18 +1110,15 @@ impl ThreadQueueRequestProcessor {
             Err(_) => true,
         };
         if !has_queued {
-            return;
+            return Ok(());
         }
-        if let Err(error) = self
+        self
             .mutate(id, |queue| {
                 let changed = !queue.paused;
                 queue.paused = true;
                 Ok(((), changed))
             })
             .await
-        {
-            tracing::warn!(%id, error = %error.message, "failed to pause thread queue");
-        }
     }
 
     pub(super) fn input_recorded(&self, id: ThreadId) {

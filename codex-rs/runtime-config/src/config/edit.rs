@@ -724,6 +724,20 @@ fn apply_blocking_to_resolved_file(
     edits: &[ConfigEdit],
     expected_version: Option<&str>,
 ) -> anyhow::Result<ConfigApplyOutcome> {
+    apply_blocking_to_resolved_file_with_snapshot(
+        resolved_config_file, edits, expected_version, |_| Ok(()),
+    ).map(|receipt| match receipt {
+        Some(()) => ConfigApplyOutcome::Applied,
+        None => ConfigApplyOutcome::VersionConflict,
+    })
+}
+
+fn apply_blocking_to_resolved_file_with_snapshot<T>(
+    resolved_config_file: &Path,
+    edits: &[ConfigEdit],
+    expected_version: Option<&str>,
+    snapshot: impl FnOnce(&str) -> anyhow::Result<T>,
+) -> anyhow::Result<Option<T>> {
     let (write_paths, _lock) = acquire_resolved_atomic_write_lock(resolved_config_file)
         .with_context(|| {
             format!(
@@ -748,12 +762,12 @@ fn apply_blocking_to_resolved_file(
             &serialized
         })?;
         if version_for_toml(&value) != expected_version {
-            return Ok(ConfigApplyOutcome::VersionConflict);
+            return Ok(None);
         }
     }
 
     if edits.is_empty() {
-        return Ok(ConfigApplyOutcome::Applied);
+        return snapshot(&serialized).map(Some);
     }
 
     let mut doc = if serialized.is_empty() {
@@ -773,17 +787,21 @@ fn apply_blocking_to_resolved_file(
     }
 
     if !mutated {
-        return Ok(ConfigApplyOutcome::Applied);
+        return snapshot(&serialized).map(Some);
     }
 
-    write_atomically(&write_paths.write_path, &document.doc.to_string()).with_context(|| {
+    let serialized = document.doc.to_string();
+    // Construct any fallible receipt from the exact buffer before committing,
+    // while the same lock still excludes independent writers.
+    let receipt = snapshot(&serialized)?;
+    write_atomically(&write_paths.write_path, &serialized).with_context(|| {
         format!(
             "failed to persist config at {}",
             write_paths.write_path.display()
         )
     })?;
 
-    Ok(ConfigApplyOutcome::Applied)
+    Ok(Some(receipt))
 }
 
 /// Persist edits asynchronously by offloading the blocking writer.
@@ -953,6 +971,23 @@ impl ConfigEditsBuilder {
             &self.config_path,
             &self.edits,
             self.expected_version.as_deref(),
+        )
+    }
+
+    /// Return the loader-canonical semantic document of this commit (or None
+    /// on version conflict), including a no-op's locked current document.
+    /// Read-time migration does not rewrite a no-op, and all fallible receipt
+    /// construction completes before persistence.
+    pub fn apply_blocking_with_config(self) -> anyhow::Result<Option<toml::Value>> {
+        apply_blocking_to_resolved_file_with_snapshot(
+            &self.config_path,
+            &self.edits,
+            self.expected_version.as_deref(),
+            |serialized| {
+                let mut doc = serialized.parse::<DocumentMut>()?;
+                codex_config::loader::migrate_config_document(&mut doc, &self.config_path)?;
+                Ok(toml::from_str(&doc.to_string())?)
+            },
         )
     }
 

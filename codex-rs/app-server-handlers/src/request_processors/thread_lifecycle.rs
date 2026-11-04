@@ -1249,10 +1249,12 @@ pub(super) async fn handle_pending_thread_resume_request(
         }
     };
     let history_items = pending.history_items.as_deref().unwrap_or(&[]);
+    let listener_has_live_in_progress_turn;
     {
         // No listener event can interleave this capture and subscription commit.
         // The index preserves completed turns/items that active-prefix replay omits.
         let state = thread_state.lock().await;
+        listener_has_live_in_progress_turn = state.has_live_in_progress_turn();
         if pending.include_turns {
             resume_turns = state.resume_turns_snapshot(usize::MAX, SortDirection::Asc, TurnItemsView::Full)
                 .map(|page| page.turns);
@@ -1272,17 +1274,17 @@ pub(super) async fn handle_pending_thread_resume_request(
         active_turn_status = ?active_turn.as_ref().map(|turn| &turn.status),
         "composing running thread resume response"
     );
-    // The active-turn snapshot is reconstructed from retained history above and may describe a
-    // turn that was interrupted by process shutdown. The live agent status is the authority for
-    // whether that persisted in-progress turn is still running.
-    let has_live_in_progress_turn =
-        matches!(conversation.agent_status().await, AgentStatus::Running);
-    let live_turn_id = conversation.active_turn_id().await;
-    if !has_live_in_progress_turn
-        || live_turn_id.as_deref() != active_turn.as_ref().map(|turn| turn.id.as_str())
-    {
-        stream_prefix.clear();
-    }
+    // A listener-observed start remains live at this event boundary until that
+    // listener consumes its terminal. Only persisted-only snapshots need core's
+    // matching current-turn identity to distinguish them from interrupted history.
+    let core_running = matches!(conversation.agent_status().await, AgentStatus::Running);
+    let core_turn_id = conversation.active_turn_id().await;
+    let has_live_in_progress_turn = listener_has_live_in_progress_turn
+        || core_running && core_turn_id.as_deref() == active_turn.as_ref().map(|turn| turn.id.as_str());
+    // Prefixes contain only events consumed by this listener generation and
+    // are reset when its producer changes. Core may already be finished while
+    // its terminal event is still queued: retain the listener-consistent prefix
+    // until that terminal event is consumed, not merely until core becomes idle.
 
     let request_id = pending.request_id;
     let connection_id = request_id.connection_id;

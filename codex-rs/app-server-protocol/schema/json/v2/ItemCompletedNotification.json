@@ -408,7 +408,19 @@
           "$ref": "#/definitions/PatchChangeKind"
         },
         "path": {
+          "description": "Legacy display spelling. Prefer `pathUri` for non-Unicode native paths.",
           "type": "string"
+        },
+        "pathUri": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PathUri"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Lossless identity when native path text cannot be represented in JSON."
         }
       },
       "required": [
@@ -586,6 +598,12 @@
         "content": {
           "items": true,
           "type": "array"
+        },
+        "isError": {
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "structuredContent": true
       },
@@ -858,7 +876,7 @@
           "type": "object"
         },
         {
-          "description": "EXPERIMENTAL - proposed plan item content. The completed plan item is authoritative and may not match the concatenation of `PlanDelta` text.",
+          "description": "Proposed plan item content. The completed plan item is authoritative and may not match the concatenation of `PlanDelta` text.",
           "properties": {
             "id": {
               "type": "string"
@@ -1146,7 +1164,7 @@
               "type": "string"
             },
             "mcpAppResourceUri": {
-              "description": "Deprecated: use `appContext.resourceUri` instead.",
+              "description": "Prefer `appContext.resourceUri` when app context is available. This field remains supported for calls without a connector identity.",
               "type": [
                 "string",
                 "null"

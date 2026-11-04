@@ -44,6 +44,18 @@ pub(super) fn tool_callback(
             return;
         }
     };
+    // Select the original callable before timeout/process special cases run.
+    // The catalog is host-owned; user arguments can select only its bound routes.
+    let resolved = scope.get_slot::<RuntimeState>()
+        .ok_or_else(|| "runtime state unavailable".to_string())
+        .and_then(|state| state.enabled_tools.resolve_operation(tool_index, input));
+    let (tool_index, input) = match resolved {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            throw_type_error(scope, &error);
+            return;
+        }
+    };
     let timeout_ms = match tool_timeout_ms(scope, args, tool_index, input.as_ref()) {
         Ok(timeout_ms) => timeout_ms,
         Err(error_text) => {

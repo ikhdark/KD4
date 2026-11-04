@@ -7,4 +7,4 @@ import type { ToolLifecycleContext } from "./ToolLifecycleContext";
 /**
  * Exact event-site timestamp from the turn's single monotonic clock.
  */
-export type TurnTimingToolLifecycleEvent = { boundary: ToolLifecycleBoundary, atMs: bigint, context: ToolLifecycleContext, retryCount: number, reentryCount: number, };
+export type TurnTimingToolLifecycleEvent = { boundary: ToolLifecycleBoundary, atMs: number, context: ToolLifecycleContext, retryCount: number, reentryCount: number, };

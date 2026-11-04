@@ -312,7 +312,7 @@ fn take_server_result<Page>(
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct ListResourcesArgs {
-    /// Lists all resources from all servers if not specified.
+    /// Lists entries from all servers if not specified.
     #[serde(default)]
     server: Option<String>,
     #[serde(default)]
@@ -320,25 +320,6 @@ struct ListResourcesArgs {
 }
 
 impl ListResourcesArgs {
-    fn normalize(self) -> Result<Self, FunctionCallError> {
-        Ok(Self {
-            server: normalize_optional_selector("server", self.server)?,
-            cursor: validate_optional_opaque_selector("cursor", self.cursor)?,
-        })
-    }
-}
-
-#[derive(Debug, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct ListResourceTemplatesArgs {
-    /// Lists all resource templates from all servers if not specified.
-    #[serde(default)]
-    server: Option<String>,
-    #[serde(default)]
-    cursor: Option<String>,
-}
-
-impl ListResourceTemplatesArgs {
     fn normalize(self) -> Result<Self, FunctionCallError> {
         Ok(Self {
             server: normalize_optional_selector("server", self.server)?,

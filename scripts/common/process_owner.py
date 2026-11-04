@@ -26,7 +26,7 @@ from contextvars import ContextVar, copy_context
 from dataclasses import dataclass
 from pathlib import Path
 
-from scripts.build.rust_tool_env import prepare_shared_sccache
+from scripts.build.rust_tool_env import direct_compiler_env
 
 
 class Operation:
@@ -275,19 +275,10 @@ def run_owned(
     """
     check_operation()
     if prepare_sccache:
-        try:
-            prepare_shared_sccache(env=kwargs.get("env"), cwd=kwargs.get("cwd"))
-        except (OSError, subprocess.SubprocessError) as error:
-            # Run this command once without the cache rather than abort it. An
-            # empty wrapper keeps Cargo from auto-starting a server inside the
-            # owned job; the caller's environment and shared server are untouched.
-            inherited = os.environ if kwargs.get("env") is None else kwargs["env"]
-            kwargs["env"] = {**inherited, "RUSTC_WRAPPER": ""}
-            print(
-                f"warning: shared compiler cache preparation failed: {error}; "
-                "running this command without sccache.",
-                file=sys.stderr,
-            )
+        # Retain the legacy caller flag, but never contact or start a cache
+        # daemon for managed builds. Run the original command exactly once.
+        inherited = os.environ if kwargs.get("env") is None else kwargs["env"]
+        kwargs["env"] = {**inherited, **direct_compiler_env(inherited)}
         check_operation()
     if capture_output:
         kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -530,11 +521,6 @@ def main(argv=None):
         type=Path,
         help="Write this file if the tree's exit cannot be confirmed.",
     )
-    parser.add_argument(
-        "--below-normal-priority",
-        action="store_true",
-        help="Windows: launch the owned command below normal priority.",
-    )
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
@@ -551,11 +537,6 @@ def main(argv=None):
                 stdout=sys.stdout,
                 stderr=sys.stderr,
                 prepare_sccache=args.prepare_sccache,
-                creationflags=(
-                    getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
-                    if args.below_normal_priority
-                    else 0
-                ),
             ).returncode
         except CleanupFailed:
             if args.cleanup_failed_marker is not None:

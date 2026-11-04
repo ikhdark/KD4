@@ -85,7 +85,7 @@ impl ToolExecutor<ToolInvocation> for ListProcessesHandler {
                     "observed_at":{"type":"string"}, "current_process_id":{"type":"integer"},
                     "matched":{"type":"integer","minimum":0}, "truncated":{"type":"boolean"},
                     "details_unavailable":{"type":"integer","minimum":0, "description":"Returned processes whose path, times or memory could not be read."},
-                    "command_line_unavailable":{"type":"integer","minimum":0, "description":"Processes passing the other filters whose command line could not be read; never matched by command_line_regex."},
+                    "command_line_unavailable":{"type":"integer","minimum":0, "description":"Processes whose command line could not be read: all passing name/pid/parent filters when command_line_regex is set, otherwise only returned processes. Never matched by command_line_regex."},
                     "processes":{"type":"array","items":{"type":"object","additionalProperties":false,
                         "properties":{
                             "pid":{"type":"integer"}, "parent_pid":{"type":"integer"}, "name":{"type":"string"},
@@ -174,6 +174,12 @@ impl ToolExecutor<ToolInvocation> for ListProcessesHandler {
 }
 
 impl CoreToolRuntime for ListProcessesHandler {
+    fn is_workspace_independent(&self) -> bool {
+        // Observing a running producer must not wait for its workspace lease.
+        // Environment and full-disk-read authorization remain in the handler.
+        true
+    }
+
     fn cancellation_cleanup_policy(&self) -> crate::tools::registry::ToolCleanupPolicy {
         crate::tools::registry::ToolCleanupPolicy::InterruptibleRead
     }
@@ -258,7 +264,11 @@ fn list(filter: &Filter) -> Result<serde_json::Value, String> {
         if processes.len() >= filter.limit {
             continue;
         }
-        if details.path.is_none() || details.started_at.is_none() {
+        if details.path.is_none()
+            || details.started_at.is_none()
+            || details.cpu_seconds.is_none()
+            || details.working_set_bytes.is_none()
+        {
             details_unavailable += 1;
         }
         let mut process = json!({

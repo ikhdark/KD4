@@ -8,9 +8,12 @@
         },
         {
           "format": "int64",
+          "maximum": 9007199254740991.0,
+          "minimum": -9007199254740991.0,
           "type": "integer"
         }
-      ]
+      ],
+      "description": "A request identifier. Numeric IDs must be integers in the inclusive range -9007199254740991 to 9007199254740991 (JavaScript safe integers). Use a string ID outside this range to preserve identity in JavaScript clients."
     },
     "W3cTraceContext": {
       "properties": {

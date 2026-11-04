@@ -16,7 +16,6 @@ use super::helpers::thread_item_titles;
 use super::read_thread::stored_thread_from_sqlite_metadata_with_name;
 use crate::ListThreadsParams;
 use crate::SortDirection;
-use crate::StoredThread;
 use crate::ThreadListStorageMode;
 use crate::ThreadPage;
 use crate::ThreadSortKey;
@@ -75,21 +74,34 @@ pub(super) async fn list_threads(
         .map(|cursor| encode_rollout_cursor(storage_path, cursor))
         .transpose()?;
     let (mut names, mut resolved_title_ids) = thread_item_titles(&page.items);
-    let scan_backwards_timestamp = if storage_path == ThreadListStoragePath::ScanAndRepair {
-        page.items
-            .first()
-            .and_then(|item| match params.sort_key {
-                ThreadSortKey::CreatedAt => codex_rollout::rollout_created_at_key(&item.path),
+    // Capture each ordering anchor before hydration. Scan-created timestamps
+    // come from physical filenames and can differ from canonical display metadata.
+    let item_backwards_cursors = page
+        .items
+        .iter()
+        .filter_map(|item| {
+            let thread_id = item.thread_id.or_else(|| {
+                super::helpers::thread_id_from_rollout_path(&item.path)
+            })?;
+            let timestamp = match params.sort_key {
+                ThreadSortKey::CreatedAt
+                    if storage_path == ThreadListStoragePath::ScanAndRepair =>
+                {
+                    codex_rollout::rollout_created_at_key(&item.path)
+                }
+                ThreadSortKey::CreatedAt => item.created_at.clone(),
                 ThreadSortKey::UpdatedAt => item.updated_at.clone(),
                 ThreadSortKey::RecencyAt => {
                     item.recency_at.clone().or_else(|| item.updated_at.clone())
                 }
-            })
-            .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(&timestamp).ok())
-            .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
-    } else {
-        None
-    };
+            }?;
+            let timestamp = chrono::DateTime::parse_from_rfc3339(&timestamp)
+                .ok()?
+                .with_timezone(&chrono::Utc);
+            let position = backwards_cursor_position(timestamp, params.sort_direction)?;
+            Some((thread_id, bind_cursor(storage_path, &position)))
+        })
+        .collect::<HashMap<_, _>>();
     if storage_path != ThreadListStoragePath::StateDb
         && let Some(state_db_ctx) = hydration_db.as_deref()
     {
@@ -196,23 +208,13 @@ pub(super) async fn list_threads(
 
     let backwards_cursor = items
         .first()
-        .and_then(|thread| {
-            let mut anchor = thread.clone();
-            if let Some(timestamp) = scan_backwards_timestamp {
-                match params.sort_key {
-                    ThreadSortKey::CreatedAt => anchor.created_at = timestamp,
-                    ThreadSortKey::UpdatedAt => anchor.updated_at = timestamp,
-                    ThreadSortKey::RecencyAt => anchor.recency_at = timestamp,
-                }
-            }
-            backwards_cursor_position(&anchor, params.sort_key, params.sort_direction)
-        })
-        .map(|position| bind_cursor(storage_path, &position));
+        .and_then(|thread| item_backwards_cursors.get(&thread.thread_id).cloned());
 
     Ok(ThreadPage {
         items,
         next_cursor,
         backwards_cursor,
+        item_backwards_cursors,
     })
 }
 
@@ -463,15 +465,9 @@ fn bind_cursor(storage_path: ThreadListStoragePath, position: &str) -> String {
 }
 
 fn backwards_cursor_position(
-    thread: &StoredThread,
-    sort_key: ThreadSortKey,
+    timestamp: chrono::DateTime<chrono::Utc>,
     sort_direction: SortDirection,
 ) -> Option<String> {
-    let timestamp = match sort_key {
-        ThreadSortKey::CreatedAt => thread.created_at,
-        ThreadSortKey::UpdatedAt => thread.updated_at,
-        ThreadSortKey::RecencyAt => thread.recency_at,
-    };
     let timestamp = match sort_direction {
         SortDirection::Asc => timestamp.checked_add_signed(ChronoDuration::milliseconds(1))?,
         SortDirection::Desc => timestamp.checked_sub_signed(ChronoDuration::milliseconds(1))?,

@@ -70,6 +70,7 @@ async fn run_control_socket_acceptor(
 ) {
     let _socket_guard = socket_guard;
     let connection_tasks = TaskTracker::new();
+    let connections = std::sync::Arc::new(tokio::sync::Semaphore::new(128));
     loop {
         let stream = tokio::select! {
             _ = shutdown_token.cancelled() => {
@@ -98,13 +99,17 @@ async fn run_control_socket_acceptor(
             }
         };
 
+        let Ok(permit) = connections.clone().try_acquire_owned() else {
+            // Bound both unfinished handshakes and established idle connections.
+            drop(stream);
+            continue;
+        };
         let transport_event_tx = transport_event_tx.clone();
         let connection_shutdown = shutdown_token.clone();
-        connection_tasks.spawn(run_control_socket_connection(
-            stream,
-            transport_event_tx,
-            connection_shutdown,
-        ));
+        connection_tasks.spawn(async move {
+            let _permit = permit;
+            run_control_socket_connection(stream, transport_event_tx, connection_shutdown).await;
+        });
     }
     connection_tasks.close();
     connection_tasks.wait().await;

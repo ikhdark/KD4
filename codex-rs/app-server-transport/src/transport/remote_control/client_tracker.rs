@@ -105,12 +105,12 @@ impl ClientTracker {
     // Detach and cancel the entire old set before any reliable delivery can wait.
     // Cleanup tasks remain owned by the tracker across connection-worker aborts.
     pub(super) fn retire_clients(&mut self) {
-        while let Some(client_key) = self.clients.keys().next().cloned() {
-            if let Some(client) = self.remove_client(&client_key) {
-                client.disconnect_token.cancel();
-                let cleanup = self.spawn_connection_closed(client.connection_id);
-                self.cleanup.push(cleanup);
-            }
+        let clients = std::mem::take(&mut self.clients);
+        self.legacy_stream_ids.clear();
+        for client in clients.into_values() {
+            client.disconnect_token.cancel();
+            let cleanup = self.spawn_connection_closed(client.connection_id);
+            self.cleanup.push(cleanup);
         }
     }
 
@@ -196,8 +196,10 @@ impl ClientTracker {
                         warn!(%error, "failed to account initialize replay identity");
                         Stopped
                     })?.len();
-                    let retained_bytes: usize = prior.iter().map(|(_, _, size)| *size).sum();
-                    if prior.len() >= CHANNEL_CAPACITY
+                    let retained_bytes: usize = self.clients.values().flat_map(|client| &client.admitted_initializes)
+                        .map(|(_, _, size)| *size).sum();
+                    let retained_identities: usize = self.clients.values().map(|client| client.admitted_initializes.len()).sum();
+                    if prior.len() >= CHANNEL_CAPACITY || retained_identities >= 4096
                         || size > super::segment::REMOTE_CONTROL_REASSEMBLED_MAX_BYTES
                             .saturating_sub(retained_bytes)
                     {
@@ -226,15 +228,11 @@ impl ClientTracker {
                     self.close_client(&client_key).await?;
                 }
 
-                if let Some(connection_id) = self.clients.get_mut(&client_key).map(|client| {
+                if let Some((connection_id, writer)) = self.clients.get_mut(&client_key).map(|client| {
                     client.last_activity_at = Instant::now();
-                    client.connection_id
+                    (client.connection_id, client.writer.clone())
                 }) {
-                    self.send_transport_event(TransportEvent::IncomingMessage {
-                        connection_id,
-                        message,
-                    })
-                    .await?;
+                    self.forward_message(&writer, connection_id, message).await?;
                     self.record_inbound_message_delivery(&client_key, seq_id);
                     return Ok(());
                 }
@@ -243,6 +241,10 @@ impl ClientTracker {
                     return Ok(());
                 }
 
+                if self.clients.len() >= 4096 {
+                    warn!("remote control active client capacity reached");
+                    return Err(Stopped);
+                }
                 let connection_id = next_connection_id();
                 let (writer_tx, writer_rx) =
                     mpsc::channel::<QueuedOutgoingMessage>(CHANNEL_CAPACITY);
@@ -269,7 +271,7 @@ impl ClientTracker {
                     client_key.clone(),
                     ClientState {
                         connection_id,
-                        writer: writer_tx,
+                        writer: writer_tx.clone(),
                         disconnect_token,
                         last_activity_at: Instant::now(),
                         last_inbound_seq_id: None,
@@ -283,10 +285,7 @@ impl ClientTracker {
                 let admitted_initialize = seq_id.zip(admitted_initialize_size)
                     .map(|(seq_id, size)| (seq_id, message.clone(), size));
                 if let Err(err) = self
-                    .send_transport_event(TransportEvent::IncomingMessage {
-                        connection_id,
-                        message,
-                    })
+                    .forward_message(&writer_tx, connection_id, message)
                     .await
                 {
                     if let Some(client) = self.remove_client(&client_key) {
@@ -429,20 +428,20 @@ impl ClientTracker {
         Some(client)
     }
 
-    async fn send_transport_event(&self, event: TransportEvent) -> Result<(), Stopped> {
-        if let TransportEvent::IncomingMessage {
-            connection_id,
-            message: JSONRPCMessage::Request(_),
-            ..
-        } = &event
-        {
-            let Some(client) = self.clients.values().find(|client| client.connection_id == *connection_id) else {
-                return Err(Stopped);
-            };
-            let TransportEvent::IncomingMessage { connection_id, message } = event else { unreachable!() };
-            return if crate::transport::enqueue_incoming_message(&self.transport_event_tx, &client.writer,
-                connection_id, message).await { Ok(()) } else { Err(Stopped) };
+    async fn forward_message(
+        &self,
+        writer: &mpsc::Sender<QueuedOutgoingMessage>,
+        connection_id: ConnectionId,
+        message: JSONRPCMessage,
+    ) -> Result<(), Stopped> {
+        if crate::transport::enqueue_incoming_message(&self.transport_event_tx, writer, connection_id, message).await {
+            Ok(())
+        } else {
+            Err(Stopped)
         }
+    }
+
+    async fn send_transport_event(&self, event: TransportEvent) -> Result<(), Stopped> {
         let event_name = transport_event_name(&event);
         match timeout(
             REMOTE_CONTROL_TRANSPORT_EVENT_SEND_TIMEOUT,

@@ -30,4 +30,4 @@ import type { SandboxMode } from "./SandboxMode";
 export type ThreadResumeParams = {threadId: string, /**
  * Configuration overrides for the resumed thread, if any.
  */
-model?: string | null, modelProvider?: string | null, serviceTier?: string | null | null, cwd?: string | null, approvalPolicy?: AskForApproval | null, sandbox?: SandboxMode | null, config?: { [key in string]?: JsonValue } | null, baseInstructions?: string | null, developerInstructions?: string | null, personality?: Personality | null};
+model?: string | null, modelProvider?: string | null, serviceTier?: string | null | null, cwd?: string | null, approvalPolicy?: AskForApproval | null, sandbox?: SandboxMode | null, config?: { [key in string]: JsonValue } | null, baseInstructions?: string | null, developerInstructions?: string | null, personality?: Personality | null};

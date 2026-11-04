@@ -8,4 +8,4 @@ import type { TurnTimingBlockingCategory } from "./TurnTimingBlockingCategory";
  * Includes wake/re-poll latency, not synchronous work before the first Pending.
  * An absent end is right-censored at the enclosing timeline's frozen endpoint.
  */
-export type TurnTimingBlockingInterval = { id: bigint, dependent: string, prerequisite: string, category: TurnTimingBlockingCategory, startNs: bigint, endNs: bigint | null, cancelled: boolean, };
+export type TurnTimingBlockingInterval = { id: number, dependent: string, prerequisite: string, category: TurnTimingBlockingCategory, startNs: number, endNs: number | null, cancelled: boolean, };

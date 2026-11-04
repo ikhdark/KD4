@@ -8,8 +8,8 @@ use codex_protocol::protocol::McpInvocation;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 
-use super::ListResourceTemplatesArgs;
 use super::ListResourceTemplatesPayload;
+use super::ListResourcesArgs;
 use super::canonical_all_list_resource_templates;
 use super::canonical_single_list_resource_templates;
 use super::ensure_cursor_has_server;
@@ -47,19 +47,8 @@ impl ListMcpResourceTemplatesHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
-        let ToolInvocation {
-            session,
-            step_context,
-            cancellation_token,
-            call_id,
-            payload,
-            ..
-        } = invocation;
-        let turn = std::sync::Arc::clone(&step_context.turn);
-        let manager = step_context.mcp.manager();
-
-        let arguments = match payload {
-            ToolPayload::Function { arguments } => arguments,
+        let arguments = match &invocation.payload {
+            ToolPayload::Function { arguments } => parse_arguments(arguments)?,
             _ => {
                 return Err(FunctionCallError::RespondToModel(
                     "list_mcp_resource_templates handler received unsupported payload".to_string(),
@@ -67,15 +56,33 @@ impl ListMcpResourceTemplatesHandler {
             }
         };
 
-        let arguments = parse_arguments(arguments.as_str())?;
-        let args: ListResourceTemplatesArgs = parse_args_with_default(arguments.clone())?;
+        let args: ListResourcesArgs = parse_args_with_default(arguments.clone())?;
         let args = args.normalize()?;
-        let ListResourceTemplatesArgs { server, cursor } = args;
-        ensure_cursor_has_server(server.as_deref(), cursor.as_deref())?;
+        ensure_cursor_has_server(args.server.as_deref(), args.cursor.as_deref())?;
+        self.handle_parsed_call(invocation, args, arguments).await
+    }
+
+    pub(super) async fn handle_parsed_call(
+        &self,
+        invocation: ToolInvocation,
+        args: ListResourcesArgs,
+        arguments: Option<serde_json::Value>,
+    ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
+        let ToolInvocation {
+            session,
+            step_context,
+            cancellation_token,
+            call_id,
+            tool_name,
+            ..
+        } = invocation;
+        let turn = std::sync::Arc::clone(&step_context.turn);
+        let manager = step_context.mcp.manager();
+        let ListResourcesArgs { server, cursor } = args;
 
         let invocation = McpInvocation {
             server: server.clone().unwrap_or_else(|| "codex".to_string()),
-            tool: "list_mcp_resource_templates".to_string(),
+            tool: tool_name.name,
             arguments: arguments.clone(),
         };
 

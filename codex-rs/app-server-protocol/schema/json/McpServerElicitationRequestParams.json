@@ -132,7 +132,6 @@
       "additionalProperties": false,
       "properties": {
         "default": {
-          "format": "double",
           "type": [
             "number",
             "null"
@@ -145,14 +144,12 @@
           ]
         },
         "maximum": {
-          "format": "double",
           "type": [
             "number",
             "null"
           ]
         },
         "minimum": {
-          "format": "double",
           "type": [
             "number",
             "null"
@@ -319,19 +316,40 @@
       "type": "string"
     },
     "McpElicitationTitledEnumItems": {
-      "additionalProperties": false,
-      "properties": {
-        "anyOf": {
-          "items": {
-            "$ref": "#/definitions/McpElicitationConstOption"
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "anyOf": {
+              "items": {
+                "$ref": "#/definitions/McpElicitationConstOption"
+              },
+              "type": "array"
+            }
           },
-          "type": "array"
+          "required": [
+            "anyOf"
+          ],
+          "title": "AnyOfMcpElicitationTitledEnumItems",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "oneOf": {
+              "items": {
+                "$ref": "#/definitions/McpElicitationConstOption"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "oneOf"
+          ],
+          "title": "OneOfMcpElicitationTitledEnumItems",
+          "type": "object"
         }
-      },
-      "required": [
-        "anyOf"
-      ],
-      "type": "object"
+      ]
     },
     "McpElicitationTitledMultiSelectEnumSchema": {
       "additionalProperties": false,

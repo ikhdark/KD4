@@ -7,7 +7,7 @@ use super::NetworkPolicyAmendment;
 use super::UserInput;
 use super::shared::v2_enum_from_core;
 use crate::protocol::item_builders::command_actions_for_path_uri;
-use crate::protocol::item_builders::command_display_string;
+use crate::protocol::item_builders::command_display_string_for_path_uri;
 use crate::protocol::item_builders::convert_patch_changes;
 use crate::protocol::item_builders::review_output_text;
 use codex_experimental_api_macros::ExperimentalApi;
@@ -185,7 +185,7 @@ pub enum ThreadItem {
     },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
-    /// EXPERIMENTAL - proposed plan item content. The completed plan item is
+    /// Proposed plan item content. The completed plan item is
     /// authoritative and may not match the concatenation of `PlanDelta` text.
     Plan {
         id: String,
@@ -277,7 +277,8 @@ pub enum ThreadItem {
         app_context: Option<McpToolCallAppContext>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        /// Deprecated: use `appContext.resourceUri` instead.
+        /// Prefer `appContext.resourceUri` when app context is available.
+        /// This field remains supported for calls without a connector identity.
         mcp_app_resource_uri: Option<String>,
         plugin_id: Option<String>,
         result: Option<Box<McpToolCallResult>>,
@@ -503,7 +504,7 @@ impl From<CoreTurnItem> for ThreadItem {
                 output_metadata: command.output_metadata,
                 stdout: command.stdout,
                 stderr: command.stderr,
-                command: command_display_string(&command.command),
+                command: command_display_string_for_path_uri(&command.command, &command.cwd),
                 command_actions: command_actions_for_path_uri(&command.parsed_cmd, &command.cwd),
                 cwd: command.cwd.into(),
                 process_id: command.process_id,
@@ -724,7 +725,12 @@ pub enum CollabAgentTool {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct FileUpdateChange {
+    /// Legacy display spelling. Prefer `pathUri` for non-Unicode native paths.
     pub path: String,
+    /// Lossless identity when native path text cannot be represented in JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub path_uri: Option<codex_utils_path_uri::PathUri>,
     pub kind: PatchChangeKind,
     pub diff: String,
 }
@@ -1013,7 +1019,7 @@ pub struct AgentMessageDeltaNotification {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-/// EXPERIMENTAL - proposed plan streaming deltas for plan items. Clients should
+/// Proposed plan streaming deltas for plan items. Clients should
 /// not assume concatenated deltas match the completed plan item content.
 pub struct PlanDeltaNotification {
     pub thread_id: String,
@@ -1261,7 +1267,7 @@ impl From<DynamicToolCallOutputContentItem>
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-/// EXPERIMENTAL. Defines a single selectable option for request_user_input.
+/// Defines a single selectable option for request_user_input.
 pub struct ToolRequestUserInputOption {
     pub label: String,
     pub description: String,
@@ -1270,7 +1276,7 @@ pub struct ToolRequestUserInputOption {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-/// EXPERIMENTAL. Represents one request_user_input question and its required options.
+/// Represents one request_user_input question and its required options.
 pub struct ToolRequestUserInputQuestion {
     pub id: String,
     pub header: String,
@@ -1285,7 +1291,7 @@ pub struct ToolRequestUserInputQuestion {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-/// EXPERIMENTAL. Params sent with a request_user_input event.
+/// Params sent with a request_user_input event.
 pub struct ToolRequestUserInputParams {
     pub thread_id: String,
     pub turn_id: String,
@@ -1299,7 +1305,7 @@ pub struct ToolRequestUserInputParams {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-/// EXPERIMENTAL. Captures a user's answer to a request_user_input question.
+/// Captures a user's answer to a request_user_input question.
 pub struct ToolRequestUserInputAnswer {
     pub answers: Vec<String>,
 }
@@ -1307,7 +1313,7 @@ pub struct ToolRequestUserInputAnswer {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-/// EXPERIMENTAL. Response payload mapping question ids to answers.
+/// Response payload mapping question ids to answers.
 pub struct ToolRequestUserInputResponse {
     pub answers: HashMap<String, ToolRequestUserInputAnswer>,
     #[serde(default)]

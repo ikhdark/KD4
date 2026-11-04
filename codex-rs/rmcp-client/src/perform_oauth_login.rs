@@ -120,6 +120,7 @@ pub async fn perform_oauth_login(
         callback_port,
         callback_url,
         /*emit_browser_url*/ true,
+        Arc::new(ReqwestHttpClient),
     )
     .await
 }
@@ -153,6 +154,42 @@ pub async fn perform_oauth_login_silent(
         callback_port,
         callback_url,
         /*emit_browser_url*/ false,
+        Arc::new(ReqwestHttpClient),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn perform_oauth_login_silent_with_http_client(
+    codex_home: &Path,
+    server_name: &str,
+    server_url: &str,
+    store_mode: OAuthCredentialsStoreMode,
+    keyring_backend_kind: AuthKeyringBackendKind,
+    http_headers: Option<HashMap<String, String>>,
+    env_http_headers: Option<HashMap<String, String>>,
+    scopes: &[String],
+    oauth_client_id: Option<&str>,
+    oauth_resource: Option<&str>,
+    callback_port: Option<u16>,
+    callback_url: Option<&str>,
+    http_client: Arc<dyn HttpClient>,
+) -> Result<()> {
+    perform_oauth_login_with_browser_output(
+        codex_home,
+        server_name,
+        server_url,
+        store_mode,
+        keyring_backend_kind,
+        http_headers,
+        env_http_headers,
+        scopes,
+        oauth_client_id,
+        oauth_resource,
+        callback_port,
+        callback_url,
+        /*emit_browser_url*/ false,
+        http_client,
     )
     .await
 }
@@ -172,11 +209,12 @@ async fn perform_oauth_login_with_browser_output(
     callback_port: Option<u16>,
     callback_url: Option<&str>,
     emit_browser_url: bool,
+    http_client: Arc<dyn HttpClient>,
 ) -> Result<()> {
     let http_context = OAuthHttpContext {
         http_headers,
         env_http_headers,
-        http_client: Arc::new(ReqwestHttpClient),
+        http_client,
     };
     OauthLoginFlow::new(
         codex_home,

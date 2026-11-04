@@ -681,12 +681,7 @@ def cargo_build_env(
             lld_link = find_windows_lld_link()
             if lld_link:
                 env[linker_env_name] = lld_link
-    rustc_wrapper = env.get("RUSTC_WRAPPER")
-    if rustc_wrapper is None and shutil.which("sccache"):
-        env["RUSTC_WRAPPER"] = "sccache"
-        set_sccache_env(env)
-    elif rustc_wrapper and is_sccache_wrapper(rustc_wrapper):
-        set_sccache_env(env)
+    env.update(shared_rust_tool_env.direct_compiler_env(env))
     return env
 
 

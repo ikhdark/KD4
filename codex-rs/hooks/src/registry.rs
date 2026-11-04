@@ -80,12 +80,18 @@ impl Hooks {
             CommandShell {
                 program: config.shell_program.unwrap_or_default(),
                 args: config.shell_args,
+                mcp_executor: None,
             },
         );
         Self {
             after_agent,
             engine,
         }
+    }
+
+    pub fn with_mcp_executor(mut self, executor: std::sync::Arc<dyn crate::mcp::HookMcpExecutor>) -> Self {
+        self.engine = self.engine.with_mcp_executor(executor);
+        self
     }
 
     pub fn startup_warnings(&self) -> &[String] {

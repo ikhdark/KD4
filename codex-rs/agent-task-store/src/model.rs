@@ -70,6 +70,7 @@ impl AgentRole {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AcceptanceCriterion {
     pub id: String,
     pub text: String,
@@ -167,7 +168,7 @@ impl AcceptanceCriterion {
         Ok(())
     }
 
-    fn validate_evidence_binding(&self, required_evidence: &[String]) -> StoreResult<()> {
+    pub(crate) fn validate_evidence_binding(&self, required_evidence: &[String]) -> StoreResult<()> {
         self.validate_evidence_policy()?;
         if let Some(requirement) = self.evidence_policy.as_ref()
             .and_then(|policy| policy.required_evidence.as_ref())
@@ -216,7 +217,7 @@ pub struct ArchitectureContractV1 {
     #[serde(default)]
     pub required_evidence: Vec<String>,
     #[serde(default)]
-    pub prohibited_changes: Vec<String>,
+    pub prohibited_changes: Vec<crate::WriteProhibition>,
     #[serde(default)]
     pub contract_claims: Vec<String>,
 }
@@ -268,7 +269,7 @@ pub struct AssignmentDraft {
     #[serde(default)]
     pub required_evidence: Vec<String>,
     #[serde(default)]
-    pub prohibited_changes: Vec<String>,
+    pub prohibited_changes: Vec<crate::WriteProhibition>,
     #[serde(default)]
     pub contract_claims: Vec<String>,
     #[serde(default)]
@@ -429,7 +430,7 @@ impl AssignmentDraft {
             &dependency_ids,
         )?;
 
-        Ok(Assignment {
+        let assignment = Assignment {
             assignment_id: AssignmentId::new(),
             root_session_id: self.root_session_id,
             independent_verification: self.independent_verification,
@@ -445,7 +446,7 @@ impl AssignmentDraft {
             dependencies: self.dependencies,
             risk_hints: self.risk_hints,
             required_evidence: self.required_evidence,
-            prohibited_changes: self.prohibited_changes,
+            prohibited_changes: crate::normalize_write_prohibitions(repo_root, &self.prohibited_changes)?,
             contract_claims: self.contract_claims,
             workspace_strategy: self.workspace_strategy,
             workspace_id: String::new(),
@@ -457,7 +458,9 @@ impl AssignmentDraft {
             benign_read_overlap_count: 0,
             task_capsule: None,
             created_at: Utc::now(),
-        })
+        };
+        crate::require_write_contract(&assignment, None)?;
+        Ok(assignment)
     }
 }
 
@@ -486,7 +489,7 @@ pub struct Assignment {
     pub dependencies: Vec<AssignmentId>,
     pub risk_hints: Vec<String>,
     pub required_evidence: Vec<String>,
-    pub prohibited_changes: Vec<String>,
+    pub prohibited_changes: Vec<crate::WriteProhibition>,
     #[serde(default)]
     pub contract_claims: Vec<String>,
     #[serde(default)]
@@ -598,12 +601,19 @@ pub struct TaskCapsuleV1 {
     pub relevant_handles: Vec<TaskCapsuleHandle>,
     pub workspace_epoch: u64,
     pub workspace_manifest_hash: String,
-    pub prohibited_changes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_manifest: Option<crate::SourceManifest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_manifest_error: Option<String>,
+    pub prohibited_changes: Vec<crate::WriteProhibition>,
     pub required_evidence: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AttemptAmendment {
+    /// Host-captured correction baseline; caller-supplied values are replaced at admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_manifest: Option<crate::SourceManifest>,
     pub reason: String,
     pub objective: Option<String>,
     pub acceptance_criteria: Option<Vec<AcceptanceCriterion>>,
@@ -680,6 +690,7 @@ impl AttemptAmendment {
 
     pub(crate) fn validate_for_assignment(&self, assignment: &Assignment) -> StoreResult<()> {
         self.validate()?;
+        crate::require_write_contract(assignment, Some(self))?;
         // Include inherited policies from assignments admitted by older runtimes.
         for criterion in assignment.effective_criteria(Some(self)) {
             criterion.validate_evidence_binding(&assignment.required_evidence)?;
@@ -1063,6 +1074,10 @@ pub struct AgentReceipt {
     /// New receipts leave this unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_scope_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_manifest_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_source_manifest: Option<crate::SourceManifest>,
     pub sealed_at: DateTime<Utc>,
 }
 
@@ -1343,6 +1358,8 @@ impl AgentTask {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentTaskAuthorization {
+    pub assignment: Assignment,
+    pub repo_root: String,
     pub root_session_id: String,
     pub admission_origin: AssignmentAdmissionOrigin,
     pub current_attempt: Attempt,

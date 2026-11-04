@@ -1,3 +1,5 @@
+//! App-server schema and TypeScript generation; see the [source map](../README.md).
+
 mod export;
 mod schema_fixtures;
 

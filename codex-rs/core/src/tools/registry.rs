@@ -206,6 +206,20 @@ pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
         TerminalFailureReuse::Never
     }
 
+    /// Pure native front-door expansion, before scheduling and evidence policy
+    /// select a runtime. No I/O, authorization or effects belong here.
+    fn resolve_call(
+        &self,
+        _payload: &ToolPayload,
+    ) -> Result<Option<(ToolName, ToolPayload)>, FunctionCallError> {
+        Ok(None)
+    }
+
+    /// Host-owned native operation metadata for the immutable Code Mode catalog.
+    fn operation_routes(&self) -> BTreeMap<String, ToolName> {
+        BTreeMap::new()
+    }
+
     /// Resolve a structured request to its executable operation before hooks
     /// and command authorization inspect it. The target must be registered.
     fn prepare_invocation<'a>(
@@ -766,14 +780,14 @@ impl AnyToolResult {
     }
 
 
-    pub(crate) fn code_mode_result_with_budget(self, budget: usize) -> serde_json::Value {
-        let mut result = self.result.code_mode_result_with_budget(&self.payload, budget);
-        if let Some(history) = self.operation_history {
-            if let Some(fields) = result.as_object_mut() {
-                fields.entry("operation_history").or_insert(history);
-            }
-        }
-        result
+    pub(crate) fn code_mode_result_with_budget(
+        self,
+        budget: usize,
+    ) -> (serde_json::Value, Option<serde_json::Value>) {
+        (
+            self.result.code_mode_result_with_budget(&self.payload, budget),
+            self.operation_history,
+        )
     }
 
     pub(crate) fn code_mode_failure_is_error(&self) -> bool {

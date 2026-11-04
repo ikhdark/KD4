@@ -157,6 +157,7 @@ struct ReadFileArgs {
     if_file_revision: Option<String>,
     encoding: Option<ranges::ByteEncoding>,
     selectors: Option<Vec<FileSelector>>,
+    resume_filter: Option<crate::session::resume_inventory::ResumeInventoryFilter>,
 }
 
 #[derive(Deserialize)]
@@ -170,6 +171,7 @@ struct RawReadFileArgs {
     if_file_revision: Option<String>,
     encoding: Option<ranges::ByteEncoding>,
     selectors: Option<Vec<FileSelector>>,
+    resume_filter: Option<crate::session::resume_inventory::ResumeInventoryFilter>,
     offset: Option<usize>,
     limit: Option<usize>,
     #[serde(default)]
@@ -183,6 +185,12 @@ impl TryFrom<RawReadFileArgs> for ReadFileArgs {
         // Dispatch consumes this flag before replay lookup/storage; the handler
         // always reads the selected filesystem when it is actually invoked.
         let _ = raw.force_fresh;
+        if let Some(filter) = &raw.resume_filter {
+            if raw.path != crate::session::resume_inventory::LOCATOR {
+                return Err("resume_filter is only supported for context:resume-state".into());
+            }
+            filter.validate()?;
+        }
         if let Some(revision) = &raw.revision {
             if revision.trim().is_empty() || revision.contains(['\0', '\n', '\r']) {
                 return Err("revision must be a nonempty Git commit revision".into());
@@ -244,6 +252,7 @@ impl TryFrom<RawReadFileArgs> for ReadFileArgs {
             if_source_hash,
             if_file_revision: raw.if_file_revision,
             encoding: raw.encoding,
+            resume_filter: raw.resume_filter,
             selectors,
         })
     }
@@ -531,7 +540,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     ..JsonSchema::object(BTreeMap::new(), None, None)
                 }).collect()),
                 ..JsonSchema::object(BTreeMap::from([
-                ("path".to_string(), JsonSchema::string(Some("File path, relative to the environment cwd or absolute, a `skill:` locator, `skill:catalog` for enabled skill metadata, `context:desktop` for Desktop guidance, `context:workflow-evidence` for diagnostic/evidence-role and metric-attribution guidance, `context:resume-state` for a read-only durable-operation/process/artifact inventory, or the `context:unsettled-tools/<offset>` recovery_path from a resume notice. Omit environment_id for host-owned locators. Resume inventory is an immutable evidence snapshot, not live control authority; recover its continuation through read_tool_output rather than rebuilding pages.".to_string()))),
+                ("path".to_string(), JsonSchema::string(Some("File path, relative to the environment cwd or absolute, a `skill:` locator, `skill:catalog` for enabled skill metadata, `context:desktop` for Desktop guidance, `context:workflow-evidence` for diagnostic/evidence-role and metric-attribution guidance, `context:resume-state` for a read-only durable-operation/process/artifact inventory, or the `context:unsettled-tools/<offset>` recovery_path from a resume notice. Omit environment_id for host-owned locators. Resume inventory supports conjunctive resume_filter selection by parent_cell_id, call_id, artifact_id or unresolved_only; selected terminal metadata remains visible. It defaults to a bounded /outstanding summary; its full immutable inventory stays in this read's retained artifact. Recover exact JSON pointers or structured pages through read_tool_output, not another inventory call. Counts include omitted history; this grants no live control authority.".to_string()))),
                 ("file_path".to_string(), JsonSchema::string(Some("Legacy alias for path; use only one.".to_string()))),
                 ("offset".to_string(), JsonSchema { minimum: Some(1.into()), maximum: Some(usize::MAX.into()), ..JsonSchema::integer(Some("Legacy 1-based starting line; use instead of selectors, defaults to 1.".to_string())) }),
                 ("limit".to_string(), JsonSchema { minimum: Some(1.into()), maximum: Some(usize::MAX.into()), ..JsonSchema::integer(Some("Legacy positive line count; defaults to 2000 when offset is supplied.".to_string())) }),
@@ -541,6 +550,12 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 ("if_file_revision".to_string(), JsonSchema::string(Some("Opaque file_revision from a large-file byte read. Requires filesystem bytes-only selectors; refuses a changed object/metadata revision, even if the file shrank below 8 MiB. Not a hash, snapshot, or if_source_hash freshness shortcut. Cannot combine with revision or if_source_hash.".into()))),
                 ("if_source_hash".to_string(), JsonSchema::string(Some("Optional 64-hex source_sha256 from a previous read. Reacquire current contents through the same authorized owner and compare the whole selected representation, not just requested ranges. On a match and complete selector resolution, return unchanged:true without content or retention; invalid, missing or partial selections keep their normal results. Omit when you need content (including a new selection); a match is not evidence that you previously acquired these selectors. Default rendered HTML and explicit exact markup have different identities.".to_string()))),
                 ("force_fresh".to_string(), JsonSchema::boolean(Some("Legacy compatibility option; every call reads current contents.".to_string()))),
+                ("resume_filter".to_string(), JsonSchema::object(BTreeMap::from([
+                    ("parent_cell_id".into(), JsonSchema::string(Some("Exact originating Code Mode cell identity.".into()))),
+                    ("call_id".into(), JsonSchema::string(Some("Exact call or parent call identity, including retired output pins.".into()))),
+                    ("artifact_id".into(), JsonSchema::string(Some("Exact retained artifact identity.".into()))),
+                    ("unresolved_only".into(), JsonSchema::boolean(Some("Exclude durable terminal receipts and observed exits; defaults false.".into()))),
+                ]), None, Some(false.into()))),
                 ("selectors".to_string(), selectors),
                 ]), None, Some(false.into()))
             },
@@ -559,7 +574,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     "read_file requires function arguments".to_string(),
                 ));
             };
-            let args = parse_read_file_arguments(arguments)?;
+            let mut args = parse_read_file_arguments(arguments)?;
             if args.selectors.as_ref().is_some_and(|selectors| {
                 selectors.is_empty() || selectors.len() > READ_TOOL_OUTPUT_MAX_SELECTORS
             }) {
@@ -638,8 +653,13 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     "context:turn-diff is not available; tracked deltas are not a reliable review source yet.".to_string(),
                 ));
             } else if args.path == crate::session::resume_inventory::LOCATOR {
+                if args.selectors.is_none() {
+                    args.selectors = Some(vec![FileSelector::Exact(
+                        ToolOutputSelector::JsonPointer { pointer: "/outstanding".into() },
+                    )]);
+                }
                 let contents = invocation.session.read_resume_inventory(
-                    turn.config.codex_home.as_path(), &turn.sub_id,
+                    turn.config.codex_home.as_path(), &turn.sub_id, args.resume_filter.as_ref(),
                 ).await.map_err(FunctionCallError::RespondToModel)?;
                 (contents, args.path.clone(), "host-context".to_string(), args.path.clone())
             } else if let Some(offset) = args.path.strip_prefix("context:unsettled-tools/") {
@@ -741,8 +761,9 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             {
                 crate::tools::parallel::wait_for_workspace_baseline().await;
                 let (contents, path) = read_skill_locator(&invocation, &args).await?;
-                let uri = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(&path)
-                    .ok()
+                let uri = (path != "skill:catalog")
+                    .then(|| codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(&path).ok())
+                    .flatten()
                     .map(|path| codex_utils_path_uri::PathUri::from_abs_path(&path).to_string())
                     .unwrap_or_else(|| args.path.clone());
                 (contents, path, "host-skills".to_string(), uri)
@@ -1199,8 +1220,12 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             }
             let mut output = JsonToolOutput::with_success(output, Some(successful))
                 .with_code_mode_failure_as_data();
+            let advisory = super::evidence_memory::source_read(
+                &invocation, if script_consumer { output.value() } else { &projected },
+            ).await;
             if let Some(evidence) = evidence {
                 let mut signal = crate::tools::context::semantic_evidence_sampling_signal(evidence);
+                if let Some(advisory) = advisory { signal["evidence_advisory"] = advisory; }
                 let delivered = if script_consumer { output.value() } else { &projected };
                 if let Some(receipt) = native_read_measurement(delivered, &json!({
                     "path":delivered["path"], "environment":delivered["environment_id"],
@@ -1570,6 +1595,13 @@ async fn read_environment_file(
     } else {
         fs.read_file_bounded(&path, MAX_FILE_BYTES, Some(&sandbox)).await
     };
+    // This owner only read the filesystem. A settled I/O failure must not
+    // become an uncertain-effect retry barrier in the operation journal.
+    let read_error = |message: String| FunctionCallError::structured(
+        codex_protocol::tool_failure::ToolFailure::no_effects(
+            codex_protocol::tool_failure::ToolFailureCode::Failed, message,
+        ).with_completed_execution(),
+    );
     let contents = match result {
         Ok(Some(contents)) => contents,
         failure => {
@@ -1583,7 +1615,7 @@ async fn read_environment_file(
                 )
             });
             let diagnostic_error = |message: String| {
-                FunctionCallError::RespondToModel(match &primary_error {
+                read_error(match &primary_error {
                     Some(primary) => {
                         format!("{primary}\nAdditional filesystem diagnostic: {message}")
                     }
@@ -1634,7 +1666,7 @@ async fn read_environment_file(
                 && err.kind() == std::io::ErrorKind::NotFound
             {
                 let note = suggestion_note(err.kind()).await.unwrap_or_default();
-                return Err(FunctionCallError::RespondToModel(format!(
+                return Err(read_error(format!(
                     "{}{note}",
                     primary_error.clone().unwrap_or_else(|| format!(
                         "unable to read {}",
@@ -1712,7 +1744,7 @@ async fn read_environment_file(
                 }
                 return Err(diagnostic_error(format!("file exceeds the {MAX_FILE_MIB} MiB snapshot limit; use bounded byte selectors")));
             }
-            return Err(FunctionCallError::RespondToModel(match failure {
+            return Err(read_error(match failure {
                 Err(err) => format!(
                     "unable to read {}: {err}",
                     path.inferred_native_path_string()

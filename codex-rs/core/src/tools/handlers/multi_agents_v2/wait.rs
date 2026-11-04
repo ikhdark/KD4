@@ -1625,8 +1625,8 @@ struct WaitReceivers {
     states: HashMap<codex_protocol::ThreadId, AgentStatus>,
 }
 
-/// Agents whose durable deltas or mailbox messages this wait delivered, in
-/// delivery order, with their current runtime states (as V1 wait reports).
+/// Agents whose durable deltas, selected completion outcomes/pending obligations,
+/// or mailbox messages this wait reports, with their current runtime states.
 async fn wait_receivers(
     session: &crate::session::session::Session,
     result: &WaitAgentResult,
@@ -1637,7 +1637,21 @@ async fn wait_receivers(
     let mut thread_ids = Vec::new();
     let mut seen_threads = HashSet::new();
     let mut seen_assignments = BTreeSet::new();
-    for delta in &result.typed_deltas {
+    let completion_outcomes = result
+        .completion
+        .as_ref()
+        .and_then(|completion| completion.get("outcomes"))
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten();
+    let completion_pending = result
+        .completion
+        .as_ref()
+        .and_then(|completion| completion.get("pending"))
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten();
+    for delta in result.typed_deltas.iter().chain(completion_outcomes).chain(completion_pending) {
         let thread_id = if let Some(thread_id) = delta.get("thread_id").and_then(JsonValue::as_str)
         {
             codex_protocol::ThreadId::from_string(thread_id).ok()

@@ -279,13 +279,8 @@ function Enable-SccacheEnvironment {
         [string]$RepoRoot
     )
 
-    if (-not (Test-Path Env:RUSTC_WRAPPER)) {
-        $env:RUSTC_WRAPPER = "sccache"
-        Set-CodexRustSccacheEnvironment -RepoRoot $RepoRoot
-    }
-    elseif (Test-SccacheWrapper -Value $env:RUSTC_WRAPPER) {
-        Set-CodexRustSccacheEnvironment -RepoRoot $RepoRoot
-    }
+    # Legacy internal name retained for existing callers.
+    Set-CodexRustDirectCompilerEnvironment
 }
 
 function ConvertTo-SafeLaneName {
@@ -969,10 +964,6 @@ function Enable-SccacheForCargoHome {
 
     $null = Copy-UserCargoConfig -CargoHome $CargoHome -SourceCargoHome $SourceCargoHome
 
-    if (-not (Get-Command sccache -ErrorAction SilentlyContinue)) {
-        return
-    }
-
     Enable-SccacheEnvironment -RepoRoot $RepoRoot
 }
 
@@ -980,10 +971,6 @@ function Enable-SccacheForLane {
     param(
         [string]$RepoRoot
     )
-
-    if (-not (Get-Command sccache -ErrorAction SilentlyContinue)) {
-        return
-    }
 
     Enable-SccacheEnvironment -RepoRoot $RepoRoot
 }
@@ -1015,7 +1002,6 @@ function Get-CargoLaneOwnedCommand {
     return @(
         $python.Source,
         (Join-Path $PSScriptRoot "../common/process_owner.py"),
-        "--below-normal-priority",
         "--parent-pid",
         [string]$PID,
         "--cleanup-failed-marker",
@@ -1045,8 +1031,8 @@ elseif (-not [string]::IsNullOrWhiteSpace($env:CODEX_CARGO_LANES_ROOT)) {
 else {
     $cargoLanesRoot = Join-Path $rustRoot "target\lanes"
 }
-Initialize-CargoLanesRoot -RepoRoot $repoRoot -LanesRoot $cargoLanesRoot
 if ($parsedArgs.MaintenanceOnly) {
+    Initialize-CargoLanesRoot -RepoRoot $repoRoot -LanesRoot $cargoLanesRoot
     Invoke-CargoLanePrune -RepoRoot $repoRoot -LanesRoot $cargoLanesRoot -ActiveNames @()
     exit 0
 }
@@ -1058,8 +1044,6 @@ if ($commandArgs.Count -eq 1 -and [string]::IsNullOrWhiteSpace($commandArgs[0]))
 # Use the validated name verbatim, as rust_build_status.py does, so a lane
 # names the same directory from either entrypoint.
 $requestedLane = $Lane
-$activeLaneNames = @(Get-ActiveCargoLaneNames -LanesRoot $cargoLanesRoot)
-$excludedLaneNames = if ([string]::IsNullOrWhiteSpace($env:CODEX_CARGO_LANE_ACTIVE_NAMES)) { @() } else { $activeLaneNames }
 $candidateLane = if ($requestedLane -ceq "auto") { Get-AffinityLaneBase -CommandArgs $commandArgs } else { $requestedLane }
 # Match Python's source-qualified family, including default/legacy target roots.
 $sha256 = [Security.Cryptography.SHA256]::Create()
@@ -1071,6 +1055,43 @@ finally { $sha256.Dispose() }
 $candidateLane = "$candidateLane-ws-$sourceKey"
 # Affinity names come from command text; hold them to the explicit-name rules.
 Assert-CargoLaneName -Lane $candidateLane
+# Mirror the managed owner's native-output preflight before creating a lane or
+# starting dependency work. Keep the full source digest in the lane name.
+$profile = "debug"
+$targets = @()
+for ($i = 0; $i -lt $commandArgs.Count; $i++) {
+    $arg = $commandArgs[$i]
+    if ($arg -eq "--") { break }
+    if ($arg -in @("--release", "-r")) { $profile = "release" }
+    elseif ($arg -eq "--profile" -and $i + 1 -lt $commandArgs.Count) { $i++; $profile = $commandArgs[$i] }
+    elseif ($arg.StartsWith("--profile=")) { $profile = $arg.Substring(10) }
+    elseif ($arg -eq "--target" -and $i + 1 -lt $commandArgs.Count) { $i++; $targets += $commandArgs[$i] }
+    elseif ($arg.StartsWith("--target=")) { $targets += $arg.Substring(9) }
+}
+if ($profile -in @("dev", "test")) { $profile = "debug" }
+elseif ($profile -eq "bench") { $profile = "release" }
+if ($targets.Count -eq 0 -and -not [string]::IsNullOrWhiteSpace($env:CARGO_BUILD_TARGET)) { $targets = @($env:CARGO_BUILD_TARGET) }
+$nativeSuffix = "build\blake3-ffffffffffffffff\out\ffffffffffffffff-blake3_sse41_x86-64_windows_msvc.o"
+function Get-NativeLaneOutputPath([string]$Root) {
+    $target = Join-Path $Root "$candidateLane-65"
+    $prefixes = @((Join-Path $target $profile))
+    foreach ($triple in $targets) {
+        if ($triple.EndsWith(".json")) { $triple = [IO.Path]::GetFileNameWithoutExtension($triple) }
+        $prefixes += Join-Path (Join-Path $target $triple) $profile
+    }
+    return @($prefixes | ForEach-Object { Join-Path $_ $nativeSuffix } | Sort-Object Length -Descending)[0]
+}
+$nativeOutput = Get-NativeLaneOutputPath $cargoLanesRoot
+if ($nativeOutput.Length -ge 260 -and [string]::IsNullOrWhiteSpace($LanesRoot) -and [string]::IsNullOrWhiteSpace($env:CODEX_CARGO_LANES_ROOT)) {
+    $cargoLanesRoot = Join-Path ([Environment]::GetFolderPath('UserProfile')) (".kd4-lanes\" + $sourceKey.Substring(0, 12))
+    $nativeOutput = Get-NativeLaneOutputPath $cargoLanesRoot
+}
+if ($nativeOutput.Length -ge 260) {
+    throw "Native assembler output path exceeds the Windows 259 UTF-16-unit budget: $nativeOutput. Use a shorter -LanesRoot and lane name; the lane owner initializes its ownership marker."
+}
+Initialize-CargoLanesRoot -RepoRoot $repoRoot -LanesRoot $cargoLanesRoot
+$activeLaneNames = @(Get-ActiveCargoLaneNames -LanesRoot $cargoLanesRoot)
+$excludedLaneNames = if ([string]::IsNullOrWhiteSpace($env:CODEX_CARGO_LANE_ACTIVE_NAMES)) { @() } else { $activeLaneNames }
 $previousLaneTargetDir = $env:CODEX_CARGO_LANE_TARGET_DIR
 $didPushLocation = $false
 # OS observations may become idle while waiting for coordination. Reservation

@@ -62,6 +62,7 @@ use crate::tool_dispatch_trace::ToolDispatchTimingSnapshot;
 mod app_server;
 mod blocking;
 mod dependency;
+mod detail_archive;
 mod measurements;
 mod operations;
 mod performance;
@@ -924,6 +925,12 @@ pub async fn retain_turn_timing_details(
     let Ok(bytes) = serde_json::to_vec(&timing.tool_calls) else {
         return timing;
     };
+    // Small diagnostics already fit inline. A redundant cache write can start
+    // a cold whole-store inventory and outlive this function's bounded wait,
+    // delaying CLI shutdown even though the complete inline evidence was kept.
+    if bytes.len() <= codex_tool_artifacts::LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES {
+        return timing;
+    }
     let codex_home = codex_home.to_path_buf();
     let thread_id = thread_id.to_string();
     // Retain creation ownership if storage outlives terminal delivery. In
@@ -1301,6 +1308,8 @@ struct TurnTimingStateInner {
     accounted_model_responses: u64,
     tool_calls: Vec<TurnTimingToolCall>,
     tool_call_timing_overflow: u32,
+    detail_archive: Option<Arc<StdMutex<detail_archive::Capture>>>,
+    archive_sequence: u64,
     /// Model-visible direct results without a (capped) detail row. The next
     /// dispatched request counts their consumes_tool_result edges as dropped.
     unrecorded_tool_result_consumptions: u64,
@@ -1441,6 +1450,8 @@ impl TurnTimingStateInner {
             accounted_model_responses: self.accounted_model_responses,
             tool_calls: Vec::new(),
             tool_call_timing_overflow: self.tool_call_timing_overflow,
+            detail_archive: None,
+            archive_sequence: 0,
             unrecorded_tool_result_consumptions: self.unrecorded_tool_result_consumptions,
             tool_closure: ToolClosureLedger::default(),
             queued_durable_tool_result_execution_ids: BTreeSet::new(),
@@ -2618,7 +2629,22 @@ impl TurnTimingState {
                         && snapshot.timing_paired_count == snapshot.accepted_count
                         && snapshot.terminal_count == snapshot.accepted_count
                         && snapshot.persisted_count == snapshot.accepted_count;
-                    if lifecycle_closed || state.tool_result_persistence_barrier_failed {
+                    // After sealing, fully terminal direct calls cannot deliver a
+                    // new projection for an unbound nested result. Waiting cannot
+                    // repair that evidence gap; return it without marking it closed.
+                    let no_delivery_pending = snapshot.timing_paired_count == snapshot.accepted_count
+                        && snapshot.terminal_count == snapshot.accepted_count
+                        && snapshot.orphan_calls.is_empty()
+                        && state.queued_durable_tool_result_execution_ids.is_empty()
+                        && state.tool_closure.entries.values().all(|entry| {
+                            entry.persisted
+                                || (entry.identity.source == TurnTimingToolCallSource::CodeMode
+                                    && entry.delivering_projection.is_none())
+                        });
+                    if lifecycle_closed
+                        || no_delivery_pending
+                        || state.tool_result_persistence_barrier_failed
+                    {
                         return snapshot;
                     }
                 }
@@ -2790,17 +2816,16 @@ impl TurnTimingState {
         // Only a model-issued call is emitted by its sampling generation; a
         // nested Code Mode call's generation is merely current at dispatch.
         // The per-call detail cap below does not bound dependency evidence.
-        if source == TurnTimingToolCallSource::Direct
+        let dropped_dependency = if source == TurnTimingToolCallSource::Direct
             && timing.sampling_generation_id.0 != "generation-pending"
             && let Some(evidence) = state.activity_timeline.blocking.as_mut()
         {
             blocking::record_dependency(evidence, timing.execution_id.0.clone(),
-                timing.sampling_generation_id.0.clone(), "emitted_by");
-        }
-        if state.tool_calls.len() >= MAX_TOOL_CALL_TIMINGS {
-            state.tool_call_timing_overflow = state.tool_call_timing_overflow.saturating_add(1);
-            return;
-        }
+                timing.sampling_generation_id.0.clone(), "emitted_by")
+        } else { None };
+        let dependency_archive = dropped_dependency.and_then(|edge| state.archive_record(
+            serde_json::json!({"kind":"dependency", "edge":edge}), true,
+        ));
 
         let observed_at_ms = state
             .elapsed_since_start(sample.time.monotonic_ns)
@@ -2926,7 +2951,16 @@ impl TurnTimingState {
         if let Some(process_exit) = pending_process_exit {
             record_tool_process_exit(&mut tool_call, &process_exit);
         }
-        state.tool_calls.push(tool_call);
+        let detail = if state.tool_calls.len() >= MAX_TOOL_CALL_TIMINGS {
+            state.tool_call_timing_overflow = state.tool_call_timing_overflow.saturating_add(1);
+            state.archive_record(serde_json::json!({"kind":"tool_call", "call":tool_call}), true)
+        } else {
+            state.tool_calls.push(tool_call);
+            None
+        };
+        drop(state);
+        detail_archive::write(dependency_archive);
+        detail_archive::write(detail);
     }
 
     pub fn update_tool_dispatch_lifecycle(
@@ -2941,6 +2975,14 @@ impl TurnTimingState {
         let Some(tool_call) = state.tool_calls.iter_mut().rev().find(|tool_call| {
             tool_call.call_id == call_id && &tool_call.execution_id == execution_id
         }) else {
+            let record = state.archive_record(serde_json::json!({
+                "kind":"lifecycle", "execution_id":execution_id, "call_id":call_id,
+                "lifecycle_events":timing.lifecycle_events, "timer_waits":timing.timer_waits,
+                "retry_count":timing.retry_count, "reentry_count":timing.reentry_count,
+                "first_poll_to_output_collected_ms":timing.first_poll_to_output_collected_ms,
+            }), false);
+            drop(state);
+            detail_archive::write(record);
             return false;
         };
         tool_call.lifecycle_events = timing.lifecycle_events;
@@ -2966,6 +3008,7 @@ impl TurnTimingState {
     /// Per-tool observers may outlive model work and cannot author the turn's live phase.
     pub fn record_tool_sample_block_reason(&self, reason: NextSampleBlockReason) {
         let mut state = self.state();
+        let record = state.archive_record(serde_json::json!({"kind":"sample_block_reason", "reason":reason}), false);
         let sample = self.clock.sample();
         state.advance(sample.time.monotonic_ns);
         state.ready_to_sample_ns = if reason == NextSampleBlockReason::ReadyToSample {
@@ -2981,10 +3024,13 @@ impl TurnTimingState {
             }
             tool_call.next_sample_block_reason = reason;
         }
+        drop(state);
+        detail_archive::write(record);
     }
 
     pub fn record_pending_tool_timer_wait(&self, wait: ToolLifecycleTimerWait) {
         let mut state = self.state();
+        let record = state.archive_record(serde_json::json!({"kind":"timer_wait", "wait":wait}), false);
         for tool_call in state.tool_calls.iter_mut().rev() {
             if tool_call.model_resumed_at_ms.is_some() {
                 break;
@@ -2995,6 +3041,8 @@ impl TurnTimingState {
             );
             tool_call.reentry_count = tool_call.reentry_count.saturating_add(1);
         }
+        drop(state);
+        detail_archive::write(record);
     }
 
     /// Records the point at which a direct tool result has been inserted into
@@ -3029,6 +3077,18 @@ impl TurnTimingState {
             // The capped row cannot carry this result's consumption edge.
             state.unrecorded_tool_result_consumptions =
                 state.unrecorded_tool_result_consumptions.saturating_add(1);
+            let generation = state.current_generation_index.map(|index| format!("generation-{index}"))
+                .unwrap_or_else(|| "generation-pending".into());
+            let execution_id = state.tool_closure.entries.values().find(|entry| {
+                entry.identity.call_id == call_id
+                    && entry.identity.source == TurnTimingToolCallSource::Direct
+                    && entry.identity.sampling_generation_id.0 == generation
+            }).map(|entry| entry.identity.execution_id.clone());
+            let record = state.archive_record(serde_json::json!({
+                "kind":"model_visible", "execution_id":execution_id, "at_ms":model_visible_at_ms,
+            }), false);
+            drop(state);
+            detail_archive::write(record);
         }
     }
 
@@ -3156,11 +3216,19 @@ impl TurnTimingState {
             record_tool_process_exit(tool_call, &timing);
             return;
         }
+        let force = state.background_tool_process_exits.len() >= MAX_TOOL_CALL_TIMINGS;
+        let record = state.archive_record(serde_json::json!({
+            "kind":"process_exit", "execution_id":timing.execution_id,
+            "event":timing.lifecycle_events.iter().find(|event| event.boundary == ToolLifecycleBoundary::ProcessExit),
+            "spawn_to_exit_ms":timing.exec_spawn_to_exit_ms,
+        }), force);
         if state.background_tool_process_exits.len() < MAX_TOOL_CALL_TIMINGS {
             state
                 .background_tool_process_exits
                 .insert((call_id.to_string(), timing.execution_id.clone()), timing);
         }
+        drop(state);
+        detail_archive::write(record);
     }
 
     pub fn record_initial_plan_generation(&self) {
@@ -4479,10 +4547,15 @@ impl TurnTimingState {
         }
         let lifecycle_context = self.lifecycle_context();
         let mut consumed_tools = Vec::new();
+        let mut archive_records = Vec::new();
         if let Some(model_resumed_at_ms) = state
             .elapsed_since_start(sample.time.monotonic_ns)
             .map(u128_to_u64_ms)
         {
+            archive_records.extend(state.archive_record(serde_json::json!({
+                "kind":"model_resumed", "at_ms":model_resumed_at_ms,
+                "context":lifecycle_context, "generation_id":resumed_generation_id,
+            }), false));
             for tool_call in state.tool_calls.iter_mut().rev() {
                 if tool_call.model_resumed_at_ms.is_some() {
                     break;
@@ -4516,12 +4589,16 @@ impl TurnTimingState {
             }
         }
         let unrecorded_consumptions = std::mem::take(&mut state.unrecorded_tool_result_consumptions);
+        let mut dropped_dependencies = Vec::new();
         if let Some(evidence) = state.activity_timeline.blocking.as_mut() {
             for execution_id in consumed_tools {
-                blocking::record_dependency(evidence, resumed_generation_id.clone(), execution_id, "consumes_tool_result");
+                dropped_dependencies.extend(blocking::record_dependency(evidence, resumed_generation_id.clone(), execution_id, "consumes_tool_result"));
             }
             evidence.dropped_dependencies =
                 evidence.dropped_dependencies.saturating_add(unrecorded_consumptions);
+        }
+        for edge in dropped_dependencies {
+            archive_records.extend(state.archive_record(serde_json::json!({"kind":"dependency", "edge":edge}), true));
         }
         if state.dispatch_ready_snapshot.is_none()
             && let Some(elapsed_ns) = elapsed_ns
@@ -4537,6 +4614,9 @@ impl TurnTimingState {
         {
             let ready_to_dispatch_ns =
                 u64::try_from(elapsed_ns.saturating_sub(ready_to_sample_ns)).unwrap_or(u64::MAX);
+            archive_records.extend(state.archive_record(serde_json::json!({
+                "kind":"ready_to_dispatch", "duration_ns":ready_to_dispatch_ns,
+            }), false));
             for tool_call in state.tool_calls.iter_mut().rev() {
                 if tool_call.ready_to_sample_to_dispatch_ns.is_some() {
                     break;
@@ -4577,6 +4657,8 @@ impl TurnTimingState {
             }
         }
         state.counters.model_request_count = state.counters.model_request_count.saturating_add(1);
+        drop(state);
+        for record in archive_records { record.write(); }
     }
 
     pub fn record_ttfm_for_turn_item(&self, item: &TurnItem) -> Option<Duration> {
@@ -4755,6 +4837,8 @@ impl TurnTimingStateInner {
                 .unwrap_or(sample.time.wall_unix_ms);
         }
         *self = Self {
+            detail_archive: self.detail_archive.take(),
+            archive_sequence: self.archive_sequence,
             activity_timeline: codex_protocol::timing::TurnTimingTimeline {
                 version: 1,
                 blocking: Some(codex_protocol::timing::TurnTimingBlockingEvidence {

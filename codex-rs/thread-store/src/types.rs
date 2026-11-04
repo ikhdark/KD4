@@ -268,6 +268,10 @@ pub struct ThreadPage {
     pub next_cursor: Option<String>,
     /// Opaque cursor for fetching in the opposite direction.
     pub backwards_cursor: Option<String>,
+    /// Reverse anchors for individual results, in the selected backend's raw
+    /// ordering space. Hydrated display timestamps must not reconstruct these.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub item_backwards_cursors: std::collections::HashMap<ThreadId, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

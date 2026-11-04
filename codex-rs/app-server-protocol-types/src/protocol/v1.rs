@@ -31,6 +31,7 @@ use crate::protocol::v2::ForcedChatgptWorkspaceIds;
 pub struct InitializeParams {
     pub client_info: ClientInfo,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub capabilities: Option<InitializeCapabilities>,
 }
 

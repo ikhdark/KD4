@@ -349,6 +349,7 @@ impl InMemoryThreadStore {
             items,
             next_cursor: None,
             backwards_cursor: None,
+            item_backwards_cursors: HashMap::new(),
         };
         match params.relation_filter {
             Some(ThreadRelationFilter::DirectChildrenOf(parent_thread_id)) => {

@@ -7,30 +7,30 @@ export type TurnTimingRequestTokenCategories = {
 /**
  * Exact content hashes from prompt provenance, not the state fingerprint.
  */
-promptSectionSha256?: { [key in string]?: string }, accountingBasis: TurnTimingTokenCategoryBasis, baseInstructions: bigint, toolSchemas: bigint, conversationHistory: bigint,
+promptSectionSha256?: { [key in string]: string }, accountingBasis: TurnTimingTokenCategoryBasis, baseInstructions: number, toolSchemas: number, conversationHistory: number,
 /**
  * Serialized tool-result bytes in this request's full logical input,
  * including retained results. Subset of conversation_history; not transport bytes.
  */
-toolOutputSerializedBytes?: bigint,
+toolOutputSerializedBytes?: number,
 /**
  * Native tool-result token estimate for this request's full logical input,
  * including retained results. Subset of conversation_history; not provider usage.
  */
-toolOutputTokensEstimate?: bigint, currentInput: bigint, repositoryContext: bigint, skills: bigint, otherInjectedContext: bigint,
+toolOutputTokensEstimate?: number, currentInput: number, repositoryContext: number, skills: number, otherInjectedContext: number,
 /**
  * Sum of the mutually exclusive category estimates above.
  */
-logicalTotal: bigint,
+logicalTotal: number,
 /**
  * One-pass local estimate over the complete serialized logical prompt.
  */
-localInputEstimate: bigint,
+localInputEstimate: number,
 /**
  * `local_input_estimate - logical_total`. This exposes estimator and JSON
  * envelope effects instead of silently assigning them to a category.
  */
-localReconciliationResidual: bigint,
+localReconciliationResidual: number,
 /**
  * Provider-reported full input tokens, when usage was returned.
  */
@@ -43,7 +43,7 @@ providerReconciliationResidual: number | null,
  * Overlapping diagnostic: logical tokens in categories whose exact hash
  * matched the preceding request. This is not added to `logical_total`.
  */
-repeatedUnchangedContext: bigint,
+repeatedUnchangedContext: number,
 /**
  * Fixed-prefix categories whose exact hash differed from the preceding
  * request. Non-empty explains why fixed-prefix reuse was ineligible.
@@ -81,4 +81,4 @@ toolOutputBudgetDropCount: number,
 /**
  * Tokens those dropped results would have occupied.
  */
-toolOutputBudgetDroppedTokenCount: bigint, };
+toolOutputBudgetDroppedTokenCount: number, };

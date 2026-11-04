@@ -301,12 +301,14 @@ fn build_tool_specs_and_registry(
     promote_deferred_tools(turn_context, &mut planned_tools);
     apply_direct_model_only_namespace_overrides(turn_context, &mut planned_tools);
     retain_unique_planned_tool_names(&mut planned_tools);
+    // Hosted fallbacks must see the accepted standalone inventory, not a
+    // namespace that will be quarantined before dispatch.
+    quarantine_conflicting_namespaces(&mut planned_tools);
 
     for spec in hosted_model_tool_specs(&context, &planned_tools) {
         planned_tools.add_hosted_spec(spec);
     }
 
-    quarantine_conflicting_namespaces(&mut planned_tools);
     apply_namespace_description_budget(&mut planned_tools);
     reserve_generated_control_names(turn_context, &mut planned_tools);
     let tool_search = append_tool_search_executor(&context, &mut planned_tools);
@@ -331,14 +333,13 @@ fn build_tool_specs_and_registry(
                     .get(tool.tool_name())
                     .map(|index| &handler.search_infos()[*index])
                     .or_else(|| tool.search_info_ref())
+                    .map(|info| (info, tool.authorization_class().native_capability_group()))
             })
             .collect::<Vec<_>>();
         if infos.is_empty() {
             return String::new();
         }
         crate::tools::handlers::tool_search_spec::render_tool_search_sources(
-            infos.iter().filter_map(|info| info.source_info.as_ref()),
-            infos.iter().any(|info| info.source_info.is_none()),
             infos.iter().copied(),
         )
     });
@@ -388,6 +389,7 @@ fn apply_direct_model_only_namespace_overrides(
             ToolExposure::Direct
             | ToolExposure::Deferred
             | ToolExposure::DirectModelOnly
+            | ToolExposure::Compatibility
             | ToolExposure::Hidden => {}
         }
     }
@@ -600,7 +602,12 @@ fn hosted_model_tool_specs(
             .runtimes()
             .iter()
             .find(|runtime| runtime.tool_name() == &ToolName::namespaced("web", "run"))
-            .is_some_and(|runtime| runtime.exposure().is_direct());
+            .is_some_and(|runtime| {
+                matches!(
+                    runtime.exposure(),
+                    ToolExposure::Direct | ToolExposure::Deferred | ToolExposure::DirectModelOnly
+                )
+            });
     // `Some(Cached/Live/Disabled)` are the options for mode when standalone search is unavailable
     // and the provider supports hosted search. `None` prevents emitting a hosted search tool.
     let web_search_mode = (!standalone_web_search_available
@@ -776,6 +783,7 @@ fn build_code_mode_executors(
     let mut has_deferred_tools = false;
     let mut has_nested_apply_patch = false;
     let mut has_nested_list_files = false;
+    let mut has_nested_file_inspection = false;
     let mut lazy_builtin_tool_names = Vec::new();
     let mut canonical_input_schemas = HashMap::new();
     let mut effective_contract_revisions = HashMap::new();
@@ -807,6 +815,8 @@ fn build_code_mode_executors(
         has_nested_apply_patch |= executor.tool_name() == &ToolName::plain("apply_patch");
         has_nested_list_files |= executor.authorization_class() != TypedToolClass::DynamicExternal
             && executor.tool_name() == &ToolName::plain("list_files");
+        has_nested_file_inspection |= executor.authorization_class() == TypedToolClass::ReadSearch
+            && executor.tool_name() == &ToolName::plain("inspect_files");
         if executor.authorization_class() != TypedToolClass::DynamicExternal
             && executor.tool_name().name == "read_file"
             && let ToolSpec::Function(tool) = &mut spec
@@ -822,8 +832,8 @@ fn build_code_mode_executors(
             }
         }
 
-        if exposure == ToolExposure::Deferred {
-            if deferred_tools_guidance_enabled {
+        if matches!(exposure, ToolExposure::Deferred | ToolExposure::Compatibility) {
+            if exposure == ToolExposure::Deferred && deferred_tools_guidance_enabled {
                 has_deferred_tools = true;
             }
             deferred_code_mode_nested_tool_specs.push(spec);
@@ -893,6 +903,18 @@ fn build_code_mode_executors(
                 if definition.name == "apply_patch" {
                     definition.description = format!("{}\nNested apply_patch is available: await tools.apply_patch(patchText). Result: {{success, operation_id, outcome, text, changes, changes_exact, environment_id, diagnostics, tool_failure?, retry?}}; outcome is committed/unchanged/failed/unknown, independently of success; multi_file_atomic is false. changes[].write_receipt hashes exact committed bytes, not current freshness; check success before continuing.", definition.description).into();
                 } else if definition.name == "read_file" {
+                    // Eager projection only. Preserve the full resolver contract,
+                    // coordinates, limits and recovery rules; defer parser internals.
+                    definition.description = definition.description
+                        .replace(
+                            "Section outline/item IDs also support Markdown (.md, .markdown): headings have source-bound IDs, levels, parent IDs and exact byte ranges; sections include descendants until the next equal/shallower heading. Duplicate titles are distinct; fenced code is ignored and Setext headings are recognized.",
+                            "Markdown outline/section selectors return source-bound IDs and exact ranges including descendants; duplicate titles have distinct IDs. Use returned IDs; resolve read_file for parser details.",
+                        )
+                        .replace(
+                            "Compatible byte ranges are merged before I/O within each revision-bound delivery group, then sliced and encoded at original selector boundaries. Live results retain selector_index (including duplicates); merging grants no extra coverage or revision guarantee.",
+                            "Raw-byte results retain original selector_index, including duplicates; merged acquisition grants no extra coverage or revision guarantee.",
+                        )
+                        .into();
                     definition.description = format!("{}\nResult fields: path, retained_bytes, complete, file_complete, retained_artifact_complete, results. Snapshot reads add total_lines, source_sha256, canonical_bytes and optional artifact_id, continuation, page_selectors, snapshot_error, canonical_sha256 (decoded UTF-16 snapshot identity; join recovery pages on it when present), unchanged; live byte pages instead add read_mode:byte_ranges, file_bytes, file_revision and, when incomplete, range_recovery. Each results[] item has selector, status, complete and text, value or data_hex/data_base64 (search hydrated_ranges), with recovery fields when incomplete.", definition.description).into();
                 }
                 eager_nested_tool_definitions.push(definition);
@@ -920,7 +942,15 @@ fn build_code_mode_executors(
         eager_nested_tool_descriptions.push("Nested apply_patch is unavailable in this session; use its direct interface only if advertised.".to_string());
     }
     if has_nested_list_files {
-        eager_nested_tool_descriptions.push("- `await tools.list_files({path, include?, exclude?, exclude_directories?, include_paths?, exclude_paths?, exclude_directory_paths?, include_hidden?, include_ignored?, include_metadata?, summary_only?, max_depth?, max_entries?})`: include/exclude/exclude_directories are arrays of case-sensitive basename patterns, never booleans. Explicit include_paths/exclude_paths/exclude_directory_paths are case-sensitive root-relative patterns with / or \\ separators, segment-local * and ?, and whole-segment ** for zero or more segments. Inclusion groups are unioned; exclusions win. max_depth:0 lists only the selected directory; default depth 8 and 2000 entries. By default respects .gitignore only inside Git repositories (from each entry's nearest repository root down; never outside one); include_ignored:true bypasses it. Hidden directories are not traversed unless include_hidden:true, independently of ignored-file filtering. For unfiltered coverage set both true and omit filters. Returns `{entries:[{path,kind}], truncated, complete}`. With include patterns only matching files are listed, but subdirectories are still traversed unless pruned by exclude_directories or exclude_directory_paths. Combine known patterns for the same root/options; check completeness under the combined limits. summary_only:true aggregates file/directory counts and logical file bytes in the same scan instead of returning entry paths; check summary.skipped and summary.totals_complete along with errors/cutoffs. Traversal and metadata costs still apply. include_metadata:true adds cheap entry size/timestamps/link/readonly metadata; omitted by default, no content detection or link-target probes. Check per-path errors and metadata_error. Resolve the full contract for other options.".to_string());
+        let guide = "- `await tools.list_files({path, include?, exclude?, exclude_directories?, include_paths?, exclude_paths?, exclude_directory_paths?, include_hidden?, include_ignored?, include_metadata?, summary_only?, max_depth?, max_entries?})`: include/exclude/exclude_directories are arrays of case-sensitive basename patterns, never booleans. Explicit include_paths/exclude_paths/exclude_directory_paths are case-sensitive root-relative patterns with / or \\ separators, segment-local * and ?, and whole-segment ** for zero or more segments. Inclusion groups are unioned; exclusions win. max_depth:0 lists only the selected directory; default depth 8 and 2000 entries. By default respects .gitignore only inside Git repositories (from each entry's nearest repository root down; never outside one); include_ignored:true bypasses it. Hidden directories are not traversed unless include_hidden:true, independently of ignored-file filtering. For unfiltered coverage set both true and omit filters. Returns `{entries:[{path,kind}], truncated, complete}`. With include patterns only matching files are listed, but subdirectories are still traversed unless pruned by exclude_directories or exclude_directory_paths. Combine known patterns for the same root/options; check completeness under the combined limits. summary_only:true aggregates file/directory counts and logical file bytes in the same scan instead of returning entry paths; check summary.skipped and summary.totals_complete along with errors/cutoffs. Traversal and metadata costs still apply. include_metadata:true adds cheap entry size/timestamps/link/readonly metadata; omitted by default, no content detection or link-target probes. Check per-path errors and metadata_error. Resolve the full contract for other options.".to_string();
+        let guide = if has_nested_file_inspection {
+            guide
+                .replacen("await tools.list_files(", "await tools.inspect_files({operation:\"list\", arguments:", 1)
+                .replacen("max_entries?})`", "max_entries?}})`", 1)
+        } else {
+            guide
+        };
+        eager_nested_tool_descriptions.push(guide);
     }
     if !lazy_builtin_tool_names.is_empty() {
         // Names only: built-ins keep this line stable when external inventories change.
@@ -952,7 +982,7 @@ fn build_code_mode_executors(
         deferred_code_mode_nested_tool_specs,
         &canonical_input_schemas,
         &effective_contract_revisions,
-    )?)];
+    )?.with_native_catalog_policy(executors))];
     result.push(Arc::new(CodeModeWaitHandler));
     Ok(result)
 }
@@ -1080,6 +1110,10 @@ fn add_tool_sources(context: &CoreToolPlanContext<'_>, planned_tools: &mut Plann
     add_mcp_resource_tools(context, planned_tools);
     add_core_utility_tools(context, planned_tools);
     add_collaboration_tools(context, planned_tools);
+    crate::tools::handlers::native_tools::consolidate_native_tools(
+        &mut planned_tools.runtimes,
+        search_tool_enabled(context.step_context.turn.as_ref()),
+    );
     let flat_mcp_tools = !use_mcp_namespaces(context.step_context.turn.as_ref());
     if !flat_mcp_tools {
         add_mcp_runtime_tools(context, planned_tools);
@@ -1269,7 +1303,7 @@ fn add_mcp_resource_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
         );
         planned_tools.add_with_exposure_and_authorization_class(
             ListMcpResourceTemplatesHandler,
-            exposure,
+            ToolExposure::Compatibility,
             TypedToolClass::ReadSearch,
         );
         planned_tools.add_with_exposure_and_authorization_class(
@@ -1380,7 +1414,15 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
             for range in [false, true] {
                 planned_tools.add_with_exposure_and_authorization_class(
                     crate::tools::handlers::GitInspectionHandler { range },
-                    if search_tool_enabled(turn_context) { ToolExposure::Deferred } else { ToolExposure::Direct },
+                    // One advertised capability; exact legacy calls retain
+                    // their complete native and Code Mode runtime contract.
+                    if range {
+                        ToolExposure::Compatibility
+                    } else if search_tool_enabled(turn_context) {
+                        ToolExposure::Deferred
+                    } else {
+                        ToolExposure::Direct
+                    },
                     TypedToolClass::ReadSearch,
                 );
             }

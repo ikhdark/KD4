@@ -39,6 +39,7 @@ pub fn item_event_to_server_notification(
         EventMsg::ItemCompleted(event) => Some(event.turn_id.as_str()),
         EventMsg::ExecCommandBegin(event) => Some(event.turn_id.as_str()),
         EventMsg::ExecCommandEnd(event) => Some(event.turn_id.as_str()),
+        EventMsg::DynamicToolCallResponse(event) => Some(event.turn_id.as_str()),
         _ => None,
     };
     let turn_id = owner
@@ -72,7 +73,7 @@ pub fn item_event_to_server_notification(
             };
             ServerNotification::ItemCompleted(ItemCompletedNotification {
                 thread_id,
-                turn_id: response.turn_id,
+                turn_id,
                 item,
                 completed_at_ms: response.completed_at_ms,
             })

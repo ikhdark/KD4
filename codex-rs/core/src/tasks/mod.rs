@@ -1554,8 +1554,10 @@ impl Session {
                 &[("boundary", "core_terminal_snapshot")],
             );
         }
+        let mut archived_timing = timing_snapshot.protocol_timing();
+        turn_context.turn_timing_state.retain_overflow_details(&mut archived_timing, turn_context.config.ephemeral).await;
         let mut timing = crate::turn_timing::retain_turn_timing_details(
-            timing_snapshot.protocol_timing(),
+            archived_timing,
             &turn_context.config.codex_home,
             &self.thread_id.to_string(),
         )
@@ -1798,8 +1800,10 @@ impl Session {
         }
         turn_context.turn_timing_state.begin_finalization();
         let timing_snapshot = turn_context.turn_timing_state.complete_snapshot();
+        let mut archived_timing = timing_snapshot.protocol_timing();
+        turn_context.turn_timing_state.retain_overflow_details(&mut archived_timing, turn_context.config.ephemeral).await;
         let timing = crate::turn_timing::retain_turn_timing_details(
-            timing_snapshot.protocol_timing(),
+            archived_timing,
             &turn_context.config.codex_home,
             &self.thread_id.to_string(),
         )
@@ -1865,10 +1869,13 @@ impl Session {
     }
 
     pub(crate) async fn close_unified_exec_processes(&self) {
-        self.services
+        if let Err(error) = self.services
             .unified_exec_manager
             .terminate_all_processes()
-            .await;
+            .await
+        {
+            tracing::warn!(%error, "background process cleanup remains unconfirmed");
+        }
     }
 
     pub(crate) async fn list_background_terminals(&self) -> Vec<BackgroundTerminalInfo> {

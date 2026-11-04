@@ -108,30 +108,58 @@ impl ApplyPatchRuntime {
         self.failure.as_ref()
     }
 
-    async fn validate_assignment(ctx: &ToolCtx) -> Result<(), ToolError> {
+    async fn validate_assignment(ctx: &ToolCtx, req: &ApplyPatchRequest) -> Result<(), ToolError> {
         let coordinator = ctx.session.services.agent_control.task_coordinator();
-        let binding = coordinator.binding_for_turn(&ctx.turn);
-        if let Some(binding) = &binding {
-            let authorization = coordinator
-                .get_agent_task_authorization(binding.assignment_id)
-                .await
-                .map_err(|error| {
-                    ToolError::Rejected(format!(
-                        "apply_patch: typed assignment state is unavailable: {error}"
-                    ))
-                })?;
-            if authorization.current_attempt.attempt_id != binding.attempt_id
-                || authorization.current_attempt.state != AttemptState::Active
-            {
-                return Err(ToolError::Rejected(
-                    "apply_patch: the bound typed assignment attempt is no longer active"
-                        .to_string(),
-                ));
+        let Some(binding) = coordinator.binding_for_turn(&ctx.turn) else {
+            if matches!(&ctx.turn.session_source, codex_protocol::protocol::SessionSource::SubAgent(_)) {
+                return Err(ToolError::Rejected("apply_patch: unbound subagents are read-only".into()));
+            }
+            return Ok(());
+        };
+        if req.turn_environment.environment.is_remote() {
+            return Err(ToolError::Rejected("apply_patch: typed source contracts require the bound local repository".into()));
+        }
+        let authorization = coordinator.get_agent_task_authorization(binding.assignment_id).await
+            .map_err(|error| ToolError::Rejected(format!("apply_patch: typed assignment unavailable: {error}")))?;
+        if authorization.current_attempt.attempt_id != binding.attempt_id
+            || authorization.current_attempt.state != AttemptState::Active
+        {
+            return Err(ToolError::Rejected("apply_patch: bound assignment attempt is no longer active".into()));
+        }
+        let assignment = &authorization.assignment;
+        let amendment = authorization.current_attempt.amendment.as_ref();
+        codex_agent_task_store::require_write_contract(assignment, amendment)
+            .and_then(|()| codex_agent_task_store::dispatch_manifest(assignment, amendment).map(|_| ()))
+            .map_err(|error| ToolError::Rejected(format!("apply_patch: {error}")))?;
+        let root = std::path::Path::new(&authorization.repo_root);
+        for (path, change) in req.action.changes() {
+            let absolute = path.to_abs_path().map_err(|error| ToolError::Rejected(error.to_string()))?;
+            let relative = codex_agent_task_store::normalize_absolute_source_path(root, &absolute)
+                .map_err(|error| ToolError::Rejected(format!("apply_patch: {error}")))?;
+            use codex_agent_task_store::SourceWriteOperation as Op;
+            let operation = match change {
+                codex_apply_patch::ApplyPatchFileChange::Add { .. } => Op::Create,
+                codex_apply_patch::ApplyPatchFileChange::Delete { .. } => Op::Delete,
+                codex_apply_patch::ApplyPatchFileChange::Update { .. } => Op::Update,
+            };
+            codex_agent_task_store::authorize_source_write(assignment, amendment, &relative, operation)
+                .map_err(|error| ToolError::Rejected(format!("apply_patch: {error}")))?;
+            if let codex_apply_patch::ApplyPatchFileChange::Update { move_path: Some(destination), .. } = change {
+                let absolute = destination.to_abs_path().map_err(|error| ToolError::Rejected(error.to_string()))?;
+                let destination = codex_agent_task_store::normalize_absolute_source_path(root, &absolute)
+                    .map_err(|error| ToolError::Rejected(format!("apply_patch: {error}")))?;
+                let destination_operation = if absolute.exists() { Op::Update } else { Op::Create };
+                for (path, operation) in [(&relative, Op::Move), (&relative, Op::Delete),
+                    (&destination, Op::Move), (&destination, destination_operation)]
+                {
+                    codex_agent_task_store::authorize_source_write(assignment, amendment, path, operation)
+                        .map_err(|error| ToolError::Rejected(format!("apply_patch: {error}")))?;
+                }
             }
         }
-
         Ok(())
     }
+
 
     fn file_system_sandbox_context_for_attempt(
         req: &ApplyPatchRequest,
@@ -295,7 +323,7 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
                     ) => permit.map_err(ToolError::Denied)?,
                 });
             }
-            Self::validate_assignment(ctx).await?;
+            Self::validate_assignment(ctx, req).await?;
             let started_at = Instant::now();
             let fs = req.turn_environment.environment.get_filesystem();
             let sandbox = Self::file_system_sandbox_context_for_attempt(req, attempt);

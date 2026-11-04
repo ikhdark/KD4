@@ -2,7 +2,6 @@ use codex_tools::JsonSchema;
 use codex_tools::LoadableToolSpec;
 use codex_tools::TOOL_SEARCH_TOOL_NAME;
 use codex_tools::ToolSearchInfo;
-use codex_tools::ToolSearchSourceInfo;
 use codex_tools::ToolSpec;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -43,17 +42,37 @@ pub(crate) fn create_tool_search_tool(default_limit: usize) -> ToolSpec {
 }
 
 pub(crate) fn render_tool_search_sources<'a>(
-    searchable_sources: impl IntoIterator<Item = &'a ToolSearchSourceInfo>,
-    has_unnamed_tools: bool,
-    search_infos: impl IntoIterator<Item = &'a ToolSearchInfo>,
+    search_infos: impl IntoIterator<Item = (&'a ToolSearchInfo, Option<&'static str>)>,
 ) -> String {
     let mut scopes = BTreeMap::<&str, BTreeSet<&str>>::new();
     let mut owners = BTreeMap::<&str, BTreeSet<Option<&str>>>::new();
-    for info in search_infos {
+    let mut source_descriptions = BTreeMap::<&str, Option<&str>>::new();
+    let mut has_unnamed_tools = false;
+    for (info, capability_group) in search_infos {
         let scope = canonical_source(info);
-        let name = info.source_info.as_ref().map(|source| source.name.as_str());
+        let (name, description) = match &info.source_info {
+            Some(source) => (Some(source.name.as_str()), source.description.as_deref()),
+            None => (
+                capability_group,
+                capability_group.map(|_| {
+                    "Grouped by existing authorization class, not a permission grant; session permissions and task restrictions still apply."
+                }),
+            ),
+        };
         scopes.entry(name.unwrap_or("")).or_default().insert(scope);
         owners.entry(scope).or_default().insert(name);
+        if let Some(name) = name {
+            source_descriptions
+                .entry(name)
+                .and_modify(|existing| {
+                    if existing.is_none() {
+                        *existing = description;
+                    }
+                })
+                .or_insert(description);
+        } else {
+            has_unnamed_tools = true;
+        }
     }
     let scope_label = |name: &str| {
         let Some(tokens) = scopes.get(name) else {
@@ -87,17 +106,6 @@ pub(crate) fn render_tool_search_sources<'a>(
             }
         )
     };
-    let mut source_descriptions = BTreeMap::new();
-    for source in searchable_sources {
-        source_descriptions
-            .entry(source.name.clone())
-            .and_modify(|existing: &mut Option<String>| {
-                if existing.is_none() {
-                    *existing = source.description.clone();
-                }
-            })
-            .or_insert(source.description.clone());
-    }
 
     if source_descriptions.is_empty() {
         if has_unnamed_tools {
@@ -114,10 +122,10 @@ pub(crate) fn render_tool_search_sources<'a>(
             .map(|(name, description)| match description {
                 Some(description) => format!(
                     "- {name}{}: {}",
-                    scope_label(&name),
-                    catalog_summary(&description)
+                    scope_label(name),
+                    catalog_summary(description)
                 ),
-                None => format!("- {name}{}", scope_label(&name)),
+                None => format!("- {name}{}", scope_label(name)),
             })
             .collect::<Vec<_>>();
         if has_unnamed_tools {

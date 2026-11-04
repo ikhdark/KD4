@@ -14,6 +14,7 @@ use crate::historical::read_git_lossy;
 use crate::historical::relative_git_path;
 use crate::historical::resolve_read_revision;
 use crate::historical::valid_oid;
+use crate::inspection::repository_root;
 use crate::operations::GitCommandControl;
 
 pub const MAX_BLAME_LINES: usize = 200;
@@ -115,8 +116,7 @@ fn capture_blame(
     result: &mut BlameResult,
     control: &GitCommandControl,
 ) -> Result<(), String> {
-    let root = read_git(cwd, &["rev-parse", "--show-toplevel"], 32 * 1024, control)?;
-    let root = PathBuf::from(root.trim_end_matches(['\r', '\n']));
+    let root = repository_root(cwd, control)?;
     result.repository_root = Some(root.clone());
     let commit = resolve_read_revision(&root, &result.revision, control)?;
     result.commit_oid = Some(commit.clone());

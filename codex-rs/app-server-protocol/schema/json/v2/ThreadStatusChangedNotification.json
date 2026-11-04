@@ -1,7 +1,25 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
-    "ThreadActiveFlag": {"enum":["waitingOnApproval","waitingOnUserInput"],"type":"string"},
+    "HarnessPhase": {
+      "enum": [
+        "resourceResolution",
+        "diffTracker",
+        "workspaceGate",
+        "evidenceTracker",
+        "delivery",
+        "processCleanup",
+        "readyToSample"
+      ],
+      "type": "string"
+    },
+    "ThreadActiveFlag": {
+      "enum": [
+        "waitingOnApproval",
+        "waitingOnUserInput"
+      ],
+      "type": "string"
+    },
     "ThreadStatus": {
       "oneOf": [
         {
@@ -60,14 +78,23 @@
               },
               "type": "array"
             },
+            "harnessPhases": {
+              "description": "Optional harness diagnostics, separate from the upstream active-flag enum.",
+              "items": {
+                "$ref": "#/definitions/HarnessPhase"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
             "type": {
               "enum": [
                 "active"
               ],
               "title": "ActiveThreadStatusType",
               "type": "string"
-            },
-            "harnessPhases": {"description":"Optional harness diagnostics, separate from the upstream active-flag enum.","items":{"$ref":"#/definitions/HarnessPhase"},"type":["array","null"]}
+            }
           },
           "required": [
             "activeFlags",
@@ -77,8 +104,7 @@
           "type": "object"
         }
       ]
-    },
-    "HarnessPhase": {"enum":["resourceResolution","diffTracker","workspaceGate","evidenceTracker","delivery","processCleanup","readyToSample"],"type":"string"}
+    }
   },
   "properties": {
     "status": {

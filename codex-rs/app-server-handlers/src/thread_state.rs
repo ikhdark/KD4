@@ -180,6 +180,7 @@ pub(crate) fn thread_listener_command_channel() -> (
 pub(crate) struct TurnSummary {
     pub(crate) started_at: Option<i64>,
     pub(crate) command_execution_started: HashSet<String>,
+    pub(crate) command_execution_canonical_started: HashSet<String>,
     pub(crate) last_error: Option<TurnError>,
     pub(crate) origin_connection_id: Option<ConnectionId>,
 }
@@ -792,6 +793,10 @@ impl ThreadState {
         self.active_stream_replay.snapshot(self.in_progress_turn_id())
     }
 
+    pub(crate) fn has_live_in_progress_turn(&self) -> bool {
+        self.active_stream_replay.is_active_turn(self.in_progress_turn_id())
+    }
+
     pub(crate) fn active_turn_id(&self) -> Option<&str> {
         self.current_turn_history.active_turn_id()
     }
@@ -952,6 +957,23 @@ impl ThreadState {
         event_turn_id: &str,
         event: &EventMsg,
     ) -> Vec<ThreadHistoryItemChange> {
+        let review_event = match event {
+            EventMsg::EnteredReviewMode(_) | EventMsg::ExitedReviewMode(_) => true,
+            EventMsg::ItemStarted(payload) => matches!(&payload.item,
+                codex_protocol::items::TurnItem::EnteredReviewMode(_) | codex_protocol::items::TurnItem::ExitedReviewMode(_)),
+            EventMsg::ItemCompleted(payload) => matches!(&payload.item,
+                codex_protocol::items::TurnItem::EnteredReviewMode(_) | codex_protocol::items::TurnItem::ExitedReviewMode(_)),
+            _ => false,
+        };
+        if review_event
+            && let Some(owner) = ThreadHistoryBuilder::scoped_event_turn_id(event)
+            && !self.current_turn_history.contains_turn(owner)
+            && !self.turn_index.turns.contains_key(owner)
+        {
+            // Live history owns all valid explicit turns in this index. An
+            // idle reducer reset must not revive a removed review owner.
+            return Vec::new();
+        }
         self.active_stream_replay.track(event_turn_id, event);
         if let EventMsg::TurnStarted(payload) = event {
             if self.turn_summary_id.as_deref() != Some(event_turn_id) {
@@ -991,13 +1013,7 @@ impl ThreadState {
                     self.turn_index.turns[turn_id]
                         .items
                         .iter()
-                        .filter_map(|item| match item {
-                            codex_app_server_protocol_types::ThreadItem::CollabAgentToolCall {
-                                id,
-                                ..
-                            } => Some(id.clone()),
-                            _ => None,
-                        }),
+                        .map(|item| item.id().to_string()),
                 );
             }
             self.current_turn_history.handle_event(event);
@@ -1022,27 +1038,14 @@ impl ThreadState {
             }
             return Vec::new();
         }
-        // Legacy wait completions lack a turn id. Resolve their owner from the
-        // durable index, preferring the current owner just as replay does.
-        let wait_owner = if let Some((call_id, operation)) =
-            ThreadHistoryBuilder::legacy_collab_end_identity(event)
+        // Unscoped tool completions must have a unique durable owner, even
+        // when an active turn happens to reuse the same call identity.
+        let wait_owner = if let Some(call_id) =
+            ThreadHistoryBuilder::legacy_tool_end_call_id(event)
         {
             let owns_wait = |turn: &&Turn| {
-                turn.items.iter().any(|item| {
-                    matches!(item,
-                codex_app_server_protocol_types::ThreadItem::CollabAgentToolCall {
-                    id, tool, ..
-                } if id == call_id && *tool == operation)
-                })
+                turn.items.iter().any(|item| ThreadHistoryBuilder::legacy_tool_end_matches(event, item))
             };
-            let current = self
-                .current_turn_history
-                .active_turn_id()
-                .and_then(|id| self.turn_index.turns.get(id))
-                .filter(owns_wait);
-            if let Some(turn) = current {
-                Some(turn.id.clone())
-            } else {
                 let mut owners = self.turn_index.turns.values().filter(owns_wait);
                 let first = owners.next().map(|turn| turn.id.clone());
                 if owners.next().is_some()
@@ -1051,7 +1054,6 @@ impl ThreadState {
                     return Vec::new();
                 }
                 first
-            }
         } else {
             None
         };
@@ -1474,12 +1476,14 @@ impl ThreadStateManager {
         &self,
         connection_id: ConnectionId,
         capabilities: ConnectionCapabilities,
+        rpc_gate: &crate::connection_rpc_gate::ConnectionRpcGate,
+        publish_ready: impl FnOnce(),
     ) {
-        self.state
-            .lock()
-            .await
-            .live_connections
-            .insert(connection_id, capabilities);
+        let mut state = self.state.lock().await;
+        rpc_gate.try_commit(|| {
+            state.live_connections.insert(connection_id, capabilities);
+            publish_ready();
+        });
     }
 
     /// Publish synchronous connection-owned bookkeeping under the same admission

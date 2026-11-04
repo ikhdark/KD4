@@ -252,18 +252,17 @@ pub(crate) async fn prepare_shell_command(input: ShellCommandPreparation<'_>) ->
         .unwrap_or(command)
 }
 
-/// Shared helper to construct sandbox transform inputs from a tokenized command line and native
+/// Shared helper to construct sandbox transform inputs from a tokenized command line and selected
 /// working directory. Validates that at least a program is present.
 pub(crate) fn build_sandbox_command(
     command: &[String],
-    cwd: &AbsolutePathBuf,
+    cwd: PathUri,
     env: &HashMap<String, String>,
     additional_permissions: Option<AdditionalPermissionProfile>,
 ) -> Result<SandboxCommand, ToolError> {
     let (program, args) = command
         .split_first()
         .ok_or_else(|| ToolError::Rejected("command args are empty".to_string()))?;
-    let cwd = PathUri::from_abs_path(cwd);
     Ok(SandboxCommand {
         program: program.clone().into(),
         args: args.to_vec(),

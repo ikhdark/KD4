@@ -230,6 +230,8 @@ fn map_hook_handler_to_api(handler: CoreHookHandlerConfig) -> ConfiguredHookHand
             r#async,
             status_message,
         },
+        CoreHookHandlerConfig::McpTool { server, tool, input, timeout_sec, status_message } =>
+            ConfiguredHookHandler::McpTool { server, tool, input, timeout_sec, status_message },
         CoreHookHandlerConfig::Prompt {} => ConfiguredHookHandler::Prompt {},
         CoreHookHandlerConfig::Agent {} => ConfiguredHookHandler::Agent {},
     }

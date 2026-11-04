@@ -20,6 +20,7 @@ export type { AdditionalPermissionProfile } from "./AdditionalPermissionProfile"
 export type { AgentMessageDeltaNotification } from "./AgentMessageDeltaNotification";
 export type { AnalyticsConfig } from "./AnalyticsConfig";
 export type { AppBranding } from "./AppBranding";
+export type { AppConfig } from "./AppConfig";
 export type { AppInfo } from "./AppInfo";
 export type { AppListUpdatedNotification } from "./AppListUpdatedNotification";
 export type { AppMetadata } from "./AppMetadata";
@@ -31,6 +32,7 @@ export type { AppTemplateUnavailableReason } from "./AppTemplateUnavailableReaso
 export type { AppToolApproval } from "./AppToolApproval";
 export type { AppToolSummary } from "./AppToolSummary";
 export type { AppToolsConfig } from "./AppToolsConfig";
+export type { ApprovalsReviewer } from "./ApprovalsReviewer";
 export type { AppsConfig } from "./AppsConfig";
 export type { AppsDefaultConfig } from "./AppsDefaultConfig";
 export type { AppsInstalledParams } from "./AppsInstalledParams";
@@ -39,7 +41,6 @@ export type { AppsListParams } from "./AppsListParams";
 export type { AppsListResponse } from "./AppsListResponse";
 export type { AppsReadParams } from "./AppsReadParams";
 export type { AppsReadResponse } from "./AppsReadResponse";
-export type { ApprovalsReviewer } from "./ApprovalsReviewer";
 export type { AskForApproval } from "./AskForApproval";
 export type { AttestationGenerateParams } from "./AttestationGenerateParams";
 export type { AttestationGenerateResponse } from "./AttestationGenerateResponse";

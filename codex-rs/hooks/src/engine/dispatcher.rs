@@ -79,7 +79,7 @@ pub(crate) fn running_summary(handler: &ConfiguredHandler) -> HookRunSummary {
     HookRunSummary {
         id: handler.run_id(),
         event_name: handler.event_name,
-        handler_type: HookHandlerType::Command,
+        handler_type: if handler.mcp_tool.is_some() { HookHandlerType::McpTool } else { HookHandlerType::Command },
         execution_mode: HookExecutionMode::Sync,
         scope: scope_for_event(handler.event_name),
         source_path: handler.source_path.clone(),
@@ -107,7 +107,11 @@ pub(crate) async fn execute_handlers<T>(
         let input_json = input_json.as_str();
         let turn_id = turn_id.clone();
         pending.push(async move {
-            let result = run_command(shell, &handler, configured_order, input_json, cwd).await;
+            let result = if let Some(target) = &handler.mcp_tool {
+                crate::mcp::run_mcp_tool(shell.mcp_executor.as_deref(), &handler, target, input_json).await
+            } else {
+                run_command(shell, &handler, configured_order, input_json, cwd).await
+            };
             (configured_order, parse(&handler, result, turn_id))
         });
     }
@@ -132,7 +136,7 @@ pub(crate) fn completed_summary(
     HookRunSummary {
         id: handler.run_id(),
         event_name: handler.event_name,
-        handler_type: HookHandlerType::Command,
+        handler_type: if handler.mcp_tool.is_some() { HookHandlerType::McpTool } else { HookHandlerType::Command },
         execution_mode: HookExecutionMode::Sync,
         scope: scope_for_event(handler.event_name),
         source_path: handler.source_path.clone(),
@@ -174,6 +178,7 @@ pub(crate) fn hook_handler_type_label(handler_type: HookHandlerType) -> &'static
         HookHandlerType::Command => "command",
         HookHandlerType::Prompt => "prompt",
         HookHandlerType::Agent => "agent",
+        HookHandlerType::McpTool => "mcp_tool",
     }
 }
 

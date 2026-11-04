@@ -568,7 +568,9 @@ impl UnifiedExecProcess {
     }
 
     fn release_finished_execution_resources(&self) {
-        if self.has_exited() && self.output_closed.load(Ordering::Acquire) {
+        // An exited root cannot release its execution lease while tree cleanup
+        // is still pending or uncertain; match the background lifecycle owner.
+        if self.has_exited() && !self.shutdown_is_pending() && self.output_closed.load(Ordering::Acquire) {
             let released = self._spawn_lifecycle.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner).take();
             drop(released);

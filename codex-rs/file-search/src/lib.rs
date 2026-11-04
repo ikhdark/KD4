@@ -100,6 +100,8 @@ pub struct FileSearchResults {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 pub struct FileSearchSnapshot {
     pub query: String,
+    #[serde(skip)]
+    pub generation: usize,
     pub matches: Vec<FileMatch>,
     pub total_match_count: usize,
     pub scanned_file_count: usize,
@@ -165,10 +167,10 @@ impl FileSearchSession {
     /// Update the query. This should be cheap relative to re-walking.
     /// Queries reuse the session's walk snapshot; create a new session to discover
     /// subsequent filesystem changes.
-    pub fn update_query(&self, pattern_text: &str) {
+    pub fn update_query(&self, pattern_text: &str) -> usize {
         self.inner
             .latest_query
-            .update(pattern_text, &self.inner.work_tx);
+            .update(pattern_text, &self.inner.work_tx)
     }
 }
 
@@ -333,24 +335,26 @@ struct QuerySubmission {
 }
 
 impl LatestQuery {
-    fn update(&self, query: &str, work_tx: &Sender<WorkSignal>) {
-        if let Ok(mut latest) = self.value.lock() {
+    fn update(&self, query: &str, work_tx: &Sender<WorkSignal>) -> usize {
+        let generation = if let Ok(mut latest) = self.value.lock() {
             latest.text.clear();
             latest.text.push_str(query);
             latest.generation = latest.generation.wrapping_add(1);
+            latest.generation
         } else {
-            return;
-        }
+            return 0;
+        };
         if self
             .notification_queued
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            return;
+            return generation;
         }
         if work_tx.send(WorkSignal::QueryUpdated).is_err() {
             self.notification_queued.store(false, Ordering::Release);
         }
+        generation
     }
 
     fn read_for_worker(&self) -> QuerySubmission {
@@ -852,6 +856,7 @@ fn matcher_worker(
 
                     let result = FileSearchSnapshot {
                         query: query.text.clone(),
+                        generation: query.generation,
                         matches,
                         total_match_count: snapshot.matched_item_count() as usize,
                         scanned_file_count: snapshot.item_count() as usize,
@@ -870,6 +875,7 @@ fn matcher_worker(
                 {
                     if !last_snapshot.match_complete {
                         last_snapshot.query = query.text.clone();
+                        last_snapshot.generation = query.generation;
                         last_snapshot.match_complete = true;
                         inner.reporter.on_update(&last_snapshot);
                     }
@@ -896,6 +902,7 @@ fn matcher_worker(
             last_snapshot = FileSearchSnapshot::default();
         }
         last_snapshot.query = latest.text;
+        last_snapshot.generation = latest.generation;
         last_snapshot.match_complete = false;
         last_snapshot.cancelled = true;
         inner.reporter.on_update(&last_snapshot);

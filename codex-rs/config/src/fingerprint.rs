@@ -52,7 +52,12 @@ pub(super) fn record_origins<T: Clone>(
 
 pub fn version_for_toml(value: &TomlValue) -> String {
     let json = serde_json::to_value(value).unwrap_or(JsonValue::Null);
-    let canonical = canonicalize(&json);
+    version_for_json(&json)
+}
+
+/// Canonical content identity for JSON inputs, including null and nested objects.
+pub fn version_for_json(value: &JsonValue) -> String {
+    let canonical = canonicalize(value);
     let serialized = serde_json::to_vec(&canonical).unwrap_or_default();
     let mut hasher = Sha256::new();
     hasher.update(serialized);

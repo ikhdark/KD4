@@ -213,14 +213,17 @@ impl ToolRouter {
                 .manifest_entries()
                 .into_iter()
                 .filter(|tool| tool.exposure() == codex_tools::ToolExposure::Deferred)
-                .filter_map(RegisteredTool::search_info_ref)
+                .filter_map(|tool| {
+                    Some((
+                        tool.search_info_ref()?,
+                        tool.authorization_class().native_capability_group(),
+                    ))
+                })
                 .collect::<Vec<_>>();
             if search_infos.is_empty() {
                 String::new()
             } else {
                 crate::tools::handlers::tool_search_spec::render_tool_search_sources(
-                    search_infos.iter().filter_map(|info| info.source_info.as_ref()),
-                    search_infos.iter().any(|info| info.source_info.is_none()),
                     search_infos.iter().copied(),
                 )
             }
@@ -456,6 +459,7 @@ impl ToolRouter {
                     crate::tools::registry::ToolExposure::Direct => "direct",
                     crate::tools::registry::ToolExposure::Deferred => "deferred",
                     crate::tools::registry::ToolExposure::DirectModelOnly => "direct_model_only",
+                    crate::tools::registry::ToolExposure::Compatibility => "compatibility",
                     crate::tools::registry::ToolExposure::Hidden => "hidden",
                 };
                 serde_json::json!({
@@ -468,6 +472,7 @@ impl ToolRouter {
                     // the rollout manifest does not scale with every registered schema.
                     "spec_sha256": tool.canonical_spec_sha256(),
                     "identity": name,
+                    "authorization_class": tool.authorization_class(),
                     "effective_contract_revision": tool.effective_contract_revision(),
                 })
             })
@@ -518,6 +523,25 @@ impl ToolRouter {
         tool_name: &ToolName,
     ) -> Option<Box<dyn ToolArgumentDiffConsumer>> {
         self.registry.create_diff_consumer(tool_name)
+    }
+
+    /// Resolve native operation groups before selecting authority, hooks,
+    /// workspace evidence, scheduling or cancellation/process ownership.
+    pub(crate) fn resolve_tool_call(&self, mut call: ToolCall) -> Result<ToolCall, FunctionCallError> {
+        let Some(group) = self.registry.registered_tool(&call.tool_name) else {
+            return Ok(call);
+        };
+        if let Some((name, payload)) = group.runtime().resolve_call(&call.payload)? {
+            let target = self.registry.registered_tool(&name).ok_or_else(|| {
+                FunctionCallError::RespondToModel("native operation is unavailable in this session".into())
+            })?;
+            if target.authorization_class() != group.authorization_class() {
+                return Err(FunctionCallError::RespondToModel("native operation authority does not match its group".into()));
+            }
+            call.tool_name = name;
+            call.payload = payload;
+        }
+        Ok(call)
     }
 
     pub fn tool_supports_parallel(&self, call: &ToolCall) -> bool {
@@ -735,6 +759,8 @@ impl ToolRouter {
             session.as_ref(),
             step_context.as_ref(),
             &call,
+            self.classify_tool_name(&step_context.turn, &call.tool_name),
+            &self.registry.semantic_tool_name(&call.tool_name).name,
         )
         .await;
         record_authorization_state_coordination(authorization_state_started.elapsed());
@@ -847,6 +873,8 @@ async fn authorize_bound_typed_tool_call(
     session: &Session,
     step_context: &StepContext,
     call: &ToolCall,
+    class: TypedToolClass,
+    semantic_name: &str,
 ) -> Result<(), FunctionCallError> {
     let coordinator = session.services.agent_control.task_coordinator();
     let Some(binding) = coordinator.binding_for_turn(&step_context.turn) else {
@@ -860,6 +888,9 @@ async fn authorize_bound_typed_tool_call(
                 "{}: this turn has no bound typed assignment attempt",
                 call.tool_name.name
             )));
+        }
+        if matches!(&step_context.turn.session_source, codex_protocol::protocol::SessionSource::SubAgent(_)) {
+            crate::agent::task_capabilities::authorize_assignment_tool(None, class, semantic_name, &call.payload)?;
         }
         return Ok(());
     };
@@ -881,8 +912,10 @@ async fn authorize_bound_typed_tool_call(
         )));
     }
 
-    // A task binding governs lifecycle, not tool authority. Active subagents
-    // use the same tool permissions as root and remain subject to their assignment.
+    crate::agent::task_capabilities::authorize_assignment_tool(
+        Some(&authorization), class, semantic_name, &call.payload,
+    )?;
+    // Inherited tool permissions are intersected with the immutable assignment.
     // An authorized tool call is meaningful progress, not just liveness.
     let heartbeated = coordinator
         .heartbeat_typed_actor_binding(&binding, /*progress*/ true)

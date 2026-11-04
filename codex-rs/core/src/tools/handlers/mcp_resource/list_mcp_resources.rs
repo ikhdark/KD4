@@ -7,7 +7,10 @@ use crate::tools::registry::ToolExecutor;
 use codex_protocol::protocol::McpInvocation;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
+use serde::Deserialize;
+use serde_json::Value;
 
+use super::ListMcpResourceTemplatesHandler;
 use super::ListResourcesArgs;
 use super::ListResourcesPayload;
 use super::canonical_all_list_resources;
@@ -23,6 +26,14 @@ use super::serialize_function_output;
 use super::take_server_result;
 
 pub struct ListMcpResourcesHandler;
+
+#[derive(Default, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ResourceListKind {
+    #[default]
+    Resources,
+    Templates,
+}
 
 impl ToolExecutor<ToolInvocation> for ListMcpResourcesHandler {
     fn tool_name(&self) -> ToolName {
@@ -47,31 +58,49 @@ impl ListMcpResourcesHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
-        let ToolInvocation {
-            session,
-            step_context,
-            cancellation_token,
-            call_id,
-            payload,
-            ..
-        } = invocation;
-        let turn = std::sync::Arc::clone(&step_context.turn);
-        let manager = step_context.mcp.manager();
-
-        let arguments = match payload {
-            ToolPayload::Function { arguments } => arguments,
+        let arguments = match &invocation.payload {
+            ToolPayload::Function { arguments } => parse_arguments(arguments)?,
             _ => {
                 return Err(FunctionCallError::RespondToModel(
                     "list_mcp_resources handler received unsupported payload".to_string(),
                 ));
             }
         };
-
-        let arguments = parse_arguments(arguments.as_str())?;
-        let args: ListResourcesArgs = parse_args_with_default(arguments.clone())?;
+        // Keep the original arguments for lifecycle evidence; only the selector
+        // decoder omits the canonical front door's operation discriminator.
+        let mut selectors = arguments.clone();
+        let kind: ResourceListKind = selectors
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .and_then(|object| object.remove("kind"))
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|err| {
+                FunctionCallError::RespondToModel(format!(
+                    "failed to parse function arguments: {err}"
+                ))
+            })?
+            .unwrap_or_default();
+        let args: ListResourcesArgs = parse_args_with_default(selectors)?;
         let args = args.normalize()?;
+        ensure_cursor_has_server(args.server.as_deref(), args.cursor.as_deref())?;
+        if kind == ResourceListKind::Templates {
+            return ListMcpResourceTemplatesHandler
+                .handle_parsed_call(invocation, args, arguments)
+                .await;
+        }
+
+        let ToolInvocation {
+            session,
+            step_context,
+            cancellation_token,
+            call_id,
+            ..
+        } = invocation;
+        let turn = std::sync::Arc::clone(&step_context.turn);
+        let manager = step_context.mcp.manager();
+
         let ListResourcesArgs { server, cursor } = args;
-        ensure_cursor_has_server(server.as_deref(), cursor.as_deref())?;
 
         let invocation = McpInvocation {
             server: server.clone().unwrap_or_else(|| "codex".to_string()),

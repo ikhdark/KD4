@@ -163,38 +163,45 @@ impl PlanHandler {
             ..
         } = invocation;
         let turn = Arc::clone(&step_context.turn);
+        // These refusals settle before durable publication; no plan mutation
+        // can escape them. Preserve uncertainty for persistence/task failures.
+        let no_effects = |message: String| FunctionCallError::structured(
+            codex_protocol::tool_failure::ToolFailure::no_effects(
+                codex_protocol::tool_failure::ToolFailureCode::Failed, message,
+            ).with_completed_execution(),
+        );
 
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
             _ => {
-                return Err(FunctionCallError::RespondToModel(
+                return Err(no_effects(
                     "update_plan handler received unsupported payload".to_string(),
                 ));
             }
         };
 
         if turn.collaboration_mode.mode == ModeKind::Plan {
-            return Err(FunctionCallError::RespondToModel(
+            return Err(no_effects(
                 "update_plan is a TODO/checklist tool and is not allowed in Plan mode".to_string(),
             ));
         }
 
         let mut arguments: JsonValue = serde_json::from_str(&arguments).map_err(|error| {
-            FunctionCallError::RespondToModel(format!("failed to parse function arguments: {error}"))
+            no_effects(format!("failed to parse function arguments: {error}"))
         })?;
         let measurements = arguments.as_object_mut().and_then(|arguments| arguments.remove("measurements"))
             .map(|packet| turn.turn_timing_state.validate_measurement_annotations(&packet))
-            .transpose().map_err(FunctionCallError::RespondToModel)?;
+            .transpose().map_err(no_effects)?;
         let mut requested_args =
             serde_json::from_value::<PlanToolArgs>(arguments).map_err(|error| {
-                FunctionCallError::RespondToModel(format!(
+                no_effects(format!(
                     "failed to parse function arguments: {error}"
                 ))
             })?;
         requested_args.sampling_revision = step_context.plan_sampling_revision.clone();
         if usize::from(requested_args.plan.is_some()) + usize::from(requested_args.set.is_some())
             + usize::from(!requested_args.pin.is_empty()) != 1 {
-            return Err(FunctionCallError::RespondToModel(
+            return Err(no_effects(
                 "provide exactly one of plan, set or a nonempty pin".to_string(),
             ));
         }
@@ -213,14 +220,14 @@ impl PlanHandler {
             .collect::<Vec<_>>();
         if active.len() > 1 {
             // Name the conflicting steps; the bare rule left callers guessing.
-            return Err(FunctionCallError::RespondToModel(format!(
+            return Err(no_effects(format!(
                 "update_plan permits at most one in_progress step at a time; no changes were made. This plan marks {} steps in_progress: {}. Keep exactly one in_progress and mark each other step completed if it is finished or pending if it is not",
                 active.len(),
                 active.join("; ")
             )));
         }
         if cancellation_token.is_cancelled() {
-            return Err(FunctionCallError::RespondToModel(
+            return Err(no_effects(
                 "update_plan was cancelled before the plan update began".to_string(),
             ));
         }
@@ -234,7 +241,7 @@ impl PlanHandler {
             // finish; the state mutex alone does not order events.
             let _publication = tokio::select! {
                 guard = session.services.plan_store.publication_guard() => guard,
-                _ = cancellation_token.cancelled() => return Err(FunctionCallError::RespondToModel(
+                _ = cancellation_token.cancelled() => return Err(no_effects(
                     "update_plan was cancelled before publication admission; no changes were made".into(),
                 )),
             };
@@ -248,8 +255,8 @@ impl PlanHandler {
             ) {
                 let (guard, inputs) = tokio::select! {
                     result = session.plan_scope_inputs() => result.map_err(|error|
-                        FunctionCallError::RespondToModel(format!("scope authorization unavailable: {error}; no changes were made")))?,
-                    _ = cancellation_token.cancelled() => return Err(FunctionCallError::RespondToModel(
+                        no_effects(format!("scope authorization unavailable: {error}; no changes were made")))?,
+                    _ = cancellation_token.cancelled() => return Err(no_effects(
                         "update_plan was cancelled before scope authorization; no changes were made".into(),
                     )),
                 };
@@ -263,9 +270,9 @@ impl PlanHandler {
                 .plan_store
                 .stage_tool(requested_args)
                 .await
-                .map_err(FunctionCallError::RespondToModel)?;
+                .map_err(no_effects)?;
             if cancellation_token.is_cancelled() {
-                return Err(FunctionCallError::RespondToModel(
+                return Err(no_effects(
                     "update_plan was cancelled before durable publication; no changes were made".into(),
                 ));
             }

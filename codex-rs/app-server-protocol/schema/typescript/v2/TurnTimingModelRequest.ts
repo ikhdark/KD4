@@ -25,36 +25,36 @@ logicalContextSha256?: string,
  * Versioned content-free JSON delivery summaries by retained physical
  * attempt. Chunks are decoded deltas, not individual provider tokens.
  */
-streamDeliveryByAttempt?: { [key in string]?: string },
+streamDeliveryByAttempt?: { [key in string]: string },
 /**
  * Host queue observations by physical attempt, then api_to_mapper or
  * mapper_to_turn stage. Missing stages are unknown, not zero. Queue sums
  * overlap provider work and each other; never subtract them from model wait
  * to invent provider computation time.
  */
-responseQueueTimingByAttempt?: { [key in string]?: { [key in string]?: ResponseQueueTiming } },
+responseQueueTimingByAttempt?: { [key in string]: { [key in string]: ResponseQueueTiming } },
 /**
  * Named setup-phase union durations in nanoseconds, frozen at dispatch.
  * Measured from request preparation (or attempt start for retries), not
  * cumulative across the turn. Phases can overlap and must not be summed.
  * Empty for older records or attempts that never dispatched.
  */
-setupPhaseNs?: { [key in string]?: bigint },
+setupPhaseNs?: { [key in string]: number },
 /**
  * SHA-256 of the exact serialized transport body for each dispatched
  * physical attempt. Includes retry bodies and websocket deltas.
  */
-requestSha256ByAttempt?: { [key in string]?: string },
+requestSha256ByAttempt?: { [key in string]: string },
 /**
  * Hashes of serialized top-level transport fields, captured at dispatch
  * even when optional prompt/token diagnostics have not finished.
  */
-requestSectionSha256ByAttempt?: { [key in string]?: { [key in string]?: string } },
+requestSectionSha256ByAttempt?: { [key in string]: { [key in string]: string } },
 /**
  * Provider response IDs retained so offline replay preserves websocket
  * continuation requests rather than inventing new response identities.
  */
-responseIdByAttempt?: { [key in string]?: string },
+responseIdByAttempt?: { [key in string]: string },
 /**
  * Zero-based logical generation owning this physical provider attempt.
  */
@@ -87,7 +87,7 @@ nextStructuredActionChanged: boolean, unchangedRelevantState: boolean, attemptKi
 /**
  * Directly observed model-stream wait for this physical attempt.
  */
-modelStreamWaitNs: bigint,
+modelStreamWaitNs: number,
 /**
  * Dispatch-to-first-actionable-output latency. This excludes reasoning
  * deltas and partial tool arguments; missing actionable output stays null.
@@ -115,7 +115,7 @@ executorMaxConcurrentToolCalls: number,
  * Unioned tool-active duration attributed to this generation. Parallel
  * tool calls are counted once per wall-clock interval.
  */
-toolActiveUnionNs: bigint, outputTokens: bigint, reasoningOutputTokens: bigint,
+toolActiveUnionNs: number, outputTokens: number, reasoningOutputTokens: number,
 /**
  * Provider-reported usage for this physical attempt. Missing usage stays
  * null, including failed attempts for which the provider reported none.

@@ -1872,11 +1872,11 @@ impl Session {
                 plugin_skill_warmup,
             );
             for err in &plugin_skill_errors {
-                error!(
-                    "failed to load skill {}: {}",
-                    err.path.display(),
-                    err.message
-                );
+                if err.is_warning {
+                    warn!("skill metadata warning {}: {}", err.path.display(), err.message);
+                } else {
+                    error!("failed to load skill {}: {}", err.path.display(), err.message);
+                }
             }
             session_configuration.thread_name = thread_name.clone();
             config_validation?;
@@ -1926,6 +1926,7 @@ impl Session {
                 &config,
                 plugins_manager.as_ref(),
                 resolved_environments.single_local_environment(),
+                &session_configuration.session_source,
             )
             .await;
             for warning in hooks.startup_warnings() {
@@ -1982,6 +1983,12 @@ impl Session {
                 .await
                 .with_workspace_cache(Arc::clone(&git_workspace));
             let shared_model_http_clients = agent_control.model_http_clients();
+            let hooks = hooks.with_mcp_executor(Arc::new(
+                crate::hook_mcp_executor::CoreHookMcpExecutor {
+                    runtime: Arc::clone(&mcp_runtime),
+                    thread_id,
+                },
+            ));
             let services = SessionServices {
                 // Initialize the MCP connection manager with an uninitialized
                 // instance. It will be replaced with one created via

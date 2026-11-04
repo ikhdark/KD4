@@ -14,8 +14,6 @@ use std::path::PathBuf;
 
 pub use detect::detect_recent_sessions;
 use export::load_session_for_import_with_content_sha256;
-pub use ledger::CompletedExternalAgentSessionImport;
-pub use ledger::record_completed_session_imports;
 use records::summarize_session;
 
 const SESSION_TITLE_MAX_LEN: usize = 120;
@@ -34,22 +32,35 @@ pub struct ImportedExternalAgentSession {
 pub struct PendingSessionImport {
     pub source_path: PathBuf,
     pub source_content_sha256: String,
+    pub imported_thread_id: codex_protocol::ThreadId,
+    pub recovery_required: bool,
     pub session: ImportedExternalAgentSession,
 }
 
-pub fn prepare_validated_session_import(
-    codex_home: &Path,
+fn prepare_validated_session_import(
+    ledger: &mut ledger::SessionImportLedgerGuard,
     session: ExternalAgentSessionMigration,
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> io::Result<Option<PendingSessionImport>> {
-    let Some(pending) = load_importable_session(&session.path, cancellation)? else {
+    if ledger.contains_source(&session.path) {
+        let content_sha256 = ledger::session_content_sha256_with_cancellation(&session.path, Some(cancellation))?;
+        if ledger.contains_fingerprint(&session.path, &content_sha256) {
+            return Ok(None);
+        }
+    }
+    let Some(mut pending) = load_importable_session(&session.path, cancellation)? else {
         return Ok(None);
     };
-    let ledger = ledger::load_import_ledger_with_cancellation(codex_home, cancellation)?;
-    Ok(
-        (!ledger.contains_fingerprint(&pending.source_path, &pending.source_content_sha256))
-            .then_some(pending),
-    )
+    if ledger.contains_fingerprint(&pending.source_path, &pending.source_content_sha256) {
+        return Ok(None);
+    }
+    let (thread_id, recovery_required) = ledger.reserve(
+        &pending.source_path,
+        &pending.source_content_sha256,
+    )?;
+    pending.imported_thread_id = thread_id;
+    pending.recovery_required = recovery_required;
+    Ok(Some(pending))
 }
 
 fn load_importable_session(path: &Path, cancellation: &tokio_util::sync::CancellationToken) -> io::Result<Option<PendingSessionImport>> {
@@ -65,6 +76,8 @@ fn load_importable_session(path: &Path, cancellation: &tokio_util::sync::Cancell
         .then_some(PendingSessionImport {
             source_path,
             source_content_sha256,
+            imported_thread_id: codex_protocol::ThreadId::new(),
+            recovery_required: false,
             session: imported_session,
         }))
 }
@@ -119,10 +132,6 @@ use codex_rollout::{StateDbHandle, is_persisted_rollout_item};
 use codex_thread_store::{AppendThreadItemsParams, CreateThreadParams, DeleteThreadParams, ThreadMetadataPatch, ThreadPersistenceMetadata, ThreadStore, ThreadStoreError, UpdateThreadMetadataParams};
 
 impl ExternalAgentConfigRequestProcessor {
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "Session imports are single-flight so concurrent imports cannot persist the same source twice"
-    )]
     pub(super) async fn import_session_item(&self, item: ExternalAgentConfigMigrationItem) -> ExternalAgentConfigImportTypeResult {
         let mut result = ExternalAgentConfigImportTypeResult { item_type: item.item_type, successes: Vec::new(), failures: Vec::new() };
         let cancellation = self.shutdown.child_token();
@@ -137,6 +146,21 @@ impl ExternalAgentConfigRequestProcessor {
             result.failures.push(failure(&item, "session_prepare", "sessions migration item is missing details".to_string(), None));
             return result;
         };
+        let home = self.codex_home.clone();
+        let token = cancellation.clone();
+        // This task is already owned by complete_import's TaskTracker. Keep the OS
+        // lock through creation, durability and ledger commit, even after disconnect.
+        let mut ledger = match tokio::task::spawn_blocking(move || ledger::lock_import_ledger(&home, Some(&token))).await {
+            Ok(Ok(ledger)) => ledger,
+            Ok(Err(err)) => {
+                result.failures.push(failure(&item, "session_ledger", err.to_string(), None));
+                return result;
+            },
+            Err(err) => {
+                result.failures.push(failure(&item, "session_ledger", format!("session ledger task failed: {err}"), None));
+                return result;
+            },
+        };
         let external_home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")).join(".claude");
         let mut selected = std::collections::HashSet::new();
         for session in &details.sessions {
@@ -144,55 +168,154 @@ impl ExternalAgentConfigRequestProcessor {
                 result.failures.push(failure(&item, "session_prepare", "session import cancelled".to_string(), Some(session.path.display().to_string())));
                 continue;
             }
-            let home = self.codex_home.clone();
             let session = session.clone();
             let external_home = external_home.clone();
             let source = session.path.display().to_string();
             let token = cancellation.clone();
             let prepared = tokio::task::spawn_blocking(move || {
-                let mut session = session;
-                let path = std::fs::canonicalize(&session.path)?;
-                let root = std::fs::canonicalize(external_home.join("projects"))?;
-                if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") || !path.starts_with(root) {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "external agent session was not detected beneath .claude/projects"));
-                }
-                session.path = path;
-                prepare_validated_session_import(&home, session, &token)
+                let prepared = (|| {
+                    let mut session = session;
+                    let path = std::fs::canonicalize(&session.path)?;
+                    let root = std::fs::canonicalize(external_home.join("projects"))?;
+                    if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") || !path.starts_with(root) {
+                        return Err(io::Error::new(io::ErrorKind::InvalidInput, "external agent session was not detected beneath .claude/projects"));
+                    }
+                    // Request aliases must be rejected before parsing/conversion.
+                    if !selected.insert(path.clone()) {
+                        return Ok(None);
+                    }
+                    session.path = path;
+                    prepare_validated_session_import(&mut ledger, session, &token)
+                })();
+                (ledger, selected, prepared)
             }).await;
-            let pending = match prepared {
-                Ok(Ok(Some(pending))) => pending,
-                Ok(Ok(None)) => continue,
-                Ok(Err(err)) => { result.failures.push(failure(&item, "session_prepare", err.to_string(), Some(source))); continue; },
-                Err(err) => { result.failures.push(failure(&item, "session_prepare", format!("session preparation task failed: {err}"), Some(source))); continue; },
-            };
-            if !selected.insert((pending.source_path.clone(), pending.source_content_sha256.clone())) { continue; }
-            let persisted = match self.persist_session(pending.session).await {
-                Ok(persisted) => persisted,
-                Err(message) => { result.failures.push(failure(&item, "session_persist", message, Some(source))); continue; },
-            };
-            let completed = CompletedExternalAgentSessionImport {
-                source_path: pending.source_path, source_content_sha256: pending.source_content_sha256, imported_thread_id: persisted.thread_id,
-            };
-            let home = self.codex_home.clone();
-            let token = cancellation.clone();
-            let recorded = tokio::task::spawn_blocking(move || record_completed_session_imports(&home, vec![completed], &token)).await;
-            match recorded {
-                Ok(Ok(())) => {
-                    result.successes.push(ExternalAgentConfigImportItemTypeSuccess { item_type: item.item_type, cwd: item.cwd.clone(), source: Some(source.clone()), target: Some(persisted.thread_id.to_string()) });
-                    if let Some(warning) = persisted.shutdown_warning { result.failures.push(failure(&item, "session_shutdown", warning, Some(source))); }
+            let prepared = match prepared {
+                Ok((returned_ledger, returned_selected, prepared)) => {
+                    ledger = returned_ledger;
+                    selected = returned_selected;
+                    prepared
                 },
-                other => {
-                    let message = match other { Ok(Err(err)) => err.to_string(), Err(err) => err.to_string(), _ => unreachable!() };
-                    let message = self.rollback_failure(persisted.thread_id, format!("failed to record imported session: {message}")).await;
-                    result.failures.push(failure(&item, "session_ledger_update", message, Some(source)));
+                Err(err) => {
+                    result.failures.push(failure(&item, "session_prepare", format!("session preparation task failed: {err}"), Some(source)));
+                    return result;
+                },
+            };
+            let pending = match prepared {
+                Ok(Some(pending)) => pending,
+                Ok(None) => continue,
+                Err(err) => {
+                    result.failures.push(failure(&item, "session_prepare", err.to_string(), Some(source)));
+                    continue;
+                },
+            };
+            let persisted = if pending.recovery_required {
+                self.persist_or_recover_session(pending.imported_thread_id, pending.session).await
+            } else {
+                self.persist_session(pending.imported_thread_id, pending.session).await
+            };
+            let persisted = match persisted {
+                Ok(persisted) => persisted,
+                Err(message) => {
+                    result.failures.push(failure(&item, "session_persist", message, Some(source)));
+                    continue;
+                },
+            };
+            let recorded = tokio::task::spawn_blocking(move || {
+                // Once the thread is durable, shutdown cancellation must not
+                // turn successful persistence into a rollback or a new identity.
+                let recorded = ledger.complete(
+                    pending.source_path,
+                    pending.source_content_sha256,
+                    persisted.thread_id,
+                );
+                (ledger, recorded, persisted)
+            }).await;
+            match recorded {
+                Ok((returned_ledger, recorded, persisted)) => {
+                    ledger = returned_ledger;
+                    match recorded {
+                        Ok(()) => {
+                            result.successes.push(ExternalAgentConfigImportItemTypeSuccess { item_type: item.item_type, cwd: item.cwd.clone(), source: Some(source.clone()), target: Some(persisted.thread_id.to_string()) });
+                            if let Some(warning) = persisted.shutdown_warning {
+                                result.failures.push(failure(&item, "session_shutdown", warning, Some(source)));
+                            }
+                        },
+                        Err(err) => {
+                            // The durable reservation still owns this exact thread.
+                            // A retry reconciles it; never delete a published thread.
+                            result.failures.push(failure(&item, "session_ledger_update", format!("failed to record imported session {}: {err}; retry will reconcile the reserved thread", persisted.thread_id), Some(source)));
+                        },
+                    }
+                },
+                Err(err) => {
+                    result.failures.push(failure(&item, "session_ledger_update", format!("session ledger task failed: {err}; the durable reservation is retained"), Some(source)));
+                    return result;
                 },
             }
         }
         result
     }
 
+    async fn persist_or_recover_session(
+        &self,
+        thread_id: ThreadId,
+        session: ImportedExternalAgentSession,
+    ) -> Result<PersistedSession, String> {
+        match self.thread_store.read_thread(codex_thread_store::ReadThreadParams {
+            thread_id,
+            include_archived: true,
+            include_history: true,
+        }).await {
+            Err(ThreadStoreError::ThreadNotFound { .. }) => self.persist_session(thread_id, session).await,
+            Err(err) => Err(format!("failed to inspect reserved import thread {thread_id}: {err}; no replacement was created")),
+            Ok(thread) => {
+                let history = thread.history.ok_or_else(|| format!("reserved import thread {thread_id} has no readable history; it was preserved"))?;
+                let expected = session.rollout_items.iter().filter(|item| is_persisted_rollout_item(item, ThreadHistoryMode::Legacy)).collect::<Vec<_>>();
+                // The recorder emits SessionMeta before the staged import batch.
+                // Later user appends and metadata edits are deliberately permitted.
+                let actual = match history.items.as_slice() {
+                    [RolloutItem::SessionMeta(_), items @ ..] => items,
+                    items => items,
+                };
+                let conflict = || format!("reserved import thread {thread_id} is incomplete or its imported history changed; it was preserved and no duplicate was created");
+                if expected.is_empty() || actual.len() < expected.len() {
+                    return Err(conflict());
+                }
+                for (actual, expected) in actual.iter().zip(expected) {
+                    // RolloutItem intentionally has no PartialEq contract.
+                    let actual = serde_json::to_value(actual).map_err(|err| format!("failed to inspect reserved import thread {thread_id}: {err}"))?;
+                    let expected = serde_json::to_value(expected).map_err(|err| format!("failed to inspect imported history: {err}"))?;
+                    if actual != expected {
+                        return Err(conflict());
+                    }
+                }
+                // A crash can precede the original durability barrier. Reopen via
+                // the existing exclusive writer lease, sync, then release only the
+                // writer acquired here. Never delete or replace recovered data.
+                self.thread_store.resume_thread(codex_thread_store::ResumeThreadParams {
+                    thread_id,
+                    rollout_path: thread.rollout_path,
+                    history: Some(std::sync::Arc::new(history.items)),
+                    include_archived: true,
+                    metadata: ThreadPersistenceMetadata {
+                        cwd: Some(thread.cwd),
+                        model_provider: thread.model_provider,
+                    },
+                }).await.map_err(|err| format!("failed to acquire reserved import thread {thread_id} for durability: {err}; it was preserved"))?;
+                let durable = self.thread_store.flush_thread_durable(thread_id).await;
+                let released = self.thread_store.discard_thread(thread_id).await;
+                if let Err(err) = durable {
+                    return Err(format!("failed to sync reserved import thread {thread_id}: {err}; writer release: {released:?}; it was preserved"));
+                }
+                released.map_err(|err| format!("failed to release reserved import thread {thread_id}: {err}; it was preserved"))?;
+                Ok(PersistedSession { thread_id, shutdown_warning: None })
+            },
+        }
+    }
+
     async fn persist_session(
         &self,
+        thread_id: ThreadId,
         session: ImportedExternalAgentSession,
     ) -> Result<PersistedSession, String> {
         let ImportedExternalAgentSession {
@@ -225,7 +348,6 @@ impl ExternalAgentConfigRequestProcessor {
         let model_info = models_manager
             .get_model_info(model.as_str(), &config.to_models_manager_config())
             .await;
-        let thread_id = ThreadId::new();
         let source = self.thread_manager.session_source();
         let cwd = config.cwd.to_path_buf();
         let model_provider = config.model_provider_id.clone();
@@ -315,6 +437,12 @@ impl ExternalAgentConfigRequestProcessor {
                     format!("failed to persist imported session: {err}"),
                 )
                 .await);
+        }
+        if let Err(err) = self.thread_store.flush_thread_durable(thread_id).await {
+            let released = self.thread_store.discard_thread(thread_id).await;
+            return Err(format!(
+                "failed to durably persist imported session {thread_id}: {err}; writer release: {released:?}; the reserved thread was preserved for retry"
+            ));
         }
         let shutdown_warning = match self.thread_store.shutdown_thread(thread_id).await {
             Ok(()) => None,

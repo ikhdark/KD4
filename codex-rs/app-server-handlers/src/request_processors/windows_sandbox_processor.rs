@@ -33,6 +33,27 @@ pub(crate) struct WindowsSandboxRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     config: Arc<Config>,
     config_manager: ConfigManager,
+    setups: Arc<std::sync::Mutex<std::collections::HashSet<crate::outgoing_message::ConnectionId>>>,
+}
+
+struct SetupReservation {
+    setups: Arc<std::sync::Mutex<std::collections::HashSet<crate::outgoing_message::ConnectionId>>>,
+    connection_id: crate::outgoing_message::ConnectionId,
+}
+
+impl Drop for SetupReservation {
+    fn drop(&mut self) {
+        self.setups.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.connection_id);
+    }
+}
+
+fn sandbox_environment() -> Result<std::collections::HashMap<String, String>, JSONRPCErrorError> {
+    std::env::vars_os().map(|(key, value)| {
+        let key = key.into_string().map_err(|_| invalid_request("Windows sandbox environment contains a non-Unicode name"))?;
+        let value = value.into_string().map_err(|_| invalid_request("Windows sandbox environment contains a non-Unicode value"))?;
+        Ok((key, value))
+    }).collect()
 }
 
 impl WindowsSandboxRequestProcessor {
@@ -45,6 +66,7 @@ impl WindowsSandboxRequestProcessor {
             outgoing,
             config,
             config_manager,
+            setups: Arc::default(),
         }
     }
 
@@ -84,13 +106,14 @@ impl WindowsSandboxRequestProcessor {
         let codex_home = config.codex_home.to_path_buf();
         let read_root = PathBuf::from(params.path);
         let grant_required = windows_sandbox_read_root_grant_required(&permission_profile)?;
+        let env_map = if grant_required { sandbox_environment()? } else { Default::default() };
         let canonical_path = tokio::task::spawn_blocking(move || {
             if grant_required {
                 codex_core::grant_read_root_non_elevated(
                     &permission_profile,
                     &workspace_roots,
                     &command_cwd,
-                    &std::env::vars().collect(),
+                    &env_map,
                     &codex_home,
                     &read_root,
                 )
@@ -130,6 +153,15 @@ impl WindowsSandboxRequestProcessor {
         // Validate requirements before acknowledging setup so callers do not get a
         // `started` response for a Windows sandbox mode that cannot be persisted.
         validate_windows_sandbox_setup_profile(&params)?;
+        let _reservation = {
+            let mut setups = self.setups.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !setups.insert(request_id.connection_id) {
+                return Err(invalid_request("Windows sandbox setup is already in progress for this connection"));
+            }
+            SetupReservation { setups: Arc::clone(&self.setups), connection_id: request_id.connection_id }
+        };
+        let env_map = sandbox_environment()?;
+        let explicit_profile = params.permission_profile_id.is_some();
         let command_cwd = params
             .cwd
             .map(PathBuf::from)
@@ -153,6 +185,16 @@ impl WindowsSandboxRequestProcessor {
             params.mode,
         )?;
 
+        if explicit_profile && let Some(warning) = config.startup_warnings.iter().find(|warning| {
+            warning.contains("Configured value for `permission_profile` is disallowed")
+        }) {
+            return Err(invalid_request(format!("invalid Windows sandbox setup profile: {warning}")));
+        }
+        if let Some(profile) = inline_permission_profile.as_ref() {
+            config.permissions.can_set_permission_profile(profile)
+                .map_err(|err| invalid_request(format!("invalid Windows sandbox setup profile: {err}")))?;
+        }
+
         self.outgoing
             .send_response(
                 request_id.clone(),
@@ -167,16 +209,18 @@ impl WindowsSandboxRequestProcessor {
             .unwrap_or_else(|| config.permissions.effective_permission_profile());
 
         tokio::spawn(async move {
+            let _reservation = _reservation;
             let setup_request = WindowsSandboxSetupRequest {
                 mode: setup_mode,
                 permission_profile,
                 workspace_roots: config.effective_workspace_roots(),
                 command_cwd,
-                env_map: std::env::vars().collect(),
+                env_map,
                 codex_home: config.codex_home.to_path_buf(),
             };
-            let setup_result =
-                codex_core::windows_sandbox::run_windows_sandbox_setup(setup_request).await;
+            let setup_result = tokio::spawn(async move {
+                codex_core::windows_sandbox::run_windows_sandbox_setup(setup_request).await
+            }).await.unwrap_or_else(|err| Err(anyhow::anyhow!("Windows sandbox setup task failed: {err}")));
             if setup_result.is_ok() {
                 // Setup persists outside ConfigManager. Publish the new mode
                 // before a client reacts to the successful completion event.
@@ -216,10 +260,8 @@ fn validate_and_canonicalize_read_root(read_root: &Path) -> anyhow::Result<PathB
     if !read_root.is_absolute() {
         anyhow::bail!("path must be absolute: {}", read_root.display());
     }
-    if !read_root.exists() {
-        anyhow::bail!("path does not exist: {}", read_root.display());
-    }
-    if !read_root.is_dir() {
+    let metadata = std::fs::metadata(read_root)?;
+    if !metadata.is_dir() {
         anyhow::bail!("path must be a directory: {}", read_root.display());
     }
     Ok(std::fs::canonicalize(read_root)?)

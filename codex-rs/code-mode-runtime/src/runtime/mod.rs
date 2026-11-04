@@ -512,6 +512,8 @@ pub(crate) struct EnabledToolCatalog {
     namespace_aliases: BTreeMap<(String, String), usize>,
     by_global_name: HashMap<String, usize>,
     by_requested_name: HashMap<String, Option<usize>>,
+    operation_routes: HashMap<usize, BTreeMap<String, usize>>,
+    compatibility_tools: HashSet<usize>,
     input_bytes: usize,
 }
 
@@ -534,7 +536,7 @@ impl EnabledToolCatalog {
     pub(crate) fn from_definitions(
         definitions: &[codex_code_mode_protocol::ToolDefinition],
     ) -> Result<Self, String> {
-        Self::new(
+        let mut catalog = Self::new(
             definitions
                 .iter()
                 .map(|definition| EnabledToolMetadata {
@@ -548,7 +550,87 @@ impl EnabledToolCatalog {
                         .map(|timeout| timeout.min(codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS)),
                 })
                 .collect(),
-        )
+        )?;
+        catalog.configure_native_routes(definitions)?;
+        Ok(catalog)
+    }
+
+    fn configure_native_routes(
+        &mut self,
+        definitions: &[codex_code_mode_protocol::ToolDefinition],
+    ) -> Result<(), String> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Policy {
+            #[serde(default)]
+            compatibility: bool,
+            #[serde(default)]
+            operations: BTreeMap<String, ToolName>,
+        }
+        for (index, definition) in definitions.iter().enumerate() {
+            let Some(annotation) = definition.input_schema.as_ref()
+                .and_then(|schema| schema.get("x-codex-native-routing-v1")) else { continue; };
+            let policy: Policy = serde_json::from_value(annotation.clone())
+                .map_err(|error| format!("invalid native catalog policy: {error}"))?;
+            self.input_bytes = self.input_bytes
+                .saturating_add(annotation.to_string().len())
+                .saturating_add(std::mem::size_of::<Policy>());
+            if policy.compatibility {
+                self.compatibility_tools.insert(index);
+            }
+            if policy.operations.is_empty() { continue; }
+            if definition.kind != CodeModeToolKind::Function {
+                return Err("native operation groups must be function tools".into());
+            }
+            let mut routes = BTreeMap::new();
+            for (operation, name) in policy.operations {
+                let target = self.tools.iter().position(|tool| tool.tool_name == name)
+                    .ok_or_else(|| format!("native operation target {name} is unavailable"))?;
+                if target == index || name.namespace != definition.tool_name.namespace
+                    || self.tools[target].kind != CodeModeToolKind::Function
+                {
+                    return Err("native operation target has an incompatible identity or kind".into());
+                }
+                self.input_bytes = self.input_bytes.saturating_add(operation.len())
+                    .saturating_add(std::mem::size_of::<(String, usize)>());
+                routes.insert(operation, target);
+            }
+            self.operation_routes.insert(index, routes);
+        }
+        if self.operation_routes.values().any(|routes| {
+            routes.values().any(|target| self.operation_routes.contains_key(target))
+        }) {
+            return Err("nested native operation groups are not supported".into());
+        }
+        Ok(())
+    }
+
+    fn is_advertised(&self, index: usize) -> bool {
+        !self.compatibility_tools.contains(&index)
+    }
+
+    fn resolve_operation(
+        &self,
+        index: usize,
+        input: Option<JsonValue>,
+    ) -> Result<(usize, Option<JsonValue>), String> {
+        let Some(routes) = self.operation_routes.get(&index) else { return Ok((index, input)); };
+        let Some(JsonValue::Object(mut fields)) = input else {
+            return Err("native groups require { operation, arguments }".into());
+        };
+        let Some(JsonValue::String(operation)) = fields.remove("operation") else {
+            return Err("native group operation must be a string".into());
+        };
+        let Some(arguments @ JsonValue::Object(_)) = fields.remove("arguments") else {
+            return Err("native group arguments must be an object".into());
+        };
+        if !fields.is_empty() {
+            return Err("native groups accept only operation and arguments".into());
+        }
+        let target = routes.get(&operation).copied().ok_or_else(|| {
+            format!("native operation {operation:?} is unavailable")
+        })?;
+        Ok((target, Some(arguments)))
     }
 
     pub(crate) fn input_bytes(&self) -> usize {
@@ -689,6 +771,8 @@ impl EnabledToolCatalog {
             namespace_aliases,
             by_global_name,
             by_requested_name,
+            operation_routes: HashMap::new(),
+            compatibility_tools: HashSet::new(),
             input_bytes,
         })
     }

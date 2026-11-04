@@ -182,7 +182,9 @@ fn serialize_console_text_inner(
         if tc.is_execution_terminating() {
             return Err(EXECUTION_TERMINATED_MESSAGE.to_string());
         }
-        return bounded_string(&mut tc, stack, max_bytes);
+        return bounded_string(&mut tc, stack, max_bytes).map(|text| {
+            codex_code_mode_protocol::model_visible_error_text(&text).unwrap_or(text)
+        });
     }
     if tc.is_execution_terminating() {
         return Err(EXECUTION_TERMINATED_MESSAGE.to_string());
@@ -499,6 +501,9 @@ pub(super) fn value_to_error_text(
     let mut text = string
         .map(|string| diagnostic_string(&mut tc, string))
         .unwrap_or_else(|| "[unprintable exception]".to_string());
+    if let Some(projected) = codex_code_mode_protocol::model_visible_error_text(&text) {
+        text = projected;
+    }
     if text.lines().next().is_some_and(|line| {
         line.starts_with("TypeError: ") && line.ends_with(".index is not a function")
     }) {

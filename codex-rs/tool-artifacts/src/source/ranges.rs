@@ -54,7 +54,13 @@ pub async fn read_ranges(
     sandbox: &FileSystemSandboxContext,
     environment_id: &str,
 ) -> Result<serde_json::Value, FunctionCallError> {
-    let error = |message: String| FunctionCallError::RespondToModel(message);
+    // This owner only observes source bytes, including on cancellation or a
+    // revision refusal. Settled failures cannot leave uncertain mutations.
+    let error = |message: String| FunctionCallError::structured(
+        codex_protocol::tool_failure::ToolFailure::no_effects(
+            codex_protocol::tool_failure::ToolFailureCode::Failed, message,
+        ).with_completed_execution(),
+    );
     let selectors = args.selectors.filter(|selectors| !selectors.is_empty())
         .ok_or_else(|| error("Files over 8 MiB require bounded bytes selectors; no whole-file snapshot is acquired.".into()))?;
     if args.if_source_hash.is_some() {

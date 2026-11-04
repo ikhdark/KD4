@@ -25,6 +25,13 @@ toolchain and Cargo configuration apply. Resolved lanes include a source-root
 hash: legacy target caches are retained but not adopted, preventing
 cross-checkout timestamp-only reuse. Use
 the emitted target directory rather than deriving it from the requested name.
+Windows lane owners preflight representative native assembler output paths before
+Cargo starts. An overlong default uses the owned private root
+`%USERPROFILE%/.kd4-lanes/<checkout-id>`; explicit roots are never redirected.
+Short explicit `--lanes-root`/`-LanesRoot` values are initialized by the same
+ownership-marker guard. The full source-root digest remains in the lane name.
+Use the emitted root explicitly for status/pruning of a relocated lane; legacy
+roots and their warm artifacts are left untouched.
 Sealed snapshots (no `.git`) built with `rust_build_status.py run-lane --repo-root
 SNAPSHOT` reuse an exact frozen bundle, or build in the nearest free warm slot
 through a content-synced source mirror, and freeze their executables with

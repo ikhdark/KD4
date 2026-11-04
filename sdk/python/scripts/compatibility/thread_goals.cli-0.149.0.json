@@ -1,0 +1,391 @@
+{
+  "schema_version": 1,
+  "runtime_version": "0.149.0",
+  "provenance": {
+    "basis": "Retained Python SDK legacy Goal models and notification metadata, not current server registrations.",
+    "models": {
+      "path": "sdk/python/src/openai_codex/generated/v2_all.py",
+      "sha256": "1c0161d921f9f22e83372a1d251ded4bb30055f829a661fed5f5dd9616e09163",
+      "lines": [
+        [
+          4059,
+          4093
+        ],
+        [
+          6078,
+          6093
+        ],
+        [
+          8151,
+          8158
+        ],
+        [
+          8428,
+          8479
+        ],
+        [
+          9738,
+          9744
+        ],
+        [
+          10278,
+          10285
+        ]
+      ]
+    },
+    "notifications": {
+      "path": "sdk/python/src/openai_codex/generated/notification_registry.py",
+      "sha256": "d6d399170b923b39572e254663939c49a667fc6ca886ea73fec548531bdf3d03",
+      "lines": [
+        174,
+        175
+      ]
+    },
+    "version_basis": "sdk/python/pyproject.toml pins openai-codex-cli-bin==0.149.0; client.py retains older-runtime Goal compatibility."
+  },
+  "definitions": {
+    "ThreadGoalStatus": {
+      "enum": [
+        "active",
+        "paused",
+        "blocked",
+        "usageLimited",
+        "budgetLimited",
+        "complete"
+      ],
+      "title": "ThreadGoalStatus",
+      "type": "string"
+    },
+    "ThreadGoal": {
+      "properties": {
+        "createdAt": {
+          "title": "Createdat",
+          "type": "integer"
+        },
+        "objective": {
+          "title": "Objective",
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/ThreadGoalStatus"
+        },
+        "threadId": {
+          "title": "Threadid",
+          "type": "string"
+        },
+        "timeUsedSeconds": {
+          "title": "Timeusedseconds",
+          "type": "integer"
+        },
+        "tokenBudget": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tokenbudget"
+        },
+        "tokensUsed": {
+          "title": "Tokensused",
+          "type": "integer"
+        },
+        "updatedAt": {
+          "title": "Updatedat",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "createdAt",
+        "objective",
+        "status",
+        "threadId",
+        "timeUsedSeconds",
+        "tokensUsed",
+        "updatedAt"
+      ],
+      "title": "ThreadGoal",
+      "type": "object"
+    },
+    "ThreadGoalClearParams": {
+      "properties": {
+        "threadId": {
+          "title": "Threadid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId"
+      ],
+      "title": "ThreadGoalClearParams",
+      "type": "object"
+    },
+    "ThreadGoalClearRequest": {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "const": "thread/goal/clear",
+          "title": "Thread/goal/clearRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadGoalClearParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "ThreadGoalClearRequest",
+      "type": "object"
+    },
+    "ThreadGoalClearResponse": {
+      "properties": {
+        "cleared": {
+          "title": "Cleared",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "cleared"
+      ],
+      "title": "ThreadGoalClearResponse",
+      "type": "object"
+    },
+    "ThreadGoalClearedNotification": {
+      "properties": {
+        "threadId": {
+          "title": "Threadid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId"
+      ],
+      "title": "ThreadGoalClearedNotification",
+      "type": "object"
+    },
+    "ThreadGoalClearedServerNotification": {
+      "properties": {
+        "method": {
+          "const": "thread/goal/cleared",
+          "title": "Thread/goal/clearedNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadGoalClearedNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "ThreadGoalClearedServerNotification",
+      "type": "object"
+    },
+    "ThreadGoalGetParams": {
+      "properties": {
+        "threadId": {
+          "title": "Threadid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId"
+      ],
+      "title": "ThreadGoalGetParams",
+      "type": "object"
+    },
+    "ThreadGoalGetRequest": {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "const": "thread/goal/get",
+          "title": "Thread/goal/getRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadGoalGetParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "ThreadGoalGetRequest",
+      "type": "object"
+    },
+    "ThreadGoalGetResponse": {
+      "properties": {
+        "goal": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadGoal"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "ThreadGoalGetResponse",
+      "type": "object"
+    },
+    "ThreadGoalSetParams": {
+      "properties": {
+        "objective": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Objective"
+        },
+        "replace": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Replace the goal atomically, resetting usage and its identity. Requires an objective.",
+          "title": "Replace"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadGoalStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "threadId": {
+          "title": "Threadid",
+          "type": "string"
+        },
+        "tokenBudget": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tokenbudget"
+        }
+      },
+      "required": [
+        "threadId"
+      ],
+      "title": "ThreadGoalSetParams",
+      "type": "object"
+    },
+    "ThreadGoalSetRequest": {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "const": "thread/goal/set",
+          "title": "Thread/goal/setRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadGoalSetParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "ThreadGoalSetRequest",
+      "type": "object"
+    },
+    "ThreadGoalSetResponse": {
+      "properties": {
+        "goal": {
+          "$ref": "#/definitions/ThreadGoal"
+        }
+      },
+      "required": [
+        "goal"
+      ],
+      "title": "ThreadGoalSetResponse",
+      "type": "object"
+    },
+    "ThreadGoalUpdatedNotification": {
+      "properties": {
+        "goal": {
+          "$ref": "#/definitions/ThreadGoal"
+        },
+        "threadId": {
+          "title": "Threadid",
+          "type": "string"
+        },
+        "turnId": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Turnid"
+        }
+      },
+      "required": [
+        "goal",
+        "threadId"
+      ],
+      "title": "ThreadGoalUpdatedNotification",
+      "type": "object"
+    },
+    "ThreadGoalUpdatedServerNotification": {
+      "properties": {
+        "method": {
+          "const": "thread/goal/updated",
+          "title": "Thread/goal/updatedNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadGoalUpdatedNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "ThreadGoalUpdatedServerNotification",
+      "type": "object"
+    }
+  },
+  "notifications": {
+    "thread/goal/cleared": "ThreadGoalClearedNotification",
+    "thread/goal/updated": "ThreadGoalUpdatedNotification"
+  }
+}

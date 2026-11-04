@@ -22,15 +22,18 @@ pub fn config_warning_from_error(
 }
 
 fn config_error_location(err: &std::io::Error) -> Option<(String, AppTextRange)> {
-    err.get_ref()
-        .and_then(|err| err.downcast_ref::<ConfigLoadError>())
-        .map(|err| {
+    let mut source = err.get_ref().map(|err| err as &(dyn std::error::Error + 'static));
+    while let Some(error) = source {
+        if let Some(err) = error.downcast_ref::<ConfigLoadError>() {
             let config_error = err.config_error();
-            (
+            return Some((
                 config_error.path.to_string_lossy().to_string(),
                 app_text_range(&config_error.range),
-            )
-        })
+            ));
+        }
+        source = error.source();
+    }
+    None
 }
 
 pub fn exec_policy_warning_location(err: &ExecPolicyError) -> (Option<String>, Option<AppTextRange>) {

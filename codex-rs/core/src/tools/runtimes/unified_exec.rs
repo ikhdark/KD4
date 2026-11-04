@@ -14,6 +14,7 @@ use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
 use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::runtimes::ShellCommandPreparation;
+use crate::tools::runtimes::build_sandbox_command;
 use crate::tools::runtimes::prepare_shell_command;
 use crate::tools::runtimes::shell_snapshot_additional_read_roots;
 use crate::tools::sandboxing::Approvable;
@@ -32,7 +33,6 @@ use crate::unified_exec::UnifiedExecProcessManager;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::request_permissions::UriAdditionalPermissionProfile;
-use codex_sandboxing::SandboxCommand;
 use codex_utils_path_uri::PathUri;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
@@ -127,24 +127,6 @@ fn unified_exec_options() -> ExecOptions {
         expiration: ExecExpiration::DefaultTimeout,
         capture_policy: ExecCapturePolicy::default(),
     }
-}
-
-fn build_unified_exec_sandbox_command(
-    command: &[String],
-    cwd: &PathUri,
-    env: &HashMap<String, String>,
-    additional_permissions: Option<AdditionalPermissionProfile>,
-) -> Result<SandboxCommand, ToolError> {
-    let (program, args) = command
-        .split_first()
-        .ok_or_else(|| ToolError::Rejected("command args are empty".to_string()))?;
-    Ok(SandboxCommand {
-        program: program.clone().into(),
-        args: args.to_vec(),
-        cwd: cwd.clone(),
-        env: env.clone(),
-        additional_permissions,
-    })
 }
 
 impl<'a> UnifiedExecRuntime<'a> {
@@ -366,9 +348,9 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
             attempt.sandbox,
         );
         let permissions = req.canonical_additional_permissions();
-        let command = build_unified_exec_sandbox_command(
+        let command = build_sandbox_command(
             &command,
-            &req.cwd,
+            req.cwd.clone(),
             &env,
             permissions
                 .clone()

@@ -1236,8 +1236,8 @@ fn list_thread_retention_directory_blocking(
     };
     let mut collect = record_budget.is_some();
     let mut artifacts_by_stem =
-        BTreeMap::<String, (u64, Option<(PathBuf, std::fs::Metadata)>)>::new();
-    let mut markers = BTreeMap::<String, (PathBuf, std::fs::Metadata)>::new();
+        std::collections::HashMap::<String, (u64, Option<(PathBuf, std::fs::Metadata)>)>::new();
+    let mut markers = std::collections::HashMap::<String, (PathBuf, std::fs::Metadata)>::new();
     let mut has_staging_entries = false;
     while let Some(entry) = entries.next().transpose()? {
         let path = entry.path();
@@ -3824,13 +3824,27 @@ fn commit_create_canonical_output_artifact(
             };
         }
     };
-    enforce_retention_locked_blocking(
-        &directory,
-        &path,
-        canonical.exact_bytes.saturating_add(metadata_budget),
-        1,
-    );
-    let usage = retention_usage_locked_blocking(&directory);
+    // A complete source is protected in this same transaction, so it adds no
+    // evictable cache bytes or entries. Do not scan every other thread (or
+    // evict its cache) to reserve quota that this source will never consume.
+    // Keep per-artifact bounds, admission, locks, rollback and marker durability.
+    let protected_source = matches!(protection, Some(ArtifactProtection::ToolHistory))
+        && canonical.complete
+        && canonical.unavailable_ranges.is_empty()
+        && staged_bytes == canonical.exact_bytes
+        && canonical.exact_bytes.saturating_add(metadata_budget)
+            <= MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD.min(MAX_RETAINED_ARTIFACT_BYTES_TOTAL);
+    let usage = if protected_source {
+        None
+    } else {
+        enforce_retention_locked_blocking(
+            &directory,
+            &path,
+            canonical.exact_bytes.saturating_add(metadata_budget),
+            1,
+        );
+        Some(retention_usage_locked_blocking(&directory))
+    };
     if !retention_shared_lock_held(&root) {
         return CanonicalOutputArtifact {
             id: Some(id),
@@ -3840,9 +3854,12 @@ fn commit_create_canonical_output_artifact(
             error: Some("lost the canonical artifact retention lock".to_string()),
         };
     }
-    let available = MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD
-        .saturating_sub(usage.thread_bytes)
-        .min(MAX_RETAINED_ARTIFACT_BYTES_TOTAL.saturating_sub(usage.global_bytes));
+    let available = usage.map_or(
+        MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD.min(MAX_RETAINED_ARTIFACT_BYTES_TOTAL),
+        |usage| MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD
+            .saturating_sub(usage.thread_bytes)
+            .min(MAX_RETAINED_ARTIFACT_BYTES_TOTAL.saturating_sub(usage.global_bytes)),
+    );
     if available < metadata_budget {
         return CanonicalOutputArtifact {
             id: Some(id),

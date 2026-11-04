@@ -114,7 +114,8 @@ fn catalog_from_outcome(outcome: &SkillLoadOutcome) -> SkillCatalog {
             .iter()
             .map(|err| {
                 format!(
-                    "Failed to load skill at {}: {}",
+                    "{} at {}: {}",
+                    if err.is_warning { "Skill metadata warning" } else { "Failed to load skill" },
                     err.path.display(),
                     err.message
                 )

@@ -139,6 +139,9 @@ pub struct McpToolCallResult {
     // representations). Using `JsonValue` keeps the payload wire-shaped and easy to export.
     pub content: Vec<JsonValue>,
     pub structured_content: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub is_error: Option<bool>,
     #[serde(rename = "_meta")]
     #[ts(rename = "_meta")]
     pub meta: Option<JsonValue>,
@@ -167,6 +170,7 @@ impl From<CoreMcpCallToolResult> for McpToolCallResult {
         Self {
             content: result.content,
             structured_content: result.structured_content,
+            is_error: result.is_error,
             meta: result.meta,
         }
     }
@@ -431,13 +435,16 @@ pub struct McpElicitationNumberSchema {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub minimum: Option<f64>,
+    #[ts(type = "number")]
+    pub minimum: Option<serde_json::Number>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub maximum: Option<f64>,
+    #[ts(type = "number")]
+    pub maximum: Option<serde_json::Number>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub default: Option<f64>,
+    #[ts(type = "number")]
+    pub default: Option<serde_json::Number>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
@@ -636,10 +643,18 @@ pub struct McpElicitationUntitledEnumItems {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(deny_unknown_fields)]
 #[ts(export_to = "v2/")]
-pub struct McpElicitationTitledEnumItems {
-    #[serde(rename = "anyOf", alias = "oneOf")]
-    #[ts(rename = "anyOf")]
-    pub any_of: Vec<McpElicitationConstOption>,
+#[serde(untagged)]
+pub enum McpElicitationTitledEnumItems {
+    AnyOf {
+        #[serde(rename = "anyOf")]
+        #[ts(rename = "anyOf")]
+        any_of: Vec<McpElicitationConstOption>,
+    },
+    OneOf {
+        #[serde(rename = "oneOf")]
+        #[ts(rename = "oneOf")]
+        one_of: Vec<McpElicitationConstOption>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]

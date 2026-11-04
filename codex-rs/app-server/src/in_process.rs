@@ -109,55 +109,69 @@ enum ServerRequestDeliveryError {
     Closed(Box<ServerRequest>),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NotificationDelivery {
+    Delivered,
+    Dropped,
+    Closed,
+}
+
+fn in_process_request_is_control(request: &ClientRequest) -> bool {
+    request.is_control()
+        && codex_app_server_transport::serialized_request_bytes_up_to(request, 64 * 1024)
+            <= 64 * 1024
+}
+
 async fn forward_server_notification(
     event_tx: &mpsc::Sender<InProcessServerEvent>,
     skipped_events: &mut usize,
     notification: ServerNotification,
-) -> bool {
+) -> NotificationDelivery {
     let requires_delivery = server_notification_requires_delivery(&notification);
-    if *skipped_events > 0 {
-        if requires_delivery {
+    if requires_delivery {
+        if *skipped_events > 0 {
             if event_tx
-                .send(InProcessServerEvent::Lagged {
-                    skipped: *skipped_events,
-                })
+                .send(InProcessServerEvent::Lagged { skipped: *skipped_events })
                 .await
                 .is_err()
             {
-                return false;
+                return NotificationDelivery::Closed;
             }
             *skipped_events = 0;
-        } else {
-            match event_tx.try_send(InProcessServerEvent::Lagged {
-                skipped: *skipped_events,
-            }) {
-                Ok(()) => *skipped_events = 0,
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    *skipped_events = skipped_events.saturating_add(1);
-                    warn!("dropping in-process server notification (queue full)");
-                    return true;
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => return false,
-            }
         }
-    }
-
-    if requires_delivery {
-        return event_tx
+        return if event_tx
             .send(InProcessServerEvent::ServerNotification(notification))
             .await
-            .is_ok();
+            .is_ok()
+        {
+            NotificationDelivery::Delivered
+        } else {
+            NotificationDelivery::Closed
+        };
     }
 
-    match event_tx.try_send(InProcessServerEvent::ServerNotification(notification)) {
-        Ok(()) => true,
+    // Reserve the actual event first. An advisory marker must not permanently
+    // consume the only slot after one transient drop.
+    let permit = match event_tx.try_reserve() {
+        Ok(permit) => permit,
         Err(mpsc::error::TrySendError::Full(_)) => {
+            if *skipped_events == 0 {
+                warn!("dropping in-process server notifications (queue full)");
+            }
             *skipped_events = skipped_events.saturating_add(1);
-            warn!("dropping in-process server notification (queue full)");
-            true
+            return NotificationDelivery::Dropped;
         }
-        Err(mpsc::error::TrySendError::Closed(_)) => false,
+        Err(mpsc::error::TrySendError::Closed(_)) => return NotificationDelivery::Closed,
+    };
+    if *skipped_events > 0 {
+        match event_tx.try_send(InProcessServerEvent::Lagged { skipped: *skipped_events }) {
+            Ok(()) => *skipped_events = 0,
+            Err(mpsc::error::TrySendError::Full(_)) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => return NotificationDelivery::Closed,
+        }
     }
+    permit.send(InProcessServerEvent::ServerNotification(notification));
+    NotificationDelivery::Delivered
 }
 
 fn forward_server_request(
@@ -362,9 +376,7 @@ impl InProcessClientSender {
     fn try_send_client_message(&self, message: InProcessClientMessage) -> IoResult<()> {
         let control = match &message {
             InProcessClientMessage::Request { request, .. } => {
-                request.is_control()
-                    && codex_app_server_transport::serialized_request_bytes_up_to(request, 64 * 1024)
-                        <= 64 * 1024
+                in_process_request_is_control(request)
             }
             // Client replies and lifecycle messages also need ingress progress.
             _ => true,
@@ -565,28 +577,33 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                         // after try_recv, stranding the last event without another wakeup.
                         Some(delivery_failure.clone()),
                         delivery_failure.clone(),
-                    ),
+                    ).with_in_process_delivery(),
                 )]);
+                let mut delivery_tasks = tokio::task::JoinSet::new();
                 let mut skipped = 0;
                 loop {
                     let envelope = tokio::select! {
                         _ = delivery_failure.cancelled() => break,
                         envelope = notification_rx.recv() => match envelope { Some(envelope) => envelope, None => break },
                     };
-                    route_outgoing_envelope(&mut connections, envelope).await;
+                    route_outgoing_envelope(&mut connections, envelope, &mut delivery_tasks).await;
                     // Filtering can intentionally omit a notification.
                     let Ok(queued) = rx.try_recv() else { continue };
-                    if let OutgoingMessage::AppServerNotification(notification) = queued.message {
-                        let delivered = tokio::select! {
-                            _ = delivery_failure.cancelled() => false,
+                    let delivery = if let OutgoingMessage::AppServerNotification(notification) = queued.message {
+                        tokio::select! {
+                            _ = delivery_failure.cancelled() => NotificationDelivery::Closed,
                             delivered = forward_server_notification(&event_tx, &mut skipped, notification) => delivered,
-                        };
-                        if !delivered {
-                            delivery_failure.cancel();
-                            break;
                         }
+                    } else {
+                        NotificationDelivery::Delivered
+                    };
+                    if delivery == NotificationDelivery::Closed {
+                        delivery_failure.cancel();
+                        break;
                     }
-                    if let Some(ack) = queued.write_complete_tx {
+                    if delivery == NotificationDelivery::Delivered
+                        && let Some(ack) = queued.write_complete_tx
+                    {
                         let _ = ack.send(std::time::Instant::now());
                     }
                 }
@@ -603,11 +620,12 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                 Arc::clone(&outbound_opted_out_notification_methods),
                 Some(delivery_failure.clone()),
                 delivery_failure.clone(),
-            ),
+            ).with_in_process_delivery(),
         );
         let outbound_shutdown = delivery_failure.clone();
         let mut outbound_handle = tokio::spawn(async move {
             let _worker_owner = outbound_shutdown.clone().drop_guard();
+            let mut delivery_tasks = tokio::task::JoinSet::new();
             loop {
                 let envelope = tokio::select! {
                     _ = outbound_shutdown.cancelled() => break,
@@ -616,7 +634,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                         None => break,
                     },
                 };
-                route_outgoing_envelope(&mut outbound_connections, envelope).await;
+                route_outgoing_envelope(&mut outbound_connections, envelope, &mut delivery_tasks).await;
             }
         });
 
@@ -633,6 +651,8 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
         let (processor_tx, mut processor_rx) = mpsc::channel::<ProcessorCommand>(
             channel_capacity.saturating_add(CONTROL_REQUEST_CAPACITY),
         );
+        let processor_shutdown = tokio_util::sync::CancellationToken::new();
+        let stop_processor = processor_shutdown.clone();
         let processor_lifetime = delivery_failure.clone().drop_guard();
         let mut processor_handle = tokio::spawn(async move {
             let _worker_owner = processor_lifetime;
@@ -661,6 +681,8 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
 
             loop {
                 tokio::select! {
+                    biased;
+                    _ = stop_processor.cancelled() => break,
                     command = processor_rx.recv() => {
                         match command {
                             Some(ProcessorCommand::Request { request, trace }) => {
@@ -762,7 +784,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                         Some(InProcessClientMessage::Request { request, trace, response_tx }) => {
                             let request = *request;
                             let request_id = request.id().clone();
-                            let control = request.is_control();
+                            let control = in_process_request_is_control(&request);
                             let at_capacity = if control {
                                 pending_controls.len() >= CONTROL_REQUEST_CAPACITY
                             } else {
@@ -856,6 +878,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                         break;
                     };
                     let outgoing_message = queued_message.message;
+                    let mut delivered = true;
                     match outgoing_message {
                         OutgoingMessage::Response(response) => {
                             pending_controls.remove(&response.id);
@@ -909,25 +932,30 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                             }
                         }
                         OutgoingMessage::AppServerNotification(notification) => {
-                            if !tokio::select! {
-                                _ = delivery_failure.cancelled() => false,
+                            let delivery = tokio::select! {
+                                _ = delivery_failure.cancelled() => NotificationDelivery::Closed,
                                 delivered = forward_server_notification(
                                     &event_tx,
                                     &mut skipped_events,
                                     notification,
                                 ) => delivered,
-                            } {
+                            };
+                            if delivery == NotificationDelivery::Closed {
                                 break;
                             }
+                            delivered = delivery == NotificationDelivery::Delivered;
                         }
                     }
-                    if let Some(write_complete_tx) = queued_message.write_complete_tx {
+                    if delivered && let Some(write_complete_tx) = queued_message.write_complete_tx {
                         let _ = write_complete_tx.send(std::time::Instant::now());
                     }
                 }
             }
         }
 
+        // Stop not-yet-started commands before settling their callers. An
+        // already-entered handler keeps its owner through committed cleanup.
+        processor_shutdown.cancel();
         delivery_failure.cancel();
         let cleanup_deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
         let notification_result = finish_in_process_task(

@@ -25,7 +25,7 @@ export type ThreadForkParams = {threadId: string, /**
 lastTurnId?: string | null, /**
  * Configuration overrides for the forked thread, if any.
  */
-model?: string | null, modelProvider?: string | null, serviceTier?: string | null | null, cwd?: string | null, approvalPolicy?: AskForApproval | null, sandbox?: SandboxMode | null, config?: { [key in string]?: JsonValue } | null, baseInstructions?: string | null, developerInstructions?: string | null, ephemeral?: boolean, /**
+model?: string | null, modelProvider?: string | null, serviceTier?: string | null | null, cwd?: string | null, approvalPolicy?: AskForApproval | null, sandbox?: SandboxMode | null, config?: { [key in string]: JsonValue } | null, baseInstructions?: string | null, developerInstructions?: string | null, ephemeral?: boolean, /**
  * Optional client-supplied analytics source classification for this forked thread.
  */
 threadSource?: ThreadSource | null};

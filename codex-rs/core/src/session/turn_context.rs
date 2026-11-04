@@ -1505,6 +1505,11 @@ impl Session {
         }
         turn_context.full_suite_budget
             .restore_policy_attempts(&session_configuration.validation_attempts);
+        if !turn_context.config.ephemeral {
+            turn_context.turn_timing_state.bind_detail_archive(
+                &turn_context.config.codex_home, &self.thread_id.to_string(), &turn_context.sub_id,
+            );
+        }
         turn_context
             .turn_timing_state
             .bind_live_phase_events(turn_context.sub_id.clone(), self.tx_event.clone());

@@ -82,4 +82,8 @@ impl ToolExecutor<ToolInvocation> for CurrentTimeHandler {
     }
 }
 
-impl CoreToolRuntime for CurrentTimeHandler {}
+impl CoreToolRuntime for CurrentTimeHandler {
+    fn is_workspace_independent(&self) -> bool {
+        true
+    }
+}

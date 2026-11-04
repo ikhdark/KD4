@@ -355,8 +355,9 @@ impl SkillsService {
     ) -> SkillLoadOutcome {
         let snapshots = input.plugin_skill_snapshots.as_ref().or(plugin_skill_preload);
         let outcome = load_skills_from_roots(roots, snapshots).await;
-        let outcome =
+        let mut outcome =
             crate::filter_skill_load_outcome_for_product(outcome, self.restriction_product);
+        crate::config_rules::apply_skill_metadata_overrides(&mut outcome.skills, skill_config_rules);
         let disabled_paths = resolve_disabled_skill_paths(&outcome.skills, skill_config_rules);
         finalize_skill_outcome(outcome, disabled_paths)
     }

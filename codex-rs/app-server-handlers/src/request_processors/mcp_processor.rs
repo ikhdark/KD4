@@ -332,10 +332,11 @@ impl McpRequestProcessor {
         let limit = params.limit.unwrap_or(total as u32).max(1) as usize;
         let effective_limit = limit.min(total);
         let start = match params.cursor {
-            Some(cursor) => match cursor.parse::<usize>() {
-                Ok(idx) => idx,
-                Err(_) => return Err(invalid_request(format!("invalid cursor: {cursor}"))),
-            },
+            Some(cursor) => {
+                let last = cursor.strip_prefix("after:")
+                    .ok_or_else(|| invalid_request("invalid MCP cursor; restart pagination"))?;
+                server_names.partition_point(|name| name.as_str() <= last)
+            }
             None => 0,
         };
 
@@ -394,7 +395,7 @@ impl McpRequestProcessor {
             .collect();
 
         let next_cursor = if end < total {
-            Some(end.to_string())
+            selected_server_names.last().map(|name| format!("after:{name}"))
         } else {
             None
         };

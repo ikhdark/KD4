@@ -8,7 +8,7 @@ use ts_rs::TS;
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-/// EXPERIMENTAL - list available apps/connectors.
+/// List available apps/connectors.
 pub struct AppsListParams {
     /// Opaque pagination cursor returned by a previous call.
     #[ts(optional = nullable)]
@@ -66,7 +66,7 @@ pub struct AppsInstalledResponse {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-/// EXPERIMENTAL - app metadata returned by app-list APIs.
+/// App metadata returned by app-list APIs.
 pub struct AppBranding {
     pub category: Option<String>,
     pub developer: Option<String>,
@@ -115,7 +115,7 @@ pub struct AppMetadata {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-/// EXPERIMENTAL - app metadata returned by app-list APIs.
+/// App metadata returned by app-list APIs.
 pub struct AppInfo {
     pub id: String,
     pub name: String,
@@ -173,7 +173,7 @@ fn non_empty_category(category: Option<&str>) -> Option<String> {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-/// EXPERIMENTAL - read metadata for specific apps/connectors.
+/// Read metadata for specific apps/connectors.
 pub struct AppsReadParams {
     /// App ids to read. The server accepts at most 100 ids and deduplicates repeated ids while
     /// preserving their first-request order.
@@ -186,7 +186,7 @@ pub struct AppsReadParams {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-/// EXPERIMENTAL - metadata returned by app/read.
+/// Metadata returned by app/read.
 pub struct AppToolSummary {
     pub name: String,
     pub title: Option<String>,
@@ -196,7 +196,7 @@ pub struct AppToolSummary {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-/// EXPERIMENTAL - metadata returned by app/read.
+/// Metadata returned by app/read.
 pub struct ConnectorMetadata {
     pub id: String,
     pub name: String,
@@ -213,7 +213,7 @@ pub struct ConnectorMetadata {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-/// EXPERIMENTAL - app/read response.
+/// App/read response.
 pub struct AppsReadResponse {
     pub apps: Vec<ConnectorMetadata>,
     pub missing_app_ids: Vec<String>,
@@ -222,7 +222,7 @@ pub struct AppsReadResponse {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-/// EXPERIMENTAL - app metadata summary for plugin responses.
+/// App metadata summary for plugin responses.
 pub struct AppSummary {
     pub id: String,
     pub name: String,
@@ -247,7 +247,7 @@ impl From<AppInfo> for AppSummary {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-/// EXPERIMENTAL - app list response.
+/// App list response.
 pub struct AppsListResponse {
     pub data: Vec<AppInfo>,
     /// Opaque cursor to pass to the next call to continue after the last item.
@@ -258,7 +258,7 @@ pub struct AppsListResponse {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-/// EXPERIMENTAL - notification emitted when the app list changes.
+/// Notification emitted when the app list changes.
 pub struct AppListUpdatedNotification {
     pub data: Vec<AppInfo>,
 }

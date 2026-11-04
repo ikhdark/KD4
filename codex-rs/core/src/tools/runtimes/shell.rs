@@ -327,8 +327,12 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             shell_snapshot_location.as_deref(),
             attempt.sandbox,
         );
-        let command =
-            build_sandbox_command(&command, &req.cwd, &env, req.additional_permissions.clone())?;
+        let command = build_sandbox_command(
+            &command,
+            codex_utils_path_uri::PathUri::from_abs_path(&req.cwd),
+            &env,
+            req.additional_permissions.clone(),
+        )?;
         let mut expiration: crate::exec::ExecExpiration = req.timeout_ms.into();
         expiration = expiration.with_cancellation(req.cancellation_token.clone());
         let stall_cancellation = req.stall_timeout_ms.map(|_| CancellationToken::new());

@@ -73,74 +73,52 @@ const HEARTBEAT_PONG_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_APP_SERVER_MAX_WEBSOCKET_MESSAGE_SIZE: usize = 128 << 20;
 const METHOD_NOT_FOUND_ERROR_CODE: i64 = -32601;
 const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
+const INVALID_PARAMS_ERROR_CODE: i64 = -32602;
 const MAX_PENDING_REMOTE_EVENTS: usize = 1024;
 const MAX_PENDING_REMOTE_EVENT_BYTES: usize = 16 << 20;
 
-#[derive(Default)]
+// Keep one maximum supported frame charge in addition to the normal backlog.
+// The multiplier is the existing conservative decoded-size accounting policy.
+const MAX_REMOTE_EVENT_OWNERSHIP_BYTES: usize =
+    MAX_PENDING_REMOTE_EVENT_BYTES + REMOTE_APP_SERVER_MAX_WEBSOCKET_MESSAGE_SIZE * 8 + std::mem::size_of::<AppServerEvent>();
+
+struct BudgetedRemoteEvent {
+    event: AppServerEvent,
+    _credit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl BudgetedRemoteEvent {
+    fn metadata(event: AppServerEvent) -> Self { Self { event, _credit: None } }
+}
+
 struct PendingRemoteEvents {
-    events: VecDeque<(AppServerEvent, usize)>,
-    bytes: usize,
+    events: VecDeque<BudgetedRemoteEvent>,
+    budget: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for PendingRemoteEvents {
+    fn default() -> Self {
+        Self { events: VecDeque::new(), budget: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_REMOTE_EVENT_OWNERSHIP_BYTES)) }
+    }
 }
 
 impl PendingRemoteEvents {
-    fn is_empty(&self) -> bool {
-        self.events.is_empty()
+    fn is_empty(&self) -> bool { self.events.is_empty() }
+    fn pop_front(&mut self) -> Option<BudgetedRemoteEvent> { self.events.pop_front() }
+
+    fn acquire_wire(&self, bytes: usize) -> IoResult<tokio::sync::OwnedSemaphorePermit> {
+        let charge = bytes.saturating_mul(8).saturating_add(std::mem::size_of::<AppServerEvent>());
+        let charge = u32::try_from(charge).map_err(IoError::other)?;
+        self.budget.clone().try_acquire_many_owned(charge).map_err(|_| IoError::new(
+            ErrorKind::OutOfMemory, "remote app-server aggregate decoded/queued/retained event byte budget exceeded; connection retired",
+        ))
     }
 
-
-    fn pop_front(&mut self) -> Option<AppServerEvent> {
-        let (event, bytes) = self.events.pop_front()?;
-        self.bytes -= bytes;
-        Some(event)
-    }
-
-    fn push_back(&mut self, event: AppServerEvent) -> IoResult<()> {
-        fn exhausted() -> IoError {
-            IoError::new(ErrorKind::OutOfMemory,
-                "remote app-server required event retention budget exceeded; connection retired")
+    fn push_back(&mut self, event: BudgetedRemoteEvent) -> IoResult<()> {
+        if self.events.len() >= MAX_PENDING_REMOTE_EVENTS {
+            return Err(IoError::new(ErrorKind::OutOfMemory, "remote app-server event retention count exceeded; connection retired"));
         }
-        let remaining = MAX_PENDING_REMOTE_EVENT_BYTES.saturating_sub(self.bytes);
-        let overhead = std::mem::size_of::<AppServerEvent>();
-        if self.events.len() >= MAX_PENDING_REMOTE_EVENTS || remaining < overhead {
-            return Err(exhausted());
-        }
-        // Count serialized content without allocating a second payload. Charge
-        // conservatively for decoded strings/containers as well as the enum.
-        struct Counter { bytes: usize, limit: usize }
-        impl std::io::Write for Counter {
-            fn write(&mut self, bytes: &[u8]) -> IoResult<usize> {
-                self.bytes = self.bytes.checked_add(bytes.len())
-                    .filter(|next| *next <= self.limit).ok_or_else(exhausted)?;
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> IoResult<()> {
-                Ok(())
-            }
-        }
-        let mut count = Counter { bytes: 0, limit: (remaining - overhead) / 8 };
-        match &event {
-            AppServerEvent::ServerNotification(value) => serde_json::to_writer(&mut count, value),
-            AppServerEvent::ServerRequest(value) => serde_json::to_writer(&mut count, value),
-            AppServerEvent::Disconnected { message } => serde_json::to_writer(&mut count, message),
-            AppServerEvent::Lagged { skipped } => serde_json::to_writer(&mut count, skipped),
-        }
-        .map_err(|error| if error.io_error_kind() == Some(ErrorKind::OutOfMemory) {
-            exhausted()
-        } else { IoError::other(error) })?;
-        let bytes = count
-            .bytes
-            .saturating_mul(8)
-            .saturating_add(std::mem::size_of::<AppServerEvent>());
-        if self.events.len() >= MAX_PENDING_REMOTE_EVENTS
-            || bytes > MAX_PENDING_REMOTE_EVENT_BYTES.saturating_sub(self.bytes)
-        {
-            return Err(IoError::new(
-                ErrorKind::OutOfMemory,
-                "remote app-server required event retention budget exceeded; connection retired",
-            ));
-        }
-        self.bytes += bytes;
-        self.events.push_back((event, bytes));
+        self.events.push_back(event);
         Ok(())
     }
 }
@@ -172,7 +150,7 @@ impl std::fmt::Debug for RemoteAppServerEndpoint {
                 auth_token,
             } => f
                 .debug_struct("WebSocket")
-                .field("websocket_url", websocket_url)
+                .field("websocket_url", &redacted_websocket_endpoint(websocket_url))
                 .field("auth_token", &auth_token.as_ref().map(|_| "[REDACTED]"))
                 .finish(),
             Self::UnixSocket { socket_path } => f
@@ -304,10 +282,11 @@ impl RemoteClientCommand {
 
 pub struct RemoteAppServerClient {
     command_tx: mpsc::Sender<RemoteClientCommand>,
-    event_rx: mpsc::Receiver<AppServerEvent>,
-    pending_events: VecDeque<AppServerEvent>,
+    event_rx: mpsc::Receiver<BudgetedRemoteEvent>,
+    pending_events: PendingRemoteEvents,
     initialize_response: AppServerInitializeResponse,
-    worker_handle: tokio::task::JoinHandle<()>,
+    worker_handle: tokio::task::JoinHandle<IoResult<()>>,
+    force_shutdown: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Clone)]
@@ -397,7 +376,10 @@ impl RemoteAppServerClient {
         .await?;
 
         let (command_tx, mut command_rx) = mpsc::channel::<RemoteClientCommand>(channel_capacity);
-        let (event_tx, event_rx) = mpsc::channel::<AppServerEvent>(channel_capacity);
+        let (event_tx, event_rx) = mpsc::channel::<BudgetedRemoteEvent>(channel_capacity);
+        let event_budget = pending_events.budget.clone();
+        let force_shutdown = tokio_util::sync::CancellationToken::new();
+        let worker_shutdown = force_shutdown.clone();
         let worker_handle = tokio::spawn(async move {
             let (mut sink, mut stream) = stream.split();
             let (writer_tx, mut writer_rx) = mpsc::channel::<RemoteWrite>(channel_capacity);
@@ -447,9 +429,10 @@ impl RemoteAppServerClient {
             }));
             let mut writer_finished = false;
             let mut closing = false;
+            let mut staged_command = None;
             let mut pending_requests =
                 HashMap::<RequestId, oneshot::Sender<IoResult<RequestResult>>>::new();
-            let mut pending_delivery = PendingRemoteEvents::default();
+            let mut pending_delivery = PendingRemoteEvents { events: VecDeque::new(), budget: event_budget };
             let mut skipped_events = 0usize;
             let mut worker_exit_error: Option<(ErrorKind, String)> = None;
             let mut heartbeat_deadline = tokio::time::Instant::now() + HEARTBEAT_INTERVAL;
@@ -468,6 +451,10 @@ impl RemoteAppServerClient {
                 }
                 tokio::select! {
                     _ = event_tx.closed() => break,
+                    _ = worker_shutdown.cancelled() => {
+                        worker_exit_error = Some((ErrorKind::TimedOut, "remote app-server shutdown forced after graceful close deadline".into()));
+                        break;
+                    }
                     _ = tokio::time::sleep_until(heartbeat_deadline),
                         if can_read && !closing && pending_ping_write.is_none() => {
                         if pending_ping.is_some() {
@@ -527,19 +514,20 @@ impl RemoteAppServerClient {
                         }
                         break;
                     }
-                    permit = event_tx.reserve(), if !pending_delivery.is_empty() => {
-                        let Ok(permit) = permit else {
-                            break;
-                        };
-                        let Some(event) = pending_delivery.pop_front() else {
-                            continue;
-                        };
-                        permit.send(event);
+                    permit = event_tx.reserve(), if !pending_delivery.is_empty() || skipped_events > 0 => {
+                        let Ok(permit) = permit else { break; };
+                        if let Some(event) = pending_delivery.pop_front() {
+                            permit.send(event);
+                        } else {
+                            permit.send(BudgetedRemoteEvent::metadata(AppServerEvent::Lagged { skipped: std::mem::take(&mut skipped_events) }));
+                        }
                     }
                     // Wait for writer ownership only as a select branch, never
                     // inside command processing where it would suspend reads.
                     _ = writer_tx.reserve(), if !closing && writer_tx.capacity() == 0 => {}
-                    command = command_rx.recv(), if !closing && writer_tx.capacity() > 0 => {
+                    command = async {
+                        if let Some(command) = staged_command.take() { Some(command) } else { command_rx.recv().await }
+                    }, if !closing && (staged_command.is_none() || writer_tx.capacity() > 0) => {
                         let Some(command) = command else {
                             closing = true;
                             if let Err(error) = queue_remote_write(&writer_tx, None, None) {
@@ -549,6 +537,20 @@ impl RemoteAppServerClient {
                             continue;
                         };
                         if command.is_abandoned_request() {
+                            continue;
+                        }
+                        if writer_tx.capacity() == 0 {
+                            // Dequeue one bounded command so local duplicate/overload
+                            // rejection is independent of unrelated socket congestion.
+                            match command {
+                                RemoteClientCommand::Request { request, response_tx } if pending_requests.contains_key(&request.id) => {
+                                    let _ = response_tx.send(Err(IoError::new(ErrorKind::InvalidInput, format!("duplicate remote app-server request id `{}`", request.id))));
+                                }
+                                RemoteClientCommand::Request { response_tx, .. } if pending_requests.len() >= channel_capacity => {
+                                    let _ = response_tx.send(Ok(Err(overloaded_error(OverloadReason::InFlightTaskCapacity, "remote app-server in-flight request capacity reached"))));
+                                }
+                                command => staged_command = Some(command),
+                            }
                             continue;
                         }
                         match command {
@@ -667,6 +669,10 @@ impl RemoteAppServerClient {
                         }
                         match message {
                             Some(Ok(Message::Text(text))) => {
+                                let wire_credit = match pending_delivery.acquire_wire(text.len()) {
+                                    Ok(credit) => credit,
+                                    Err(error) => { worker_exit_error = Some((error.kind(), error.to_string())); break; }
+                                };
                                 match serde_json::from_str::<JSONRPCMessage>(&text) {
                                     Ok(JSONRPCMessage::Response(response)) => {
                                         if let Some(response_tx) = pending_requests.remove(&response.id) {
@@ -692,6 +698,7 @@ impl RemoteAppServerClient {
                                                 &mut pending_delivery,
                                                 &mut skipped_events,
                                                 event,
+                                                wire_credit,
                                             ) {
                                                 warn!(%err, "failed to deliver remote app-server event");
                                                 worker_exit_error = Some((err.kind(), err.to_string()));
@@ -708,6 +715,7 @@ impl RemoteAppServerClient {
                                                     &mut pending_delivery,
                                                     &mut skipped_events,
                                                     AppServerEvent::ServerRequest(request),
+                                                    wire_credit,
                                                 ) {
                                                     Ok(Some(request)) => {
                                                         let request_id = request.id().clone();
@@ -740,15 +748,15 @@ impl RemoteAppServerClient {
                                                 }
                                             }
                                             Err(err) => {
-                                                warn!(%err, method, "rejecting unknown remote app-server request");
+                                                warn!(%err, method, "rejecting unsupported or malformed remote app-server request");
                                                 if let Err(reject_err) = queue_remote_write(
                                                     &writer_tx,
                                                     Some(JSONRPCMessage::Error(JSONRPCError {
                                                         error: JSONRPCErrorError {
-                                                            code: METHOD_NOT_FOUND_ERROR_CODE,
-                                                            message: format!(
-                                                                "unsupported remote app-server request `{method}`"
-                                                            ),
+                                                            code: if ServerRequest::is_known_method(&method) { INVALID_PARAMS_ERROR_CODE } else { METHOD_NOT_FOUND_ERROR_CODE },
+                                                            message: if ServerRequest::is_known_method(&method) {
+                                                                format!("invalid parameters for remote app-server request `{method}`: {err}")
+                                                            } else { format!("unsupported remote app-server request `{method}`") },
                                                             data: None,
                                                         },
                                                         id: request_id,
@@ -834,6 +842,7 @@ impl RemoteAppServerClient {
                     "remote app-server worker channel is closed".to_string(),
                 )
             });
+            let worker_result = disconnect_message.as_ref().map_or(Ok(()), |_| Err(IoError::new(err_kind, err_message.clone())));
             for (_, response_tx) in pending_requests {
                 let _ = response_tx.send(Err(IoError::new(err_kind, err_message.clone())));
             }
@@ -846,14 +855,16 @@ impl RemoteAppServerClient {
                 )
                 .await;
             }
+            worker_result
         });
 
         Ok(Self {
             command_tx,
             event_rx,
-            pending_events: pending_events.into(),
+            pending_events,
             initialize_response,
             worker_handle,
+            force_shutdown,
         })
     }
 
@@ -952,49 +963,41 @@ impl RemoteAppServerClient {
 
     pub async fn next_event(&mut self) -> Option<AppServerEvent> {
         if let Some(event) = self.pending_events.pop_front() {
-            return Some(event);
+            return Some(event.event);
         }
-        self.event_rx.recv().await
+        self.event_rx.recv().await.map(|event| event.event)
     }
 
     pub async fn shutdown(self) -> IoResult<()> {
-        let Self {
-            command_tx,
-            event_rx,
-            pending_events: _pending_events,
-            initialize_response: _initialize_response,
-            worker_handle,
-        } = self;
-        let mut worker_handle = tokio_util::task::AbortOnDropHandle::new(worker_handle);
+        // Cleanup custody is independent of cancellation of the public waiter.
+        tokio::spawn(self.shutdown_owned()).await
+            .map_err(|error| IoError::other(format!("remote shutdown owner failed: {error}")))?
+    }
+
+    async fn shutdown_owned(self) -> IoResult<()> {
+        let Self { command_tx, event_rx, pending_events: _pending_events,
+            initialize_response: _initialize_response, mut worker_handle, force_shutdown } = self;
+        let mut event_rx = Some(event_rx);
         let (response_tx, response_rx) = oneshot::channel();
-        // Queue admission can block behind a stalled socket write, so it must
-        // share the same deadline as the close acknowledgement and worker exit.
-        let shutdown_result = timeout(SHUTDOWN_TIMEOUT, async {
-            let close_result = if command_tx
-                .send(RemoteClientCommand::Shutdown { response_tx })
-                .await
-                .is_ok()
-            {
-                match response_rx.await {
-                    Ok(result) => result,
-                    Err(_) => Ok(()),
-                }
+        let result = timeout(SHUTDOWN_TIMEOUT, async {
+            let close_result = if command_tx.send(RemoteClientCommand::Shutdown { response_tx }).await.is_ok() {
+                response_rx.await.unwrap_or_else(|_| Err(IoError::new(ErrorKind::BrokenPipe, "remote close receipt dropped")))
             } else {
-                Ok(())
+                Err(IoError::new(ErrorKind::BrokenPipe, "remote shutdown command channel closed"))
             };
-            // Consumer loss aborts the writer, so retain this receiver until
-            // the ordered WebSocket close has been acknowledged.
-            drop(event_rx);
-            let _ = (&mut worker_handle).await;
-            close_result
-        })
-        .await;
-        match shutdown_result {
+            drop(event_rx.take());
+            let joined = (&mut worker_handle).await.map_err(|error| IoError::other(format!("remote coordinator failed: {error}")))?;
+            close_result.and(joined)
+        }).await;
+        match result {
             Ok(result) => result,
-            Err(_elapsed) => {
-                worker_handle.abort();
-                let _ = worker_handle.await;
-                Ok(())
+            Err(_) => {
+                // The coordinator owns abort-and-join of its writer. Never abort
+                // that owner and mistake a dropped nested handle for joined cleanup.
+                force_shutdown.cancel();
+                drop(event_rx.take());
+                worker_handle.await.map_err(|error| IoError::other(format!("remote coordinator failed during forced shutdown: {error}")))??;
+                Err(IoError::new(ErrorKind::TimedOut, "remote shutdown required forced closure after graceful deadline"))
             }
         }
     }
@@ -1037,21 +1040,31 @@ impl RemoteAppServerRequestHandle {
     }
 }
 
+fn redacted_websocket_endpoint(raw: &str) -> String {
+    let Ok(mut url) = Url::parse(raw) else { return "<invalid websocket endpoint>".into(); };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
+}
+
 async fn connect_websocket_endpoint(
     websocket_url: String,
     auth_token: Option<String>,
 ) -> IoResult<(String, WebSocketStream<MaybeTlsStream<TcpStream>>)> {
+    let endpoint = redacted_websocket_endpoint(&websocket_url);
     let url = Url::parse(&websocket_url).map_err(|err| {
         IoError::new(
             ErrorKind::InvalidInput,
-            format!("invalid websocket URL `{websocket_url}`: {err}"),
+            format!("invalid websocket URL `{endpoint}`: {err}"),
         )
     })?;
     if auth_token.is_some() && !websocket_url_supports_auth_token(&url) {
         return Err(IoError::new(
             ErrorKind::InvalidInput,
             format!(
-                "remote auth tokens require `wss://` or loopback `ws://` URLs; got `{websocket_url}`"
+                "remote auth tokens require `wss://` or loopback `ws://` URLs; got `{endpoint}`"
             ),
         ));
     }
@@ -1059,7 +1072,7 @@ async fn connect_websocket_endpoint(
     let mut request = url.as_str().into_client_request().map_err(|err| {
         IoError::new(
             ErrorKind::InvalidInput,
-            format!("invalid websocket URL `{websocket_url}`: {err}"),
+            format!("invalid websocket URL `{endpoint}`: {err}"),
         )
     })?;
     if let Some(auth_token) = auth_token.as_deref() {
@@ -1100,7 +1113,7 @@ async fn connect_websocket_endpoint(
         .map(|(stream, _response)| stream)
         .map_err(|err| {
             IoError::other(format!(
-                "failed to connect to remote app server at `{websocket_url}`: {err}"
+                "failed to connect to remote app server at `{endpoint}`: {err}"
             ))
         })
     })
@@ -1108,11 +1121,11 @@ async fn connect_websocket_endpoint(
     .map_err(|_| {
         IoError::new(
             ErrorKind::TimedOut,
-            format!("timed out connecting to remote app server at `{websocket_url}`"),
+            format!("timed out connecting to remote app server at `{endpoint}`"),
         )
     })??;
 
-    Ok((websocket_url, stream))
+    Ok((endpoint, stream))
 }
 
 async fn connect_unix_socket_endpoint(
@@ -1168,6 +1181,31 @@ fn remote_websocket_config() -> WebSocketConfig {
         .max_message_size(Some(REMOTE_APP_SERVER_MAX_WEBSOCKET_MESSAGE_SIZE))
 }
 
+fn validate_initialize_result(raw: &JsonRpcResult) -> IoResult<()> {
+    let object = raw.as_object().ok_or_else(|| IoError::new(ErrorKind::InvalidData, "initialize result must be an object"))?;
+    for key in ["userAgent", "codexHome"] {
+        if !object.get(key).is_some_and(|value| value.as_str().is_some_and(|text| !text.is_empty())) {
+            return Err(IoError::new(ErrorKind::InvalidData, format!("initialize result requires nonempty string `{key}`")));
+        }
+    }
+    for key in ["platformFamily", "platformOs"] {
+        if object.get(key).is_some_and(|value| !value.is_null() && !value.is_string()) {
+            return Err(IoError::new(ErrorKind::InvalidData, format!("initialize result has invalid `{key}`")));
+        }
+    }
+    fn optional<T: DeserializeOwned>(raw: &JsonRpcResult, key: &str) -> IoResult<()> {
+        if let Some(value) = raw.get(key).filter(|value| !value.is_null()) {
+            T::deserialize(value).map_err(|error| IoError::new(ErrorKind::InvalidData, format!("invalid initialize `{key}`: {error}")))?;
+        }
+        Ok(())
+    }
+    optional::<codex_app_server_protocol_types::ServerBuildInfo>(raw, "buildInfo")?;
+    optional::<codex_app_server_protocol_types::ServerRuntimeInfo>(raw, "runtimeInfo")?;
+    optional::<codex_app_server_protocol_types::ServerCapabilities>(raw, "serverCapabilities")?;
+    optional::<codex_app_server_protocol_types::ServerLocalWatermark>(raw, "localWatermark")?;
+    Ok(())
+}
+
 async fn initialize_remote_connection<S>(
     stream: &mut WebSocketStream<S>,
     endpoint: &str,
@@ -1175,13 +1213,13 @@ async fn initialize_remote_connection<S>(
     pending_event_capacity: usize,
     initialize_timeout: Duration,
     expected_home: Option<&AbsolutePathBuf>,
-) -> IoResult<(Vec<AppServerEvent>, AppServerInitializeResponse)>
+) -> IoResult<(PendingRemoteEvents, AppServerInitializeResponse)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     timeout(initialize_timeout, async {
         let initialize_request_id = RequestId::String("initialize".to_string());
-        let mut pending_events = Vec::new();
+        let mut pending_events = PendingRemoteEvents::default();
         write_jsonrpc_message(
             stream,
             JSONRPCMessage::Request(jsonrpc_request_from_client_request(
@@ -1204,6 +1242,7 @@ where
                     })?;
                     match message {
                         JSONRPCMessage::Response(response) if response.id == initialize_request_id => {
+                            validate_initialize_result(&response.result)?;
                             break Ok(AppServerInitializeResponse::from_json(response.result));
                         }
                         JSONRPCMessage::Error(error) if error.id == initialize_request_id => {
@@ -1214,7 +1253,7 @@ where
                         }
                         JSONRPCMessage::Notification(notification) => {
                             if let Some(event) = app_server_event_from_notification(notification)? {
-                                if pending_events.len() >= pending_event_capacity {
+                                if pending_events.events.len() >= pending_event_capacity {
                                     break Err(IoError::new(
                                         ErrorKind::InvalidData,
                                         format!(
@@ -1222,7 +1261,8 @@ where
                                         ),
                                     ));
                                 }
-                                pending_events.push(event);
+                                let credit = pending_events.acquire_wire(text.len())?;
+                                pending_events.push_back(BudgetedRemoteEvent { event, _credit: Some(credit) })?;
                             }
                         }
                         JSONRPCMessage::Request(request) => {
@@ -1238,8 +1278,9 @@ where
                                 Err(err) => {
                                     warn!(%err, method, "rejecting unknown remote app-server request during initialize");
                                     (
-                                        METHOD_NOT_FOUND_ERROR_CODE,
-                                        format!("unsupported remote app-server request `{method}`"),
+                                        if ServerRequest::is_known_method(&method) { INVALID_PARAMS_ERROR_CODE } else { METHOD_NOT_FOUND_ERROR_CODE },
+                                        if ServerRequest::is_known_method(&method) { format!("invalid parameters for remote app-server request `{method}`: {err}") }
+                                        else { format!("unsupported remote app-server request `{method}`") },
                                     )
                                 }
                             };
@@ -1354,101 +1395,64 @@ fn remote_event_requires_delivery(event: &AppServerEvent) -> bool {
 }
 
 fn forward_remote_event(
-    event_tx: &mpsc::Sender<AppServerEvent>,
+    event_tx: &mpsc::Sender<BudgetedRemoteEvent>,
     pending_delivery: &mut PendingRemoteEvents,
     skipped_events: &mut usize,
     event: AppServerEvent,
+    credit: tokio::sync::OwnedSemaphorePermit,
 ) -> IoResult<Option<ServerRequest>> {
-    if event_tx.is_closed() {
-        return Err(IoError::new(
-            ErrorKind::BrokenPipe,
-            "remote app-server event consumer channel is closed",
-        ));
+    fn closed() -> IoError { IoError::new(ErrorKind::BrokenPipe, "remote app-server event consumer channel is closed") }
+    fn rejected(event: BudgetedRemoteEvent) -> Option<ServerRequest> {
+        match event.event { AppServerEvent::ServerRequest(request) => Some(request), _ => None }
     }
-
-    if remote_event_requires_delivery(&event) {
-        // Do not interpose a worker select pass (or a spurious backlog) while
-        // the consumer has room. Retained events and lag markers keep priority.
+    if event_tx.is_closed() { return Err(closed()); }
+    let required = remote_event_requires_delivery(&event);
+    let event = BudgetedRemoteEvent { event, _credit: Some(credit) };
+    if required {
         let event = if pending_delivery.is_empty() && *skipped_events == 0 {
             match event_tx.try_send(event) {
                 Ok(()) => return Ok(None),
                 Err(mpsc::error::TrySendError::Full(event)) => event,
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    return Err(IoError::new(
-                        ErrorKind::BrokenPipe,
-                        "remote app-server event consumer channel is closed",
-                    ));
-                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return Err(closed()),
             }
-        } else {
-            event
-        };
+        } else { event };
         if *skipped_events > 0 {
-            pending_delivery.push_back(AppServerEvent::Lagged {
-                skipped: *skipped_events,
-            })?;
-            *skipped_events = 0;
+            pending_delivery.push_back(BudgetedRemoteEvent::metadata(AppServerEvent::Lagged { skipped: std::mem::take(skipped_events) }))?;
         }
         pending_delivery.push_back(event)?;
         return Ok(None);
     }
-
-    // A best-effort event must not overtake retained lossless events.
     if !pending_delivery.is_empty() {
         *skipped_events = skipped_events.saturating_add(1);
-        return Ok(match event {
-            AppServerEvent::ServerRequest(request) => Some(request),
-            _ => None,
-        });
+        return Ok(rejected(event));
     }
-
     let mut sent_lagged = false;
     if *skipped_events > 0 {
-        match event_tx.try_send(AppServerEvent::Lagged {
-            skipped: *skipped_events,
-        }) {
-            Ok(()) => {
-                *skipped_events = 0;
-                sent_lagged = true;
-            }
+        match event_tx.try_send(BudgetedRemoteEvent::metadata(AppServerEvent::Lagged { skipped: *skipped_events })) {
+            Ok(()) => { *skipped_events = 0; sent_lagged = true; }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 *skipped_events = skipped_events.saturating_add(1);
-                return Ok(match event {
-                    AppServerEvent::ServerRequest(request) => Some(request),
-                    _ => None,
-                });
+                return Ok(rejected(event));
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                return Err(IoError::new(
-                    ErrorKind::BrokenPipe,
-                    "remote app-server event consumer channel is closed",
-                ));
-            }
+            Err(mpsc::error::TrySendError::Closed(_)) => return Err(closed()),
         }
     }
-
     match event_tx.try_send(event) {
         Ok(()) => Ok(None),
         Err(mpsc::error::TrySendError::Full(event)) => {
-            if sent_lagged && matches!(&event, AppServerEvent::ServerRequest(_)) {
+            if sent_lagged && matches!(&event.event, AppServerEvent::ServerRequest(_)) {
                 pending_delivery.push_back(event)?;
                 return Ok(None);
             }
             *skipped_events = skipped_events.saturating_add(1);
-            Ok(match event {
-                AppServerEvent::ServerRequest(request) => Some(request),
-                _ => None,
-            })
+            Ok(rejected(event))
         }
-        Err(mpsc::error::TrySendError::Closed(_)) => Err(IoError::new(
-            ErrorKind::BrokenPipe,
-            "remote app-server event consumer channel is closed",
-        )),
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(closed()),
     }
 }
 
 async fn deliver_event(
-    event_tx: &mpsc::Sender<AppServerEvent>,
+    event_tx: &mpsc::Sender<BudgetedRemoteEvent>,
     pending_delivery: &mut PendingRemoteEvents,
     skipped_events: &mut usize,
     event: AppServerEvent,
@@ -1465,15 +1469,17 @@ async fn deliver_event(
     }
     if *skipped_events > 0 {
         event_tx
-            .send(AppServerEvent::Lagged {
+            .send(BudgetedRemoteEvent::metadata(AppServerEvent::Lagged {
                 skipped: *skipped_events,
-            })
+            }))
             .await
             .map_err(|_| IoError::new(ErrorKind::BrokenPipe, "event consumer closed"))?;
         *skipped_events = 0;
     }
+    let bytes = match &event { AppServerEvent::Disconnected { message } => message.len(), _ => 0 };
+    let credit = pending_delivery.acquire_wire(bytes)?;
     event_tx
-        .send(event)
+        .send(BudgetedRemoteEvent { event, _credit: Some(credit) })
         .await
         .map_err(|_| IoError::new(ErrorKind::BrokenPipe, "event consumer closed"))?;
     Ok(())

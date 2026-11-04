@@ -137,12 +137,8 @@ try {
         $env:RUSTC_WRAPPER = ""
         $env:RUSTC_WORKSPACE_WRAPPER = ""
     }
-    elseif (-not (Test-Path Env:RUSTC_WRAPPER) -and (Get-Command sccache -ErrorAction SilentlyContinue)) {
-        Set-CodexRustSccacheEnvironment -RepoRoot $repoRoot
-        $env:RUSTC_WRAPPER = "sccache"
-    }
-    elseif (Test-SccacheWrapper -Value $env:RUSTC_WRAPPER) {
-        Set-CodexRustSccacheEnvironment -RepoRoot $repoRoot
+    else {
+        Set-CodexRustDirectCompilerEnvironment
     }
     Set-CodexRustMsvcLinkerEnvironment
 

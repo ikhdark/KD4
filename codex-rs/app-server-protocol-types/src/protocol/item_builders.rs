@@ -80,7 +80,7 @@ pub fn build_command_execution_begin_item(payload: &ExecCommandBeginEvent) -> Th
         stdout: None,
         stderr: None,
         id: payload.call_id.clone(),
-        command: command_display_string(&payload.command),
+        command: command_display_string_for_path_uri(&payload.command, &payload.cwd),
         cwd: payload.cwd.clone().into(),
         process_id: payload.process_id.clone(),
         parent_call_id: None,
@@ -111,7 +111,7 @@ pub fn build_command_execution_end_item(payload: &ExecCommandEndEvent) -> Thread
         stdout: Some(payload.stdout.clone()),
         stderr: Some(payload.stderr.clone()),
         id: payload.call_id.clone(),
-        command: command_display_string(&payload.command),
+        command: command_display_string_for_path_uri(&payload.command, &payload.cwd),
         cwd: payload.cwd.clone().into(),
         process_id: payload.process_id.clone(),
         parent_call_id: None,
@@ -133,14 +133,20 @@ pub fn build_command_execution_end_item(payload: &ExecCommandEndEvent) -> Thread
 /// backslashes remain readable and arguments still round-trip through the CRT parsing rules.
 /// Other commands keep the existing POSIX-style display, including its NUL-byte placeholder.
 pub fn command_display_string(command: &[String]) -> String {
+    command_display_string_with_convention(command, command.first().is_some_and(|program| is_windows_absolute_path(program)))
+}
+
+/// Format using the executor's path convention, including PATH-resolved programs.
+pub fn command_display_string_for_path_uri(command: &[String], cwd: &PathUri) -> String {
+    command_display_string_with_convention(command, cwd.infer_path_convention() == Some(PathConvention::Windows))
+}
+
+fn command_display_string_with_convention(command: &[String], windows: bool) -> String {
     if command.iter().any(|arg| arg.contains('\0')) {
         return shlex_join(command);
     }
 
-    if command
-        .first()
-        .is_some_and(|program| is_windows_absolute_path(program))
-    {
+    if windows {
         command
             .iter()
             .map(|arg| codex_shell_command::quote_windows_arg(arg))
@@ -211,6 +217,10 @@ pub fn convert_patch_changes(changes: &HashMap<PathBuf, FileChange>) -> Vec<File
         .iter()
         .map(|(path, change)| FileUpdateChange {
             path: path.to_string_lossy().into_owned(),
+            path_uri: if path.to_str().is_none() {
+                codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path_checked(path)
+                    .ok().map(|path| PathUri::from_abs_path(&path))
+            } else { None },
             kind: map_patch_change_kind(change),
             diff: format_file_change_diff(change),
         })

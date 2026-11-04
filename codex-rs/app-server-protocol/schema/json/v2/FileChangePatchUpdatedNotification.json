@@ -10,7 +10,19 @@
           "$ref": "#/definitions/PatchChangeKind"
         },
         "path": {
+          "description": "Legacy display spelling. Prefer `pathUri` for non-Unicode native paths.",
           "type": "string"
+        },
+        "pathUri": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PathUri"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Lossless identity when native path text cannot be represented in JSON."
         }
       },
       "required": [
@@ -77,6 +89,9 @@
           "type": "object"
         }
       ]
+    },
+    "PathUri": {
+      "type": "string"
     }
   },
   "properties": {

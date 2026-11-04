@@ -9,4 +9,4 @@ import type { TurnTimingDependencyEdge } from "./TurnTimingDependencyEdge";
  * by ID and append edges; terminal records contain the complete retained lists.
  * Resource prerequisites name a resource class, not a holder or CPU scheduler.
  */
-export type TurnTimingBlockingEvidence = { version: number, intervals: Array<TurnTimingBlockingInterval>, dependencies: Array<TurnTimingDependencyEdge>, droppedIntervals: bigint, droppedDependencies: bigint, };
+export type TurnTimingBlockingEvidence = { version: number, intervals: Array<TurnTimingBlockingInterval>, dependencies: Array<TurnTimingDependencyEdge>, droppedIntervals: number, droppedDependencies: number, };

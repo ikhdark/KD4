@@ -105,12 +105,12 @@ use codex_core_plugins::remote::is_valid_remote_plugin_id;
 use codex_core_plugins::remote::validate_remote_plugin_id;
 use codex_core_plugins::remote_bundle::RemotePluginBundleInstallError;
 use codex_mcp::McpOAuthLoginSupport;
-use codex_mcp::oauth_login_support;
+use codex_mcp::oauth_login_support_with_http_client;
 use codex_mcp::should_retry_without_scopes;
 use codex_plugin::PluginId;
 use codex_plugin::PluginTelemetryMetadata;
 use codex_protocol::auth::AuthMode as DomainAuthMode;
-use codex_rmcp_client::perform_oauth_login_silent;
+use codex_rmcp_client::perform_oauth_login_silent_with_http_client;
 use futures::StreamExt;
 
 const PLUGIN_OAUTH_DISCOVERY_CONCURRENCY: usize = 8;
@@ -245,6 +245,25 @@ fn share_context_for_source(
                 share_principals: None,
             }),
         MarketplacePluginSource::Git { .. } | MarketplacePluginSource::Npm { .. } => None,
+    }
+}
+
+// Sharing metadata is optional on listings, but its failure stays visible.
+async fn load_shared_plugin_ids_for_listing(
+    config: &Config,
+) -> (
+    std::collections::BTreeMap<AbsolutePathBuf, String>,
+    Vec<codex_app_server_protocol_types::MarketplaceLoadErrorInfo>,
+) {
+    match load_shared_plugin_ids_by_local_path(config).await {
+        Ok(mapping) => (mapping, Vec::new()),
+        Err(err) => (
+            Default::default(),
+            vec![codex_app_server_protocol_types::MarketplaceLoadErrorInfo {
+                marketplace_path: config.codex_home.clone(),
+                message: err.message,
+            }],
+        ),
     }
 }
 
@@ -698,7 +717,11 @@ impl PluginRequestProcessor {
         }
         let mut scopes = Vec::new();
         let mut errors = Vec::new();
+        let mut seen = HashSet::new();
         for cwd in roots {
+            if !seen.insert(cwd) {
+                continue;
+            }
             match self.load_latest_config(Some(cwd.to_path_buf())).await {
                 Ok(config) => scopes.push(PluginMarketplaceScope {
                     config: config.plugins_config_input(), roots: vec![cwd.clone()],
@@ -726,7 +749,11 @@ impl PluginRequestProcessor {
             marketplace_kinds.unwrap_or_else(|| vec![PluginListMarketplaceKind::Local]);
         let include_local = marketplace_kinds.contains(&PluginListMarketplaceKind::Local);
         let config = self.config_manager.load_non_project_config().await.map_config_load_error()?;
-        let (scopes, scope_load_errors) = self.load_marketplace_scopes(&roots, &config).await;
+        let (scopes, scope_load_errors) = if include_local {
+            self.load_marketplace_scopes(&roots, &config).await
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let global_plugins_enabled = config.features.enabled(Feature::Plugins);
         let include_vertical = global_plugins_enabled
             && marketplace_kinds.contains(&PluginListMarketplaceKind::Vertical);
@@ -769,13 +796,14 @@ impl PluginRequestProcessor {
             let outcome = if include_local {
             let scopes_for_marketplace_listing = scopes.clone();
             let plugins_manager_for_marketplace_listing = plugins_manager.clone();
-            let shared_plugin_ids_by_local_path =
-                load_shared_plugin_ids_by_local_path(&config).await?;
-            match tokio::task::spawn_blocking(move || {
+            let (shared_plugin_ids_by_local_path, share_mapping_errors) =
+                load_shared_plugin_ids_for_listing(&config).await;
+            let mut outcome = match tokio::task::spawn_blocking(move || {
                 let outcome = plugins_manager_for_marketplace_listing
                     .list_marketplaces_for_scopes(
                         &scopes_for_marketplace_listing,
-                        /*include_openai_curated*/ !use_remote_global_catalog,
+                        // Keep the fallback until a usable remote global catalog exists.
+                        /*include_openai_curated*/ true,
                     )?;
                 Ok::<
                     (
@@ -828,7 +856,9 @@ impl PluginRequestProcessor {
                         "failed to list marketplace plugins: {err}"
                     )));
                 }
-            }
+            };
+            outcome.1.extend(share_mapping_errors);
+            outcome
         } else {
             (Vec::new(), Vec::new())
         };
@@ -939,6 +969,11 @@ impl PluginRequestProcessor {
         let ((mut data, mut marketplace_load_errors), (remote_data, refresh_global_remote_catalog_cache)) =
             join_plugin_listing_reads(local, remote).await?;
         marketplace_load_errors.extend(scope_load_errors);
+        if use_remote_global_catalog
+            && remote_data.iter().any(|marketplace| marketplace.name == REMOTE_GLOBAL_MARKETPLACE_NAME)
+        {
+            data.retain(|marketplace| marketplace.name != OPENAI_CURATED_MARKETPLACE_NAME);
+        }
         data.extend(remote_data);
 
         if include_local
@@ -1042,21 +1077,22 @@ impl PluginRequestProcessor {
             Some(self.effective_plugins_changed_callback()),
         );
 
-        let (local, remote) = tokio::join!(
+        let ((mut data, mut marketplace_load_errors), remote) = join_plugin_listing_reads(
             self.load_local_installed_and_suggested_plugins(
                 plugins_manager.clone(),
                 &config,
                 scopes,
                 install_suggestion_plugin_names,
             ),
-            self.load_remote_installed_plugins(
-                plugins_manager,
-                &plugins_input,
-                &remote_installed_plugin_visible_marketplaces,
-                auth.as_ref(),
-            ),
-        );
-        let (mut data, mut marketplace_load_errors) = local?;
+            async {
+                Ok::<_, JSONRPCErrorError>(self.load_remote_installed_plugins(
+                    plugins_manager,
+                    &plugins_input,
+                    &remote_installed_plugin_visible_marketplaces,
+                    auth.as_ref(),
+                ).await)
+            },
+        ).await?;
         marketplace_load_errors.extend(scope_load_errors);
         data.extend(remote);
         filter_openai_curated_installed_conflicts(
@@ -1090,8 +1126,9 @@ impl PluginRequestProcessor {
         ),
         JSONRPCErrorError,
     > {
-        let shared_plugin_ids_by_local_path = load_shared_plugin_ids_by_local_path(config).await?;
-        match tokio::task::spawn_blocking(move || {
+        let (shared_plugin_ids_by_local_path, share_mapping_errors) =
+            load_shared_plugin_ids_for_listing(config).await;
+        let mut outcome = match tokio::task::spawn_blocking(move || {
             let outcome = plugins_manager.list_marketplaces_for_scopes(
                 &scopes,
                 /*include_openai_curated*/ true,
@@ -1154,7 +1191,9 @@ impl PluginRequestProcessor {
             Err(err) => Err(internal_error(format!(
                 "failed to list installed and suggested plugins: {err}"
             ))),
-        }
+        }?;
+        outcome.1.extend(share_mapping_errors);
+        Ok(outcome)
     }
 
     async fn load_remote_installed_plugins(
@@ -1727,8 +1766,7 @@ impl PluginRequestProcessor {
         )
         .await;
         if !plugin_mcp_servers.is_empty() {
-            self.start_plugin_mcp_oauth_logins(&config, plugin_mcp_servers)
-                .await;
+            self.start_plugin_mcp_oauth_logins(&config, plugin_mcp_servers);
         }
 
         let plugin_app_declarations = load_plugin_apps(result.installed_path.as_path()).await;
@@ -1763,6 +1801,13 @@ impl PluginRequestProcessor {
         validate_remote_plugin_id(&remote_plugin_id)?;
 
         let auth = self.auth_manager.auth().await;
+        if !workspace_codex_plugins_enabled(
+            &config,
+            auth.as_ref(),
+            Some(&self.workspace_settings_cache),
+        ).await {
+            return Err(invalid_request("Codex plugins are disabled for this workspace"));
+        }
         let remote_plugin_service_config = RemotePluginServiceConfig::new(
             config.chatgpt_base_url.clone(),
             config.http_client_factory(),
@@ -1912,8 +1957,7 @@ impl PluginRequestProcessor {
         )
         .await;
         if !plugin_mcp_servers.is_empty() {
-            self.start_plugin_mcp_oauth_logins(&config, plugin_mcp_servers)
-                .await;
+            self.start_plugin_mcp_oauth_logins(&config, plugin_mcp_servers);
         }
 
         let is_chatgpt_auth = auth.as_ref().is_some_and(CodexAuth::is_chatgpt_auth);
@@ -2064,19 +2108,50 @@ impl PluginRequestProcessor {
         )
     }
 
-    async fn start_plugin_mcp_oauth_logins(
+    fn start_plugin_mcp_oauth_logins(
         &self,
         config: &Config,
         plugin_mcp_servers: HashMap<String, McpServerConfig>,
     ) {
+        // Own discovery as well as login after the install commits. Neither
+        // stage is part of the install acknowledgement's result contract.
+        let processor = self.clone();
+        let config = config.clone();
+        tokio::spawn(async move {
+            processor.run_plugin_mcp_oauth_logins(config, plugin_mcp_servers).await;
+        });
+    }
+
+    async fn run_plugin_mcp_oauth_logins(
+        &self,
+        config: Config,
+        plugin_mcp_servers: HashMap<String, McpServerConfig>,
+    ) {
+        let runtime_context = codex_mcp::McpRuntimeContext::new(
+            self.thread_manager.environment_manager(),
+            config.cwd.to_path_buf(),
+        );
         let discoveries = futures::stream::iter(plugin_mcp_servers)
-            .map(|(name, server)| async move {
-                let support = oauth_login_support(&server.transport).await;
-                (name, server, support)
+            .map(|(name, server)| {
+                let http_client = runtime_context.resolve_http_client(&name, &server);
+                async move {
+                    let http_client = match http_client {
+                        Ok(http_client) => http_client,
+                        Err(err) => {
+                            warn!("failed to resolve plugin MCP OAuth runtime for {name}: {err}");
+                            return None;
+                        }
+                    };
+                    let support = oauth_login_support_with_http_client(
+                        &server.transport, Arc::clone(&http_client),
+                    ).await;
+                    Some((name, server, support, http_client))
+                }
             })
-            .buffered(PLUGIN_OAUTH_DISCOVERY_CONCURRENCY);
+            .buffer_unordered(PLUGIN_OAUTH_DISCOVERY_CONCURRENCY);
         tokio::pin!(discoveries);
-        while let Some((name, server, support)) = discoveries.next().await {
+        while let Some(discovery) = discoveries.next().await {
+            let Some((name, server, support, http_client)) = discovery else { continue };
             let oauth_config = match support {
                 McpOAuthLoginSupport::Supported(config) => config,
                 McpOAuthLoginSupport::Unsupported => continue,
@@ -2104,7 +2179,7 @@ impl PluginRequestProcessor {
 
             tokio::spawn(async move {
                 let oauth_client_id = server.oauth_client_id();
-                let first_attempt = perform_oauth_login_silent(
+                let first_attempt = perform_oauth_login_silent_with_http_client(
                     &codex_home,
                     &name,
                     &oauth_config.url,
@@ -2117,12 +2192,13 @@ impl PluginRequestProcessor {
                     server.oauth_resource.as_deref(),
                     callback_port,
                     callback_url.as_deref(),
+                    Arc::clone(&http_client),
                 )
                 .await;
 
                 let final_result = match first_attempt {
                     Err(err) if should_retry_without_scopes(&resolved_scopes, &err) => {
-                        perform_oauth_login_silent(
+                        perform_oauth_login_silent_with_http_client(
                             &codex_home,
                             &name,
                             &oauth_config.url,
@@ -2135,6 +2211,7 @@ impl PluginRequestProcessor {
                             server.oauth_resource.as_deref(),
                             callback_port,
                             callback_url.as_deref(),
+                            http_client,
                         )
                         .await
                     }

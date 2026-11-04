@@ -244,6 +244,7 @@ async fn handle_submit_agent_receipt(
         session,
         step_context,
         payload,
+        cancellation_token,
         ..
     } = invocation;
     let turn = Arc::clone(&step_context.turn);
@@ -273,6 +274,22 @@ async fn handle_submit_agent_receipt(
         ))
     })?;
     let draft = args.into_receipt_draft(&task)?;
+    // Same order as patch publication: workspace lease, then SQLite writer.
+    // Cancellation/timeout withdraws this wait only; no other writer is interrupted.
+    let _handoff_lease = if !task.assignment.write_scope.is_empty() {
+        let primary = crate::tools::handlers::wait_for_observed_tool_environment(
+            &step_context.environments, None, &cancellation_token,
+        ).await?.ok_or_else(|| FunctionCallError::RequiredOperationBlocked("receipt: local source environment unavailable".into()))?;
+        if primary.environment.is_remote() {
+            return Err(FunctionCallError::RequiredOperationBlocked("receipt: source handoff requires the bound local repository".into()));
+        }
+        Some(tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => return Err(FunctionCallError::RespondToModel("receipt cancelled before handoff capture".into())),
+            result = crate::workspace_operation_gate::acquire_patch_operation_with_timeout(&primary.environment, primary.cwd()) =>
+                result.map_err(FunctionCallError::RequiredOperationBlocked)?,
+        })
+    } else { None };
     let receipt = store.submit_agent_receipt(binding.attempt_id, draft).await
         .map_err(|error| task_store_error(SUBMIT_AGENT_RECEIPT_TOOL, error))?;
     coordinator.mark_task_inactive(binding.assignment_id);
@@ -880,6 +897,7 @@ struct AmendAgentTaskArgs {
 impl AmendAgentTaskArgs {
     fn into_amendment(self) -> AttemptAmendment {
         AttemptAmendment {
+            source_manifest: None,
             reason: self.reason,
             objective: self.objective,
             acceptance_criteria: self.acceptance_criteria.map(|criteria| {

@@ -106,6 +106,20 @@ impl Drop for WaitRegistration<'_> {
         }
         // Cancellation or a dropped future must not consume the only wakeup.
         state.notify_next(&self.resource);
+        let pending_absent = !state.pending_waits.contains_key(&self.id);
+        let queue_absent = state.waiters.get(&self.resource).is_none_or(|queue| {
+            !queue.queued.iter().any(|waiter| waiter.id == self.id)
+        });
+        let notified_absent = state
+            .waiters
+            .get(&self.resource)
+            .is_none_or(|queue| queue.notified != Some(self.id));
+        // Emit outside the owner mutex: tracing must not extend its critical
+        // section or participate in lock ordering. The fields describe this
+        // registration's removal, not the state of unrelated waiters.
+        drop(state);
+        tracing::debug!(waiter_id = %self.id, resource = %self.resource,
+            pending_absent, queue_absent, notified_absent, "agent_lock waiter removed");
     }
 }
 
@@ -266,8 +280,10 @@ impl AgentResourceLocks {
             let prerequisite = last_observed_holder.as_ref().map(|holder| format!(
                 "agent_lock:{}:holder={}:acquisition={}", holder.resource, holder.owner, holder.token,
             )).unwrap_or_else(|| format!("agent_lock:{resource}"));
+            let waiter_id = guard.id;
             registration = Some(guard);
-            tracing::debug!(thread_id = %session.thread_id, resource = %resource, "agent_lock waiter registered");
+            tracing::debug!(thread_id = %session.thread_id, resource = %resource,
+                waiter_id = %waiter_id, "agent_lock waiter registered");
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => {

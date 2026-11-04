@@ -507,7 +507,13 @@ where
                         }
                         Some(IncomingWebSocketMessage::Pong) => {}
                         Some(IncomingWebSocketMessage::Close) => {
-                            return writer_control_tx.try_send(WebSocketControl::FlushClose).is_ok();
+                            // Close intent is not another coalescible ping flush.
+                            // The supervisor's grace deadline bounds this wait too.
+                            return tokio::select! {
+                                biased;
+                                _ = disconnect_token.cancelled() => false,
+                                result = timeout(WEBSOCKET_CLOSE_TIMEOUT, writer_control_tx.send(WebSocketControl::FlushClose)) => matches!(result, Ok(Ok(()))),
+                            };
                         }
                         Some(IncomingWebSocketMessage::Binary) => {
                             warn!("dropping unsupported binary websocket message");

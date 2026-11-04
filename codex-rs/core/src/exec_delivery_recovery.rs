@@ -48,6 +48,12 @@ impl OutputDeltaRecovery {
         !state.stopped || state.seen[index] < self.cap
     }
 
+    /// Truncation is independent of whether the first-hop event was admitted.
+    pub fn cap_reached(&self) -> (bool, bool) {
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        (state.seen[0] > self.cap, state.seen[1] > self.cap)
+    }
+
     /// Called only after capture and the event sender have finished.
     pub fn take_suffix(&self) -> (Vec<u8>, Vec<u8>) {
         let mut state = self

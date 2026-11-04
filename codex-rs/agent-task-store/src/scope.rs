@@ -151,6 +151,7 @@ fn git_common_directory(canonical_root: &Path) -> StoreResult<Option<PathBuf>> {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepoScope {
     pub path: String,
     #[serde(default)]

@@ -149,7 +149,9 @@ impl ToolExecutor<ToolInvocation> for ReadToolOutputHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(handle_read_tool_output(invocation))
+        Box::pin(async move {
+            handle_read_tool_output(invocation).await.map_err(settled_recovery_failure)
+        })
     }
 }
 
@@ -211,6 +213,19 @@ impl Drop for RecoveryAttemptObservation<'_> {
             let _ = metrics.counter("codex.tool_output_recovery.attempt", 1,
                 &[("phase", self.phase), ("completed", if self.completed { "true" } else { "false" })]);
         }
+    }
+}
+
+// This handler only observes retained bytes. Settled legacy read failures do
+// not leave user mutations to reconcile; preserve any explicit owner contract.
+fn settled_recovery_failure(error: FunctionCallError) -> FunctionCallError {
+    match error {
+        FunctionCallError::RespondToModel(message) => FunctionCallError::structured(
+            codex_protocol::tool_failure::ToolFailure::no_effects(
+                codex_protocol::tool_failure::ToolFailureCode::Failed, message,
+            ).with_completed_execution(),
+        ),
+        other => other,
     }
 }
 
@@ -417,6 +432,14 @@ async fn handle_read_tool_output(
         }
         crate::tools::context::ensure_exact_model_delivery(&result, &invocation)?;
         record_recovery_metrics(&invocation);
+        // Command logs return before the snapshot recovery path below. Honor
+        // the same opt-in cell allowance without relaxing its hard ceiling.
+        if args.cell_recovery
+            && let ToolCallSource::CodeMode { cell_id, .. } = &invocation.source
+        {
+            let tokens = codex_utils_output_truncation::model_token_count(&result.value().to_string());
+            invocation.session.services.code_mode_service.raise_output_budget(cell_id, tokens);
+        }
         attempt.completed = true;
         return Ok(boxed_tool_output(result));
     }
@@ -468,6 +491,7 @@ async fn handle_read_tool_output(
         max_bytes,
         &invocation.cancellation_token,
         delivery_policy,
+        foreign_source.then_some(source_thread_id),
     )
     .await
     .map_err(|err| FunctionCallError::RespondToModel(err.for_model()))?;
@@ -760,6 +784,7 @@ async fn drain_recovery_snapshot_for_delivery(
     max_bytes: usize,
     cancellation_token: &CancellationToken,
     policy: Option<codex_protocol::protocol::TruncationPolicy>,
+    source_thread_id: Option<codex_protocol::ThreadId>,
 ) -> Result<DrainedRecoveryTransaction, ReadToolOutputError> {
     loop {
         let result = drain_recovery_snapshot_with_byte_limit(
@@ -780,6 +805,11 @@ async fn drain_recovery_snapshot_for_delivery(
         // This field is always present in the final direct result. Omitting it
         // here lets a page fill the budget and then fail the exact-delivery guard.
         envelope["historical_authenticity"] = serde_json::json!(snapshot.historical_authenticity());
+        // Descendant recovery adds its owner to the final packet too. Fit the
+        // same envelope that the exact-delivery guard will receive below.
+        if let Some(source_thread_id) = source_thread_id {
+            envelope["source_thread_id"] = serde_json::json!(source_thread_id);
+        }
         let projected = codex_code_mode::model_visible_tool_result(
             &ToolName::plain(READ_TOOL_OUTPUT_TOOL_NAME),
             &envelope,

@@ -1549,6 +1549,13 @@ impl ToolCallRuntime {
             .is_some_and(|router| router.has_registered_tool(name))
     }
 
+    pub(crate) fn resolve_tool_call(&self, call: ToolCall) -> Result<ToolCall, FunctionCallError> {
+        match self.step_context.tool_router() {
+            Some(router) => router.resolve_tool_call(call),
+            None => Ok(call),
+        }
+    }
+
     pub(crate) fn create_diff_consumer(
         &self,
         tool_name: &codex_tools::ToolName,
@@ -1618,6 +1625,28 @@ impl ToolCallRuntime {
         timing: Arc<ToolDispatchTiming>,
         admission_hint: Option<(crate::tool_history::WorkspaceCallClassification, bool)>,
     ) -> impl std::future::Future<Output = Result<ToolCallCompletion, CodexErr>> {
+        let resolved = self.step_context.tool_router().map_or_else(
+            || Ok(call.clone()),
+            |router| router.resolve_tool_call(call.clone()),
+        );
+        let resolved = match resolved {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                timing.mark_first_poll();
+                timing.record_outcome("failure");
+                timing.mark_output_collected();
+                return Either::Left(std::future::ready(Ok(ToolCallCompletion {
+                    response: Self::failure_response(call, error),
+                    failure_detail: None,
+                    required_terminal: None,
+                    pending_continuation_ack: None,
+                })));
+            }
+        };
+        // An eager classification of the group envelope is not evidence for
+        // the selected operation. Reclassify its original argument contract.
+        let admission_hint = if resolved == call { admission_hint } else { None };
+        let call = resolved;
         let tool_call_timing_guard = ToolCallTimingGuard::capture_for_turn(
             Arc::clone(&timing),
             Arc::clone(&self.step_context.turn.turn_timing_state),
@@ -1665,7 +1694,7 @@ impl ToolCallRuntime {
             tool_name: call.tool_name.to_string(),
             call_id: call.call_id.clone(),
         };
-        WORKSPACE_GATE_CALL.scope(gate_call, async move {
+        Either::Right(WORKSPACE_GATE_CALL.scope(gate_call, async move {
             self.ensure_execution_allowed().map_err(|error| CodexErr::Fatal(error.to_string()))?;
             timing.mark_first_poll();
             let _tool_call_timing_guard = tool_call_timing_guard;
@@ -2040,7 +2069,7 @@ impl ToolCallRuntime {
                 }
             }
         })
-        .in_current_span()
+        .in_current_span())
     }
 
 
@@ -2148,6 +2177,10 @@ impl ToolCallRuntime {
             return Either::Left(std::future::ready(Err(FunctionCallError::Fatal(
                 "step tool router was not finalized before tool execution".to_string(),
             ))));
+        };
+        let call = match router.resolve_tool_call(call) {
+            Ok(call) => call,
+            Err(error) => return Either::Left(std::future::ready(Err(error))),
         };
         let supports_parallel = router.tool_supports_parallel(&call);
         let wait_for_runtime_cancellation = router.tool_waits_for_runtime_cancellation(&call);

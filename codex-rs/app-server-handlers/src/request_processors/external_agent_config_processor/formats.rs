@@ -36,15 +36,29 @@ pub(super) fn documents(source: &Path, target: &Path, agents: bool) -> io::Resul
     let mut failures = Vec::new();
     if agents {
         let mut role_names = std::collections::HashSet::new();
+        if target.is_dir() {
+            for entry in fs::read_dir(target)? {
+                let entry = entry?;
+                if entry.file_type()?.is_file() && entry.path().extension().and_then(|ext| ext.to_str()) == Some("toml") {
+                    let existing: TomlValue = toml::from_str(&fs::read_to_string(entry.path())?).map_err(io::Error::other)?;
+                    if let Some(name) = existing.get("name").and_then(TomlValue::as_str) {
+                        role_names.insert(name.to_string());
+                    }
+                }
+            }
+        }
         for file in agent_source_files(source)? {
             let target = subagent_target_file(&file, target).ok_or_else(|| invalid_data_error("invalid subagent filename"))?;
             if target.try_exists()? { continue; }
-            let document = parse_document(&file)?;
+            let document = match parse_document(&file) {
+                Ok(document) => document,
+                Err(error) => { failures.push((file, error.to_string())); continue; }
+            };
             let Some(metadata) = agent_metadata(&document) else {
                 failures.push((file, "subagent needs name/description/body and cannot use tool restrictions or an unsupported permission mode".to_string()));
                 continue;
             };
-            if metadata.effort.as_ref().is_some_and(|effort| map_agent_reasoning_effort(effort).is_none()) {
+            if document.frontmatter.get("effort").is_some_and(|value| value.as_scalar().and_then(map_agent_reasoning_effort).is_none()) {
                 failures.push((file, "subagent has an unsupported reasoning effort".to_string()));
                 continue;
             }
@@ -60,17 +74,25 @@ pub(super) fn documents(source: &Path, target: &Path, agents: bool) -> io::Resul
             plans.push(DocumentPlan { name: metadata.name.clone(), target, contents: render_agent_toml(&document.body, &metadata)? });
         }
     } else {
-        let mut names = std::collections::HashSet::new();
+        let mut sources = BTreeMap::<String, Vec<(PathBuf, ParsedDocument)>>::new();
         for file in command_source_files(source)? {
             if file.file_stem().and_then(|stem| stem.to_str()) == Some("README") { continue; }
-            let document = parse_document(&file)?;
+            let document = match parse_document(&file) {
+                Ok(document) => document,
+                Err(error) => { failures.push((file, error.to_string())); continue; }
+            };
             let Some(name) = command_skill_name_if_supported(source, &file, &document) else {
                 failures.push((file, "command cannot be represented as a skill: description required; runtime controls, argument/template expansion, shell interpolation and file references are unsupported".to_string()));
                 continue;
             };
-            if !names.insert(name) { failures.push((file, "source command names collide after skill-name normalization".to_string())); }
+            sources.entry(name).or_default().push((file, document));
         }
-        for (file, name, document) in unique_supported_command_sources(source)? {
+        for (name, mut documents) in sources {
+            if documents.len() != 1 {
+                failures.extend(documents.into_iter().map(|(file, _)| (file, "source command names collide after skill-name normalization".to_string())));
+                continue;
+            }
+            let Some((file, document)) = documents.pop() else { continue; };
             let destination = target.join(&name).join("SKILL.md");
             if !destination.try_exists()? {
                 let source_name = command_source_name(source, &file);
@@ -82,13 +104,14 @@ pub(super) fn documents(source: &Path, target: &Path, agents: bool) -> io::Resul
     Ok(DocumentConversions { plans, failures })
 }
 
-pub(super) fn hooks(source: &Path, target_config_dir: &Path) -> io::Result<(Vec<String>, String, ConversionFailures)> {
-    let (migration, failures) = hook_migration(source, target_config_dir)?;
+pub(super) fn hooks(source: &Path, target_config_dir: &Path) -> io::Result<(Vec<String>, String, ConversionFailures, HookAssets)> {
+    let assets = HookAssets::read(&source.join(EXTERNAL_AGENT_HOOKS_SUBDIR))?;
+    let (migration, failures) = hook_migration(source, &assets.target(target_config_dir), &assets)?;
     let names = migration.keys().cloned().collect();
     let mut payload = serde_json::Map::new();
     payload.insert("hooks".to_string(), JsonValue::Object(migration));
     let rendered = serde_json::to_string_pretty(&payload).map_err(io::Error::other)?;
-    Ok((names, format!("{rendered}\n"), failures))
+    Ok((names, format!("{rendered}\n"), failures, assets))
 }
 
 fn invalid_data_error(message: impl Into<String>) -> io::Error { io::Error::new(io::ErrorKind::InvalidData, message.into()) }
@@ -119,6 +142,7 @@ struct AgentMetadata {
 fn hook_migration(
     source_external_agent_dir: &Path,
     target_config_dir: &Path,
+    assets: &HookAssets,
 ) -> io::Result<(serde_json::Map<String, JsonValue>, ConversionFailures)> {
     let mut settings_files = Vec::new();
     let mut disabled = false;
@@ -147,10 +171,14 @@ fn hook_migration(
             for group in groups {
                 let selections = if let Some(hooks) = group.get("hooks").and_then(JsonValue::as_array) {
                     if hooks.is_empty() { vec![group.clone()] } else {
+                        let metadata = group.as_object().into_iter().flat_map(|group| group.iter())
+                            .filter(|(key, _)| key.as_str() != "hooks")
+                            .map(|(key, value)| (key.clone(), value.clone()))
+                            .collect::<serde_json::Map<_, _>>();
                         hooks.iter().map(|hook| {
-                            let mut selection = group.clone();
-                            if let Some(object) = selection.as_object_mut() { object.insert("hooks".to_string(), JsonValue::Array(vec![hook.clone()])); }
-                            selection
+                            let mut selection = metadata.clone();
+                            selection.insert("hooks".to_string(), JsonValue::Array(vec![hook.clone()]));
+                            JsonValue::Object(selection)
                         }).collect()
                     }
                 } else { vec![group.clone()] };
@@ -159,7 +187,7 @@ fn hook_migration(
                     events.insert(event.clone(), JsonValue::Array(vec![selection]));
                     let mut selected = serde_json::Map::new();
                     selected.insert("hooks".to_string(), JsonValue::Object(events));
-                    if let Err(err) = append_convertible_hook_groups(&JsonValue::Object(selected), &mut migration, target_config_dir, source_external_agent_dir) {
+                    if let Err(err) = append_convertible_hook_groups(&JsonValue::Object(selected), &mut migration, target_config_dir, source_external_agent_dir, assets) {
                         failures.push((path.clone(), err.to_string()));
                     }
                 }
@@ -174,6 +202,7 @@ fn append_convertible_hook_groups(
     hooks_payload: &mut serde_json::Map<String, JsonValue>,
     target_config_dir: &Path,
     source_external_agent_dir: &Path,
+    assets: &HookAssets,
 ) -> io::Result<()> {
     let Some(config) = settings.get("hooks") else { return Ok(()); };
     let config = config.as_object().ok_or_else(|| invalid_data_error("hooks must be an object"))?;
@@ -203,7 +232,7 @@ fn append_convertible_hook_groups(
                 }
                 let command = hook.get("command").and_then(JsonValue::as_str).map(str::trim).filter(|command| !command.is_empty())
                     .ok_or_else(|| invalid_data_error("command hook requires a non-empty command"))?;
-                let command = rewrite_hook_command(command, target_config_dir, source_external_agent_dir)
+                let command = rewrite_hook_command(command, target_config_dir, source_external_agent_dir, assets)
                     .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, format!("hook command cannot be safely relocated: {command}")))?;
                 let mut handler = serde_json::Map::new();
                 handler.insert("type".to_string(), JsonValue::String("command".to_string()));
@@ -243,8 +272,17 @@ fn rewrite_hook_command(
     command: &str,
     target_config_dir: &Path,
     source_external_agent_dir: &Path,
+    assets: &HookAssets,
 ) -> Option<String> {
-    if looks_like_windows_hook_command(command) {
+    if looks_like_windows_hook_command(command) || command.contains(['\n', '\r']) || command.contains("<<") {
+        return None;
+    }
+    // Config-layer hooks have no source-runtime environment injection. Do not
+    // activate commands whose project identity would silently become empty.
+    let project_variable = external_agent_project_dir_env_var();
+    if command.contains(&format!("${project_variable}"))
+        || command.contains(&format!("${{{project_variable}}}"))
+    {
         return None;
     }
     let relative_root = format!(
@@ -258,7 +296,7 @@ fn rewrite_hook_command(
             .to_string_lossy()
             .replace('\\', "/")
     );
-    let target_root = target_config_dir.join(EXTERNAL_AGENT_MIGRATED_HOOKS_SUBDIR);
+    let target_root = target_config_dir;
     let mut output = String::new();
     let mut start = 0;
     let mut quote = None;
@@ -272,6 +310,9 @@ fn rewrite_hook_command(
         if ch == '\\' && quote != Some('\'') {
             escaped = true;
             continue;
+        }
+        if quote.is_none() && ch == '#' && (index == 0 || command[..index].ends_with(|ch: char| ch.is_whitespace() || matches!(ch, ';' | '|' | '&'))) {
+            return None;
         }
         if matches!(ch, '\'' | '"') {
             if quote == Some(ch) {
@@ -325,6 +366,9 @@ fn rewrite_hook_command(
         {
             return None;
         }
+        if !assets.entries.iter().any(|asset| asset.contents.is_some() && asset.relative == Path::new(suffix)) {
+            return None;
+        }
         output.push_str(&command[copied..start]);
         output.push_str(&shell_single_quote(
             &target_root.join(suffix).to_string_lossy(),
@@ -350,39 +394,124 @@ fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-pub(super) fn copy_hook_scripts(source_external_agent_dir: &Path, target_config_dir: &Path, cancellation: &CancellationToken) -> io::Result<()> {
-    let source_hooks = source_external_agent_dir.join(EXTERNAL_AGENT_HOOKS_SUBDIR);
-    if !source_hooks.is_dir() {
-        return Ok(());
-    }
-    let target_hooks = target_config_dir.join(EXTERNAL_AGENT_MIGRATED_HOOKS_SUBDIR);
-    copy_dir_recursive_skip_existing(&source_hooks, &target_hooks, cancellation)
+/// Immutable, content-addressed hook assets. hooks.json is the activation
+/// boundary; failed publication leaves only a complete reusable asset snapshot.
+pub(super) struct HookAssets {
+    entries: Vec<HookAsset>,
+    identity: String,
 }
 
-fn copy_dir_recursive_skip_existing(source: &Path, target: &Path, cancellation: &CancellationToken) -> io::Result<()> {
-    super::files::check_cancel(cancellation)?;
-    fs::create_dir_all(target)?;
-    for entry in fs::read_dir(source)? {
-        super::files::check_cancel(cancellation)?;
-        let entry = entry?;
-        let source_path = entry.path();
-        let target_path = target.join(entry.file_name());
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            copy_dir_recursive_skip_existing(&source_path, &target_path, cancellation)?;
-        } else if file_type.is_file() {
-            let contents = fs::read(&source_path)?;
-            if !publish_new_file(
-                &target_path,
-                &contents,
-                Some(fs::metadata(&source_path)?.permissions()),
-            )? && fs::read(&target_path)? != contents
-            {
-                return Err(invalid_data_error(format!(
-                    "conflicting hook script: {}",
-                    target_path.display()
-                )));
+struct HookAsset {
+    relative: PathBuf,
+    contents: Option<Vec<u8>>,
+    permissions: Option<fs::Permissions>,
+}
+
+impl HookAssets {
+    fn read(root: &Path) -> io::Result<Self> {
+        let mut entries = Vec::new();
+        let mut remaining = 256 * 1024 * 1024;
+        match fs::symlink_metadata(root) {
+            Ok(metadata) if metadata.file_type().is_dir() => {
+                read_hook_assets(root, Path::new(""), &mut entries, &mut remaining)?;
             }
+            Ok(_) => return Err(io::Error::new(io::ErrorKind::Unsupported, "hook assets root must be a real directory")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        use sha2::Digest;
+        let mut digest = sha2::Sha256::new();
+        for entry in &entries {
+            let relative = entry.relative.to_str().ok_or_else(|| invalid_data_error("hook asset path is not UTF-8"))?;
+            digest.update((relative.len() as u64).to_le_bytes());
+            digest.update(relative.as_bytes());
+            if let Some(contents) = &entry.contents {
+                digest.update([1]);
+                digest.update((contents.len() as u64).to_le_bytes());
+                digest.update(contents);
+                if let Some(permissions) = &entry.permissions {
+                    digest.update([u8::from(permissions.readonly())]);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        digest.update(permissions.mode().to_le_bytes());
+                    }
+                }
+            } else {
+                digest.update([0]);
+            }
+        }
+        Ok(Self { entries, identity: hex::encode(digest.finalize()) })
+    }
+
+    fn target(&self, target_config_dir: &Path) -> PathBuf {
+        target_config_dir.join(EXTERNAL_AGENT_MIGRATED_HOOKS_SUBDIR).join(format!("import-{}", self.identity))
+    }
+
+    pub(super) fn publish(&self, target_config_dir: &Path, cancellation: &CancellationToken) -> io::Result<()> {
+        if self.entries.is_empty() { return Ok(()); }
+        let destination = self.target(target_config_dir);
+        let (destination, _lock) = super::files::lock_target(&destination, cancellation)?;
+        if destination.try_exists()? {
+            if Self::read(&destination)?.identity != self.identity {
+                return Err(invalid_data_error(format!("conflicting immutable hook snapshot: {}", destination.display())));
+            }
+            return Ok(());
+        }
+        let parent = destination.parent().ok_or_else(|| invalid_data_error("hook snapshot has no parent"))?;
+        let staging = tempfile::Builder::new().prefix(".hook-import-").tempdir_in(parent)?;
+        let staged = staging.path().join("assets");
+        fs::create_dir(&staged)?;
+        for entry in &self.entries {
+            super::files::check_cancel(cancellation)?;
+            let path = staged.join(&entry.relative);
+            if let Some(contents) = &entry.contents {
+                if !publish_new_file(&path, contents, entry.permissions.clone())? {
+                    return Err(invalid_data_error("duplicate staged hook asset"));
+                }
+            } else {
+                fs::create_dir(&path)?;
+            }
+        }
+        super::files::check_cancel(cancellation)?;
+        fs::rename(&staged, &destination)
+    }
+}
+
+fn read_hook_assets(root: &Path, relative: &Path, assets: &mut Vec<HookAsset>, remaining: &mut usize) -> io::Result<()> {
+    use std::io::Read;
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(root.join(relative))? {
+        if entries.len() + assets.len() >= 10_000 {
+            return Err(invalid_data_error("hook assets exceed the entry budget"));
+        }
+        entries.push(entry?);
+    }
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        if assets.len() >= 10_000 {
+            return Err(invalid_data_error("hook assets exceed the entry budget"));
+        }
+        let path = relative.join(entry.file_name());
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            assets.push(HookAsset { relative: path.clone(), contents: None, permissions: None });
+            read_hook_assets(root, &path, assets, remaining)?;
+        } else if kind.is_file() {
+            let file = fs::File::open(entry.path())?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Err(invalid_data_error("hook asset changed during import"));
+            }
+            let mut contents = Vec::new();
+            file.take(*remaining as u64 + 1).read_to_end(&mut contents)?;
+            if contents.len() > *remaining {
+                return Err(invalid_data_error("hook assets exceed the byte budget"));
+            }
+            *remaining -= contents.len();
+            assets.push(HookAsset { relative: path, contents: Some(contents), permissions: Some(metadata.permissions()) });
+        } else {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, format!("hook assets contain a symlink or special file: {}", entry.path().display())));
         }
     }
     Ok(())
@@ -441,34 +570,6 @@ fn command_source_files(source_commands: &Path) -> io::Result<Vec<PathBuf>> {
     collect_markdown_files(source_commands, &mut files)?;
     files.sort();
     Ok(files)
-}
-
-fn unique_supported_command_sources(
-    source_commands: &Path,
-) -> io::Result<Vec<(PathBuf, String, ParsedDocument)>> {
-    let mut by_name = BTreeMap::<String, Vec<(PathBuf, ParsedDocument)>>::new();
-    for source_file in command_source_files(source_commands)? {
-        let document = parse_document(&source_file)?;
-        let Some(name) = command_skill_name_if_supported(source_commands, &source_file, &document)
-        else {
-            continue;
-        };
-        by_name
-            .entry(name)
-            .or_default()
-            .push((source_file, document));
-    }
-
-    Ok(by_name
-        .into_iter()
-        .filter_map(|(name, mut source_files)| {
-            if source_files.len() != 1 {
-                return None;
-            }
-            let (source_file, document) = source_files.pop()?;
-            Some((source_file, name, document))
-        })
-        .collect())
 }
 
 fn collect_markdown_files(dir: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {

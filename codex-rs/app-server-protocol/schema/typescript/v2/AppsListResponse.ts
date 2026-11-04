@@ -4,7 +4,7 @@
 import type { AppInfo } from "./AppInfo";
 
 /**
- * EXPERIMENTAL - app list response.
+ * App list response.
  */
 export type AppsListResponse = { data: Array<AppInfo>,
 /**

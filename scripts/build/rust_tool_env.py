@@ -23,6 +23,18 @@ _SCOOP_LLVM_LLD_LINK = Path("apps/llvm/current/bin/lld-link.exe")
 CORE_BUILD_PACKAGES = ("codex-core",)
 
 
+def direct_compiler_env(env: Mapping[str, str]) -> dict[str, str]:
+    """Keep managed compilation independent of the shared sccache daemon."""
+    updates: dict[str, str] = {}
+    for name in ("RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER"):
+        value = env.get(name, env.get(f"CARGO_BUILD_{name}"))
+        if value is None or is_sccache_wrapper(value):
+            # Empty overrides Cargo configuration; deleting the variable would
+            # allow an inherited rustc-wrapper setting to select sccache again.
+            updates[name] = ""
+    return updates
+
+
 def local_rust_env(
     env: Mapping[str, str],
     *,
@@ -30,21 +42,11 @@ def local_rust_env(
     which: Callable[[str], str | None] = shutil.which,
 ) -> dict[str, str]:
     """Shared, probe-free defaults for Just, lane and direct Cargo entrypoints."""
+    updates = direct_compiler_env(env)
     if env.get("CI", "").lower() not in ("", "0", "false", "no"):
-        return {}
-    updates: dict[str, str] = {}
+        return updates
     if not env.get("CARGO_NET_GIT_FETCH_WITH_CLI"):
         updates["CARGO_NET_GIT_FETCH_WITH_CLI"] = "true"
-    wrapper = env.get("RUSTC_WRAPPER")
-    if wrapper is None:
-        wrapper = which("sccache")
-        if wrapper:
-            updates["RUSTC_WRAPPER"] = wrapper
-    if wrapper and is_sccache_wrapper(wrapper) and repo_root is not None:
-        if not env.get("SCCACHE_BASEDIRS"):
-            updates["SCCACHE_BASEDIRS"] = os.path.abspath(repo_root)
-        if not env.get("SCCACHE_CACHE_SIZE"):
-            updates["SCCACHE_CACHE_SIZE"] = sccache_cache_size(env)
     missing_linkers = [
         f"CARGO_TARGET_{target}_PC_WINDOWS_MSVC_LINKER"
         for target in ("X86_64", "AARCH64")

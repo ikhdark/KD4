@@ -16,7 +16,7 @@ pub(super) fn omitted_output_marker(omitted_bytes: usize) -> Vec<u8> {
     .into_bytes()
 }
 
-pub(super) fn split_valid_utf8_prefix_with_max<'a>(
+pub(crate) fn split_valid_utf8_prefix_with_max<'a>(
     buffer: &mut &'a [u8],
     max_bytes: usize,
     flush_incomplete: bool,

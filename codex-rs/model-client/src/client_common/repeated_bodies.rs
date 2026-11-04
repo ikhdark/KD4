@@ -239,6 +239,7 @@ impl IncludedContent {
         let mut changed = false;
         match value {
             Value::Object(object) => {
+                changed |= compact_listing_cutoffs(object);
                 // Only exact acquired source rows qualify for range sharing.
                 if object.contains_key("canonical_range")
                     && object.get("complete") != Some(&Value::Bool(false))
@@ -366,6 +367,40 @@ impl IncludedContent {
             None
         }
     }
+}
+
+fn compact_listing_cutoffs(object: &mut serde_json::Map<String, Value>) -> bool {
+    // Only native listing envelopes. This is a lossless model-only encoding:
+    // raw history, native JS values and every cutoff/coverage field stay intact.
+    if !["path", "environment_id", "effective_walk_options", "entries", "errors",
+        "truncated", "complete"].iter().all(|field| object.contains_key(*field))
+    {
+        return false;
+    }
+    let Some(stops) = object.get("unexplored").and_then(Value::as_array) else {
+        return false;
+    };
+    if stops.len() < 2 {
+        return false;
+    }
+    let mut groups: Vec<Value> = Vec::new();
+    for stop in stops {
+        let Some(mut fields) = stop.as_object().cloned() else { return false };
+        let Some(path @ Value::String(_)) = fields.remove("path") else { return false };
+        if let Some(last) = groups.last_mut()
+            && last["fields"] == Value::Object(fields.clone())
+        {
+            last["paths"].as_array_mut().unwrap().push(path);
+        } else {
+            groups.push(json!({"fields":fields,"paths":[path]}));
+        }
+    }
+    let encoded = json!({"encoding":"consecutive_shared_fields_v1","groups":groups});
+    if encoded.to_string().len() + 32 >= object["unexplored"].to_string().len() {
+        return false;
+    }
+    object.insert("unexplored".into(), encoded);
+    true
 }
 
 fn source_key(value: &Value) -> Option<String> {

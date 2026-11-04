@@ -3,6 +3,7 @@ use crate::shell::Shell;
 use crate::shell::ShellType;
 use crate::shell::get_shell;
 use crate::shell::get_shell_by_model_provided_path;
+use crate::shell::resolve_use_login_shell;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -160,6 +161,12 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
             raw.script_body.as_deref(),
         )
         .map_err(|error| error.to_string())?;
+        if command.is_argv() && (raw.shell.is_some() || raw.login == Some(true)) {
+            return Err(
+                "`shell` and `login=true` require a script command; omit `shell` and omit `login` or set it to false with program/args."
+                    .to_string(),
+            );
+        }
         // Environment selection and workdir resolution intentionally happen
         // in a separate boundary pass before the command arguments are
         // decoded. Reading these fields here keeps this decoder permissive for
@@ -312,15 +319,7 @@ pub(crate) fn get_command(
     allow_login_shell: bool,
     environment_is_remote: bool,
 ) -> Result<ResolvedCommand, String> {
-    let use_login_shell = match args.login {
-        Some(true) if !allow_login_shell => {
-            return Err(
-                "login shell is disabled by config; omit `login` or set it to false.".to_string(),
-            );
-        }
-        Some(use_login_shell) => use_login_shell,
-        None => allow_login_shell,
-    };
+    let use_login_shell = resolve_use_login_shell(args.login, allow_login_shell)?;
     let invocation = args.command_invocation();
 
     if invocation.is_powershell_script() {
@@ -361,9 +360,9 @@ pub(crate) fn get_command(
     }
 
     if invocation.is_argv() {
-        if args.shell.is_some() || args.login.is_some() {
+        if args.shell.is_some() || args.login == Some(true) {
             return Err(
-                "`shell` and `login` are only valid for script commands; omit them with program/args."
+                "`shell` and `login=true` require a script command; omit `shell` and omit `login` or set it to false with program/args."
                     .to_string(),
             );
         }

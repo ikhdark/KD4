@@ -63,6 +63,10 @@ Build freshness includes the bytes of the automatically selected Cargo Rusty V8
 cache archive, not just explicit archive overrides. A cached archive change
 invalidates auto-skip even if file timestamps are preserved.
 
+External `-SkipBuild -SourceBundleManifest` bundles use their verified target,
+version, inventory identity, and file digests rather than scanning the unrelated
+local Cargo checkout. Locally built bundles still require content-bound stamps.
+
 The local publisher does not download a missing Rusty V8 archive by default.
 Reuse its Cargo cache, pass `-RustyV8Archive` or `RUSTY_V8_ARCHIVE` with an
 existing local archive, or opt into `-AllowRustyV8Download` only when downloading

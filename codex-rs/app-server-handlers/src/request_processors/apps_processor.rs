@@ -48,6 +48,7 @@ use codex_mcp::ToolInfo;
 use codex_mcp::tool_is_model_visible;
 use std::future::Future;
 use std::pin::Pin;
+use sha2::Digest;
 
 mod installed;
 
@@ -160,24 +161,26 @@ impl AppsRequestProcessor {
             if !include_tools {
                 return Ok(HashMap::new());
             }
-            let mcp_manager = self.thread_manager.mcp_manager();
-            connectors::list_accessible_connectors_from_mcp_tools_with_mcp_manager(
-                &config,
-                /*force_refetch*/ false,
-                self.thread_manager.environment_manager(),
-                Arc::clone(&mcp_manager),
-            )
-            .await
-            .map_err(|err| internal_error(format!("failed to read app tools: {err}")))?;
-            let mcp_config = mcp_manager.runtime_config(&config).await;
-            let tools = mcp_manager
-                .codex_apps_tools_cache()
-                .current_tools(
+            let tools = if matches!(auth.as_ref(), Some(CodexAuth::Headers(_))) {
+                self.refresh_app_tools(&config, auth.clone()).await
+                    .map_err(|err| internal_error(format!("failed to read app tools: {err}")))?
+            } else {
+                let mcp_manager = self.thread_manager.mcp_manager();
+                let status = connectors::list_accessible_connectors_from_mcp_tools_with_mcp_manager(
+                    &config,
+                    /*force_refetch*/ false,
+                    self.thread_manager.environment_manager(),
+                    Arc::clone(&mcp_manager),
+                ).await.map_err(|err| internal_error(format!("failed to read app tools: {err}")))?;
+                if !status.codex_apps_ready {
+                    return Err(invalid_request("app tool discovery is not ready; retry app/read"));
+                }
+                let mcp_config = mcp_manager.runtime_config(&config).await;
+                mcp_manager.codex_apps_tools_cache().current_tools(
                     config.codex_home.to_path_buf(),
                     mcp_config.codex_apps_tools_cache_key(auth.as_ref()),
-                )
-                .await
-                .unwrap_or_default();
+                ).await.ok_or_else(|| invalid_request("app tool snapshot is unavailable; retry app/read"))?
+            };
             Ok::<_, JSONRPCErrorError>(app_tool_summaries_by_connector(&tools, &seen_app_ids))
         };
         let load_metadata = async {
@@ -367,17 +370,13 @@ impl AppsRequestProcessor {
         let AppsListParams {
             cursor,
             limit,
-            thread_id: _,
+            thread_id,
             force_refetch,
         } = params;
+        // The wire notification has no workspace/thread identity. Only global
+        // requests may publish global enablement snapshots or use global dedupe.
+        let allow_global_notifications = thread_id.is_none();
         let mut request_last_notified_apps = None;
-        let start = match cursor {
-            Some(cursor) => match cursor.parse::<usize>() {
-                Ok(idx) => idx,
-                Err(_) => return Err(invalid_request(format!("invalid cursor: {cursor}"))),
-            },
-            None => 0,
-        };
 
         let loaded_plugins = plugins_manager
             .plugins_for_config(&config.plugins_config_input())
@@ -433,7 +432,7 @@ impl AppsRequestProcessor {
                 merge_loaded_apps(all_connectors.as_deref(), accessible_connectors.as_deref()),
                 &config,
             );
-            if should_send_app_list_updated_notification(
+            if allow_global_notifications && should_send_app_list_updated_notification(
                 merged.as_slice(),
                 accessible_loaded,
                 all_loaded,
@@ -494,7 +493,7 @@ impl AppsRequestProcessor {
                 merge_loaded_apps(all_connectors_for_update, accessible_connectors_for_update),
                 &config,
             );
-            if should_send_app_list_updated_notification(
+            if allow_global_notifications && should_send_app_list_updated_notification(
                 merged.as_slice(),
                 accessible_loaded,
                 all_loaded,
@@ -510,7 +509,7 @@ impl AppsRequestProcessor {
             }
 
             if accessible_loaded && all_loaded {
-                let response = paginate_apps(merged.as_slice(), start, limit)?;
+                let response = paginate_apps(merged.as_slice(), cursor.as_deref(), limit)?;
                 return Ok((response, codex_apps_ready));
             }
         }
@@ -652,10 +651,24 @@ fn should_send_app_list_updated_notification(
 
 fn paginate_apps(
     connectors: &[AppInfo],
-    start: usize,
+    cursor: Option<&str>,
     limit: Option<u32>,
 ) -> Result<AppsListResponse, JSONRPCErrorError> {
     let total = connectors.len();
+    // Bind the ordered identity and effective policy, not a cloned JSON copy of
+    // every app's descriptive metadata on every page.
+    let snapshot = connectors.iter().map(|app| (
+        &app.id, app.is_enabled, app.is_accessible, &app.plugin_display_names,
+    )).collect::<Vec<_>>();
+    let identity = hex::encode(sha2::Sha256::digest(serde_json::to_vec(&snapshot).map_err(|error| internal_error(error.to_string()))?));
+    let start = match cursor {
+        None => 0,
+        Some(cursor) => {
+            let (snapshot, offset) = cursor.split_once(':').ok_or_else(|| invalid_request("invalid app cursor; restart pagination"))?;
+            if snapshot != identity { return Err(invalid_request("app catalog changed; restart pagination")); }
+            offset.parse::<usize>().map_err(|_| invalid_request("invalid app cursor"))?
+        }
+    };
     if start > total {
         return Err(invalid_request(format!(
             "cursor {start} exceeds total apps {total}"
@@ -670,7 +683,7 @@ fn paginate_apps(
         .map(app_info_to_api)
         .collect();
     let next_cursor = if end < total {
-        Some(end.to_string())
+        Some(format!("{identity}:{end}"))
     } else {
         None
     };

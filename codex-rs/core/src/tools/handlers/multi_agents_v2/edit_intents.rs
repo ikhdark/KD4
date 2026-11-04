@@ -137,7 +137,8 @@ impl ToolExecutor<ToolInvocation> for Handler {
                     control.ensure_agent_in_tree(thread_id).await.map_err(|e| e.to_string())?;
                     let text = format!("Advisory edit-intent overlap with assignment {}, attempt {}: {}. Declarations are not locks or overwrite permission; reconcile current bytes before publishing.",
                         args.assignment_id, args.expected_attempt_id, serde_json::to_string(&warnings).map_err(|e| e.to_string())?);
-                    let communication = communication_from_plaintext_message(author.clone(), recipient, text);
+                    let mut communication = communication_from_plaintext_message(author.clone(), recipient, text);
+                    communication.trigger_turn = false;
                     control.send_inter_agent_communication(thread_id, communication,
                         AgentCommunicationContext::new(AgentCommunicationKind::Message, invocation.session.thread_id)).await.map_err(|e| e.to_string())
                 }.await;

@@ -59,6 +59,13 @@
     "AgentPath": {
       "type": "string"
     },
+    "ApprovalsReviewer": {
+      "description": "Approval reviewer reported to API clients. This build supports user review only.",
+      "enum": [
+        "user"
+      ],
+      "type": "string"
+    },
     "AskForApproval": {
       "oneOf": [
         {
@@ -920,7 +927,19 @@
           "$ref": "#/definitions/PatchChangeKind"
         },
         "path": {
+          "description": "Legacy display spelling. Prefer `pathUri` for non-Unicode native paths.",
           "type": "string"
+        },
+        "pathUri": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PathUri"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Lossless identity when native path text cannot be represented in JSON."
         }
       },
       "required": [
@@ -952,6 +971,18 @@
         }
       },
       "type": "object"
+    },
+    "HarnessPhase": {
+      "enum": [
+        "resourceResolution",
+        "diffTracker",
+        "workspaceGate",
+        "evidenceTracker",
+        "delivery",
+        "processCleanup",
+        "readyToSample"
+      ],
+      "type": "string"
     },
     "HookPromptFragment": {
       "properties": {
@@ -1175,6 +1206,12 @@
         "content": {
           "items": true,
           "type": "array"
+        },
+        "isError": {
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "structuredContent": true
       },
@@ -1869,7 +1906,13 @@
       ],
       "type": "object"
     },
-    "ThreadActiveFlag": {"enum":["waitingOnApproval","waitingOnUserInput"],"type":"string"},
+    "ThreadActiveFlag": {
+      "enum": [
+        "waitingOnApproval",
+        "waitingOnUserInput"
+      ],
+      "type": "string"
+    },
     "ThreadExtra": {
       "description": "Extra app-server data for a thread.",
       "type": "object"
@@ -1988,7 +2031,7 @@
           "type": "object"
         },
         {
-          "description": "EXPERIMENTAL - proposed plan item content. The completed plan item is authoritative and may not match the concatenation of `PlanDelta` text.",
+          "description": "Proposed plan item content. The completed plan item is authoritative and may not match the concatenation of `PlanDelta` text.",
           "properties": {
             "id": {
               "type": "string"
@@ -2276,7 +2319,7 @@
               "type": "string"
             },
             "mcpAppResourceUri": {
-              "description": "Deprecated: use `appContext.resourceUri` instead.",
+              "description": "Prefer `appContext.resourceUri` when app context is available. This field remains supported for calls without a connector identity.",
               "type": [
                 "string",
                 "null"
@@ -2860,14 +2903,23 @@
               },
               "type": "array"
             },
+            "harnessPhases": {
+              "description": "Optional harness diagnostics, separate from the upstream active-flag enum.",
+              "items": {
+                "$ref": "#/definitions/HarnessPhase"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
             "type": {
               "enum": [
                 "active"
               ],
               "title": "ActiveThreadStatusType",
               "type": "string"
-            },
-            "harnessPhases": {"description":"Optional harness diagnostics, separate from the upstream active-flag enum.","items":{"$ref":"#/definitions/HarnessPhase"},"type":["array","null"]}
+            }
           },
           "required": [
             "activeFlags",
@@ -3574,6 +3626,17 @@
             "null"
           ]
         },
+        "dependencyGraph": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TurnTimingDependencyGraph"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Native causal envelopes. A partial graph retains reasons, not a claimed critical path; streaming forks and descendants need independent coverage."
+        },
         "deterministicContinuationReceiptOverflow": {
           "default": 0,
           "format": "uint32",
@@ -3625,6 +3688,9 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "measurementEvidence": {
+          "description": "Versioned identity-backed output/context evidence and explicit request classifications. Absence is legacy unknown, never a measured zero."
+        },
         "milestones": {
           "$ref": "#/definitions/TurnTimingMilestones"
         },
@@ -3675,6 +3741,9 @@
           },
           "description": "Provider usage observed on generations with no recorded progress kinds and unchanged relevant state. A changed next action alone is not progress under this predicate; useful inference or diagnosis may still occur. Final-answer publication is excluded. This observational diagnostic is neither measured avoidable savings nor authority to stop a turn."
         },
+        "performanceObservations": {
+          "description": "Same-clock native transport/connection observations and current-process resource accounting. Missing endpoints remain unknown. Explicit runner cohort labels do not independently certify matched workloads."
+        },
         "preFirstModelOutput": {
           "anyOf": [
             {
@@ -3687,6 +3756,9 @@
         },
         "profileValid": {
           "type": "boolean"
+        },
+        "recoveryTelemetry": {
+          "description": "Versioned physical-attempt capture and referenced recovery attribution."
         },
         "schemaVersion": {
           "format": "uint16",
@@ -3775,11 +3847,7 @@
         },
         "unions": {
           "$ref": "#/definitions/TurnTimingUnions"
-        },
-        "dependencyGraph": {"anyOf":[{"$ref":"#/definitions/TurnTimingDependencyGraph"},{"type":"null"}],"description":"Native causal envelopes. A partial graph retains reasons, not a claimed critical path; streaming forks and descendants need independent coverage."},
-        "measurementEvidence": {"description":"Versioned identity-backed output/context evidence and explicit request classifications. Absence is legacy unknown, never a measured zero."},
-        "recoveryTelemetry": {"description":"Versioned physical-attempt capture and referenced recovery attribution."},
-        "performanceObservations": {"description":"Same-clock native transport/connection observations and current-process resource accounting. Missing endpoints remain unknown. Explicit runner cohort labels do not independently certify matched workloads."}
+        }
       },
       "required": [
         "classificationComplete",
@@ -4142,6 +4210,7 @@
           "type": "integer"
         },
         "modelFallbackCount": {
+          "description": "Schema 37+: unique fallback entries. A subset of model_retry_count.",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -4159,6 +4228,7 @@
           "type": "integer"
         },
         "modelRetryCount": {
+          "description": "Schema 37+: unique physical retry/fallback transport entries, not plans.",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -4458,6 +4528,158 @@
         "relation"
       ],
       "type": "object"
+    },
+    "TurnTimingDependencyGraph": {
+      "description": "Bounded native task envelopes, not a prediction of achievable savings.",
+      "properties": {
+        "clockDomainId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "complete": {
+          "type": "boolean"
+        },
+        "durationNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "finishNode": {
+          "type": "string"
+        },
+        "includesDescendants": {
+          "type": "boolean"
+        },
+        "nodes": {
+          "items": {
+            "$ref": "#/definitions/TurnTimingDependencyNode"
+          },
+          "type": "array"
+        },
+        "schemaVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "startNode": {
+          "type": "string"
+        },
+        "startedAtNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "unavailableReasons": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "complete",
+        "durationNs",
+        "finishNode",
+        "includesDescendants",
+        "nodes",
+        "schemaVersion",
+        "startNode",
+        "startedAtNs",
+        "unavailableReasons"
+      ],
+      "type": "object"
+    },
+    "TurnTimingDependencyNode": {
+      "properties": {
+        "dependsOn": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "endNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "evidenceRef": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "inputIdentity": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/definitions/TurnTimingDependencyNodeKind"
+        },
+        "necessity": {
+          "description": "Explicit referenced assessment, never inferred from equal identities.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "necessityEvidence": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "repeatOf": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "samplingRequestId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "startNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "workIdentity": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "dependsOn",
+        "id",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "TurnTimingDependencyNodeKind": {
+      "enum": [
+        "boundary",
+        "model",
+        "tool",
+        "wait"
+      ],
+      "type": "string"
     },
     "TurnTimingDeterministicContinuationReceipt": {
       "properties": {
@@ -5258,6 +5480,13 @@
           ],
           "default": "primary"
         },
+        "cacheComparisonKey": {
+          "description": "Explicit controlled-run comparison key, not inferred from cache hits.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "completedMs": {
           "default": null,
           "format": "uint64",
@@ -5361,6 +5590,13 @@
         },
         "isContinuation": {
           "type": "boolean"
+        },
+        "logicalContextSha256": {
+          "description": "SHA256 of the full logical instructions/input/tools, before transport delta normalization, independently of optional heavy diagnostics.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "modelEmittedToolCallCount": {
           "default": 0,
@@ -5526,9 +5762,7 @@
         "unchangedRelevantState": {
           "default": false,
           "type": "boolean"
-        },
-        "cacheComparisonKey": {"description":"Explicit controlled-run comparison key, not inferred from cache hits.","type":["string","null"]},
-        "logicalContextSha256": {"description":"SHA256 of the full logical instructions/input/tools, before transport delta normalization, independently of optional heavy diagnostics.","type":["string","null"]}
+        }
       },
       "required": [
         "isContinuation"
@@ -6985,16 +7219,20 @@
           "type": "object"
         }
       ]
-    },
-    "ApprovalsReviewer": {"description":"Approval reviewer reported to API clients. This build supports user review only.","enum":["user"],"type":"string"},
-    "HarnessPhase": {"enum":["resourceResolution","diffTracker","workspaceGate","evidenceTracker","delivery","processCleanup","readyToSample"],"type":"string"},
-    "TurnTimingDependencyGraph": {"description":"Bounded native task envelopes, not a prediction of achievable savings.","properties":{"clockDomainId":{"type":["string","null"]},"complete":{"type":"boolean"},"durationNs":{"format":"uint64","minimum":0,"type":"integer"},"finishNode":{"type":"string"},"includesDescendants":{"type":"boolean"},"nodes":{"items":{"$ref":"#/definitions/TurnTimingDependencyNode"},"type":"array"},"schemaVersion":{"format":"uint16","minimum":0,"type":"integer"},"startNode":{"type":"string"},"startedAtNs":{"format":"uint64","minimum":0,"type":"integer"},"unavailableReasons":{"items":{"type":"string"},"type":"array"}},"required":["complete","durationNs","finishNode","includesDescendants","nodes","schemaVersion","startNode","startedAtNs","unavailableReasons"],"type":"object"},
-    "TurnTimingDependencyNode": {"properties":{"dependsOn":{"items":{"type":"string"},"type":"array"},"endNs":{"format":"uint64","minimum":0,"type":["integer","null"]},"evidenceRef":{"type":["string","null"]},"id":{"type":"string"},"inputIdentity":{"type":["string","null"]},"kind":{"$ref":"#/definitions/TurnTimingDependencyNodeKind"},"necessity":{"description":"Explicit referenced assessment, never inferred from equal identities.","type":["string","null"]},"necessityEvidence":{"items":{"type":"string"},"type":"array"},"repeatOf":{"type":["string","null"]},"samplingRequestId":{"type":["string","null"]},"startNs":{"format":"uint64","minimum":0,"type":["integer","null"]},"workIdentity":{"type":["string","null"]}},"required":["dependsOn","id","kind"],"type":"object"},
-    "TurnTimingDependencyNodeKind": {"enum":["boundary","model","tool","wait"],"type":"string"}
+    }
   },
   "properties": {
     "approvalPolicy": {
       "$ref": "#/definitions/AskForApproval"
+    },
+    "approvalsReviewer": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ApprovalsReviewer"
+        }
+      ],
+      "default": "user",
+      "description": "Reviewer currently used for approval requests on this thread."
     },
     "cwd": {
       "$ref": "#/definitions/AbsolutePathBuf"
@@ -7039,8 +7277,7 @@
     },
     "thread": {
       "$ref": "#/definitions/Thread"
-    },
-    "approvalsReviewer": {"allOf":[{"$ref":"#/definitions/ApprovalsReviewer"}],"default":"user","description":"Reviewer currently used for approval requests on this thread."}
+    }
   },
   "required": [
     "approvalPolicy",

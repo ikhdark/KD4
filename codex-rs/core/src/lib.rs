@@ -1,4 +1,5 @@
 //! Root of the `codex-core` library.
+//! See the [runtime navigation map](../README.md) for subsystem entry points.
 
 // The Windows transport future exceeds the default trait-solver recursion depth.
 #![recursion_limit = "256"]
@@ -48,6 +49,7 @@ pub mod exec_env;
 mod exec_policy;
 mod git_workspace;
 mod hook_runtime;
+mod hook_mcp_executor;
 pub(crate) use codex_model_client::image_preparation;
 mod installation_id;
 

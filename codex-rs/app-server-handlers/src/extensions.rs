@@ -25,12 +25,26 @@ pub(crate) fn thread_extensions(
 
 pub(crate) fn app_server_extension_event_sink(
     outgoing: Arc<OutgoingMessageSender>,
- ) -> Arc<dyn ExtensionEventSink> {
-    Arc::new(AppServerExtensionEventSink { outgoing })
+    thread_state_manager: crate::thread_state::ThreadStateManager,
+) -> Arc<dyn ExtensionEventSink> {
+    // Extension callbacks are synchronous. One bounded relay performs the
+    // asynchronous subscriber lookup; never spawn one task per warning.
+    let (warnings, mut pending) = tokio::sync::mpsc::channel::<(ThreadId, ServerNotification)>(32);
+    let outgoing = Arc::downgrade(&outgoing);
+    tokio::spawn(async move {
+        while let Some((thread_id, notification)) = pending.recv().await {
+            let Some(outgoing) = outgoing.upgrade() else { break; };
+            let recipients = thread_state_manager.subscribed_connection_ids(thread_id).await;
+            // Empty recipient lists mean broadcast to the generic sender.
+            if recipients.is_empty() { continue; }
+            outgoing.send_server_notification_to_connections(&recipients, notification).await;
+        }
+    });
+    Arc::new(AppServerExtensionEventSink { warnings })
 }
 
 struct AppServerExtensionEventSink {
-    outgoing: Arc<OutgoingMessageSender>,
+    warnings: tokio::sync::mpsc::Sender<(ThreadId, ServerNotification)>,
 }
 
 impl ExtensionEventSink for AppServerExtensionEventSink {
@@ -41,13 +55,12 @@ impl ExtensionEventSink for AppServerExtensionEventSink {
                     codex_protocol::timing::client_probe::key(&thread_id.to_string()),
                     codex_protocol::timing::client_probe::key(&warning.message),
                 ));
-                let accepted = self.outgoing
-                    .try_send_server_notification(ServerNotification::Warning(
-                        WarningNotification {
-                            thread_id: Some(thread_id.to_string()),
-                            message: warning.message,
-                        },
-                    ));
+                let accepted = self.warnings.try_send((thread_id, ServerNotification::Warning(
+                    WarningNotification {
+                        thread_id: Some(thread_id.to_string()),
+                        message: warning.message,
+                    },
+                ))).is_ok();
                 if let Some((thread, message)) = identity {
                     codex_protocol::timing::client_probe::record(120, 0, thread, 0, message,
                         [u64::from(accepted), 0, 0, 0]);

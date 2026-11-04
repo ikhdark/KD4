@@ -200,6 +200,8 @@ pub struct CodexThread {
     pub(crate) session_source: SessionSource,
     session_configured: SessionConfiguredEvent,
     rollout_path: Option<PathBuf>,
+    fallback_created_at: i64,
+    fallback_activity_at: std::sync::atomic::AtomicI64,
     out_of_band_elicitations: OutOfBandElicitationLeases,
     residency_gate: Arc<tokio::sync::RwLock<()>>,
 }
@@ -223,11 +225,14 @@ impl CodexThread {
     ) -> Self {
         let out_of_band_elicitations =
             OutOfBandElicitationLeases::new(codex.session.services.elicitations.clone());
+        let created_at = chrono::Utc::now().timestamp();
         Self {
             codex,
             session_source,
             session_configured,
             rollout_path,
+            fallback_created_at: created_at,
+            fallback_activity_at: std::sync::atomic::AtomicI64::new(created_at),
             out_of_band_elicitations,
             residency_gate: Arc::new(tokio::sync::RwLock::new(())),
         }
@@ -699,7 +704,29 @@ impl CodexThread {
     }
 
     pub async fn next_event(&self) -> CodexResult<Event> {
-        self.codex.next_event().await
+        let event = self.codex.next_event().await?;
+        if matches!(
+            &event.msg,
+            codex_protocol::protocol::EventMsg::UserMessage(_)
+                | codex_protocol::protocol::EventMsg::TurnStarted(_)
+                | codex_protocol::protocol::EventMsg::TurnComplete(_)
+                | codex_protocol::protocol::EventMsg::TurnAborted(_)
+        ) {
+            self.fallback_activity_at.fetch_max(
+                chrono::Utc::now().timestamp(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        Ok(event)
+    }
+
+    /// Stable runtime metadata when no persistent record exists. Reads are not activity.
+    pub fn fallback_metadata_timestamps(&self) -> (i64, i64) {
+        (
+            self.fallback_created_at,
+            self.fallback_activity_at
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     pub async fn agent_status(&self) -> AgentStatus {

@@ -2166,8 +2166,7 @@ pub struct AuthManager {
     enable_codex_api_key_env: bool,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
     keyring_backend_kind: AuthKeyringBackendKind,
-    forced_login_method: Option<ForcedLoginMethod>,
-    forced_chatgpt_workspace_id: RwLock<Option<Vec<String>>>,
+    forced_login_restrictions: RwLock<(Option<ForcedLoginMethod>, Option<Vec<String>>)>,
     managed_auth_policy: ManagedAuthPolicy,
     chatgpt_base_url: Option<String>,
     agent_identity_authapi_base_url: Option<String>,
@@ -2223,11 +2222,7 @@ impl Debug for AuthManager {
                 &self.auth_credentials_store_mode,
             )
             .field("keyring_backend_kind", &self.keyring_backend_kind)
-            .field("forced_login_method", &self.forced_login_method)
-            .field(
-                "forced_chatgpt_workspace_id",
-                &self.forced_chatgpt_workspace_id,
-            )
+            .field("forced_login_restrictions", &self.forced_login_restrictions)
             .field("managed_auth_policy", &self.managed_auth_policy)
             .field("chatgpt_base_url", &self.chatgpt_base_url)
             .field("auth_route_config", &self.auth_route_config)
@@ -2301,8 +2296,10 @@ impl AuthManager {
             enable_codex_api_key_env,
             auth_credentials_store_mode,
             keyring_backend_kind,
-            forced_login_method,
-            forced_chatgpt_workspace_id: RwLock::new(forced_chatgpt_workspace_id),
+            forced_login_restrictions: RwLock::new((
+                forced_login_method,
+                forced_chatgpt_workspace_id,
+            )),
             managed_auth_policy,
             chatgpt_base_url,
             agent_identity_authapi_base_url,
@@ -2334,8 +2331,7 @@ impl AuthManager {
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
             keyring_backend_kind: AuthKeyringBackendKind::default(),
-            forced_login_method: None,
-            forced_chatgpt_workspace_id: RwLock::new(None),
+            forced_login_restrictions: RwLock::new((None, None)),
             managed_auth_policy: ManagedAuthPolicy::default(),
             chatgpt_base_url: None,
             agent_identity_authapi_base_url: default_agent_identity_authapi_base_url(),
@@ -2858,6 +2854,8 @@ impl AuthManager {
                 "configuration-backed external auth cannot be replaced at runtime",
             ));
         }
+        // A policy rebind may have happened while resolving the provider.
+        self.validate_external_auth(&auth, &external_auth_source)?;
         source_slot.source = Some(external_auth_source.clone());
         source_slot.generation = Arc::new(());
         let generation = Arc::clone(&source_slot.generation);
@@ -2890,6 +2888,7 @@ impl AuthManager {
                 "external auth is already configured",
             ));
         }
+        self.validate_external_auth(&auth, &external_auth_source)?;
         source.source = Some(external_auth_source.clone());
         source.generation = Arc::new(());
         let generation = Arc::clone(&source.generation);
@@ -2909,18 +2908,62 @@ impl AuthManager {
     }
 
     pub fn set_forced_chatgpt_workspace_id(&self, workspace_id: Option<Vec<String>>) {
-        if let Ok(mut guard) = self.forced_chatgpt_workspace_id.write()
-            && *guard != workspace_id
+        if let Ok(mut guard) = self.forced_login_restrictions.write()
+            && guard.1 != workspace_id
         {
-            *guard = workspace_id;
+            guard.1 = workspace_id;
         }
     }
 
+    /// Credential-store ownership is process-scoped; do not report a successful
+    /// write to a new store while this manager still reads and retires the old one.
+    pub fn check_credential_store_config(
+        &self,
+        config: &impl AuthManagerConfig,
+    ) -> std::io::Result<()> {
+        if self.codex_home != config.codex_home()
+            || self.auth_credentials_store_mode != config.cli_auth_credentials_store_mode()
+            || self.keyring_backend_kind != config.auth_keyring_backend_kind()
+        {
+            return Err(std::io::Error::other(
+                "credential-store configuration changed; restart the app server before account operations",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Rebind user-configured restrictions without weakening managed requirements.
+    /// Source -> restrictions -> cache is the publication order; no IO or await
+    /// occurs under these locks. Retire in-flight loads before clearing the cache.
+    pub fn set_login_restrictions(
+        &self,
+        method: Option<ForcedLoginMethod>,
+        workspaces: Option<Vec<String>>,
+    ) -> std::io::Result<bool> {
+        let mut source = self.external_auth.write()
+            .map_err(|_| std::io::Error::other("external auth lock is poisoned"))?;
+        let mut restrictions = self.forced_login_restrictions.write()
+            .map_err(|_| std::io::Error::other("login restrictions lock is poisoned"))?;
+        if restrictions.0 == method && restrictions.1 == workspaces {
+            return Ok(false);
+        }
+        let mut cached = self.inner.write()
+            .map_err(|_| std::io::Error::other("auth lock is poisoned"))?;
+        *restrictions = (method, workspaces);
+        source.generation = Arc::new(());
+        cached.auth = None;
+        cached.permanent_refresh_failure = None;
+        cached.policy_epoch += 1;
+        cached.identity_epoch = cached.policy_epoch;
+        self.auth_change_tx.send_modify(|revision| *revision += 1);
+        Ok(true)
+    }
+
     pub fn forced_chatgpt_workspace_id(&self) -> Option<Vec<String>> {
-        self.forced_chatgpt_workspace_id
+        self.forced_login_restrictions
             .read()
             .ok()
-            .and_then(|guard| guard.clone())
+            .and_then(|guard| guard.1.clone())
     }
 
     pub fn effective_chatgpt_workspaces(&self) -> Option<Vec<String>> {
@@ -2929,17 +2972,21 @@ impl AuthManager {
     }
 
     pub fn is_login_method_allowed(&self, method: ForcedLoginMethod) -> bool {
+        let restrictions = self.forced_login_restrictions.read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.managed_auth_policy.allows_login_method(
             method,
-            self.forced_login_method,
-            self.forced_chatgpt_workspace_id().as_deref(),
+            restrictions.0,
+            restrictions.1.as_deref(),
         )
     }
 
     fn allowed_login_methods(&self) -> Vec<ForcedLoginMethod> {
+        let restrictions = self.forced_login_restrictions.read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.managed_auth_policy.allowed_login_methods(
-            self.forced_login_method,
-            self.forced_chatgpt_workspace_id().as_deref(),
+            restrictions.0,
+            restrictions.1.as_deref(),
         )
     }
 

@@ -12,7 +12,7 @@
       "type": "string"
     },
     "ToolRequestUserInputAnswer": {
-      "description": "EXPERIMENTAL. Captures a user's answer to a request_user_input question.",
+      "description": "Captures a user's answer to a request_user_input question.",
       "properties": {
         "answers": {
           "items": {
@@ -27,7 +27,7 @@
       "type": "object"
     }
   },
-  "description": "EXPERIMENTAL. Response payload mapping question ids to answers.",
+  "description": "Response payload mapping question ids to answers.",
   "properties": {
     "answers": {
       "additionalProperties": {

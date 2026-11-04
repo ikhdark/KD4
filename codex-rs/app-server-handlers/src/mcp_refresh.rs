@@ -3,7 +3,6 @@ use codex_core::CodexThread;
 use codex_core::ThreadManager;
 use codex_protocol::protocol::McpServerRefreshConfig;
 use futures::StreamExt;
-use futures::TryStreamExt;
 use std::io;
 use std::sync::Arc;
 use tracing::Instrument;
@@ -55,7 +54,8 @@ pub(crate) async fn queue_strict_refresh(
     // Poll independent plans concurrently, but retain enumeration/error order.
     // Dropping the stream on failure cancels unfinished planning; no refresh is
     // published until every required plan has succeeded.
-    let refreshes = futures::stream::iter(thread_ids.into_iter().map(|thread_id| async move {
+    let mut plans = futures::stream::iter(thread_ids.into_iter().enumerate().map(|(index, thread_id)| async move {
+        let result = async {
         let thread = thread_manager
             .get_thread(thread_id)
             .await
@@ -64,10 +64,20 @@ pub(crate) async fn queue_strict_refresh(
             .instrument(refresh_trace_span(refresh_id, Some(thread_id)))
             .await?;
         Ok::<_, io::Error>((thread_id, thread, config))
+        }.await;
+        (index, result)
     }))
-    .buffered(REFRESH_PLAN_CONCURRENCY)
-    .try_collect::<Vec<_>>()
-    .await?;
+    .buffer_unordered(REFRESH_PLAN_CONCURRENCY);
+    let mut ready = std::collections::BTreeMap::new();
+    let mut refreshes = Vec::new();
+    let mut next_index = 0;
+    while let Some((index, result)) = plans.next().await {
+        ready.insert(index, result);
+        while let Some(result) = ready.remove(&next_index) {
+            refreshes.push(result?);
+            next_index += 1;
+        }
+    }
     thread_manager
         .queue_mcp_server_refreshes_atomically(refreshes)
         .instrument(refresh_trace_span(refresh_id, None))
@@ -81,7 +91,7 @@ pub(crate) async fn queue_strict_refresh(
     clippy::await_holding_invalid_type,
     reason = "The runtime-refresh owner spans capture and publication so an older plan cannot overwrite a newer batch"
 )]
-pub(crate) async fn queue_best_effort_refresh(
+async fn queue_best_effort_refresh_owned(
     thread_manager: &Arc<ThreadManager>,
     config_manager: &ConfigManager,
 ) {
@@ -94,7 +104,8 @@ pub(crate) async fn queue_best_effort_refresh(
     let _refresh_guard = config_manager.lock_runtime_refresh().await;
     if refresh_trace_enabled() { tracing::info!(target: "codex_plugin_refresh", phase = "planning", refresh_id, config_generation = config_manager.policy_generation(), wait_us = started.elapsed().as_micros() as u64); }
     let thread_ids = thread_manager.list_thread_ids().await;
-    let plans = futures::stream::iter(thread_ids.into_iter().map(|thread_id| async move {
+    let mut plans = futures::stream::iter(thread_ids.into_iter().enumerate().map(|(index, thread_id)| async move {
+        let result = async {
         let thread = thread_manager.get_thread(thread_id).await
             .map_err(|err| format!("failed to load thread {thread_id} for MCP refresh: {err}"))?;
         let config = build_refresh_config(thread.as_ref(), config_manager, true)
@@ -102,11 +113,14 @@ pub(crate) async fn queue_best_effort_refresh(
             .await
             .map_err(|err| format!("failed to build MCP refresh config for thread {thread_id}: {err}"))?;
         Ok::<_, String>((thread_id, thread, config))
+        }.await;
+        (index, result)
     }))
-    .buffered(REFRESH_PLAN_CONCURRENCY)
+    .buffer_unordered(REFRESH_PLAN_CONCURRENCY)
     .collect::<Vec<_>>()
     .await;
-    let refreshes = plans.into_iter().filter_map(|plan| match plan {
+    plans.sort_by_key(|(index, _)| *index);
+    let refreshes = plans.into_iter().filter_map(|(_, plan)| match plan {
         Ok(plan) => Some(plan),
         Err(err) => { warn!("{err}"); None }
     }).collect();
@@ -119,6 +133,22 @@ pub(crate) async fn queue_best_effort_refresh(
         return;
     }
     if refresh_trace_enabled() { tracing::info!(target: "codex_plugin_refresh", phase = "queued", refresh_id, config_generation = config_manager.policy_generation(), elapsed_us = started.elapsed().as_micros() as u64); }
+}
+
+pub(crate) async fn queue_best_effort_refresh(
+    thread_manager: &Arc<ThreadManager>,
+    config_manager: &ConfigManager,
+) {
+    let thread_manager = Arc::clone(thread_manager);
+    let config_manager = config_manager.clone();
+    // Runtime feature reconciliation mutates live state while materializing
+    // plans. Once admitted, its owner must finish publication even if the
+    // lifecycle caller is canceled.
+    if let Err(error) = tokio::spawn(async move {
+        queue_best_effort_refresh_owned(&thread_manager, &config_manager).await;
+    }).await {
+        warn!("MCP reconciliation owner failed: {error}");
+    }
 }
 
 async fn build_refresh_config(

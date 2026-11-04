@@ -205,7 +205,11 @@ impl ToolExecutor<ToolInvocation> for ListFilesHandler {
                             message.push_str(&suggestions.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", "));
                         }
                     }
-                    return Err(FunctionCallError::RespondToModel(message));
+                    return Err(FunctionCallError::structured(
+                        codex_protocol::tool_failure::ToolFailure::no_effects(
+                            codex_protocol::tool_failure::ToolFailureCode::Failed, message,
+                        ).with_completed_execution(),
+                    ));
                 }
             };
             // read_file and list_files take native paths, not URIs. The

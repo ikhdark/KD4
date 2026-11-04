@@ -278,6 +278,11 @@ impl CommandExecRequestProcessor {
             ));
         }
 
+        if process_id.is_none() && (tty || stream_stdin || stream_stdout_stderr) {
+            return Err(invalid_request("command/exec tty or streaming requires a client-supplied processId"));
+        }
+        let timeout_ms = timeout_ms.map(|timeout| u64::try_from(timeout)
+            .map_err(|_| invalid_params(format!("command/exec timeoutMs must be non-negative, got {timeout}")))).transpose()?;
         let cwd = cwd.map_or_else(|| self.fallback_cwd.clone(), |cwd| self.fallback_cwd.join(cwd));
         // Resolve every execution setting from one effective snapshot. In particular,
         // sandbox setup and persisted permission changes must not leave one-off
@@ -324,7 +329,7 @@ impl CommandExecRequestProcessor {
             )?;
             for (key, value) in env_overrides {
                 #[cfg(windows)]
-                env.retain(|inherited_key, _| !inherited_key.eq_ignore_ascii_case(&key));
+                env.retain(|inherited_key, _| !super::process_exec_processor::environment_keys_equal(inherited_key, &key));
                 match value {
                     Some(value) => {
                         env.insert(key, value);
@@ -335,17 +340,6 @@ impl CommandExecRequestProcessor {
                 }
             }
         }
-        let timeout_ms = match timeout_ms {
-            Some(timeout_ms) => match u64::try_from(timeout_ms) {
-                Ok(timeout_ms) => Some(timeout_ms),
-                Err(_) => {
-                    return Err(invalid_params(format!(
-                        "command/exec timeoutMs must be non-negative, got {timeout_ms}"
-                    )));
-                }
-            },
-            None => None,
-        };
         let windows_sandbox_level = WindowsSandboxLevel::from_config(&config);
         let output_bytes_cap = if disable_output_cap {
             None

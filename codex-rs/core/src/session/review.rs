@@ -173,6 +173,11 @@ pub(super) async fn spawn_review_thread(
         start_fence: None,
     }];
     let tc = Arc::new(review_turn_context);
+    if !tc.config.ephemeral {
+        tc.turn_timing_state.bind_detail_archive(
+            &tc.config.codex_home, &sess.thread_id.to_string(), &tc.sub_id,
+        );
+    }
     tc.turn_timing_state
         .bind_live_phase_events(tc.sub_id.clone(), sess.tx_event.clone());
     if tc.environments.single_local_environment_cwd().is_some() {

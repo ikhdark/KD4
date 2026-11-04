@@ -1664,7 +1664,15 @@
               "type": "string"
             },
             "params": {
-              "type": "null"
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "maxProperties": 0,
+                  "type": "object"
+                }
+              ]
             }
           },
           "required": [
@@ -1807,7 +1815,15 @@
               "type": "string"
             },
             "params": {
-              "type": "null"
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "maxProperties": 0,
+                  "type": "object"
+                }
+              ]
             }
           },
           "required": [
@@ -1926,7 +1942,15 @@
               "type": "string"
             },
             "params": {
-              "type": "null"
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "maxProperties": 0,
+                  "type": "object"
+                }
+              ]
             }
           },
           "required": [
@@ -2021,7 +2045,15 @@
               "type": "string"
             },
             "params": {
-              "type": "null"
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "maxProperties": 0,
+                  "type": "object"
+                }
+              ]
             }
           },
           "required": [
@@ -2044,7 +2076,15 @@
               "type": "string"
             },
             "params": {
-              "type": "null"
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "maxProperties": 0,
+                  "type": "object"
+                }
+              ]
             }
           },
           "required": [
@@ -2091,7 +2131,15 @@
               "type": "string"
             },
             "params": {
-              "type": "null"
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "maxProperties": 0,
+                  "type": "object"
+                }
+              ]
             }
           },
           "required": [
@@ -2114,7 +2162,15 @@
               "type": "string"
             },
             "params": {
-              "type": "null"
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "maxProperties": 0,
+                  "type": "object"
+                }
+              ]
             }
           },
           "required": [
@@ -2357,7 +2413,15 @@
               "type": "string"
             },
             "params": {
-              "type": "null"
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "maxProperties": 0,
+                  "type": "object"
+                }
+              ]
             }
           },
           "required": [
@@ -2428,7 +2492,15 @@
               "type": "string"
             },
             "params": {
-              "type": "null"
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "maxProperties": 0,
+                  "type": "object"
+                }
+              ]
             }
           },
           "required": [
@@ -3647,7 +3719,6 @@
       "additionalProperties": false,
       "properties": {
         "default": {
-          "format": "double",
           "type": [
             "number",
             "null"
@@ -3660,14 +3731,12 @@
           ]
         },
         "maximum": {
-          "format": "double",
           "type": [
             "number",
             "null"
           ]
         },
         "minimum": {
-          "format": "double",
           "type": [
             "number",
             "null"
@@ -3834,19 +3903,40 @@
       "type": "string"
     },
     "McpElicitationTitledEnumItems": {
-      "additionalProperties": false,
-      "properties": {
-        "anyOf": {
-          "items": {
-            "$ref": "#/definitions/McpElicitationConstOption"
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "anyOf": {
+              "items": {
+                "$ref": "#/definitions/McpElicitationConstOption"
+              },
+              "type": "array"
+            }
           },
-          "type": "array"
+          "required": [
+            "anyOf"
+          ],
+          "title": "AnyOfMcpElicitationTitledEnumItems",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "oneOf": {
+              "items": {
+                "$ref": "#/definitions/McpElicitationConstOption"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "oneOf"
+          ],
+          "title": "OneOfMcpElicitationTitledEnumItems",
+          "type": "object"
         }
-      },
-      "required": [
-        "anyOf"
-      ],
-      "type": "object"
+      ]
     },
     "McpElicitationTitledMultiSelectEnumSchema": {
       "additionalProperties": false,
@@ -4455,9 +4545,12 @@
         },
         {
           "format": "int64",
+          "maximum": 9007199254740991.0,
+          "minimum": -9007199254740991.0,
           "type": "integer"
         }
       ],
+      "description": "A request identifier. Numeric IDs must be integers in the inclusive range -9007199254740991 to 9007199254740991 (JavaScript safe integers). Use a string ID outside this range to preserve identity in JavaScript clients.",
       "title": "RequestId"
     },
     "RequestPermissionProfile": {
@@ -5103,7 +5196,7 @@
           "type": "object"
         },
         {
-          "description": "EXPERIMENTAL - proposed plan streaming deltas for plan items.",
+          "description": "Proposed plan streaming deltas for plan items.",
           "properties": {
             "method": {
               "enum": [
@@ -5880,7 +5973,7 @@
           "type": "object"
         },
         {
-          "description": "EXPERIMENTAL - Request input from the user for a tool call.",
+          "description": "Request input from the user for a tool call.",
           "properties": {
             "id": {
               "$ref": "#/definitions/v2/RequestId"
@@ -6157,7 +6250,7 @@
       "type": "object"
     },
     "ToolRequestUserInputAnswer": {
-      "description": "EXPERIMENTAL. Captures a user's answer to a request_user_input question.",
+      "description": "Captures a user's answer to a request_user_input question.",
       "properties": {
         "answers": {
           "items": {
@@ -6172,7 +6265,7 @@
       "type": "object"
     },
     "ToolRequestUserInputOption": {
-      "description": "EXPERIMENTAL. Defines a single selectable option for request_user_input.",
+      "description": "Defines a single selectable option for request_user_input.",
       "properties": {
         "description": {
           "type": "string"
@@ -6189,7 +6282,7 @@
     },
     "ToolRequestUserInputParams": {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "description": "EXPERIMENTAL. Params sent with a request_user_input event.",
+      "description": "Params sent with a request_user_input event.",
       "properties": {
         "autoResolutionMs": {
           "default": null,
@@ -6226,7 +6319,7 @@
       "type": "object"
     },
     "ToolRequestUserInputQuestion": {
-      "description": "EXPERIMENTAL. Represents one request_user_input question and its required options.",
+      "description": "Represents one request_user_input question and its required options.",
       "properties": {
         "header": {
           "type": "string"
@@ -6264,7 +6357,7 @@
     },
     "ToolRequestUserInputResponse": {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "description": "EXPERIMENTAL. Response payload mapping question ids to answers.",
+      "description": "Response payload mapping question ids to answers.",
       "properties": {
         "answers": {
           "additionalProperties": {
@@ -6892,7 +6985,7 @@
         "type": "object"
       },
       "AppBranding": {
-        "description": "EXPERIMENTAL - app metadata returned by app-list APIs.",
+        "description": "App metadata returned by app-list APIs.",
         "properties": {
           "category": {
             "type": [
@@ -6981,7 +7074,7 @@
         "type": "object"
       },
       "AppInfo": {
-        "description": "EXPERIMENTAL - app metadata returned by app-list APIs.",
+        "description": "App metadata returned by app-list APIs.",
         "properties": {
           "appMetadata": {
             "anyOf": [
@@ -7091,7 +7184,7 @@
       },
       "AppListUpdatedNotification": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "EXPERIMENTAL - notification emitted when the app list changes.",
+        "description": "Notification emitted when the app list changes.",
         "properties": {
           "data": {
             "items": {
@@ -7231,7 +7324,7 @@
         "type": "object"
       },
       "AppSummary": {
-        "description": "EXPERIMENTAL - app metadata summary for plugin responses.",
+        "description": "App metadata summary for plugin responses.",
         "properties": {
           "category": {
             "type": [
@@ -7364,7 +7457,7 @@
         "type": "object"
       },
       "AppToolSummary": {
-        "description": "EXPERIMENTAL - metadata returned by app/read.",
+        "description": "Metadata returned by app/read.",
         "properties": {
           "description": {
             "type": "string"
@@ -7387,6 +7480,13 @@
       },
       "AppToolsConfig": {
         "type": "object"
+      },
+      "ApprovalsReviewer": {
+        "description": "Approval reviewer reported to API clients. This build supports user review only.",
+        "enum": [
+          "user"
+        ],
+        "type": "string"
       },
       "AppsConfig": {
         "properties": {
@@ -7469,7 +7569,7 @@
       },
       "AppsListParams": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "EXPERIMENTAL - list available apps/connectors.",
+        "description": "List available apps/connectors.",
         "properties": {
           "cursor": {
             "description": "Opaque pagination cursor returned by a previous call.",
@@ -7504,7 +7604,7 @@
       },
       "AppsListResponse": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "EXPERIMENTAL - app list response.",
+        "description": "App list response.",
         "properties": {
           "data": {
             "items": {
@@ -7528,7 +7628,7 @@
       },
       "AppsReadParams": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "EXPERIMENTAL - read metadata for specific apps/connectors.",
+        "description": "Read metadata for specific apps/connectors.",
         "properties": {
           "appIds": {
             "description": "App ids to read. The server accepts at most 100 ids and deduplicates repeated ids while preserving their first-request order.",
@@ -7550,7 +7650,7 @@
       },
       "AppsReadResponse": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "EXPERIMENTAL - app/read response.",
+        "description": "App/read response.",
         "properties": {
           "apps": {
             "items": {
@@ -9498,6 +9598,49 @@
           },
           {
             "properties": {
+              "input": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "server": {
+                "type": "string"
+              },
+              "statusMessage": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "timeoutSec": {
+                "format": "uint64",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "tool": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "mcp_tool"
+                ],
+                "title": "McpToolConfiguredHookHandlerType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "input",
+              "server",
+              "tool",
+              "type"
+            ],
+            "title": "McpToolConfiguredHookHandler",
+            "type": "object"
+          },
+          {
+            "properties": {
               "type": {
                 "enum": [
                   "prompt"
@@ -9551,7 +9694,7 @@
         "type": "object"
       },
       "ConnectorMetadata": {
-        "description": "EXPERIMENTAL - metadata returned by app/read.",
+        "description": "Metadata returned by app/read.",
         "properties": {
           "description": {
             "type": [
@@ -10867,7 +11010,19 @@
             "$ref": "#/definitions/v2/PatchChangeKind"
           },
           "path": {
+            "description": "Legacy display spelling. Prefer `pathUri` for non-Unicode native paths.",
             "type": "string"
+          },
+          "pathUri": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/PathUri"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Lossless identity when native path text cannot be represented in JSON."
           }
         },
         "required": [
@@ -11568,6 +11723,18 @@
         },
         "type": "object"
       },
+      "HarnessPhase": {
+        "enum": [
+          "resourceResolution",
+          "diffTracker",
+          "workspaceGate",
+          "evidenceTracker",
+          "delivery",
+          "processCleanup",
+          "readyToSample"
+        ],
+        "type": "string"
+      },
       "HookCompletedNotification": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
@@ -11633,7 +11800,8 @@
         "enum": [
           "command",
           "prompt",
-          "agent"
+          "agent",
+          "mcpTool"
         ],
         "type": "string"
       },
@@ -13333,6 +13501,12 @@
             "items": true,
             "type": "array"
           },
+          "isError": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "structuredContent": true
         },
         "required": [
@@ -14233,7 +14407,7 @@
       },
       "PlanDeltaNotification": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "EXPERIMENTAL - proposed plan streaming deltas for plan items. Clients should not assume concatenated deltas match the completed plan item content.",
+        "description": "Proposed plan streaming deltas for plan items. Clients should not assume concatenated deltas match the completed plan item content.",
         "properties": {
           "delta": {
             "type": "string"
@@ -16235,9 +16409,12 @@
           },
           {
             "format": "int64",
+            "maximum": 9007199254740991.0,
+            "minimum": -9007199254740991.0,
             "type": "integer"
           }
-        ]
+        ],
+        "description": "A request identifier. Numeric IDs must be integers in the inclusive range -9007199254740991 to 9007199254740991 (JavaScript safe integers). Use a string ID outside this range to preserve identity in JavaScript clients."
       },
       "ResidencyRequirement": {
         "enum": [
@@ -18291,7 +18468,13 @@
         ],
         "type": "object"
       },
-      "ThreadActiveFlag": {"enum":["waitingOnApproval","waitingOnUserInput"],"type":"string"},
+      "ThreadActiveFlag": {
+        "enum": [
+          "waitingOnApproval",
+          "waitingOnUserInput"
+        ],
+        "type": "string"
+      },
       "ThreadArchiveParams": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
@@ -18517,6 +18700,15 @@
           "approvalPolicy": {
             "$ref": "#/definitions/v2/AskForApproval"
           },
+          "approvalsReviewer": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/ApprovalsReviewer"
+              }
+            ],
+            "default": "user",
+            "description": "Reviewer currently used for approval requests on this thread."
+          },
           "cwd": {
             "$ref": "#/definitions/v2/AbsolutePathBuf"
           },
@@ -18560,8 +18752,7 @@
           },
           "thread": {
             "$ref": "#/definitions/v2/Thread"
-          },
-          "approvalsReviewer": {"allOf":[{"$ref":"#/definitions/v2/ApprovalsReviewer"}],"default":"user","description":"Reviewer currently used for approval requests on this thread."}
+          }
         },
         "required": [
           "approvalPolicy",
@@ -18712,7 +18903,7 @@
             "type": "object"
           },
           {
-            "description": "EXPERIMENTAL - proposed plan item content. The completed plan item is authoritative and may not match the concatenation of `PlanDelta` text.",
+            "description": "Proposed plan item content. The completed plan item is authoritative and may not match the concatenation of `PlanDelta` text.",
             "properties": {
               "id": {
                 "type": "string"
@@ -19000,7 +19191,7 @@
                 "type": "string"
               },
               "mcpAppResourceUri": {
-                "description": "Deprecated: use `appContext.resourceUri` instead.",
+                "description": "Prefer `appContext.resourceUri` when app context is available. This field remains supported for calls without a connector identity.",
                 "type": [
                   "string",
                   "null"
@@ -20265,6 +20456,15 @@
           "approvalPolicy": {
             "$ref": "#/definitions/v2/AskForApproval"
           },
+          "approvalsReviewer": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/ApprovalsReviewer"
+              }
+            ],
+            "default": "user",
+            "description": "Reviewer currently used for approval requests on this thread."
+          },
           "cwd": {
             "$ref": "#/definitions/v2/AbsolutePathBuf"
           },
@@ -20308,8 +20508,7 @@
           },
           "thread": {
             "$ref": "#/definitions/v2/Thread"
-          },
-          "approvalsReviewer": {"allOf":[{"$ref":"#/definitions/v2/ApprovalsReviewer"}],"default":"user","description":"Reviewer currently used for approval requests on this thread."}
+          }
         },
         "required": [
           "approvalPolicy",
@@ -20429,6 +20628,15 @@
           "approvalPolicy": {
             "$ref": "#/definitions/v2/AskForApproval"
           },
+          "approvalsReviewer": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/ApprovalsReviewer"
+              }
+            ],
+            "default": "user",
+            "description": "Reviewer currently used for approval requests on this thread."
+          },
           "collaborationMode": {
             "$ref": "#/definitions/v2/CollaborationMode"
           },
@@ -20489,8 +20697,7 @@
                 "type": "null"
               }
             ]
-          },
-          "approvalsReviewer": {"allOf":[{"$ref":"#/definitions/v2/ApprovalsReviewer"}],"default":"user","description":"Reviewer currently used for approval requests on this thread."}
+          }
         },
         "required": [
           "approvalPolicy",
@@ -20687,6 +20894,15 @@
           "approvalPolicy": {
             "$ref": "#/definitions/v2/AskForApproval"
           },
+          "approvalsReviewer": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/ApprovalsReviewer"
+              }
+            ],
+            "default": "user",
+            "description": "Reviewer currently used for approval requests on this thread."
+          },
           "cwd": {
             "$ref": "#/definitions/v2/AbsolutePathBuf"
           },
@@ -20730,8 +20946,7 @@
           },
           "thread": {
             "$ref": "#/definitions/v2/Thread"
-          },
-          "approvalsReviewer": {"allOf":[{"$ref":"#/definitions/v2/ApprovalsReviewer"}],"default":"user","description":"Reviewer currently used for approval requests on this thread."}
+          }
         },
         "required": [
           "approvalPolicy",
@@ -20822,14 +21037,23 @@
                 },
                 "type": "array"
               },
+              "harnessPhases": {
+                "description": "Optional harness diagnostics, separate from the upstream active-flag enum.",
+                "items": {
+                  "$ref": "#/definitions/v2/HarnessPhase"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
               "type": {
                 "enum": [
                   "active"
                 ],
                 "title": "ActiveThreadStatusType",
                 "type": "string"
-              },
-              "harnessPhases": {"description":"Optional harness diagnostics, separate from the upstream active-flag enum.","items":{"$ref":"#/definitions/v2/HarnessPhase"},"type":["array","null"]}
+              }
             },
             "required": [
               "activeFlags",
@@ -22131,6 +22355,17 @@
               "null"
             ]
           },
+          "dependencyGraph": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/TurnTimingDependencyGraph"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Native causal envelopes. A partial graph retains reasons, not a claimed critical path; streaming forks and descendants need independent coverage."
+          },
           "deterministicContinuationReceiptOverflow": {
             "default": 0,
             "format": "uint32",
@@ -22182,6 +22417,9 @@
             "minimum": 0.0,
             "type": "integer"
           },
+          "measurementEvidence": {
+            "description": "Versioned identity-backed output/context evidence and explicit request classifications. Absence is legacy unknown, never a measured zero."
+          },
           "milestones": {
             "$ref": "#/definitions/v2/TurnTimingMilestones"
           },
@@ -22232,6 +22470,9 @@
             },
             "description": "Provider usage observed on generations with no recorded progress kinds and unchanged relevant state. A changed next action alone is not progress under this predicate; useful inference or diagnosis may still occur. Final-answer publication is excluded. This observational diagnostic is neither measured avoidable savings nor authority to stop a turn."
           },
+          "performanceObservations": {
+            "description": "Same-clock native transport/connection observations and current-process resource accounting. Missing endpoints remain unknown. Explicit runner cohort labels do not independently certify matched workloads."
+          },
           "preFirstModelOutput": {
             "anyOf": [
               {
@@ -22244,6 +22485,9 @@
           },
           "profileValid": {
             "type": "boolean"
+          },
+          "recoveryTelemetry": {
+            "description": "Versioned physical-attempt capture and referenced recovery attribution."
           },
           "schemaVersion": {
             "format": "uint16",
@@ -22332,11 +22576,7 @@
           },
           "unions": {
             "$ref": "#/definitions/v2/TurnTimingUnions"
-          },
-          "dependencyGraph": {"anyOf":[{"$ref":"#/definitions/v2/TurnTimingDependencyGraph"},{"type":"null"}],"description":"Native causal envelopes. A partial graph retains reasons, not a claimed critical path; streaming forks and descendants need independent coverage."},
-          "measurementEvidence": {"description":"Versioned identity-backed output/context evidence and explicit request classifications. Absence is legacy unknown, never a measured zero."},
-          "recoveryTelemetry": {"description":"Versioned physical-attempt capture and referenced recovery attribution."},
-          "performanceObservations": {"description":"Same-clock native transport/connection observations and current-process resource accounting. Missing endpoints remain unknown. Explicit runner cohort labels do not independently certify matched workloads."}
+          }
         },
         "required": [
           "classificationComplete",
@@ -22699,6 +22939,7 @@
             "type": "integer"
           },
           "modelFallbackCount": {
+            "description": "Schema 37+: unique fallback entries. A subset of model_retry_count.",
             "format": "uint32",
             "minimum": 0.0,
             "type": "integer"
@@ -22716,6 +22957,7 @@
             "type": "integer"
           },
           "modelRetryCount": {
+            "description": "Schema 37+: unique physical retry/fallback transport entries, not plans.",
             "format": "uint32",
             "minimum": 0.0,
             "type": "integer"
@@ -23015,6 +23257,158 @@
           "relation"
         ],
         "type": "object"
+      },
+      "TurnTimingDependencyGraph": {
+        "description": "Bounded native task envelopes, not a prediction of achievable savings.",
+        "properties": {
+          "clockDomainId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "complete": {
+            "type": "boolean"
+          },
+          "durationNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "finishNode": {
+            "type": "string"
+          },
+          "includesDescendants": {
+            "type": "boolean"
+          },
+          "nodes": {
+            "items": {
+              "$ref": "#/definitions/v2/TurnTimingDependencyNode"
+            },
+            "type": "array"
+          },
+          "schemaVersion": {
+            "format": "uint16",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "startNode": {
+            "type": "string"
+          },
+          "startedAtNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "unavailableReasons": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "complete",
+          "durationNs",
+          "finishNode",
+          "includesDescendants",
+          "nodes",
+          "schemaVersion",
+          "startNode",
+          "startedAtNs",
+          "unavailableReasons"
+        ],
+        "type": "object"
+      },
+      "TurnTimingDependencyNode": {
+        "properties": {
+          "dependsOn": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "endNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "evidenceRef": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "inputIdentity": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "$ref": "#/definitions/v2/TurnTimingDependencyNodeKind"
+          },
+          "necessity": {
+            "description": "Explicit referenced assessment, never inferred from equal identities.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "necessityEvidence": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "repeatOf": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "samplingRequestId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "startNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "workIdentity": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "dependsOn",
+          "id",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "TurnTimingDependencyNodeKind": {
+        "enum": [
+          "boundary",
+          "model",
+          "tool",
+          "wait"
+        ],
+        "type": "string"
       },
       "TurnTimingDeterministicContinuationReceipt": {
         "properties": {
@@ -23815,6 +24209,13 @@
             ],
             "default": "primary"
           },
+          "cacheComparisonKey": {
+            "description": "Explicit controlled-run comparison key, not inferred from cache hits.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "completedMs": {
             "default": null,
             "format": "uint64",
@@ -23918,6 +24319,13 @@
           },
           "isContinuation": {
             "type": "boolean"
+          },
+          "logicalContextSha256": {
+            "description": "SHA256 of the full logical instructions/input/tools, before transport delta normalization, independently of optional heavy diagnostics.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "modelEmittedToolCallCount": {
             "default": 0,
@@ -24083,9 +24491,7 @@
           "unchangedRelevantState": {
             "default": false,
             "type": "boolean"
-          },
-          "cacheComparisonKey": {"description":"Explicit controlled-run comparison key, not inferred from cache hits.","type":["string","null"]},
-          "logicalContextSha256": {"description":"SHA256 of the full logical instructions/input/tools, before transport delta normalization, independently of optional heavy diagnostics.","type":["string","null"]}
+          }
         },
         "required": [
           "isContinuation"
@@ -25891,12 +26297,7 @@
           "okOverridden"
         ],
         "type": "string"
-      },
-      "ApprovalsReviewer": {"description":"Approval reviewer reported to API clients. This build supports user review only.","enum":["user"],"type":"string"},
-      "HarnessPhase": {"enum":["resourceResolution","diffTracker","workspaceGate","evidenceTracker","delivery","processCleanup","readyToSample"],"type":"string"},
-      "TurnTimingDependencyGraph": {"description":"Bounded native task envelopes, not a prediction of achievable savings.","properties":{"clockDomainId":{"type":["string","null"]},"complete":{"type":"boolean"},"durationNs":{"format":"uint64","minimum":0,"type":"integer"},"finishNode":{"type":"string"},"includesDescendants":{"type":"boolean"},"nodes":{"items":{"$ref":"#/definitions/v2/TurnTimingDependencyNode"},"type":"array"},"schemaVersion":{"format":"uint16","minimum":0,"type":"integer"},"startNode":{"type":"string"},"startedAtNs":{"format":"uint64","minimum":0,"type":"integer"},"unavailableReasons":{"items":{"type":"string"},"type":"array"}},"required":["complete","durationNs","finishNode","includesDescendants","nodes","schemaVersion","startNode","startedAtNs","unavailableReasons"],"type":"object"},
-      "TurnTimingDependencyNode": {"properties":{"dependsOn":{"items":{"type":"string"},"type":"array"},"endNs":{"format":"uint64","minimum":0,"type":["integer","null"]},"evidenceRef":{"type":["string","null"]},"id":{"type":"string"},"inputIdentity":{"type":["string","null"]},"kind":{"$ref":"#/definitions/v2/TurnTimingDependencyNodeKind"},"necessity":{"description":"Explicit referenced assessment, never inferred from equal identities.","type":["string","null"]},"necessityEvidence":{"items":{"type":"string"},"type":"array"},"repeatOf":{"type":["string","null"]},"samplingRequestId":{"type":["string","null"]},"startNs":{"format":"uint64","minimum":0,"type":["integer","null"]},"workIdentity":{"type":["string","null"]}},"required":["dependsOn","id","kind"],"type":"object"},
-      "TurnTimingDependencyNodeKind": {"enum":["boundary","model","tool","wait"],"type":"string"}
+      }
     }
   },
   "title": "CodexAppServerProtocol",

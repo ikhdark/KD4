@@ -43,6 +43,11 @@ pub enum ToolExposure {
     /// model tool while excluding it from the nested code-mode tool surface.
     DirectModelOnly,
 
+    /// Keep a legacy callable available for exact dispatch and Code Mode
+    /// resolution, without advertising another direct or searchable tool.
+    /// Unlike Hidden, this retains the nested runtime contract.
+    Compatibility,
+
     /// Keep this tool registered for dispatch without exposing it to the model.
     Hidden,
 }

@@ -8,11 +8,13 @@ use codex_tools::JsonSchema;
 use codex_tools::JsonToolOutput;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolName;
+use codex_tools::ToolOutput;
 use codex_tools::ToolSpec;
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::FunctionCallError;
+use crate::session::turn_context::TurnEnvironment;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
@@ -23,6 +25,55 @@ use crate::tools::registry::ToolExecutor;
 
 pub(crate) struct GitInspectionHandler {
     pub(crate) range: bool,
+}
+
+/// The common authorization/startup boundary for native read-only Git tools.
+/// Keep operation schemas and cancellation owners separate: status may wait for
+/// changes, while the other operations are bounded immediate observations.
+pub(super) async fn prepare_git_read(
+    invocation: &ToolInvocation,
+    environment_id: Option<&str>,
+    label: &str,
+    restriction: &str,
+) -> Result<TurnEnvironment, FunctionCallError> {
+    let environment = wait_for_tool_environment(
+        &invocation.step_context.environments,
+        environment_id,
+        &invocation.cancellation_token,
+    )
+    .await?
+    .ok_or_else(|| {
+        FunctionCallError::RespondToModel(format!(
+            "{label} requires a selected local environment"
+        ))
+    })?;
+    if environment.environment.is_remote()
+        || !invocation
+            .step_context
+            .turn
+            .file_system_sandbox_policy()
+            .has_full_disk_read_access()
+    {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "{label} requires a local environment with full disk read access; {restriction}"
+        )));
+    }
+    crate::tools::parallel::wait_for_workspace_baseline().await;
+    Ok(environment)
+}
+
+/// Preserve the same exact-result contract for direct and Code Mode calls.
+pub(super) fn git_read_output(
+    mut value: serde_json::Value,
+    environment_id: &str,
+    invocation: &ToolInvocation,
+    delivery_error: impl FnOnce() -> String,
+) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
+    value["environment_id"] = json!(environment_id);
+    let output = JsonToolOutput::new(value);
+    crate::tools::context::ensure_exact_model_delivery(&output, invocation)
+        .map_err(|_| FunctionCallError::RespondToModel(delivery_error()))?;
+    Ok(boxed_tool_output(output))
 }
 
 /// Omitted (max_patch_bytes, max_files) keep a complete direct response within
@@ -40,6 +91,8 @@ const DEFAULT_MAX_COMMITS: usize = 50;
 #[serde(deny_unknown_fields)]
 struct Arguments {
     comparison: Option<DiffComparison>,
+    #[serde(default)]
+    include_history: bool,
     base: Option<String>,
     head: Option<String>,
     #[serde(default)]
@@ -83,12 +136,13 @@ impl ToolExecutor<ToolInvocation> for GitInspectionHandler {
             ("max_files".to_string(), bounded(1, 1000, format!("Maximum file records returned; default {default_files}. Totals cover the full selected endpoint diff, even if records/patch are truncated."))),
             ("environment_id".to_string(), JsonSchema::string(Some("Selected local execution environment; full disk read access required.".into()))),
         ]);
+        properties.insert("traversal".to_string(), JsonSchema::string_enum(vec![json!("all_parents"), json!("first_parent")], Some("Default all_parents. History only: selects base..head reachability traversal; merges included once, no per-commit diffs/statistics are summed.".into())));
+        properties.insert("max_commits".to_string(), bounded(1, 1000, format!("History only: maximum topologically ordered commit records returned; default {DEFAULT_MAX_COMMITS}. total_commits is separate.")));
         let required = if self.range {
-            properties.insert("traversal".to_string(), JsonSchema::string_enum(vec![json!("all_parents"), json!("first_parent")], Some("Default all_parents. Selects base..head reachability traversal; merges included once, no per-commit diffs/statistics are summed.".into())));
-            properties.insert("max_commits".to_string(), bounded(1, 1000, format!("Maximum topologically ordered commit records returned; default {DEFAULT_MAX_COMMITS}. total_commits is separate.")));
             vec!["base".to_string(), "head".to_string()]
         } else {
             properties.insert("comparison".to_string(), JsonSchema::string_enum(vec![json!("staged"), json!("unstaged"), json!("revisions")], Some("Required. staged: captured HEAD (or unborn empty tree) to live index; unstaged: live index to working tree; revisions: explicit base/head commit trees. Never combines staged and unstaged.".into())));
+            properties.insert("include_history".to_string(), JsonSchema::boolean(Some("Default false. With comparison:revisions and explicit base/head, also summarize base..head commits, ancestry/merge bases and shallow-history uncertainty. Returns the commit-range result with endpoint_diff separate from reachability history; paths limit only that diff. Enables traversal/max_commits, excludes source_ranges, and defaults max_patch_bytes/max_files to 8192/30 instead of 16384/50. Reversions can have commits but no endpoint changes; statistics are never summed across commits.".into())));
             properties.insert("source_ranges".to_string(), JsonSchema::object(BTreeMap::from([
                 ("context_lines".into(), bounded(0, 100, "Surrounding lines per hunk side; default 3. Both source and patch use this context.".into())),
                 ("max_bytes".into(), bounded(0, 131_072, "Maximum combined old/new source text bytes; default 16384. Whole hunks only, at most 1000 returned; omitted ranges remain explicitly incomplete. Independent of max_patch_bytes.".into())),
@@ -99,7 +153,7 @@ impl ToolExecutor<ToolInvocation> for GitInspectionHandler {
         let purpose = if self.range {
             "Summarize base..head commits separately from the base-tree to head-tree endpoint diff. Reversions can produce commits with zero endpoint changes. Ancestry booleans, all merge bases, shallow-history uncertainty and all-parent/first-parent traversal are explicit. Non-ancestor ranges are allowed; paths never filter commits. No per-commit statistics are summed."
         } else {
-            "Inspect one explicit Git comparison: staged, unstaged, or two immutable revisions. Optional source_ranges resolves hunks into exact old/new source text and line ranges with configurable context from the SAME Git capture, binding each side to its path/mode/blob OID, including deletions and renames. Zero line_count denotes an anchor, not a source line. Working-tree blob IDs identify captured normalized content, not stored/recoverable objects or current raw bytes. diff_sha256 binds the full capture even when patch/files are truncated; use source_ranges.if_diff_sha256 with matching paths/context to reject stale coordinates. Binary/non-UTF-8/non-regular source ranges remain explicitly unavailable; pure renames/mode changes have no source hunks. Coverage is only changed lines with context, never complete behavioral review or read_file history/retention credit. Returns comparison endpoints, status/modes/raw OIDs, rename similarity, binary flags and exact Git patch hunks; never reconstructs diffs from turn patch tracking."
+            "Inspect one explicit Git comparison: staged, unstaged, or two immutable revisions. For revisions, include_history:true also returns the base..head commit-range summary with endpoint_diff separate from commit history; traversal/max_commits apply only to history. Otherwise optional source_ranges resolves hunks into exact old/new source text and line ranges with configurable context from the SAME Git capture, binding each side to its path/mode/blob OID, including deletions and renames. Zero line_count denotes an anchor, not a source line. Working-tree blob IDs identify captured normalized content, not stored/recoverable objects or current raw bytes. diff_sha256 binds the full capture even when patch/files are truncated; use source_ranges.if_diff_sha256 with matching paths/context to reject stale coordinates. Binary/non-UTF-8/non-regular source ranges remain explicitly unavailable; pure renames/mode changes have no source hunks. Coverage is only changed lines with context, never complete behavioral review or read_file history/retention credit. Returns comparison endpoints, status/modes/raw OIDs, rename similarity, binary flags and exact Git patch hunks; never reconstructs diffs from turn patch tracking."
         };
         ToolSpec::Function(ResponsesApiTool {
             name: if self.range {
@@ -114,7 +168,11 @@ impl ToolExecutor<ToolInvocation> for GitInspectionHandler {
             strict: false,
             defer_loading: None,
             parameters: JsonSchema::object(properties, Some(required), Some(false.into())),
-            output_schema: Some(output_schema(self.range).into()),
+            output_schema: Some(if self.range {
+                output_schema(true)
+            } else {
+                json!({"oneOf": [output_schema(false), output_schema(true)]})
+            }.into()),
         })
     }
 
@@ -126,8 +184,10 @@ impl ToolExecutor<ToolInvocation> for GitInspectionHandler {
                 ));
             };
             let args: Arguments = parse_arguments(arguments)?;
-            if self.range && (args.comparison.is_some() || args.source_ranges.is_some())
-                || !self.range && (args.traversal.is_some() || args.max_commits.is_some())
+            let range = self.range || args.include_history;
+            if self.range && (args.comparison.is_some() || args.include_history)
+                || range && args.source_ranges.is_some()
+                || !range && (args.traversal.is_some() || args.max_commits.is_some())
             {
                 return Err(FunctionCallError::RespondToModel(
                     "arguments do not match the selected Git inspection tool".into(),
@@ -140,33 +200,24 @@ impl ToolExecutor<ToolInvocation> for GitInspectionHandler {
                     FunctionCallError::RespondToModel("comparison is required".into())
                 })?
             };
-            let environment = wait_for_tool_environment(
-                &invocation.step_context.environments,
-                args.environment_id.as_deref(),
-                &invocation.cancellation_token,
-            )
-            .await?
-            .ok_or_else(|| {
-                FunctionCallError::RespondToModel(
-                    "Git inspection requires a selected local environment".into(),
-                )
-            })?;
-            if environment.environment.is_remote()
-                || !invocation
-                    .step_context
-                    .turn
-                    .file_system_sandbox_policy()
-                    .has_full_disk_read_access()
-            {
-                return Err(FunctionCallError::RespondToModel("Git inspection requires a local environment with full disk read access; remote/restricted reads are unsupported".into()));
+            if args.include_history && !matches!(comparison, DiffComparison::Revisions) {
+                return Err(FunctionCallError::RespondToModel(
+                    "include_history requires comparison:revisions with base and head".into(),
+                ));
             }
-            crate::tools::parallel::wait_for_workspace_baseline().await;
+            let environment = prepare_git_read(
+                &invocation,
+                args.environment_id.as_deref(),
+                "Git inspection",
+                "remote/restricted reads are unsupported",
+            )
+            .await?;
             let cwd = environment
                 .cwd()
                 .to_abs_path()
                 .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
                 .to_path_buf();
-            let (default_patch, default_files) = default_limits(self.range);
+            let (default_patch, default_files) = default_limits(range);
             let request = DiffRequest {
                 comparison,
                 base: args.base,
@@ -177,7 +228,7 @@ impl ToolExecutor<ToolInvocation> for GitInspectionHandler {
                 source_ranges: args.source_ranges,
             };
             let operation = async {
-                if self.range {
+                if range {
                     serde_json::to_value(
                         codex_git_utils::summarize_commit_range(
                             cwd,
@@ -192,25 +243,23 @@ impl ToolExecutor<ToolInvocation> for GitInspectionHandler {
                 }
                 .map_err(|error| error.to_string())
             };
-            let mut output = tokio::select! {
+            let output = tokio::select! {
                 _ = invocation.cancellation_token.cancelled() => return Err(FunctionCallError::RespondToModel("Git inspection cancelled; no repository writes were requested".into())),
                 result = operation => result.map_err(FunctionCallError::RespondToModel)?,
             };
-            output["environment_id"] = json!(environment.environment_id);
-            let output = JsonToolOutput::new(output);
-            crate::tools::context::ensure_exact_model_delivery(&output, &invocation).map_err(
-                |_| {
-                    FunctionCallError::RespondToModel(format!(
-                        "Git inspection result exceeds the current model delivery budget; nothing was delivered. Retry with smaller {} or narrower paths.",
-                        if self.range {
-                            "max_patch_bytes, max_files or max_commits"
-                        } else {
-                            "max_patch_bytes or max_files"
-                        }
-                    ))
-                },
-            )?;
-            Ok(boxed_tool_output(output))
+            git_read_output(
+                output,
+                &environment.environment_id,
+                &invocation,
+                || format!(
+                    "Git inspection result exceeds the current model delivery budget; nothing was delivered. Retry with smaller {} or narrower paths.",
+                    if range {
+                        "max_patch_bytes, max_files or max_commits"
+                    } else {
+                        "max_patch_bytes or max_files"
+                    }
+                ),
+            )
         })
     }
 }

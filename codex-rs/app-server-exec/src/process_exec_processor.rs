@@ -100,7 +100,7 @@ fn log_process_spawn_request(params: &ProcessSpawnParams) {
 pub struct ProcessExecRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     environment_manager: Arc<EnvironmentManager>,
-    sessions: Arc<Mutex<HashMap<ConnectionProcessHandle, ProcessSession>>>,
+    sessions: Arc<Mutex<crate::command_exec::ConnectionSessionMap<ConnectionProcessHandle, ProcessSession>>>,
     run_tasks: tokio_util::task::TaskTracker,
 }
 
@@ -145,7 +145,11 @@ impl ProcessExecRequestProcessor {
         if size.is_some() && !tty {
             return Err(invalid_params("process/spawn size requires tty: true"));
         }
-        let mut env = std::env::vars().collect::<HashMap<_, _>>();
+        let mut env = std::env::vars_os().map(|(key, value)| {
+            let key = key.into_string().map_err(|_| internal_error("inherited environment contains a non-Unicode name"))?;
+            let value = value.into_string().map_err(|_| internal_error("inherited environment contains a non-Unicode value"))?;
+            Ok((key, value))
+        }).collect::<Result<HashMap<_, _>, JSONRPCErrorError>>()?;
         if let Some(env_overrides) = env_overrides {
             #[cfg(windows)]
             validate_environment_override_keys(&env_overrides, method_name)?;
@@ -154,7 +158,7 @@ impl ProcessExecRequestProcessor {
                 // the inherited spelling before applying either an unset or a
                 // replacement, so duplicate spellings cannot win during spawn.
                 #[cfg(windows)]
-                env.retain(|inherited_key, _| !inherited_key.eq_ignore_ascii_case(&key));
+                env.retain(|inherited_key, _| !environment_keys_equal(inherited_key, &key));
                 match value {
                     Some(value) => {
                         env.insert(key, value);
@@ -259,6 +263,10 @@ struct ConnectionProcessHandle {
     process_handle: String,
 }
 
+impl crate::command_exec::ConnectionSessionKey for ConnectionProcessHandle {
+    fn connection_id(&self) -> ConnectionId { self.connection_id }
+}
+
 #[derive(Clone)]
 struct ProcessSession {
     control_tx: mpsc::Sender<ProcessControlRequest>,
@@ -308,7 +316,7 @@ struct RunProcessParams {
 }
 
 struct ProcessTerminalCleanup {
-    sessions: Arc<Mutex<HashMap<ConnectionProcessHandle, ProcessSession>>>,
+    sessions: Arc<Mutex<crate::command_exec::ConnectionSessionMap<ConnectionProcessHandle, ProcessSession>>>,
     process_key: ConnectionProcessHandle,
 }
 
@@ -359,11 +367,6 @@ impl ProcessExecRequestProcessor {
             .try_commit(|| self.run_tasks.token())
             .ok_or_else(|| invalid_request("connection is closed"))?;
 
-        let Some((program, args)) = command.split_first() else {
-            return Err(internal_error(
-                "validated process command unexpectedly empty",
-            ));
-        };
         let stream_stdin = tty || stream_stdin;
         let stream_stdout_stderr = tty || stream_stdout_stderr;
         let arg0 = None;
@@ -396,6 +399,12 @@ impl ProcessExecRequestProcessor {
                 .ok_or_else(|| invalid_request("connection is closed"))??;
         }
 
+        let sessions = Arc::clone(&self.sessions);
+        // An RPC cancellation drops only the waiter, never the reservation owner.
+        let spawn_owner = tokio::spawn(async move {
+        let Some((program, args)) = command.split_first() else {
+            return Err(internal_error("validated process command unexpectedly empty"));
+        };
         let spawned = if tty {
             codex_utils_pty::spawn_pty_process(
                 program,
@@ -415,12 +424,11 @@ impl ProcessExecRequestProcessor {
         let spawned = match spawned {
             Ok(spawned) => spawned,
             Err(err) => {
-                self.sessions.lock().await.remove(&process_key);
+                sessions.lock().await.remove(&process_key);
                 return Err(internal_error(format!("failed to spawn process: {err}")));
             }
         };
 
-        let sessions = Arc::clone(&self.sessions);
         let response_outgoing = Arc::clone(&outgoing);
         let response_request_id = request_id.clone();
         let (response_enqueued_tx, response_enqueued_rx) = oneshot::channel();
@@ -452,7 +460,9 @@ impl ProcessExecRequestProcessor {
             .await;
         let _ = response_enqueued_tx.send(());
 
-        Ok(())
+        Ok::<_, JSONRPCErrorError>(())
+        });
+        spawn_owner.await.map_err(|err| internal_error(format!("process spawn owner failed: {err}")))?
     }
 
     async fn write_stdin(
@@ -467,10 +477,9 @@ impl ProcessExecRequestProcessor {
             ));
         }
 
-        let delta = match params.delta_base64 {
-            Some(delta_base64) => crate::command_exec::decode_stdin_delta(&delta_base64)?,
-            None => Vec::new(),
-        };
+        if let Some(encoded) = params.delta_base64.as_deref() {
+            crate::command_exec::validate_stdin_delta_length(encoded)?;
+        }
 
         let process_key = ConnectionProcessHandle {
             connection_id: request_id.connection_id,
@@ -483,22 +492,24 @@ impl ProcessExecRequestProcessor {
             .get(&process_key)
             .cloned()
             .ok_or_else(|| no_active_process_error(&process_key.process_handle))?;
+        let busy = || invalid_request("process stdin write queue is full; retry after a pending write completes");
+        let slot = session.write_slots.try_acquire_owned().map_err(|_| busy())?;
+        let write_permit = session.write_tx.try_reserve_owned().map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => busy(),
+            mpsc::error::TrySendError::Closed(_) => process_no_longer_running_error(&process_key.process_handle),
+        })?;
+        let delta = params.delta_base64.as_deref().map(crate::command_exec::decode_stdin_delta).transpose()?.unwrap_or_default();
         let outgoing = Arc::clone(&self.outgoing);
         let cancellation = rpc_gate.cancellation_token();
         // Keep FIFO admission in the process lane, then transfer the potentially
         // backpressured acknowledgement to the existing connection task owner.
         drop(rpc_gate.spawn_with_commit(|| {
-            let busy = || invalid_request("process stdin write queue is full; retry after a pending write completes");
-            let slot = session.write_slots.try_acquire_owned().map_err(|_| busy())?;
             let (response_tx, response_rx) = oneshot::channel();
-            session.write_tx.try_send(StdinWriteRequest {
+            write_permit.send(StdinWriteRequest {
                 delta,
                 close_stdin: params.close_stdin,
                 response_tx: Some(response_tx),
-            }).map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => busy(),
-                mpsc::error::TrySendError::Closed(_) => process_no_longer_running_error(&process_key.process_handle),
-            })?;
+            });
             Ok::<_, JSONRPCErrorError>(async move {
                 // Waiting response deliveries count against the same finite limit.
                 let _slot = slot;
@@ -556,19 +567,7 @@ impl ProcessExecRequestProcessor {
 
     async fn close_connection_processes(&self, connection_id: ConnectionId) {
         let controls = {
-            let mut sessions = self.sessions.lock().await;
-            let process_handles = sessions
-                .keys()
-                .filter(|process_handle| process_handle.connection_id == connection_id)
-                .cloned()
-                .collect::<Vec<_>>();
-            let mut controls = Vec::with_capacity(process_handles.len());
-            for process_handle in process_handles {
-                if let Some(control) = sessions.remove(&process_handle) {
-                    controls.push(control);
-                }
-            }
-            controls
+            self.sessions.lock().await.remove_connection(connection_id)
         };
 
         futures::future::join_all(controls.into_iter().map(|control| async move {
@@ -646,8 +645,10 @@ async fn run_process(params: RunProcessParams) {
         exit_rx,
     } = spawned;
     let session = Arc::new(session);
-    tokio::pin!(exit_rx);
+    let native_exit = crate::command_exec::observe_process_exit(Arc::clone(&session), exit_rx);
+    tokio::pin!(native_exit);
     let mut expiration_outcome = None;
+    let mut termination_retry = None;
     let (stdio_timeout_tx, stdio_timeout_rx) = watch::channel(false);
     let stdin_writer_handle = spawn_stdin_writer(
         Arc::clone(&session),
@@ -683,6 +684,32 @@ async fn run_process(params: RunProcessParams) {
 
     let exit_code = loop {
         tokio::select! {
+            biased;
+            exit = &mut native_exit => {
+                break if matches!(expiration_outcome, Some(ExecExpirationOutcome::TimedOut)) {
+                    EXEC_TIMEOUT_EXIT_CODE
+                } else { exit };
+            }
+            outcome = &mut expiration, if expiration_outcome.is_none() => {
+                if let Some(code) = session.exit_code() { break code; }
+                expiration_outcome = Some(outcome);
+                termination_retry = Some(tokio::time::Instant::now() + Duration::from_secs(1));
+                if let Err(error) = session.request_terminate() {
+                    tracing::warn!(%process_handle, %error, cleanup_pending = true,
+                        "expired process termination failed; native exit remains unconfirmed");
+                }
+            }
+            _ = async {
+                if let Some(deadline) = termination_retry {
+                    tokio::time::sleep_until(deadline).await;
+                } else { std::future::pending::<()>().await; }
+            } => {
+                if let Err(error) = session.request_terminate() {
+                    tracing::warn!(%process_handle, %error, cleanup_pending = true,
+                        "automatic process termination failed; native exit remains unconfirmed and cleanup will retry");
+                }
+                termination_retry = Some(tokio::time::Instant::now() + Duration::from_secs(1));
+            }
             delivered = &mut response_barrier, if !response_processed => {
                 response_processed = true;
                 if delivered {
@@ -693,6 +720,7 @@ async fn run_process(params: RunProcessParams) {
             }
             _ = connection_cancellation.cancelled(), if !connection_cancelled => {
                 connection_cancelled = true;
+                termination_retry = Some(tokio::time::Instant::now() + Duration::from_secs(1));
                 if let Err(error) = session.request_terminate() {
                     tracing::warn!(
                         process_handle = %process_handle,
@@ -723,23 +751,14 @@ async fn run_process(params: RunProcessParams) {
                     },
                     None => {
                         control_open = false;
+                        termination_retry = Some(tokio::time::Instant::now() + Duration::from_secs(1));
                         let _ = session.request_terminate();
                     }
                 }
             }
-            outcome = &mut expiration, if expiration_outcome.is_none() => {
-                expiration_outcome = Some(outcome);
-                let _ = session.request_terminate();
-            }
-            exit = &mut exit_rx => {
-                if matches!(expiration_outcome, Some(ExecExpirationOutcome::TimedOut)) {
-                    break EXEC_TIMEOUT_EXIT_CODE;
-                } else {
-                    break exit.unwrap_or(-1);
-                }
-            }
         }
     };
+    drop(control_rx);
     stdin_writer_handle.abort();
     let _ = stdin_writer_handle.await;
 
@@ -823,6 +842,7 @@ fn collect_spawn_process_output(
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::new();
         let mut cap = OutputByteCap::new(output_bytes_cap);
+        let mut delivered_prefix = 0;
         let streaming_requested = stream_output;
         let mut response_processed = response_ready.is_cancelled();
         let mut pending_cap_signal = false;
@@ -839,23 +859,31 @@ fn collect_spawn_process_output(
             }
             let mut chunk = tokio::select! {
                 permit = &mut capacity, if stream_output && response_processed
-                    && (!buffer.is_empty() || pending_cap_signal) => {
+                    && (delivered_prefix < buffer.len() || pending_cap_signal) => {
                     if let Some(permit) = permit {
+                        let end = (delivered_prefix + OUTPUT_CHUNK_SIZE_HINT).min(buffer.len());
                         permit.send(OutgoingEnvelope::ToConnection {
                             connection_id,
                             message: OutgoingMessage::AppServerNotification(
                                 ServerNotification::ProcessOutputDelta(ProcessOutputDeltaNotification {
                                     process_handle: process_handle.clone(),
                                     stream,
-                                    delta_base64: STANDARD.encode(&buffer),
-                                    cap_reached: pending_cap_signal,
+                                    delta_base64: STANDARD.encode(&buffer[delivered_prefix..end]),
+                                    cap_reached: pending_cap_signal && end == buffer.len(),
                                 }),
                             ),
                             write_complete_tx: None,
                         });
                         // Admission and suffix retirement have no intervening await.
-                        buffer.clear();
-                        pending_cap_signal = false;
+                        delivered_prefix = end;
+                        if end == buffer.len() {
+                            buffer.clear();
+                            delivered_prefix = 0;
+                            pending_cap_signal = false;
+                        } else if delivered_prefix >= buffer.len() - delivered_prefix {
+                            buffer.drain(..delivered_prefix);
+                            delivered_prefix = 0;
+                        }
                         capacity.set(outgoing.reserve_server_notification_capacity(&connection_cancellation));
                     } else {
                         // Cancellation/shutdown/queue closure is terminal. Temporary
@@ -880,15 +908,14 @@ fn collect_spawn_process_output(
                     break;
                 },
             };
-            while chunk.len() < OUTPUT_CHUNK_SIZE_HINT
-                && let Ok(next_chunk) = output_rx.try_recv()
-            {
-                chunk.extend_from_slice(&next_chunk);
-            }
+            let discard = cap.truncated();
+            chunk = crate::command_exec::coalesce_output_batch(chunk, &mut output_rx, discard);
+            if discard { continue; }
             let (capped_chunk, cap_reached) = cap.accept(&chunk);
             buffer.extend_from_slice(capped_chunk);
             pending_cap_signal |= cap_reached;
         }
+        if delivered_prefix > 0 { buffer.drain(..delivered_prefix); }
         ProcessOutputCapture {
             reached_eof,
             base64: (streaming_requested && !buffer.is_empty()).then(|| STANDARD.encode(&buffer)),
@@ -914,16 +941,40 @@ pub(super) fn validate_environment_override_keys(
     method_name: &str,
 ) -> Result<(), JSONRPCErrorError> {
     let mut keys = overrides.keys().collect::<Vec<_>>();
-    keys.sort_unstable();
-    let mut names = std::collections::HashSet::new();
-    for key in keys {
-        if !names.insert(key.to_ascii_lowercase()) {
+    if keys.iter().any(|key| key.encode_utf16().count() > 32767) {
+        return Err(invalid_params(format!("{method_name} environment name is too long")));
+    }
+    keys.sort_by(|left, right| compare_environment_keys(left, right));
+    for pair in keys.windows(2) {
+        if environment_keys_equal(pair[0], pair[1]) {
             return Err(invalid_params(format!(
-                "{method_name} env contains conflicting case-insensitive key {key:?}"
+                "{method_name} env contains conflicting case-insensitive key {:?}", pair[1]
             )));
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn compare_environment_keys(left: &str, right: &str) -> std::cmp::Ordering {
+    let left = left.encode_utf16().collect::<Vec<_>>();
+    let right = right.encode_utf16().collect::<Vec<_>>();
+    // SAFETY: Both counted UTF-16 buffers remain live; the RPC admission limit
+    // bounds their lengths well below i32::MAX.
+    let order = unsafe { windows_sys::Win32::Globalization::CompareStringOrdinal(
+        left.as_ptr(), left.len() as i32, right.as_ptr(), right.len() as i32, 1,
+    ) };
+    match order {
+        1 => std::cmp::Ordering::Less,
+        2 => std::cmp::Ordering::Equal,
+        3 => std::cmp::Ordering::Greater,
+        _ => left.cmp(&right),
+    }
+}
+
+#[cfg(windows)]
+pub(super) fn environment_keys_equal(left: &str, right: &str) -> bool {
+    compare_environment_keys(left, right) == std::cmp::Ordering::Equal
 }
 
 fn no_active_process_error(process_handle: &str) -> JSONRPCErrorError {

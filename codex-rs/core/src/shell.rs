@@ -89,6 +89,19 @@ pub struct Shell {
     pub(crate) shell_path: PathBuf,
 }
 
+/// Shared command-tool policy: an explicit request cannot enable disabled profiles.
+pub(crate) fn resolve_use_login_shell(
+    login: Option<bool>,
+    allow_login_shell: bool,
+) -> Result<bool, String> {
+    if !allow_login_shell && login == Some(true) {
+        return Err(
+            "login shell is disabled by config; omit `login` or set it to false.".to_string(),
+        );
+    }
+    Ok(login.unwrap_or(allow_login_shell))
+}
+
 impl Shell {
     pub fn name(&self) -> &'static str {
         self.shell_type.name()

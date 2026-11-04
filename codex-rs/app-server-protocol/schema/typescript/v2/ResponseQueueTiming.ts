@@ -7,4 +7,4 @@
  * Sums include only enqueued/dequeued events; cancellation can censor a send
  * or leave events queued. Terminal receipt is independent of provider usage.
  */
-export type ResponseQueueTiming = { enqueuedEvents: bigint, dequeuedEvents: bigint, enqueueWaitNs: bigint, queueResidenceNs: bigint, maxEnqueueWaitNs: bigint, maxQueueResidenceNs: bigint, terminalReceived: boolean, };
+export type ResponseQueueTiming = { enqueuedEvents: number, dequeuedEvents: number, enqueueWaitNs: number, queueResidenceNs: number, maxEnqueueWaitNs: number, maxQueueResidenceNs: number, terminalReceived: boolean, };

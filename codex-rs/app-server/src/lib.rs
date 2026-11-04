@@ -33,6 +33,7 @@ use crate::connection_cleanup::ConnectionCleanupTasks;
 use codex_app_server_handlers::MessageProcessor;
 use codex_app_server_handlers::MessageProcessorArgs;
 use crate::outgoing_message::ConnectionId;
+use crate::outgoing_message::ConnectionRequestId;
 use crate::outgoing_message::OutgoingEnvelope;
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::QueuedOutgoingMessage;
@@ -57,6 +58,8 @@ use codex_analytics::AppServerRpcTransport;
 use codex_app_server_protocol_types::ConfigWarningNotification;
 use codex_app_server_protocol_types::JSONRPCMessage;
 use codex_app_server_protocol_types::JSONRPCRequest;
+use codex_app_server_protocol_types::OverloadReason;
+use codex_app_server_protocol_types::overloaded_error;
 use codex_app_server_protocol_types::RemoteControlStatusChangedNotification;
 use codex_app_server_protocol_types::ServerNotification;
 use codex_config::ConfigLayerSource;
@@ -186,6 +189,21 @@ enum OutboundControlEvent {
     DisconnectAll,
 }
 
+fn apply_outbound_control(
+    connections: &mut HashMap<ConnectionId, OutboundConnectionState>,
+    event: OutboundControlEvent,
+) {
+    match event {
+        OutboundControlEvent::Opened { connection_id, state } => {
+            connections.insert(connection_id, state);
+        }
+        OutboundControlEvent::Closed { connection_id } => {
+            connections.remove(&connection_id);
+        }
+        OutboundControlEvent::DisconnectAll => connections.clear(),
+    }
+}
+
 fn prepare_connection(
     connection_id: ConnectionId,
     origin: transport::ConnectionOrigin,
@@ -268,6 +286,7 @@ async fn process_connection_request(
 struct ShutdownState {
     requested: bool,
     forced: bool,
+    timed_out: bool,
     signal_listener_failed: bool,
     deadline: Option<tokio::time::Instant>,
     last_logged_running_turn_count: Option<usize>,
@@ -351,6 +370,7 @@ impl ShutdownState {
             .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
         {
             self.forced = true;
+            self.timed_out = true;
             warn!("app-server shared shutdown deadline expired; forcing cleanup");
         }
         if self.forced || running_turn_count == 0 {
@@ -400,12 +420,14 @@ impl ShutdownState {
                     Err(error) => {
                         self.signal_listener_failed = true;
                         warn!(%error, "shutdown signal listener failed during cleanup; retaining shared deadline");
-                        self.forced = tokio::time::timeout_at(deadline, &mut cleanup).await.is_err();
+                        self.timed_out = tokio::time::timeout_at(deadline, &mut cleanup).await.is_err();
+                        self.forced = self.timed_out;
                     }
                 }
             }
             _ = tokio::time::sleep_until(deadline) => {
                 self.forced = true;
+                self.timed_out = true;
                 warn!("app-server shared shutdown deadline expired during cleanup");
             }
             _ = &mut cleanup => {}
@@ -499,6 +521,33 @@ pub async fn run_main(
     session_source: SessionSource,
     auth: AppServerWebsocketAuthSettings,
     runtime_options: AppServerRuntimeOptions,
+) -> IoResult<()> {
+    // The caller observes a retained supervisor rather than owning raw task
+    // handles. Dropping this future requests graceful drain, never detaches
+    // processor/transport cleanup without a shutdown owner.
+    let caller_cancelled = CancellationToken::new();
+    let _cancel_on_drop = caller_cancelled.clone().drop_guard();
+    tokio::spawn(run_main_owned(
+        arg0_paths, cli_config_overrides, loader_overrides, strict_config,
+        default_analytics_enabled, transport, session_source, auth,
+        runtime_options, caller_cancelled,
+    ))
+    .await
+    .map_err(|error| std::io::Error::other(format!("app-server supervisor failed: {error}")))?
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_main_owned(
+    arg0_paths: Arg0DispatchPaths,
+    cli_config_overrides: CliConfigOverrides,
+    loader_overrides: LoaderOverrides,
+    strict_config: bool,
+    default_analytics_enabled: bool,
+    transport: AppServerTransport,
+    session_source: SessionSource,
+    auth: AppServerWebsocketAuthSettings,
+    runtime_options: AppServerRuntimeOptions,
+    caller_cancelled: CancellationToken,
 ) -> IoResult<()> {
     let loader_overrides = loader_overrides_with_test_user_config_file(
         loader_overrides,
@@ -642,11 +691,12 @@ pub async fn run_main(
     // Admission shares one budget, with signal supervision already active while
     // waiting. Dropping any wait releases its guards; no native lock wait survives.
     let startup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    let startup_signal = async {
-        if runtime_options.install_shutdown_signal_handler {
-            startup_shutdown_signal(tokio::signal::ctrl_c()).await
-        } else {
-            std::future::pending::<()>().await
+    let startup_cancellation = caller_cancelled.clone();
+    let startup_signal = async move {
+        tokio::select! {
+            _ = startup_cancellation.cancelled() => {}
+            _ = startup_shutdown_signal(tokio::signal::ctrl_c()),
+                if runtime_options.install_shutdown_signal_handler => {}
         }
     };
     tokio::pin!(startup_signal);
@@ -658,12 +708,21 @@ pub async fn run_main(
                     result.map_err(|_| std::io::Error::new(ErrorKind::TimedOut, "app-server startup admission timed out"))??,
                 _ = &mut startup_signal => return Err(std::io::Error::new(ErrorKind::Interrupted, "app-server startup cancelled")),
             };
-            prepare_control_socket_path(socket_path.as_path()).await?;
+            tokio::select! {
+                result = tokio::time::timeout_at(startup_deadline, prepare_control_socket_path(socket_path.as_path())) =>
+                    result.map_err(|_| std::io::Error::new(ErrorKind::TimedOut, "app-server socket preparation timed out"))??,
+                _ = &mut startup_signal => return Err(std::io::Error::new(ErrorKind::Interrupted, "app-server startup cancelled")),
+            }
             Some(startup_lock)
         }
         _ => None,
     };
-    let state_db_init = match init_sqlite_state_db_with_fresh_start_on_corruption(&config).await {
+    let state_db_init_result = tokio::select! {
+        result = tokio::time::timeout_at(startup_deadline, init_sqlite_state_db_with_fresh_start_on_corruption(&config)) =>
+            result.map_err(|_| std::io::Error::new(ErrorKind::TimedOut, "app-server database admission timed out"))?,
+        _ = &mut startup_signal => return Err(std::io::Error::new(ErrorKind::Interrupted, "app-server startup cancelled")),
+    };
+    let state_db_init = match state_db_init_result {
         Ok(state_db_init) => state_db_init,
         Err(err) => {
             return Err(std::io::Error::other(format!(
@@ -682,7 +741,12 @@ pub async fn run_main(
         });
     }
 
-    if let Ok(Some(err)) = check_execpolicy_for_warnings(&config.config_layer_stack).await {
+    let execpolicy_warning = tokio::select! {
+        result = tokio::time::timeout_at(startup_deadline, check_execpolicy_for_warnings(&config.config_layer_stack)) =>
+            result.map_err(|_| std::io::Error::new(ErrorKind::TimedOut, "app-server exec-policy admission timed out"))?,
+        _ = &mut startup_signal => return Err(std::io::Error::new(ErrorKind::Interrupted, "app-server startup cancelled")),
+    };
+    if let Ok(Some(err)) = execpolicy_warning {
         config_warnings.push(exec_policy_config_warning(&err));
     }
 
@@ -752,14 +816,16 @@ pub async fn run_main(
     };
     let transport_shutdown_token = CancellationToken::new();
     let force_shutdown_token = CancellationToken::new();
+    let shutdown_timed_out = Arc::new(AtomicBool::new(false));
     let (shutdown_observation_tx, shutdown_observation_rx) =
-        oneshot::channel::<futures::future::BoxFuture<'static, ()>>();
+        oneshot::channel::<futures::future::BoxFuture<'static, bool>>();
     let mut transport_accept_handles = Vec::<JoinHandle<()>>::new();
 
     let single_client_mode = matches!(&transport, AppServerTransport::Stdio);
     let shutdown_when_no_connections = single_client_mode;
-    let graceful_signal_restart_enabled =
-        runtime_options.install_shutdown_signal_handler && !single_client_mode;
+    // Startup may have registered Ctrl-C even for stdio. Keep ownership in
+    // steady state instead of leaving Tokio's process-wide listener unserviced.
+    let graceful_signal_restart_enabled = runtime_options.install_shutdown_signal_handler;
     let mut app_server_client_name_rx = None;
 
     match &transport {
@@ -883,48 +949,60 @@ pub async fn run_main(
 
     let outbound_handle = tokio::spawn(async move {
         let mut outbound_connections = HashMap::<ConnectionId, OutboundConnectionState>::new();
-        loop {
+        let mut delivery_tasks = tokio::task::JoinSet::new();
+        let mut controls_open = true;
+        let mut output_open = true;
+        while controls_open || output_open {
             outbound_connections.retain(|_, state| !state.is_disconnected());
             tokio::select! {
-                    biased;
-                    event = outbound_control_rx.recv() => {
-                        let Some(event) = event else {
-                            break;
-                        };
-                        match event {
-                            OutboundControlEvent::Opened {
-                                connection_id,
-                                state,
-                            } => {
-                                outbound_connections.insert(connection_id, state);
-                            }
-                            OutboundControlEvent::Closed { connection_id } => {
-                                outbound_connections.remove(&connection_id);
-                            }
-                            OutboundControlEvent::DisconnectAll => {
-                                info!(
-                                    "disconnecting {} outbound websocket connection(s) for graceful restart",
-                                    outbound_connections.len()
-                                );
-                                for connection_state in outbound_connections.values() {
-                                    connection_state.request_disconnect();
-                                }
-                                outbound_connections.clear();
+                event = outbound_control_rx.recv(), if controls_open => {
+                    match event {
+                        Some(event) => apply_outbound_control(&mut outbound_connections, event),
+                        None => controls_open = false,
+                    }
+                }
+                envelope = outgoing_rx.recv(), if output_open => {
+                    let Some(envelope) = envelope else {
+                        output_open = false;
+                        continue;
+                    };
+                    // Register any earlier Opened before its first payload, but
+                    // bound control work so churn cannot starve existing clients.
+                    for _ in 0..CHANNEL_CAPACITY {
+                        match outbound_control_rx.try_recv() {
+                            Ok(event) => apply_outbound_control(&mut outbound_connections, event),
+                            Err(mpsc::error::TryRecvError::Empty) => break,
+                            Err(mpsc::error::TryRecvError::Disconnected) => {
+                                controls_open = false;
+                                break;
                             }
                         }
                     }
-                    envelope = outgoing_rx.recv() => {
-                    let Some(envelope) = envelope else {
-                        break;
-                    };
-                    route_outgoing_envelope(&mut outbound_connections, envelope).await;
+                    route_outgoing_envelope(&mut outbound_connections, envelope, &mut delivery_tasks).await;
+                }
+                result = delivery_tasks.join_next(), if !delivery_tasks.is_empty() => {
+                    if let Some(Err(error)) = result {
+                        panic!("stdio delivery task failed: {error}");
+                    }
                 }
             }
         }
-        info!("outbound router task exited (channel closed)");
+        // Cancellation requests retirement; joining proves that the descendant
+        // has actually retired and makes worker panics part of the runtime result.
+        for state in outbound_connections.values_mut() {
+            state.close_delivery();
+        }
+        while let Some(result) = delivery_tasks.join_next().await {
+            if let Err(error) = result {
+                panic!("stdio delivery task failed: {error}");
+            }
+        }
+        outbound_connections.clear();
+        info!("outbound router task exited (channels drained)");
     });
 
     let processor_handle = tokio::spawn({
+        let shutdown_timed_out = Arc::clone(&shutdown_timed_out);
         let auth_manager = Arc::clone(&auth_manager);
         let analytics_events_client =
             analytics_events_client_from_config(Arc::clone(&auth_manager), &config);
@@ -1002,6 +1080,7 @@ pub async fn run_main(
             // SIGTERM is not lost when transport traffic wins the race.
             let mut shutdown_signal_wait = Box::pin(shutdown_signal());
             let exit_reason = loop {
+                connection_cleanup_tasks.reap_ready();
                 let running_turn_count = {
                     let running_turn_count = running_turn_count_rx.borrow();
                     *running_turn_count
@@ -1015,8 +1094,15 @@ pub async fn run_main(
 
                 tokio::select! {
                     _ = transport_shutdown_token.cancelled() => break "outbound_delivery_failed",
+                    _ = caller_cancelled.cancelled(), if !shutdown_state.requested() => {
+                        shutdown_state.on_signal(
+                            ShutdownSignal::Forceable, connections.len(), running_turn_count,
+                        );
+                        processor.begin_drain();
+                    }
                     _ = tokio::time::sleep_until(shutdown_state.deadline.unwrap_or_else(|| tokio::time::Instant::now() + SHUTDOWN_TIMEOUT)), if shutdown_state.requested() => {
                         shutdown_state.forced = true;
+                        shutdown_state.timed_out = true;
                     }
                     shutdown_signal_result = &mut shutdown_signal_wait, if graceful_signal_restart_enabled && !shutdown_state.forced() && !shutdown_state.signal_listener_failed => {
                         shutdown_signal_wait.set(shutdown_signal());
@@ -1048,6 +1134,20 @@ pub async fn run_main(
                                 writer,
                                 disconnect_sender,
                             } => {
+                                // Each live connection reserves room for its eventual
+                                // close cleanup. Saturation rejects only new opens;
+                                // completion controls and retirement remain admitted.
+                                if connection_cleanup_tasks.len()
+                                    .saturating_add(connections.len())
+                                    .saturating_add(3) > 4 * CHANNEL_CAPACITY
+                                {
+                                    if let Some(disconnect) = disconnect_sender {
+                                        disconnect.cancel();
+                                    } else {
+                                        transport_shutdown_token.cancel();
+                                    }
+                                    continue;
+                                }
                                 let (mut connection, outbound_opened) = prepare_connection(
                                     connection_id,
                                     origin,
@@ -1090,7 +1190,11 @@ pub async fn run_main(
                                 let worker_transport = transport.clone();
                                 let status_rx = remote_control_status_rx.clone();
                                 let status_publication = Arc::clone(&remote_status_publication);
+                                let disconnect_on_exit = worker_connection.disconnect.clone().drop_guard();
                                 connection_cleanup_tasks.spawn(async move {
+                                    // This guard also runs during unwinding or before
+                                    // the worker's first poll if it is aborted.
+                                    let _disconnect_on_exit = disconnect_on_exit;
                                     let cancelled = worker_connection.session.rpc_gate.cancellation_token();
                                     tokio::select! {
                                         biased;
@@ -1145,16 +1249,38 @@ pub async fn run_main(
                                     break "last_connection_closed";
                                 }
                             }
-                            TransportEvent::IncomingMessage { connection_id, message } => {
+                            TransportEvent::IncomingMessage { connection_id, message, _ingress_permit } => {
                                 match message {
                                     JSONRPCMessage::Request(request) => {
                                         let Some(connection) = connections.get(&connection_id) else {
                                             warn!("dropping request from unknown connection: {connection_id:?}");
                                             continue;
                                         };
-                                        if !connection.request_ingress.as_ref().is_some_and(|ingress| ingress.try_send(request)) {
-                                            warn!(?connection_id, "retiring overloaded connection request ingress");
+                                        let Some(ingress) = connection.request_ingress.as_ref() else {
                                             connection.disconnect.cancel();
+                                            continue;
+                                        };
+                                        match ingress.try_send(request) {
+                                            Ok(()) => {},
+                                            Err(mpsc::error::TrySendError::Full(request)) => {
+                                                // Reject only this unadmitted request. Reuse the
+                                                // bounded rejection owner, including ID collision
+                                                // and delivery-failure handling, without stalling
+                                                // the shared dispatcher or canceling other turns.
+                                                initialize_notification_sender.send_unregistered_error(
+                                                    ConnectionRequestId {
+                                                        connection_id,
+                                                        request_id: request.id,
+                                                    },
+                                                    overloaded_error(
+                                                        OverloadReason::TransportIngress,
+                                                        "Server overloaded; retry later.",
+                                                    ),
+                                                ).await;
+                                            }
+                                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                                connection.disconnect.cancel();
+                                            }
                                         }
                                     }
                                     JSONRPCMessage::Response(response) => {
@@ -1245,6 +1371,7 @@ pub async fn run_main(
                 )
                 .await;
             if shutdown_state.forced() {
+                shutdown_timed_out.store(shutdown_state.timed_out, std::sync::atomic::Ordering::Release);
                 connection_cleanup_tasks.abort();
                 transport_shutdown_token.cancel();
                 force_shutdown_token.cancel();
@@ -1267,6 +1394,7 @@ pub async fn run_main(
                         }
                     })
                     .await;
+                shutdown_state.timed_out
             }));
         }
     });
@@ -1279,6 +1407,7 @@ pub async fn run_main(
         transport_shutdown_token,
         transport_accept_handles,
         force_shutdown_token,
+        shutdown_timed_out,
         async {
             match shutdown_observation_rx.await {
                 Ok(observation) => observation.await,
@@ -1302,7 +1431,8 @@ async fn finish_runtime_task_groups(
     transport_shutdown: CancellationToken,
     transport_handles: Vec<JoinHandle<()>>,
     force_shutdown: CancellationToken,
-    shutdown_observation: impl std::future::Future<Output = ()>,
+    shutdown_timed_out: Arc<AtomicBool>,
+    shutdown_observation: impl std::future::Future<Output = bool>,
 ) -> IoResult<()> {
     use futures::StreamExt;
     use futures::stream::FuturesUnordered;
@@ -1344,13 +1474,23 @@ async fn finish_runtime_task_groups(
         };
         let next = tokio::select! {
             biased;
-            _ = async {
+            timed_out = async {
                 tokio::select! {
-                    _ = force_shutdown.cancelled() => {}
-                    _ = &mut shutdown_observation => {}
+                    _ = force_shutdown.cancelled() => shutdown_timed_out.load(std::sync::atomic::Ordering::Acquire),
+                    timed_out = &mut shutdown_observation => timed_out,
                 }
             }, if !forced => {
                 forced = true;
+                if first_error.is_none() {
+                    first_error = Some(std::io::Error::new(
+                        if timed_out { ErrorKind::TimedOut } else { ErrorKind::Interrupted },
+                        if timed_out {
+                            "app-server cleanup deadline expired; cleanup was forced"
+                        } else {
+                            "app-server cleanup was interrupted by forced shutdown"
+                        },
+                    ));
+                }
                 transport_shutdown.cancel();
                 for handle in &abort_handles {
                     handle.abort();

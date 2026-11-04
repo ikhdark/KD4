@@ -426,20 +426,21 @@ fn raw_override_contains(
     key: &str,
 ) -> bool {
     let key = key.split('.').collect::<Vec<_>>();
-    overrides
-        .into_iter()
-        .flat_map(|overrides| overrides.keys())
-        .chain(cli_overrides.iter().map(|(key, _)| key))
-        .any(|candidate| {
-            codex_config::parse_override_key(candidate).is_ok_and(|candidate| {
-                candidate
-                    .iter()
-                    .map(String::as_str)
-                    .zip(&key)
-                    .all(|(candidate, key)| candidate == *key)
-                    && candidate.len() >= key.len()
-            })
+    let matching_path = |candidate: &str| {
+        codex_config::parse_override_key(candidate).ok().filter(|candidate| {
+            candidate.iter().map(String::as_str).zip(&key)
+                .all(|(candidate, key)| candidate == *key)
         })
+    };
+    overrides.into_iter().flat_map(|overrides| overrides.iter()).any(|(candidate, value)| {
+        let Some(path) = matching_path(candidate) else { return false; };
+        path.len() >= key.len()
+            || key[path.len()..].iter().try_fold(value, |value, key| value.get(*key)).is_some()
+    }) || cli_overrides.iter().any(|(candidate, value)| {
+        let Some(path) = matching_path(candidate) else { return false; };
+        path.len() >= key.len()
+            || key[path.len()..].iter().try_fold(value, |value, key| value.get(*key)).is_some()
+    })
 }
 
 fn persisted_settings_override_mask(
@@ -702,24 +703,28 @@ impl ThreadRequestProcessor {
         self.background_tasks
             .spawn(
                 async move {
-                    match processor.thread_archive_inner(params).await {
-                        Ok((response, archived_thread_ids)) => {
-                            processor
-                                .outgoing
-                                .send_response(request_id.clone(), response)
-                                .await;
-                            for thread_id in archived_thread_ids {
-                                processor
-                                    .outgoing
-                                    .send_server_notification(ServerNotification::ThreadArchived(
-                                        ThreadArchivedNotification { thread_id },
-                                    ))
-                                    .await;
-                            }
-                            Ok(None)
+                    let mut archived_thread_ids = Vec::new();
+                    let result = processor
+                        .thread_archive_inner(params, &mut archived_thread_ids)
+                        .await;
+                    match result {
+                        Ok(response) => {
+                            processor.outgoing.send_response(request_id, response).await;
                         }
-                        Err(error) => Err(error),
+                        Err(error) if archived_thread_ids.is_empty() => return Err(error),
+                        Err(error) => {
+                            processor.outgoing.send_error(request_id, error).await;
+                        }
                     }
+                    for thread_id in archived_thread_ids {
+                        processor
+                            .outgoing
+                            .send_server_notification(ServerNotification::ThreadArchived(
+                                ThreadArchivedNotification { thread_id },
+                            ))
+                            .await;
+                    }
+                    Ok(None)
                 }
                 .instrument(tracing::Span::current()),
             )
@@ -862,6 +867,7 @@ impl ThreadRequestProcessor {
     }
 
     async fn finalize_thread_teardown(&self, thread_id: ThreadId) {
+        self.thread_manager.cleanup_absent_thread_with(thread_id, || async {
         if let Some(queue) = &self.thread_queue_processor {
             queue.retire_thread(thread_id).await;
         }
@@ -875,6 +881,7 @@ impl ThreadRequestProcessor {
         self.thread_watch_manager
             .remove_thread(&thread_id.to_string())
             .await;
+        }).await;
     }
 
     async fn rollback_failed_resumed_thread(
@@ -1208,29 +1215,13 @@ impl ThreadRequestProcessor {
     }
 
     pub(crate) async fn shutdown_threads_with_result(&self) -> std::io::Result<()> {
-        // Keep exact producer identities across the manager's bounded report.
-        // A loop observation can expire before its accepted terminal/writer
-        // owners settle; receipt admission must remain open until they do.
-        let mut owners = Vec::new();
-        for id in self.thread_manager.list_thread_ids().await {
-            if let Ok(thread) = self.thread_manager.get_thread(id).await {
-                owners.push(thread);
-            }
-        }
+        // The manager's retained per-instance owners include accepted terminal
+        // and persistence drains. Its timeout observes those owners without
+        // cancelling them; do not add another unbounded observer here.
         let report = self
             .thread_manager
             .shutdown_all_threads_bounded(Duration::from_secs(10))
             .await;
-        let drained =
-            futures::future::join_all(owners.iter().map(|thread| thread.wait_until_drained()))
-                .await;
-        let mut drain_failed = false;
-        for outcome in drained {
-            if let Err(error) = outcome {
-                drain_failed = true;
-                warn!(%error, "thread producer drain failed during shutdown");
-            }
-        }
         self.thread_state_manager
             .clear_all_out_of_band_elicitation_leases()
             .await;
@@ -1240,7 +1231,7 @@ impl ThreadRequestProcessor {
         for thread_id in &report.timed_out {
             warn!("timed out waiting for thread {thread_id} to shut down");
         }
-        if drain_failed || !report.submit_failed.is_empty() || !report.timed_out.is_empty() {
+        if !report.submit_failed.is_empty() || !report.timed_out.is_empty() {
             return Err(std::io::Error::other(format!(
                 "session persistence unconfirmed: failures={:?}, timed_out={:?}",
                 report.failures, report.timed_out
@@ -1583,6 +1574,7 @@ impl ThreadRequestProcessor {
             session_configured.session_id.to_string(),
             &config_snapshot,
             session_configured.rollout_path.clone(),
+            thread.fallback_metadata_timestamps(),
         );
         thread.project_id = project_id;
 
@@ -1706,104 +1698,101 @@ impl ThreadRequestProcessor {
     async fn thread_archive_inner(
         &self,
         params: ThreadArchiveParams,
-    ) -> Result<(ThreadArchiveResponse, Vec<String>), JSONRPCErrorError> {
+        archived_thread_ids: &mut Vec<String>,
+    ) -> Result<ThreadArchiveResponse, JSONRPCErrorError> {
         let _thread_list_state_permit = self.acquire_thread_list_state_permit().await;
-        self.thread_archive_response(params).await
+        self.thread_archive_response(params, archived_thread_ids).await
     }
 
     async fn thread_archive_response(
         &self,
         params: ThreadArchiveParams,
-    ) -> Result<(ThreadArchiveResponse, Vec<String>), JSONRPCErrorError> {
+        archived_thread_ids: &mut Vec<String>,
+    ) -> Result<ThreadArchiveResponse, JSONRPCErrorError> {
         let thread_id = ThreadId::from_string(&params.thread_id)
             .map_err(|err| invalid_request(format!("invalid session id: {err}")))?;
 
-        let thread_ids = self.state_db_spawn_subtree_thread_ids(thread_id).await?;
-
-        let mut archive_thread_ids = Vec::new();
-        match self
+        // Reuse deletion's reversible admission fence. Never commit it: an
+        // archived thread must remain resumable after unarchive.
+        let (_archive_fence, thread_ids) = self
+            .thread_manager
+            .begin_agent_subtree_removal(thread_id)
+            .await
+            .map_err(|err| internal_error(format!("failed to fence subtree archive: {err}")))?;
+        let root = self
             .thread_store
             .read_thread(StoreReadThreadParams {
                 thread_id,
-                include_archived: false,
+                include_archived: true,
                 include_history: false,
             })
             .await
-        {
-            Ok(thread) => {
-                if thread.archived_at.is_none() {
-                    archive_thread_ids.push(thread_id);
-                }
-            }
-            Err(err) => return Err(thread_store_archive_error("archive", err)),
-        }
-        for descendant_thread_id in thread_ids.into_iter().skip(1) {
-            match self
-                .thread_store
-                .read_thread(StoreReadThreadParams {
-                    thread_id: descendant_thread_id,
-                    include_archived: true,
-                    include_history: false,
-                })
+            .map_err(|err| thread_store_archive_error("archive", err))?;
+        if root.archived_at.is_none() {
+            self.prepare_thread_for_archive(thread_id).await?;
+            self.thread_store
+                .archive_thread(StoreArchiveThreadParams { thread_id })
                 .await
-            {
-                Ok(thread) => {
-                    if thread.archived_at.is_none() {
-                        archive_thread_ids.push(descendant_thread_id);
-                    }
+                .map_err(|err| thread_store_archive_error("archive", err))?;
+            archived_thread_ids.push(thread_id.to_string());
+        }
+
+        let mut failures = Vec::new();
+        for descendant_thread_id in thread_ids.into_iter().skip(1).rev() {
+            let result = async {
+                let descendant = self
+                    .thread_store
+                    .read_thread(StoreReadThreadParams {
+                        thread_id: descendant_thread_id,
+                        include_archived: true,
+                        include_history: false,
+                    })
+                    .await
+                    .map_err(|err| thread_store_archive_error("archive", err))?;
+                if descendant.archived_at.is_some() {
+                    return Ok(false);
                 }
-                Err(err) => {
-                    warn!(
-                        "failed to read spawned descendant thread {descendant_thread_id} while archiving {thread_id}: {err}"
-                    );
+                self.prepare_thread_for_archive(descendant_thread_id).await?;
+                self.thread_store
+                    .archive_thread(StoreArchiveThreadParams {
+                        thread_id: descendant_thread_id,
+                    })
+                    .await
+                    .map_err(|err| thread_store_archive_error("archive", err))?;
+                Ok::<_, JSONRPCErrorError>(true)
+            }
+            .await;
+            match result {
+                Ok(true) => archived_thread_ids.push(descendant_thread_id.to_string()),
+                Ok(false) => {}
+                Err(error) => {
+                    warn!(%descendant_thread_id, message = %error.message,
+                        "spawned descendant archive incomplete");
+                    failures.push(serde_json::json!({
+                        "threadId": descendant_thread_id.to_string(),
+                        "message": error.message,
+                    }));
                 }
             }
         }
-
-        let mut archived_thread_ids = Vec::new();
-        let Some((parent_thread_id, descendant_thread_ids)) = archive_thread_ids.split_first()
-        else {
-            return Ok((ThreadArchiveResponse {}, archived_thread_ids));
-        };
-
-        self.prepare_thread_for_archive(*parent_thread_id).await?;
-        match self
-            .thread_store
-            .archive_thread(StoreArchiveThreadParams {
-                thread_id: *parent_thread_id,
-            })
-            .await
-        {
-            Ok(()) => {
-                archived_thread_ids.push(parent_thread_id.to_string());
-            }
-            Err(err) => return Err(thread_store_archive_error("archive", err)),
+        if !failures.is_empty() {
+            let failed_thread_ids = failures
+                .iter()
+                .filter_map(|failure| failure.get("threadId").cloned())
+                .collect::<Vec<_>>();
+            let mut error = internal_error(
+                "subtree archive incomplete; retry thread/archive to finish remaining descendants",
+            );
+            error.data = Some(serde_json::json!({
+                "reason": "partialArchive",
+                "archivedThreadIds": archived_thread_ids,
+                "failedThreadIds": failed_thread_ids,
+                "failures": failures,
+                "retryable": true,
+            }));
+            return Err(error);
         }
-
-        for descendant_thread_id in descendant_thread_ids.iter().rev().copied() {
-            if let Err(err) = self.prepare_thread_for_archive(descendant_thread_id).await {
-                warn!("failed to quiesce spawned descendant {descendant_thread_id}: {err:?}");
-                continue;
-            }
-            match self
-                .thread_store
-                .archive_thread(StoreArchiveThreadParams {
-                    thread_id: descendant_thread_id,
-                })
-                .await
-            {
-                Ok(()) => {
-                    archived_thread_ids.push(descendant_thread_id.to_string());
-                }
-                Err(err) => {
-                    warn!(
-                        "failed to archive spawned descendant thread {descendant_thread_id} while archiving {thread_id}: {err}"
-                    );
-                }
-            }
-        }
-
-        Ok((ThreadArchiveResponse {}, archived_thread_ids))
+        Ok(ThreadArchiveResponse {})
     }
 
     pub(super) async fn state_db_spawn_subtree_thread_ids(
@@ -3000,6 +2989,14 @@ impl ThreadRequestProcessor {
                 })
                 .await
         };
+        let stored_page = match stored_page {
+            Err(ThreadStoreError::ThreadNotFound { thread_id: missing })
+                if missing == thread_id && self.thread_manager.get_thread(thread_id).await.is_ok() =>
+            {
+                Err(ThreadStoreError::Unsupported { operation: "list_items_unmaterialized" })
+            }
+            other => other,
+        };
         let page = match stored_page {
             Ok(page) => page,
             Err(ThreadStoreError::Unsupported { .. }) => {
@@ -3335,6 +3332,7 @@ impl ThreadRequestProcessor {
             thread.session_configured().session_id.to_string(),
             &config_snapshot,
             thread.rollout_path(),
+            thread.fallback_metadata_timestamps(),
         );
         self.thread_watch_manager
             .upsert_thread(&loaded_thread)
@@ -3374,6 +3372,7 @@ impl ThreadRequestProcessor {
         app_server_client_version: Option<String>,
         supports_openai_form_elicitation: bool,
     ) -> Result<(), JSONRPCErrorError> {
+        let mut revalidation_restarts = 0;
         'resume: loop {
         let parsed_thread_id = ParsedThreadId::parse(&params.thread_id);
         if let Some(thread_id) = parsed_thread_id.valid()
@@ -3580,6 +3579,12 @@ impl ThreadRequestProcessor {
                     ));
                 };
                 params = retry_params;
+                revalidation_restarts += 1;
+                if revalidation_restarts >= 3 {
+                    let mut error = invalid_request("thread changed repeatedly during resume; retry the request");
+                    error.data = Some(serde_json::json!({"reason": "threadChanged"}));
+                    return Err(error);
+                }
                 continue 'resume;
             }
             resume_source_thread = Some(current);
@@ -4317,6 +4322,7 @@ impl ThreadRequestProcessor {
                     session_id.clone(),
                     &config_snapshot,
                     rollout_path.map(Into::into),
+                    thread.fallback_metadata_timestamps(),
                 );
                 thread.preview = preview.clone();
                 Ok(thread)
@@ -4605,6 +4611,7 @@ impl ThreadRequestProcessor {
                     session_configured.session_id.to_string(),
                     &config_snapshot,
                     /*path*/ None,
+                    forked_thread.fallback_metadata_timestamps(),
                 );
                 thread.preview = preview_from_rollout_items(&history_items);
                 thread.forked_from_id = Some(source_thread_id.to_string());
@@ -4830,7 +4837,13 @@ impl ThreadRequestProcessor {
                 }
             }
             None if relation_filter.is_some() => None,
-            None => Some(vec![self.config.model_provider_id.clone()]),
+            None => Some(vec![
+                self.config_manager
+                    .load_latest_config(None)
+                    .await
+                    .map_config_load_error()?
+                    .model_provider_id,
+            ]),
         };
         let (allowed_sources_vec, source_kind_filter) =
             if relation_filter.is_some() && source_kinds.is_none() {
@@ -4877,6 +4890,12 @@ impl ThreadRequestProcessor {
                     .as_ref()
                     .is_none_or(|filter| source_kind_matches(&source, filter))
                 {
+                    if items.is_empty() && filtered.is_empty() {
+                        backwards_cursor = page
+                            .item_backwards_cursors
+                            .get(&it.thread_id)
+                            .cloned();
+                    }
                     filtered.push(it);
                     if filtered.len() >= remaining {
                         break;
@@ -4884,9 +4903,6 @@ impl ThreadRequestProcessor {
                 }
             }
             items.extend(filtered);
-            if backwards_cursor.is_none() && !items.is_empty() {
-                backwards_cursor = page.backwards_cursor;
-            }
             remaining = requested_page_size.saturating_sub(items.len());
 
             next_cursor = page.next_cursor;
@@ -5573,8 +5589,9 @@ fn build_thread_from_snapshot(
     session_id: String,
     config_snapshot: &ThreadConfigSnapshot,
     path: Option<PathBuf>,
+    timestamps: (i64, i64),
 ) -> Thread {
-    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let (created_at, updated_at) = timestamps;
     Thread {
         project_id: None,
         id: thread_id.to_string(),
@@ -5586,9 +5603,9 @@ fn build_thread_from_snapshot(
         ephemeral: config_snapshot.ephemeral,
         history_mode: config_snapshot.history_mode,
         model_provider: config_snapshot.model_provider_id.clone(),
-        created_at: now,
-        updated_at: now,
-        recency_at: Some(now),
+        created_at,
+        updated_at,
+        recency_at: Some(updated_at),
         status: ThreadStatus::NotLoaded,
         path,
         cwd: config_snapshot.cwd().clone(),
@@ -5641,6 +5658,7 @@ fn build_thread_from_loaded_snapshot(
         loaded_thread.session_configured().session_id.to_string(),
         config_snapshot,
         loaded_thread.rollout_path(),
+        loaded_thread.fallback_metadata_timestamps(),
     )
 }
 

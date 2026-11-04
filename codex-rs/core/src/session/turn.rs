@@ -1,4 +1,45 @@
-use std::collections::BTreeMap;
+mod answer_delivery;
+mod assistant_stream;
+mod generation_budget;
+mod request_scaffold;
+mod tool_surface;
+
+pub(super) use answer_delivery::NoProseAuthorization;
+use answer_delivery::MISSING_ANSWER_REPAIR_DIRECTIVE;
+use answer_delivery::TurnOutputState;
+use answer_delivery::final_message_candidate_from_output;
+use answer_delivery::update_final_message_candidate;
+pub(crate) use generation_budget::LogicalGenerationBudget;
+use generation_budget::CompletionPendingInputDisposition;
+use generation_budget::ForcedTerminalReason;
+use generation_budget::LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE;
+use generation_budget::LogicalGenerationAdmission;
+use generation_budget::MAX_SUBAGENT_CONTEXT_PRESSURE_EVENTS;
+use generation_budget::SUBAGENT_CONTEXT_BUDGET_FORCED_TERMINAL_DIRECTIVE;
+use generation_budget::completion_pending_input_disposition;
+use generation_budget::generation_budget_blocks_follow_up;
+use generation_budget::observe_context_pressure_event;
+use generation_budget::record_forced_terminal_budget_boundary;
+
+pub(super) use assistant_stream::AssistantMessageStreamParsers;
+use assistant_stream::ParsedAssistantTextDelta;
+use assistant_stream::PlanModeStreamState;
+use assistant_stream::append_partial_reasoning_text;
+use assistant_stream::apply_partial_agent_message_delta;
+use assistant_stream::complete_partial_plan_items;
+use assistant_stream::emit_streamed_assistant_text_delta;
+use assistant_stream::flush_assistant_text_segments_all;
+use assistant_stream::flush_assistant_text_segments_for_item;
+use assistant_stream::handle_assistant_item_done_in_plan_mode;
+pub(super) use request_scaffold::RequestScaffoldCache;
+pub(crate) use request_scaffold::build_projected_prompt;
+use request_scaffold::build_projected_prompt_from_scaffold;
+pub(super) use tool_surface::SessionPreparedRouterCache;
+pub(super) use tool_surface::agent_surface_stage;
+pub(crate) use tool_surface::built_tools;
+use tool_surface::built_tools_for_pending_turn;
+use tool_surface::finalized_router_matches_current_exposure;
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -6,18 +47,14 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::Weak;
 use std::sync::atomic::Ordering;
 
-use crate::agents_md::RepositoryStableContextBundle;
 use crate::apply_skill_injection_observability;
 use crate::client::AttemptPreparedCallback;
 use crate::client::ModelClientSession;
 use crate::client::StartupPrewarmClaim;
 use crate::client_common::Prompt;
-use crate::client_common::PromptDigests;
 use crate::client_common::ResponseEvent;
-use crate::client_common::ToolSchemaArtifact;
 use crate::collect_explicit_skill_mentions;
 use crate::compact::InitialContextInjection;
 use crate::compact::InlineAutoCompactReuse;
@@ -27,10 +64,7 @@ use crate::compact_model_fallback::record_model_fallback;
 use crate::compact_model_fallback::should_retry_with_current_model;
 use crate::compact_remote_v2::run_inline_remote_auto_compact_task as run_inline_remote_auto_compact_task_v2;
 use crate::connectors;
-use crate::context::ApprovalPromptContext;
 use crate::context::ContextualUserFragment;
-use crate::context::PermissionsInstructions;
-use crate::context::PromptContextCategory;
 use crate::context::RecommendedPluginsInstructions;
 use crate::context::is_startup_contextual_user_fragment;
 use crate::context::world_state::WorldState;
@@ -53,8 +87,6 @@ use crate::mcp_skill_dependencies::PlannedMcpDependencyEffect;
 use crate::mcp_skill_dependencies::apply_mcp_dependency_effect;
 use crate::mcp_skill_dependencies::inventory_contains_expected;
 use crate::mcp_skill_dependencies::plan_mcp_dependencies;
-use crate::mcp_tool_exposure::build_mcp_tool_exposure;
-use crate::mcp_tool_exposure::resolve_selected_skill_mcp_exposure;
 use crate::mentions::build_connector_slug_counts;
 use crate::mentions::build_skill_name_counts;
 use crate::mentions::collect_explicit_app_ids;
@@ -85,7 +117,6 @@ use crate::session::turn_execution::SamplingRequestSignalCollector;
 use crate::session::turn_execution::TurnExecutionControl;
 use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
 use crate::session_startup_prewarm::SessionStartupPrewarmResolution;
-use crate::stable_context::StableContextKind;
 use crate::stable_context::StableContextTarget;
 use crate::stable_context::filter_unchanged_stable_context_items;
 use crate::stable_context::mark_trusted_stable_context_item;
@@ -97,12 +128,10 @@ use crate::stream_events_utils::InFlightToolCall;
 use crate::stream_events_utils::InFlightToolResult;
 use crate::stream_events_utils::OrderedResponseItemRecorder;
 use crate::stream_events_utils::TurnItemContributorPolicy;
-use crate::stream_events_utils::finalize_non_tool_response_item;
 use crate::stream_events_utils::handle_non_tool_response_item;
 use crate::stream_events_utils::handle_output_item_done;
 use crate::stream_events_utils::last_assistant_message_from_item;
 use crate::stream_events_utils::raw_assistant_output_text_from_item;
-use crate::stream_events_utils::record_completed_response_item_with_finalized_facts;
 use crate::tasks::TurnTaskResult;
 use crate::tasks::emit_compact_metric;
 use crate::tool_history::ModelGenerationId;
@@ -110,20 +139,8 @@ use crate::tools::ToolRouter;
 use crate::tools::context::RequiredToolTerminal;
 use crate::tools::context::RequiredToolTerminalCause;
 use crate::tools::context::SharedTurnDiffTracker;
-use crate::tools::exposure::AgentSurfaceStage;
-use crate::tools::exposure::DirectMcpToolEntrypoint;
-use crate::tools::exposure::DynamicToolExposureIdentity;
-use crate::tools::exposure::EnvironmentSurfaceMode;
-use crate::tools::exposure::GoalSurfaceState;
-use crate::tools::exposure::ToolExposureIdentity;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::registry::ToolArgumentDiffConsumer;
-use crate::tools::router::ToolRouterParams;
-use crate::tools::router::ToolSuggestCandidates;
-use crate::tools::router::ToolSuggestPresentation;
-use crate::tools::router::extension_tool_surface_revision;
-use crate::tools::router::extension_tool_surface_snapshot;
-use crate::tools::spec_plan::search_tool_enabled;
 use crate::tools::spec_plan::tool_suggest_enabled;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::turn_timing::ContinuationCause;
@@ -160,21 +177,17 @@ use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
-use codex_protocol::items::PlanItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::build_hook_prompt_message;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
-use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentMessageContentDeltaEvent;
 use codex_protocol::protocol::AgentReasoningSectionBreakEvent;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::NextSampleBlockReason;
-use codex_protocol::protocol::PlanDeltaEvent;
 use codex_protocol::protocol::ReasoningContentDeltaEvent;
 use codex_protocol::protocol::ReasoningRawContentDeltaEvent;
 use codex_protocol::protocol::SafetyBufferingEvent;
@@ -190,11 +203,6 @@ use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 use codex_tools::DiscoverableTool;
 use codex_tools::ToolName;
-use codex_tools::request_user_input_available_modes;
-use codex_utils_stream_parser::AssistantTextChunk;
-use codex_utils_stream_parser::AssistantTextStreamParser;
-use codex_utils_stream_parser::ProposedPlanSegment;
-use codex_utils_stream_parser::extract_proposed_plan_text;
 use futures::future::BoxFuture;
 use futures::prelude::*;
 use futures::stream::FuturesOrdered;
@@ -815,6 +823,7 @@ pub(crate) fn run_turn(
                         .await
                         .temporarily_unavailable,
                     budget_forced_terminal,
+                    context_pressure_events,
                 )
                 .await?;
                 // Keep this future lazy: the finalized router must record its source
@@ -1535,7 +1544,7 @@ pub(crate) fn run_turn(
                                 changed_tests.incomplete.extend(uncertain_contents);
                                 changed_tests.incomplete.sort();
                                 changed_tests.incomplete.dedup();
-                                let mut assessment = turn_execution.completion_assessment();
+                                let mut assessment = turn_execution.completion_assessment(settled_state.mutation_revision);
                                 if let Some(advisory) = changed_tests_advisory(&changed_tests.changed) {
                                     assessment.advisories.push(advisory);
                                 }
@@ -2013,141 +2022,6 @@ fn authoritative_wait_terminal_surface(
     }
 }
 
-// Repetition is established by execution receipts and relevant state, never
-// by a generation count. Retain only explicit owner/context terminal fences.
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LogicalGenerationAdmission {
-    Regular,
-    Terminal { forced: bool },
-    Exhausted,
-}
-
-#[derive(Clone, Copy, Default)]
-pub(crate) struct LogicalGenerationBudget {
-    regular_generations_exhausted: bool,
-    terminal_generation_used: bool,
-}
-
-impl LogicalGenerationBudget {
-    fn accepted_user_input(&mut self) {
-        self.regular_generations_exhausted = false;
-        self.terminal_generation_used = false;
-    }
-
-    /// The next regular request becomes the one forced final synthesis.
-    fn exhaust_regular_generations(&mut self) {
-        self.regular_generations_exhausted = true;
-    }
-
-    fn is_exhausted(self) -> bool {
-        self.regular_generations_exhausted && self.terminal_generation_used
-    }
-
-    fn has_regular_generation_capacity(self) -> bool {
-        !self.regular_generations_exhausted
-    }
-
-    fn admit(&mut self, terminal_requested: bool) -> LogicalGenerationAdmission {
-        if terminal_requested {
-            if self.terminal_generation_used {
-                return LogicalGenerationAdmission::Exhausted;
-            }
-            self.terminal_generation_used = true;
-            return LogicalGenerationAdmission::Terminal { forced: false };
-        }
-        if !self.regular_generations_exhausted {
-            return LogicalGenerationAdmission::Regular;
-        }
-        if self.terminal_generation_used {
-            return LogicalGenerationAdmission::Exhausted;
-        }
-        self.terminal_generation_used = true;
-        LogicalGenerationAdmission::Terminal { forced: true }
-    }
-
-    fn can_admit(self, terminal_requested: bool) -> bool {
-        let mut preview = self;
-        preview.admit(terminal_requested) != LogicalGenerationAdmission::Exhausted
-    }
-}
-
-fn generation_budget_blocks_follow_up(
-    budget: LogicalGenerationBudget,
-    next_generation_request: Option<&GenerationRequestDisposition>,
-) -> bool {
-    next_generation_request
-        .is_some_and(|request| !budget.can_admit(request.terminal_completion_only))
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CompletionPendingInputDisposition {
-    None,
-    Continue,
-    Defer,
-}
-
-fn completion_pending_input_disposition(
-    budget: LogicalGenerationBudget,
-    has_pending_input: bool,
-) -> CompletionPendingInputDisposition {
-    if !has_pending_input {
-        CompletionPendingInputDisposition::None
-    } else if budget.has_regular_generation_capacity() {
-        CompletionPendingInputDisposition::Continue
-    } else {
-        CompletionPendingInputDisposition::Defer
-    }
-}
-
-const LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE: &str = "An explicit terminal boundary requires a final tool-free synthesis. Work is suspended, not completed. Do not call tools. Summarize completed work and truthfully report remaining work, failed validation, running processes, and how to resume.";
-
-/// A spawned agent that fills this many context windows in one turn reports
-/// what it covered instead of compacting again; its parent splits the rest.
-const MAX_SUBAGENT_CONTEXT_PRESSURE_EVENTS: u32 = 2;
-const SUBAGENT_CONTEXT_BUDGET_FORCED_TERMINAL_DIRECTIVE: &str = "This spawned agent reached its context budget. Work is suspended, not completed. This is the final tool-free synthesis request. Do not call tools. Report what you covered, and list the unread files or byte ranges and any unfinished work exactly, so the parent can split the remaining scope.";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ForcedTerminalReason {
-    GenerationBudget,
-    SubagentContextBudget,
-}
-
-/// Counts a mid-turn context-pressure event. A spawned agent at its budget
-/// gets one forced final synthesis instead of another context window.
-fn observe_context_pressure_event(
-    session_source: &SessionSource,
-    events: &mut u32,
-    budget: &mut LogicalGenerationBudget,
-) -> bool {
-    *events = events.saturating_add(1);
-    let reached = *events >= MAX_SUBAGENT_CONTEXT_PRESSURE_EVENTS
-        && matches!(
-            session_source,
-            SessionSource::SubAgent(codex_protocol::protocol::SubAgentSource::ThreadSpawn { .. })
-        );
-    if reached {
-        budget.exhaust_regular_generations();
-    }
-    reached
-}
-
-async fn record_forced_terminal_budget_boundary(
-    sess: &Session,
-    turn_context: &TurnContext,
-    reason: ForcedTerminalReason,
-) {
-    let message = match reason {
-        ForcedTerminalReason::GenerationBudget =>
-            "This turn reached an explicit terminal boundary. Work is suspended; the assistant will report completed and unfinished work. Send another message to resume.".to_string(),
-        ForcedTerminalReason::SubagentContextBudget => format!(
-            "This spawned agent reached its budget of {MAX_SUBAGENT_CONTEXT_PRESSURE_EVENTS} compactions in one turn. It will report what it covered and the unread scope so its parent can split the remaining work."
-        ),
-    };
-    sess.send_event(turn_context, EventMsg::Warning(WarningEvent { message }))
-        .await;
-}
-
 /// Test files by common convention: a test directory or a test-named file.
 /// This only selects paths for the advisory below; it discovers no tests.
 fn conventional_test_path(path: &str) -> bool {
@@ -2333,7 +2207,7 @@ async fn supersede_context_notice_if_present(
 const SCOPE_ESTIMATE_BYTES_PER_TOKEN: i64 = 4;
 
 /// Spawned agents always need their host-enforced budget, regardless of wording.
-fn spawned_agent_context_budget_notice(turn: &TurnContext) -> String {
+fn spawned_agent_context_budget_notice(turn: &TurnContext, events: u32) -> String {
     let mut notice = String::from(
         "Before committing to an exhaustive review or full-read request, use the known file count, byte volume, and tool throughput to assess whether the requested coverage is feasible. Estimated total volume is a batching or splitting signal, not evidence that the current counted context budget is exhausted.",
     );
@@ -2359,6 +2233,11 @@ fn spawned_agent_context_budget_notice(turn: &TurnContext) -> String {
         " Context pressure may be relieved by retiring exactly recoverable consumed output or by model summarization that can lose detail. Not every relief route summarizes; duration is unknown without measurements for the active route.",
     );
     notice.push_str(&format!(
+        " Authoritative counted events this turn: {events}/{MAX_SUBAGENT_CONTEXT_PRESSURE_EVENTS}; remaining: {}. Routine exact retirement is uncounted regardless of its checkpoint trigger; only compaction/summarization or fallback retirement beyond kept generations counts. Required next action: {}.",
+        MAX_SUBAGENT_CONTEXT_PRESSURE_EVENTS.saturating_sub(events),
+        if events >= MAX_SUBAGENT_CONTEXT_PRESSURE_EVENTS { "tool-free partial handback to the parent" } else { "continue the assigned scope within the remaining allowance" },
+    ));
+    notice.push_str(&format!(
         " As a spawned agent, cover exactly the files or ranges your assignment names and never silently substitute a sample. Your context budget is {MAX_SUBAGENT_CONTEXT_PRESSURE_EVENTS} counted context-pressure events per turn: when the assigned scope needs more, stop at the budget and report what you read with the unread files or byte ranges listed, so the parent can split the remaining work. Report unfinished coverage in the final answer."
     ));
     notice
@@ -2369,6 +2248,7 @@ async fn record_sampling_notices(
     turn: &TurnContext,
     mcp_unavailable: bool,
     forced_terminal: Option<ForcedTerminalReason>,
+    context_pressure_events: u32,
 ) -> CodexResult<()> {
     // Root scope comes from the actual request and configured instructions, not
     // keyword matches in quotations, prohibitions, reports or rejected input.
@@ -2380,7 +2260,7 @@ async fn record_sampling_notices(
             sess,
             turn,
             "exhaustive_scope_feasibility",
-            &spawned_agent_context_budget_notice(turn),
+            &spawned_agent_context_budget_notice(turn, context_pressure_events),
         )
         .await?;
     }
@@ -5210,432 +5090,6 @@ pub(super) fn collect_explicit_app_ids_from_skill_items(
     connector_ids
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RepositoryScaffoldIdentity {
-    identity: [u8; 32],
-    semantic_replacement: bool,
-}
-
-#[derive(Debug)]
-struct RequestScaffoldOwner {
-    config: Arc<crate::config::Config>,
-    exec_policy: Option<Arc<codex_execpolicy::Policy>>,
-    model_slug: String,
-    stable_context_manifest: crate::stable_context::StableContextManifest,
-    repository: Option<RepositoryScaffoldIdentity>,
-}
-
-impl RequestScaffoldOwner {
-    fn matches(
-        &self,
-        prepared: &PreparedPromptInput,
-        step_context: &StepContext,
-        exec_policy: Option<&Arc<codex_execpolicy::Policy>>,
-    ) -> bool {
-        (Arc::ptr_eq(&self.config, &step_context.turn.config)
-            || self.config.as_ref() == step_context.turn.config.as_ref())
-            && match (&self.exec_policy, exec_policy) {
-                (None, None) => true,
-                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
-                _ => false,
-            }
-            && self.model_slug == step_context.turn.model_info.slug
-            && stable_context_owner_matches(
-                &self.stable_context_manifest,
-                prepared.stable_context_manifest(),
-            )
-            && self.repository == repository_scaffold_identity(step_context)
-    }
-}
-
-#[derive(Debug)]
-struct RequestScaffold {
-    base_instructions: BaseInstructions,
-    tools: Arc<ToolSchemaArtifact>,
-    stable_context_manifest: crate::stable_context::StableContextManifest,
-    reused_stable_context_manifest: crate::stable_context::StableContextManifest,
-    stable_input_bytes: u64,
-    stable_input_tokens: i64,
-    digests: PromptDigests,
-    exact_provenance_fragments: Vec<(String, PromptContextCategory)>,
-}
-
-impl RequestScaffold {
-    fn build(
-        prepared: &PreparedPromptInput,
-        step_context: &StepContext,
-        tools: Arc<ToolSchemaArtifact>,
-        base_instructions: BaseInstructions,
-        exec_policy: Option<&codex_execpolicy::Policy>,
-    ) -> Self {
-        let mut manifest = prepared.stable_context_manifest().with_repository_identity(
-            step_context
-                .agents_md_stable_context
-                .as_ref()
-                .map(RepositoryStableContextBundle::metadata),
-        );
-        let stable_input_bytes = manifest.projected_bytes();
-        let stable_input_tokens = manifest.projected_tokens();
-        manifest = manifest
-            .with_base_model(&step_context.turn.model_info.slug, &base_instructions.text)
-            .add_component_bytes(
-                StableContextKind::ToolSchemas,
-                "tool_schemas",
-                tools.serialized(),
-            );
-        if tools.has_request_user_input() {
-            manifest = manifest.add_measured_component(
-                StableContextKind::RequestUserInput,
-                "request_user_input_available",
-                b"request_user_input",
-                0,
-                0,
-            );
-        }
-        if tools.has_wait() {
-            manifest = manifest.add_measured_component(
-                StableContextKind::Wait,
-                "wait_available",
-                b"wait",
-                0,
-                0,
-            );
-        }
-        let digests = PromptDigests {
-            instructions: manifest.active_content_hash(StableContextKind::BaseModel),
-            tools: Some(tools.digest()),
-            history: None,
-        };
-        let reused_stable_context_manifest = manifest.with_local_reused(true);
-        let mut exact_provenance_fragments = Vec::with_capacity(3);
-        if step_context.turn.config.include_permissions_instructions {
-            let Some(exec_policy) = exec_policy else {
-                unreachable!("permissions scaffold requires the current exec policy");
-            };
-            let permissions = PermissionsInstructions::from_permission_profile(
-                &step_context.turn.permission_profile,
-                step_context.turn.approval_policy.value(),
-                ApprovalPromptContext::new(
-                    step_context
-                        .turn
-                        .model_info
-                        .model_messages
-                        .as_ref()
-                        .and_then(|messages| messages.approvals.as_ref()),
-                ),
-                exec_policy,
-                step_context.turn.cwd(),
-                step_context
-                    .turn
-                    .config
-                    .features
-                    .enabled(Feature::ExecPermissionApprovals),
-                step_context
-                    .turn
-                    .config
-                    .features
-                    .enabled(Feature::RequestPermissionsTool),
-            )
-            .render();
-            exact_provenance_fragments
-                .push((permissions, PromptContextCategory::EnvironmentPermissions));
-        }
-        if let Some(role_policy) = crate::session::multi_agents::usage_hint_text(
-            &step_context.turn,
-            &step_context.turn.session_source,
-        ) {
-            exact_provenance_fragments
-                .push((role_policy.to_string(), PromptContextCategory::AgentRole));
-        }
-        if matches!(step_context.turn.session_source, SessionSource::VSCode)
-            && let Some(desktop_context) = step_context.turn.developer_instructions.as_deref()
-        {
-            exact_provenance_fragments.push((
-                crate::context::desktop_instructions::project(desktop_context).into_owned(),
-                PromptContextCategory::AppDesktop,
-            ));
-        }
-        Self {
-            base_instructions,
-            tools,
-            stable_context_manifest: manifest,
-            reused_stable_context_manifest,
-            stable_input_bytes,
-            stable_input_tokens,
-            digests,
-            exact_provenance_fragments,
-        }
-    }
-
-    fn manifest(&self, locally_reused: bool) -> &crate::stable_context::StableContextManifest {
-        if locally_reused {
-            &self.reused_stable_context_manifest
-        } else {
-            &self.stable_context_manifest
-        }
-    }
-}
-
-#[derive(Debug)]
-struct ResolvedRequestScaffold {
-    scaffold: Arc<RequestScaffold>,
-    locally_reused: bool,
-}
-
-/// Cheap identity for the model-visible tool surface of one request.
-///
-/// Materializing the schema artifact walks the registry and takes the router schema lock, so
-/// the scaffold cache compares this token first and only acquires the artifact on a miss.
-/// `router` is the registry identity and `activation_revision` advances whenever deferred
-/// tool activation changes the exposed surface, which together determine the artifact the
-/// router would hand back. Keeping a weak reference reserves the allocation identity after
-/// the router drops, so a later router cannot reuse its address and match a stale token.
-#[derive(Clone, Debug)]
-struct ToolSchemaSurfaceToken {
-    router: Weak<ToolRouter>,
-    activation_revision: u64,
-    terminal_completion_only: bool,
-}
-
-impl ToolSchemaSurfaceToken {
-    fn capture(
-        router: &Arc<ToolRouter>,
-        turn: &crate::session::turn_context::TurnContext,
-        terminal_completion_only: bool,
-    ) -> Self {
-        Self {
-            router: Arc::downgrade(router),
-            activation_revision: turn.deferred_tool_activation_revision(),
-            terminal_completion_only,
-        }
-    }
-
-    fn matches(&self, other: &Self) -> bool {
-        Weak::ptr_eq(&self.router, &other.router)
-            && self.activation_revision == other.activation_revision
-            && self.terminal_completion_only == other.terminal_completion_only
-    }
-}
-
-#[derive(Debug)]
-struct RequestScaffoldCacheEntry {
-    owner: RequestScaffoldOwner,
-    scaffold: Arc<RequestScaffold>,
-    tool_schema_surface: ToolSchemaSurfaceToken,
-}
-
-#[derive(Debug, Default)]
-pub(super) struct RequestScaffoldCache {
-    entry: Option<RequestScaffoldCacheEntry>,
-}
-
-impl RequestScaffoldCache {
-    fn resolve(
-        &mut self,
-        prepared: &PreparedPromptInput,
-        sess: &Session,
-        router: &Arc<ToolRouter>,
-        step_context: &StepContext,
-        base_instructions: &BaseInstructions,
-        terminal_completion_only: bool,
-    ) -> ResolvedRequestScaffold {
-        let exec_policy = step_context
-            .turn
-            .config
-            .include_permissions_instructions
-            .then(|| sess.services.exec_policy.current());
-        let tool_schema_surface =
-            ToolSchemaSurfaceToken::capture(router, &step_context.turn, terminal_completion_only);
-        // Check the cheap surface token before materializing the schema artifact so a repeated
-        // request with an unchanged tool surface never touches the router schema cache.
-        if let Some(entry) = self.entry.as_ref()
-            && entry.tool_schema_surface.matches(&tool_schema_surface)
-            && entry
-                .owner
-                .matches(prepared, step_context, exec_policy.as_ref())
-            && entry.scaffold.base_instructions == *base_instructions
-        {
-            return ResolvedRequestScaffold {
-                scaffold: Arc::clone(&entry.scaffold),
-                locally_reused: true,
-            };
-        }
-
-        let tools = router.model_visible_schemas_for_turn(&step_context.turn);
-        // A different router instance or activation revision can still project the same
-        // surface. Fall back to the artifact comparison so those requests keep reusing the
-        // scaffold instead of rebuilding it.
-        if let Some(entry) = self.entry.as_mut()
-            && entry
-                .owner
-                .matches(prepared, step_context, exec_policy.as_ref())
-            && entry.scaffold.base_instructions == *base_instructions
-            && tool_schema_surface_matches(&entry.scaffold.tools, &tools)
-        {
-            entry.tool_schema_surface = tool_schema_surface;
-            return ResolvedRequestScaffold {
-                scaffold: Arc::clone(&entry.scaffold),
-                locally_reused: true,
-            };
-        }
-
-        let owner = RequestScaffoldOwner {
-            config: Arc::clone(&step_context.turn.config),
-            exec_policy: exec_policy.as_ref().map(Arc::clone),
-            model_slug: step_context.turn.model_info.slug.clone(),
-            stable_context_manifest: prepared.stable_context_manifest().clone(),
-            repository: repository_scaffold_identity(step_context),
-        };
-        let scaffold = Arc::new(RequestScaffold::build(
-            prepared,
-            step_context,
-            tools,
-            base_instructions.clone(),
-            exec_policy.as_deref(),
-        ));
-        self.entry = Some(RequestScaffoldCacheEntry {
-            owner,
-            scaffold: Arc::clone(&scaffold),
-            tool_schema_surface,
-        });
-        ResolvedRequestScaffold {
-            scaffold,
-            locally_reused: false,
-        }
-    }
-
-}
-
-fn arc_identity_or_equivalent<T: ?Sized>(
-    left: &Arc<T>,
-    right: &Arc<T>,
-    equivalent: impl FnOnce(&T, &T) -> bool,
-) -> bool {
-    Arc::ptr_eq(left, right) || equivalent(left.as_ref(), right.as_ref())
-}
-
-fn tool_schema_surface_matches(
-    left: &Arc<ToolSchemaArtifact>,
-    right: &Arc<ToolSchemaArtifact>,
-) -> bool {
-    arc_identity_or_equivalent(left, right, |left, right| {
-        left.digest() == right.digest() && left.serialized() == right.serialized()
-    })
-}
-
-fn repository_scaffold_identity(step_context: &StepContext) -> Option<RepositoryScaffoldIdentity> {
-    step_context
-        .agents_md_stable_context
-        .as_ref()
-        .map(|bundle| {
-            let (identity, _locally_reused, semantic_replacement) = bundle.metadata();
-            RepositoryScaffoldIdentity {
-                identity,
-                semantic_replacement,
-            }
-        })
-}
-
-fn stable_context_owner_matches(
-    left: &crate::stable_context::StableContextManifest,
-    right: &crate::stable_context::StableContextManifest,
-) -> bool {
-    left.projection_enabled() == right.projection_enabled()
-        && left.fail_open() == right.fail_open()
-        && left.components().len() == right.components().len()
-        && left
-            .components()
-            .iter()
-            .zip(right.components())
-            .all(|(left, right)| {
-                left.kind == right.kind
-                    && left.identity == right.identity
-                    && left.active == right.active
-                    && left.disposition == right.disposition
-            })
-}
-
-pub(crate) fn build_projected_prompt(
-    sess: &Session,
-    prepared: &PreparedPromptInput,
-    router: &ToolRouter,
-    step_context: &StepContext,
-    base_instructions: BaseInstructions,
-) -> Prompt {
-    let scaffold = ResolvedRequestScaffold {
-        scaffold: Arc::new(RequestScaffold::build(
-            prepared,
-            step_context,
-            router.model_visible_schemas_for_turn(&step_context.turn),
-            base_instructions,
-            step_context
-                .turn
-                .config
-                .include_permissions_instructions
-                .then(|| sess.services.exec_policy.current())
-                .as_deref(),
-        )),
-        locally_reused: false,
-    };
-    build_projected_prompt_from_scaffold(prepared, step_context, &scaffold)
-}
-
-fn build_projected_prompt_from_scaffold(
-    prepared: &PreparedPromptInput,
-    step_context: &StepContext,
-    resolved_scaffold: &ResolvedRequestScaffold,
-) -> Prompt {
-    let scaffold = resolved_scaffold.scaffold.as_ref();
-    let [
-        input,
-        fallback_input,
-        tool_history_fallback_input,
-        stable_context_tool_history_fallback_input,
-    ] = prepared.shared_prompt_projections();
-    let digests = PromptDigests {
-        history: prepared.fingerprint(),
-        ..scaffold.digests
-    };
-    let prompt_provenance = prepared.prompt_provenance().with_exact_fragments(
-        &input,
-        scaffold
-            .exact_provenance_fragments
-            .iter()
-            .map(|(fragment, category)| (fragment.as_str(), *category)),
-    );
-    Prompt {
-        input,
-        formatted_inputs: Default::default(),
-        stable_context_fallback_input: fallback_input,
-        tool_history_fallback_input,
-        stable_context_tool_history_fallback_input,
-        tool_history_substitutions: prepared.tool_history_substitutions(),
-        stable_context_fallback_tool_history_substitutions: prepared
-            .fallback_tool_history_substitutions(),
-        stable_context_manifest: scaffold.manifest(resolved_scaffold.locally_reused).clone(),
-        deferred_dynamic_history: Some(
-            crate::client_common::DeferredDynamicHistoryMeasurement::new(
-                scaffold.stable_input_bytes,
-                scaffold.stable_input_tokens,
-            ),
-        ),
-        prompt_provenance,
-        digests,
-        tools: Arc::clone(&scaffold.tools),
-        parallel_tool_calls: step_context.turn.model_info.supports_parallel_tool_calls,
-        tool_calls_disabled: false,
-        soft_limit_waiver: false,
-        base_instructions: scaffold.base_instructions.clone(),
-        output_schema: step_context
-            .turn
-            .final_output_json_schema
-            .as_ref()
-            .map(|schema| schema.original().clone()),
-        output_schema_strict: true,
-        stream_progress_timeout: None,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn run_sampling_request<'a>(
     sess: Arc<Session>,
@@ -6063,582 +5517,6 @@ fn enforce_terminal_prompt_contract(prompt: &mut Prompt, terminal_completion_onl
     prompt.tool_calls_disabled = terminal_completion_only;
 }
 
-async fn finalized_router_matches_current_exposure(
-    sess: &Session,
-    step_context: &StepContext,
-    router: &ToolRouter,
-) -> bool {
-    if !router.matches_planning_context(step_context.turn.as_ref()) {
-        return false;
-    }
-    if router.exposure_identity().dynamic_identity()
-        != current_dynamic_tool_exposure_identity(sess, step_context).await
-    {
-        return false;
-    }
-    let turn_context = step_context.turn.as_ref();
-    if !tool_suggest_enabled(turn_context) {
-        return router.tool_suggest_candidates.is_none();
-    }
-    let loaded_plugins = sess
-        .services
-        .plugins_manager
-        .plugins_for_config(&turn_context.config.plugins_config_input())
-        .await;
-    // Advisory catalog fetches can finish without changing the turn config.
-    router.tool_suggest_candidates
-        == cached_tool_suggest_candidates(sess, turn_context, &loaded_plugins).await
-}
-
-async fn cached_tool_suggest_candidates(
-    sess: &Session,
-    turn_context: &TurnContext,
-    loaded_plugins: &PluginLoadOutcome,
-) -> Option<ToolSuggestCandidates> {
-    if !tool_suggest_enabled(turn_context) {
-        return None;
-    }
-    let auth = sess.services.auth_manager.auth().await;
-    let plugins_config = turn_context.config.plugins_config_input();
-    sess.services
-        .plugins_manager
-        .cached_recommended_plugin_candidates_for_config(RecommendedPluginCandidatesInput {
-            plugins_config: &plugins_config,
-            loaded_plugins,
-            auth: auth.as_ref(),
-            disabled_tools: &turn_context.config.tool_suggest.disabled_tools,
-            app_server_client_name: turn_context.app_server_client_name.as_deref(),
-        })
-        .map(|tools| ToolSuggestCandidates {
-            tools,
-            presentation: ToolSuggestPresentation::RecommendationContext,
-        })
-}
-
-async fn current_dynamic_tool_exposure_identity(
-    sess: &Session,
-    step_context: &StepContext,
-) -> DynamicToolExposureIdentity {
-    let mcp_tool_snapshot = step_context.mcp_tool_snapshot().await;
-    DynamicToolExposureIdentity {
-        agent_surface_stage: agent_surface_stage(sess, step_context.turn.as_ref()),
-        extension_tool_surface_revision: extension_tool_surface_revision(sess),
-        mcp_tool_catalog_revision: mcp_tool_snapshot.revision,
-        mcp_resources_available: mcp_tool_snapshot.resources_available,
-        request_user_input_eligible: request_user_input_eligible(step_context.turn.as_ref()),
-        collaboration_mode: step_context.turn.collaboration_mode.mode,
-        environment_mode: EnvironmentSurfaceMode::from_count(
-            step_context.environments.turn_environments.len(),
-        ),
-        environment_starting: !step_context.environments.starting.is_empty(),
-        native_environment_contract: crate::tools::spec_plan::native_environment_contract(
-            step_context,
-        ),
-        windows_shell_guidance: crate::tools::spec_plan::requires_windows_shell_guidance(
-            step_context,
-        ),
-    }
-}
-
-struct SessionPreparedRouter {
-    planning_generation: u64,
-    config: Arc<crate::config::Config>,
-    dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
-    router: Arc<ToolRouter>,
-}
-
-fn same_config_snapshot(
-    left: &Arc<crate::config::Config>,
-    right: &Arc<crate::config::Config>,
-) -> bool {
-    Arc::ptr_eq(left, right) || left.as_ref() == right.as_ref()
-}
-
-#[derive(Default)]
-pub(super) struct SessionPreparedRouterCache {
-    entry: std::sync::Mutex<Option<SessionPreparedRouter>>,
-}
-
-impl SessionPreparedRouterCache {
-    fn get(&self, planning_generation: u64, turn_context: &TurnContext) -> Option<Arc<ToolRouter>> {
-        self.entry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .filter(|entry| {
-                entry.planning_generation == planning_generation
-                    && same_config_snapshot(&entry.config, &turn_context.config)
-                    && entry.dynamic_tools.as_slice() == turn_context.dynamic_tools.as_slice()
-                    && entry.router.matches_planning_context(turn_context)
-            })
-            .map(|entry| Arc::clone(&entry.router))
-    }
-
-    fn publish(
-        &self,
-        planning_generation: u64,
-        turn_context: &TurnContext,
-        router: Arc<ToolRouter>,
-    ) {
-        *self
-            .entry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(SessionPreparedRouter {
-            planning_generation,
-            config: Arc::clone(&turn_context.config),
-            dynamic_tools: turn_context.dynamic_tools.clone(),
-            router,
-        });
-    }
-}
-
-async fn built_tools_for_pending_turn(
-    sess: &Session,
-    step_context: &Arc<StepContext>,
-    selected_skill_invocations: &[SkillInvocation],
-    planning_generation: u64,
-    cancellation_token: &CancellationToken,
-) -> CodexResult<Arc<ToolRouter>> {
-    let prepared = sess.startup_prepared_router.take_for_first_turn().await;
-    let turn_context = step_context.turn.as_ref();
-    if selected_skill_invocations.is_empty()
-        && let Some(prepared) = prepared
-        && prepared.planning_generation == planning_generation
-        && prepared.config.as_ref() == turn_context.config.as_ref()
-        && prepared.dynamic_tools.as_slice() == turn_context.dynamic_tools.as_slice()
-        && prepared.router.matches_planning_context(turn_context)
-    {
-        let _router_build_timing_guard = turn_context
-            .turn_timing_state
-            .begin_local_phase(TurnLocalPhase::RouterBuild);
-        if sess.services.planning_generation() == planning_generation
-            && finalized_router_matches_current_exposure(
-                sess,
-                step_context,
-                prepared.router.as_ref(),
-            )
-            .await
-        {
-            turn_context.refresh_deferred_tool_capabilities(
-                prepared.router.deferred_tool_capability_revisions(),
-            );
-            sess.prepared_tool_router.publish(
-                planning_generation,
-                turn_context,
-                Arc::clone(&prepared.router),
-            );
-            trace!(
-                planning_generation,
-                "reused startup-prepared pending-turn router"
-            );
-            return Ok(prepared.router);
-        }
-    }
-
-    if selected_skill_invocations.is_empty()
-        && let Some(router) = sess
-            .prepared_tool_router
-            .get(planning_generation, turn_context)
-        && sess.services.planning_generation() == planning_generation
-        && finalized_router_matches_current_exposure(sess, step_context, router.as_ref()).await
-    {
-        turn_context
-            .refresh_deferred_tool_capabilities(router.deferred_tool_capability_revisions());
-        return Ok(router);
-    }
-
-    let router = built_tools(
-        sess,
-        step_context,
-        selected_skill_invocations,
-        cancellation_token,
-    )
-    .await?;
-    if selected_skill_invocations.is_empty()
-        && sess.services.planning_generation() == planning_generation
-    {
-        sess.prepared_tool_router
-            .publish(planning_generation, turn_context, Arc::clone(&router));
-    }
-    Ok(router)
-}
-
-#[instrument(level = "trace",
-    skip_all,
-    fields(
-        turn_id = %step_context.turn.sub_id,
-        model = %step_context.turn.model_info.slug,
-        apps_enabled = step_context.turn.apps_enabled()
-    )
-)]
-pub(crate) async fn built_tools(
-    sess: &Session,
-    step_context: &Arc<StepContext>,
-    selected_skill_invocations: &[SkillInvocation],
-    cancellation_token: &CancellationToken,
-) -> CodexResult<Arc<ToolRouter>> {
-    let turn_context = step_context.turn.as_ref();
-    let _router_build_timing_guard = turn_context
-        .turn_timing_state
-        .begin_local_phase(TurnLocalPhase::RouterBuild);
-    if turn_context.config.web_search_mode.value()
-        != codex_protocol::config_types::WebSearchMode::Disabled
-    {
-        turn_context
-            .provider
-            .prepare_hosted_web_search()
-            .or_cancel(cancellation_token)
-            .await??;
-    }
-    let mcp_connection_manager = step_context.mcp.manager();
-    let has_mcp_servers = mcp_connection_manager.has_servers();
-    let mcp_tool_snapshot = step_context
-        .mcp_tool_snapshot()
-        .or_cancel(cancellation_token)
-        .await?;
-    let mcp_tool_catalog_revision = mcp_tool_snapshot.revision;
-    let all_mcp_tools = mcp_tool_snapshot.tools.as_slice();
-    let loaded_plugins = sess
-        .services
-        .plugins_manager
-        .plugins_for_config(&turn_context.config.plugins_config_input())
-        .instrument(trace_span!("built_tools.load_plugins"))
-        .await;
-    let extension_snapshot = extension_tool_surface_snapshot(sess);
-    let extension_tool_executors = extension_snapshot.tools;
-    let selected_skill_mcp_exposure = resolve_selected_skill_mcp_exposure(
-        selected_skill_invocations,
-        &loaded_plugins,
-        all_mcp_tools,
-    );
-    for diagnostic in &selected_skill_mcp_exposure.diagnostics {
-        warn!("{diagnostic}");
-    }
-    let exposure_identity = derive_tool_exposure_identity(
-        sess,
-        step_context,
-        &selected_skill_mcp_exposure.direct_entrypoints,
-        mcp_tool_catalog_revision,
-        mcp_tool_snapshot.resources_available,
-        &extension_tool_executors,
-        extension_snapshot.revision,
-    );
-    let connector_snapshot = step_context.mcp.config().connector_snapshot.clone();
-
-    let apps_enabled = turn_context.apps_enabled();
-    let accessible_connectors =
-        apps_enabled.then(|| connectors::accessible_connectors_from_mcp_tools(all_mcp_tools));
-    let connectors = if apps_enabled {
-        let connectors = codex_connectors::merge::merge_plugin_connectors_with_accessible(
-            connector_snapshot
-                .connector_ids()
-                .iter()
-                .map(|connector_id| connector_id.0.clone()),
-            accessible_connectors.clone().unwrap_or_default(),
-        );
-        Some(connectors::with_app_enabled_state(
-            connectors,
-            &turn_context.config,
-        ))
-    } else {
-        None
-    };
-    let tool_suggest_candidates =
-        cached_tool_suggest_candidates(sess, turn_context, &loaded_plugins).await;
-    let mcp_tool_exposure = build_mcp_tool_exposure(
-        all_mcp_tools,
-        connectors.as_deref(),
-        &turn_context.config,
-        search_tool_enabled(turn_context),
-        &selected_skill_mcp_exposure.selection,
-    );
-    let mcp_tools = has_mcp_servers.then_some(mcp_tool_exposure.direct_tools);
-    let deferred_mcp_tools = mcp_tool_exposure.deferred_tools;
-    // Index construction and concurrent cache-build waits can block. Keep them
-    // off runtime workers so cancellation and other turns can still progress.
-    let router_step = Arc::clone(step_context);
-    let search_cache = Arc::clone(&sess.services.tool_search_handler_cache);
-    let span = tracing::Span::current();
-    let router_build = AbortOnDropHandle::new(tokio::task::spawn_blocking(move || {
-        let _enter = span.enter();
-        ToolRouter::try_from_context(
-            router_step.as_ref(),
-            ToolRouterParams {
-                mcp_tools,
-                deferred_mcp_tools,
-                tool_suggest_candidates,
-                extension_tool_executors,
-                dynamic_tools: router_step.turn.dynamic_tools.as_slice(),
-                exposure_identity,
-            },
-            &search_cache,
-        )
-    }));
-    let router = Arc::new(
-        router_build
-            .or_cancel(cancellation_token)
-            .await?
-            .map_err(|error| CodexErr::Fatal(format!("tool router build task failed: {error}")))?
-            .map_err(CodexErr::InvalidRequest)?,
-    );
-    step_context
-        .turn
-        .refresh_deferred_tool_capabilities(router.deferred_tool_capability_revisions());
-    Ok(router)
-}
-
-fn derive_tool_exposure_identity(
-    sess: &Session,
-    step_context: &StepContext,
-    selected_skill_direct_mcp_entrypoints: &[DirectMcpToolEntrypoint],
-    mcp_tool_catalog_revision: u64,
-    mcp_resources_available: bool,
-    extension_tool_executors: &[Arc<
-        dyn codex_extension_api::ToolExecutor<codex_extension_api::ToolCall>,
-    >],
-    extension_tool_surface_revision: u64,
-) -> ToolExposureIdentity {
-    let turn_context = step_context.turn.as_ref();
-    let agent_surface_stage = agent_surface_stage(sess, turn_context);
-    let goal_surface_state = goal_surface_state(extension_tool_executors);
-    let tool_search_available = search_tool_enabled(turn_context);
-    let request_user_input_eligible = request_user_input_eligible(turn_context);
-    let environment_mode =
-        EnvironmentSurfaceMode::from_count(step_context.environments.turn_environments.len());
-    let environment_starting = !step_context.environments.starting.is_empty();
-
-    ToolExposureIdentity {
-        selected_skill_direct_mcp_entrypoints: selected_skill_direct_mcp_entrypoints.to_vec(),
-        agent_surface_stage,
-        goal_surface_state,
-        extension_tool_surface_revision,
-        mcp_tool_catalog_revision,
-        mcp_resources_available,
-        tool_search_available,
-        request_user_input_eligible,
-        collaboration_mode: turn_context.collaboration_mode.mode,
-        environment_mode,
-        environment_starting,
-        native_environment_contract: crate::tools::spec_plan::native_environment_contract(
-            step_context,
-        ),
-        windows_shell_guidance: crate::tools::spec_plan::requires_windows_shell_guidance(
-            step_context,
-        ),
-    }
-}
-
-fn request_user_input_eligible(turn_context: &TurnContext) -> bool {
-    let available_modes = request_user_input_available_modes(turn_context.config.features.get());
-    turn_context.config.experimental_request_user_input_enabled
-        && available_modes.contains(&turn_context.collaboration_mode.mode)
-}
-
-pub(super) fn agent_surface_stage(sess: &Session, turn_context: &TurnContext) -> AgentSurfaceStage {
-    let spawn_eligible = turn_context.multi_agent_version != MultiAgentVersion::Disabled;
-    let control = &sess.services.agent_control;
-    agent_surface_stage_from_snapshot(
-        spawn_eligible,
-        // Latched rather than current: a graph that empties when children finish
-        // must not retract tool schemas that sit in the cached prompt prefix.
-        control.ever_had_live_agents(),
-        control.task_coordinator().has_bindings(),
-    )
-}
-
-fn agent_surface_stage_from_snapshot(
-    spawn_eligible: bool,
-    child_graph_nonempty: bool,
-    typed_bindings_present: bool,
-) -> AgentSurfaceStage {
-    if typed_bindings_present {
-        AgentSurfaceStage::TypedAdministration
-    } else if child_graph_nonempty {
-        AgentSurfaceStage::Lifecycle
-    } else if spawn_eligible {
-        AgentSurfaceStage::SpawnOnly
-    } else {
-        AgentSurfaceStage::Prohibited
-    }
-}
-
-fn goal_surface_state(
-    executors: &[Arc<dyn codex_extension_api::ToolExecutor<codex_extension_api::ToolCall>>],
-) -> GoalSurfaceState {
-    if executors.iter().any(|executor| {
-        matches!(
-            executor.tool_name().name.as_str(),
-            "get_goal" | "update_goal"
-        ) && executor.exposure() == codex_tools::ToolExposure::Direct
-    }) {
-        GoalSurfaceState::Active
-    } else if executors
-        .iter()
-        .any(|executor| executor.tool_name() == ToolName::plain("create_goal"))
-    {
-        GoalSurfaceState::Inactive
-    } else {
-        GoalSurfaceState::Disabled
-    }
-}
-
-/// Host-only, turn-scoped opt-in; schema absence and model text cannot grant it.
-pub(super) struct NoProseAuthorization;
-
-const MISSING_ANSWER_REPAIR_DIRECTIVE: &str = "The response ended without a completed final answer. Deliver the answer required by the current request, including any requested explanation or truthful blocker; Commentary and successful tool stdout are not a final answer. Do not repeat completed effects or invent validation. If and only if the request explicitly authorizes no prose, and no structured output schema applies, declare that disposition with an empty final_answer message rather than an empty response. Otherwise supply a nonempty final answer. This is the single missing-answer repair attempt.";
-
-#[derive(Debug, Default)]
-enum AnswerDelivery {
-    #[default]
-    Missing,
-    Message(codex_protocol::protocol::AcceptedFinalMessage),
-    /// An explicit completed final item, not a reasoning-only/empty response.
-    NoProse,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-enum VisibleOutputNovelty {
-    Unobserved,
-    NewCommunication,
-    ExactRepeat,
-    Replay,
-}
-
-/// Turn-local only: one answer and one visible identity. Observation is not
-/// permission to suppress output, skip reasoning, or accept unfinished work.
-#[derive(Default)]
-struct TurnOutputState {
-    revision: Option<String>,
-    answer: AnswerDelivery,
-    last_visible: Option<(String, Option<MessagePhase>, [u8; 32])>,
-    missing_answer_repair_attempted: bool,
-    no_prose_authorized: bool,
-}
-
-impl TurnOutputState {
-    fn reconcile_revision(&mut self, revision: &str) {
-        if self.revision.as_deref() != Some(revision) {
-            self.invalidate_answer();
-            self.last_visible = None;
-            self.revision = Some(revision.to_string());
-        }
-    }
-
-    fn invalidate_answer(&mut self) {
-        self.answer = AnswerDelivery::Missing;
-    }
-
-    fn invalidate_for_repair(&mut self) {
-        self.invalidate_answer();
-        self.last_visible = None;
-        self.revision = None;
-    }
-
-    fn observe(
-        &mut self,
-        output: Option<FinalizedAssistantOutput>,
-        candidate: Option<codex_protocol::protocol::AcceptedFinalMessage>,
-        revision: String,
-        allow_answer: bool,
-        allow_no_prose: bool,
-    ) -> VisibleOutputNovelty {
-        use sha2::Digest;
-        self.reconcile_revision(&revision);
-        if !allow_answer {
-            // Output accompanying tools may precede their effects/results.
-            self.invalidate_answer();
-        } else if let Some(candidate) = candidate {
-            self.answer = AnswerDelivery::Message(candidate);
-        } else if allow_no_prose
-            && (self.no_prose_authorized || self.missing_answer_repair_attempted)
-            && output.as_ref().is_some_and(|output| {
-                output.phase == Some(MessagePhase::FinalAnswer) && output.text.is_empty()
-            })
-        {
-            self.answer = AnswerDelivery::NoProse;
-        }
-        let Some(output) = output else {
-            // Necessary silent inference has no observable novelty verdict.
-            return VisibleOutputNovelty::Unobserved;
-        };
-        let digest: [u8; 32] = sha2::Sha256::digest(output.text.as_bytes()).into();
-        let novelty = match &self.last_visible {
-            Some((id, phase, previous)) if phase == &output.phase && previous == &digest => {
-                if id == &output.item_id {
-                    VisibleOutputNovelty::Replay
-                } else {
-                    VisibleOutputNovelty::ExactRepeat
-                }
-            }
-            _ => VisibleOutputNovelty::NewCommunication,
-        };
-        self.last_visible = Some((output.item_id, output.phase, digest));
-        tracing::debug!(
-            ?novelty,
-            "task-bound visible output observation; semantic necessity unknown"
-        );
-        novelty
-    }
-
-    fn has_answer(&self) -> bool {
-        !matches!(self.answer, AnswerDelivery::Missing)
-    }
-
-    fn answer_text(&self) -> Option<String> {
-        match &self.answer {
-            AnswerDelivery::Message(message) => Some(message.text.clone()),
-            _ => None,
-        }
-    }
-
-    fn take_answer(&mut self) -> Option<codex_protocol::protocol::AcceptedFinalMessage> {
-        match std::mem::take(&mut self.answer) {
-            AnswerDelivery::Message(message) => Some(message),
-            _ => None,
-        }
-    }
-}
-
-fn final_message_candidate_from_output(
-    output: crate::stream_events_utils::FinalizedAssistantOutput,
-) -> Option<codex_protocol::protocol::AcceptedFinalMessage> {
-    use codex_protocol::models::MessagePhase;
-    use codex_protocol::protocol::AcceptedFinalMessageOrigin;
-    if matches!(output.phase, Some(MessagePhase::Commentary | MessagePhase::PartialAnswer))
-        || output.text.trim().is_empty()
-    {
-        return None;
-    }
-    Some(codex_protocol::protocol::AcceptedFinalMessage {
-        item_id: output.item_id,
-        text: output.text,
-        origin: if output.phase == Some(MessagePhase::FinalAnswer) {
-            AcceptedFinalMessageOrigin::AssistantFinal
-        } else {
-            AcceptedFinalMessageOrigin::LegacyUnphased
-        },
-        completion_attempt_id: String::new(),
-    })
-}
-
-fn update_final_message_candidate(
-    current: &mut Option<codex_protocol::protocol::AcceptedFinalMessage>,
-    candidate: codex_protocol::protocol::AcceptedFinalMessage,
-) {
-    use codex_protocol::protocol::AcceptedFinalMessageOrigin;
-    let rank = |origin| match origin {
-        AcceptedFinalMessageOrigin::AssistantFinal => 2,
-        AcceptedFinalMessageOrigin::LegacyUnphased => 1,
-        AcceptedFinalMessageOrigin::Plan => 0,
-    };
-    if current
-        .as_ref()
-        .is_none_or(|previous| rank(candidate.origin) >= rank(previous.origin))
-    {
-        *current = Some(candidate);
-    }
-}
-
 #[derive(Debug)]
 struct SamplingRequestResult {
     needs_follow_up: bool,
@@ -6670,627 +5548,6 @@ impl UnsettledSamplingRequestResult {
             server_end_turn_false: false,
         }
     }
-}
-
-/// Ephemeral per-response state for streaming a single proposed plan.
-/// This is intentionally not persisted or stored in session/state since it
-/// only exists while a response is actively streaming. The final plan text
-/// is extracted from the completed assistant message.
-/// Tracks a single proposed plan item across a streaming response.
-struct ProposedPlanItemState {
-    item_id: String,
-    started: bool,
-    completed: bool,
-    /// Text already delivered to clients, retained if the final item never arrives.
-    streamed_text: String,
-}
-
-/// Aggregated state used only while streaming a plan-mode response.
-/// Includes per-item parsers, deferred agent message bookkeeping, and the plan item lifecycle.
-struct PlanModeStreamState {
-    /// Agent message items started by the model but deferred until we see non-plan text.
-    pending_agent_message_items: HashMap<String, TurnItem>,
-    /// Agent message items whose start notification has been emitted.
-    started_agent_message_items: BTreeMap<String, TurnItem>,
-    /// Leading whitespace buffered until we see non-whitespace text for an item.
-    leading_whitespace_by_item: HashMap<String, String>,
-    /// Tracks plan item lifecycle while streaming plan output.
-    plan_item_state: ProposedPlanItemState,
-}
-
-impl PlanModeStreamState {
-    fn new(turn_id: &str) -> Self {
-        Self {
-            pending_agent_message_items: HashMap::new(),
-            started_agent_message_items: BTreeMap::new(),
-            leading_whitespace_by_item: HashMap::new(),
-            plan_item_state: ProposedPlanItemState::new(turn_id),
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-pub(super) struct AssistantMessageStreamParsers {
-    plan_mode: bool,
-    parsers_by_item: HashMap<String, AssistantTextStreamParser>,
-}
-
-type ParsedAssistantTextDelta = AssistantTextChunk;
-
-impl AssistantMessageStreamParsers {
-    pub(super) fn new(plan_mode: bool) -> Self {
-        Self {
-            plan_mode,
-            parsers_by_item: HashMap::new(),
-        }
-    }
-
-    fn parser_mut(&mut self, item_id: &str) -> &mut AssistantTextStreamParser {
-        if !self.parsers_by_item.contains_key(item_id) {
-            self.parsers_by_item.insert(
-                item_id.to_owned(),
-                AssistantTextStreamParser::new(self.plan_mode),
-            );
-        }
-        self.parsers_by_item
-            .get_mut(item_id)
-            .unwrap_or_else(|| unreachable!("stream parser was inserted above"))
-    }
-
-    pub(super) fn seed_item_text(&mut self, item_id: &str, text: &str) -> ParsedAssistantTextDelta {
-        if text.is_empty() {
-            return ParsedAssistantTextDelta::default();
-        }
-        self.parser_mut(item_id).push_str(text)
-    }
-
-    pub(super) fn parse_delta(&mut self, item_id: &str, delta: &str) -> ParsedAssistantTextDelta {
-        self.parser_mut(item_id).push_str(delta)
-    }
-
-    pub(super) fn finish_item(&mut self, item_id: &str) -> ParsedAssistantTextDelta {
-        let Some(mut parser) = self.parsers_by_item.remove(item_id) else {
-            return ParsedAssistantTextDelta::default();
-        };
-        parser.finish()
-    }
-
-    fn drain_finished(&mut self) -> Vec<(String, ParsedAssistantTextDelta)> {
-        let parsers_by_item = std::mem::take(&mut self.parsers_by_item);
-        parsers_by_item
-            .into_iter()
-            .map(|(item_id, mut parser)| (item_id, parser.finish()))
-            .collect()
-    }
-}
-
-impl ProposedPlanItemState {
-    fn new(turn_id: &str) -> Self {
-        Self {
-            item_id: format!("{turn_id}-plan"),
-            started: false,
-            completed: false,
-            streamed_text: String::new(),
-        }
-    }
-
-    async fn start(&mut self, sess: &Session, turn_context: &TurnContext) {
-        if self.started || self.completed {
-            return;
-        }
-        self.started = true;
-        let item = TurnItem::Plan(PlanItem {
-            id: self.item_id.clone(),
-            text: String::new(),
-        });
-        sess.emit_turn_item_started(turn_context, &item).await;
-    }
-
-    async fn push_delta(&mut self, sess: &Session, turn_context: &TurnContext, delta: &str) {
-        // A delta without a preceding ItemStarted event produces an invalid
-        // client-visible item stream. Treat both out-of-phase cases as inert.
-        if !self.started || self.completed {
-            return;
-        }
-        if delta.is_empty() {
-            return;
-        }
-        self.streamed_text.push_str(delta);
-        let event = PlanDeltaEvent {
-            thread_id: sess.thread_id.to_string(),
-            turn_id: turn_context.sub_id.clone(),
-            item_id: self.item_id.clone(),
-            delta: delta.to_string(),
-        };
-        sess.send_event(turn_context, EventMsg::PlanDelta(event))
-            .await;
-    }
-
-    async fn complete_with_text(
-        &mut self,
-        sess: &Session,
-        turn_context: &TurnContext,
-        text: String,
-    ) {
-        if self.completed || !self.started {
-            return;
-        }
-        self.completed = true;
-        let item = TurnItem::Plan(PlanItem {
-            id: self.item_id.clone(),
-            text,
-        });
-        sess.emit_turn_item_completed(turn_context, item).await;
-    }
-}
-
-/// In plan mode we defer agent message starts until the parser emits non-plan
-/// text. The parser buffers each line until it can rule out a tag prefix, so
-/// plan-only outputs never show up as empty assistant messages.
-async fn maybe_emit_pending_agent_message_start(
-    sess: &Session,
-    turn_context: &TurnContext,
-    state: &mut PlanModeStreamState,
-    item_id: &str,
-) {
-    if state.started_agent_message_items.contains_key(item_id) {
-        return;
-    }
-    if let Some(item) = state.pending_agent_message_items.remove(item_id) {
-        sess.emit_turn_item_started(turn_context, &item).await;
-        state
-            .started_agent_message_items
-            .insert(item_id.to_string(), item);
-    }
-}
-
-/// Agent messages are text-only today; concatenate all text entries.
-fn agent_message_text(item: &codex_protocol::items::AgentMessageItem) -> String {
-    item.content
-        .iter()
-        .map(|entry| match entry {
-            codex_protocol::items::AgentMessageContent::Text { text } => text.as_str(),
-        })
-        .collect()
-}
-
-// A first prose batch can await ItemStarted publication after extracting buffered
-// whitespace. Retain that accepted batch across sampling-worker abort, including
-// the interval where its returned state is queued but the caller has not resumed.
-struct OwnedPlanStreamState {
-    state: Option<PlanModeStreamState>,
-    session: Arc<Session>,
-    turn: Arc<TurnContext>,
-    in_flight: Option<super::DurableHistoryCommitInFlight>,
-    runtime: tokio::runtime::Handle,
-}
-
-impl Drop for OwnedPlanStreamState {
-    fn drop(&mut self) {
-        let Some(mut state) = self.state.take() else {
-            return;
-        };
-        let session = Arc::clone(&self.session);
-        let turn = Arc::clone(&self.turn);
-        let in_flight = self.in_flight.take();
-        self.runtime.spawn(async move {
-            let _in_flight = in_flight;
-            complete_partial_plan_items(&session, &turn, &mut state).await;
-        });
-    }
-}
-
-async fn complete_partial_plan_items(
-    sess: &Session,
-    turn_context: &TurnContext,
-    state: &mut PlanModeStreamState,
-) {
-    for (_, item) in std::mem::take(&mut state.started_agent_message_items) {
-        sess.emit_turn_item_completed(turn_context, item).await;
-    }
-    let plan_text = std::mem::take(&mut state.plan_item_state.streamed_text);
-    state
-        .plan_item_state
-        .complete_with_text(sess, turn_context, plan_text)
-        .await;
-}
-
-#[expect(
-    clippy::expect_used,
-    reason = "Owned state exists until its single handoff; a failed publication task cannot supply a replacement state"
-)]
-async fn handle_plan_segments(
-    sess: &Arc<Session>,
-    turn_context: &Arc<TurnContext>,
-    state: &mut PlanModeStreamState,
-    item_id: &str,
-    segments: Vec<ProposedPlanSegment>,
-) {
-    let starts_prose = !state.started_agent_message_items.contains_key(item_id)
-        && segments.iter().any(|segment| {
-            matches!(segment,
-            ProposedPlanSegment::Normal(delta) if delta.chars().any(|ch| !ch.is_whitespace()))
-        });
-    if !starts_prose {
-        handle_plan_segments_inner(sess, turn_context, state, item_id, segments).await;
-        return;
-    }
-    sess.durable_history_commits_in_flight
-        .fetch_add(1, Ordering::AcqRel);
-    let mut owned = OwnedPlanStreamState {
-        state: Some(std::mem::replace(
-            state,
-            PlanModeStreamState::new(&turn_context.sub_id),
-        )),
-        session: Arc::clone(sess),
-        turn: Arc::clone(turn_context),
-        in_flight: Some(super::DurableHistoryCommitInFlight {
-            session: Arc::clone(sess),
-        }),
-        runtime: tokio::runtime::Handle::current(),
-    };
-    let session = Arc::clone(sess);
-    let turn = Arc::clone(turn_context);
-    let item_id = item_id.to_string();
-    let (send_state, receive_state) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        handle_plan_segments_inner(
-            &session,
-            &turn,
-            owned.state.as_mut().expect("owned plan state"),
-            &item_id,
-            segments,
-        )
-        .await;
-        // On an abandoned receiver, Drop closes the actual published prefix.
-        let _ = send_state.send(owned);
-    });
-    let mut returned = receive_state
-        .await
-        .expect("owned plan publication task must return its state");
-    *state = returned.state.take().expect("returned plan state");
-}
-
-/// Split the stream into normal assistant text vs. proposed plan content.
-/// Normal text becomes AgentMessage deltas; plan content becomes PlanDelta +
-/// TurnItem::Plan.
-async fn handle_plan_segments_inner(
-    sess: &Session,
-    turn_context: &TurnContext,
-    state: &mut PlanModeStreamState,
-    item_id: &str,
-    segments: Vec<ProposedPlanSegment>,
-) {
-    for segment in segments {
-        match segment {
-            ProposedPlanSegment::Normal(delta) => {
-                if delta.is_empty() {
-                    continue;
-                }
-                let has_non_whitespace = delta.chars().any(|ch| !ch.is_whitespace());
-                if !has_non_whitespace && !state.started_agent_message_items.contains_key(item_id) {
-                    let entry = state
-                        .leading_whitespace_by_item
-                        .entry(item_id.to_string())
-                        .or_default();
-                    entry.push_str(&delta);
-                    continue;
-                }
-                let delta = if !state.started_agent_message_items.contains_key(item_id) {
-                    if let Some(prefix) = state.leading_whitespace_by_item.remove(item_id) {
-                        format!("{prefix}{delta}")
-                    } else {
-                        delta
-                    }
-                } else {
-                    delta
-                };
-                maybe_emit_pending_agent_message_start(sess, turn_context, state, item_id).await;
-
-                let event = AgentMessageContentDeltaEvent {
-                    thread_id: sess.thread_id.to_string(),
-                    turn_id: turn_context.sub_id.clone(),
-                    item_id: item_id.to_string(),
-                    delta,
-                };
-                if let Some(item) = state.started_agent_message_items.get_mut(item_id) {
-                    apply_partial_agent_message_delta(item, &event);
-                }
-                sess.send_event(turn_context, EventMsg::AgentMessageContentDelta(event))
-                    .await;
-            }
-            ProposedPlanSegment::ProposedPlanStart => {
-                if !state.plan_item_state.completed {
-                    state.plan_item_state.start(sess, turn_context).await;
-                }
-            }
-            ProposedPlanSegment::ProposedPlanDelta(delta) => {
-                if !state.plan_item_state.completed {
-                    if !state.plan_item_state.started {
-                        state.plan_item_state.start(sess, turn_context).await;
-                    }
-                    state
-                        .plan_item_state
-                        .push_delta(sess, turn_context, &delta)
-                        .await;
-                }
-            }
-            ProposedPlanSegment::ProposedPlanEnd => {}
-        }
-    }
-}
-
-fn append_partial_reasoning_text(parts: &mut Vec<String>, index: i64, delta: &str) {
-    let Ok(index) = usize::try_from(index) else {
-        return;
-    };
-    if let Some(part) = parts.get_mut(index) {
-        part.push_str(delta);
-    } else if index == parts.len() {
-        parts.push(delta.to_string());
-    }
-}
-
-fn apply_partial_agent_message_delta(item: &mut TurnItem, event: &AgentMessageContentDeltaEvent) {
-    let TurnItem::AgentMessage(message) = item else {
-        return;
-    };
-    if !event.delta.is_empty() {
-        match message.content.last_mut() {
-            Some(codex_protocol::items::AgentMessageContent::Text { text }) => {
-                text.push_str(&event.delta);
-            }
-            None => message
-                .content
-                .push(codex_protocol::items::AgentMessageContent::Text {
-                    text: event.delta.clone(),
-                }),
-        }
-    }
-}
-
-async fn emit_streamed_assistant_text_delta(
-    sess: &Arc<Session>,
-    turn_context: &Arc<TurnContext>,
-    plan_mode_state: Option<&mut PlanModeStreamState>,
-    item_id: &str,
-    parsed: ParsedAssistantTextDelta,
-) -> Option<AgentMessageContentDeltaEvent> {
-    if parsed.is_empty() {
-        return None;
-    }
-    if let Some(state) = plan_mode_state {
-        if !parsed.plan_segments.is_empty() {
-            handle_plan_segments(sess, turn_context, state, item_id, parsed.plan_segments).await;
-        }
-        return None;
-    }
-    if parsed.visible_text.is_empty() {
-        return None;
-    }
-    let event = AgentMessageContentDeltaEvent {
-        thread_id: sess.thread_id.to_string(),
-        turn_id: turn_context.sub_id.clone(),
-        item_id: item_id.to_string(),
-        delta: parsed.visible_text,
-    };
-    sess.send_event(
-        turn_context,
-        EventMsg::AgentMessageContentDelta(event.clone()),
-    )
-    .await;
-    Some(event)
-}
-
-/// Flush buffered assistant text parser state when an assistant message item ends.
-async fn flush_assistant_text_segments_for_item(
-    sess: &Arc<Session>,
-    turn_context: &Arc<TurnContext>,
-    plan_mode_state: Option<&mut PlanModeStreamState>,
-    parsers: &mut AssistantMessageStreamParsers,
-    item_id: &str,
-) {
-    let parsed = parsers.finish_item(item_id);
-    let _ =
-        emit_streamed_assistant_text_delta(sess, turn_context, plan_mode_state, item_id, parsed)
-            .await;
-}
-
-/// Flush any remaining buffered assistant text parser state at response completion.
-async fn flush_assistant_text_segments_all(
-    sess: &Arc<Session>,
-    turn_context: &Arc<TurnContext>,
-    mut plan_mode_state: Option<&mut PlanModeStreamState>,
-    parsers: &mut AssistantMessageStreamParsers,
-) -> Vec<AgentMessageContentDeltaEvent> {
-    let mut emitted = Vec::new();
-    for (item_id, parsed) in parsers.drain_finished() {
-        if let Some(event) = emit_streamed_assistant_text_delta(
-            sess,
-            turn_context,
-            plan_mode_state.as_deref_mut(),
-            &item_id,
-            parsed,
-        )
-        .await
-        {
-            emitted.push(event);
-        }
-    }
-    emitted
-}
-
-/// Emit completion for plan items by parsing the finalized assistant message.
-async fn maybe_complete_plan_item_from_message(
-    sess: &Session,
-    turn_context: &TurnContext,
-    state: &mut PlanModeStreamState,
-    item: &ResponseItem,
-) {
-    if let ResponseItem::Message { role, content, .. } = item
-        && role == "assistant"
-    {
-        let mut text = String::new();
-        for entry in content {
-            if let ContentItem::OutputText { text: chunk } = entry {
-                text.push_str(chunk);
-            }
-        }
-        if let Some(plan_text) = extract_proposed_plan_text(&text) {
-            if !state.plan_item_state.started {
-                state.plan_item_state.start(sess, turn_context).await;
-            }
-            state
-                .plan_item_state
-                .complete_with_text(sess, turn_context, plan_text)
-                .await;
-        }
-    }
-}
-
-/// Emit a completed agent message in plan mode, respecting deferred starts.
-async fn emit_agent_message_in_plan_mode(
-    sess: &Session,
-    turn_context: &TurnContext,
-    agent_message: codex_protocol::items::AgentMessageItem,
-    state: &mut PlanModeStreamState,
-) {
-    let agent_message_id = agent_message.id.clone();
-    let text = agent_message_text(&agent_message);
-    if text.trim().is_empty() {
-        state.pending_agent_message_items.remove(&agent_message_id);
-        if let Some(started_item) = state.started_agent_message_items.remove(&agent_message_id) {
-            sess.emit_turn_item_completed(turn_context, started_item)
-                .await;
-        }
-        return;
-    }
-
-    maybe_emit_pending_agent_message_start(sess, turn_context, state, &agent_message_id).await;
-
-    if !state
-        .started_agent_message_items
-        .contains_key(&agent_message_id)
-    {
-        let start_item = state
-            .pending_agent_message_items
-            .remove(&agent_message_id)
-            .unwrap_or_else(|| {
-                TurnItem::AgentMessage(codex_protocol::items::AgentMessageItem {
-                    id: agent_message_id.clone(),
-                    content: Vec::new(),
-                    phase: None,
-                    interruption: None,
-                })
-            });
-        sess.emit_turn_item_started(turn_context, &start_item).await;
-        state
-            .started_agent_message_items
-            .insert(agent_message_id.clone(), start_item);
-    }
-
-    sess.emit_turn_item_completed(turn_context, TurnItem::AgentMessage(agent_message))
-        .await;
-    state.started_agent_message_items.remove(&agent_message_id);
-}
-
-/// Emit completion for a plan-mode turn item, handling agent messages specially.
-async fn emit_turn_item_in_plan_mode(
-    sess: &Session,
-    turn_context: &TurnContext,
-    turn_item: TurnItem,
-    previously_active_item: Option<&TurnItem>,
-    state: &mut PlanModeStreamState,
-) {
-    match turn_item {
-        TurnItem::AgentMessage(agent_message) => {
-            emit_agent_message_in_plan_mode(sess, turn_context, agent_message, state).await;
-        }
-        _ => {
-            if previously_active_item.is_none() {
-                sess.emit_turn_item_started(turn_context, &turn_item).await;
-            }
-            sess.emit_turn_item_completed(turn_context, turn_item).await;
-        }
-    }
-}
-
-/// Handle a completed assistant response item in plan mode, returning true if handled.
-#[allow(clippy::too_many_arguments)]
-async fn handle_assistant_item_done_in_plan_mode(
-    sess: &Arc<Session>,
-    turn_context: &Arc<TurnContext>,
-    turn_store: &codex_extension_api::ExtensionData,
-    item: &ResponseItem,
-    state: &mut PlanModeStreamState,
-    previously_active_item: Option<&TurnItem>,
-    last_agent_message: &mut Option<String>,
-    assistant_output: &mut Option<FinalizedAssistantOutput>,
-    final_message_candidate: &mut Option<codex_protocol::protocol::AcceptedFinalMessage>,
-) -> std::io::Result<bool> {
-    if let ResponseItem::Message { role, .. } = item
-        && role == "assistant"
-    {
-        let finalized_turn_item = finalize_non_tool_response_item(
-            sess,
-            TurnItemContributorPolicy::Run(turn_store),
-            item,
-            /*plan_mode*/ true,
-        )
-        .await;
-        let finalized_facts = finalized_turn_item.as_ref().map(|item| item.facts.clone());
-        record_completed_response_item_with_finalized_facts(
-            sess, turn_context, item, finalized_facts.as_ref(),
-        ).await?;
-        maybe_complete_plan_item_from_message(sess, turn_context, state, item).await;
-        if let Some(finalized_turn_item) = finalized_turn_item {
-            emit_turn_item_in_plan_mode(
-                sess,
-                turn_context,
-                finalized_turn_item.turn_item,
-                previously_active_item,
-                state,
-            )
-            .await;
-        }
-        let final_last_agent_message = finalized_facts
-            .as_ref()
-            .and_then(|facts| facts.last_agent_message.clone());
-        if let Some(candidate) = finalized_facts
-            .as_ref()
-            .and_then(|facts| facts.assistant_output.clone())
-            .and_then(final_message_candidate_from_output)
-        {
-            update_final_message_candidate(final_message_candidate, candidate);
-        } else if final_message_candidate.is_none()
-            && let ResponseItem::Message { content, .. } = item
-        {
-            let text = content
-                .iter()
-                .filter_map(|entry| match entry {
-                    ContentItem::OutputText { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<String>();
-            if let Some(text) = extract_proposed_plan_text(&text) {
-                *final_message_candidate = Some(codex_protocol::protocol::AcceptedFinalMessage {
-                    item_id: state.plan_item_state.item_id.clone(),
-                    text,
-                    origin: codex_protocol::protocol::AcceptedFinalMessageOrigin::Plan,
-                    completion_attempt_id: String::new(),
-                });
-            }
-        }
-
-        if let Some(agent_message) = final_last_agent_message {
-            *last_agent_message = Some(agent_message);
-        }
-        if let Some(output) = finalized_facts.and_then(|facts| facts.assistant_output) {
-            *assistant_output = Some(output);
-        }
-        return Ok(true);
-    }
-    Ok(false)
 }
 
 

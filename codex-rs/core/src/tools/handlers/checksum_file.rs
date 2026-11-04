@@ -65,7 +65,11 @@ impl ToolExecutor<ToolInvocation> for ChecksumFileHandler {
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
         Box::pin(async move {
-            let error = |message: String| FunctionCallError::RespondToModel(message);
+            let error = |message: String| FunctionCallError::structured(
+                codex_protocol::tool_failure::ToolFailure::no_effects(
+                    codex_protocol::tool_failure::ToolFailureCode::Failed, message,
+                ).with_completed_execution(),
+            );
             let ToolPayload::Function { ref arguments } = invocation.payload else {
                 return Err(error("checksum_file requires function arguments".into()));
             };
@@ -83,7 +87,7 @@ impl ToolExecutor<ToolInvocation> for ChecksumFileHandler {
                 .transpose()?;
             let checksum = checksum_source(&invocation, &args.path, args.environment_id.as_deref())
                 .await
-                .map_err(|failure| error(failure.message))?;
+                .map_err(ChecksumFailure::into_tool_error)?;
             let sha256 = &checksum.sha256;
             let mut value = json!({
                 "path":checksum.path, "environment_id":checksum.environment_id,
@@ -112,6 +116,21 @@ pub(super) struct FileChecksum {
 pub(super) struct ChecksumFailure {
     pub(super) reason: &'static str,
     pub(super) message: String,
+}
+
+impl ChecksumFailure {
+    fn into_tool_error(self) -> FunctionCallError {
+        use codex_protocol::tool_failure::{ToolFailure, ToolFailureCode};
+        let code = match self.reason {
+            "access_denied" => ToolFailureCode::PermissionDenied,
+            "cancelled" => ToolFailureCode::Cancelled,
+            "source_changed_during_check" => ToolFailureCode::StaleInput,
+            _ => ToolFailureCode::Failed,
+        };
+        let mut failure = ToolFailure::no_effects(code, self.message).with_completed_execution();
+        failure.details = Some(json!({"checksum_failure_reason": self.reason}));
+        FunctionCallError::structured(failure)
+    }
 }
 
 /// The checksum and freshness tools share the same authorized, revision-guarded

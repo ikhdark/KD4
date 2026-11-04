@@ -3,6 +3,8 @@ mod declarations;
 mod engine;
 pub(crate) mod events;
 mod legacy_notify;
+mod mcp;
+pub use mcp::{HookMcpCall, HookMcpExecutor};
 mod output_spill;
 mod registry;
 mod schema;

@@ -5,6 +5,7 @@ use codex_app_server_protocol_types::ServerNotification;
 use codex_app_server_protocol_projection::item_event_to_server_notification;
 use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::EventMsg;
+use std::collections::HashSet;
 
 const MAX_PREFIX_BYTES: usize = 1024 * 1024;
 const MAX_PREFIX_EVENTS: usize = 256;
@@ -15,7 +16,8 @@ pub(super) struct ActiveStreamReplay {
     thread_id: Option<String>,
     entries: Vec<Entry>,
     bytes: usize,
-    incomplete: bool,
+    incomplete_items: HashSet<String>,
+    untracked_incomplete: bool,
 }
 
 struct Entry {
@@ -25,6 +27,18 @@ struct Entry {
 }
 
 impl ActiveStreamReplay {
+    fn mark_incomplete(&mut self, item_id: String) {
+        // Keep recovery identity retention bounded even for malformed or very
+        // numerous unfinished items. The conservative fallback lasts one turn.
+        if item_id.len() > MAX_PREFIX_BYTES / MAX_PREFIX_EVENTS
+            || self.incomplete_items.len() >= MAX_PREFIX_EVENTS
+        {
+            self.untracked_incomplete = true;
+        } else {
+            self.incomplete_items.insert(item_id);
+        }
+    }
+
     pub(super) fn track(&mut self, turn_id: &str, event: &EventMsg) {
         if matches!(event, EventMsg::TurnStarted(_)) {
             *self = Self {
@@ -48,11 +62,21 @@ impl ActiveStreamReplay {
                 return;
             }
             let id = completed.item.id();
+            self.incomplete_items.remove(&id);
             self.entries.retain(|entry| entry.item_id != id);
             self.bytes = self.entries.iter().map(|entry| entry.bytes).sum();
             return;
         }
-        if self.incomplete {
+        let item_id = match event {
+            EventMsg::ItemStarted(started) => started.item.id(),
+            EventMsg::AgentMessageContentDelta(delta) => delta.item_id.clone(),
+            EventMsg::PlanDelta(delta) => delta.item_id.clone(),
+            EventMsg::ReasoningContentDelta(delta) => delta.item_id.clone(),
+            EventMsg::ReasoningRawContentDelta(delta) => delta.item_id.clone(),
+            EventMsg::AgentReasoningSectionBreak(part) => part.item_id.clone(),
+            _ => return,
+        };
+        if self.untracked_incomplete || self.incomplete_items.contains(&item_id) {
             return;
         }
         let thread_id = match event {
@@ -71,7 +95,7 @@ impl ActiveStreamReplay {
             EventMsg::AgentReasoningSectionBreak(_) => match &self.thread_id {
                 Some(thread_id) => thread_id.clone(),
                 None => {
-                    self.incomplete = true;
+                    self.mark_incomplete(item_id);
                     return;
                 }
             },
@@ -85,7 +109,7 @@ impl ActiveStreamReplay {
             && let Some(additional) = merge_size(&last.notification, &notification)
         {
             if additional > MAX_PREFIX_BYTES.saturating_sub(self.bytes) {
-                self.incomplete = true;
+                self.mark_incomplete(item_id);
                 return;
             }
             merge_delta(&mut last.notification, &notification);
@@ -97,7 +121,7 @@ impl ActiveStreamReplay {
         if self.entries.len() >= MAX_PREFIX_EVENTS
             || bytes > MAX_PREFIX_BYTES.saturating_sub(self.bytes)
         {
-            self.incomplete = true;
+            self.mark_incomplete(item_id);
             return;
         }
         let item_id = match &notification {
@@ -119,7 +143,7 @@ impl ActiveStreamReplay {
     }
 
     pub(super) fn snapshot(&self, active_turn_id: Option<&str>) -> Vec<ServerNotification> {
-        if active_turn_id.is_none() || self.turn_id.as_deref() != active_turn_id {
+        if !self.is_active_turn(active_turn_id) {
             return Vec::new();
         }
         let mut notifications = self
@@ -127,13 +151,17 @@ impl ActiveStreamReplay {
             .iter()
             .map(|entry| entry.notification.clone())
             .collect::<Vec<_>>();
-        if self.incomplete {
+        if self.untracked_incomplete || !self.incomplete_items.is_empty() {
             notifications.push(ServerNotification::ConfigWarning(codex_app_server_protocol_types::ConfigWarningNotification {
                 summary: "Active stream recovery is partial: the bounded prefix retention limit was exceeded. Wait for canonical item completion; do not treat the visible prefix as the complete result.".into(),
                 details: self.turn_id.as_ref().map(|id| format!("turn_id: {id}")), path: None, range: None,
             }));
         }
         notifications
+    }
+
+    pub(super) fn is_active_turn(&self, active_turn_id: Option<&str>) -> bool {
+        active_turn_id.is_some() && self.turn_id.as_deref() == active_turn_id
     }
 }
 

@@ -171,15 +171,19 @@ struct RemoteControlEnrollmentState {
     lock: Semaphore,
     lifecycle: StdMutex<CancellationToken>,
     retry_after: StdMutex<Option<time::OffsetDateTime>>,
+    request_policy: watch::Receiver<RemoteControlPolicyDecision>,
+    request_auth_manager: Arc<AuthManager>,
 }
 
 impl RemoteControlEnrollmentState {
-    fn new(enrollment: Option<RemoteControlEnrollment>) -> Self {
+    fn new(enrollment: Option<RemoteControlEnrollment>, request_policy: watch::Receiver<RemoteControlPolicyDecision>, request_auth_manager: Arc<AuthManager>) -> Self {
         Self {
             enrollment: StdMutex::new(enrollment),
             lock: Semaphore::new(1),
             lifecycle: StdMutex::new(CancellationToken::new()),
             retry_after: StdMutex::new(None),
+            request_policy,
+            request_auth_manager,
         }
     }
 
@@ -191,6 +195,11 @@ impl RemoteControlEnrollmentState {
     }
 
     fn admit_request(&self) -> io::Result<()> {
+        // HTTP-client preparation can await after the public operation's first
+        // check. Revalidate at the actual shared backend admission boundary.
+        if !policy_admits_current_identity(&self.request_policy, &self.request_auth_manager) {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "remote control request denied by managed policy"));
+        }
         if let Some(deadline) = self.retry_after() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -439,6 +448,7 @@ impl RemoteControlHandle {
     ) -> io::Result<T> {
         let mut auth_changes = self.auth_manager.auth_change_receiver();
         let mut desired_changes = self.desired_state_tx.subscribe();
+        let mut policy_changes = self.policy.subscribe();
         let epoch = self.policy_auth_epoch()?;
         self.ensure_remote_control_allowed_io()?;
         tokio::pin!(operation);
@@ -452,6 +462,12 @@ impl RemoteControlHandle {
                     self.ensure_remote_control_allowed_io()?;
                 }
                 _ = desired_changes.changed() => self.ensure_remote_control_allowed_io()?,
+                changed = policy_changes.changed() => {
+                    if changed.is_err() {
+                        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "remote control policy monitor stopped"));
+                    }
+                    self.ensure_remote_control_allowed_io()?;
+                }
                 result = &mut operation => {
                     self.ensure_remote_control_allowed_io()?;
                     return self.auth_manager.with_policy_auth_epoch(epoch, || result)?;
@@ -536,15 +552,16 @@ impl RemoteControlHandle {
             server_name = %status.server_name,
             "remote control enable requested"
         );
-        if matches!(
-            status.status,
-            RemoteControlConnectionStatus::Connected
-                | RemoteControlConnectionStatus::Connecting
-        ) {
-            return Ok(status);
-        }
-
-        Ok(self.publish_status(RemoteControlConnectionStatus::Connecting))
+        // The worker may publish Connected after the diagnostic snapshot above.
+        // Decide the transition under the same watch lock as publication.
+        self.status_tx.send_if_modified(|status| {
+            if matches!(status.status, RemoteControlConnectionStatus::Connected | RemoteControlConnectionStatus::Connecting) {
+                return false;
+            }
+            *status = remote_control_status_with_connection_status(status, RemoteControlConnectionStatus::Connecting);
+            true
+        });
+        Ok(self.status())
     }
 
     pub async fn disable(
@@ -911,14 +928,22 @@ impl RemoteControlHandle {
         &self,
         app_server_client_name: Option<&str>,
     ) -> io::Result<Option<String>> {
-        if self.pairing_persistence_key_required && self.pairing_persistence_key.borrow().is_none()
-        {
-            let app_server_client_name =
-                app_server_client_name.ok_or_else(pairing_unavailable_error)?;
-            self.pairing_persistence_key
-                .send_replace(Some(app_server_client_name.to_string()));
+        let mut selected = None;
+        self.pairing_persistence_key.send_if_modified(|key| {
+            if self.pairing_persistence_key_required && key.is_none()
+                && let Some(name) = app_server_client_name
+            {
+                *key = Some(name.to_string());
+                selected = key.clone();
+                return true;
+            }
+            selected = key.clone();
+            false
+        });
+        if self.pairing_persistence_key_required && selected.is_none() {
+            return Err(pairing_unavailable_error());
         }
-        Ok(self.pairing_persistence_key.borrow().clone())
+        Ok(selected)
     }
 
     pub async fn pairing_status(
@@ -1431,7 +1456,7 @@ pub async fn start_remote_control(
     let websocket_desired_state_tx = desired_state_tx.clone();
     let policy_desired_state_tx = desired_state_tx.clone();
     let websocket_desired_state_persistence_lock = desired_state_persistence_lock.clone();
-    let current_enrollment = Arc::new(RemoteControlEnrollmentState::new(/*enrollment*/ None));
+    let current_enrollment = Arc::new(RemoteControlEnrollmentState::new(None, shared_policy.subscribe(), auth_manager.clone()));
     let websocket_current_enrollment = current_enrollment.clone();
     let pairing_persistence_key_required = app_server_client_name_rx.is_some();
     let (pairing_persistence_key, _pairing_persistence_key_rx) = watch::channel(None);

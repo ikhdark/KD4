@@ -47,7 +47,7 @@ struct FsWatchState {
 }
 
 enum WatchEntry {
-    Pending { reservation_id: u64 },
+    Pending { reservation_id: u64, cancellation: CancellationToken },
     Active(ActiveWatchEntry),
 }
 
@@ -105,15 +105,21 @@ impl Drop for PendingReservation {
 
 impl WatchEntry {
     async fn stop(self) {
-        if let Self::Active(entry) = self {
-            entry.cancellation.cancel();
-            if tokio::time::timeout(FS_WATCH_SHUTDOWN_GRACE, entry.done_rx)
-                .await
-                .is_err()
-            {
-                entry.abort_handle.abort();
+        match self {
+            Self::Pending { cancellation, .. } => cancellation.cancel(),
+            Self::Active(entry) => {
+                entry.cancellation.cancel();
+                let abort_handle = entry.abort_handle;
+                // Bound forwarding and native teardown together. On timeout,
+                // the blocking task still owns the native handles; dropping
+                // its join handle does not cancel or abandon native teardown.
+                if tokio::time::timeout(FS_WATCH_SHUTDOWN_GRACE, async move {
+                    let _ = entry.done_rx.await;
+                    entry.native.stop().await;
+                }).await.is_err() {
+                    abort_handle.abort();
+                }
             }
-            entry.native.stop().await;
         }
     }
 }
@@ -148,6 +154,7 @@ impl FsWatchManager {
             watch_id: watch_id.clone(),
         };
 
+        let cancellation = rpc_gate.cancellation_token().child_token();
         let reservation_id = {
             let mut state = self.state.lock().await;
             let reservation_id = state.next_reservation_id;
@@ -157,7 +164,10 @@ impl FsWatchManager {
                         "watchId already exists: {watch_id}"
                     ))),
                     Entry::Vacant(entry) => {
-                        entry.insert(WatchEntry::Pending { reservation_id });
+                        entry.insert(WatchEntry::Pending {
+                            reservation_id,
+                            cancellation: cancellation.clone(),
+                        });
                         Ok(reservation_id)
                     }
                 });
@@ -177,7 +187,6 @@ impl FsWatchManager {
             id: reservation_id,
             armed: true,
         };
-        let cancellation = rpc_gate.cancellation_token().child_token();
         let setup_guard = cancellation.clone().drop_guard();
         let setup_permit = tokio::select! {
             biased;
@@ -304,7 +313,7 @@ impl FsWatchManager {
                 if !matches!(
                     entry,
                     WatchEntry::Pending {
-                        reservation_id: current
+                        reservation_id: current, ..
                     } if *current == reservation_id
                 ) {
                     return Err(internal_error(
@@ -374,7 +383,7 @@ impl FsWatchManager {
         if matches!(
             state.entries.get(watch_key),
             Some(WatchEntry::Pending {
-                reservation_id: current
+                reservation_id: current, ..
             }) if *current == reservation_id
         ) {
             state.entries.remove(watch_key);

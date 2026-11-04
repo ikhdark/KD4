@@ -18,7 +18,12 @@ pub fn rg_search_no_match_eligible(command: &[String], shell_type: Option<ShellT
     let [argv] = commands.as_slice() else { return false };
     if !argv.first().is_some_and(|program| is_rg_program(program)) { return false; }
     let roles = RgArgumentRoles::parse(argv);
-    roles.searches && roles.unresolved_file_inputs(argv).is_empty()
+    // Ignore-file dependencies affect result reuse, not rg's exit-status contract.
+    // Keep stdin and executable transforms excluded; exact terminal streams and
+    // empty stderr are checked by the command owner before accepting exit 1.
+    roles.searches
+        && !roles.uses_stdin
+        && codex_shell_command::is_safe_command::is_known_safe_direct_argv(argv)
 }
 
 struct SearchDiagnosticBudget {

@@ -1,3 +1,5 @@
+//! App-server wire types and method registration; see the [source map](../README.md).
+
 mod experimental_api;
 mod protocol;
 pub mod rpc;

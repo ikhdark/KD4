@@ -454,6 +454,12 @@ pub async fn read_command_log(
             .map_err(|error| super::ReadToolOutputError::Io(error.to_string()))?;
         let mut remaining = max_bytes;
         let mut results = Vec::new();
+        // Selector-local errors must not discard independent retained evidence.
+        // Reuse the snapshot owner's invalid-result contract for command logs.
+        let invalid = |selector: &ToolOutputSelector, message: String| {
+            serde_json::to_value(super::invalid_selector_result(selector.clone(), message))
+                .map_err(|error| super::ReadToolOutputError::Io(error.to_string()))
+        };
         let mut offsets = std::collections::BTreeMap::new();
         let mut ranges = Vec::with_capacity(selectors.len());
         let mut byte_ranges = Vec::new();
@@ -537,9 +543,10 @@ pub async fn read_command_log(
             }
             if let ToolOutputSelector::Bytes { start, end } = selector {
                 if start > end || *start > metadata.len() {
-                    return Err(super::ReadToolOutputError::InvalidRange(format!(
+                    results.push(invalid(selector, format!(
                         "byte range must be within retained bytes 0..{}", metadata.len()
-                    )));
+                    ))?);
+                    continue;
                 }
                 // Match the indexed artifact owner: an oversized upper bound
                 // reads the available tail; a start beyond EOF stays invalid.
@@ -547,11 +554,13 @@ pub async fn read_command_log(
                 continue;
             }
             let ToolOutputSelector::Lines { start, end } = selector else {
-                return Err(super::ReadToolOutputError::InvalidRange(
-                    "Command logs support bytes, lines, tail, search and structured selectors; source snapshots retain sections and JSON pointers. Preserve this artifact_id and do not rerun its producer.".into()));
+                results.push(invalid(selector,
+                    "Command logs support bytes, lines, tail, search and structured selectors; source snapshots retain sections and JSON pointers. Preserve this artifact_id and do not rerun its producer.".into())?);
+                continue;
             };
             if *start == 0 || end < start {
-                return Err(super::ReadToolOutputError::InvalidRange("expected 1-based start <= end".into()));
+                results.push(invalid(selector, "expected 1-based start <= end".into())?);
+                continue;
             }
             ranges.push((*start, *end));
         }

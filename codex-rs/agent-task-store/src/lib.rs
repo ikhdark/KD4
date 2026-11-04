@@ -11,6 +11,10 @@ mod local;
 mod model;
 mod scope;
 mod shared;
+mod write_contract;
+pub use write_contract::{WriteProhibition, WriteProhibitionKind, SourceWriteOperation,
+    SourceManifest, authorize_source_write, capture_source_manifest, dispatch_manifest,
+    normalize_write_prohibitions, normalize_absolute_source_path, require_write_contract};
 
 pub use error::StoreError;
 pub use error::StoreResult;

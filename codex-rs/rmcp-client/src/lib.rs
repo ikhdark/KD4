@@ -33,6 +33,7 @@ pub use perform_oauth_login::perform_oauth_login;
 pub use perform_oauth_login::perform_oauth_login_return_url;
 pub use perform_oauth_login::perform_oauth_login_return_url_with_http_client;
 pub use perform_oauth_login::perform_oauth_login_silent;
+pub use perform_oauth_login::perform_oauth_login_silent_with_http_client;
 pub use rmcp::model::ElicitationAction;
 pub use rmcp_client::Elicitation;
 pub use rmcp_client::ElicitationResponse;

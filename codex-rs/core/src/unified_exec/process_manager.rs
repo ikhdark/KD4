@@ -741,16 +741,19 @@ async fn finish_exited_process_result(
             Err(_) => process.has_exited(),
         }
     {
+        let resumable_output = match &mut result {
+            Ok(response) => Some(response),
+            Err(UnifiedExecError::ProcessFailedWithOutput { output, .. }) => Some(output.as_mut()),
+            Err(UnifiedExecError::ToolHistoryPersistence { output: Some(output), .. }) => Some(output.as_mut()),
+            _ => None,
+        }.filter(|response| response.process_id.is_some());
         let completion = match hard_deadline {
-            Some(bound)
-                if result
-                    .as_ref()
-                    .is_ok_and(|response| response.process_id.is_some()) =>
+            Some(bound) if resumable_output.is_some() =>
             {
                 match tokio::time::timeout_at(bound, process.wait_for_terminal_completion()).await {
                     Ok(completion) => completion,
                     Err(_) => {
-                        if let Ok(response) = &mut result {
+                        if let Some(response) = resumable_output {
                             let notice = "Process exited; completion bookkeeping is pending. Poll the retained session; do not rerun the command.";
                             // The handler and its caller both finish an exited
                             // process; the second bounded wait must not repeat it.
@@ -1022,7 +1025,8 @@ impl UnifiedExecProcessManager {
                 .processes
                 .get(&process_id)
                 .is_some_and(|entry| Arc::ptr_eq(&entry.process, process));
-            (matches && process.has_exited())
+            // Persistence failure cannot retire unconfirmed cancellation custody.
+            (matches && process.has_exited() && !process.shutdown_is_pending())
                 .then(|| store.remove(process_id))
                 .flatten()
         };
@@ -3084,7 +3088,7 @@ impl UnifiedExecProcessManager {
             .map(|(process_id, _, _)| process_id)
     }
 
-    pub(crate) async fn terminate_all_processes(&self) {
+    pub(crate) async fn terminate_all_processes(&self) -> Result<(), String> {
         let processes: Vec<(u32, Arc<UnifiedExecProcess>)> = {
             let processes = self.process_store.lock().await;
             // In-flight admissions retain their reservations until their own
@@ -3107,8 +3111,10 @@ impl UnifiedExecProcessManager {
         ))
         .await;
 
+        let mut failures = Vec::new();
         for (process_id, process, result) in termination_results {
             if let Err(err) = result {
+                failures.push(format!("process {process_id} termination is unconfirmed: {err}"));
                 tracing::warn!(
                     process_id,
                     %err,
@@ -3131,9 +3137,21 @@ impl UnifiedExecProcessManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        for cleanup in pending {
-            run_pending_process_cleanup(cleanup).await;
+        if !pending.is_empty() {
+            failures.push("cancelled startup cleanup remains owned and pending".to_string());
         }
+        for cleanup in pending {
+            // Reconciliation retries until confirmation. Shutdown observes its
+            // existing owner; it must not join that unbounded recovery loop.
+            if !cleanup.reconciliation_started.load(Ordering::Acquire) {
+                if let Some(session) = cleanup.session.upgrade() {
+                    session.terminal_tasks.spawn(run_pending_process_cleanup(cleanup));
+                } else {
+                    enqueue_pending_process_cleanup(cleanup);
+                }
+            }
+        }
+        if failures.is_empty() { Ok(()) } else { Err(failures.join("; ")) }
     }
 
     /// Terminates retained processes whose originating tool calls never published a durable

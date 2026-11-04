@@ -180,13 +180,30 @@ pub struct AppConfig {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
-#[serde(rename_all = "snake_case")]
 #[ts(export_to = "v2/")]
+#[ts(as = "AppsConfigTypeScript")]
 pub struct AppsConfig {
     #[serde(default, rename = "_default")]
     pub default: Option<AppsDefaultConfig>,
     #[serde(default, flatten)]
     pub apps: HashMap<String, AppConfig>,
+}
+
+/// TypeScript index values must also admit the reserved `_default` property.
+#[derive(TS)]
+#[ts(export_to = "v2/")]
+pub struct AppsConfigTypeScript {
+    #[ts(rename = "_default")]
+    pub default: Option<AppsDefaultConfig>,
+    #[ts(flatten)]
+    pub apps: HashMap<String, Option<AppsConfigValue>>,
+}
+
+#[derive(TS)]
+#[ts(untagged, export_to = "v2/")]
+pub enum AppsConfigValue {
+    App(AppConfig),
+    Default(AppsDefaultConfig),
 }
 
 /// Backward-compatible API shape for ChatGPT workspace login restrictions.
@@ -257,6 +274,7 @@ pub struct ConfigLayer {
     pub version: String,
     pub config: JsonValue,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub disabled_reason: Option<String>,
 }
 
@@ -329,6 +347,7 @@ pub struct ConfigReadResponse {
     pub config: Config,
     pub origins: HashMap<String, ConfigLayerMetadata>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub layers: Option<Vec<ConfigLayer>>,
 }
 
@@ -443,6 +462,19 @@ pub enum ConfiguredHookHandler {
         #[ts(rename = "timeoutSec")]
         timeout_sec: Option<u64>,
         r#async: bool,
+        #[serde(rename = "statusMessage")]
+        #[ts(rename = "statusMessage")]
+        status_message: Option<String>,
+    },
+    #[serde(rename = "mcp_tool")]
+    #[ts(rename = "mcp_tool")]
+    McpTool {
+        server: String,
+        tool: String,
+        input: serde_json::Map<String, JsonValue>,
+        #[serde(rename = "timeoutSec")]
+        #[ts(rename = "timeoutSec")]
+        timeout_sec: Option<u64>,
         #[serde(rename = "statusMessage")]
         #[ts(rename = "statusMessage")]
         status_message: Option<String>,

@@ -58,10 +58,38 @@ pub async fn add_marketplace(
     request: MarketplaceAddRequest,
 ) -> Result<MarketplaceAddOutcome, MarketplaceAddError> {
     tokio::task::spawn_blocking(move || {
-        add_marketplace_sync(codex_home.as_path(), &requirements, request)
+        add_marketplace_sync(codex_home.as_path(), &requirements, request, None)
     })
     .await
     .map_err(|err| MarketplaceAddError::Internal(format!("failed to add marketplace: {err}")))?
+}
+
+/// Validate an import's selected identity before any marketplace publication.
+pub async fn add_marketplace_with_expected_name(
+    codex_home: PathBuf,
+    requirements: ConfigRequirements,
+    request: MarketplaceAddRequest,
+    expected_name: String,
+) -> Result<MarketplaceAddOutcome, MarketplaceAddError> {
+    tokio::task::spawn_blocking(move || {
+        add_marketplace_sync(codex_home.as_path(), &requirements, request, Some(&expected_name))
+    })
+    .await
+    .map_err(|err| MarketplaceAddError::Internal(format!("failed to add marketplace: {err}")))?
+}
+
+fn validate_selected_marketplace_name(
+    expected_name: Option<&str>,
+    marketplace_name: &str,
+) -> Result<(), MarketplaceAddError> {
+    if let Some(expected_name) = expected_name
+        && expected_name != marketplace_name
+    {
+        return Err(MarketplaceAddError::InvalidRequest(format!(
+            "marketplace source identifies as {marketplace_name:?}, not {expected_name:?}"
+        )));
+    }
+    Ok(())
 }
 
 pub fn is_local_marketplace_source(
@@ -78,6 +106,7 @@ fn add_marketplace_sync(
     codex_home: &Path,
     requirements: &ConfigRequirements,
     request: MarketplaceAddRequest,
+    expected_name: Option<&str>,
 ) -> Result<MarketplaceAddOutcome, MarketplaceAddError> {
     let MarketplaceAddRequest {
         source,
@@ -109,6 +138,7 @@ fn add_marketplace_sync(
         let marketplace_name = validate_marketplace_source_root(&existing_root)?;
         validate_marketplace_name_for_add(managed_marketplace_name, &marketplace_name)
             .map_err(MarketplaceAddError::InvalidRequest)?;
+        validate_selected_marketplace_name(expected_name, &marketplace_name)?;
         let _operation = crate::installed_marketplaces::try_lock_marketplace_operation(codex_home, &marketplace_name)
             .map_err(|err| MarketplaceAddError::Internal(format!("marketplace operation is busy or unavailable: {err}")))?;
         // The optimistic source lookup is not publication authority. Re-read
@@ -140,6 +170,7 @@ fn add_marketplace_sync(
         let marketplace_name = validate_marketplace_source_root(path)?;
         validate_marketplace_name_for_add(managed_marketplace_name, &marketplace_name)
             .map_err(MarketplaceAddError::InvalidRequest)?;
+        validate_selected_marketplace_name(expected_name, &marketplace_name)?;
         let _operation = crate::installed_marketplaces::try_lock_marketplace_operation(codex_home, &marketplace_name)
             .map_err(|err| MarketplaceAddError::Internal(format!("marketplace operation is busy or unavailable: {err}")))?;
         if validate_marketplace_source_root(path)? != marketplace_name {
@@ -191,6 +222,7 @@ fn add_marketplace_sync(
     let marketplace_name = validate_marketplace_source_root(&staged_root)?;
     validate_marketplace_name_for_add(managed_marketplace_name, &marketplace_name)
         .map_err(MarketplaceAddError::InvalidRequest)?;
+    validate_selected_marketplace_name(expected_name, &marketplace_name)?;
     if let MarketplaceSource::Git { url, ref_name } = &source {
         write_added_git_marketplace_metadata(
             &staged_root,

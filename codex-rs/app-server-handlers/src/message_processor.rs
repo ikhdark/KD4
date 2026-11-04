@@ -235,6 +235,8 @@ impl MessageProcessor {
                     request_attestation: session.request_attestation(),
                     experimental_api: session.experimental_api_enabled(),
                 },
+                &session.rpc_gate,
+                || {},
             )
             .await;
     }
@@ -298,7 +300,7 @@ impl MessageProcessor {
                 session_source.clone(),
                 environment_manager,
                 thread_extensions(
-                    app_server_extension_event_sink(outgoing.clone()),
+                    app_server_extension_event_sink(outgoing.clone(), thread_state_manager.clone()),
                     BuiltinExtensionDependencies {
                         auth_manager: auth_manager.clone(),
                         environment_manager: Arc::clone(&environment_manager_for_extensions),
@@ -400,6 +402,7 @@ impl MessageProcessor {
             outgoing.clone(),
             analytics_events_client.clone(),
             Arc::clone(&config),
+            config_manager.clone(),
             config_warnings.clone(),
             rpc_transport,
         );
@@ -566,7 +569,8 @@ impl MessageProcessor {
         );
         // Reject the complete wire envelope (including trace fields) before
         // cloning it into request contexts. Interrupt is the registered control RPC.
-        if codex_app_server_protocol_types::client_request_is_control(&request.method)
+        if (request.method == "initialize"
+            || codex_app_server_protocol_types::client_request_is_control(&request.method))
             && serialized_request_bytes_up_to(&request, 64 * 1024) > 64 * 1024
         {
             self.outgoing
@@ -636,7 +640,7 @@ impl MessageProcessor {
         outbound_initialized: &AtomicBool,
         parent_trace: Option<codex_protocol::protocol::W3cTraceContext>,
     ) {
-        if request.is_control()
+        if (request.is_control() || matches!(&request, ClientRequest::Initialize { .. }))
             && serialized_request_bytes_up_to(&(&request, &parent_trace), 64 * 1024) > 64 * 1024
         {
             self.outgoing
@@ -819,9 +823,18 @@ impl MessageProcessor {
         // connection outbound-ready. Websocket JSON-RPC calls pass `None` so
         // lib.rs can deliver connection-scoped initialize notifications first.
         outbound_initialized: Option<&AtomicBool>,
-        request_context: RequestContext,
+        mut request_context: RequestContext,
     ) -> Result<(), JSONRPCErrorError> {
         let connection_id = connection_request_id.connection_id;
+        if matches!(&codex_request, ClientRequest::Initialize { .. }) {
+            let bytes = serialized_request_bytes_up_to(&codex_request, 64 * 1024);
+            let bytes = bytes.saturating_add(request_context.retained_trace_bytes_up_to(
+                (64_usize * 1024).saturating_sub(bytes)));
+            if bytes > 64 * 1024 || !self.outgoing.admit_request_work(&mut request_context, bytes, false).await {
+                return Err(overloaded_error(OverloadReason::SerializedRequestQueue,
+                    "initialize exceeds the 64 KiB or outstanding request budget"));
+            }
+        }
         if let ClientRequest::Initialize { request_id, params } = codex_request {
             let connection_initialized = self
                 .initialize_processor
@@ -841,6 +854,12 @@ impl MessageProcessor {
                         ConnectionCapabilities {
                             request_attestation: session.request_attestation(),
                             experimental_api: session.experimental_api_enabled(),
+                        },
+                        &session.rpc_gate,
+                        || {
+                            if let Some(ready) = outbound_initialized {
+                                ready.store(true, std::sync::atomic::Ordering::Release);
+                            }
                         },
                     )
                     .await;
@@ -1613,7 +1632,7 @@ impl MessageProcessor {
                     }
                     ClientRequest::TurnInterrupt { params, .. } => self
                         .turn_processor
-                        .turn_interrupt(&request_id, params)
+                        .turn_interrupt(&request_id, params, &self.thread_queue_processor)
                         .await
                         .map(|response| response.map(Into::into)),
                     ClientRequest::BugCreate { params, .. } => {

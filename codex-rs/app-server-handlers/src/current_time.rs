@@ -49,7 +49,9 @@ impl TimeProvider for AppServerTimeProvider {
             let outgoing = outgoing
                 .upgrade()
                 .context("app-server current-time provider is unavailable")?;
-            request_current_time(outgoing, thread_state_manager, thread_id).await
+            request_current_time(outgoing, thread_state_manager, thread_id, None)
+                .await
+                .map(|(time, _)| time)
         })
     }
 
@@ -60,8 +62,8 @@ impl TimeProvider for AppServerTimeProvider {
             let outgoing = outgoing
                 .upgrade()
                 .context("app-server current-time provider is unavailable")?;
-            let started_at =
-                request_current_time(outgoing.clone(), thread_state_manager.clone(), thread_id)
+            let (started_at, clock_owner) =
+                request_current_time(outgoing.clone(), thread_state_manager.clone(), thread_id, None)
                     .await?;
             let wake_at = started_at
                 .checked_add_signed(
@@ -75,13 +77,12 @@ impl TimeProvider for AppServerTimeProvider {
                 if current >= wake_at {
                     return Ok(());
                 }
-                let remaining = (wake_at - current)
-                    .to_std()
-                    .context("external sleep remaining duration is outside the supported range")?;
-                tokio::time::sleep(remaining.min(CURRENT_TIME_POLL_INTERVAL)).await;
-                current =
-                    request_current_time(outgoing.clone(), thread_state_manager.clone(), thread_id)
-                        .await?;
+                // The peer supplies integral Unix seconds. Subsecond polling
+                // cannot reveal a finer timestamp and only repeats the RPC.
+                tokio::time::sleep(CURRENT_TIME_POLL_INTERVAL).await;
+                current = request_current_time(
+                    outgoing.clone(), thread_state_manager.clone(), thread_id, Some(clock_owner),
+                ).await?.0;
             }
         })
     }
@@ -114,7 +115,8 @@ async fn request_current_time(
     outgoing: Arc<OutgoingMessageSender>,
     thread_state_manager: ThreadStateManager,
     thread_id: ThreadId,
-) -> Result<DateTime<Utc>> {
+    expected_owner: Option<ConnectionId>,
+) -> Result<(DateTime<Utc>, ConnectionId)> {
     let deadline = Instant::now() + CURRENT_TIME_REQUEST_TIMEOUT;
     timeout_at(
         deadline,
@@ -127,11 +129,14 @@ async fn request_current_time(
             CURRENT_TIME_REQUEST_TIMEOUT.as_secs()
         )
     })?;
-    let (request_id, rx) = timeout_at(deadline, async {
+    let (request_id, rx, clock_owner) = timeout_at(deadline, async {
         let connection_ids = thread_state_manager
             .subscribed_connection_ids(thread_id)
             .await;
         let connection_id = require_single_current_time_connection(&connection_ids)?;
+        if expected_owner.is_some_and(|owner| owner != connection_id) {
+            bail!("external clock owner changed during sleep");
+        }
         // The subscription wait consumes the same budget as delivery and the
         // response. Do not publish a request once that budget has expired.
         if Instant::now() >= deadline {
@@ -147,6 +152,7 @@ async fn request_current_time(
                 Some(thread_id),
             )
             .await
+            .map(|(request_id, rx)| (request_id, rx, connection_id))
             .map_err(|err| {
                 anyhow!(
                     "current-time request failed: code={} message={}",
@@ -192,7 +198,7 @@ async fn request_current_time(
     let response: CurrentTimeReadResponse =
         serde_json::from_value(result).context("invalid current-time response")?;
 
-    DateTime::from_timestamp(response.current_time_at, 0).ok_or_else(|| {
+    DateTime::from_timestamp(response.current_time_at, 0).map(|time| (time, clock_owner)).ok_or_else(|| {
         anyhow!(
             "current-time response is outside the supported range: currentTimeAt={} (expected Unix seconds)",
             response.current_time_at

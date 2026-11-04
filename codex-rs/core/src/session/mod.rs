@@ -2589,10 +2589,12 @@ impl Session {
             self.services.plugins_manager.clear_cache();
         }
         let environments = self.services.turn_environments.snapshot().await;
+        let session_source = self.state.lock().await.session_configuration.session_source.clone();
         let hooks = build_hooks_for_config(
             config.as_ref(),
             self.services.plugins_manager.as_ref(),
             environments.single_local_environment(),
+            &session_source,
         )
         .await;
 
@@ -2610,6 +2612,12 @@ impl Session {
                 runtime.manager().invalidate_resource_caches();
             }
             let hooks = hooks.with_run_history_from(&self.services.hooks.load());
+            let hooks = hooks.with_mcp_executor(Arc::new(
+                crate::hook_mcp_executor::CoreHookMcpExecutor {
+                    runtime: Arc::clone(&self.services.mcp_runtime),
+                    thread_id: self.thread_id,
+                },
+            ));
             self.services.hooks.store(Arc::new(hooks));
             let new_config = notify_config_contributors
                 .then(|| Self::build_effective_session_config(&state.session_configuration));
@@ -8185,7 +8193,14 @@ async fn build_hooks_for_config(
     config: &Config,
     plugins_manager: &PluginsManager,
     environment: Option<&TurnEnvironment>,
+    session_source: &SessionSource,
 ) -> Hooks {
+    // Opaque command/MCP hooks cannot enforce a worker's source-write contract.
+    // Apply at construction AND refresh, including unbound/CSV subagents.
+    if matches!(session_source, SessionSource::SubAgent(_)) {
+        tracing::debug!("subagent hooks are root-owned; no opaque worker hooks admitted");
+        return Hooks::new(HooksConfig::default());
+    }
     let (hook_shell_program, hook_shell_argv) = environment
         .and_then(|environment| environment.shell.as_ref())
         .and_then(|shell| {

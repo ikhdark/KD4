@@ -519,8 +519,9 @@ fn environment_selection_error(err: CodexErr) -> JSONRPCErrorError {
 
 fn resolve_runtime_workspace_roots(workspace_roots: Vec<AbsolutePathBuf>) -> Vec<AbsolutePathBuf> {
     let mut resolved_roots = Vec::new();
+    let mut seen = std::collections::HashSet::with_capacity(workspace_roots.len());
     for root in workspace_roots {
-        if !resolved_roots.iter().any(|existing| existing == &root) {
+        if seen.insert(root.clone()) {
             resolved_roots.push(root);
         }
     }

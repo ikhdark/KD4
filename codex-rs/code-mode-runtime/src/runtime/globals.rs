@@ -213,11 +213,12 @@ fn build_all_tool_names_value<'s>(
     catalog: &super::EnabledToolCatalog,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
     let enabled_tools = &catalog.tools;
-    let array = v8::Array::new(scope, enabled_tools.len() as i32);
-    for index in 0..enabled_tools.len() {
+    let visible = (0..enabled_tools.len()).filter(|index| catalog.is_advertised(*index)).collect::<Vec<_>>();
+    let array = v8::Array::new(scope, visible.len() as i32);
+    for (output_index, index) in visible.into_iter().enumerate() {
         let name = v8::String::new(scope, catalog.presentation_name(index))
             .ok_or_else(|| "failed to allocate ALL_TOOL_NAMES name".to_string())?;
-        if array.set_index(scope, index as u32, name.into()) != Some(true) {
+        if array.set_index(scope, output_index as u32, name.into()) != Some(true) {
             return Err("failed to append ALL_TOOL_NAMES name".to_string());
         }
     }
@@ -352,7 +353,8 @@ fn build_all_tools_value<'s>(
     catalog: &super::EnabledToolCatalog,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
     let enabled_tools = &catalog.tools;
-    let array = v8::Array::new(scope, enabled_tools.len() as i32);
+    let visible_count = (0..enabled_tools.len()).filter(|index| catalog.is_advertised(*index)).count();
+    let array = v8::Array::new(scope, visible_count as i32);
     let name_key = v8::String::new(scope, "name")
         .ok_or_else(|| "failed to allocate ALL_TOOLS name key".to_string())?;
     let description_key = v8::String::new(scope, "description")
@@ -363,7 +365,9 @@ fn build_all_tools_value<'s>(
         .ok_or_else(|| "failed to allocate namespace instructions reference key".to_string())?;
     let mut first_guidance = std::collections::BTreeMap::new();
 
-    for (index, tool) in enabled_tools.iter().enumerate() {
+    for (output_index, (index, tool)) in enabled_tools.iter().enumerate()
+        .filter(|(index, _)| catalog.is_advertised(*index)).enumerate()
+    {
         let item = v8::Object::new(scope);
         let name = v8::String::new(scope, catalog.presentation_name(index))
             .ok_or_else(|| "failed to allocate ALL_TOOLS name".to_string())?;
@@ -393,7 +397,7 @@ fn build_all_tools_value<'s>(
         if item.set(scope, description_key.into(), description.into()) != Some(true) {
             return Err("failed to set ALL_TOOLS description".to_string());
         }
-        if array.set_index(scope, index as u32, item.into()) != Some(true) {
+        if array.set_index(scope, output_index as u32, item.into()) != Some(true) {
             return Err("failed to append ALL_TOOLS metadata".to_string());
         }
     }
@@ -427,6 +431,9 @@ fn install_tool_property<'s>(
 ) -> Result<(), String> {
     let key = v8::String::new(scope, name)
         .ok_or_else(|| "failed to allocate tool name".to_string())?;
+    let attributes = if scope.get_slot::<RuntimeState>()
+        .is_some_and(|state| !state.enabled_tools.is_advertised(index))
+    { v8::PropertyAttribute::DONT_ENUM } else { v8::PropertyAttribute::NONE };
     let index = u32::try_from(index).map_err(|_| "tool callback index exceeds u32".to_string())?;
     let data = v8::Integer::new_from_unsigned(scope, index);
     if object.set_lazy_data_property_with_data(
@@ -434,7 +441,7 @@ fn install_tool_property<'s>(
         key.into(),
         tool_property_callback,
         data.into(),
-        v8::PropertyAttribute::NONE,
+        attributes,
         v8::SideEffectType::HasSideEffect,
         v8::SideEffectType::HasSideEffect,
     ) != Some(true) {

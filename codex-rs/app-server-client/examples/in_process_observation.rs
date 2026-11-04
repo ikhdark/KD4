@@ -4,6 +4,8 @@ use codex_app_server_client::InProcessAppServerClient;
 use codex_app_server_client::InProcessClientStartArgs;
 use codex_app_server_client::InProcessServerEvent;
 use codex_app_server_protocol_types::ClientRequest;
+use codex_app_server_protocol_types::InitializeParams;
+use futures::FutureExt;
 use codex_app_server_protocol_types::RequestId;
 use codex_arg0::Arg0DispatchPaths;
 use codex_config::CloudConfigBundleLoader;
@@ -27,17 +29,17 @@ use tokio::task::JoinSet;
 
 type Failure = Box<dyn Error + Send + Sync>;
 
-fn emit(value: Value) -> Result<(), Failure> {
-    let mut output = std::io::stdout().lock();
-    serde_json::to_writer(&mut output, &value)?;
-    output.write_all(b"\n")?;
-    output.flush()?;
+fn emit(output: &std::sync::mpsc::SyncSender<Value>, value: Value) -> Result<(), Failure> {
+    output.try_send(value).map_err(|error| std::io::Error::new(
+        std::io::ErrorKind::WouldBlock, format!("bounded observation stdout unavailable: {error}"),
+    ))?;
     Ok(())
 }
 
 async fn start(
     cli: &PathBuf,
     overrides: &[(String, toml::Value)],
+    initialize: &InitializeParams,
 ) -> Result<InProcessAppServerClient, Failure> {
     let home = PathBuf::from(
         std::env::var_os("CODEX_HOME").ok_or("explicit private CODEX_HOME required")?,
@@ -59,6 +61,7 @@ async fn start(
     )
     .await?;
     let state_db = codex_core::init_state_db(&config).await;
+    let capabilities = initialize.capabilities.clone().unwrap_or_default();
     Ok(InProcessAppServerClient::start(InProcessClientStartArgs {
         arg0_paths: Arg0DispatchPaths {
             codex_self_exe: Some(cli.clone()),
@@ -75,11 +78,11 @@ async fn start(
         config_warnings: Vec::new(),
         session_source: SessionSource::Exec,
         enable_codex_api_key_env: false,
-        client_name: "kdr_in_process_observation".into(),
-        client_version: env!("CARGO_PKG_VERSION").into(),
-        experimental_api: true,
-        mcp_server_openai_form_elicitation: false,
-        opt_out_notification_methods: Vec::new(),
+        client_name: initialize.client_info.name.clone(),
+        client_version: initialize.client_info.version.clone(),
+        experimental_api: capabilities.experimental_api,
+        mcp_server_openai_form_elicitation: capabilities.mcp_server_openai_form_elicitation,
+        opt_out_notification_methods: capabilities.opt_out_notification_methods.unwrap_or_default(),
         channel_capacity: 8,
     })
     .await?)
@@ -106,7 +109,23 @@ async fn run() -> Result<(), Failure> {
             parsed.remove("value").ok_or("missing override value")?,
         ));
     }
-    let mut client = Some(start(&cli, &overrides).await?);
+    let mut client: Option<InProcessAppServerClient> = None;
+    let mut initialize_params: Option<InitializeParams> = None;
+    let (output_tx, output_rx) = std::sync::mpsc::sync_channel::<Value>(64);
+    let (output_done_tx, mut output_done) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let result: Result<(), Failure> = (|| {
+            let mut output = std::io::stdout().lock();
+            while let Ok(value) = output_rx.recv() {
+                serde_json::to_writer(&mut output, &value)?;
+                output.write_all(b"\n")?;
+                output.flush()?;
+            }
+            Ok(())
+        })();
+        let _ = output_done_tx.send(result);
+    });
+    let mut output_finished = false;
     let (input_tx, mut input_rx) = mpsc::channel(8);
     let input = std::thread::spawn(move || {
         let mut input = std::io::stdin().lock();
@@ -130,28 +149,54 @@ async fn run() -> Result<(), Failure> {
     });
     let mut requests = JoinSet::new();
     let mut failure: Option<Failure> = None;
+    let mut cleanup_failures = Vec::new();
+    let mut input_closed = false;
     loop {
         let result: Result<bool, Failure> = async {
             tokio::select! {
-                incoming = input_rx.recv() => {
-                    let Some(incoming) = incoming else { return Ok(false) };
+                output = &mut output_done => {
+                    output_finished = true;
+                    output.map_err(|_| "stdout owner dropped")??;
+                    return Err("stdout owner ended before admission closed".into());
+                }
+                incoming = input_rx.recv(), if !input_closed => {
+                    let Some(incoming) = incoming else { input_closed = true; return Ok(true) };
                     let value: Value = incoming.map_err(std::io::Error::other)?;
                     let id = value.get("id").cloned().unwrap_or(Value::Null);
                     match value.get("method").and_then(Value::as_str) {
-                        Some("initialize") => emit(json!({"id":id,"result":client.as_ref().ok_or("client retired")?.initialize_response().raw()}))?,
+                        Some("initialize") => {
+                            let params = serde_json::from_value::<InitializeParams>(value.get("params").cloned().unwrap_or(Value::Null));
+                            match params {
+                                Ok(params) if !params.capabilities.as_ref().is_some_and(|caps| caps.request_attestation)
+                                    && params.client_info.title.is_none()
+                                    && initialize_params.as_ref().is_none_or(|prior| prior == &params) => {
+                                    if client.is_none() { client = Some(start(&cli, &overrides, &params).await?); }
+                                    initialize_params = Some(params);
+                                    emit(&output_tx, json!({"id":id,"result":client.as_ref().ok_or("client retired")?.initialize_response().raw()}))?;
+                                }
+                                _ => emit(&output_tx, json!({"id":id,"error":{"code":-32602,"message":"invalid, unsupported, or changed initialize parameters"}}))?,
+                            }
+                        },
                         Some("initialized") => {}, // public start already performed this handshake
                         Some("kdr/reconnect") => {
                             if !requests.is_empty() { return Err("reconnect requires settled requests".into()); }
                             let retiring = client.take().ok_or("client retired")?;
                             let stale = retiring.request_handle();
-                            retiring.shutdown().await?;
+                            retiring.shutdown_until_complete().await?;
                             let request: ClientRequest = serde_json::from_value(json!({"id":999999,"method":"thread/loaded/list","params":{}}))?;
                             let retired = stale.request(request).await.is_err();
-                            client = Some(start(&cli, &overrides).await?);
-                            emit(json!({"id":id,"result":{"shutdownJoined":true,"retiredHandleRejected":retired,
+                            client = Some(start(&cli, &overrides, initialize_params.as_ref().ok_or("initialize required")?).await?);
+                            emit(&output_tx, json!({"id":id,"result":{"shutdownJoined":true,"retiredHandleRejected":retired,
                                 "initialize":client.as_ref().ok_or("client retired")?.initialize_response().raw()}}))?;
                         },
                         Some(_) => {
+                            if requests.len() >= 64 {
+                                emit(&output_tx, json!({"id":id,"error":codex_app_server_protocol_types::overloaded_error(
+                                    codex_app_server_protocol_types::OverloadReason::InFlightTaskCapacity,
+                                    "observation adapter request capacity reached",
+                                )}))?;
+                                return Ok(true);
+                            }
                             let request: ClientRequest = serde_json::from_value(value)?;
                             let handle = client.as_ref().ok_or("client retired")?.request_handle();
                             requests.spawn(async move {
@@ -172,14 +217,22 @@ async fn run() -> Result<(), Failure> {
                         },
                     }
                 },
-                event = client.as_mut().ok_or("client retired")?.next_event() => match event {
-                    Some(InProcessServerEvent::ServerNotification(notification)) => emit(serde_json::to_value(notification)?)?,
-                    Some(InProcessServerEvent::ServerRequest(request)) => emit(serde_json::to_value(request)?)?,
+                event = async { match client.as_mut() {
+                    Some(client) => client.next_event().await,
+                    None => std::future::pending().await,
+                }} => match event {
+                    Some(InProcessServerEvent::ServerNotification(notification)) => emit(&output_tx, serde_json::to_value(notification)?)?,
+                    Some(InProcessServerEvent::ServerRequest(request)) => {
+                        if input_closed {
+                            client.as_ref().ok_or("client retired")?.reject_server_request(request.id().clone(),
+                                codex_app_server_protocol_types::JSONRPCErrorError { code: -32000, message: "observation input closed".into(), data: None }).await?;
+                        } else { emit(&output_tx, serde_json::to_value(request)?)?; }
+                    },
                     Some(InProcessServerEvent::Lagged { .. }) => return Err("finite in-process observation lost events".into()),
                     None => return Err("in-process event stream ended before shutdown".into()),
                 },
                 result = requests.join_next(), if !requests.is_empty() => {
-                    emit(result.ok_or("missing request owner")??)?;
+                    emit(&output_tx, result.ok_or("missing request owner")??)?;
                 },
             }
             Ok(true)
@@ -192,21 +245,59 @@ async fn run() -> Result<(), Failure> {
                 break;
             }
         }
+        if input_closed && requests.is_empty() {
+            if let Some(client) = client.as_mut() {
+                // Drain already admitted final events before explicit retirement.
+                while let Some(Some(event)) = client.next_event().now_or_never() {
+                    let result = match event {
+                        InProcessServerEvent::ServerNotification(notification) => serde_json::to_value(notification)
+                            .map_err(|error| -> Failure { error.into() }).and_then(|value| emit(&output_tx, value)),
+                        InProcessServerEvent::ServerRequest(request) => client.reject_server_request(request.id().clone(),
+                            codex_app_server_protocol_types::JSONRPCErrorError { code: -32000, message: "observation input closed".into(), data: None }).await.map_err(Into::into),
+                        InProcessServerEvent::Lagged { .. } => Err("finite in-process observation lost events".into()),
+                    };
+                    if let Err(error) = result { failure = Some(error); break; }
+                }
+            }
+            break;
+        }
     }
     // Always use the production shutdown barrier, including on a failed observation.
-    if let Some(client) = client {
-        client.shutdown().await?;
+    if let Some(client) = client
+        && let Err(error) = client.shutdown_until_complete().await
+    {
+        if failure.is_none() { failure = Some(error.into()); }
+        else { cleanup_failures.push(error.to_string()); }
     }
     while let Some(result) = requests.join_next().await {
-        emit(result?)?;
+        let result = result.map_err(|error| -> Failure { error.into() }).and_then(|value| emit(&output_tx, value));
+        if let Err(error) = result {
+            if failure.is_none() { failure = Some(error); }
+            else { cleanup_failures.push(error.to_string()); }
+        }
+    }
+    drop(output_tx);
+    if !output_finished {
+        let result: Result<(), Failure> = match tokio::time::timeout(std::time::Duration::from_secs(5), &mut output_done).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err("stdout owner dropped".into()),
+            Err(_) => Err("stdout owner remained blocked after cleanup".into()),
+        };
+        if let Err(error) = result {
+            if failure.is_none() { failure = Some(error); }
+            else { cleanup_failures.push(error.to_string()); }
+        }
     }
     drop(input_rx);
     // On errors stdin can still be open; process ownership, not a blocking join,
     // bounds the failed observation. Normal EOF proves the reader has finished.
     if failure.is_none() {
-        input.join().map_err(|_| "input reader panicked")?;
+        if input.join().is_err() { failure = Some("input reader panicked".into()); }
     }
     match failure {
+        Some(error) if !cleanup_failures.is_empty() => Err(std::io::Error::other(format!(
+            "{error}; secondary cleanup failures: {}", cleanup_failures.join("; "),
+        )).into()),
         Some(error) => Err(error),
         None => Ok(()),
     }

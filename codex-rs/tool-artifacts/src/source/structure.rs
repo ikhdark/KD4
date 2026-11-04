@@ -103,8 +103,8 @@ impl<'de> Deserialize<'de> for FileSelector {
             Err(error) => error,
         };
         Err(serde::de::Error::custom(match kind {
-            Some("symbol" | "enclosing" | "search") => structure.to_string(),
-            Some("bytes" | "lines" | "section" | "json_pointer" | "structured") => exact.to_string(),
+            Some("symbol" | "enclosing") => structure.to_string(),
+            Some("bytes" | "lines" | "section" | "json_pointer" | "structured" | "search") => exact.to_string(),
             Some(other) => format!(
                 "unsupported read_file selector kind `{}`; use one of {FILE_SELECTOR_KINDS} ({{\"kind\":\"section\",\"id\":\"outline\"}} lists Rust/Python items or Markdown headings)",
                 other.chars().take(64).collect::<String>()
@@ -125,34 +125,6 @@ pub enum StructureSelector {
     Enclosing {
         line: usize,
     },
-    Search {
-        query: String,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        regex: bool,
-        // Defaulted like every sibling field and like the identically named
-        // field on `ToolOutputSelector::Search`. Without a default, a selector
-        // that omitted only `enclosing` failed the untagged `oneOf` and the
-        // rejection could not name the missing field, so the call was retried
-        // in the same shape. `false` keeps the previous meaning of an explicit
-        // `enclosing: false`.
-        #[serde(default)]
-        enclosing: bool,
-        #[serde(default)]
-        case_insensitive: bool,
-        #[serde(default)]
-        start_byte: u64,
-        #[serde(default = "default_max_results")]
-        max_results: usize,
-        #[serde(default = "default_context_lines")]
-        context_lines: usize,
-    },
-}
-
-fn default_max_results() -> usize {
-    20
-}
-fn default_context_lines() -> usize {
-    3
 }
 
 fn enclosing(items: &[CodeItem], line: usize) -> Result<&CodeItem, ReadToolOutputError> {
@@ -305,10 +277,6 @@ pub fn resolve_batch(
             FileSelector::Structure(
                 StructureSelector::Symbol { .. }
                     | StructureSelector::Enclosing { .. }
-                    | StructureSelector::Search {
-                        enclosing: true,
-                        ..
-                    }
             ) | FileSelector::Exact(
                 ToolOutputSelector::Section { .. }
                     | ToolOutputSelector::Search {
@@ -360,10 +328,6 @@ pub fn resolve_batch(
             FileSelector::Structure(
                 StructureSelector::Symbol { .. }
                     | StructureSelector::Enclosing { .. }
-                    | StructureSelector::Search {
-                        enclosing: true,
-                        ..
-                    }
             ) | FileSelector::Exact(
                 ToolOutputSelector::Section { .. }
                     | ToolOutputSelector::Search {
@@ -408,25 +372,6 @@ pub fn resolve_batch(
                 // Enrichment failure must not suppress an executable search.
                 // Keep the error on the requested selector, alongside plain evidence.
                 match &selector {
-                    FileSelector::Structure(StructureSelector::Search {
-                        query,
-                        regex,
-                        case_insensitive,
-                        start_byte,
-                        max_results,
-                        context_lines,
-                        ..
-                    }) => {
-                        resolved.push(ToolOutputSelector::Search {
-                            query: query.clone(),
-                            regex: *regex,
-                            enclosing: false,
-                            case_insensitive: *case_insensitive,
-                            start_byte: *start_byte,
-                            max_results: *max_results,
-                            context_lines: *context_lines,
-                        });
-                    }
                     FileSelector::Exact(ToolOutputSelector::Search { .. }) => {
                         if let FileSelector::Exact(mut search) = selector.clone() {
                             if let ToolOutputSelector::Search { enclosing, .. } = &mut search {
@@ -602,30 +547,6 @@ fn resolve_item(
             }
         }
         StructureSelector::Enclosing { line } => enclosing(items, line)?,
-        StructureSelector::Search {
-            query,
-            regex,
-            enclosing,
-            case_insensitive,
-            start_byte,
-            max_results,
-            context_lines,
-        } => {
-            // Matching, enclosing resolution, and fitting happen once in the
-            // snapshot owner, including subsequent immutable search pages.
-            return Ok((
-                ToolOutputSelector::Search {
-                    query,
-                    regex,
-                    enclosing,
-                    case_insensitive,
-                    start_byte,
-                    max_results,
-                    context_lines,
-                },
-                None,
-            ));
-        }
     };
     Ok((
         ToolOutputSelector::Lines {

@@ -18,6 +18,9 @@ pub struct SkillConfig {
     /// Name-based selector.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Local catalog applicability text; does not modify the provider's skill file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description_override: Option<String>,
     pub enabled: bool,
 }
 

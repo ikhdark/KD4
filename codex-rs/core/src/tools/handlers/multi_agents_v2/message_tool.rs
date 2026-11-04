@@ -107,7 +107,7 @@ impl SendMessageHandler {
             serde_json::from_str(&arguments)
                 .ok()
                 .and_then(|value| ancestor_refusal(&invocation.step_context.turn, &value))
-                .map_or(error, FunctionCallError::RespondToModel)
+                .map_or(error, ancestor_message_refusal)
         })?;
         let target = args.single_target()?;
         match (target, args.targets) {
@@ -145,7 +145,8 @@ impl SendMessageHandler {
                             {
                                 Ok(output) => serde_json::json!({"target": target, "status": "queued", "acknowledgment": serde_json::from_str::<serde_json::Value>(&output.into_text()).ok()}),
                                 Err(error) => serde_json::json!({
-                                    "target": target, "status": "failed", "error": error.to_string()
+                                    "target": target, "status": "failed", "error": error.to_string(),
+                                    "tool_failure": error.failure(),
                                 }),
                             }
                         }
@@ -153,10 +154,33 @@ impl SendMessageHandler {
                 ))
                 .await;
                 let success = outcomes.iter().all(|outcome| outcome["status"] == "queued");
-                Ok(boxed_tool_output(FunctionToolOutput::from_text(
-                    serde_json::json!({"recipients": outcomes}).to_string(),
-                    Some(success),
-                )))
+                let accepted = outcomes.iter().filter(|row| row["status"] == "queued")
+                    .map(|row| row["target"].clone()).collect::<Vec<_>>();
+                let failed = outcomes.iter().filter(|row| row["status"] == "failed")
+                    .map(|row| row["target"].clone()).collect::<Vec<_>>();
+                let mut value = serde_json::json!({
+                    "status": if success { "success" } else if accepted.is_empty() { "failed" } else { "partial_success" },
+                    "accepted_targets": accepted, "failed_targets": failed, "recipients": outcomes,
+                    "retry": "Do not resend accepted recipients. Resolve and recover only failed targets; uncertain admissions still require their original owner.",
+                });
+                if !success {
+                    use codex_protocol::tool_failure::{ToolEffectsState, ToolExecutionState, ToolFailure, ToolFailureCode};
+                    let mut failure = ToolFailure::new(ToolFailureCode::Failed,
+                        "One or more message recipients failed; exact per-recipient admissions are retained.");
+                    failure.execution_state = ToolExecutionState::Completed;
+                    failure.effects = if !accepted.is_empty() { ToolEffectsState::Reported }
+                        else if outcomes.iter().all(|row| row["tool_failure"]["effects"] == "none") {
+                            ToolEffectsState::None
+                        } else { ToolEffectsState::Unknown };
+                    failure.details = Some(serde_json::json!({
+                        "accepted_targets": accepted, "failed_targets": failed,
+                        "per_recipient_outcomes": "/recipients",
+                    }));
+                    value["tool_failure"] = serde_json::json!(failure);
+                }
+                Ok(boxed_tool_output(codex_tools::JsonToolOutput::with_success(
+                    value, Some(success),
+                ).with_code_mode_failure_as_data()))
             }
             _ => Err(FunctionCallError::RespondToModel(
                 "Provide exactly one of `target` (or its alias `task_name`) or a non-empty `targets` list."
@@ -259,6 +283,12 @@ pub(crate) fn ancestor_refusal(
     .then(|| crate::agent::control::ANCESTOR_PROGRESS_REFUSAL.to_string())
 }
 
+fn ancestor_message_refusal(message: String) -> FunctionCallError {
+    FunctionCallError::structured(codex_protocol::tool_failure::ToolFailure::no_effects(
+        codex_protocol::tool_failure::ToolFailureCode::PermissionDenied, message,
+    ))
+}
+
 /// Handles the shared MultiAgentV2 message flow for both `send_message` and `followup_task`.
 pub(crate) async fn handle_message_string_tool(
     invocation: ToolInvocation,
@@ -285,7 +315,7 @@ pub(crate) async fn handle_message_string_tool(
         Ok(thread_id) => thread_id,
         Err(error) => {
             return Err(ancestor_refusal(&turn, &serde_json::json!({ "target": target }))
-                .map_or(error, FunctionCallError::RespondToModel));
+                .map_or(error, ancestor_message_refusal));
         }
     };
     let receiver_agent = session
@@ -374,7 +404,7 @@ pub(crate) async fn handle_message_string_tool(
     let control = &session.services.agent_control;
     control
         .validate_inter_agent_communication(&communication, &context)
-        .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
+        .map_err(|err| ancestor_message_refusal(collab_agent_error(receiver_thread_id, err).to_string()))?;
     // Queue-only delivery has an existing retained owner even when the runtime
     // is cold. Reload only when there is no usable queue, or a turn is required.
     if mode == MessageDeliveryMode::TriggerTurn

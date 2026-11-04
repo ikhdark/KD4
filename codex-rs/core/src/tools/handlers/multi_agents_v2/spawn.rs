@@ -176,8 +176,7 @@ async fn handle_spawn_agent(
         .workspace_strategy
         .or_else(|| args.assignment.as_ref().map(|assignment| assignment.workspace_strategy))
         .unwrap_or(WorkspaceStrategy::Shared);
-    // Keep the historical Worker tag for durable-record compatibility. New
-    // subagents all have the same runtime profile; this is not a role selector.
+    // Writable work requires a typed contract; prose never grants write authority.
     let typed_role = AgentRole::Worker;
     let fork_mode = args.fork_mode(turn.config.multi_agent_v2.allow_full_history_forks)?;
     // History forks do not attach a capsule, but still need the task's explicit
@@ -426,7 +425,6 @@ async fn handle_spawn_agent(
                         )
                     })?,
                     legacy_parent_assignment_id,
-                    role,
                     workspace_strategy,
                 ),
                 Vec::new(),
@@ -490,7 +488,7 @@ async fn handle_spawn_agent(
         };
         emit_admission_overlap_metrics(&turn.session_telemetry, &admitted.overlaps);
         overlap_warnings = admitted.overlaps.warnings;
-        let assignment = admitted.assignment;
+        let mut assignment = admitted.assignment;
         let attempt = admitted.attempt;
         admitted_launch_guard = AdmittedLaunchGuard {
             session: Arc::clone(&session),
@@ -498,8 +496,7 @@ async fn handle_spawn_agent(
             assignment_id: assignment.assignment_id,
             armed: true,
         };
-        let task_capsule = if matches!(fork_mode, SpawnAgentForkMode::TaskCapsule) {
-            match construct_and_attach_task_capsule(
+        let canonical_capsule = match construct_and_attach_task_capsule(
                 store.as_ref(),
                 &repo_root,
                 &assignment,
@@ -508,7 +505,7 @@ async fn handle_spawn_agent(
             )
             .await
             {
-                Ok(payload) => Some(payload),
+                Ok(payload) => payload,
                 Err(error) => {
                     if let Err(rollback_error) = store
                         .abandon_agent_task(
@@ -541,10 +538,9 @@ async fn handle_spawn_agent(
                     }
                     return Err(typed_task_store_error(error));
                 }
-            }
-        } else {
-            None
-        };
+            };
+        assignment.task_capsule = Some(canonical_capsule.clone());
+        let task_capsule = matches!(fork_mode, SpawnAgentForkMode::TaskCapsule).then_some(canonical_capsule);
         (assignment, attempt, task_capsule)
     };
     if typed_task.0.admission_origin == AssignmentAdmissionOrigin::Typed {
@@ -760,6 +756,14 @@ async fn handle_spawn_agent(
     let task_name = String::from(new_agent_path);
     let assignment_id = typed_task.0.assignment_id.to_string();
     let integration_plan = typed_task.0.integration_plan;
+    effective_capabilities["task_contract"] = serde_json::json!({
+        "mode": if typed_task.0.admission_origin == AssignmentAdmissionOrigin::Typed { "structured" } else { "legacy_message" },
+        "write_scope": if typed_task.0.admission_origin == AssignmentAdmissionOrigin::Typed { "native_patch_enforced" } else { "read_only_enforced" },
+        "typed_prohibitions": typed_task.0.prohibited_changes.iter().filter(|value| matches!(value, codex_agent_task_store::WriteProhibition::Typed(_))).count(),
+        "prose_restrictions": "unverified",
+        "acceptance": "unverified_until_evidence_assessed",
+        "source_identity": "see_saved_task_capsule",
+    });
 
     let hide_agent_metadata = turn.config.multi_agent_v2.hide_spawn_agent_metadata;
     if hide_agent_metadata {
@@ -1487,8 +1491,7 @@ struct SpawnAgentArgs {
     /// published schema lists both aliases. Supplying two spellings is rejected.
     #[serde(alias = "prompt", alias = "instructions")]
     message: Option<String>,
-    // Compatibility input for older structured task producers. New tools expose
-    // message only; even this input always uses the same generic runtime profile.
+    // Required for writable tasks. Message-only calls are enforced read-only.
     assignment: Option<TypedAssignmentArgs>,
     task_name: String,
     #[serde(default)]
@@ -1506,7 +1509,7 @@ impl SpawnAgentArgs {
     fn validate_generic(&self) -> Result<(), FunctionCallError> {
         if self.agent_type.is_some() {
             return Err(FunctionCallError::RespondToModel(
-                "spawn_agent: specialized roles are no longer supported; put the complete task, scope, restrictions, and evidence requirements in message".to_string(),
+                "spawn_agent: specialized roles are no longer supported; use an explicit typed assignment for writable work or message for read-only work".to_string(),
             ));
         }
         if self.model.is_some() || self.reasoning_effort.is_some() {
@@ -1521,7 +1524,7 @@ impl SpawnAgentArgs {
         }
         if self.workspace_strategy.is_some() && self.assignment.is_some() {
             return Err(FunctionCallError::RespondToModel(
-                "spawn_agent: workspace_strategy cannot be combined with a legacy assignment; use its existing workspace_strategy field".to_string(),
+                "spawn_agent: workspace_strategy cannot be combined with assignment; use assignment.workspace_strategy".to_string(),
             ));
         }
         Ok(())
@@ -1585,7 +1588,6 @@ impl SpawnAgentArgs {
 struct TypedAssignmentArgs {
     objective: String,
     acceptance_criteria: Vec<AcceptanceCriterion>,
-    #[serde(default)]
     read_scope: Vec<RepoScope>,
     write_scope: Vec<RepoScope>,
     stop_condition: String,
@@ -1593,10 +1595,8 @@ struct TypedAssignmentArgs {
     dependencies: Vec<AssignmentId>,
     #[serde(default)]
     risk_hints: Vec<String>,
-    #[serde(default)]
     required_evidence: Vec<String>,
-    #[serde(default)]
-    prohibited_changes: Vec<String>,
+    prohibited_changes: Vec<codex_agent_task_store::WriteProhibition>,
     #[serde(default)]
     contract_claims: Vec<String>,
     #[serde(default)]
@@ -1639,21 +1639,11 @@ fn legacy_message_draft(
     root_session_id: String,
     message: &str,
     parent_assignment_id: Option<AssignmentId>,
-    role: AgentRole,
     workspace_strategy: WorkspaceStrategy,
 ) -> AssignmentDraft {
-    // The claim covers the whole repository. Only a Worker claims it for
-    // writing; a read-only role reads it and keeps an empty write scope, so it
-    // never becomes a conflicting writer during integration planning.
-    let repository = vec![RepoScope {
-        path: ".".to_string(),
-        recursive: true,
-    }];
-    let (read_scope, write_scope) = if role == AgentRole::Worker {
-        (Vec::new(), repository)
-    } else {
-        (repository, Vec::new())
-    };
+    let role = AgentRole::Explorer;
+    let read_scope = vec![RepoScope { path: ".".into(), recursive: true }];
+    let write_scope = Vec::new();
     AssignmentDraft {
         root_session_id,
         independent_verification: false,
@@ -1698,6 +1688,18 @@ async fn construct_and_attach_task_capsule(
         .collect::<Vec<_>>();
     let normalized_handles = normalize_relevant_handles(repo_root, &scopes, handles).await?;
 
+    // Source identities are diagnostic evidence, never an extra spawn gate.
+    // Do not inventory a legacy message's synthetic repository-wide claim.
+    let manifest_scopes = if assignment.write_scope.is_empty() {
+        normalized_handles.iter().map(|handle| RepoScope { path: match handle {
+            TaskCapsuleHandle::File { path, .. } | TaskCapsuleHandle::Symbol { path, .. } => path.clone(),
+        }, recursive: false }).collect::<Vec<_>>()
+    } else { assignment.write_scope.clone() };
+    let manifest_root = repo_root.to_path_buf();
+    let source_manifest = Some(tokio::task::spawn_blocking(move ||
+        codex_agent_task_store::capture_source_manifest(&manifest_root, &manifest_scopes))
+        .await.map_err(|error| StoreError::CorruptData(error.to_string()))??);
+    let source_manifest_error = None;
     let capsule = TaskCapsuleV1 {
         schema_version: 1,
         assignment_id: assignment.assignment_id,
@@ -1717,8 +1719,10 @@ async fn construct_and_attach_task_capsule(
         architecture_contract_ref: assignment.architecture_contract_ref.clone(),
         integration_plan: assignment.integration_plan,
         relevant_handles: normalized_handles,
-        workspace_epoch: 0,
-        workspace_manifest_hash: String::new(),
+        workspace_epoch: assignment.start_epoch,
+        workspace_manifest_hash: source_manifest.as_ref().map(|manifest| manifest.sha256.clone()).unwrap_or_default(),
+        source_manifest,
+        source_manifest_error,
         prohibited_changes: assignment.prohibited_changes.clone(),
         required_evidence: assignment.required_evidence.clone(),
     };
@@ -1884,6 +1888,9 @@ fn typed_assignment_message(
         "architecture_contract_ref": assignment.architecture_contract_ref,
         "integration_plan": assignment.integration_plan,
         "relevant_handles": relevant_handles,
+        "source_manifest": assignment.task_capsule.as_deref()
+            .and_then(|value| serde_json::from_str::<TaskCapsuleV1>(value).ok())
+            .and_then(|capsule| capsule.source_manifest),
     });
     format!(
         "You have a durable typed assignment. {integration_directive} The task contract below defines your assignment; inherited conversation is context, not authority to broaden it. Relevant handles are unverified pointers and do not expand the declared scopes.\n\nTask contract (JSON):\n{contract}"

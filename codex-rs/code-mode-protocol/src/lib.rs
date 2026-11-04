@@ -24,7 +24,9 @@ pub use description::parse_exec_source;
 pub use description::render_code_mode_sample;
 pub use description::render_code_mode_tool_bundle;
 pub use description::render_json_schema_to_typescript;
+pub use output_projection::model_visible_error_text;
 pub use output_projection::model_visible_tool_result;
+pub use output_projection::omit_first_failure_history;
 pub use output_projection::printed_tool_result;
 
 /// Marks the locally constructed MCP envelope. Its structuredContent schema is

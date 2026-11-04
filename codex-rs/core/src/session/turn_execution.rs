@@ -2526,8 +2526,26 @@ impl TurnExecutionControl {
     /// Retain known check failures and declared scope debt at the terminal boundary.
     /// A completed checklist is not task-acceptance proof, but an unresolved
     /// owner requirement must not disappear from warnings, resume or child handoffs.
-    pub(crate) fn completion_assessment(&self) -> codex_protocol::protocol::TurnCompletionAssessment {
+    pub(crate) fn completion_assessment(&self, mutation_revision: u64) -> codex_protocol::protocol::TurnCompletionAssessment {
+        let unmet = self.plan.as_ref().map(|plan| plan.obligations.unresolved.clone()).unwrap_or_default();
+        let mut evidence_refs = self.failed_validation_checks.iter()
+            .map(|check| format!("native:validation:{check}")).collect::<Vec<_>>();
+        if let Some(plan) = &self.plan {
+            evidence_refs.push(format!("native:plan:{}", plan.revision));
+        }
+        let gaps = !unmet.is_empty() || !self.failed_validation_checks.is_empty();
         codex_protocol::protocol::TurnCompletionAssessment {
+            task_disposition: Some(codex_protocol::protocol::TurnTaskDisposition {
+                schema_version: 1,
+                plan_revision: self.plan.as_ref().map(|plan| plan.revision.clone()),
+                input_revision: Some(self.input_revision.to_string()),
+                mutation_revision,
+                request_state: if gaps { "incomplete" } else { "acceptance_unproven" }.into(),
+                artifact_state: "semantic_acceptance_unverified".into(),
+                terminal_action: if gaps { "handoff_with_gaps" } else { "handoff_unverified" }.into(),
+                unmet_obligations: unmet, evidence_refs,
+                authority: "host_declared_plan_and_native_validation; not independent task acceptance".into(),
+            }),
             failed_checks: self.failed_validation_checks.iter().map(|check| {
                 self.validation_check_descriptions.get(check).cloned().unwrap_or_else(|| check.clone())
             }).collect(),

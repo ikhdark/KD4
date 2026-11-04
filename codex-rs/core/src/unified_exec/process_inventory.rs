@@ -4,11 +4,12 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use serde_json::Value;
 
-const INVENTORY_ID: &str = "msg_sctx_process_inventory_";
+const INVENTORY_ID: &str = "msg_sctx_process_inventory";
 
 pub(crate) fn is_process_inventory(item: &ResponseItem) -> bool {
     matches!(item, ResponseItem::Message { id: Some(id), role, .. }
-        if role == "developer" && id.as_str().starts_with(INVENTORY_ID))
+        if role == "developer" && (id.as_str() == INVENTORY_ID
+            || id.as_str().strip_prefix(INVENTORY_ID).is_some_and(|suffix| suffix.starts_with('_'))))
 }
 
 /// Only core-authored inventory data can contribute historical handles on resume.
@@ -206,7 +207,7 @@ impl UnifiedExecProcessManager {
         });
         Some(ResponseItem::Message {
             id: Some(codex_protocol::ResponseItemId::new(
-                "msg_sctx_process_inventory",
+                INVENTORY_ID,
             )),
             role: "developer".into(),
             phase: None,

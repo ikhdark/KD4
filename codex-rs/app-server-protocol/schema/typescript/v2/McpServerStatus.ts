@@ -7,7 +7,7 @@ import type { ResourceTemplate } from "../ResourceTemplate";
 import type { Tool } from "../Tool";
 import type { McpAuthStatus } from "./McpAuthStatus";
 
-export type McpServerStatus = { name: string, serverInfo: McpServerInfo | null, tools: { [key in string]?: Tool }, resources: Array<Resource>, resourceTemplates: Array<ResourceTemplate>,
+export type McpServerStatus = { name: string, serverInfo: McpServerInfo | null, tools: { [key in string]: Tool }, resources: Array<Resource>, resourceTemplates: Array<ResourceTemplate>,
 /**
  * Resource discovery errors for this server. Nonempty means its resource inventory is incomplete.
  */

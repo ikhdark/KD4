@@ -4,16 +4,16 @@ export JUST_SHELL := justfile_directory() / "scripts/build/just-shell.py"
 set shell := ["python", "-c", 'import os, runpy; runpy.run_path(os.environ["JUST_SHELL"], run_name="__main__")']
 set windows-shell := ["python", "-c", 'import os, runpy; runpy.run_path(os.environ["JUST_SHELL"], run_name="__main__")']
 
-rust_parallelism := "8" # Match codex-rs/.cargo/config.toml; standard env/CLI overrides still win.
-cargo_build_jobs := env_var_or_default("CARGO_BUILD_JOBS", rust_parallelism)
-export CARGO_BUILD_JOBS := cargo_build_jobs
 python := "python"
-# Admission never queues by default; opt in with --set rust_validation_wait_seconds 5.
+# Busy reusable lanes wait for their owner; this value is not an admission timeout.
 rust_validation_wait_seconds := "0"
 
-# Display help
+# Display help without starting PowerShell.
+[script("python")]
 help:
-    just -l
+    import subprocess
+    import sys
+    sys.exit(subprocess.run(["just", "-l"], check=False).returncode)
 
 # `codex`
 alias c := codex
@@ -21,9 +21,7 @@ codex *args:
     cargo run --bin codex -- {args}
 
 # Prefer the already-built debug binary (may be stale); fall back to `cargo run`.
-[windows]
-codex-fast *args:
-    just codex-stale-ok {args}
+alias codex-fast := codex-stale-ok
 
 codex-lane *args:
     just cargo-lane codex cargo run --bin codex -- {args}; exit $LASTEXITCODE

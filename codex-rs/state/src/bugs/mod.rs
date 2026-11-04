@@ -41,6 +41,8 @@ pub struct BugClaim {
     pub attempt_id: String,
     pub attempt_count: i64,
     pub claim_token: String,
+    /// Stop provider work before the persisted lease can be reclaimed.
+    pub work_deadline: std::time::Instant,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -154,7 +156,7 @@ impl BugStore {
              SET attempt_count = attempt_count + 1, claim_token = ?, claim_timestamp = ?, updated_at = ? \
              WHERE id = ? AND status = 'pending' AND attempt_count < ? \
                AND (claim_token IS NULL OR claim_timestamp < ?) \
-             RETURNING id, raw_text, thread_id, attempt_count, claim_token",
+             RETURNING id, raw_text, thread_id, attempt_count, claim_token, claim_timestamp",
         )
         .bind(&token)
         .bind(now)
@@ -181,7 +183,7 @@ impl BugStore {
                  ORDER BY created_at, id LIMIT 1) \
              AND status = 'pending' AND attempt_count < ? \
              AND (claim_token IS NULL OR claim_timestamp < ?) \
-             RETURNING id, raw_text, thread_id, attempt_count, claim_token",
+             RETURNING id, raw_text, thread_id, attempt_count, claim_token, claim_timestamp",
         )
         .bind(&token)
         .bind(now)
@@ -194,6 +196,17 @@ impl BugStore {
         .fetch_optional(&self.pool)
         .await?;
         self.register_attempt(row).await
+    }
+
+    pub async fn enrich_git_context(
+        &self, id: i64, repository_root: Option<&str>, git_commit: Option<&str>,
+    ) -> anyhow::Result<()> {
+        // Submission metadata remains immutable. Optional post-save evidence
+        // has its own insert-only identity and observation timestamp.
+        sqlx::query("INSERT INTO bug_git_enrichment (bug_id, repository_root, git_commit, captured_at) VALUES (?, ?, ?, ?) ON CONFLICT(bug_id) DO NOTHING")
+            .bind(id).bind(repository_root).bind(git_commit)
+            .bind(chrono::Utc::now().timestamp()).execute(&self.pool).await?;
+        Ok(())
     }
 
     async fn register_attempt(
@@ -299,6 +312,8 @@ impl BugStore {
 }
 
 fn row_to_claim(row: sqlx::sqlite::SqliteRow) -> BugClaim {
+    let remaining = (row.get::<i64, _>("claim_timestamp") + STALE_CLAIM_SECONDS
+        - chrono::Utc::now().timestamp() - 60).max(0) as u64;
     BugClaim {
         id: row.get("id"),
         raw_text: row.get("raw_text"),
@@ -306,6 +321,7 @@ fn row_to_claim(row: sqlx::sqlite::SqliteRow) -> BugClaim {
         attempt_id: uuid::Uuid::now_v7().to_string(),
         attempt_count: row.get("attempt_count"),
         claim_token: row.get("claim_token"),
+        work_deadline: std::time::Instant::now() + Duration::from_secs(remaining),
     }
 }
 

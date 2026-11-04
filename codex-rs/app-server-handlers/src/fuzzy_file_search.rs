@@ -81,10 +81,10 @@ impl FuzzyFileSearchSession {
         {
             #[expect(clippy::unwrap_used)]
             let mut latest_query = self.shared.latest_query.lock().unwrap();
-            *latest_query = query.clone();
+            let generation = self.session.update_query(&query);
+            *latest_query = (query, generation);
             self.shared.query_changed.notify_waiters();
         }
-        self.session.update_query(&query);
     }
 }
 
@@ -115,7 +115,7 @@ pub(crate) fn start_fuzzy_file_search_session(
     let shared = Arc::new(SessionShared {
         connection_id,
         session_id,
-        latest_query: Mutex::new(String::new()),
+        latest_query: Mutex::new((String::new(), 0)),
         outgoing,
         pending_deliveries: Mutex::new(PendingDeliveries::default()),
         delivery_ready: Notify::new(),
@@ -151,7 +151,7 @@ pub(crate) fn start_fuzzy_file_search_session(
 struct SessionShared {
     connection_id: ConnectionId,
     session_id: String,
-    latest_query: Mutex<String>,
+    latest_query: Mutex<(String, usize)>,
     outgoing: Arc<OutgoingMessageSender>,
     pending_deliveries: Mutex<PendingDeliveries>,
     delivery_ready: Notify,
@@ -170,6 +170,7 @@ enum DeliveryKind {
 struct QueuedDelivery {
     kind: DeliveryKind,
     query: String,
+    generation: usize,
     notification: ServerNotification,
 }
 
@@ -183,12 +184,12 @@ impl PendingDeliveries {
     fn enqueue(&mut self, kind: DeliveryKind, delivery: QueuedDelivery) {
         match kind {
             DeliveryKind::Update => {
-                if !self.completion.as_ref().is_some_and(|completion| completion.query == delivery.query) {
+                if !self.completion.as_ref().is_some_and(|completion| completion.generation == delivery.generation) {
                     self.update = Some(delivery);
                 }
             }
             DeliveryKind::Completion => {
-                if self.update.as_ref().is_some_and(|update| update.query == delivery.query) {
+                if self.update.as_ref().is_some_and(|update| update.generation == delivery.generation) {
                     self.update = None;
                 }
                 self.completion = Some(delivery);
@@ -206,6 +207,7 @@ impl SessionShared {
         &self,
         kind: DeliveryKind,
         query: String,
+        generation: usize,
         notification: ServerNotification,
     ) {
         if self.canceled.load(Ordering::Relaxed) {
@@ -217,6 +219,7 @@ impl SessionShared {
             QueuedDelivery {
                 kind,
                 query,
+                generation,
                 notification,
             },
         );
@@ -226,14 +229,14 @@ impl SessionShared {
         self.delivery_ready.notify_one();
     }
 
-    async fn progress_superseded(&self, query: &str) {
+    async fn progress_superseded(&self, generation: usize) {
         loop {
             let completed = self.completion_ready.notified();
             tokio::pin!(completed);
             completed.as_mut().enable();
             #[expect(clippy::unwrap_used)]
             let superseded = self.pending_deliveries.lock().unwrap().completion.as_ref()
-                .is_some_and(|completion| completion.query == query);
+                .is_some_and(|completion| completion.generation == generation);
             if superseded {
                 return;
             }
@@ -241,10 +244,10 @@ impl SessionShared {
         }
     }
 
-    fn query_is_current(&self, query: &str) -> bool {
+    fn query_is_current(&self, query: &str, generation: usize) -> bool {
         #[expect(clippy::unwrap_used)]
         let latest_query = self.latest_query.lock().unwrap();
-        query == latest_query.as_str()
+        query == latest_query.0 && generation == latest_query.1
     }
 }
 
@@ -289,7 +292,7 @@ async fn run_delivery_relay(shared: Arc<SessionShared>) {
         let query_changed = shared.query_changed.notified();
         tokio::pin!(query_changed);
         query_changed.as_mut().enable();
-        if shared.canceled.load(Ordering::Relaxed) || !shared.query_is_current(&delivery.query) {
+        if shared.canceled.load(Ordering::Relaxed) || !shared.query_is_current(&delivery.query, delivery.generation) {
             continue;
         }
         let recipients = [shared.connection_id];
@@ -297,7 +300,7 @@ async fn run_delivery_relay(shared: Arc<SessionShared>) {
             biased;
             _ = shared.delivery_cancellation.cancelled() => return,
             _ = query_changed => continue,
-            _ = shared.progress_superseded(&delivery.query), if delivery.kind == DeliveryKind::Update => continue,
+            _ = shared.progress_superseded(delivery.generation), if delivery.kind == DeliveryKind::Update => continue,
             _ = shared.outgoing.send_server_notification_to_connections(
                 &recipients,
                 delivery.notification,
@@ -316,11 +319,11 @@ impl SessionReporterImpl {
             return;
         }
 
-        let query = {
+        let (query, generation) = {
             #[expect(clippy::unwrap_used)]
             self.shared.latest_query.lock().unwrap().clone()
         };
-        if snapshot.query != query {
+        if snapshot.query != query || snapshot.generation != generation {
             return;
         }
 
@@ -347,7 +350,7 @@ impl SessionReporterImpl {
             },
         );
         self.shared
-            .enqueue_delivery(DeliveryKind::Update, query, notification);
+            .enqueue_delivery(DeliveryKind::Update, query, snapshot.generation, notification);
     }
 
     fn send_complete(&self, snapshot: &file_search::FileSearchSnapshot) {
@@ -358,7 +361,7 @@ impl SessionReporterImpl {
         {
             #[expect(clippy::unwrap_used)]
             let latest_query = self.shared.latest_query.lock().unwrap();
-            if query != latest_query.as_str() {
+            if query != latest_query.0 || snapshot.generation != latest_query.1 {
                 return;
             }
         }
@@ -387,7 +390,7 @@ impl SessionReporterImpl {
             },
         );
         self.shared
-            .enqueue_delivery(DeliveryKind::Completion, query, notification);
+            .enqueue_delivery(DeliveryKind::Completion, query, snapshot.generation, notification);
     }
 }
 

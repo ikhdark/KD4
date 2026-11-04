@@ -662,16 +662,19 @@ impl InProcessAppServerClient {
             let mut shutdown_ack = None;
             let mut skipped_events = 0usize;
             let mut pending_delivery = std::collections::VecDeque::new();
+            let mut forwarding = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     // A retained request handle cannot keep an input-capable
                     // runtime alive after its only event consumer has gone away.
                     _ = event_tx.closed() => break,
-                    permit = event_tx.reserve(), if !pending_delivery.is_empty() => {
+                    permit = event_tx.reserve(), if !pending_delivery.is_empty() || skipped_events > 0 => {
                         match permit {
                             Ok(permit) => {
                                 if let Some(event) = pending_delivery.pop_front() {
                                     permit.send(event);
+                                } else {
+                                    permit.send(InProcessServerEvent::Lagged { skipped: std::mem::take(&mut skipped_events) });
                                 }
                             }
                             Err(_) => {
@@ -679,15 +682,23 @@ impl InProcessAppServerClient {
                             }
                         }
                     }
+                    _ = forwarding.join_next(), if !forwarding.is_empty() => {}
                     command = command_rx.recv() => {
                         match command {
                             Some(command) if command.is_abandoned_request() => {}
                             Some(ClientCommand::Request { request, trace, response_tx }) => {
+                                if forwarding.len() >= channel_capacity {
+                                    let _ = response_tx.send(Ok(Err(codex_app_server_protocol_types::overloaded_error(
+                                        codex_app_server_protocol_types::OverloadReason::InFlightTaskCapacity,
+                                        "in-process facade request capacity reached",
+                                    ))));
+                                    continue;
+                                }
                                 let request_sender = request_sender.clone();
-                                // Request waits happen on a detached task so
+                                // Request waits happen on a tracked bounded task so
                                 // this loop can keep draining runtime events
                                 // while the request is blocked on client input.
-                                tokio::spawn(async move {
+                                forwarding.spawn(async move {
                                     let result = request_sender.request_with_trace(*request, trace).await;
                                     let _ = response_tx.send(result);
                                 });
@@ -778,7 +789,12 @@ impl InProcessAppServerClient {
             // preserves custody of committed work through graceful shutdown.
             command_rx.close();
             drop(command_rx);
-            let result = handle.shutdown().await;
+            let mut result = handle.shutdown().await;
+            while let Some(joined) = forwarding.join_next().await {
+                if let Err(error) = joined && result.is_ok() {
+                    result = Err(IoError::other(format!("in-process request forwarder failed: {error}")));
+                }
+            }
             if let Some(response_tx) = shutdown_ack {
                 let _ = response_tx.send(result.as_ref().map(|_| ()).map_err(|error| {
                     IoError::new(error.kind(), error.to_string())
@@ -942,6 +958,12 @@ impl InProcessAppServerClient {
                 )
             })?
             .map_err(|error| IoError::other(format!("in-process shutdown owner failed: {error}")))?
+    }
+
+    /// Waits for the actual cleanup owner without an observer timeout.
+    /// Executable adapters must keep their runtime alive through this barrier.
+    pub async fn shutdown_until_complete(self) -> IoResult<()> {
+        self.shutdown_owned().await
     }
 
     async fn shutdown_owned(self) -> IoResult<()> {

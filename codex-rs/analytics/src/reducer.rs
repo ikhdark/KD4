@@ -2109,6 +2109,7 @@ pub(crate) fn analytics_tool_item(item: &ThreadItem) -> Option<ThreadItem> {
                 .iter()
                 .map(|change| FileUpdateChange {
                     path: String::new(),
+                    path_uri: None,
                     kind: change.kind.clone(),
                     diff: String::new(),
                 })
