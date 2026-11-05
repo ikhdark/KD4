@@ -17,7 +17,6 @@ use http::HeaderMap as ApiHeaderMap;
 use http::HeaderValue;
 use serde::Serialize;
 use serde_json::Value;
-use uuid::Uuid;
 
 use crate::client::X_CODEX_INSTALLATION_ID_HEADER;
 use crate::client::X_CODEX_PARENT_THREAD_ID_HEADER;
@@ -188,15 +187,11 @@ impl CodexResponsesMetadata {
         }
     }
 
-    /// Prompt-cache routing identity, sent as `prompt_cache_key` and the `session-id` header.
-    /// Threads of one installation share their instructions and tools, but only requests
-    /// routed alike can reuse them: a per-thread value makes nearly every first request cold.
-    /// Turn metadata and `thread-id` keep the real identities.
+    /// Keep cache routing and transport session identity aligned with the caller's
+    /// session, including its agent tree. Installation identity is not session identity;
+    /// sharing it across unrelated sessions was not established as a cache-miss fix.
     pub(crate) fn cache_affinity_id(&self) -> String {
-        if self.installation_id.is_empty() {
-            return self.session_id.clone();
-        }
-        Uuid::new_v5(&Uuid::NAMESPACE_OID, self.installation_id.as_bytes()).to_string()
+        self.session_id.clone()
     }
 
     /// Auxiliary work has one durable attempt identity, not a synthetic coding turn.

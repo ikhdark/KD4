@@ -538,6 +538,17 @@ async fn handle_read_tool_output(
     })?;
     output["historical_authenticity"] = serde_json::json!(snapshot.historical_authenticity());
     if foreign_source { output["source_thread_id"] = serde_json::json!(source_thread_id); }
+    // A complete root JSON value is full report acquisition, but not exact
+    // source spelling. Keep it separate from byte/source-inspection coverage.
+    if successful && output["complete"] == true
+        && output["results"].as_array().is_some_and(|results| results.iter().any(|result| {
+            result["status"] == "ok" && result["selector"]["kind"] == "json_pointer"
+                && result["selector"]["pointer"] == "" && result.get("value").is_some()
+                && result["complete"] != false
+        }))
+    {
+        selectors.push(serde_json::json!({"kind":"json_pointer", "pointer":"", "semantic_value":true}));
+    }
     let inspection_delivery = successful
         && !foreign_source
         && snapshot.historical_authenticity() == "authenticated"
@@ -550,7 +561,7 @@ async fn handle_read_tool_output(
     let mut inner = recovery_tool_output(output, successful, evidence.clone());
     attempt.phase = "delivery";
     crate::tools::context::ensure_exact_model_delivery(&inner, &invocation)?;
-    if evidence.is_some() && !foreign_source {
+    if (evidence.is_some() || !selectors.is_empty()) && !foreign_source {
         invocation.session.record_tool_history_recovery(
             args.artifact_id.clone(), invocation.call_id.clone(), selectors,
         ).await;

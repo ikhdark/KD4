@@ -101,10 +101,20 @@ fn required_tool_terminal(
         RequiredToolTerminalCause::Blocked => "blocked",
         RequiredToolTerminalCause::Failure => "failed",
     };
+    let message = format!("required tool `{}` {label}", call.tool_name);
+    // A cell stopped by a nested tool names that tool and its reason. The cell's
+    // own name would tell the recipient nothing about what actually blocked it.
+    let message = match signal
+        .and_then(|signal| signal.get("nested_terminal_reason"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(reason) => format!("{message}: {reason}"),
+        None => message,
+    };
     Some(RequiredToolTerminal {
         call_id: call.call_id.clone(),
         cause,
-        message: format!("required tool `{}` {label}", call.tool_name),
+        message,
     })
 }
 
@@ -2031,6 +2041,7 @@ impl ToolCallRuntime {
                         );
                     }
                     let failure_detail = Self::search_failure_detail(&error_call, &other);
+                    let terminal_reason = other.failure().message;
                     let response = Self::failure_response(error_call.clone(), other);
                     let evidence_capture_started = Instant::now();
                     let workspace_evidence_deferred = dispatch_state.handler_started() && if passive_poll {
@@ -2057,7 +2068,7 @@ impl ToolCallRuntime {
                             call_id: error_call.call_id,
                             cause,
                             message: format!(
-                                "required tool `{}` {}",
+                                "required tool `{}` {}: {terminal_reason}",
                                 error_call.tool_name,
                                 match cause {
                                     RequiredToolTerminalCause::Blocked => "blocked",

@@ -805,17 +805,29 @@ impl EnabledToolCatalog {
     }
 
     /// `resolve_tool` also accepts the spellings scripts copy from call sites
-    /// (`tools.x`) and provider namespaces (`functions.x`). Registered and
-    /// ambiguous identities keep their exact meaning.
+    /// (`tools.x`) and provider namespaces (`functions.x`), and the bare local
+    /// name harness text uses for a namespaced tool (`get_agent_task`) when
+    /// exactly one tool has it. Registered and ambiguous identities keep their
+    /// exact meaning.
     fn resolve_script_spelling(&self, requested_name: &str) -> Option<usize> {
         if self.by_requested_name.contains_key(requested_name) {
             return self.resolve_requested_name(requested_name);
         }
-        ["tools.", "functions."].into_iter().find_map(|prefix| {
-            requested_name
-                .strip_prefix(prefix)
-                .and_then(|name| self.resolve_requested_name(name))
-        })
+        let name = ["tools.", "functions."]
+            .into_iter()
+            .find_map(|prefix| requested_name.strip_prefix(prefix))
+            .unwrap_or(requested_name);
+        if self.by_requested_name.contains_key(name) {
+            return self.resolve_requested_name(name);
+        }
+        let mut local_matches = self
+            .tools
+            .iter()
+            .enumerate()
+            .filter(|(_, tool)| tool.tool_name.name == name)
+            .map(|(index, _)| index);
+        let index = local_matches.next()?;
+        local_matches.next().is_none().then_some(index)
     }
 
     fn resolution_diagnostic(&self, requested: Option<&str>) -> serde_json::Value {

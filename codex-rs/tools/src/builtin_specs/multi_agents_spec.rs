@@ -49,6 +49,34 @@ impl Default for WaitAgentTimeoutOptions {
     }
 }
 
+impl WaitAgentTimeoutOptions {
+    /// Reject an invalid explicit deadline before subscribing or publishing a wait.
+    /// Omission alone selects the existing event-driven wait without a deadline.
+    pub fn validate_timeout_ms(
+        self,
+        timeout_ms: Option<i64>,
+    ) -> Result<Option<i64>, crate::FunctionCallError> {
+        if let Some(ms) = timeout_ms
+            && !(self.min_timeout_ms..=self.max_timeout_ms).contains(&ms)
+        {
+            let mut failure = codex_protocol::tool_failure::ToolFailure::no_effects(
+                codex_protocol::tool_failure::ToolFailureCode::InvalidInput,
+                format!(
+                    "wait_agent: timeout_ms must be an integer from {} through {}; no wait was started",
+                    self.min_timeout_ms, self.max_timeout_ms,
+                ),
+            );
+            failure.field_errors.push(codex_protocol::tool_failure::ToolFieldError {
+                path: "/timeout_ms".into(),
+                expected: format!("integer in {}..={}", self.min_timeout_ms, self.max_timeout_ms),
+                correction: "Use a value in the advertised range, omit timeout_ms for event-driven waiting, or use list_agents/get_agent_task for an immediate status snapshot.".into(),
+            });
+            return Err(crate::FunctionCallError::structured(failure));
+        }
+        Ok(timeout_ms)
+    }
+}
+
 
 pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
     let mut properties = spawn_agent_common_properties_v2();
@@ -425,6 +453,11 @@ fn list_agents_output_schema() -> Value {
                 "type": "array",
                 "items": { "type": "array", "items": { "type": "string" }, "minItems": 2, "maxItems": 2 }
             },
+            "report_retrieval": {
+                "type": "array",
+                "items": { "type": "object", "additionalProperties": true },
+                "description": "Host-recorded child handoff kind and full-report acquisition (not_recorded, partial, complete or unknown), independent of completed lifecycle status. Complete means the full canonical bytes or root JSON value reached a native caller; it does not prove model-visible delivery, semantic review or integration. Recovery uses immutable parent-owned artifacts. Legacy unregistered handoffs are absent, not known consumed."
+            },
             "revision": { "type": "string", "description": "Opaque visible-view identity, independent of omitted content; not a source or acceptance revision." },
             "unchanged": { "type": "boolean", "description": "If true retain the prior visible snapshot; empty arrays do not revoke existing failures or agents. Hidden report recovery may still change." },
             "task_text_recovery": { "type": ["string", "null"] },
@@ -738,9 +771,11 @@ fn wait_agent_tool_parameters_v2(options: WaitAgentTimeoutOptions) -> JsonSchema
         (
             "timeout_ms".to_string(),
             JsonSchema {
+                minimum: Some(options.min_timeout_ms.into()),
+                maximum: Some(options.max_timeout_ms.into()),
                 ..JsonSchema::integer(Some(format!(
-                    "Explicit caller deadline in milliseconds. Omit to keep waiting; the default {} ms interval is internal maintenance cadence only and does not return an unchanged result. Values below {} are ignored and wait without a deadline; values above {} are capped. Use list_agents or get_agent_task for an immediate status snapshot.",
-                    options.default_timeout_ms, options.min_timeout_ms, options.max_timeout_ms,
+                    "Explicit caller deadline in milliseconds, from {} through {}; out-of-range values are rejected before waiting. Use list_agents or get_agent_task for an immediate status snapshot. Omit to keep waiting; the default {} ms interval is internal maintenance cadence only and does not return an unchanged result.",
+                    options.min_timeout_ms, options.max_timeout_ms, options.default_timeout_ms,
                 )))
             },
         ),

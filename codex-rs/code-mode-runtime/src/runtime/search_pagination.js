@@ -25,7 +25,8 @@ const __codex_search_scope = (options, result) => {
     limits: { max_depth: null, max_directories: null,
       max_matches_per_file: options.page_size !== undefined ? null : options.lines ? options.max_per_file ?? 10 : null,
       page_size: options.page_size ?? null, inventory_files: options.page_size !== undefined ? 128 : null,
-      diagnostic_lines: 20, exact_capture: "bounded_by_exec_command_and_await_command" } };
+      diagnostic_lines: 20, exact_capture: result?.search_backend === "native_file_search"
+        ? "bounded_by_native_file_search" : "bounded_by_exec_command_and_await_command" } };
 };
 
 // Extend the existing rg helper, session store and guarded checksum owners.
@@ -55,7 +56,12 @@ const __codex_paginate_search = (search) => {
     if (options.no_ignore) args.push("--no-ignore");
     for (const glob of options.glob) args.push("--glob", glob);
     args.push("--", ...options.path);
-    let result = await tools.exec_command({ program: "rg", args, force_fresh: true });
+    const nativeSearch = typeof globalThis.resolve_tool === "function"
+      ? globalThis.resolve_tool("file_search") : undefined;
+    let result = typeof nativeSearch === "function"
+      ? await nativeSearch({ paths: options.path, globs: options.glob,
+          hidden: options.hidden, no_ignore: options.no_ignore, inventory: true })
+      : await tools.exec_command({ program: "rg", args, force_fresh: true });
     if (result?.session_id != null) {
       try {
         const collected = await await_command(result);

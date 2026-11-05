@@ -309,7 +309,7 @@ impl Session {
         let models_manager = Arc::clone(&self.services.models_manager);
         let mut responses_metadata = CodexResponsesMetadata::new(
             self.installation_id.clone(),
-            self.thread_id.to_string(),
+            self.session_id().to_string(),
             self.thread_id.to_string(),
             self.current_window_id().await,
         );

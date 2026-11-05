@@ -141,6 +141,12 @@ RETURNING last_watermark
             .transpose()?;
         if let Some(claim) = claim.as_ref() {
             *self.backfill_worker.held_claim() = Some(claim.clone());
+            // Shutdown may have checked for a claim while the SQL acquisition
+            // was still pending. Do not leave that late claim behind until expiry.
+            if self.backfill_stop_requested() {
+                self.release_backfill_claim(claim).await?;
+                return Ok(None);
+            }
         }
         Ok(claim)
     }
@@ -152,19 +158,28 @@ RETURNING last_watermark
         Ok(())
     }
 
+    /// A metadata gap can hide lineage even after an earlier complete pass.
+    /// Only the current lease owner may withdraw that coverage certificate.
+    pub async fn invalidate_backfill_coverage(&self, claim: &crate::BackfillClaim) -> anyhow::Result<()> {
+        let result = sqlx::query("UPDATE backfill_state SET last_success_at = NULL WHERE id = 1 AND status = 'running' AND claim_token = ?")
+            .bind(&claim.token).execute(self.pool.as_ref()).await?;
+        anyhow::ensure!(result.rows_affected() == 1, "backfill claim ownership was lost");
+        Ok(())
+    }
+
     pub async fn release_backfill_claim(&self, claim: &crate::BackfillClaim) -> anyhow::Result<()> {
-        self.backfill_worker.forget_claim(claim);
         let result = sqlx::query("UPDATE backfill_state SET status = 'pending', updated_at = ?, claim_token = NULL WHERE id = 1 AND status = 'running' AND claim_token = ?")
             .bind(Utc::now().timestamp()).bind(&claim.token).execute(self.pool.as_ref()).await?;
+        self.backfill_worker.forget_claim(claim);
         anyhow::ensure!(result.rows_affected() == 1, "backfill claim ownership was lost");
         Ok(())
     }
 
     pub async fn complete_backfill_claim(&self, claim: &crate::BackfillClaim, watermark: Option<&str>) -> anyhow::Result<()> {
-        self.backfill_worker.forget_claim(claim);
         let now = Utc::now().timestamp();
         let result = sqlx::query("UPDATE backfill_state SET status = 'complete', last_watermark = COALESCE(?, last_watermark), last_success_at = ?, updated_at = ?, claim_token = NULL WHERE id = 1 AND status = 'running' AND claim_token = ?")
             .bind(watermark).bind(now).bind(now).bind(&claim.token).execute(self.pool.as_ref()).await?;
+        self.backfill_worker.forget_claim(claim);
         anyhow::ensure!(result.rows_affected() == 1, "backfill claim ownership was lost");
         Ok(())
     }

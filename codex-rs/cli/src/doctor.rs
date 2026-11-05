@@ -2504,29 +2504,29 @@ async fn websocket_reachability_check(
 
     let api_provider = match runtime_provider.api_provider().await {
         Ok(api_provider) => api_provider,
-        Err(err) => {
+        Err(_) => {
             return websocket_probe_warning(
                 "Responses WebSocket provider setup failed",
                 details,
-                format!("provider setup failed: {err}"),
+                "provider setup failed (details redacted)".to_string(),
                 "Inspect the provider setup error and correct the affected provider configuration.",
             );
         }
     };
     match api_provider.websocket_url_for_path("responses") {
         Ok(url) => {
-            details.push(format!("endpoint: {url}"));
+            details.push(redact_detail(&format!("endpoint: {url}")));
             if let Some(host) = url.host_str()
                 && let Some(port) = url.port_or_known_default()
             {
                 details.extend(dns_address_family_details(host, port).await);
             }
         }
-        Err(err) => {
+        Err(_) => {
             return websocket_probe_warning(
                 "Responses WebSocket endpoint could not be built",
                 details,
-                format!("endpoint build failed: {err}"),
+                "endpoint build failed (details redacted)".to_string(),
                 "Correct the active provider base URL and WebSocket endpoint configuration described by the error.",
             );
         }
@@ -2534,11 +2534,11 @@ async fn websocket_reachability_check(
 
     let api_auth = match runtime_provider.api_auth().await {
         Ok(api_auth) => api_auth,
-        Err(err) => {
+        Err(_) => {
             return websocket_probe_warning(
                 "Responses WebSocket auth could not be resolved",
                 details,
-                format!("auth resolution failed: {err}"),
+                "auth resolution failed (details redacted)".to_string(),
                 "Resolve the reported authentication or credential configuration error, then rerun codex doctor.",
             );
         }
@@ -2578,7 +2578,14 @@ async fn websocket_reachability_check(
                     "immediate close code: {}",
                     close.code.as_deref().unwrap_or("not supplied")
                 ));
-                details.push(format!("immediate close reason: {}", close.reason));
+                details.push(format!(
+                    "immediate close reason: {}",
+                    if close.reason.is_empty() {
+                        "empty"
+                    } else {
+                        "present (redacted)"
+                    }
+                ));
                 return DoctorCheck::new(
                     "network.websocket_reachability",
                     "websocket",
@@ -2598,12 +2605,18 @@ async fn websocket_reachability_check(
             )
             .details(details)
         }
-        Ok(Err(err)) => websocket_probe_warning(
-            "Responses WebSocket failed; HTTPS fallback may still work",
-            details,
-            websocket_error_detail(&err),
-            "Check proxy, VPN, firewall, DNS, custom CA, and WebSocket policy support.",
-        ),
+        Ok(Err(err)) => {
+            if let Some(status) = err.status {
+                details.push(format!("handshake result: HTTP {status}"));
+            }
+            details.push(format!("handshake failure stage: {:?}", err.stage));
+            websocket_probe_warning(
+                "Responses WebSocket failed; HTTPS fallback may still work",
+                details,
+                websocket_error_detail(&err.error),
+                "Check proxy, VPN, firewall, DNS, custom CA, and WebSocket policy support.",
+            )
+        }
         Err(_) => websocket_probe_warning(
             "Responses WebSocket timed out; HTTPS fallback may still work",
             details,
@@ -2631,27 +2644,41 @@ fn websocket_probe_warning(
 }
 
 fn websocket_error_detail(err: &ApiError) -> String {
-    match err {
-        ApiError::Transport(transport) => format!("handshake transport error: {transport}"),
-        ApiError::Api { status, message } => {
-            format!("handshake API error: {status} {message}")
+    let category = match err {
+        ApiError::Transport(transport) => {
+            let category = match transport {
+                codex_api::TransportError::Http { status, .. } => {
+                    return format!("handshake transport error: http {status} [redacted]");
+                }
+                codex_api::TransportError::RetryLimit => "retry limit",
+                codex_api::TransportError::Timeout => "timeout",
+                codex_api::TransportError::ConnectionTimeout => "connection timeout",
+                codex_api::TransportError::Connection(_) => "connection",
+                codex_api::TransportError::Network(_) => "network",
+                codex_api::TransportError::PreDispatch(_) => "pre-dispatch",
+                codex_api::TransportError::Build(_) => "request build",
+                codex_api::TransportError::ResponseTooLarge { .. } => "response too large",
+            };
+            return format!("handshake transport error: {category} [redacted]");
         }
-        ApiError::Stream(message) => format!("handshake stream error: {message}"),
-        ApiError::WebsocketConnect(message) => format!("handshake connection error: {message}"),
-        ApiError::ContextWindowExceeded
-        | ApiError::QuotaExceeded
-        | ApiError::UsageNotIncluded
-        | ApiError::Retryable { .. }
-        | ApiError::WebsocketRejected { .. }
-        | ApiError::WebsocketClosed { .. }
-        | ApiError::RateLimit(_)
-        | ApiError::InvalidRequest { .. }
-        | ApiError::CyberPolicy { .. }
-        | ApiError::ServerOverloaded { .. }
-        | ApiError::IncompleteResponse(_)
-        | ApiError::TerminalResponse { .. }
-        | ApiError::ProviderFailure { .. } => format!("handshake error: {err}"),
-    }
+        ApiError::Api { status, .. } => return format!("handshake API error: {status} [redacted]"),
+        ApiError::Stream(_) => "stream",
+        ApiError::WebsocketConnect(_) => "connection",
+        ApiError::ContextWindowExceeded => "context window exceeded",
+        ApiError::QuotaExceeded => "quota exceeded",
+        ApiError::UsageNotIncluded => "usage not included",
+        ApiError::Retryable { .. } => "retryable",
+        ApiError::WebsocketRejected { .. } => "websocket rejected",
+        ApiError::WebsocketClosed { .. } => "websocket closed",
+        ApiError::RateLimit(_) => "rate limit",
+        ApiError::InvalidRequest { .. } => "invalid request",
+        ApiError::CyberPolicy { .. } => "cyber policy",
+        ApiError::ServerOverloaded { .. } => "server overloaded",
+        ApiError::IncompleteResponse(_) => "incomplete response",
+        ApiError::TerminalResponse { source, .. } => return websocket_error_detail(source),
+        ApiError::ProviderFailure { .. } => "provider failure",
+    };
+    format!("handshake error: {category} [redacted]")
 }
 
 fn auth_mode_name(auth: &CodexAuth) -> &'static str {

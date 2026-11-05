@@ -2225,11 +2225,23 @@ fn fold_nested_required_terminal(
             (output.with_outcome(ToolOutputOutcome::Failure), "failure")
         }
     };
+    // Failed dispatches carry the whole structured failure as their message;
+    // the turn's final answer needs only its reason.
+    let reason = serde_json::from_str::<JsonValue>(&terminal.message)
+        .ok()
+        .and_then(|failure| {
+            failure
+                .pointer("/tool_failure/message")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or(terminal.message);
     merge_code_mode_signal(
         output,
         serde_json::json!({
             "outcome": outcome,
             "nested_ordinal": terminal.ordinal,
+            "nested_terminal_reason": reason,
         }),
     )
 }

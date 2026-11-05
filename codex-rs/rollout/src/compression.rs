@@ -881,17 +881,21 @@ pub(crate) fn existing_rollout_path_blocking(path: &Path) -> Option<PathBuf> {
 
 /// Blocking open with the same bounded representation-transition retry as
 /// [`open_rollout_line_reader`].
-pub(crate) fn open_rollout_file_with_retry(path: &Path) -> io::Result<File> {
+pub(crate) fn open_rollout_file_with_retry(path: &Path) -> io::Result<(PathBuf, File)> {
+    let open_once = || {
+        let physical = existing_rollout_path_blocking(path).unwrap_or_else(|| path.to_path_buf());
+        File::open(&physical).map(|file| (physical, file))
+    };
     for _ in 0..MAX_OPEN_RETRIES {
-        match File::open(path) {
-            Ok(file) => return Ok(file),
+        match open_once() {
+            Ok(opened) => return Ok(opened),
             Err(error) if is_retryable_open_error(&error) => {
                 std::thread::sleep(OPEN_ROLLOUT_LINE_READER_RETRY_DELAY);
             }
             Err(error) => return Err(error),
         }
     }
-    File::open(path)
+    open_once()
 }
 
 /// Hydrates a selected rollout for feedback on a blocking thread. Both raw

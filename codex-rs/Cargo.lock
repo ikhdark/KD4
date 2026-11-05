@@ -1571,6 +1571,7 @@ dependencies = [
  "futures",
  "http",
  "regex-lite",
+ "rustls",
  "schemars 0.8.22",
  "serde",
  "serde_json",

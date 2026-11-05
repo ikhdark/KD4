@@ -63,9 +63,7 @@ pub(super) async fn create_project(
 ) -> ThreadStoreResult<CreatedProject> {
     let state = state(store)?;
     // Named threads must have rows; give ones still being indexed the chance to appear.
-    if !params.thread_ids.is_empty() {
-        state.await_thread_index().await;
-    }
+    let coverage_certified = params.thread_ids.is_empty() || state.await_thread_index().await;
     state
         .create_project(
             params.name,
@@ -79,7 +77,18 @@ pub(super) async fn create_project(
             project: stored_project(created.project),
             created: created.created,
         })
-        .map_err(project_idempotency_error)
+        .map_err(|error| {
+            // Let the transactional owner preserve existing-row and idempotent
+            // successes. Only an actual missing valid ID needs a coverage error.
+            if !coverage_certified
+                && error.to_string().strip_prefix("thread not found: ")
+                    .is_some_and(|id| codex_protocol::ThreadId::from_string(id).is_ok())
+            {
+                internal("thread index is still being built; retry shortly")
+            } else {
+                project_idempotency_error(error)
+            }
+        })
 }
 
 pub(super) async fn update_project(

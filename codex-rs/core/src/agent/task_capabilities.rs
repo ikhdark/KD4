@@ -24,6 +24,19 @@ pub(crate) enum TypedToolClass {
 }
 
 impl TypedToolClass {
+    /// Static catalog eligibility, not an execution grant. Assignment-specific
+    /// checks (including patch scope and task operations) still run at dispatch.
+    pub(crate) fn available_to_subagents(self) -> bool {
+        matches!(
+            self,
+            Self::AgentCommunication
+                | Self::OwnTask
+                | Self::ReadSearch
+                | Self::CodeModeControl
+                | Self::StructuredEdit
+        )
+    }
+
     /// Discovery labels describe the existing class, never grant authority.
     pub(crate) fn native_capability_group(self) -> Option<&'static str> {
         match self {
@@ -245,8 +258,86 @@ fn canonical_repository_root(repo_root: &Path) -> Result<PathBuf, CapabilityPoli
     })
 }
 
+/// This turn's capability refusals. A refusal leaves the turn running, so the
+/// terminal boundary must still say whether permitted work could have replaced the
+/// refused operation. The host records what it observed and never reads intent from prose.
+#[derive(Default)]
+pub(crate) struct CapabilityRefusals(std::sync::Mutex<Vec<CapabilityRefusal>>);
+
+struct CapabilityRefusal {
+    tool: String,
+    /// Reads can stand in for refused inspection, never for a refused source edit.
+    replaceable: bool,
+    followed_by_work: bool,
+}
+
+impl CapabilityRefusals {
+    fn entries(&self) -> std::sync::MutexGuard<'_, Vec<CapabilityRefusal>> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn record(&self, tool: &str, class: TypedToolClass) {
+        let mut entries = self.entries();
+        match entries.iter_mut().find(|refusal| refusal.tool == tool) {
+            Some(refusal) => refusal.followed_by_work = false,
+            None => entries.push(CapabilityRefusal {
+                tool: tool.to_string(),
+                replaceable: class != TypedToolClass::StructuredEdit,
+                followed_by_work: false,
+            }),
+        }
+    }
+
+    pub(crate) fn record_permitted_work(&self) {
+        for refusal in self.entries().iter_mut() {
+            refusal.followed_by_work = true;
+        }
+    }
+
+    /// Unresolved refusals make the host's disposition `incomplete`; a replaced
+    /// one stays an advisory because the worker may have legitimately finished.
+    pub(crate) fn apply_to(
+        &self,
+        assessment: &mut codex_protocol::protocol::TurnCompletionAssessment,
+    ) {
+        for refusal in self.entries().iter() {
+            let tool = &refusal.tool;
+            if refusal.replaceable && refusal.followed_by_work {
+                assessment.advisories.push(format!(
+                    "Refused `{tool}`; permitted work followed, but the report may not cover the refused operation."
+                ));
+                continue;
+            }
+            assessment.verification_gaps.push(if refusal.replaceable {
+                format!("Refused `{tool}` and no permitted work followed, so the report may not establish the assignment.")
+            } else {
+                format!("Refused `{tool}`; this assignment has no permitted route to that work, so the report may not establish it.")
+            });
+            let disposition = assessment.task_disposition.get_or_insert_with(|| {
+                codex_protocol::protocol::TurnTaskDisposition {
+                    schema_version: 1,
+                    plan_revision: None,
+                    input_revision: None,
+                    mutation_revision: 0,
+                    request_state: String::new(),
+                    artifact_state: "semantic_acceptance_unverified".into(),
+                    terminal_action: String::new(),
+                    unmet_obligations: Vec::new(),
+                    evidence_refs: Vec::new(),
+                    authority: "host_capability_refusal; not independent task acceptance".into(),
+                }
+            });
+            disposition.request_state = "incomplete".into();
+            disposition.terminal_action = "handoff_with_gaps".into();
+            disposition.evidence_refs.push(format!("native:capability_refusal:{tool}"));
+        }
+    }
+}
+
 /// Classes come from host registration, not task prose. Opaque execution cannot
 /// prove source confinement; writable workers use the scope-checked patch owner.
+/// A refusal denies this call only: the worker keeps its turn, so it can use a
+/// permitted route or report the blocker instead of losing its completed work.
 pub(crate) fn authorize_assignment_tool(
     authorization: Option<&codex_agent_task_store::AgentTaskAuthorization>,
     class: TypedToolClass,
@@ -254,8 +345,17 @@ pub(crate) fn authorize_assignment_tool(
     payload: &crate::tools::context::ToolPayload,
 ) -> Result<(), crate::FunctionCallError> {
 
-    let refused = |reason: &str| crate::FunctionCallError::RequiredOperationBlocked(
-        format!("{semantic_name}: {reason}"));
+    let refused = |reason: &str| {
+        let mut failure = codex_protocol::tool_failure::ToolFailure::no_effects(
+            codex_protocol::tool_failure::ToolFailureCode::PermissionDenied,
+            format!("{semantic_name}: {reason}"),
+        );
+        failure.details = Some(serde_json::json!({"denial_kind":"capability_denied"}));
+        failure.safe_next_actions.push(
+            "Continue the assignment using native read/search or already-authorized scoped apply_patch; return the available evidence or a precise blocker. Do not retry the prohibited action through another route.".into(),
+        );
+        crate::FunctionCallError::structured(failure)
+    };
     if matches!(semantic_name, "spawn_agent" | "followup_task") {
         return Err(refused("workers cannot delegate execution authority; ask the root to admit the assignment"));
     }

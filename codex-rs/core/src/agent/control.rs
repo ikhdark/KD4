@@ -568,6 +568,20 @@ impl AgentControl {
         .await
     }
 
+    pub(crate) async fn register_child_report_artifact(
+        &self,
+        parent_thread_id: ThreadId,
+        artifact_id: String,
+        origin: String,
+        bytes: u64,
+        sha256: String,
+    ) -> CodexResult<()> {
+        let parent = self.upgrade()?.get_thread(parent_thread_id).await?;
+        parent.codex.session.try_register_tool_artifact_origin(
+            artifact_id, origin, bytes, sha256,
+        ).await
+    }
+
     pub(crate) fn validate_inter_agent_communication(
         &self,
         communication: &InterAgentCommunication,
@@ -1006,11 +1020,12 @@ impl AgentControl {
         let Some(graph) = state.agent_graph_store() else {
             return Ok(());
         };
-        // A resume can precede full indexing. Unindexed children cannot be restored, the same
-        // as without a store, and a resume never waits for them.
-        if !graph.edge_coverage_certified().await.unwrap_or(false) {
+        // Coverage is needed to prove absence, not to restore known children.
+        // Historical gaps must not prevent recovery of an otherwise readable tree.
+        if !graph.await_edge_coverage().await.map_err(|err| CodexErr::Fatal(err.to_string()))? {
             tracing::warn!(
-                "restoring descendants of {root_thread_id} before the thread index is complete"
+                %root_thread_id,
+                "thread index coverage is incomplete; restoring known descendants only"
             );
         }
         let root_path = self
@@ -1593,6 +1608,7 @@ impl AgentControl {
                     let parent_config = artifact_owner.config().await;
                     let communication =
                     crate::session_prefix::inter_agent_completion_communication_with_diagnostics(
+                        &control,
                         &parent_config.codex_home,
                         parent_thread_id,
                         parent_agent_path,

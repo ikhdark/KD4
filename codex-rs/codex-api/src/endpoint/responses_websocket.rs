@@ -2,6 +2,9 @@ use crate::auth::SharedAuthProvider;
 use crate::common::ResponseEvent;
 use crate::common::ResponseStream;
 use crate::common::ResponsesWsRequest;
+use crate::endpoint::responses_websocket_probe::ResponsesWebsocketProbeError;
+use crate::endpoint::responses_websocket_probe::ResponsesWebsocketProbeFailureStage;
+use crate::endpoint::responses_websocket_probe::probe_tracking_headers;
 use crate::error::ApiError;
 use crate::provider::Provider;
 use crate::response_event_channel::ResponseEventSender;
@@ -749,7 +752,7 @@ pub struct ResponsesWebsocketClient {
 }
 
 /// Close frame information captured by a handshake probe.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ResponsesWebsocketClose {
     /// WebSocket close code returned by the server, absent for an empty close frame.
     pub code: Option<String>,
@@ -758,12 +761,14 @@ pub struct ResponsesWebsocketClose {
 }
 
 /// Result of a handshake-only Responses WebSocket probe.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ResponsesWebsocketProbe {
     /// Redacted by callers before displaying or serializing support reports.
     pub url: String,
     /// HTTP status returned by the successful WebSocket upgrade.
     pub status: StatusCode,
+    /// Allowlisted tracking headers, never included in Debug output.
+    pub headers: HeaderMap,
     /// Whether the server reported reasoning support in the upgrade response.
     pub reasoning_included: bool,
     /// Whether the server returned a model catalog ETag in the upgrade response.
@@ -772,6 +777,26 @@ pub struct ResponsesWebsocketProbe {
     pub server_model_present: bool,
     /// Close frame received immediately after upgrade, when one arrives quickly.
     pub immediate_close: Option<ResponsesWebsocketClose>,
+}
+
+impl std::fmt::Debug for ResponsesWebsocketClose {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResponsesWebsocketClose")
+            .field("code", &self.code)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ResponsesWebsocketProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResponsesWebsocketProbe")
+            .field("status", &self.status)
+            .field("reasoning_included", &self.reasoning_included)
+            .field("models_etag_present", &self.models_etag_present)
+            .field("server_model_present", &self.server_model_present)
+            .field("immediate_close", &self.immediate_close)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ResponsesWebsocketClient {
@@ -813,7 +838,8 @@ impl ResponsesWebsocketClient {
             self.auth.dispatch_guard(),
             connect_websocket(ws_url, headers, http_client_factory, turn_state.clone()),
         )
-        .await?;
+        .await
+        .map_err(|failure| *failure.error)?;
         let mut connection = ResponsesWebsocketConnection::new(
             connected.stream,
             self.provider.stream_idle_timeout,
@@ -837,7 +863,7 @@ impl ResponsesWebsocketClient {
         extra_headers: HeaderMap,
         default_headers: HeaderMap,
         immediate_close_timeout: Duration,
-    ) -> Result<ResponsesWebsocketProbe, ApiError> {
+    ) -> Result<ResponsesWebsocketProbe, ResponsesWebsocketProbeError> {
         let ws_url = self
             .provider
             .websocket_url_for_path("responses")
@@ -851,7 +877,8 @@ impl ResponsesWebsocketClient {
             merge_request_headers(&self.provider.headers, extra_headers, default_headers);
         self.auth
             .try_add_auth_headers(&mut headers)
-            .map_err(TransportError::from)?;
+            .map_err(TransportError::from)
+            .map_err(ApiError::from)?;
 
         let connected = codex_http_client::with_dispatch_guard(
             self.auth.dispatch_guard(),
@@ -863,6 +890,8 @@ impl ResponsesWebsocketClient {
             ),
         )
         .await?;
+        let status = connected.response.status();
+        let headers = probe_tracking_headers(connected.response.headers());
         let mut stream = connected.stream;
         let deadline = Instant::now() + immediate_close_timeout;
         let immediate_close = loop {
@@ -870,8 +899,13 @@ impl ResponsesWebsocketClient {
                 break None;
             }
             let message = match tokio::time::timeout_at(deadline, stream.next()).await {
-                Ok(Some(message)) => message.map_err(|err| {
-                    ApiError::Stream(format!("failed to read websocket probe event: {err}"))
+                Ok(Some(message)) => message.map_err(|err| ResponsesWebsocketProbeError {
+                    error: Box::new(ApiError::Stream(format!(
+                        "failed to read websocket probe event: {err}"
+                    ))),
+                    stage: ResponsesWebsocketProbeFailureStage::Unknown,
+                    status: Some(status),
+                    headers: Some(headers.clone()),
                 })?,
                 Ok(None) | Err(_) => break None,
             };
@@ -882,7 +916,8 @@ impl ResponsesWebsocketClient {
 
         Ok(ResponsesWebsocketProbe {
             url: ws_url.to_string(),
-            status: connected.status,
+            status,
+            headers,
             reasoning_included: connected.metadata.reasoning_included(),
             models_etag_present: connected.metadata.models_etag_present(),
             server_model_present: connected.metadata.server_model_present(),
@@ -929,7 +964,7 @@ fn merge_request_headers(
 
 struct ConnectedWebsocket {
     stream: WsStream,
-    status: StatusCode,
+    response: tokio_tungstenite::tungstenite::handshake::client::Response,
     metadata: ResponsesStreamMetadata,
 }
 
@@ -938,7 +973,7 @@ async fn connect_websocket(
     headers: HeaderMap,
     http_client_factory: &HttpClientFactory,
     turn_state: Option<Arc<OnceLock<String>>>,
-) -> Result<ConnectedWebsocket, ApiError> {
+) -> Result<ConnectedWebsocket, ResponsesWebsocketProbeError> {
     info!("connecting to responses websocket");
 
     let mut request = url.as_str().into_client_request().map_err(|err| {
@@ -956,9 +991,12 @@ async fn connect_websocket(
                 ApiError::Stream(format!("websocket TLS configuration task failed: {err}"))
             })?
             .map_err(|err| {
-                ApiError::Transport(TransportError::Build(format!(
-                    "failed to configure websocket TLS: {err}"
-                )))
+                ResponsesWebsocketProbeError::before_upgrade(
+                    ApiError::Transport(TransportError::Build(format!(
+                        "failed to configure websocket TLS: {err}"
+                    ))),
+                    ResponsesWebsocketProbeFailureStage::Tls,
+                )
             })?
             .with_tcp_nodelay();
     let response = connector.connect(request, websocket_config()).await;
@@ -973,7 +1011,21 @@ async fn connect_websocket(
         }
         Err(err) => {
             error!("failed to connect to responses websocket");
-            return Err(map_ws_error(err, &url));
+            let stage = match &err {
+                WsError::Tls(_) => ResponsesWebsocketProbeFailureStage::Tls,
+                WsError::Io(error)
+                    if error
+                        .get_ref()
+                        .is_some_and(|source| source.is::<rustls::Error>()) =>
+                {
+                    ResponsesWebsocketProbeFailureStage::Tls
+                }
+                _ => ResponsesWebsocketProbeFailureStage::Unknown,
+            };
+            return Err(ResponsesWebsocketProbeError::before_upgrade(
+                map_ws_error(err, &url),
+                stage,
+            ));
         }
     };
 
@@ -981,7 +1033,7 @@ async fn connect_websocket(
     metadata.apply_turn_state(turn_state.as_deref());
     Ok(ConnectedWebsocket {
         stream: WsStream::new(stream),
-        status: response.status(),
+        response,
         metadata,
     })
 }

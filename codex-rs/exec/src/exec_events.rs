@@ -251,8 +251,8 @@ pub struct CommandExecutionItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub output_metadata: Option<codex_protocol::items::CommandExecutionOutputMetadata>,
-    /// Captured stdout. Omitted when byte-identical to `aggregated_output`, so
-    /// an absent `stdout` means `aggregated_output` is the stdout text.
+    /// Captured stdout. Omitted when byte-identical to `aggregated_output`, but
+    /// may also be unavailable; absence alone does not identify the stdout bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub stdout: Option<String>,

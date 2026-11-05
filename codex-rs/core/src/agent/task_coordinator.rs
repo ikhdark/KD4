@@ -103,6 +103,35 @@ pub(crate) struct AgentTaskCoordinator {
     /// same idempotent evidence and bump the task revision.
     reconciled_terminal_outcomes: Arc<Mutex<HashSet<(AttemptId, String)>>>,
     heartbeat_receipts: Arc<Mutex<HeartbeatReceipts>>,
+    /// Why the host's own terminal assessment declared an attempt's turn incomplete.
+    /// Every sealing path reads this, so whichever reaches the attempt first decides alike.
+    declared_gaps: Arc<Mutex<HashMap<AttemptId, Vec<String>>>>,
+}
+
+/// The reasons a terminal assessment declares its task `incomplete`, bounded for a receipt.
+fn declared_incomplete_reasons(
+    assessment: Option<&codex_protocol::protocol::TurnCompletionAssessment>,
+) -> Vec<String> {
+    let Some(assessment) = assessment.filter(|assessment| {
+        assessment
+            .task_disposition
+            .as_ref()
+            .is_some_and(|disposition| disposition.request_state == "incomplete")
+    }) else {
+        return Vec::new();
+    };
+    let reasons = assessment
+        .failed_checks
+        .iter()
+        .chain(&assessment.verification_gaps)
+        .take(8)
+        .map(|reason| reason.chars().take(192).collect::<String>())
+        .collect::<Vec<_>>();
+    if reasons.is_empty() {
+        vec!["The host declared this turn's task incomplete.".to_string()]
+    } else {
+        reasons
+    }
 }
 
 struct TypedActorHeartbeatReceipt {
@@ -409,10 +438,14 @@ impl AgentTaskCoordinator {
                         StoreError::CorruptData("pending terminal has no thread".into())
                     })?;
                 let summary = match &event {
-                    codex_protocol::protocol::EventMsg::TurnComplete(event) => event.timing.as_ref()
-                        .and_then(|timing| timing.completion_assessment.as_ref())
-                        .and_then(|assessment| assessment.bounded_summary(&event.turn_id))
-                        .unwrap_or_else(|| crate::agent::status::NO_COMPLETION_DIAGNOSTICS.to_string()),
+                    codex_protocol::protocol::EventMsg::TurnComplete(event) => {
+                        let assessment = event.timing.as_ref()
+                            .and_then(|timing| timing.completion_assessment.as_ref());
+                        self.note_terminal_assessment(binding.attempt_id, assessment);
+                        assessment
+                            .and_then(|assessment| assessment.bounded_summary(&event.turn_id))
+                            .unwrap_or_else(|| crate::agent::status::NO_COMPLETION_DIAGNOSTICS.to_string())
+                    }
                     codex_protocol::protocol::EventMsg::TurnAborted(_) => format!(
                         "Host terminal boundary for turn {}: turn aborted; partial effects may remain.", pending.turn_id),
                     _ => return Err(StoreError::CorruptData("pending terminal event is not terminal".into())),
@@ -1014,6 +1047,31 @@ impl AgentTaskCoordinator {
     }
 
 
+    /// A later terminal of the same attempt replaces the earlier assessment.
+    pub(crate) fn note_terminal_assessment(
+        &self,
+        attempt_id: AttemptId,
+        assessment: Option<&codex_protocol::protocol::TurnCompletionAssessment>,
+    ) {
+        let reasons = declared_incomplete_reasons(assessment);
+        let mut gaps = self
+            .declared_gaps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reasons.is_empty() {
+            gaps.remove(&attempt_id);
+        } else {
+            gaps.insert(attempt_id, reasons);
+        }
+    }
+
+    fn forget_declared_gaps(&self, attempt_id: AttemptId) {
+        self.declared_gaps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&attempt_id);
+    }
+
     pub(crate) async fn seal_missing_receipt_for_attempt(
         &self,
         agent_path: &AgentPath,
@@ -1047,6 +1105,7 @@ impl AgentTaskCoordinator {
             return Ok(None);
         }
         if task.receipt.is_some() || task.current_attempt.state != AttemptState::Active {
+            self.forget_declared_gaps(binding.attempt_id);
             if let Some(publication) = host_completion.as_mut() {
                 publication.publish().await?;
             }
@@ -1119,6 +1178,19 @@ impl AgentTaskCoordinator {
                 "Agent stopped without a final response.".to_string(),
             ),
         };
+        // A final response ends the turn; it cannot outrank the host's own record
+        // that the turn left work undone. The report still reaches the parent.
+        let declared_gaps = self
+            .declared_gaps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&binding.attempt_id)
+            .cloned()
+            .unwrap_or_default();
+        let unfulfilled = legacy_outcome
+            && outcome == AgentStatusClaim::Completed
+            && !declared_gaps.is_empty();
+        let outcome = if unfulfilled { AgentStatusClaim::NeedsMain } else { outcome };
         let mut receipt = ReceiptDraft {
             status: AgentStatusClaim::NeedsMain,
             summary: format!(
@@ -1147,20 +1219,22 @@ impl AgentTaskCoordinator {
             ),
             architecture_contract: None,
         };
+        if legacy_outcome {
+            receipt.status = outcome;
+            receipt.summary = summary;
+            // A host final response is lifecycle evidence, not a typed
+            // validation/acceptance report.
+            receipt.validation_call_ids.clear();
+            receipt.blockers = if unfulfilled { declared_gaps } else { Vec::new() };
+            receipt.next_action = unfulfilled.then(|| {
+                "Treat this report as unfulfilled until its blockers are resolved; handle them here or send this worker a follow-up.".to_string()
+            });
+        }
         let result = if let Some(publication) = host_completion {
-            if legacy_outcome {
-                receipt.status = outcome;
-                receipt.summary = summary;
-                // Match record_legacy_agent_outcome: a host final response is
-                // lifecycle evidence, not a typed validation/acceptance report.
-                receipt.validation_call_ids.clear();
-                receipt.blockers.clear();
-                receipt.next_action = None;
-            }
             publication.seal_receipt(receipt, legacy_outcome).await
         } else if legacy_outcome {
             store
-                .record_legacy_agent_outcome(binding.attempt_id, outcome, summary)
+                .record_legacy_agent_outcome(binding.attempt_id, receipt)
                 .await
         } else {
             store
@@ -1169,11 +1243,13 @@ impl AgentTaskCoordinator {
         };
         match result {
             Ok(receipt) => {
+                self.forget_declared_gaps(binding.attempt_id);
                 self.mark_task_inactive(binding.assignment_id);
                 Ok(Some(receipt))
             }
             Err(error) => {
                 if binding_no_longer_needs_receipt(store.as_ref(), &binding).await? {
+                    self.forget_declared_gaps(binding.attempt_id);
                     self.mark_task_inactive(binding.assignment_id);
                     Ok(None)
                 } else {

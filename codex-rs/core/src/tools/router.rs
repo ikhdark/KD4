@@ -1,4 +1,5 @@
 use crate::FunctionCallError;
+use crate::agent::task_capabilities::CapabilityRefusals;
 use crate::agent::task_capabilities::TypedToolClass;
 use crate::client_common::ToolSchemaArtifact;
 use crate::session::session::Session;
@@ -755,16 +756,22 @@ impl ToolRouter {
             }
         }
         let authorization_state_started = Instant::now();
+        let class = self.classify_tool_name(&step_context.turn, &call.tool_name);
         let authorization_result = authorize_bound_typed_tool_call(
             session.as_ref(),
             step_context.as_ref(),
             &call,
-            self.classify_tool_name(&step_context.turn, &call.tool_name),
+            class,
             &self.registry.semantic_tool_name(&call.tool_name).name,
         )
         .await;
         record_authorization_state_coordination(authorization_state_started.elapsed());
         authorization_result?;
+        // Only work that yields evidence can stand in for a refused operation.
+        // A Code Mode cell is not that work; its nested calls arrive here themselves.
+        let refusals = matches!(class, TypedToolClass::ReadSearch | TypedToolClass::StructuredEdit)
+            .then(|| step_context.turn.extension_data.get::<CapabilityRefusals>())
+            .flatten();
         let ToolCall {
             tool_name,
             call_id,
@@ -782,9 +789,18 @@ impl ToolRouter {
             payload,
         };
 
-        self.registry
+        let result = self
+            .registry
             .dispatch_any_with_terminal_outcome(invocation, Arc::clone(&dispatch_state))
-            .await
+            .await;
+        if let Some(refusals) = refusals
+            && result.as_ref().is_ok_and(|output| {
+                output.outcome_for_logging() == codex_tools::ToolOutputOutcome::Success
+            })
+        {
+            refusals.record_permitted_work();
+        }
+        result
     }
 }
 
@@ -877,6 +893,13 @@ async fn authorize_bound_typed_tool_call(
     semantic_name: &str,
 ) -> Result<(), FunctionCallError> {
     let coordinator = session.services.agent_control.task_coordinator();
+    let record_refusal = |_: &FunctionCallError| {
+        step_context
+            .turn
+            .extension_data
+            .get_or_init(CapabilityRefusals::default)
+            .record(semantic_name, class);
+    };
     let Some(binding) = coordinator.binding_for_turn(&step_context.turn) else {
         // A deliberately unbound turn cannot acquire authority from a task
         // attached later (or bound to another thread at turn entry).
@@ -890,7 +913,8 @@ async fn authorize_bound_typed_tool_call(
             )));
         }
         if matches!(&step_context.turn.session_source, codex_protocol::protocol::SessionSource::SubAgent(_)) {
-            crate::agent::task_capabilities::authorize_assignment_tool(None, class, semantic_name, &call.payload)?;
+            crate::agent::task_capabilities::authorize_assignment_tool(None, class, semantic_name, &call.payload)
+                .inspect_err(record_refusal)?;
         }
         return Ok(());
     };
@@ -914,7 +938,8 @@ async fn authorize_bound_typed_tool_call(
 
     crate::agent::task_capabilities::authorize_assignment_tool(
         Some(&authorization), class, semantic_name, &call.payload,
-    )?;
+    )
+    .inspect_err(record_refusal)?;
     // Inherited tool permissions are intersected with the immutable assignment.
     // An authorized tool call is meaningful progress, not just liveness.
     let heartbeated = coordinator

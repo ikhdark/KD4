@@ -223,9 +223,7 @@ fn scan_rollout_metadata(
     use std::io::BufRead;
     use std::io::Read;
 
-    let physical = compression::existing_rollout_path_blocking(rollout_path)
-        .unwrap_or_else(|| rollout_path.to_path_buf());
-    let file = compression::open_rollout_file_with_retry(&physical)?;
+    let (physical, file) = compression::open_rollout_file_with_retry(rollout_path)?;
     let input: Box<dyn Read + Send> = if physical
         .extension()
         .is_some_and(|extension| extension == "zst")
@@ -716,7 +714,7 @@ struct BackfillDiscovery {
 /// What a pass that claimed the backfill lease left unsettled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PassRemainder {
-    /// Every rollout after the checkpoint settled, payload gaps included.
+    /// Every rollout after the checkpoint settled with complete metadata coverage.
     Settled,
     /// Discovery retained a traversal cursor after a bounded slice. The caller
     /// may continue with this memo while its overall deadline permits.
@@ -736,10 +734,9 @@ struct BackfillMemoEntry {
 enum BackfillMemoOutcome {
     /// Reconciled, or content that no retry can repair.
     Settled,
-    /// Indexed provisionally with an unreadable session metadata payload. A lost
-    /// artifact never pins the checkpoint: it is read again on later passes unless
-    /// the payload versions stamped before the read that confirmed the gap still
-    /// match; `None` until such a read.
+    /// Indexed provisionally with an unreadable session metadata payload. It cannot
+    /// certify lineage or advance the checkpoint. Retry when the rollout or its
+    /// payload dependencies change; `None` until a confirming read stamps them.
     PayloadGap(Option<Vec<PayloadDependencyVersion>>),
 }
 
@@ -969,6 +966,7 @@ pub(crate) async fn backfill_sessions_until(
     let mut stopped = false;
     let mut report = BackfillPassReport::default();
     let mut payload_gaps = 0usize;
+    let mut coverage_revoked = false;
     let mut memo_updates: Vec<(PathBuf, Option<BackfillMemoEntry>)> = Vec::new();
     let parallelism = std::thread::available_parallelism()
         .map_or(2, |threads| threads.get() / 2)
@@ -1011,6 +1009,27 @@ pub(crate) async fn backfill_sessions_until(
                     break;
                 };
                 stats.scanned = stats.scanned.saturating_add(1);
+                let metadata_gap = match &attempt {
+                    BackfillRead::Unchanged { settled } => !settled,
+                    BackfillRead::Read { extraction: Ok(outcome), .. } => {
+                        outcome.unresolved_payloads != 0
+                    }
+                    BackfillRead::Read { extraction: Err(err), .. } => {
+                        is_repairable_payload_gap(err)
+                    }
+                    _ => false,
+                };
+                // Revoke before publishing a provisional row, not at the end of a
+                // potentially long pass. Readers may otherwise trust incomplete lineage.
+                if metadata_gap && !coverage_revoked {
+                    if let Err(err) = runtime.invalidate_backfill_coverage(&claim).await {
+                        stats.failed = stats.failed.saturating_add(1);
+                        unresolved_failures = true;
+                        warn!("failed to invalidate incomplete thread index coverage: {err}");
+                        break 'batches;
+                    }
+                    coverage_revoked = true;
+                }
                 let (source_version, gap_dependencies, expected, extraction) = match attempt {
                     BackfillRead::SourceUnavailable | BackfillRead::AuthorityUnavailable => {
                         memo_updates.push((rollout.path.clone(), None));
@@ -1023,6 +1042,8 @@ pub(crate) async fn backfill_sessions_until(
                         report.unchanged = report.unchanged.saturating_add(1);
                         if !settled {
                             payload_gaps = payload_gaps.saturating_add(1);
+                            stats.failed = stats.failed.saturating_add(1);
+                            unresolved_failures = true;
                         }
                         if !unresolved_failures {
                             contiguous_watermark = Some(rollout.watermark.clone());
@@ -1089,10 +1110,10 @@ pub(crate) async fn backfill_sessions_until(
                             (false, None)
                         } else {
                             stats.upserted = stats.upserted.saturating_add(1);
-                            // A provisional row keeps the rollout listed. Later passes reread it
-                            // once its payload changes; a lost artifact must not pin progress.
+                            // A provisional row keeps the rollout listed, but missing session
+                            // metadata may hide a parent edge. It cannot certify coverage.
                             if recoverable_gap {
-                                (true, Some(BackfillMemoOutcome::PayloadGap(gap_dependencies)))
+                                (false, Some(BackfillMemoOutcome::PayloadGap(gap_dependencies)))
                             } else {
                                 (true, Some(BackfillMemoOutcome::Settled))
                             }
@@ -1113,7 +1134,7 @@ pub(crate) async fn backfill_sessions_until(
                             stats.failed = stats.failed.saturating_add(1);
                             (true, Some(BackfillMemoOutcome::Settled))
                         } else if is_repairable_payload_gap(&err) {
-                            (true, Some(BackfillMemoOutcome::PayloadGap(gap_dependencies)))
+                            (false, Some(BackfillMemoOutcome::PayloadGap(gap_dependencies)))
                         } else {
                             (false, None)
                         }
@@ -1199,12 +1220,12 @@ pub(crate) async fn backfill_sessions_until(
             );
         }
     }
-    // Lost artifacts no longer hold certification back, so say what they cost, once per change.
+    // Provisional rows are usable for listing, not proof of complete lineage.
     if !stopped && payload_gaps != memo.reported_payload_gaps {
         memo.reported_payload_gaps = payload_gaps;
         if payload_gaps > 0 {
             warn!(
-                "{payload_gaps} rollouts at {} have unreadable payload artifacts; they are indexed provisionally and may show incomplete metadata",
+                "{payload_gaps} rollouts at {} have unreadable session metadata payloads; rows are provisional and thread index coverage remains uncertified",
                 codex_home.display()
             );
         }

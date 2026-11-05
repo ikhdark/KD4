@@ -2,6 +2,7 @@ pub(crate) mod images;
 pub(crate) mod models;
 pub(crate) mod responses;
 pub(crate) mod responses_websocket;
+mod responses_websocket_probe;
 pub(crate) mod search;
 mod session;
 
@@ -14,4 +15,6 @@ pub use responses_websocket::ResponsesWebsocketClient;
 pub use responses_websocket::ResponsesWebsocketClose;
 pub use responses_websocket::ResponsesWebsocketConnection;
 pub use responses_websocket::ResponsesWebsocketProbe;
+pub use responses_websocket_probe::ResponsesWebsocketProbeError;
+pub use responses_websocket_probe::ResponsesWebsocketProbeFailureStage;
 pub use search::SearchClient;

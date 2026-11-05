@@ -112,11 +112,11 @@ impl Handler {
         let min_timeout_ms = turn.config.multi_agent_v2.min_wait_timeout_ms;
         let max_timeout_ms = turn.config.multi_agent_v2.max_wait_timeout_ms;
         let default_timeout_ms = turn.config.multi_agent_v2.default_wait_timeout_ms;
-        let explicit_timeout_ms = match args.timeout_ms {
-            Some(ms) if ms < min_timeout_ms => None,
-            Some(ms) => Some(ms.min(max_timeout_ms)),
-            None => None,
-        };
+        let explicit_timeout_ms = WaitAgentTimeoutOptions {
+            min_timeout_ms,
+            max_timeout_ms,
+            default_timeout_ms,
+        }.validate_timeout_ms(args.timeout_ms)?;
         let maintenance_interval =
             Duration::from_millis(u64::try_from(default_timeout_ms.max(0)).unwrap_or(u64::MAX));
 

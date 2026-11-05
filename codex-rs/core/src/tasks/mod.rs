@@ -1499,6 +1499,17 @@ impl Session {
             }),
             _ => turn_context.terminal_error.lock().await.clone(),
         };
+        // Required-operation stops are recoverable boundaries for the root, but
+        // not successful worker handoffs. Preserve the typed tool diagnostic and
+        // prevent legacy auto-receipts from converting this stop into Completed.
+        let error = error.or_else(|| {
+            required_tool_terminal.as_ref()
+                .filter(|_| matches!(turn_context.session_source, codex_protocol::protocol::SessionSource::SubAgent(_)))
+                .map(|terminal| ErrorEvent {
+                    message: terminal.message.clone(),
+                    codex_error_info: Some(CodexErrorInfo::Other),
+                })
+        });
         if error.is_some()
             && (abort_reason.is_none()
                 || matches!(
@@ -1594,6 +1605,20 @@ impl Session {
                     &turn_context.sub_id,
                     &unsaved_records.join("; "),
                 ));
+        }
+        if let Some(refusals) = turn_context
+            .extension_data
+            .get::<crate::agent::task_capabilities::CapabilityRefusals>()
+        {
+            refusals.apply_to(timing.completion_assessment.get_or_insert_with(Default::default));
+        }
+        // Publishing the terminal status lets watchers seal immediately, so the
+        // seal's input must exist before the terminal event is built.
+        if let Some(binding) = turn_context.agent_task_binding.get().and_then(Option::as_ref) {
+            self.services
+                .agent_control
+                .task_coordinator()
+                .note_terminal_assessment(binding.attempt_id, timing.completion_assessment.as_ref());
         }
         if finalization
             .permit

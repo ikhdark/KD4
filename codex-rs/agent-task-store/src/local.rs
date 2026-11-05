@@ -3555,21 +3555,9 @@ impl LocalAgentTaskStore {
     pub fn record_legacy_agent_outcome(
         &self,
         attempt_id: AttemptId,
-        status: AgentStatusClaim,
-        summary: String,
+        receipt: ReceiptDraft,
     ) -> TaskStoreFuture<'_, AgentReceipt> {
         Box::pin(async move {
-            let receipt = ReceiptDraft {
-                status,
-                summary,
-                criterion_results: Vec::new(),
-                declared_changes: Vec::new(),
-                validation_call_ids: Vec::new(),
-                blockers: Vec::new(),
-                risks: Vec::new(),
-                next_action: None,
-                architecture_contract: None,
-            };
             let result = self
                 .submit_agent_receipt_impl(attempt_id, receipt, true, None)
                 .await;

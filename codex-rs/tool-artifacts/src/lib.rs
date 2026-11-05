@@ -5565,8 +5565,8 @@ mod selective_json;
 struct ValidatedJsonPointers {
     metadata: LogicalArtifactMetadata,
     index: Option<RawJsonPointerIndex>,
-    error: Option<&'static str>,
-    unavailable_targets: BTreeSet<String>,
+    error: Option<String>,
+    unavailable_targets: BTreeMap<String, String>,
 }
 
 impl ValidatedJsonPointers {
@@ -5575,7 +5575,14 @@ impl ValidatedJsonPointers {
         // documents use a bounded request-targeted index instead.
         let index = (metadata.complete && bytes.len() <= 16 * 1024)
             .then(|| lexical_json_pointer_index(bytes)).flatten();
-        Self::with_index(metadata, index, None)
+        let failure = (metadata.complete && index.is_none()).then(|| {
+            selective_json::index(bytes, &[String::new()]).err().map(|error| error.message())
+        }).flatten();
+        let mut validated = Self::with_index(metadata, index, None);
+        if let Some(failure) = failure {
+            validated.error = Some(failure);
+        }
+        validated
     }
 
     fn for_selectors(metadata: &LogicalArtifactMetadata, bytes: &[u8], selectors: &[ToolOutputSelector]) -> Self {
@@ -5583,19 +5590,22 @@ impl ValidatedJsonPointers {
             ToolOutputSelector::JsonPointer { pointer } => Some(pointer.clone()),
             _ => None,
         }).collect::<Vec<_>>();
-        let index = metadata
-            .complete
-            .then(|| selective_json::index(bytes, &targets))
-            .flatten();
+        let attempted = metadata.complete.then(|| selective_json::index(bytes, &targets));
+        let failure = attempted.as_ref().and_then(|result| result.as_ref().err()).map(|error| error.message());
+        let index = attempted.and_then(Result::ok);
         if index.is_none() && metadata.complete
             && let Some((index, failed)) = selective_json::index_preserving_siblings(bytes, &targets)
         {
-            let available = targets.iter().filter(|target| !failed.contains(*target)).cloned().collect::<Vec<_>>();
+            let available = targets.iter().filter(|target| !failed.contains_key(*target)).cloned().collect::<Vec<_>>();
             let mut validated = Self::with_index(metadata, Some(index), Some(&available));
-            validated.unavailable_targets = failed;
+            validated.unavailable_targets = failed.into_iter().map(|(target, error)| (target, error.message())).collect();
             return validated;
         }
-        Self::with_index(metadata, index, Some(&targets))
+        let mut validated = Self::with_index(metadata, index, Some(&targets));
+        if metadata.complete && let Some(failure) = failure {
+            validated.error = Some(failure);
+        }
+        validated
     }
 
     fn with_index(metadata: &LogicalArtifactMetadata, mut index: Option<RawJsonPointerIndex>, targets: Option<&[String]>) -> Self {
@@ -5627,7 +5637,7 @@ impl ValidatedJsonPointers {
             mismatch.then_some("Persisted JSON pointer index does not match the retained bytes; recover bytes instead.")
         } else {
             Some(
-                "Malformed, depth-limited or index-budget-limited JSON has no verified semantic addresses; recover bytes instead.",
+                "JSON semantic-address index is unavailable; recover bytes or select a narrower pointer.",
             )
         };
         let mut verified = metadata.clone();
@@ -5638,19 +5648,19 @@ impl ValidatedJsonPointers {
         Self {
             metadata: verified,
             index,
-            error,
-            unavailable_targets: BTreeSet::new(),
+            error: error.map(str::to_owned),
+            unavailable_targets: BTreeMap::new(),
         }
     }
 
-    fn error(&self, selector: &ToolOutputSelector) -> Option<&'static str> {
+    fn error(&self, selector: &ToolOutputSelector) -> Option<&str> {
         let ToolOutputSelector::JsonPointer { pointer } = selector else {
             return None;
         };
-        if self.unavailable_targets.contains(pointer) {
-            return Some("JSON pointer exceeds the bounded address-index budget; raw bytes and successful sibling selections remain available.");
+        if let Some(error) = self.unavailable_targets.get(pointer) {
+            return Some(error);
         }
-        self.error.or_else(|| self.index.as_ref().filter(|index| index.ambiguous(pointer))
+        self.error.as_deref().or_else(|| self.index.as_ref().filter(|index| index.ambiguous(pointer))
             .map(|_| "JSON pointer is ambiguous because a decoded object member name is duplicated; recover bytes instead."))
     }
 }
@@ -7170,7 +7180,7 @@ fn exact_selector_result(
     {
         return invalid_selector_result(
             selector,
-            "json_pointer requires valid JSON within the existing depth limit; raw snapshot bytes and sibling selections remain available",
+            "JSON semantic addresses are unavailable for this selection; raw snapshot bytes and sibling selections remain available",
         );
     }
     if matches!(selector, ToolOutputSelector::Lines { .. }) && metadata.line_starts.is_empty() {

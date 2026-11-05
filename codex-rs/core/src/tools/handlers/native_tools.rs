@@ -35,10 +35,11 @@ type Group = (
 const GROUPS: &[Group] = &[
     (
         "inspect_files",
-        "List paths, wait for local file state, and inspect checksums, line endings, freshness, classification and prior read coverage.",
+        "List/search paths, wait for local file state, and inspect checksums, line endings, freshness, classification and prior read coverage.",
         TypedToolClass::ReadSearch,
         &[
             ("list", "list_files"),
+            ("search", "file_search"),
             ("wait", "wait_for_file"),
             ("paths", "canonical_paths"),
             ("checksum", "checksum_file"),

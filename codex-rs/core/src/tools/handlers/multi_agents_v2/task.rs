@@ -286,8 +286,13 @@ async fn handle_submit_agent_receipt(
         Some(tokio::select! {
             biased;
             _ = cancellation_token.cancelled() => return Err(FunctionCallError::RespondToModel("receipt cancelled before handoff capture".into())),
+            // Nothing was written, and a busy workspace does not establish that this
+            // turn cannot proceed. The worker decides whether and when to submit again.
             result = crate::workspace_operation_gate::acquire_patch_operation_with_timeout(&primary.environment, primary.cwd()) =>
-                result.map_err(FunctionCallError::RequiredOperationBlocked)?,
+                result.map_err(|busy| FunctionCallError::structured(codex_protocol::tool_failure::ToolFailure::no_effects(
+                    codex_protocol::tool_failure::ToolFailureCode::RetryableFailure,
+                    format!("{SUBMIT_AGENT_RECEIPT_TOOL}: no receipt was sealed. {busy}"),
+                )))?,
         })
     } else { None };
     let receipt = store.submit_agent_receipt(binding.attempt_id, draft).await

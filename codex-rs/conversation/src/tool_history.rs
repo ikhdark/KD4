@@ -2772,6 +2772,37 @@ impl ToolHistoryState {
         })
     }
 
+    /// Native content acquisition is observable; semantic review/integration is
+    /// not. Reuse immutable origins and the persisted recovery-range ledger.
+    pub fn child_report_retrieval(&self) -> Vec<serde_json::Value> {
+        self.internal_artifact_origins.iter().filter_map(|(id, origin)| {
+            let report = origin.0.strip_prefix("context:child_report:")?;
+            let mut parts = report.rsplitn(3, ':');
+            let handoff = parts.next()?;
+            let thread = parts.next()?;
+            let path = parts.next()?;
+            let selectors = self.recovered_artifact_selectors(id).unwrap_or_default();
+            let complete = selectors.iter().any(|selector| {
+                (selector["kind"] == "bytes" && selector["start"].as_u64() == Some(0)
+                    && selector["end"].as_u64() == Some(origin.1))
+                    || (selector["kind"] == "json_pointer" && selector["pointer"] == ""
+                        && selector["semantic_value"] == true)
+            });
+            let retrieval = if complete { "complete" }
+                else if selectors.iter().any(|selector| selector["kind"] == "forgotten_coverage") { "unknown" }
+                else if selectors.is_empty() { "not_recorded" } else { "partial" };
+            Some(serde_json::json!({
+                "agent_path": path, "source_thread_id": thread,
+                "handoff": handoff, "full_report_retrieval": retrieval,
+                "integration": "not_established_by_retrieval",
+                "recovery": {"tool":"read_tool_output", "arguments": {
+                    "artifact_id": id, "selectors":[{"kind":"bytes", "start":0, "end":origin.1}],
+                }},
+                "canonical_bytes":origin.1, "canonical_sha256":origin.2,
+            }))
+        }).collect()
+    }
+
     fn recovered_artifact_selectors(&self, id: &str) -> Option<&[serde_json::Value]> {
         let coverage = self.recovered_artifacts.get(id)?;
         (self.artifact_identity(id) == Some((coverage.bytes, coverage.sha256.as_str())))

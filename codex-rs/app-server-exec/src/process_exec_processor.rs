@@ -852,10 +852,11 @@ fn collect_spawn_process_output(
         // Every loop exit decides whether the pipe reached EOF.
         let reached_eof;
         loop {
-            if *stdio_timeout_rx.borrow() {
-                reached_eof = output_rx.is_closed() && output_rx.is_empty();
-                drain_timed_out = !reached_eof;
-                break;
+            if *stdio_timeout_rx.borrow() && !output_rx.is_closed() {
+                // Stop admission at the deadline, not collection of bytes already
+                // admitted. Closing also releases a reader blocked on its send.
+                drain_timed_out = true;
+                output_rx.close();
             }
             let mut chunk = tokio::select! {
                 permit = &mut capacity, if stream_output && response_processed
@@ -900,12 +901,12 @@ fn collect_spawn_process_output(
                 },
                 chunk = output_rx.recv() => match chunk {
                     Some(chunk) => chunk,
-                    None => { reached_eof = true; break; },
+                    None => { reached_eof = !drain_timed_out; break; },
                 },
-                _ = stdio_timeout_rx.wait_for(|&v| v) => {
-                    reached_eof = output_rx.is_closed() && output_rx.is_empty();
-                    drain_timed_out = !reached_eof;
-                    break;
+                _ = stdio_timeout_rx.wait_for(|&v| v), if !output_rx.is_closed() => {
+                    // The next iteration closes admission and drains the finite
+                    // queued suffix through the same byte-cap and delivery owner.
+                    continue;
                 },
             };
             let discard = cap.truncated();

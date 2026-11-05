@@ -244,9 +244,9 @@ pub fn sqlite_telemetry_recorder(
     sqlite_metrics::recorder(metrics, originator)
 }
 
-/// Coverage certified once stays usable. The periodic refresh and the identity
-/// migration reopen reconciliation without invalidating indexed rows, and readers
-/// fall back to rollout headers for fields a later pass has not filled yet.
+/// Periodic refresh keeps a valid certificate while reconciling newer rows, but
+/// a known session-metadata gap revokes it: missing lineage is not absence.
+/// Readers still fall back to rollout headers for fields not yet indexed.
 async fn require_backfill_complete(
     runtime: StateDbHandle,
     codex_home: &Path,

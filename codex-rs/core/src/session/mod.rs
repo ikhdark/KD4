@@ -3248,6 +3248,7 @@ impl Session {
             });
         let communication =
             crate::session_prefix::inter_agent_completion_communication_with_diagnostics(
+                &self.services.agent_control,
                 &turn_context.config.codex_home,
                 parent_thread_id,
                 parent_agent_path,
@@ -6904,6 +6905,10 @@ impl Session {
             .await
             .tool_history_state_ref()
             .completed_source_inspection(artifact_id, bytes, sha256, attempt_id)
+    }
+
+    pub(crate) async fn child_report_retrieval(&self) -> Vec<serde_json::Value> {
+        self.state.lock().await.tool_history_state_ref().child_report_retrieval()
     }
 
     pub(crate) async fn operation_attempt_advisory(

@@ -444,42 +444,11 @@ struct LoadedPluginsCacheEntry {
     retry_after: Option<std::time::Instant>,
 }
 
-/// How long a cache key's plugin roots count as freshly reobserved on disk.
-///
-/// `invalidate_changed_plugin_roots` re-reads every plugin's committed
-/// publication (entry lock, active version, install identity) to notice another
-/// process activating or reinstalling a plugin. Startup alone calls
-/// `plugins_for_config` many times within a few hundred milliseconds, so within
-/// this bound a cache hit trusts the last observation. This process's own
-/// installs and refreshes clear the cache directly and are unaffected.
-const PLUGIN_ROOT_REVALIDATION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-const MAX_OBSERVED_PLUGIN_ROOT_KEYS: usize = 20;
-
 #[derive(Default)]
 struct LoadedPluginsCache {
     generation: u64,
     entries: Vec<LoadedPluginsCacheEntry>,
     skill_roots: Vec<CachedPluginSkillRoots>,
-    /// When each key's cached plugin roots were last reobserved consistent with
-    /// disk: the start of that observation, never its end. A load does not stamp
-    /// one; the first cache hit after it reobserves, then later hits reuse it.
-    roots_observed: Vec<(PluginLoadCacheKey, Instant)>,
-}
-
-impl LoadedPluginsCache {
-    fn roots_recently_observed(&self, key: &PluginLoadCacheKey) -> bool {
-        self.roots_observed.iter().any(|(observed_key, observed_at)| {
-            observed_key == key && observed_at.elapsed() < PLUGIN_ROOT_REVALIDATION_INTERVAL
-        })
-    }
-
-    fn note_roots_observed(&mut self, key: &PluginLoadCacheKey, observed_at: Instant) {
-        self.roots_observed.retain(|(observed_key, _)| observed_key != key);
-        if self.roots_observed.len() >= MAX_OBSERVED_PLUGIN_ROOT_KEYS {
-            self.roots_observed.remove(0);
-        }
-        self.roots_observed.push((key.clone(), observed_at));
-    }
 }
 
 struct CachedPluginSkillRoots {
@@ -818,7 +787,6 @@ impl PluginsManager {
         cache.generation = cache.generation.wrapping_add(1);
         cache.entries.clear();
         cache.skill_roots.clear();
-        cache.roots_observed.clear();
     }
 
     fn clear_caches_after_marketplace_source_refresh(
@@ -976,28 +944,22 @@ impl PluginsManager {
     }
 
     async fn invalidate_changed_plugin_roots(&self, key: &PluginLoadCacheKey) -> Vec<crate::store::PluginReadLease> {
-        let observation_started = Instant::now();
-        let (observed_generation, plugin_roots) = {
+        let plugin_roots = {
             let cache = self.loaded_plugins_cache.read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // Every cached root for this key was reobserved moments ago. No lease
-            // is returned: leases only cover the check-to-clone window below.
-            if cache.roots_recently_observed(key) {
-                return Vec::new();
-            }
-            let plugin_roots = cache.entries.iter().filter(|entry| entry.key == *key)
+            cache.entries.iter().filter(|entry| entry.key == *key)
                 .flat_map(|entry| entry.plugins.iter()
                     .map(|plugin| (plugin.config_name.clone(), plugin.root.clone(), plugin.installation_id.clone())))
                 .chain(cache.skill_roots.iter().filter(|entry| entry.key == *key)
                     .flat_map(|entry| entry.plugin_roots.iter().cloned()))
-                .collect::<Vec<_>>();
-            (cache.generation, plugin_roots)
+                .collect::<Vec<_>>()
         };
         if plugin_roots.is_empty() {
             return Vec::new();
         }
-        // Reobserve the committed publication, not merely version/path. Leases
-        // survive until the caller has cloned the matching cached capabilities.
+        // Reobserve every committed publication, not a recent timestamp: another
+        // process can uninstall or replace it between two calls. Hold the read
+        // leases until the caller clones the matching cached capabilities.
         let store = self.store.clone();
         let leases = tokio::task::spawn_blocking(move || {
             plugin_roots.into_iter().filter_map(|(name, root, identity)| {
@@ -1011,16 +973,7 @@ impl PluginsManager {
             }).collect::<Option<Vec<_>>>()
         }).await.ok().flatten();
         match leases {
-            Some(leases) => {
-                // Stamp the start of the observation, and only if no clear raced it:
-                // everything checked above was still current when it began.
-                let mut cache = self.loaded_plugins_cache.write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if cache.generation == observed_generation {
-                    cache.note_roots_observed(key, observation_started);
-                }
-                leases
-            }
+            Some(leases) => leases,
             None => {
                 self.clear_loaded_plugins_cache();
                 Vec::new()

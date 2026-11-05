@@ -485,11 +485,24 @@ pub(crate) fn record_tool_result_measurement(
         |projection| (projection.canonical_sha256.clone(), projection.canonical_bytes,
             projection.projection_truncated || projection.omitted_sections > 0),
     );
+    // Preserve typed attribution independently of script/outer display, without
+    // copying diagnostics, operation handles or arbitrary failure details.
+    let failure = match result {
+        Ok(result) => result.result.tool_failure(),
+        Err(error) => Some(error.failure()),
+    };
+    let failure = failure.map(|failure| serde_json::json!({
+        "code": failure.code,
+        "execution_state": failure.execution_state,
+        "effects": failure.effects,
+        "retry_safe": failure.retry_safe,
+    }));
     timing.record_tool_output_measurement(call_id, execution_id, serde_json::json!({
         "byteAccounting":"canonical_and_rendered_v1",
         "contentSha256":canonical_hash, "originalBytes":original_bytes,
         "renderedSha256":rendered_hash, "renderedBytes":rendered.len(),
         "truncated":truncated,
+        "toolFailure":failure,
     }));
 }
 

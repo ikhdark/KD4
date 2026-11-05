@@ -17,6 +17,7 @@ const COMPLETION_MESSAGE_MAX_TOKENS: usize = 4_000;
 const COMPLETION_MESSAGE_ENVELOPE_TOKEN_RESERVE: usize = 100;
 const ERROR_MAX_TOKENS: usize =
     COMPLETION_MESSAGE_MAX_TOKENS - COMPLETION_MESSAGE_ENVELOPE_TOKEN_RESERVE;
+const OVERSIZED_REPORT_EXCERPT_TOKENS: usize = 1_000;
 const ERROR_NEXT_ACTION: &str = "This agent's turn failed. The full sealed error remains available through get_agent_task; retrieve it with the assignment id returned by spawn_agent before deciding whether to retry. If you still need this agent, use the available collaboration tools to give it another task.";
 const TYPED_COMPLETION_NEXT_ACTION: &str = "The full sealed receipt remains available through get_agent_task; retrieve it with the assignment id returned by spawn_agent.";
 
@@ -57,6 +58,7 @@ fn format_bounded_subagent_error_notification(agent_reference: &str, error: &str
 }
 
 pub(crate) async fn inter_agent_completion_communication_with_diagnostics(
+    control: &crate::agent::AgentControl,
     codex_home: &std::path::Path,
     parent_thread_id: ThreadId,
     task_name: AgentPath,
@@ -87,18 +89,32 @@ pub(crate) async fn inter_agent_completion_communication_with_diagnostics(
     let recovery = serde_json::json!({"tool":"read_tool_output", "arguments":{
         "artifact_id":artifact_id, "selectors":[{"kind":"json_pointer", "pointer":""}],
     }, "canonical_sha256":canonical.sha256, "canonical_bytes":canonical.exact_bytes});
-    let receipt = format!("{}\nFull result recovery: {recovery}\nSummary only: findings, errors, diagnostics or unresolved work may be omitted below. Retrieve the complete result before accepting or integrating it.", receipt.unwrap_or_default());
-    let receipt = Some(receipt.as_str());
-    let message = format_inter_agent_completion_message_with_diagnostics(
+    let recovery = format!("{}\nFull result recovery: {recovery}", receipt.unwrap_or_default());
+    let completed_report = format!("{recovery}\nComplete report below; nothing was omitted, so no retrieval is needed to read it.");
+    let render = |receipt: &str| format_inter_agent_completion_message_with_diagnostics(
         task_name.clone(),
         sender.clone(),
         status,
-        receipt,
+        Some(receipt),
         protected_host_summary,
-    ).ok_or_else(|| "terminal result has no completion envelope".to_string())?;
+    ).ok_or_else(|| "terminal result has no completion envelope".to_string());
+    let (message, full_inline) = render(&completed_report)?;
+    let message = if full_inline {
+        message
+    } else {
+        render(&format!("{recovery}\nSummary only: findings, errors, diagnostics or unresolved work may be omitted below. Retrieve the complete result before accepting or integrating it."))?.0
+    };
     if approx_token_count(&message) >= COMPLETION_MESSAGE_MAX_TOKENS {
         return Err("Completion envelope exceeds its budget; full result retained but not delivered".into());
     }
+    // Completion artifacts have no tool call to register their origin. Without
+    // this, the existing recovery ledger silently ignores subsequent reads.
+    control.register_child_report_artifact(
+        parent_thread_id, artifact_id.to_string(),
+        format!("context:child_report:{sender}:{sender_thread_id}:{}",
+            if full_inline { "full_inline" } else { "summary_only" }),
+        canonical.exact_bytes, canonical.sha256.clone(),
+    ).await.map_err(|error| format!("Full child report tracking failed: {error}"))?;
     let mut communication =
         InterAgentCommunication::new(sender, task_name, Vec::new(), message, false);
     if let AgentStatus::Errored(error) = status {
@@ -129,13 +145,18 @@ fn format_inter_agent_completion_message_with_diagnostics(
     status: &AgentStatus,
     receipt: Option<&str>,
     protected_host_summary: Option<&str>,
-) -> Option<String> {
+) -> Option<(String, bool)> {
     let payload = match status {
         AgentStatus::Stopped {
             last_agent_message,
             stop_cause,
         } => {
             let cause = serde_json::to_string(stop_cause).unwrap_or_default();
+            let stop = format!("Host execution stop cause: {cause}.");
+            let protected = match protected_host_summary.filter(|summary| !summary.is_empty()) {
+                Some(summary) => format!("{stop}\n\n{summary}"),
+                None => stop,
+            };
             return Some(format_bounded_inter_agent_completion_message(
                 task_name,
                 sender,
@@ -151,7 +172,7 @@ fn format_inter_agent_completion_message_with_diagnostics(
                     .unwrap_or("No authored report was delivered."),
                 TYPED_COMPLETION_NEXT_ACTION,
                 receipt,
-                Some(&format!("Host execution stop cause: {cause}.")),
+                Some(&protected),
             ));
         }
         AgentStatus::Completed(Some(message)) => {
@@ -161,7 +182,7 @@ fn format_inter_agent_completion_message_with_diagnostics(
                 without_protected_prefix(message, protected_host_summary),
                 TYPED_COMPLETION_NEXT_ACTION,
                 receipt,
-                None,
+                protected_host_summary,
             ));
         }
         AgentStatus::Completed(None) => String::new(),
@@ -175,7 +196,7 @@ fn format_inter_agent_completion_message_with_diagnostics(
                 without_protected_prefix(message, protected_host_summary),
                 TYPED_COMPLETION_NEXT_ACTION,
                 receipt,
-                None,
+                protected_host_summary,
             ));
         }
         AgentStatus::CompletedWithSurface {
@@ -192,18 +213,20 @@ fn format_inter_agent_completion_message_with_diagnostics(
                 ),
                 ERROR_NEXT_ACTION,
                 receipt,
-                None,
+                protected_host_summary,
             ));
         }
         AgentStatus::Shutdown => "Agent shut down.".to_string(),
         AgentStatus::NotFound => "Agent was not found.".to_string(),
         AgentStatus::PendingInit | AgentStatus::Running | AgentStatus::Interrupted => return None,
     };
-    Some(
+    Some((
         InterAgentCompletionMessage::new(task_name, sender, payload)
             .with_receipt(receipt)
             .render(),
-    )
+        // These short statuses leave host diagnostics to the retained result.
+        protected_host_summary.is_none_or(str::is_empty),
+    ))
 }
 
 /// Older status projections may carry a host completion summary. Remove only
@@ -219,6 +242,7 @@ fn without_protected_prefix<'a>(text: &'a str, protected_host_summary: Option<&s
     }
 }
 
+/// Returns the rendered message and whether it carries the whole payload.
 fn format_bounded_inter_agent_completion_message(
     task_name: AgentPath,
     sender: AgentPath,
@@ -226,7 +250,7 @@ fn format_bounded_inter_agent_completion_message(
     retrieval_guidance: &str,
     receipt: Option<&str>,
     protected_host_summary: Option<&str>,
-) -> String {
+) -> (String, bool) {
     // Only host-owned input gets protected space. Matching authored text in an
     // omitted middle section cannot suppress or replace these facts.
     let mut protected = protected_host_summary.unwrap_or_default().to_string();
@@ -251,7 +275,7 @@ fn format_bounded_inter_agent_completion_message(
     if approx_tokens_from_byte_count(body_bytes) < COMPLETION_MESSAGE_MAX_TOKENS as u64 {
         let unabridged = render(payload, &protected);
         if approx_token_count(&unabridged) < COMPLETION_MESSAGE_MAX_TOKENS {
-            return unabridged;
+            return (unabridged, true);
         }
     }
 
@@ -269,14 +293,17 @@ fn format_bounded_inter_agent_completion_message(
             truncate_text(&protected, TruncationPolicy::Tokens(512))
         );
     }
-    let mut payload_budget = ERROR_MAX_TOKENS.saturating_sub(approx_token_count(&protected));
+    // The recipient is told to retrieve the whole result, so a long excerpt is
+    // delivered twice. Keep only enough to identify the report and its outcome.
+    let mut payload_budget = OVERSIZED_REPORT_EXCERPT_TOKENS
+        .min(ERROR_MAX_TOKENS.saturating_sub(approx_token_count(&protected)));
     loop {
         let payload = truncate_text(payload, TruncationPolicy::Tokens(payload_budget));
         let payload = format!("{payload}\n\n{retrieval_guidance}");
         let message = render(&payload, &protected);
         let message_tokens = approx_token_count(&message);
         if message_tokens < COMPLETION_MESSAGE_MAX_TOKENS || payload_budget == 0 {
-            return message;
+            return (message, false);
         }
 
         // Rendering adds the typed envelope and can expand escaped control characters. Tighten

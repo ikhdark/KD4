@@ -145,6 +145,11 @@ impl Handler {
             }
         }
 
+        let report_retrieval = session.child_report_retrieval().await.into_iter().filter(|report| {
+                resolved_prefix.as_ref().is_none_or(|prefix| {
+                    report["agent_path"].as_str().is_some_and(|path| agent_path_matches_prefix(path, prefix))
+                })
+            }).collect();
         let mut result = ListAgentsResult {
             agents: agents.into_iter().map(ListedAgentView::from).collect(),
             typed_tasks,
@@ -153,6 +158,7 @@ impl Handler {
             unchanged: false,
             task_text_recovery: None,
             completed_report_recovery: None,
+            report_retrieval,
         };
         if args.status_only && let Some(reports) = result.completed_report_snapshot() {
             // Retain the exact omitted bodies, not a later current-state reread.
@@ -249,6 +255,7 @@ pub(crate) struct ListAgentsResult {
     task_text_recovery: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     completed_report_recovery: Option<JsonValue>,
+    report_retrieval: Vec<JsonValue>,
 }
 
 impl ListAgentsResult {
@@ -267,7 +274,7 @@ impl ListAgentsResult {
         // still invalidate this fingerprint. This is never a freshness witness.
         let bytes = serde_json::to_vec(&json!([
             root, args.path_prefix, args.compact, args.status_only, self.agents, self.typed_tasks,
-            self.unresolved_descendants, self.task_text_recovery,
+            self.unresolved_descendants, self.task_text_recovery, self.report_retrieval,
         ]))
         .map_err(|error| FunctionCallError::RespondToModel(format!("list_agents: snapshot serialization failed: {error}")))?;
         self.revision = hex::encode(sha2::Sha256::digest(bytes));
@@ -276,6 +283,7 @@ impl ListAgentsResult {
             self.agents.clear();
             self.typed_tasks.clear();
             self.unresolved_descendants.clear();
+            self.report_retrieval.clear();
         }
         Ok(())
     }

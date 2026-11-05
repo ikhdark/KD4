@@ -299,6 +299,7 @@ fn build_tool_specs_and_registry(
     let mut phases = crate::StartupPhaseLog::start("router_specs");
     let mut planned_tools = PlannedTools::default();
     add_tool_sources(&context, &mut planned_tools);
+    restrict_worker_tool_exposure(turn_context, &mut planned_tools.runtimes);
     phases.mark("tool_sources");
     promote_deferred_tools(turn_context, &mut planned_tools);
     apply_direct_model_only_namespace_overrides(turn_context, &mut planned_tools);
@@ -1043,13 +1044,18 @@ fn build_code_mode_executors(
                 .join(", ")
         ));
     }
-    let code_mode_tool = create_code_mode_tool(
+    let mut code_mode_tool = create_code_mode_tool(
         tool_mode == ToolMode::CodeModeOnly,
         turn_context.config.features.enabled(Feature::Kd4Runtime),
         has_deferred_tools,
         &direct_only_tool_names,
         &eager_nested_tool_descriptions,
     );
+    if matches!(turn_context.session_source, SessionSource::SubAgent(_))
+        && let ToolSpec::Freeform(tool) = &mut code_mode_tool
+    {
+        tool.description.insert_str(0, "Worker capabilities: use native read_file/read_tool_output and the advertised native read/search tools (inspect_files for path listing/search). exec/wait orchestrate those tools; they do not grant shell access. exec_command, shell_command, write_stdin, process control and opaque external execution are unavailable to workers, even for read-only commands; shell examples below apply only where those tools are authorized. Scoped apply_patch still requires a typed writable assignment. If permitted tools cannot finish the assignment, preserve useful results and report the exact blocked/unverified remainder; a blocked operation is not completion.\n\n");
+    }
     phases.mark("exec_description");
     let mut result: Vec<Arc<dyn CoreToolRuntime>> = vec![Arc::new(CodeModeExecuteHandler::new_with_input_schemas(
         code_mode_tool,
@@ -1199,6 +1205,23 @@ fn conflicting_namespace_metadata<'a>(
     conflicts
 }
 
+fn restrict_worker_tool_exposure(turn_context: &TurnContext, runtimes: &mut [RegisteredTool]) {
+    if !matches!(turn_context.session_source, SessionSource::SubAgent(_)) {
+        return;
+    }
+    // Narrow advertisement only. Keep the registered runtime so stale direct
+    // calls still reach assignment authorization, including terminal blockers.
+    for tool in runtimes {
+        let available = tool.authorization_class().available_to_subagents()
+            && !matches!(tool.tool_name().name.as_str(), "spawn_agent" | "followup_task" | "set_agent_gate")
+            && (tool.authorization_class() != TypedToolClass::StructuredEdit
+                || tool.tool_name().name == "apply_patch");
+        if !available {
+            tool.set_exposure(ToolExposure::Hidden);
+        }
+    }
+}
+
 #[instrument(level = "trace", skip_all)]
 fn add_tool_sources(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools) {
     add_shell_tools(context, planned_tools);
@@ -1210,6 +1233,9 @@ fn add_tool_sources(context: &CoreToolPlanContext<'_>, planned_tools: &mut Plann
     add_mcp_resource_tools(context, planned_tools);
     add_core_utility_tools(context, planned_tools);
     add_collaboration_tools(context, planned_tools);
+    // Group only eligible operations: hiding a compatibility target after its
+    // group was built would leave an invalid Code Mode routing reference.
+    restrict_worker_tool_exposure(context.step_context.turn.as_ref(), &mut planned_tools.runtimes);
     crate::tools::handlers::native_tools::consolidate_native_tools(
         &mut planned_tools.runtimes,
         search_tool_enabled(context.step_context.turn.as_ref()),
@@ -1511,6 +1537,10 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
                 .iter()
                 .any(|environment| !environment.environment.is_remote())
         {
+            planned_tools.add_with_authorization_class(
+                crate::tools::handlers::FileSearchHandler,
+                TypedToolClass::ReadSearch,
+            );
             for range in [false, true] {
                 planned_tools.add_with_exposure_and_authorization_class(
                     crate::tools::handlers::GitInspectionHandler { range },

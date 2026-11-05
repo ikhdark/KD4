@@ -1294,6 +1294,12 @@ pub fn decode_execution_wrapper(binary: &str, args: &[String]) -> ExecutionWrapp
         {
             index += 1;
         }
+        // `which` only prints where a tool lives; its operand is not launched.
+        let subcommand = args.get(index..).unwrap_or_default().iter()
+            .find(|arg| !arg.starts_with('+'));
+        if subcommand.is_some_and(|arg| arg == "which") {
+            return ExecutionWrapper::NonExecution;
+        }
         if args.get(index).is_none_or(|arg| arg != "run") {
             return ExecutionWrapper::Opaque;
         }

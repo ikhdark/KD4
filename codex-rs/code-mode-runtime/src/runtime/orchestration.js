@@ -546,7 +546,9 @@
       // previews: one bounded read per file, normalized/deduplicated selectors,
       // whole-source hashes and immutable recovery for oversized selections.
       const read = hydrate ? capability("read_file") : undefined;
-      const run = capability("exec_command");
+      const nativeSearch = typeof globalThis.resolve_tool === "function"
+        ? globalThis.resolve_tool("file_search") : undefined;
+      const run = typeof nativeSearch === "function" ? nativeSearch : capability("exec_command");
       // Fixed flags keep the record format independent of user configuration:
       // Search NUL-containing files as text: otherwise rg can silently stop at
       // a NUL without a per-file JSON event, even for a negative result.
@@ -580,7 +582,7 @@
       // The host advertises this contract in its existing tool metadata. Older
       // hosts (or implicit-ignore searches) retain the safe fresh-execution path.
       const typedReplay =
-        no_ignore &&
+        typeof nativeSearch !== "function" && no_ignore &&
         (typeof globalThis.resolve_tool === "function"
           ? globalThis.resolve_tool("exec_command")?.description?.includes("(search_miss_v1)")
           : typeof ALL_TOOLS !== "undefined" && ALL_TOOLS.some(
@@ -589,7 +591,11 @@
             tool.description?.includes("(search_miss_v1)"),
         ));
       try {
-        evidence.result = await run({
+        evidence.result = await run(typeof nativeSearch === "function" ? {
+          paths: [...new Set(paths)], patterns: patterns.map(item => item.pattern), globs,
+          fixed, ignore_case, ascii_case: literal && ignore_case, hidden, no_ignore,
+          json: jsonSearch, ...(lines && !paged && jsonSearch ? { max_count: max_per_file + 1 } : {}),
+        } : {
           program: "rg",
           args,
           force_fresh: force_fresh || !typedReplay,
@@ -997,7 +1003,10 @@
       try {
         integer(max_observations, 1, 1024, "max_observations");
         integer(max_wait_ms, 5_000, 300_000, "max_wait_ms");
-        integer(max_bytes, 65536, 4 * 1024 * 1024, "max_bytes");
+        integer(max_bytes, 1, 4 * 1024 * 1024, "max_bytes");
+        // This is an evidence-collection bound, not a display budget. Keep room
+        // for one native receipt when callers request a smaller positive limit.
+        max_bytes = Math.max(65536, max_bytes);
         if (on_progress !== undefined && typeof on_progress !== "function")
           throw new TypeError("on_progress must be a function");
       } catch (error) {
@@ -1151,7 +1160,8 @@
           if (current.session_id == null) {
             if (
               current.exit_code === 0 ||
-              (current.exit_code === 1 && current.search_no_match === true)
+              (current.exit_code === 1 && current.search_no_match === true) ||
+              current.session_capabilities?.shutdown === "shutdown_confirmed"
             ) {
               if (retainedBytes >= max_bytes)
                 reject("command succeeded but its completed evidence reached the byte limit; retain these observations, do not restart the command", evidence);
