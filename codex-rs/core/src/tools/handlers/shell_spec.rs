@@ -843,8 +843,11 @@ pub(crate) fn unified_exec_eager_output_schema() -> Value {
                         "type": "string",
                         "description": "Combined display text; may be truncated."
                     },
+                    // Bounded so the declaration reads `number`: BigInt only carries unsafe integers.
                     "exit_code": {
                         "type": ["integer", "null"],
+                        "minimum": i32::MIN,
+                        "maximum": u32::MAX,
                         "description": "Exit status; null while running or when unavailable."
                     },
                     "stdout": {
@@ -858,6 +861,8 @@ pub(crate) fn unified_exec_eager_output_schema() -> Value {
                     "streams_complete": {"type": "boolean"},
                     "session_id": {
                         "type": "integer",
+                        "minimum": 0,
+                        "maximum": u32::MAX,
                         "description": "Present while the process runs, or after exit while output remains unread: pass the whole result to await_command, or use it with write_stdin."
                     },
                     "recovery": {
@@ -1045,7 +1050,7 @@ pub(crate) fn eager_exec_command_description(windows_environment: bool) -> Strin
         ""
     };
     format!(
-        "Runs an executable through `program`/`args`, or explicit shell source through `cmd` or `script_body`, and returns when it finishes; one that outlives its wait returns a live session_id instead. Do not restart a command while it is live or its effects are uncertain.\nWith a live session_id: `await await_command(r)` collects it to completion. Otherwise `await tools.write_stdin({{session_id:r.session_id, incarnation:r.session_capabilities.incarnation, ...}})`: chars sends input, empty chars with yield_time_ms polls, terminate:true stops the process tree and confirms cleanup, and event_filter:{{contains:[\"READY\"],timeout_ms:5000}} waits for a literal. Stop when a result has no session_id.\nSearch: read a known path directly. Find unknown filenames with `rg --files <literal-root> --glob '<pattern>'`, then use the returned paths; `rg -l` lists matching files and scoped `rg -n` shows matches. rg skips hidden and ignored files unless told otherwise; exit 1 means no matches, 2 a failed search. Prefer read_file selectors over shell paging.\nFilesystem safety: keep destructive operations in one shell, resolve recursive delete or move targets inside the intended directory first, and avoid unresolved variables or globs.{windows}\nLaunch dependent work only after its prerequisites succeeded.\nFor interactive stdin use tty or pipe_stdin. Those, login, stall_timeout_ms, and the full search, Windows and launch rules: `resolve_tool(\"exec_command\").section(\"arguments\")` and the other sections its `.description` lists."
+        "Runs an executable through `program`/`args`, or explicit shell source through `cmd` or `script_body`, and returns when it finishes; one that outlives its wait returns a live session_id instead. Do not restart a command while it is live or its effects are uncertain.\nWith a live session_id: `await await_command(r)` collects it to completion. Otherwise `await tools.write_stdin({{session_id:r.session_id, incarnation:r.session_capabilities.incarnation, ...}})`: chars sends input, empty chars with yield_time_ms polls, terminate:true stops the process tree and confirms cleanup, and event_filter:{{contains:[\"READY\"],timeout_ms:5000}} waits for a literal. Stop when a result has no session_id.\nSearch: read a known path directly. Find unknown filenames with `rg --files <literal-root> --glob '<pattern>'`, then use the returned paths; `rg -l` lists matching files and scoped `rg -n` shows matches. rg skips hidden and ignored files unless told otherwise; exit 1 means no matches, 2 a failed search. Prefer read_file selectors over shell paging.\nFilesystem safety: keep destructive operations in one shell, resolve recursive delete or move targets inside the intended directory first, and avoid unresolved variables or globs.{windows}\nThis covers launches, polling, readiness, cancellation and resume with no contract lookup; tty, pipe_stdin, login and stall_timeout_ms: `resolve_tool(\"exec_command\").section(\"arguments\")`."
     )
 }
 

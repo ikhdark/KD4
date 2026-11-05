@@ -193,6 +193,7 @@ pub enum ToolOutputSelector {
         end_row: Option<usize>,
         #[serde(default = "structured::default_max_rows")]
         max_rows: usize,
+        #[serde(default = "structured::default_malformed_rows")]
         malformed_rows: structured::MalformedRows,
         #[serde(default)]
         pointer: String,

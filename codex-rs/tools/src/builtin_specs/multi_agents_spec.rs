@@ -185,7 +185,7 @@ pub fn create_followup_task_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "followup_task".to_string(),
-        description: "Send a new assignment, correction requiring action, or urgent intervention to an existing non-root agent; trigger a turn if idle. If running, deliver promptly at message boundaries while sampling, or after the pending tool call completes. Use send_message for information that does not require a new turn. A typed (`assignment`) agent accepts a follow-up only while its attempt is active; once its receipt is sealed, spawn a new assignment instead."
+        description: "Send an authorized assignment, correction requiring action, or urgent intervention to an existing non-root agent; trigger a turn if idle. If running, deliver promptly at message boundaries while sampling, or after the pending tool call completes. Use send_message for information that does not require a new turn. A typed (`assignment`) agent accepts a follow-up only while its bound attempt is active. For an eligible in-scope correction to a sealed worker assignment, recover get_agent_task and use amend_agent_task before followup_task; this preserves the original receipt and write boundaries. Otherwise admit a new authorized assignment."
             .to_string(),
         strict: false,
         defer_loading: None,

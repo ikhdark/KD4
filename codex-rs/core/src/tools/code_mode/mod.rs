@@ -940,7 +940,8 @@ impl CodeModeService {
                 || state.get("session_id").is_some_and(|id| !id.is_null())
                 || state.get("process_exited").and_then(JsonValue::as_bool) != Some(true)
                 || !(state.get("exit_code").and_then(JsonValue::as_i64) == Some(0)
-                    || (state["search_no_match"] == true && state["exit_code"] == 1))
+                    || (state["search_no_match"] == true && state["exit_code"] == 1)
+                    || cancellation_confirmed(state))
                 || state.get("error").is_some_and(|error| !error.is_null())
                 || state
                     .get("pending_deferred_completions")
@@ -1872,7 +1873,8 @@ pub(super) fn handle_runtime_response(
         // A script printing only result.output must not hide a crashed or
         // unstarted command behind later successful output.
         if (state["exit_code"].as_i64().is_some_and(|code| code != 0)
-            && !(state["search_no_match"] == true && state["exit_code"] == 1))
+            && !(state["search_no_match"] == true && state["exit_code"] == 1)
+            && !cancellation_confirmed(state))
             || state["execution_state"] == "unknown"
             || state["execution_state"] == "not_started"
             || state.get("error").is_some_and(|error| !error.is_null())
@@ -4094,6 +4096,14 @@ fn nested_command_state(
         }
     }
     Some(state)
+}
+
+/// The owner confirmed the cancellation it was asked for, tree cleanup included. The nonzero
+/// exit is then that cancellation's expected result, not a command failure to report.
+fn cancellation_confirmed(state: &JsonValue) -> bool {
+    state["execution_state"] == "exited"
+        && state.pointer("/session_capabilities/shutdown")
+            == Some(&JsonValue::from("shutdown_confirmed"))
 }
 
 /// Exact command controls shared by code-mode and history pressure receipts.

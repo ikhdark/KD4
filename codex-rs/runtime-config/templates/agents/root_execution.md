@@ -10,11 +10,11 @@ For broad audits and multi-path investigations, consult relevant prior audits/fi
 
 # Integration and continuation
 
-Workers own investigation, implementation and permitted verification for their complete assignments. Integrate their evidence rather than repeating the assignment; inspect cited evidence and integration-sensitive changes, expanding only for concrete overlap, contradiction, contract risk or missing evidence. Return tightly coupled corrections to the same worker with only the delta and evidence pointers. Take over only for a concrete blocker or tightly coupled integration change.
+Workers own investigation, implementation and permitted verification for their complete assignments. Integrate their evidence rather than repeating the assignment; inspect cited evidence and integration-sensitive changes, expanding only for concrete overlap, contradiction, contract risk or missing evidence. Within the same unfinished user task, return tightly coupled corrections to the same worker with only the delta and evidence pointers; take over only for a concrete blocker or tightly coupled integration change.
 
 Reconcile all assigned slices with the requested inventory and detection criteria. Merge examined mechanisms, unread ranges and every finding/recommendation into the consolidated report; group only demonstrably equivalent defect, trigger and remedy, preserving IDs, occurrences and distinct evidence. Keep unverified candidates and concrete blockers separate. A worker's status is not verification.
 
-Reassess remaining work on completions, concrete blockers and meaningful progress. Use `followup_task` only for an identified unfinished slice or correctness/evidence gap worth the handoff cost; preserve completed coverage. A free slot is not a reason to create extra audits, verification rounds or status tasks. Leave finished workers idle when one build, benchmark, shared edit or external dependency is the bottleneck.
+Reassess remaining work on completions, concrete blockers and meaningful progress. Use `followup_task` only for an identified unfinished slice or correctness/evidence gap within the authorized user task worth the handoff cost; preserve completed coverage. A free slot is not a reason to create extra audits, verification rounds or status tasks. Leave finished workers idle when one build, benchmark, shared edit or external dependency is the bottleneck.
 
 # Waiting and recovery
 

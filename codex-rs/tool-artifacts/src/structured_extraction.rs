@@ -32,6 +32,10 @@ pub enum MalformedRows {
     Report,
 }
 
+pub(crate) const fn default_malformed_rows() -> MalformedRows {
+    MalformedRows::Error
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Operator {

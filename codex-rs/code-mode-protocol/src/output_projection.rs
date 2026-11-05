@@ -430,7 +430,11 @@ fn compact_complete_read(raw: &Value, printed: &mut serde_json::Map<String, Valu
     }
     if raw["file_complete"] == true {
         printed.remove("canonical_bytes");
+    } else if raw["file_complete"] == false && raw.get("continuation").is_none_or(Value::is_null) {
+        // The caller selected this part; only a first page has more to continue into.
+        printed.remove("file_complete");
     }
+    shorten_digest(printed, "source_sha256");
     // Recovered log text is the evidence here; read_file keeps the hash patches anchor on.
     if raw.get("source_sha256").is_none() {
         printed.remove("canonical_sha256");
@@ -446,6 +450,7 @@ fn compact_complete_read(raw: &Value, printed: &mut serde_json::Map<String, Valu
     for row in rows.iter_mut().filter_map(Value::as_object_mut) {
         row.remove("status");
         row.remove("complete");
+        compact_structured_row(row);
         // Hydrated search ranges resolve against their parent, so those rows stay as they are.
         if row.get("text").is_none() {
             continue;
@@ -464,9 +469,57 @@ fn compact_complete_read(raw: &Value, printed: &mut serde_json::Map<String, Valu
     }
 }
 
-/// A fully successful result whose print can drop what only matters when something went
-/// wrong: every call repeats these fields, and later requests carry each print. Scripts
-/// keep the whole native value, and any failure, partial or uncertain outcome prints in full.
+/// Later cells type printed hashes into patches and read_file freshness checks, which take this
+/// 12-character form; scripts keep the whole digest.
+fn shorten_digest(object: &mut serde_json::Map<String, Value>, key: &str) {
+    if let Some(short) = object
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|digest| digest.len() == 64 && digest.is_ascii())
+        .map(|digest| digest[..12].to_string())
+    {
+        object.insert(key.into(), Value::String(short));
+    }
+}
+
+/// A clean structured page prints its rows and the selector fields that were not defaults.
+fn compact_structured_row(row: &mut serde_json::Map<String, Value>) {
+    let is_empty = |value: &Value| value.as_array().is_some_and(Vec::is_empty);
+    if let Some(selector) = row
+        .get_mut("selector")
+        .and_then(Value::as_object_mut)
+        .filter(|selector| selector.get("kind").is_some_and(|kind| kind == "structured"))
+    {
+        selector.retain(|key, value| match key.as_str() {
+            "fields" | "filters" => !is_empty(value),
+            "pointer" => value != "",
+            "malformed_rows" => value != "error",
+            "start_row" => value != 1,
+            "max_rows" => value != 100,
+            _ => true,
+        });
+    }
+    let Some(page) = row
+        .get_mut("value")
+        .and_then(Value::as_object_mut)
+        .filter(|page| page.get("rows").is_some_and(Value::is_array))
+    else {
+        return;
+    };
+    let delivered = page["rows"].as_array().map(Vec::len);
+    page.retain(|key, value| match key.as_str() {
+        "errors" => !is_empty(value),
+        "malformed_rows" => value != 0,
+        "rows_exhausted" | "coverage_complete" => value != true,
+        "rows_scanned" => value.as_u64().map(|scanned| scanned as usize) != delivered,
+        _ => true,
+    });
+}
+
+/// A settled result whose print can drop what only matters when something went wrong: every
+/// call repeats these fields, and later requests carry each print. A plain nonzero exit with
+/// complete capture counts: its output and status are the news. Scripts keep the whole native
+/// value, and any partial or uncertain outcome prints in full.
 enum RoutineSuccess {
     Command,
     FinishedPoll,
@@ -496,7 +549,7 @@ impl RoutineSuccess {
                 let healthy = raw.get("error").is_none_or(Value::is_null)
                     && raw["stream_chunks_complete"] != false
                     && raw["output_reduced"] != true;
-                let finished = raw["exit_code"] == 0
+                let finished = raw["exit_code"].is_number()
                     && raw["execution_state"] == "exited"
                     && raw.get("session_id").is_none_or(Value::is_null);
                 if !healthy {
@@ -544,11 +597,18 @@ impl RoutineSuccess {
                         "process_exited",
                     ],
                 );
-                // Unusual launches keep their receipt.
-                if raw
-                    .get("environment_receipt")
-                    .and_then(routine_launch_receipt)
-                    .is_some()
+                // Unusual launches keep their receipt, and so does a command that really failed:
+                // what ran can be the cause. A search miss or a confirmed cancellation did not.
+                let shutdown = raw.pointer("/session_capabilities/shutdown");
+                let failed = !matches!(self, Self::RunningCommand)
+                    && raw["exit_code"] != 0
+                    && raw["search_no_match"] != true
+                    && shutdown.is_none_or(|status| status != "shutdown_confirmed");
+                if !failed
+                    && raw
+                        .get("environment_receipt")
+                        .and_then(routine_launch_receipt)
+                        .is_some()
                 {
                     printed.remove("environment_receipt");
                 }
@@ -558,6 +618,18 @@ impl RoutineSuccess {
                     remove(printed, &["exit_code", "output_reference", "raw_output_artifact_bytes"]);
                 } else {
                     printed.remove("execution_state");
+                    // A finished process has no capabilities left; its shutdown state is the
+                    // one fact here that the exit code does not already give.
+                    let no_capabilities = printed
+                        .get_mut("session_capabilities")
+                        .and_then(Value::as_object_mut)
+                        .is_some_and(|capabilities| {
+                            capabilities.retain(|key, _| key == "shutdown");
+                            capabilities.is_empty()
+                        });
+                    if no_capabilities {
+                        printed.remove("session_capabilities");
+                    }
                 }
                 if matches!(self, Self::FinishedPoll) {
                     // `recovery` is the one route to the whole log; these only restate it.
@@ -599,6 +671,13 @@ impl RoutineSuccess {
                         }
                         if change.get("diff_complete") == Some(&Value::Bool(true)) {
                             remove(change, &["diff_complete", "diff_bytes", "diff_format"]);
+                        }
+                        // The committed hash is what a later guard or freshness check names.
+                        if let Some(receipt) =
+                            change.get_mut("write_receipt").and_then(Value::as_object_mut)
+                        {
+                            receipt.remove("bytes");
+                            shorten_digest(receipt, "sha256");
                         }
                     }
                 }

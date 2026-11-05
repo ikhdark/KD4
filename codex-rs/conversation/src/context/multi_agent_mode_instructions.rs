@@ -3,7 +3,18 @@ use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::protocol::MULTI_AGENT_MODE_CLOSE_TAG;
 use codex_protocol::protocol::MULTI_AGENT_MODE_OPEN_TAG;
 
-const EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT: &str = "Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work. Requests for thoroughness or investigation alone do not authorize spawning.";
+const EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT: &str = concat!(
+    "Default to root-only execution for each new user task. Do not delegate work, including ",
+    "spawning sub-agents or assigning work to existing agents through followup_task, send_message ",
+    "or other tools, unless the user or applicable AGENTS.md/skill instructions explicitly ",
+    "authorize delegation for that task. Task-scoped authorization expires when the overall user ",
+    "task is completed. Worker completion alone neither revokes that authorization nor authorizes ",
+    "new work: the root may resume the worker for corrections within its original assignment while ",
+    "the overall task remains active. Prior delegation and available workers do not authorize ",
+    "delegating a subsequent task. Status updates, interruptions and continuations of an unfinished ",
+    "task preserve its applicable authorization. Requests for thoroughness or investigation alone ",
+    "do not authorize delegation."
+);
 
 
 #[derive(Debug, Clone, PartialEq, Eq)]

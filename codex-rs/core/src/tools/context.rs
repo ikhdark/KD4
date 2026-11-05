@@ -1621,15 +1621,25 @@ impl ToolOutput for ExecCommandToolOutput {
     }
 
     fn outcome_for_logging(&self) -> ToolOutputOutcome {
+        // The owner confirmed the cancellation it was asked for, tree cleanup included,
+        // so the nonzero exit is that request's expected result rather than a failure.
+        let cancellation_confirmed = self.process_exited
+            && self.process_id.is_none()
+            && self.session_capabilities.as_ref().and_then(|capabilities| capabilities.shutdown)
+                == Some(ExecShutdownStatus::ShutdownConfirmed);
         if self.error.is_some()
             || (self.process_exited
                 && self.exit_code != Some(0)
-                && !self.search_no_match_is_success())
+                && !self.search_no_match_is_success()
+                && !cancellation_confirmed)
         {
             ToolOutputOutcome::Failure
         } else if self.process_id.is_some() {
             ToolOutputOutcome::Yielded
-        } else if self.exit_code == Some(0) || self.search_no_match_is_success() {
+        } else if self.exit_code == Some(0)
+            || self.search_no_match_is_success()
+            || cancellation_confirmed
+        {
             ToolOutputOutcome::Success
         } else {
             ToolOutputOutcome::Failure

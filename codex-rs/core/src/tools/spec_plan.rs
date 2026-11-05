@@ -792,6 +792,7 @@ fn warm_tool_contract_hashes(executors: &[RegisteredTool]) {
 
 fn build_code_mode_executors(
     turn_context: &TurnContext,
+    explicit_environment_addressing: bool,
     executors: &[RegisteredTool],
 ) -> Result<Vec<Arc<dyn CoreToolRuntime>>, String> {
     let tool_mode = effective_tool_mode(turn_context);
@@ -903,7 +904,8 @@ fn build_code_mode_executors(
                         .then(crate::tools::handlers::shell_spec::unified_exec_eager_output_schema);
                 // Eager prompt projection only: registration and resolve_tool keep
                 // the full contract, and the handlers still decode these fields.
-                // Each is used by under 3% of threads (or is set from a ready recipe).
+                // Each is rare in real threads (5% or fewer) or is set from a ready recipe; a
+                // rejected update_plan names `superseded` and `scope_change_refs` when they apply.
                 let withdrawn: &[&str] = match &*definition.name {
                     "read_file" => &[
                         "file_path",
@@ -912,12 +914,15 @@ fn build_code_mode_executors(
                         "encoding",
                         "if_file_revision",
                         "resume_filter",
+                        "revision",
                     ],
                     "read_tool_output" => &["audit_only", "cell_recovery", "source_thread_id"],
-                    "exec_command" => &["login", "tty", "pipe_stdin", "stall_timeout_ms"],
+                    "exec_command" => &["login", "tty", "pipe_stdin", "stall_timeout_ms", "shell"],
                     "update_plan" => &[
                         "measurements",
                         "scope_change_instructions",
+                        "scope_change_refs",
+                        "superseded",
                     ],
                     _ => &[],
                 };
@@ -932,6 +937,10 @@ fn build_code_mode_executors(
                     {
                         for field in withdrawn {
                             properties.remove(*field);
+                        }
+                        // Only explicit addressing gives this field a choice to make.
+                        if &*definition.name == "read_file" && !explicit_environment_addressing {
+                            properties.remove("environment_id");
                         }
                     }
                     if &*definition.name == "read_file" {
@@ -2010,7 +2019,15 @@ fn prepend_code_mode_executors(
     planned_tools: &mut PlannedTools,
 ) -> Result<(), String> {
     let turn_context = context.step_context.turn.as_ref();
-    let code_mode_executors = build_code_mode_executors(turn_context, planned_tools.runtimes())?;
+    let explicit_environment_addressing = matches!(
+        tool_environment_mode(context.step_context),
+        ToolEnvironmentMode::Multiple
+    );
+    let code_mode_executors = build_code_mode_executors(
+        turn_context,
+        explicit_environment_addressing,
+        planned_tools.runtimes(),
+    )?;
     planned_tools.runtimes.splice(
         0..0,
         code_mode_executors

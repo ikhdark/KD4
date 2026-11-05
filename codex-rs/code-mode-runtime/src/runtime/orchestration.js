@@ -62,6 +62,7 @@
   const arraySome = Function.prototype.call.bind(Array.prototype.some);
   const arrayEvery = Function.prototype.call.bind(Array.prototype.every);
   const objectPrototype = Object.prototype;
+  const defineProperties = Object.defineProperties;
   const arrayPrototype = Array.prototype;
   const nativeJSON = JSON;
   const nativeStringify = JSON.stringify;
@@ -176,7 +177,8 @@
           throw new TypeError("source_hashes must declare a SHA-256 for every requested path");
         for (const path of unique) {
           const hash = ownDescriptor(source_hashes, path)?.value;
-          if (typeof hash !== "string" || !/^[0-9a-f]{64}$/i.test(hash))
+          // Prints give the 12-character form, which the patch grammar accepts too.
+          if (typeof hash !== "string" || !/^[0-9a-f]{12,64}$/i.test(hash))
             throw new TypeError(`missing or invalid source_hashes identity: ${path}`);
           expected.set(path, hash.toLowerCase());
         }
@@ -240,7 +242,7 @@
             evidence.consistency.source_sha256 = expected.get(path);
             if (typeof initial.source_sha256 !== "string")
               fail("read has no source identity to verify", evidence);
-            if (initial.source_sha256.toLowerCase() !== expected.get(path)) {
+            if (!initial.source_sha256.toLowerCase().startsWith(expected.get(path))) {
               evidence.consistency.status = "inconsistent";
               fail("file differs from its declared source identity", evidence);
             }
@@ -1058,6 +1060,20 @@
       while (true) {
         arrayPush(observations, current);
         const evidence = { terminal: current, observations };
+        // The fields an exec_command receipt offers, so one result shape serves
+        // both. Not enumerable: serialized evidence and prints stay unchanged.
+        defineProperties(evidence, {
+          exit_code: { value: current?.exit_code, configurable: true },
+          output: {
+            get: () => {
+              let joined = "";
+              for (let index = 0; index < observations.length; ++index)
+                joined += observations[index]?.output ?? "";
+              return joined;
+            },
+            configurable: true,
+          },
+        });
         // Concatenate only attributed, contiguous producer bytes. Equal text
         // at later offsets is new output; gaps/unknown slices never certify a
         // complete stream. The terminal receipt itself remains a delta.

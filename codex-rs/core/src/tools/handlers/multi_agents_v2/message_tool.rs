@@ -364,7 +364,7 @@ pub(crate) async fn handle_message_string_tool(
                     || authorization.current_attempt.state != AttemptState::Active)
             {
                 return Err(FunctionCallError::RespondToModel(format!(
-                    "typed assignment {} has no active bound attempt; recover its retained receipt with get_agent_task, or explicitly admit new work before requesting another turn",
+                    "typed assignment {} has no active bound attempt; recover its current task and retained receipt with get_agent_task. For an eligible in-scope correction to a sealed worker assignment, use amend_agent_task before followup_task; otherwise explicitly admit authorized new work before requesting another turn",
                     binding.assignment_id
                 )));
             }
