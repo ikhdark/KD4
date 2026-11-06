@@ -477,6 +477,7 @@ struct ResponseEnvelope {
     created_at: Option<Value>,
     completed_at: Option<Value>,
     service_tier: Option<Value>,
+    prompt_cache_diagnostics: Option<Value>,
     model: Option<Value>,
     usage: Option<Value>,
     end_turn: Option<Value>,
@@ -522,6 +523,39 @@ pub(crate) fn decode_diagnostic(context: &str, error: &serde_json::Error) -> Str
     )
 }
 
+
+/// Retain only content-free diagnostic fields. Malformed extensions must not
+/// reject an otherwise valid model response or invalidate unrelated measurements.
+fn parse_prompt_cache_diagnostics(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    let label = |value: &Value| {
+        value.as_str().is_some_and(|label| {
+            !label.is_empty() && label.len() <= 128
+                && label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+    };
+    let kind = object.get("type").filter(|value| label(value))?;
+    let mut result = serde_json::Map::new();
+    result.insert("type".to_owned(), kind.clone());
+    if let Some(reason) = object.get("reason").filter(|value| !value.is_null()) {
+        if !label(reason) {
+            return None;
+        }
+        result.insert("reason".to_owned(), reason.clone());
+    }
+    for name in ["cache_missed_tokens", "comparison_reusable_tokens"] {
+        if let Some(value) = object.get(name).filter(|value| !value.is_null()) {
+            value.as_i64().filter(|count| *count >= 0)?;
+            result.insert(name.to_owned(), value.clone());
+        }
+    }
+    if kind.as_str() == Some("cache_miss")
+        && (!result.contains_key("reason") || !result.contains_key("cache_missed_tokens"))
+    {
+        return None;
+    }
+    Some(Value::Object(result))
+}
 
 fn parse_usage(value: Option<Value>) -> Option<TokenUsage> {
     use codex_protocol::protocol::TokenUsageCoverage;
@@ -791,11 +825,18 @@ impl ResponsesStreamEvent<'_> {
             !tier.is_empty() && tier.len() <= 64
                 && tier.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
         });
+        let raw_diagnostics = response.filter(|_| phase == "completed")
+            .and_then(|response| response.prompt_cache_diagnostics.as_ref())
+            .filter(|value| !value.is_null());
+        let prompt_cache_diagnostics = raw_diagnostics.and_then(parse_prompt_cache_diagnostics);
         Some(crate::telemetry::ProviderObservation {
             phase, response_id: response_id.map(str::to_owned), created_at, completed_at,
             response_service_tier: response_service_tier.map(str::to_owned),
             response_service_tier_invalid: raw_tier.is_some_and(|value| !value.is_null())
                 && response_service_tier.is_none(),
+            prompt_cache_diagnostics_invalid: raw_diagnostics.is_some()
+                && prompt_cache_diagnostics.is_none(),
+            prompt_cache_diagnostics,
             safety_buffering,
             output_token_receipts: token_receipts,
             token_receipts_complete: false,

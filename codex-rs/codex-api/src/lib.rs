@@ -41,6 +41,7 @@ pub use crate::auth::AuthProviderFuture;
 pub use crate::auth::SharedAuthProvider;
 pub use crate::auth::auth_header_telemetry;
 pub use crate::common::OpenAiVerbosity;
+pub use crate::common::PromptCacheOptions;
 pub use crate::common::Reasoning;
 pub use crate::common::ReasoningContext;
 pub use crate::common::ReasoningSummaryDelivery;

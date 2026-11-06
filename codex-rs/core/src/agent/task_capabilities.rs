@@ -334,6 +334,30 @@ impl CapabilityRefusals {
     }
 }
 
+/// One refused assignment tool call. Its only conversion is a no-effects
+/// `PermissionDenied` failure, so a refusal cannot end the assignment; terminal
+/// outcomes stay with the router's `RequiredOperationBlocked` paths.
+#[derive(Debug)]
+pub(crate) struct CapabilityDenied {
+    semantic_name: String,
+    reason: String,
+}
+
+impl From<CapabilityDenied> for crate::FunctionCallError {
+    fn from(denied: CapabilityDenied) -> Self {
+        let CapabilityDenied { semantic_name, reason } = denied;
+        let mut failure = codex_protocol::tool_failure::ToolFailure::no_effects(
+            codex_protocol::tool_failure::ToolFailureCode::PermissionDenied,
+            format!("{semantic_name}: {reason}"),
+        );
+        failure.details = Some(serde_json::json!({"denial_kind":"capability_denied"}));
+        failure.safe_next_actions.push(
+            "Continue the assignment using native read/search or already-authorized scoped apply_patch; return the available evidence or a precise blocker. Do not retry the prohibited action through another route.".into(),
+        );
+        Self::structured(failure)
+    }
+}
+
 /// Classes come from host registration, not task prose. Opaque execution cannot
 /// prove source confinement; writable workers use the scope-checked patch owner.
 /// A refusal denies this call only: the worker keeps its turn, so it can use a
@@ -343,18 +367,11 @@ pub(crate) fn authorize_assignment_tool(
     class: TypedToolClass,
     semantic_name: &str,
     payload: &crate::tools::context::ToolPayload,
-) -> Result<(), crate::FunctionCallError> {
+) -> Result<(), CapabilityDenied> {
 
-    let refused = |reason: &str| {
-        let mut failure = codex_protocol::tool_failure::ToolFailure::no_effects(
-            codex_protocol::tool_failure::ToolFailureCode::PermissionDenied,
-            format!("{semantic_name}: {reason}"),
-        );
-        failure.details = Some(serde_json::json!({"denial_kind":"capability_denied"}));
-        failure.safe_next_actions.push(
-            "Continue the assignment using native read/search or already-authorized scoped apply_patch; return the available evidence or a precise blocker. Do not retry the prohibited action through another route.".into(),
-        );
-        crate::FunctionCallError::structured(failure)
+    let refused = |reason: &str| CapabilityDenied {
+        semantic_name: semantic_name.to_string(),
+        reason: reason.to_string(),
     };
     if matches!(semantic_name, "spawn_agent" | "followup_task") {
         return Err(refused("workers cannot delegate execution authority; ask the root to admit the assignment"));

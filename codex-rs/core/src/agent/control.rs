@@ -1022,7 +1022,8 @@ impl AgentControl {
         };
         // Coverage is needed to prove absence, not to restore known children.
         // Historical gaps must not prevent recovery of an otherwise readable tree.
-        if !graph.await_edge_coverage().await.map_err(|err| CodexErr::Fatal(err.to_string()))? {
+        // Check without waiting: resume must not stall on a certification that may never return.
+        if !graph.edge_coverage_certified().await.map_err(|err| CodexErr::Fatal(err.to_string()))? {
             tracing::warn!(
                 %root_thread_id,
                 "thread index coverage is incomplete; restoring known descendants only"

@@ -1434,6 +1434,9 @@ struct ProviderObservations {
     response_id: Option<String>,
     response_service_tier: Option<String>,
     response_service_tier_invalid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_diagnostics: Option<serde_json::Value>,
+    prompt_cache_diagnostics_invalid: bool,
     // Preserve the contributing labels BEFORE collapsing disagreement to unknown.
     // Fixed-size per-attempt inventory; overflow remains explicit, never a pass.
     service_tier_observations: Vec<ProviderTierObservation>,
@@ -1458,6 +1461,7 @@ struct ProviderTierObservation {
 #[derive(Debug, Default)]
 struct ModelAttemptOffsets {
     provider_observations: Option<ProviderObservations>,
+    prompt_cache_comparison_response_id: Option<String>,
     token_receipts: Option<ModelTokenReceipts>,
     stream_delivery_json: Option<String>,
     transport_attempt: u64,
@@ -1489,6 +1493,13 @@ struct ModelAttemptClock {
 }
 
 impl ModelAttemptClock {
+    fn record_prompt_cache_comparison(&self, options: Option<&codex_api::PromptCacheOptions>) {
+        if let Some(options) = options {
+            self.offsets.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                .prompt_cache_comparison_response_id = Some(options.comparison_response_id.clone());
+        }
+    }
+
     fn record_provider_observation(&self, observation: codex_api::ProviderObservation) {
         if let Some(count) = observation.output_token_receipts {
             let now_us = self.elapsed_us();
@@ -1538,6 +1549,14 @@ impl ModelAttemptClock {
             version: 1, ..Default::default()
         });
         evidence.invalid |= observation.invalid_source_fields || now_us == u64::MAX;
+        if observation.phase == "completed" {
+            evidence.prompt_cache_diagnostics_invalid |= observation.prompt_cache_diagnostics_invalid;
+            if let Some(diagnostics) = observation.prompt_cache_diagnostics {
+                evidence.prompt_cache_diagnostics_invalid |= evidence.prompt_cache_diagnostics
+                    .as_ref().is_some_and(|previous| previous != &diagnostics);
+                evidence.prompt_cache_diagnostics.get_or_insert(diagnostics);
+            }
+        }
         if observation.response_service_tier.is_some() || observation.response_service_tier_invalid {
             if evidence.service_tier_observations.len() < 16 {
                 evidence.service_tier_observations.push(ProviderTierObservation {
@@ -1860,6 +1879,8 @@ struct ModelStreamDelivery {
     #[serde(skip_serializing_if = "Option::is_none")]
     requested_service_tier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_comparison_response_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     token_receipts: Option<ModelTokenReceipts>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider_observations: Option<ProviderObservations>,
@@ -1985,6 +2006,7 @@ impl ModelStreamDeliveryObserver {
         self.summary.first_response_body_byte_ns = offsets.first_response_body_byte_ns;
         self.summary.provider_processing_us = offsets.provider_processing_us;
         self.summary.provider_observations = offsets.provider_observations.clone();
+        self.summary.prompt_cache_comparison_response_id = offsets.prompt_cache_comparison_response_id.clone();
         self.summary.token_receipts = offsets.token_receipts.clone().map(|mut receipts| {
             receipts.complete &= complete;
             receipts.text_complete &= complete;
@@ -2951,6 +2973,8 @@ struct ModelClientState {
 #[derive(Debug, Default)]
 struct PromptContextMeasurements {
     baseline: Option<PromptContextBaseline>,
+    /// Last admitted completion, independent of optional asynchronous prefix measurements.
+    latest_completed_response_id: Option<String>,
     latest_attempt: Option<String>,
     predecessor: Option<oneshot::Receiver<Option<PromptContextBaseline>>>,
 }
@@ -3365,7 +3389,7 @@ pub enum StartupPrewarmClaim {
 }
 
 // Input is compared through the normalized prefix chain. Delivery-only stream
-// options and client metadata do not affect previous_response_id reuse. Keep
+// options, diagnostic comparisons and client metadata do not affect previous_response_id reuse. Keep
 // this destructuring exhaustive so new fields require an explicit reuse decision.
 // Both equality and fingerprinting use this same ordered projection.
 fn responses_request_reuse_properties(
@@ -3385,6 +3409,7 @@ fn responses_request_reuse_properties(
         include,
         service_tier,
         prompt_cache_key,
+        prompt_cache_options: _,
         text,
         client_metadata: _,
     } = request;
@@ -4146,6 +4171,22 @@ impl ModelClient {
             include.push("message.output_text.logprobs".to_string());
         }
         let prompt_cache_key = Some(self.prompt_cache_key(responses_metadata));
+        // Diagnostics are metadata-only and best effort. Leave legacy models,
+        // custom providers and Responses Lite requests byte-compatible.
+        let model_version = model_info.slug.strip_prefix("gpt-")
+            .and_then(|name| name.split('-').next())
+            .and_then(|version| {
+                let mut parts = version.split('.');
+                Some((parts.next()?.parse::<u32>().ok()?,
+                    parts.next().unwrap_or("0").parse::<u32>().ok()?))
+            });
+        let prompt_cache_options = (self.state.include_timing_metrics && is_openai
+            && !model_info.use_responses_lite && model_version.is_some_and(|version| version >= (5, 6)))
+            .then(|| self.state.prompt_context_measurements.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .latest_completed_response_id.clone())
+            .flatten()
+            .map(|comparison_response_id| codex_api::PromptCacheOptions { comparison_response_id });
         let service_tier = model_info.service_tier_for_request(service_tier);
         let request = ResponsesApiRequest {
             model: model_info.slug.clone(),
@@ -4169,6 +4210,7 @@ impl ModelClient {
             include,
             service_tier,
             prompt_cache_key,
+            prompt_cache_options,
             text,
             client_metadata: Some(responses_metadata.client_metadata()),
         };
@@ -5538,6 +5580,7 @@ impl ModelClientSession {
                     )?;
                     self.client
                         .prepare_response_items_for_request(&mut request.input);
+                    attempt_clock.record_prompt_cache_comparison(request.prompt_cache_options.as_ref());
                     drop(request_transformation_guard);
                     let request_session_telemetry = session_telemetry_for_request(session_telemetry, &request, self.turn_timing.as_ref());
                     let attempt_identity = new_attempt_identity(sampling_request_id);
@@ -5764,6 +5807,8 @@ impl ModelClientSession {
                                 Arc::clone(&self.client.state.provider),
                                 attempt,
                                 /*websocket_success*/ None,
+                                self.client.state.include_timing_metrics.then(||
+                                    Arc::clone(&self.client.state.prompt_context_measurements)),
                             );
                             return Ok(stream);
                         }
@@ -5908,6 +5953,12 @@ impl ModelClientSession {
                     }
                 };
             let mut request = request;
+            if warmup {
+                request.prompt_cache_options = None;
+            }
+            if let Some(clock) = attempt_clock.as_ref() {
+                clock.record_prompt_cache_comparison(request.prompt_cache_options.as_ref());
+            }
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
                 client_setup.api_auth.as_ref(),
@@ -6476,6 +6527,8 @@ impl ModelClientSession {
                 Arc::clone(&self.client.state.provider),
                 attempt,
                 (!warmup).then(|| (self.client.clone(), websocket_epoch)),
+                (!warmup && self.client.state.include_timing_metrics).then(||
+                    Arc::clone(&self.client.state.prompt_context_measurements)),
             );
             self.websocket_session.last_response_rx = Some(last_request_rx);
             self.websocket_session.last_response = None;
@@ -6945,6 +6998,7 @@ fn map_response_stream(
     provider: SharedModelProvider,
     attempt: Option<ModelAttemptState>,
     websocket_success: Option<(ModelClient, u64)>,
+    prompt_context_measurements: Option<Arc<StdMutex<PromptContextMeasurements>>>,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>) {
     let codex_api::ResponseStream {
         mut rx_event,
@@ -6955,6 +7009,17 @@ fn map_response_stream(
     }
     let api_stream = futures::stream::poll_fn(move |cx| rx_event.poll_recv_charged(cx))
     .inspect(move |event| {
+        // Publish only admitted completions. This brief existing-owner lock has
+        // no awaits/nested locks and does not wait for optional diagnostics.
+        if let Ok(ResponseEvent::Completed { response_id, .. }) = event.event()
+            && !response_id.is_empty() && response_id.len() <= 256
+            && response_id.bytes().all(|byte| byte.is_ascii_alphanumeric()
+                || matches!(byte, b'_' | b'-' | b'.'))
+            && let Some(owner) = prompt_context_measurements.as_ref()
+        {
+            owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                .latest_completed_response_id = Some(response_id.clone());
+        }
         // Opening a stream or receiving partial output is not a successful
         // request. HTTP and connection-only warmup never clear WS failures.
         if matches!(event.event(), Ok(ResponseEvent::Completed { .. }))

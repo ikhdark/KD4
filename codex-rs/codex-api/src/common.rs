@@ -286,6 +286,12 @@ impl Serialize for ResponsesInput {
 }
 
 
+/// Diagnostic comparison only; does not change cache routing or conversation state.
+#[derive(Debug, Serialize, Clone, PartialEq)]
+pub struct PromptCacheOptions {
+    pub comparison_response_id: String,
+}
+
 #[derive(Debug, Serialize, Clone, PartialEq)]
 pub struct ResponsesApiRequest {
     pub model: String,
@@ -306,6 +312,8 @@ pub struct ResponsesApiRequest {
     pub service_tier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_options: Option<PromptCacheOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<TextControls>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -329,6 +337,7 @@ impl From<&ResponsesApiRequest> for ResponseCreateWsRequest {
             include: request.include.clone(),
             service_tier: request.service_tier.clone(),
             prompt_cache_key: request.prompt_cache_key.clone(),
+            prompt_cache_options: request.prompt_cache_options.clone(),
             text: request.text.clone(),
             generate: None,
             client_metadata: request.client_metadata.clone(),
@@ -358,6 +367,8 @@ pub struct ResponseCreateWsRequest {
     pub service_tier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_options: Option<PromptCacheOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<TextControls>,
     #[serde(skip_serializing_if = "Option::is_none")]

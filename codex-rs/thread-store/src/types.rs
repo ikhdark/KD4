@@ -190,7 +190,8 @@ pub enum ThreadListStorageMode {
     /// their selected backend.
     #[default]
     PreferStateDb,
-    /// Require SQLite and surface storage failures to the caller.
+    /// Read the current SQLite catalog, including during backfill, and surface
+    /// storage failures.
     StateDbOnly,
     /// Use the legacy JSONL scan-and-repair listing path.
     ScanAndRepair,

@@ -62,8 +62,8 @@ pub(super) async fn create_project(
     params: CreateProjectParams,
 ) -> ThreadStoreResult<CreatedProject> {
     let state = state(store)?;
-    // Named threads must have rows; give ones still being indexed the chance to appear.
-    let coverage_certified = params.thread_ids.is_empty() || state.await_thread_index().await;
+    // Only explains a missing named thread below; never wait for certification here.
+    let coverage_certified = params.thread_ids.is_empty() || state.thread_index_certified().await;
     state
         .create_project(
             params.name,

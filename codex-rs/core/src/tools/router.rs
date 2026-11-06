@@ -1,4 +1,5 @@
 use crate::FunctionCallError;
+use crate::agent::task_capabilities::CapabilityDenied;
 use crate::agent::task_capabilities::CapabilityRefusals;
 use crate::agent::task_capabilities::TypedToolClass;
 use crate::client_common::ToolSchemaArtifact;
@@ -893,7 +894,7 @@ async fn authorize_bound_typed_tool_call(
     semantic_name: &str,
 ) -> Result<(), FunctionCallError> {
     let coordinator = session.services.agent_control.task_coordinator();
-    let record_refusal = |_: &FunctionCallError| {
+    let record_refusal = |_: &CapabilityDenied| {
         step_context
             .turn
             .extension_data

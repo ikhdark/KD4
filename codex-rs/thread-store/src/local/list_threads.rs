@@ -227,16 +227,9 @@ pub(super) async fn select_rollout_threads(
 ) -> ThreadStoreResult<SelectedRolloutThreads> {
     match storage_path_for_request(params, cursor)? {
         ThreadListStoragePath::StateDb => {
-            // Relation and index-only views have no filesystem fallback, so a partial index
-            // would read as missing threads. Project membership is only ever written here.
-            if params.project_id.is_none()
-                && let Some(state_db) = state_db.as_ref()
-                && !state_db.await_thread_index().await
-            {
-                return Err(ThreadStoreError::Internal {
-                    message: "thread index is still being built; retry shortly".to_string(),
-                });
-            }
+            // Serve the current catalog without waiting for backfill certification.
+            // Desktop's sidebar and sub-agent listings use this path, and historical
+            // payload gaps can keep certification withdrawn indefinitely.
             list_state_threads_for_storage(
                 state_db,
                 config,

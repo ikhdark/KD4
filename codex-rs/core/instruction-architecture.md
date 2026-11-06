@@ -181,7 +181,10 @@ stale direct calls still reach normal assignment authorization. The worker exec
 description names native read/search alternatives. `tasks/mod.rs` publishes a
 required-operation worker stop as a non-success terminal, so the legacy receipt
 owner cannot seal it as completed; root recovery boundaries are unchanged.
-A capability refusal denies only its call. `agent/task_capabilities.rs::CapabilityRefusals`
+A capability refusal denies only its call: `authorize_assignment_tool` returns
+`CapabilityDenied`, whose only conversion is the no-effects `PermissionDenied` failure
+(`denial_kind: capability_denied`); assignment termination stays with the router's
+`RequiredOperationBlocked` paths. `agent/task_capabilities.rs::CapabilityRefusals`
 records it for the turn and `tasks/mod.rs` applies it to the terminal assessment
 before publishing status: a refused source edit, or a refusal no successful read or
 edit followed, makes the disposition `incomplete`; one that permitted work followed
