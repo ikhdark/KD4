@@ -617,7 +617,11 @@ impl RoutineSuccess {
                     // stays reachable by artifact id, and the terminal result names its route.
                     remove(printed, &["exit_code", "output_reference", "raw_output_artifact_bytes"]);
                 } else {
-                    printed.remove("execution_state");
+                    // A cancellation's nonzero exit code does not say the process is gone, and
+                    // cells spent a generation asking. Every other finish needs no such word.
+                    if shutdown.is_none() {
+                        printed.remove("execution_state");
+                    }
                     // A finished process has no capabilities left; its shutdown state is the
                     // one fact here that the exit code does not already give.
                     let no_capabilities = printed
@@ -643,6 +647,11 @@ impl RoutineSuccess {
                             "recovery_scope",
                         ],
                     );
+                    // A complete transcript in view leaves nothing to recover, and a printed
+                    // route invites reading the same bytes back. Scripts keep the native route.
+                    if raw["retained_output_complete"] == true && raw["retained_output"].is_string() {
+                        printed.remove("recovery");
+                    }
                 } else if printed.get("output").and_then(Value::as_str).is_some_and(str::is_empty) {
                     // Nothing was printed, so there is nothing to recover.
                     printed.remove("output_reference");

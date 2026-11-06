@@ -17,6 +17,7 @@ use http::HeaderMap as ApiHeaderMap;
 use http::HeaderValue;
 use serde::Serialize;
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::client::X_CODEX_INSTALLATION_ID_HEADER;
 use crate::client::X_CODEX_PARENT_THREAD_ID_HEADER;
@@ -24,6 +25,11 @@ use crate::client::X_CODEX_TURN_METADATA_HEADER;
 use crate::client::X_CODEX_WINDOW_ID_HEADER;
 use crate::client::X_OPENAI_SUBAGENT_HEADER;
 use codex_git_utils::GitWorkspaceMetadata;
+
+/// Installation-wide prompt-cache keys. Replaying five days of real traffic, eight keep as few
+/// requests over the overload point as one key per session does; fewer do not, and more leave
+/// fewer first requests able to reuse another session's prefix.
+const PROMPT_CACHE_BUCKETS: u8 = 8;
 
 pub(crate) const INSTALLATION_ID_KEY: &str = "installation_id";
 pub(crate) const SESSION_ID_KEY: &str = "session_id";
@@ -187,11 +193,27 @@ impl CodexResponsesMetadata {
         }
     }
 
-    /// Keep cache routing and transport session identity aligned with the caller's
-    /// session, including its agent tree. Installation identity is not session identity;
-    /// sharing it across unrelated sessions was not established as a cache-miss fix.
-    pub(crate) fn cache_affinity_id(&self) -> String {
+    /// Transport session identity, sent as the `session-id` header. It stays the caller's
+    /// session, including its agent tree: installation identity is not session identity.
+    pub(crate) fn transport_session_id(&self) -> String {
         self.session_id.clone()
+    }
+
+    /// Prompt-cache routing identity, sent as `prompt_cache_key`. Threads of one installation
+    /// share their instructions and tools, but only requests routed alike can reuse them: a
+    /// per-session value leaves nearly every first request cold. One value for the whole
+    /// installation overloads routing instead: cache misses double once a key passes about 60
+    /// requests a minute, which concurrent sessions reach. So each session picks one of a few
+    /// installation-wide buckets, and its agent tree follows it. Requests without an
+    /// installation identity, such as auxiliary work, keep their own session.
+    pub(crate) fn prompt_cache_routing_id(&self) -> String {
+        if self.installation_id.is_empty() {
+            return self.session_id.clone();
+        }
+        let session = Uuid::new_v5(&Uuid::NAMESPACE_OID, self.session_id.as_bytes());
+        let bucket = session.as_bytes()[0] % PROMPT_CACHE_BUCKETS;
+        let identity = format!("{}:{bucket}", self.installation_id);
+        Uuid::new_v5(&Uuid::NAMESPACE_OID, identity.as_bytes()).to_string()
     }
 
     /// Auxiliary work has one durable attempt identity, not a synthetic coding turn.

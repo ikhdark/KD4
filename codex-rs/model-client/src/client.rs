@@ -3713,8 +3713,7 @@ impl ModelClient {
     }
 
     fn prompt_cache_key(&self, metadata: &CodexResponsesMetadata) -> String {
-        // Match the session-id affinity sent on both transports.
-        metadata.cache_affinity_id()
+        metadata.prompt_cache_routing_id()
     }
 
     /// Attach before cloning, so regular and compaction sessions share the
@@ -4378,7 +4377,7 @@ impl ModelClient {
             headers.insert("x-client-request-id", header_value);
         }
         headers.extend(build_session_headers(
-            Some(responses_metadata.cache_affinity_id()),
+            Some(responses_metadata.transport_session_id()),
             Some(responses_metadata.thread_id.to_string()),
         ));
         headers.extend(self.build_responses_compatibility_headers(responses_metadata));
@@ -4636,7 +4635,7 @@ impl ModelClientSession {
         use_responses_lite: bool,
     ) -> ApiResponsesOptions {
         ApiResponsesOptions {
-            session_id: Some(responses_metadata.cache_affinity_id()),
+            session_id: Some(responses_metadata.transport_session_id()),
             thread_id: Some(responses_metadata.thread_id.to_string()),
             session_source: Some(self.client.state.session_source.clone()),
             extra_headers: {

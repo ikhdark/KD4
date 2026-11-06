@@ -1038,6 +1038,9 @@ fn build_code_mode_executors(
                     // Read as task or validation status, it was called without
                     // paths after failed checks (audit 2026-10-22 #29).
                     "read_status" => "read_status (read-history coverage for given paths)",
+                    // Listed alone it read as the process tool, and cells printed its union
+                    // contract to do what exec_command already describes for one process.
+                    "manage_process" => "manage_process (process groups; for one, tools.write_stdin)",
                     name => name,
                 })
                 .collect::<Vec<_>>()

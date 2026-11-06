@@ -29,6 +29,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::Weak;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -1314,6 +1316,8 @@ pub(crate) struct ConnectionCapabilities {
 #[derive(Clone, Default)]
 pub(crate) struct ThreadStateManager {
     state: Arc<Mutex<ThreadStateManagerInner>>,
+    /// Live connections that can generate attestation, readable without the async state lock.
+    attestation_capable_connections: Arc<AtomicUsize>,
 }
 
 fn core_lease_id(lease: &OutOfBandElicitationLeaseKey) -> OutOfBandElicitationLeaseId {
@@ -1481,9 +1485,31 @@ impl ThreadStateManager {
     ) {
         let mut state = self.state.lock().await;
         rpc_gate.try_commit(|| {
-            state.live_connections.insert(connection_id, capabilities);
+            let previous = state.live_connections.insert(connection_id, capabilities);
+            self.track_attestation_capable_connection(
+                previous.is_some_and(|previous| previous.request_attestation),
+                capabilities.request_attestation,
+            );
             publish_ready();
         });
+    }
+
+    fn track_attestation_capable_connection(&self, was_capable: bool, is_capable: bool) {
+        match (was_capable, is_capable) {
+            (false, true) => {
+                self.attestation_capable_connections
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            (true, false) => {
+                self.attestation_capable_connections
+                    .fetch_sub(1, Ordering::SeqCst);
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn has_attestation_capable_connection(&self) -> bool {
+        self.attestation_capable_connections.load(Ordering::SeqCst) > 0
     }
 
     /// Publish synchronous connection-owned bookkeeping under the same admission
@@ -1861,7 +1887,9 @@ impl ThreadStateManager {
     pub(crate) async fn remove_connection(&self, connection_id: ConnectionId) -> Vec<ThreadId> {
         {
             let mut state = self.state.lock().await;
-            state.live_connections.remove(&connection_id);
+            if let Some(capabilities) = state.live_connections.remove(&connection_id) {
+                self.track_attestation_capable_connection(capabilities.request_attestation, false);
+            }
             release_all_out_of_band_elicitation_leases_for_connection(&mut state, connection_id);
             let thread_ids = state
                 .thread_ids_by_connection

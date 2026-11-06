@@ -397,9 +397,9 @@ pub(crate) fn run_turn(
             prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
         client_session.set_turn_timing(Arc::clone(&turn_context.turn_timing_state));
         // The first turn adopts the session's startup dial however far it has got, with a
-        // fresh dial behind it if that one fails or stalls. Desktop attestation disables
-        // that path but is available now, and later turns have no dial left: preconnect
-        // now rather than dial serially at dispatch.
+        // fresh dial behind it if that one fails or stalls. An attestation-capable client
+        // disables that path but is available now, and later turns have no dial left:
+        // preconnect now rather than dial serially at dispatch.
         let startup_transport = if sess.services.model_client.startup_websocket_enabled() {
             sess.take_session_startup_transport().await
         } else {

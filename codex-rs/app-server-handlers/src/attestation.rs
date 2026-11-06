@@ -47,7 +47,12 @@ impl std::fmt::Debug for AppServerAttestationProvider {
 
 impl AttestationProvider for AppServerAttestationProvider {
     fn supports_startup_requests(&self) -> bool {
-        false
+        // Generation needs a thread subscriber, and none exists yet at startup. With no
+        // attestation-capable client connected, this thread's requests carry no attestation at
+        // any point, so waiting for a subscriber would delay them for nothing.
+        !self
+            .thread_state_manager
+            .has_attestation_capable_connection()
     }
 
     fn wait_until_ready(
