@@ -200,6 +200,7 @@ use codex_tools::validate_dynamic_tools;
 pub(super) const THREAD_PAGE_DEFAULT_LIMIT: usize = 25;
 pub(super) const THREAD_PAGE_MAX_LIMIT: usize = 100;
 const MAX_THREAD_START_CONFIG_ATTEMPTS: usize = 3;
+const MAX_THREAD_RESUME_CONFIG_ATTEMPTS: usize = 3;
 const CODEX_TUI_CLIENT_NAME: &str = "codex-tui";
 const THREAD_ROLLBACK_DEPRECATION_SUMMARY: &str =
     "thread/rollback is deprecated and will be removed soon";
@@ -889,12 +890,12 @@ impl ThreadRequestProcessor {
         thread_id: ThreadId,
         thread: &Arc<CodexThread>,
         was_already_running: bool,
-    ) {
+    ) -> bool {
         if was_already_running {
             warn!(
                 "skipping rollback for failed resume of thread {thread_id}: the request reused an existing instance"
             );
-            return;
+            return false;
         }
 
         let rollback_succeeded = self
@@ -910,6 +911,7 @@ impl ThreadRequestProcessor {
                 "skipping app-server cleanup for failed resume {thread_id}: a different thread instance is loaded under that id"
             );
         }
+        rollback_succeeded
     }
 
     pub(crate) async fn thread_unsubscribe(
@@ -3406,6 +3408,40 @@ impl ThreadRequestProcessor {
     pub(crate) async fn thread_resume(
         &self,
         request_id: ConnectionRequestId,
+        params: ThreadResumeParams,
+        app_server_client_name: Option<String>,
+        app_server_client_version: Option<String>,
+        supports_openai_form_elicitation: bool,
+    ) -> Result<(), JSONRPCErrorError> {
+        for attempt in 1..=MAX_THREAD_RESUME_CONFIG_ATTEMPTS {
+            let result = self
+                .thread_resume_attempt(
+                    request_id.clone(),
+                    params.clone(),
+                    app_server_client_name.clone(),
+                    app_server_client_version.clone(),
+                    supports_openai_form_elicitation,
+                )
+                .await;
+            match result {
+                Err(error)
+                    if is_config_generation_changed(&error)
+                        && attempt < MAX_THREAD_RESUME_CONFIG_ATTEMPTS =>
+                {
+                    // Retry only before admission or after confirmed rollback.
+                    // Each attempt reloads history and config with the original
+                    // overrides; never retry a policy denial or an accepted resume.
+                    warn!(attempt, "configuration changed during thread/resume; retrying admission");
+                }
+                result => return result,
+            }
+        }
+        unreachable!("resume attempts always return on the final attempt")
+    }
+
+    async fn thread_resume_attempt(
+        &self,
+        request_id: ConnectionRequestId,
         mut params: ThreadResumeParams,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
@@ -3553,18 +3589,11 @@ impl ThreadRequestProcessor {
 
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
         let policy_generation = self.config_manager.policy_generation();
-        let config = match self
+        let config = self
             .config_manager
             .load_for_cwd(request_overrides, typesafe_overrides, history_cwd)
             .await
-            .map_config_load_error()
-        {
-            Ok(config) => config,
-            Err(error) => {
-                self.outgoing.send_error(request_id, error).await;
-                return Ok(());
-            }
-        };
+            .map_config_load_error()?;
 
         let resumed_thread_id = match &thread_history {
             InitialHistory::Resumed(resumed) => Some(resumed.conversation_id),
@@ -3629,14 +3658,9 @@ impl ThreadRequestProcessor {
             resume_source_thread = Some(current);
         }
 
-        if let Err(error) = self
-            .config_manager
+        self.config_manager
             .validate_policy_generation(policy_generation)
-            .map_config_load_error()
-        {
-            self.outgoing.send_error(request_id, error).await;
-            return Ok(());
-        }
+            .map_config_load_error()?;
         match crate::bespoke_event_handling::with_startup_mcp_elicitation(
             Arc::clone(&self.outgoing),
             request_id.connection_id,
@@ -3667,14 +3691,18 @@ impl ThreadRequestProcessor {
                         .validate_policy_generation(policy_generation)
                         .map_config_load_error()
                 {
-                    self.rollback_failed_resumed_thread(
+                    if !self.rollback_failed_resumed_thread(
                         thread_id,
                         &codex_thread,
                         was_already_running,
                     )
-                    .await;
-                    self.outgoing.send_error(request_id, error).await;
-                    return Ok(());
+                    .await {
+                        return Err(internal_error(format!(
+                            "{message}; failed to roll back resumed thread {thread_id}; admission was not retried",
+                            message = error.message,
+                        )));
+                    }
+                    return Err(error);
                 }
                 if was_already_running {
                     let Some(live_params) = running_resume_params else {

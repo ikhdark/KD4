@@ -642,6 +642,10 @@ impl CodeModeExecuteHandler {
         // Preserve the captured response while allowing cancellation to finish
         // delivery and dispatch cleanup despite an unrelated open dialog.
         let dialog_wait_started = std::time::Instant::now();
+        tracing::info!(event.name = "codex.code_mode.dialog_delivery_gate_entered",
+            turn_id = %exec.turn.sub_id, runtime_cell_id = %cell_id,
+            parent_tool_call_id = %call_id, scope = "session_wide",
+            "captured cell response entered dialog delivery gate");
         tokio::select! {
             biased;
             _ = cancellation_token.cancelled() => {}

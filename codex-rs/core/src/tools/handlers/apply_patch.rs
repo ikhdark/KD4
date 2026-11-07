@@ -1342,10 +1342,16 @@ async fn run_owned_patch(
             Err(error) => Err(error),
         };
         let reversal_candidates = historical_reversal_candidates(receipt_delta);
+        let regression_changes = super::evidence_memory::patch_changes(receipt_delta);
         // Release the workspace gate before optional history reads. Advisories
         // must neither hold mutation locks nor change execution/approval results.
         drop(runtime);
         let mut result = result;
+        if let Ok(output) = &mut result {
+            output.diagnostics.extend(super::evidence_memory::changed_behavior(
+                &req, tool_ctx.turn.as_ref(), regression_changes,
+            ).await);
+        }
         if let Ok(output) = &mut result
             && !reversal_candidates.is_empty()
         {

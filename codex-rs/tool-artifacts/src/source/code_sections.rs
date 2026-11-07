@@ -153,6 +153,18 @@ pub fn syntax_regression(
     }))
 }
 
+/// Qualified function bodies for bounded, evidence-scoped change assessment.
+/// Reuses selector parsing; ambiguity/recovery is not a preservation verdict.
+pub fn function_bodies<'a>(
+    path: &str, source: &'a str, deadline: Instant,
+) -> Option<Vec<(String, &'a str)>> {
+    if source.len() > 256 * 1024 { return None; }
+    let (items, complete) = parse_with_completeness(path, source, "", deadline)?;
+    if !complete || items.len() > 2048 { return None; }
+    Some(items.into_iter().filter(|item| matches!(item.kind, "fn" | "def"))
+        .map(|item| (item.qualified_name, &source[item.start..item.end])).collect())
+}
+
 pub(super) fn parse_with_completeness(
     path: &str,
     source: &str,
