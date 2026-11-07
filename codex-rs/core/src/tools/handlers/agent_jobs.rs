@@ -10,7 +10,6 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::handlers::multi_agents_common::apply_spawn_agent_model_defaults_and_overrides;
 use crate::tools::handlers::multi_agents_common::apply_spawn_agent_service_tier;
 use crate::tools::handlers::multi_agents_common::build_agent_spawn_config_for_step;
-use crate::tools::handlers::multi_agents_common::inherit_live_service_tier;
 use crate::tools::handlers::parse_arguments;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
@@ -257,7 +256,6 @@ async fn build_runner_options(
     let max_concurrency = normalize_concurrency(requested_concurrency, agent_max_threads);
     let mut spawn_config = build_agent_spawn_config_for_step(step)?;
     spawn_config.cwd = spawn_agents_on_csv::single_local_environment_cwd(&step.environments)?;
-    let parent_service_tier = inherit_live_service_tier(session, &mut spawn_config).await;
     apply_spawn_agent_model_defaults_and_overrides(
         session,
         turn.as_ref(),
@@ -270,7 +268,6 @@ async fn build_runner_options(
         session,
         turn.as_ref(),
         &mut spawn_config,
-        parent_service_tier.as_deref(),
         /*requested_service_tier*/ None,
     )
     .await?;

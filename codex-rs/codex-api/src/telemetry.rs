@@ -72,6 +72,9 @@ pub struct ProviderObservation {
     /// Bounded provider-reported comparison outcome, never inferred from usage.
     pub prompt_cache_diagnostics: Option<serde_json::Value>,
     pub prompt_cache_diagnostics_invalid: bool,
+    /// Bounded server-reported timing (`server_timing` phase only); never client-measured.
+    pub server_timing: Option<serde_json::Value>,
+    pub server_timing_invalid: bool,
     pub created_at: Option<f64>,
     pub completed_at: Option<f64>,
     pub safety_buffering: bool,
@@ -246,7 +249,13 @@ where
         start,
     };
     let (result, timing) = if telemetry.is_some() {
-        codex_http_client::capture_transport_timing(send(req)).await
+        let interval_telemetry = telemetry.clone();
+        let observer: codex_http_client::TransportIntervalObserver = Arc::new(move |interval| {
+            if let Some(telemetry) = interval_telemetry.as_ref() {
+                telemetry.on_transport_interval(attempt, interval);
+            }
+        });
+        codex_http_client::capture_transport_timing_observed(send(req), Some(observer)).await
     } else {
         (
             send(req).await,

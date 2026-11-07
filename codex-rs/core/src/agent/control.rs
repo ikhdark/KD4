@@ -280,6 +280,9 @@ pub(crate) struct AgentControl {
     /// ID shared by the whole agent control session. This means every sub-agents from a common
     /// root share the same session ID.
     session_id: SessionId,
+    /// Latest committed root preference, retained by the whole tree even when
+    /// the root has no attached client. Unset is a real default-tier selection.
+    root_service_tier: Arc<arc_swap::ArcSwapOption<String>>,
     /// Weak handle back to the global thread registry/state.
     /// This is `Weak` to avoid reference cycles and shadow persistence of the form
     /// `ThreadManagerState -> CodexThread -> Session -> SessionServices -> ThreadManagerState`.
@@ -315,6 +318,9 @@ impl AgentControl {
 
     pub(crate) fn with_session_id(mut self, session_id: SessionId, max_threads: usize) -> Self {
         self.session_id = session_id;
+        if let Some(manager) = self.manager.upgrade() {
+            self.root_service_tier = manager.root_service_tier_for_session(session_id);
+        }
         self.agent_execution_limiter.initialize(max_threads);
         self.task_coordinator
             .initialize_metric_capacity(max_threads);
@@ -323,6 +329,16 @@ impl AgentControl {
 
     pub(crate) fn session_id(&self) -> SessionId {
         self.session_id
+    }
+
+    pub(crate) fn root_service_tier(&self) -> Option<String> {
+        self.root_service_tier
+            .load_full()
+            .map(|tier| tier.as_ref().clone())
+    }
+
+    pub(crate) fn set_root_service_tier(&self, service_tier: Option<String>) {
+        self.root_service_tier.store(service_tier.map(Arc::new));
     }
 
     pub(crate) fn task_coordinator(&self) -> &AgentTaskCoordinator {

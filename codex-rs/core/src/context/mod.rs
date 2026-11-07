@@ -10,7 +10,6 @@ pub use codex_prompts::PermissionsInstructions;
 pub(crate) use codex_conversation::context::CollaborationModeInstructions;
 pub(crate) use codex_conversation::context::is_legacy_compaction_warning_fragment;
 pub(crate) use codex_conversation::context::is_startup_contextual_user_fragment;
-pub(crate) use codex_conversation::context::CurrentTimeReminder;
 pub(crate) use codex_conversation::context::is_session_visualization_directory;
 pub(crate) use codex_conversation::context::HookAdditionalContext;
 pub use codex_conversation::context::extension_image_generation_output_hint;

@@ -22,7 +22,45 @@ const ERROR_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
 tokio::task_local! {
-    static TRANSPORT_TIMING: std::cell::Cell<TransportTiming>;
+    static TRANSPORT_TIMING: TransportTimingContext;
+}
+
+/// A real connector-owned interval. Application send/header/body awaits are
+/// not isolated socket transfer, TCP RTT, DNS, or TLS evidence.
+#[derive(Clone, Copy, Debug)]
+pub struct TransportIntervalObservation {
+    pub phase: &'static str,
+    pub started_at: std::time::Instant,
+    pub completed_at: std::time::Instant,
+    pub wire_bytes: Option<u64>,
+    /// Static source label only; never a URL, header or payload.
+    pub provenance: &'static str,
+}
+
+pub type TransportIntervalObserver = std::sync::Arc<
+    dyn Fn(TransportIntervalObservation) + Send + Sync,
+>;
+
+struct TransportTimingContext {
+    timing: std::cell::Cell<TransportTiming>,
+    interval_observer: Option<TransportIntervalObserver>,
+}
+
+impl TransportTimingContext {
+    fn new(interval_observer: Option<TransportIntervalObserver>) -> Self {
+        Self { timing: std::cell::Cell::new(TransportTiming::default()), interval_observer }
+    }
+}
+
+/// Retain this handle before moving I/O to another task/thread or returning a
+/// body stream. It remains bound to the originating physical retry attempt.
+/// Do not reuse it for later requests or unrelated pooled-connection traffic.
+pub fn current_transport_interval_observer() -> Option<TransportIntervalObserver> {
+    TRANSPORT_TIMING.try_with(|context| context.interval_observer.clone()).ok().flatten()
+}
+
+pub fn observe_transport_interval(observation: TransportIntervalObservation) {
+    if let Some(observer) = current_transport_interval_observer() { observer(observation); }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -44,12 +82,18 @@ pub struct TransportTiming {
 pub async fn capture_transport_timing<F: std::future::Future>(
     future: F,
 ) -> (F::Output, TransportTiming) {
+    capture_transport_timing_observed(future, None).await
+}
+
+pub async fn capture_transport_timing_observed<F: std::future::Future>(
+    future: F, observer: Option<TransportIntervalObserver>,
+) -> (F::Output, TransportTiming) {
     TRANSPORT_TIMING
         .scope(
-            std::cell::Cell::new(TransportTiming::default()),
+            TransportTimingContext::new(observer),
             async move {
                 let result = future.await;
-                (result, TRANSPORT_TIMING.with(std::cell::Cell::get))
+                (result, TRANSPORT_TIMING.with(|context| context.timing.get()))
             },
         )
         .await
@@ -66,9 +110,9 @@ fn record_response_header_time(duration: std::time::Duration) {
 
 pub(crate) fn record_timing(update: impl FnOnce(&mut TransportTiming)) {
     let _ = TRANSPORT_TIMING.try_with(|slot| {
-        let mut timing = slot.get();
+        let mut timing = slot.timing.get();
         update(&mut timing);
-        slot.set(timing);
+        slot.timing.set(timing);
     });
 }
 
@@ -99,7 +143,7 @@ pub fn record_first_response_body_byte() {
 
 pub fn current_transport_timing() -> TransportTiming {
     TRANSPORT_TIMING
-        .try_with(std::cell::Cell::get)
+        .try_with(|context| context.timing.get())
         .unwrap_or_default()
 }
 
@@ -109,7 +153,7 @@ pub fn with_transport_timing<F: std::future::Future>(
     future: F,
 ) -> impl std::future::Future<Output = F::Output> {
     TRANSPORT_TIMING.scope(
-        std::cell::Cell::new(TransportTiming::default()),
+        TransportTimingContext::new(current_transport_interval_observer()),
         future,
     )
 }

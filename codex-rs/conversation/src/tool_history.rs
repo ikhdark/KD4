@@ -409,6 +409,42 @@ impl ToolHistoryCandidate {
         };
     }
 
+    /// A checkpoint describes what survived, not whether the task no longer
+    /// needs it. Keep producer assertions separate from runtime eligibility.
+    fn checkpoint_preservation(&self) -> serde_json::Value {
+        let pin = self.checkpoint_pin();
+        let pin_sha256 = pin.as_ref().map(|(text, _)| sha256(text.as_bytes()));
+        let pin = pin.and_then(|(text, _)| serde_json::from_str::<serde_json::Value>(&text).ok());
+        let output = serde_json::from_str::<serde_json::Value>(&self.bounded_model_output).ok();
+        let notes = ["decision", "conclusion", "qualifications", "uncertainty", "unresolved_dependencies"]
+            .into_iter().filter_map(|key| {
+                let value = output.as_ref()?.get(key)?;
+                // Never truncate a qualification into an apparently complete
+                // assertion. Large notes retain their exact artifact route.
+                let inline = serde_json::to_vec(value).ok()?.len() <= 1024;
+                Some(serde_json::json!({"field":key, "inline_complete":inline,
+                    "value":inline.then_some(value)}))
+            }).collect::<Vec<_>>();
+        serde_json::json!({
+            "pin":pin,
+            "pin_sha256":pin_sha256,
+            "producer_notes":notes,
+            "producer_notes_scope":"quoted producer assertions; not verified conclusions or completion",
+            "semantic_conclusion":{"status":"not_recorded"},
+            "unresolved_task_dependencies":{"status":"not_recorded"},
+            "qualifications":{
+                "digest":"bounded producer excerpt, not a semantic summary",
+                "source_dependencies_current":self.source_dependencies_current,
+                "source_dependencies":self.source_dependencies,
+                "consumption":"historical provider exposure, not review or future irrelevance",
+            },
+            "recovery":{"tool":"read_tool_output", "arguments":{
+                "artifact_id":self.artifact_id,
+                "selectors":[{"kind":"bytes", "start":0, "end":self.artifact_bytes}],
+            }},
+        })
+    }
+
     fn fit_receipt(&self, receipt_id: &str) -> Option<(String, u64)> {
         if !self.complete || !self.projection_eligible {
             return None;
@@ -1229,6 +1265,7 @@ impl PressureRetirementTrigger {
 pub fn pressure_retirement_checkpoint(
     call_ids: &[String],
     trigger: PressureRetirementTrigger,
+    lifecycle: serde_json::Value,
 ) -> ResponseItem {
     let receipts = call_ids
         .iter()
@@ -1237,6 +1274,7 @@ pub fn pressure_retirement_checkpoint(
     let payload = serde_json::json!({
         "source": PRESSURE_RETIREMENT_SOURCE,
         "trigger": trigger.as_str(),
+        "lifecycle": lifecycle,
         "recovery_lookup": {"tool": "read_file", "path": "context:resume-state",
             "filter_field": "resume_filter.call_id", "key_source": "receipts object key",
             "scope": "lookup keys, not independently authenticated artifact or semantic-review receipts"},
@@ -1836,6 +1874,20 @@ impl ToolHistoryState {
         keep_generations: usize,
         target_tokens: u64,
     ) -> (Vec<String>, u64) {
+        let (calls, saved, _) = self.pressure_retirement_decision(items, keep_generations, target_tokens, false);
+        (calls, saved)
+    }
+
+    /// Policy and preservation evidence from the same selector, not a second
+    /// eligibility implementation. Diagnostic receipts are excluded from the
+    /// sampling projection, not assertions that a consumer is finished.
+    pub fn pressure_retirement_decision(
+        &self,
+        items: &[ResponseItem],
+        keep_generations: usize,
+        target_tokens: u64,
+        capture: bool,
+    ) -> (Vec<String>, u64, serde_json::Value) {
         let reused = crate::tool_occurrence::reused_call_ids(items);
         let retired = items
             .iter()
@@ -1863,41 +1915,88 @@ impl ToolHistoryState {
         let resolutions = FailureResolutionIndex::default();
         let mut selected = Vec::new();
         let mut saved = 0u64;
+        let mut decisions = Vec::new();
+        let mut observed = 0usize;
         for item in items {
-            if saved >= target_tokens {
+            if saved >= target_tokens && !capture {
                 break;
             }
             let Some((call_id, output)) = canonical_textual_output_identity(item) else {
                 continue;
             };
-            let Some(candidate) = self.candidates.get(call_id) else {
-                continue;
-            };
-            if reused.contains(call_id)
-                || retired.contains(call_id)
-                || has_non_text_output(item)
-                || candidate
-                    .consumed_by_generation
-                    .as_ref()
-                    .is_none_or(|generation| kept.contains(&generation))
-                || (!candidate.successful
-                    && self.failure_resolution(candidate, &resolutions).is_none())
-                || sha256(output.as_bytes()) != candidate.derived.bounded_model_output_sha256
-            {
-                continue;
+            let candidate = self.candidates.get(call_id);
+            let mut pin_tokens = None;
+            let mut resolution_call_id = None;
+            let reason = if saved >= target_tokens { "target_satisfied" }
+                else if let Some(candidate) = candidate {
+                    if reused.contains(call_id) { "reused_call_id" }
+                    else if retired.contains(call_id) { "already_retired" }
+                    else if has_non_text_output(item) { "non_text_output" }
+                    else if candidate.consumed_by_generation.is_none() { "not_consumed" }
+                    else if candidate.consumed_by_generation.as_ref().is_some_and(|generation| kept.contains(&generation)) { "active_generation" }
+                    else if !candidate.successful && {
+                        resolution_call_id = self.failure_resolution(candidate, &resolutions).map(|resolved| resolved.call_id.as_str());
+                        resolution_call_id.is_none()
+                    } { "unresolved_failure" }
+                    else if sha256(output.as_bytes()) != candidate.derived.bounded_model_output_sha256 { "representation_changed" }
+                    else if let Some((_, tokens)) = candidate.checkpoint_pin() {
+                        pin_tokens = Some(tokens);
+                        saved = saved.saturating_add(candidate.derived.bounded_model_output_tokens.saturating_sub(tokens as u64));
+                        selected.push(call_id.to_string());
+                        "selected"
+                    } else { "no_smaller_recovery_pin" }
+                } else { "untracked_output" };
+            if capture {
+                observed = observed.saturating_add(1);
+                // Bound rejected candidates, never discard a selected output's
+                // lifecycle receipt merely because it occurs late in history.
+                if decisions.len() < 1024 || reason == "selected" {
+                    decisions.push(serde_json::json!({
+                        "call_id":call_id, "reason":reason,
+                        "artifact_id":candidate.map(|candidate| &candidate.artifact_id),
+                        "output_sha256":candidate.map(|candidate| &candidate.derived.bounded_model_output_sha256),
+                        "output_item_sha256":serde_json::to_vec(item).ok().map(|bytes| sha256(&bytes)),
+                        "model_bytes":output.len(),
+                        "model_tokens_estimate":candidate.map(|candidate| candidate.derived.bounded_model_output_tokens),
+                        "pin_tokens_estimate":pin_tokens,
+                        "eligibility_state":candidate.map(|candidate| serde_json::json!({
+                            "complete":candidate.complete,
+                            "projection_eligible":candidate.projection_eligible,
+                            "successful":candidate.successful,
+                            "consumed_by_generation":candidate.consumed_by_generation,
+                            "in_kept_generations":candidate.consumed_by_generation.as_ref()
+                                .is_some_and(|generation| kept.contains(&generation)),
+                            "source_dependencies_current":candidate.source_dependencies_current,
+                            "source_dependencies":candidate.source_dependencies,
+                        })),
+                        "lifecycle":candidate.filter(|_| reason == "selected").map(|candidate| serde_json::json!({
+                            "eligibility_rule":"consumed_exact_text_with_smaller_complete_recovery_pin_v1",
+                            "consumed_by_generation":candidate.consumed_by_generation,
+                            "successful":candidate.successful,
+                            "resolution_call_id":resolution_call_id,
+                            "complete":candidate.complete,
+                            "projection_eligible":candidate.projection_eligible,
+                            "kept_generations":keep_generations,
+                            "minimum_raw_tokens":MINIMUM_RAW_TOKENS,
+                            "minimum_saved_tokens":MINIMUM_SAVED_TOKENS,
+                            "minimum_relative_savings_percent":MINIMUM_RELATIVE_SAVINGS_PERCENT,
+                            "artifact_sha256":candidate.artifact_sha256,
+                            "artifact_bytes":candidate.artifact_bytes,
+                            "preserved":candidate.checkpoint_preservation(),
+                            "semantic_necessity":"unknown; not an eligibility input",
+                        })),
+                    }));
+                }
             }
-            let Some((_, pin_tokens)) = candidate.checkpoint_pin() else {
-                continue;
-            };
-            saved = saved.saturating_add(
-                candidate
-                    .derived
-                    .bounded_model_output_tokens
-                    .saturating_sub(pin_tokens as u64),
-            );
-            selected.push(call_id.to_string());
         }
-        (selected, saved)
+        (selected, saved, serde_json::json!({"schema_version":1,
+            "rule":"consumed_successful_or_resolved_exact_text_smaller_pin_oldest_first_v1",
+            "keep_generations":keep_generations, "kept_generations":kept,
+            "target_tokens_estimate":target_tokens,
+            "minimum_raw_tokens":MINIMUM_RAW_TOKENS,
+            "minimum_saved_tokens":MINIMUM_SAVED_TOKENS,
+            "minimum_relative_savings_percent":MINIMUM_RELATIVE_SAVINGS_PERCENT,
+            "complete":observed == decisions.len(), "actual_count":observed, "rows":decisions}))
     }
 
     fn is_persisted_empty(&self) -> bool {
@@ -2770,6 +2869,24 @@ impl ToolHistoryState {
             "required_remaining_work":"unknown; consult original task and selectors",
             "coverage_semantics":"recorded exact delivery only, not semantic review; null is unknown",
         })
+    }
+
+    /// Point-in-time canonical history and historical delivery are different
+    /// from visibility in the requesting model's most recent prompt.
+    pub fn retirement_recovery_context(&self, id: &str, items: &[ResponseItem]) -> serde_json::Value {
+        let mut evidence = self.retention_recovery_obligation(id);
+        let call = self.artifact_call_ids.get(id);
+        evidence["historical_provider_exposure"] = serde_json::to_value(
+            call.and_then(|call| self.exposed_representations.get(call))
+        ).unwrap_or_default();
+        evidence["canonical_output_present"] = call.map(|call| items.iter().any(|item|
+            canonical_textual_output_identity(item).is_some_and(|(id, _)| id == call)
+        )).into();
+        evidence["checkpoint_retired"] = call.map(|call| items.iter().filter_map(phase_checkpoint_ids)
+            .any(|ids| ids.contains(call))).into();
+        evidence["same_evidence_already_model_visible"] = serde_json::Value::Null;
+        evidence["availability_scope"] = "canonical history and historical acquisition only; current model visibility and necessity remain unknown".into();
+        evidence
     }
 
     /// Native content acquisition is observable; semantic review/integration is

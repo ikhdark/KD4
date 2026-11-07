@@ -2409,6 +2409,25 @@ impl UnifiedExecProcessManager {
         pending_spawns: &PendingSpawnRegistration,
     ) -> Result<Arc<UnifiedExecProcess>, UnifiedExecError> {
         let spawn_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("process_spawn");
+        if codex_protocol::timing::observations::enabled() {
+            let effective_env = request.env.iter().collect::<std::collections::BTreeMap<_, _>>();
+            let command = codex_conversation::operation_history::digest(serde_json::json!({
+                "command":request.command, "cwd":request.cwd, "environment":effective_env,
+                "arg0":request.arg0, "tty":tty, "pipe_stdin":pipe_stdin}));
+            let configuration = codex_conversation::operation_history::digest(serde_json::json!({
+                "permissions":request.permission_profile,
+                "private_desktop":request.windows_sandbox_private_desktop,
+                "workspace_roots":request.windows_sandbox_workspace_roots}));
+            if let Some(dispatch) = active_tool_dispatch_timing()
+                && let Some(timing) = dispatch.turn_timing_state() {
+                timing.observe_runtime("command_prepared", &dispatch.execution_id().0,
+                    serde_json::json!({"command_sha256":command, "configuration_sha256":configuration,
+                        "process_handle":process_id,
+                        "identity_scope":"prepared_host_command_arguments_cwd_environment_and_policy",
+                        "input_state_complete":false,
+                        "remote_final_environment_complete":!environment.is_remote()}));
+            }
+        }
         let spawn_timing = active_tool_dispatch_timing()
             .and_then(|timing| timing.turn_timing_state())
             .map(|timing| timing.begin_local_phase(TurnLocalPhase::ExecutorReadinessWait));

@@ -67,10 +67,14 @@ impl RetryOn {
     ) -> bool {
         attempt < max_retries
             && self.retry_transport
-            && matches!(
+            && (matches!(
                 err,
                 TransportError::PreDispatch(_) | TransportError::ConnectionTimeout
             )
+                // reqwest's is_connect is the transport owner's proof that
+                // this hop failed before HTTP dispatch. Keep HTTP responses
+                // and ambiguous post-dispatch network failures non-replayable.
+                || matches!(err, TransportError::Connection(error) if error.is_connect()))
     }
 }
 

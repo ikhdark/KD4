@@ -98,6 +98,11 @@ pub(super) fn resolve_tool_response(
         state.pending_tool_calls.remove(id)
     }
     .ok_or_else(|| format!("unknown tool call `{id}`"))?;
+    if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
+        state.causal.result_received();
+    }
+    let observation = codex_protocol::timing::observations::enabled()
+        .then(|| (response.is_ok(), completed_result.is_some()));
     tracing::info!(
         event.name = "codex.code_mode_nested_tool.runtime_receipt",
         runtime_tool_call_id = %id,
@@ -140,6 +145,11 @@ pub(super) fn resolve_tool_response(
             .exception()
             .map(|exception| value_to_error_text(&mut tc, exception))
             .unwrap_or_else(|| "unknown code mode exception".to_string()));
+    }
+    if let Some((success, late)) = observation {
+        let _ = codex_protocol::timing::observations::record("nested_promise_settled", "", "", id,
+            serde_json::json!({"transport_success":success, "completed_after_deadline":late,
+                "shared_ns":codex_code_mode_protocol::shared_monotonic_now()}));
     }
     tracing::info!(
         event.name = "codex.code_mode_nested_tool.promise_settled",

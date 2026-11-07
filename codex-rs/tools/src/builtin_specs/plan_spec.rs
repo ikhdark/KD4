@@ -68,18 +68,18 @@ pub fn create_update_plan_tool() -> ToolSpec {
         ("pin".into(), pins),
         ("explanation".into(), JsonSchema::string(None)),
         ("expected_revision".into(), JsonSchema::string(Some(
-            "Revision returned by the last update. Required after the plan changed since this sampling step; rejects stale updates without mutation.".into()))),
+            "Revision returned by the last update, required after the plan changed since this sampling step. Rejects stale updates without mutation.".into()))),
         ("superseded".into(), JsonSchema::array(JsonSchema::object(BTreeMap::from([
             ("step_id".into(), JsonSchema::string(None)),
             ("reason".into(), JsonSchema::string(None)),
         ]), Some(vec!["step_id".into(), "reason".into()]), Some(false.into())),
-            Some("Unfinished removed steps/orphan requirements retired by a user scope change. Each needs an authentic input citation.".into()))),
+            Some("User-authorized retirement of unfinished removed step/orphan IDs; requires plan (not pin/set) and an authentic input citation.".into()))),
         ("scope_change_instructions".into(), JsonSchema {
-            description: Some("Map superseded IDs to exact accepted user text authorizing the scope change; explanation alone is not authorization.".into()),
+            description: Some("With plan, map superseded IDs to exact accepted user text authorizing the scope change; explanation alone is not authorization.".into()),
             ..JsonSchema::object(BTreeMap::new(), None, Some(JsonSchema::string(None).into()))
         }),
         ("scope_change_refs".into(), JsonSchema {
-            description: Some("Compact alternative to exact text: map superseded IDs to authentic input_id/sha256 references returned on reconciliation.".into()),
+            description: Some("With plan, map superseded IDs to authentic input_id/sha256 references returned on reconciliation, instead of exact text.".into()),
             ..JsonSchema::object(BTreeMap::new(), None, Some(reference.into()))
         }),
         ("scope_change_reviewed_revision".into(), JsonSchema::string(Some(
@@ -116,7 +116,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
                 "no_progress":{"type":"boolean"},
                 "completion_authority":{"const":"checklist_only"},
                 "lineage_complete":{"const":false,"description":"This compact model result omits durable requirement lineage and is not a complete replay snapshot."},
-                "remaining_requirements":{"type":"object","additionalProperties":{"type":"string"}},
+                "remaining_requirements":{"type":"object","description":"Unfinished requirement text not already carried by display rows or pinned_requirements, keyed by requirement ID; continues/superseded require returned step_ids or unresolved orphan IDs, not mapped requirement IDs.","additionalProperties":{"type":"string"}},
                 "pinned_requirements":{"type":"object","additionalProperties":{
                     "type":"object","properties":{
                         "text":{"type":"string"},

@@ -284,6 +284,7 @@ impl ThreadMetadataSync {
                 }
                 RolloutItem::SessionMeta(_)
                 | RolloutItem::ToolManifest(_)
+                | RolloutItem::ContextReplay { .. }
                 | RolloutItem::SamplingBoundary(_)
                 | RolloutItem::EventMsg(_)
                 | RolloutItem::ResponseItem(_)

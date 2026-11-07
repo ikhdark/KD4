@@ -350,56 +350,6 @@
       },
       "type": "object"
     },
-    "CurrentTimeReminderConfigToml": {
-      "additionalProperties": false,
-      "properties": {
-        "clock_source": {
-          "$ref": "#/definitions/CurrentTimeSource"
-        },
-        "delivery_mode": {
-          "$ref": "#/definitions/CurrentTimeReminderDeliveryMode"
-        },
-        "enabled": {
-          "type": "boolean"
-        },
-        "reminder_interval_seconds": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "sleep_tool": {
-          "description": "Expose the input-interruptible `clock.sleep` tool.",
-          "type": "boolean"
-        }
-      },
-      "type": "object"
-    },
-    "CurrentTimeReminderDeliveryMode": {
-      "description": "Which inference boundaries may receive current-time reminders.",
-      "oneOf": [
-        {
-          "description": "Allow a reminder before any inference request once the interval is due.",
-          "enum": [
-            "any_inference"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "Allow reminders after user input or tool output; new context windows still force one.",
-          "enum": [
-            "after_user_or_tool_output"
-          ],
-          "type": "string"
-        }
-      ]
-    },
-    "CurrentTimeSource": {
-      "enum": [
-        "system",
-        "external"
-      ],
-      "type": "string"
-    },
     "DebugConfigLockToml": {
       "additionalProperties": false,
       "properties": {
@@ -456,16 +406,6 @@
         },
         {
           "$ref": "#/definitions/CodeModeConfigToml"
-        }
-      ]
-    },
-    "FeatureToml_for_CurrentTimeReminderConfigToml": {
-      "anyOf": [
-        {
-          "type": "boolean"
-        },
-        {
-          "$ref": "#/definitions/CurrentTimeReminderConfigToml"
         }
       ]
     },
@@ -660,6 +600,43 @@
           },
           "required": [
             "command",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "input": {
+              "additionalProperties": true,
+              "default": {},
+              "type": "object"
+            },
+            "server": {
+              "type": "string"
+            },
+            "statusMessage": {
+              "default": null,
+              "type": "string"
+            },
+            "timeout": {
+              "default": null,
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "tool": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "mcp_tool"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "server",
+            "tool",
             "type"
           ],
           "type": "object"
@@ -1885,7 +1862,27 @@
     },
     "SkillConfig": {
       "additionalProperties": false,
-      "properties": {"description_override":{"description":"Local catalog applicability text; does not modify the provider's skill file.","type":"string"},"enabled":{"type":"boolean"},"name":{"description":"Name-based selector.","type":"string"},"path":{"allOf":[{"$ref":"#/definitions/AbsolutePathBuf"}],"description":"Path-based selector."}},
+      "properties": {
+        "description_override": {
+          "description": "Local catalog applicability text; does not modify the provider's skill file.",
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "name": {
+          "description": "Name-based selector.",
+          "type": "string"
+        },
+        "path": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AbsolutePathBuf"
+            }
+          ],
+          "description": "Path-based selector."
+        }
+      },
       "required": [
         "enabled"
       ],
@@ -3774,16 +3771,10 @@
         "concurrent_reasoning_summaries": {
           "type": "boolean"
         },
-        "current_time_reminder": {
-          "$ref": "#/definitions/FeatureToml_for_CurrentTimeReminderConfigToml"
-        },
         "default_mode_request_user_input": {
           "type": "boolean"
         },
         "deferred_executor": {
-          "type": "boolean"
-        },
-        "direct_runtime": {
           "type": "boolean"
         },
         "enable_fanout": {
@@ -3831,9 +3822,6 @@
         "multi_agent_v2": {
           "$ref": "#/definitions/FeatureToml_for_MultiAgentV2ConfigToml"
         },
-        "non_prefixed_mcp_tool_names": {
-          "type": "boolean"
-        },
         "personality": {
           "type": "boolean"
         },
@@ -3841,9 +3829,6 @@
           "type": "boolean"
         },
         "plugins": {
-          "type": "boolean"
-        },
-        "prevent_idle_sleep": {
           "type": "boolean"
         },
         "remote_plugin": {
@@ -3876,9 +3861,6 @@
         "standalone_web_search": {
           "type": "boolean"
         },
-        "terminal_visualization_instructions": {
-          "type": "boolean"
-        },
         "tool_call_mcp_elicitation": {
           "type": "boolean"
         },
@@ -3889,12 +3871,6 @@
           "type": "boolean"
         },
         "use_agent_identity": {
-          "type": "boolean"
-        },
-        "web_search_cached": {
-          "type": "boolean"
-        },
-        "web_search_request": {
           "type": "boolean"
         }
       },
@@ -4154,7 +4130,7 @@
       "type": "object"
     },
     "pressure_reasoning_retirement": {
-      "description": "Opt-in: when a context-pressure retirement rewrites prompt history, also leave reasoning older than the newest kept generations out of sampling requests. Stored history is unchanged. Default: false.",
+      "description": "When a context-pressure retirement rewrites prompt history, also leave reasoning older than the newest kept generations out of sampling requests. Stored history is unchanged. Default: true.",
       "type": "boolean"
     },
     "project_doc_fallback_filenames": {
@@ -4226,7 +4202,8 @@
       }
     },
     "show_raw_agent_reasoning": {
-      "description": "When set to `true`, `AgentReasoningRawContentEvent` events will be shown in the UI/output. Defaults to `false`.",
+      "default": true,
+      "description": "When set to `true`, `AgentReasoningRawContentEvent` events will be shown in the UI/output. Defaults to `true`.",
       "type": "boolean"
     },
     "skills": {

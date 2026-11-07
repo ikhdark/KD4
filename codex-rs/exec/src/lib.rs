@@ -25,7 +25,6 @@ use codex_app_server_client::ThreadLifecycleOverrides;
 use codex_app_server_client::thread_resume_params_from_config as build_thread_resume_params;
 use codex_app_server_client::thread_start_params_from_config as build_thread_start_params;
 use codex_app_server_protocol::ClientRequest;
-use codex_app_server_protocol::CurrentTimeReadResponse;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::McpServerElicitationAction;
 use codex_app_server_protocol::McpServerElicitationRequestResponse;
@@ -147,7 +146,6 @@ use std::io::IsTerminal;
 use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
-use std::time::SystemTime;
 use supports_color::Stream;
 use tokio::sync::mpsc;
 use tracing::Instrument;
@@ -495,7 +493,6 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         personality: None,
         compact_prompt: None,
         show_raw_agent_reasoning: oss.then_some(true),
-        tools_web_search_request: None,
         ephemeral: ephemeral.then_some(true),
         bypass_hook_trust: bypass_hook_trust.then_some(true),
         additional_writable_roots: add_dir,
@@ -1916,17 +1913,6 @@ async fn handle_server_request(
                 "attestation generation is not supported in exec mode".to_string(),
             )
             .await
-        }
-        ServerRequest::CurrentTimeRead { request_id, .. } => {
-            match CurrentTimeReadResponse::try_from(SystemTime::now()).and_then(|response| {
-                serde_json::to_value(response)
-                    .map_err(|err| format!("failed to serialize current time response: {err}"))
-            }) {
-                Ok(response) => {
-                    resolve_server_request(client, request_id, response, "currentTime/read").await
-                }
-                Err(err) => Err(err),
-            }
         }
         ServerRequest::ApplyPatchApproval { request_id, params } => {
             reject_server_request(

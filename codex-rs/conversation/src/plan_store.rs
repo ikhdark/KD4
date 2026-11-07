@@ -171,10 +171,15 @@ impl PlanLineage {
             .unwrap_or(key)
     }
 
-    /// Nontrivial scope that the display rows alone cannot reconstruct.
+    /// Nontrivial scope not already carried by display rows or pinned requirements.
     pub fn remaining_requirements(&self, plan: &UpdatePlanArgs) -> BTreeMap<String, String> {
         self.obligation_summary(plan).unresolved.into_iter().filter_map(|id| {
             let requirement = self.requirements.get(&id)?;
+            // Both consumers publish pinned_requirements alongside this map.
+            // Keep its authentic text/provenance there, not twice in the result.
+            if requirement.source.is_some() {
+                return None;
+            }
             (!plan.plan.iter().any(|step| {
                 step.step == requirement.text
                     && self.step_requirements.get(&self.step_id(&step.step))

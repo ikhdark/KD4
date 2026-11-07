@@ -56,6 +56,7 @@ pub const MAX_PENDING_DELEGATE_REQUESTS: usize = 256;
 pub const TOOL_CATALOG_CAPABILITY: &str = "tool-catalog-v1";
 pub const NAMED_STATE_CAPABILITY: &str = "named-state-v1";
 pub const RECEIPT_RECOVERY_CAPABILITY: &str = "terminal-receipt-recovery-v1";
+pub const CAUSAL_INPUTS_CAPABILITY: &str = "causal-tool-inputs-v1";
 
 /// A close observation expired while storage remains owned. Unlike a terminal
 /// host error, this response permits observing the same session's close again.

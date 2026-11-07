@@ -607,6 +607,10 @@ impl ThreadScopedOutgoingMessageSender {
     ) where
         T: Into<ClientResponsePayload>,
     {
+        let observation = codex_protocol::timing::observations::Span::start(
+            "bounded_response", &self.thread_id.to_string(), "", "",
+            serde_json::json!({"connection_id":request_id.connection_id.0,
+                "request_id":request_id.request_id, "boundary":"server_response_attempt_not_client_receipt"}));
         let mut context = None;
         if tokio::time::timeout_at(deadline, async {
             context = self.outgoing.request_context(&request_id).await;
@@ -615,6 +619,9 @@ impl ThreadScopedOutgoingMessageSender {
         {
             self.outgoing.fail_connection_delivery(request_id.connection_id).await;
             self.outgoing.finish_request_context(context.as_ref()).await;
+            observation.finish("deadline_expired", serde_json::Value::Null);
+        } else {
+            observation.finish("owner_returned", serde_json::Value::Null);
         }
     }
 
@@ -1236,6 +1243,9 @@ impl OutgoingMessageSender {
         thread_id: ThreadId,
         _experimental_api_enabled: bool,
     ) {
+        let observation = codex_protocol::timing::observations::Span::start(
+            "request_replay", &thread_id.to_string(), "", &connection_id.0.to_string(),
+            serde_json::json!({"scope":"eligible_pending_requests_not_dynamic_tool_reexecution"}));
         let (request_ids, target_closed) = {
             let active_connections = Arc::clone(&self.active_connections).lock_owned().await;
             let is_active = active_connections
@@ -1312,12 +1322,19 @@ impl OutgoingMessageSender {
             }
             entry.connection_ids.insert(connection_id);
             entry.delivered_connection_ids.insert(connection_id);
+            if codex_protocol::timing::observations::enabled() {
+                let _ = codex_protocol::timing::observations::record("request_replay_enqueued",
+                    &thread_id.to_string(), "", &connection_id.0.to_string(),
+                    serde_json::json!({"request_id":request_id,
+                        "boundary":"queue_commit_not_peer_receipt"}));
+            }
             permit.send(OutgoingEnvelope::ToConnection {
                 connection_id,
                 message: OutgoingMessage::Request(entry.request.clone()),
                 write_complete_tx: None,
             });
         }
+        observation.finish("enqueued", serde_json::Value::Null);
     }
 
     pub async fn notify_client_response(
@@ -1393,6 +1410,8 @@ impl OutgoingMessageSender {
     }
 
     pub async fn cancel_all_requests(&self, error: Option<JSONRPCErrorError>) {
+        let observation = codex_protocol::timing::observations::Span::start(
+            "cancel_pending_requests", "", "", "all", serde_json::Value::Null);
         let entries = {
             let mut request_id_to_callback = self
                 .request_id_to_callback
@@ -1404,6 +1423,7 @@ impl OutgoingMessageSender {
                 .collect::<Vec<_>>()
         };
 
+        let cancelled = entries.len();
         for entry in entries {
             self.analytics_events_client
                 .track_server_request_aborted(now_unix_timestamp_ms(), entry.request.id().clone());
@@ -1414,6 +1434,7 @@ impl OutgoingMessageSender {
                 warn!("could not notify callback for {request_id:?} due to: {err:?}");
             }
         }
+        observation.finish("callbacks_removed", serde_json::json!({"count":cancelled}));
     }
 
     async fn take_request_callback_from_connection(
@@ -1731,6 +1752,10 @@ impl OutgoingMessageSender {
                 targeted_connections = connection_ids.len(),
                 "app-server event: {notification}"
             );
+            let observation = codex_protocol::timing::observations::Span::start(
+                "notification_route", "", "", "",
+                serde_json::json!({"target_connections":connection_ids.iter().map(|id| id.0).collect::<Vec<_>>(),
+                    "broadcast":connection_ids.is_empty()}));
             let outgoing_message = OutgoingMessage::AppServerNotification(notification);
             let delivery_deadline = tokio::time::Instant::now() + RESOURCE_DELIVERY_TIMEOUT;
             if connection_ids.is_empty() {
@@ -1754,9 +1779,11 @@ impl OutgoingMessageSender {
                         self.fail_connection_delivery(target).await;
                     }
                 }
+                observation.finish(if sent {"enqueued"} else {"delivery_failed"}, serde_json::json!({"broadcast":true}));
                 return;
             }
             let mut outgoing_message = Some(outgoing_message);
+            let mut delivered = 0;
             for (index, connection_id) in connection_ids.iter().enumerate() {
                 let Some(message) =
                     clone_or_take_last(&mut outgoing_message, index + 1 == connection_ids.len())
@@ -1780,7 +1807,10 @@ impl OutgoingMessageSender {
                     );
                     self.fail_connection_delivery(*connection_id).await;
                 }
+                if sent { delivered += 1; }
             }
+            observation.finish(if delivered == connection_ids.len() {"enqueued"} else {"delivery_failed"},
+                serde_json::json!({"enqueued":delivered, "expected":connection_ids.len()}));
         })
     }
 
@@ -2261,6 +2291,16 @@ fn aggregate_turn_delivery(
     origin_connection_id: Option<ConnectionId>,
     outcomes: Vec<TurnDeliveryOutcome>,
 ) -> TurnDeliveryFact {
+    if codex_protocol::timing::observations::enabled() {
+        let _ = codex_protocol::timing::observations::record("terminal_writer_receipts",
+            &thread_id.to_string(), &turn_id, &turn_id, serde_json::json!({
+                "boundary":"transport_writer_flush_not_client_or_paint",
+                "origin_connection":origin_connection_id.map(|id| id.0),
+                "outcomes":outcomes.iter().map(|outcome| serde_json::json!({
+                    "connection_id":outcome.connection_id.0, "outcome":format!("{:?}", outcome.kind),
+                    "dispatch_elapsed_ms":outcome.successful_elapsed_ms,
+                    "post_core_ms":outcome.post_core_delivery_latency_ms})).collect::<Vec<_>>()}));
+    }
     let origin_outcome = origin_connection_id.and_then(|origin| {
         outcomes
             .iter()

@@ -4840,6 +4840,7 @@ fn multi_agent_version_from_items(
             RolloutItem::TurnContext(turn_context) => turn_context.multi_agent_version,
             RolloutItem::SessionMeta(_)
             | RolloutItem::ToolManifest(_)
+            | RolloutItem::ContextReplay { .. }
             | RolloutItem::SamplingBoundary(_)
             | RolloutItem::ResponseItem(_)
             | RolloutItem::InterAgentCommunication(_)
@@ -5017,6 +5018,14 @@ pub enum RolloutItem {
     /// Model-invisible marker for the exact committed history prefix prepared
     /// for one physical provider attempt.
     SamplingBoundary(SamplingBoundaryItem),
+    /// Always-on local replay evidence. Never conversation input or acceptance proof.
+    ContextReplay {
+        version: u8,
+        turn_id: Option<String>,
+        sampling_request_id: String,
+        physical_attempt_id: String,
+        capture: serde_json::Value,
+    },
     ResponseItem(ResponseItem),
     /// Legacy delivery item reconstructed as a model-visible `agent_message`.
     InterAgentCommunication(InterAgentCommunication),

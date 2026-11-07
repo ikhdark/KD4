@@ -508,10 +508,8 @@ impl ExecCommandHandler {
         ) {
             return Ok(boxed_tool_output(refusal));
         }
-        let direct_runtime = turn.config.features.enabled(Feature::DirectRuntime);
         let preflight = preflight_invocation_for_kd4_runtime(
             turn.config.features.enabled(Feature::Kd4Runtime),
-            direct_runtime,
             original_invocation,
             &original_resolved_command.safety_command,
             original_resolved_command.preflight_shell_type,

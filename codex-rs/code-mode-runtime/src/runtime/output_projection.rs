@@ -486,9 +486,36 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
       size + displaySize({body: Number.MAX_SAFE_INTEGER, ...body.source}, true) + 11 + utf8Size(body.text), 0);
     return framedLength < displaySize(projected, true) ? raw : undefined;
   }
-  function rawText(projected, fragment, source = projected) {
+  function sourceDisplay(projected, original) {
+    if (!Array.isArray(projected.results) || !Array.isArray(original.results)) return projected;
+    const hash = original.canonical_sha256 || original.source_sha256;
+    if (typeof hash !== 'string' || hash.length !== 64) return projected;
+    let eligible = false;
+    const restore = (row, native) => {
+      const range = native?.canonical_range;
+      if (typeof row?.text !== 'string' || native?.complete === false ||
+          !isSafeInteger(range?.start) || !isSafeInteger(range?.end) ||
+          range.end - range.start < 256) return row;
+      eligible = true;
+      return {...row, canonical_range: range};
+    };
+    const results = projected.results.map((row, index) => {
+      const native = original.results[index];
+      if (row?.selector?.kind === 'search' && Array.isArray(row.value?.hydrated_ranges))
+        return {...row, value: {...row.value, hydrated_ranges: row.value.hydrated_ranges.map((range, index) =>
+          restore(range, native?.value?.hydrated_ranges?.[index]))}};
+      return restore(row, native);
+    });
+    if (!eligible) return projected;
+    const display = {...projected, results};
+    for (const field of ['source_sha256', 'canonical_sha256'])
+      if (original[field] !== undefined) display[field] = original[field];
+    return display;
+  }
+  function rawText(projected, fragment, source = projected, original = projected, standalone = false) {
     if (fragment) {
-      const raw = rawText({results: fragment === 'rows' ? projected : [projected]}, undefined, source);
+      const raw = rawText({results: fragment === 'rows' ? projected : [projected]}, undefined, source,
+        {results: fragment === 'rows' ? original : [original]}, true);
       if (!raw) return undefined;
       const rows = fragment === 'rows' ? projected : [projected];
       const unframed = rows.some(row => typeof row?.text !== 'string' &&
@@ -522,39 +549,53 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
     }
     if (Array.isArray(projected.results) && !('output' in projected)) {
       const texts = [];
-      const frame = (item) => {
+      const frame = (item, native = item) => {
         if (item === null || typeof item !== 'object' || typeof item.text !== 'string') {
           return item;
         }
         const {text, ...rest} = item;
         const text_lines = lineCount(text);
+        // Coordinates and body boundaries live once, in the counted label.
+        // The envelope keeps a stable body index plus all independent metadata.
+        // Unknown caller fields retain the legacy representation unchanged.
+        let header;
+        if (!('body' in rest) && !('text_lines' in rest)) {
+          const {selector, canonical_range, ...fields} = rest;
+          header = {...fields, body: Number.MAX_SAFE_INTEGER};
+        }
         // A whole result's envelope already shows its path and artifact; a
         // selected fragment prints without one, so only its label names them.
         // Only an incomplete body needs its completeness repeated here.
-        texts.push({text, source: {
-          ...(source !== projected ? {path: source.path, artifact_id: source.artifact_id,
+        texts.push({text, header, source: {
+          ...(standalone ? {path: source.path, artifact_id: source.artifact_id,
             source_sha256: source.source_sha256 || source.canonical_sha256,
             canonical_sha256: source.canonical_sha256, source_encoding: source.source_encoding,
             selector_encoding: source.selector_encoding, selector_coordinate_space: source.selector_coordinate_space,
             environment_id: source.environment_id, canonical_uri: source.canonical_uri} : {}),
-          selector: item.selector, canonical_range: item.canonical_range,
-          complete: item.complete === true ? undefined : item.complete, text_lines}});
-        return {...rest, text_lines};
+          // Compact display may omit native coordinates. Keep them once in the
+          // body label, bound to the same unmodified native row as its text.
+          selector: item.selector ?? native?.selector,
+          canonical_range: item.canonical_range ?? native?.canonical_range,
+          complete: (item.complete ?? native?.complete) === true ? undefined : (item.complete ?? native?.complete),
+          text_lines}});
+        return header || {...rest, text_lines};
       };
-      const results = projected.results.map((result) => {
-        const framed = frame(result);
+      const results = projected.results.map((result, index) => {
+        const native = original.results?.[index];
+        const framed = frame(result, native);
         if (result?.selector?.kind === 'search' &&
             Array.isArray(result.value?.hydrated_ranges)) {
           return {...framed, value: {...result.value,
-            hydrated_ranges: result.value.hydrated_ranges.map(frame)}};
+            hydrated_ranges: result.value.hydrated_ranges.map((range, index) =>
+              frame(range, native?.value?.hydrated_ranges?.[index]))}};
         }
         return framed;
       });
       // Standalone registered rows have no parent envelope. Even a short or
       // empty body needs its trusted source label, not just its text/range.
-      if (!texts.some(body => escapes(body.text)) && source === projected) return undefined;
+      if (!texts.some(body => escapes(body.text)) && !standalone) return undefined;
       const raw = {envelope: {...projected, results}, texts};
-      return source === projected ? smallerFrame(projected, raw) : raw;
+      return standalone ? raw : smallerFrame(projected, raw);
     }
     if (Array.isArray(projected.content)) {
       const texts = [];
@@ -1004,13 +1045,17 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
     let internedChars = 0;
     const append = (raw, owner) => {
       if (raw.texts.every(body => body.text.length < 512)) {
-        texts.push(...raw.texts);
+        for (const body of raw.texts) {
+          if (body.header) body.header.body = texts.length + 1;
+          texts.push(body);
+        }
         return;
       }
       framedBodies ??= new Map();
       let previous = framedBodies.get(owner);
       if (!previous) framedBodies.set(owner, previous = []);
       raw.texts.forEach((body, index) => {
+        if (body.header) body.header.body = texts.length + 1;
         const first = previous[index] ?? (roots ? equalBodies.get(body.text) : undefined);
         // Exact string-key equality shares rendering, never source identity.
         // Content interning is restricted to inert packets and bounded below;
@@ -1075,8 +1120,9 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
       }
       if (!unchangedRoot(entry)) return item;
       const display = entry.fragment ? standaloneFragment(entry.projected, entry.rootOriginal,
-        fragmentCache ??= new Map()) : entry.projected;
-      const raw = rawText(display, entry.fragment, entry.rootOriginal || entry.projected);
+        fragmentCache ??= new Map()) : entry.sourceFragments
+          ? sourceDisplay(entry.projected, entry.original) : entry.projected;
+      const raw = rawText(display, entry.fragment, entry.rootOriginal || entry.original, entry.original);
       frames?.set(item, {raw, display});
       if (raw === undefined) return display;
       append(raw, entry.original);

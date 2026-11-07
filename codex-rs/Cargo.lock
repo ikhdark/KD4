@@ -1609,6 +1609,7 @@ dependencies = [
  "codex-utils-build-info",
  "codex-utils-cli",
  "futures",
+ "serde_json",
  "time",
  "tokio",
  "tokio-util",

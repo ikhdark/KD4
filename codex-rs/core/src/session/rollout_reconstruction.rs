@@ -1134,6 +1134,7 @@ impl Session {
                             response.lineage_complete.then_some(response.lineage);
                     }
                 }
+                RolloutItem::ContextReplay { .. } => {}
                 RolloutItem::AdditionalContextState { .. } => {
                     active_segment
                         .get_or_insert_with(ActiveReplaySegment::default)
@@ -1295,6 +1296,7 @@ impl Session {
                 RolloutItem::EventMsg(_)
                 | RolloutItem::TurnContext(_)
                 | RolloutItem::WorldState(_)
+                | RolloutItem::ContextReplay { .. }
                 | RolloutItem::SamplingBoundary(_)
                 | RolloutItem::ToolManifest(_)
                 | RolloutItem::SessionMeta(_) => {}
@@ -1350,6 +1352,7 @@ impl Session {
                 }
                 RolloutItem::SessionMeta(_)
                 | RolloutItem::ToolManifest(_)
+                | RolloutItem::ContextReplay { .. }
                 | RolloutItem::SamplingBoundary(_)
                 | RolloutItem::ResponseItem(_)
                 | RolloutItem::InterAgentCommunication(_)

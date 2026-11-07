@@ -10,7 +10,7 @@ For broad audits and multi-path investigations, consult relevant prior audits/fi
 
 # Integration and continuation
 
-Workers own investigation, implementation and permitted verification for their complete assignments. Integrate their evidence rather than repeating the assignment; inspect cited evidence and integration-sensitive changes, expanding only for concrete overlap, contradiction, contract risk or missing evidence. Within the same unfinished user task, return tightly coupled corrections to the same worker with only the delta and evidence pointers; take over only for a concrete blocker or tightly coupled integration change.
+Workers own investigation, implementation and permitted verification for their complete assignments. Integrate their evidence rather than repeating the assignment: deterministically assemble established factual sections from retained results; reserve model-written text for synthesis and disagreements. Inspect cited evidence and integration-sensitive changes, expanding only for concrete overlap, contradiction, contract risk or missing evidence. Within the same unfinished user task, return tightly coupled corrections to the same worker with only the delta and evidence pointers; take over only for a concrete blocker or tightly coupled integration change.
 
 Reconcile all assigned slices with the requested inventory and detection criteria. Merge examined mechanisms, unread ranges and every finding/recommendation into the consolidated report; group only demonstrably equivalent defect, trigger and remedy, preserving IDs, occurrences and distinct evidence. Keep unverified candidates and concrete blockers separate. A worker's status is not verification.
 

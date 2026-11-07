@@ -419,6 +419,7 @@ pub(super) fn build_projected_prompt_from_scaffold(
     );
     Prompt {
         input,
+        replay_snapshot: Some(prepared.sampling_replay_snapshot()),
         formatted_inputs: Default::default(),
         stable_context_fallback_input: fallback_input,
         tool_history_fallback_input,

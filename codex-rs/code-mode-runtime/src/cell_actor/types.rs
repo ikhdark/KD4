@@ -32,6 +32,7 @@ pub(crate) enum CellError {
 
 pub(crate) struct CellToolCall {
     pub(crate) id: String,
+    pub(crate) causal_predecessors: Option<Vec<String>>,
     pub(crate) name: ToolName,
     pub(crate) kind: ToolKind,
     pub(crate) input: Option<JsonValue>,

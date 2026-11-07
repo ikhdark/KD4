@@ -31,12 +31,14 @@ impl CodeModeSessionDelegate for RemoteDelegate {
         cancellation: NestedCancellation,
     ) -> ToolInvocationFuture<'a> {
         Box::pin(async move {
+            let mut invocation: codex_code_mode_protocol::host::WireNestedToolCall = invocation.into();
+            if !self.peer.causal_inputs { invocation.causal_predecessors = None; }
             match self
                 .peer
                 .call(
                     self.session_id.clone(),
                     DelegateRequest::InvokeTool {
-                        invocation: invocation.into(),
+                        invocation,
                     },
                     cancellation,
                 )

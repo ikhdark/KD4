@@ -3,7 +3,6 @@ use codex_config::config_toml::ConfigLockfileToml;
 use codex_config::config_toml::ConfigToml;
 use codex_config::config_toml::OrchestratorFeatureToml;
 use codex_config::config_toml::OrchestratorToml;
-use codex_features::CurrentTimeReminderConfigToml;
 use codex_features::Feature;
 use codex_features::FeatureToml;
 use codex_features::FeaturesToml;
@@ -153,12 +152,6 @@ fn save_config_resolved_fields(
         resolved_config_to_toml(&config.multi_agent_v2, "features.multi_agent_v2")?;
     multi_agent_v2.enabled = Some(config.features.enabled(Feature::MultiAgentV2));
     features.multi_agent_v2 = Some(FeatureToml::Config(multi_agent_v2));
-    if let Some(current_time_reminder) = config.current_time_reminder.as_ref() {
-        let mut current_time_reminder: CurrentTimeReminderConfigToml =
-            resolved_config_to_toml(current_time_reminder, "features.current_time_reminder")?;
-        current_time_reminder.enabled = Some(config.features.enabled(Feature::CurrentTimeReminder));
-        features.current_time_reminder = Some(FeatureToml::Config(current_time_reminder));
-    }
 
     let agents = lock_config.agents.get_or_insert_with(Default::default);
     // Multi-agent v2 owns thread fanout through its feature config. Preserve

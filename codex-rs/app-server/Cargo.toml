@@ -39,6 +39,7 @@ codex-utils-absolute-path = { workspace = true }
 codex-utils-build-info = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 futures = { workspace = true }
+serde_json = { workspace = true }
 time = { workspace = true }
 toml = { workspace = true }
 tokio = { workspace = true, features = [

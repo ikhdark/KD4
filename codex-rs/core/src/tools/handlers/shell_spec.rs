@@ -8,7 +8,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 
 const SHELL_SCRIPT_DESCRIPTION: &str = "Explicit source for the selected shell (the session default when omitted), for pipelines, redirection, expansion, compound statements, or builtins. Use `program`/`args` for executables; never concatenate executable arguments into shell source.";
-const EXECUTABLE_DESCRIPTION: &str = "Executable to launch directly through the existing process owner with `args`. Prefer this for executables. Normal permission and sandbox checks still apply. Batch files require explicit shell execution.";
+const EXECUTABLE_DESCRIPTION: &str = "Executable to launch directly through the existing process owner with `args`; shell builtins and Windows batch files require explicit shell source instead. Prefer this for executables. Normal permission and sandbox checks still apply.";
 const ARGUMENTS_DESCRIPTION: &str = "Literal arguments for `program`, excluding the program name. Pass each argument separately without shell quoting; the process owner handles Windows argument serialization. Shell operators and expansions remain literal data unless a shell is explicitly invoked.";
 
 fn shell_parameter() -> JsonSchema {

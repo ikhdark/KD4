@@ -31,9 +31,6 @@ pub const MULTI_AGENT_DEFAULT_WAIT_TIMEOUT_MS: i64 = MULTI_AGENT_MIN_WAIT_TIMEOU
 
 mod feature_configs;
 pub use feature_configs::CodeModeConfigToml;
-pub use feature_configs::CurrentTimeReminderConfigToml;
-pub use feature_configs::CurrentTimeReminderDeliveryMode;
-pub use feature_configs::CurrentTimeSource;
 pub use feature_configs::MultiAgentV2ConfigToml;
 use feature_configs::RemovedAppsMcpPathOverrideConfigToml;
 
@@ -120,21 +117,12 @@ pub enum Feature {
     CodeModeOnly,
     /// Use the single unified PTY-backed exec tool.
     UnifiedExec,
-    /// Keep terminal completion and tool-result delivery on the authoritative runtime path.
-    DirectRuntime,
-    /// Add terminal-specific visualization guidance to TUI developer instructions.
-    TerminalVisualizationInstructions,
     /// Stream structured progress while apply_patch input is being generated.
     ApplyPatchStreamingEvents,
     /// Allow exec tools to request additional permissions while staying sandboxed.
     ExecPermissionApprovals,
     /// Expose the built-in request_permissions tool.
     RequestPermissionsTool,
-    /// Allow the model to request web searches that fetch live content.
-    WebSearchRequest,
-    /// Allow the model to request web searches that fetch cached content.
-    /// Takes precedence over `WebSearchRequest`.
-    WebSearchCached,
     /// Expose the extension-backed standalone web search tool.
     StandaloneWebSearch,
     /// Experimental shell snapshotting.
@@ -159,8 +147,6 @@ pub enum Feature {
     SpawnCsv,
     /// Enable apps.
     Apps,
-    /// Expose MCP model-visible namespaces without the legacy `mcp__` prefix.
-    NonPrefixedMcpToolNames,
     /// Enable discoverable tool suggestions for apps.
     ToolSuggest,
     /// Enable plugins.
@@ -213,8 +199,6 @@ pub enum Feature {
     SkillMcpDependencyInstall,
     /// Allow request_user_input in Default collaboration mode.
     DefaultModeRequestUserInput,
-    /// Add current-time reminders to model-visible context.
-    CurrentTimeReminder,
     /// Route MCP tool approval prompts through the MCP elicitation request path.
     ToolCallMcpElicitation,
     /// Prompt Codex Apps connector auth failures through MCP URL elicitations.
@@ -223,8 +207,6 @@ pub enum Feature {
     Personality,
     /// Enable Fast mode selection in the TUI and request layer.
     FastMode,
-    /// Prevent idle system sleep while a turn is actively running.
-    PreventIdleSleep,
     /// Use Agent Identity for ChatGPT-authenticated sessions.
     UseAgentIdentity,
 
@@ -257,42 +239,15 @@ impl Feature {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct LegacyFeatureUsage {
-    pub alias: String,
-    pub feature: Feature,
-    pub summary: String,
-    pub details: Option<String>,
-}
-
 /// Holds the effective set of enabled features.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Features {
     enabled: u128,
-    legacy_usages: BTreeSet<LegacyFeatureUsage>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct FeatureOverrides {
-    pub web_search_request: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FeatureConfigSource<'a> {
     pub features: Option<&'a FeaturesToml>,
-}
-
-impl FeatureOverrides {
-    fn apply(self, features: &mut Features) {
-        if let Some(enabled) = self.web_search_request {
-            if enabled {
-                features.enable(Feature::WebSearchRequest);
-            } else {
-                features.disable(Feature::WebSearchRequest);
-            }
-            features.record_legacy_usage("web_search_request", Feature::WebSearchRequest);
-        }
-    }
 }
 
 impl Features {
@@ -333,27 +288,6 @@ impl Features {
         }
     }
 
-    pub fn record_legacy_usage_force(&mut self, alias: &str, feature: Feature) {
-        let (summary, details) = legacy_usage_notice(alias, feature);
-        self.legacy_usages.insert(LegacyFeatureUsage {
-            alias: alias.to_string(),
-            feature,
-            summary,
-            details,
-        });
-    }
-
-    pub fn record_legacy_usage(&mut self, alias: &str, feature: Feature) {
-        if alias == feature.key() {
-            return;
-        }
-        self.record_legacy_usage_force(alias, feature);
-    }
-
-    pub fn legacy_feature_usages(&self) -> impl Iterator<Item = &LegacyFeatureUsage> + '_ {
-        self.legacy_usages.iter()
-    }
-
     /// Emit non-default public feature states without selecting a telemetry transport.
     pub fn emit_metrics(&self, mut emit: impl FnMut(&'static str, bool)) {
         for feature in FEATURES {
@@ -370,21 +304,6 @@ impl Features {
     /// Apply a table of key -> bool toggles (e.g. from TOML).
     pub fn apply_map(&mut self, m: &BTreeMap<String, bool>) {
         for (k, v) in m {
-            match k.as_str() {
-                "web_search_request" => {
-                    self.record_legacy_usage_force(
-                        "features.web_search_request",
-                        Feature::WebSearchRequest,
-                    );
-                }
-                "web_search_cached" => {
-                    self.record_legacy_usage_force(
-                        "features.web_search_cached",
-                        Feature::WebSearchCached,
-                    );
-                }
-                _ => {}
-            }
             match canonical_feature_for_key(k) {
                 Some(feat) if matches!(feat.stage(), Stage::Internal) => {
                     tracing::warn!("internal feature key cannot be set in user config: {k}");
@@ -406,7 +325,6 @@ impl Features {
     pub fn from_sources(
         base: FeatureConfigSource<'_>,
         profile: FeatureConfigSource<'_>,
-        overrides: FeatureOverrides,
     ) -> Self {
         let mut features = Features::with_defaults();
 
@@ -416,7 +334,6 @@ impl Features {
             }
         }
 
-        overrides.apply(&mut features);
         features.normalize_dependencies();
 
         features
@@ -444,47 +361,6 @@ impl Features {
             self.enable(Feature::CodeMode);
         }
     }
-}
-
-fn legacy_usage_notice(alias: &str, feature: Feature) -> (String, Option<String>) {
-    let canonical = feature.key();
-    match feature {
-        Feature::WebSearchRequest | Feature::WebSearchCached => {
-            let label = match alias {
-                "web_search" => "[features].web_search",
-                "features.web_search_request" | "web_search_request" => {
-                    "[features].web_search_request"
-                }
-                "features.web_search_cached" | "web_search_cached" => {
-                    "[features].web_search_cached"
-                }
-                _ => alias,
-            };
-            let summary =
-                format!("`{label}` is deprecated because web search is enabled by default.");
-            (summary, Some(web_search_details().to_string()))
-        }
-        _ => {
-            let label = if alias.contains('.') || alias.starts_with('[') {
-                alias.to_string()
-            } else {
-                format!("[features].{alias}")
-            };
-            let summary = format!("`{label}` is deprecated. Use `[features].{canonical}` instead.");
-            let details = if alias == canonical {
-                None
-            } else {
-                Some(format!(
-                    "Enable it with `--enable {canonical}` or `[features].{canonical}` in config.toml. See https://developers.openai.com/codex/config-basic#feature-flags for details."
-                ))
-            };
-            (summary, details)
-        }
-    }
-}
-
-fn web_search_details() -> &'static str {
-    "Set `web_search` to `\"live\"`, `\"indexed\"`, `\"cached\"`, or `\"disabled\"` at the top level (or under a profile) in config.toml if you want to override it."
 }
 
 /// Returns the feature registered for a canonical key, including internal-only keys.
@@ -535,8 +411,6 @@ pub struct FeaturesToml {
     pub code_mode: Option<FeatureToml<CodeModeConfigToml>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_agent_v2: Option<FeatureToml<MultiAgentV2ConfigToml>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub current_time_reminder: Option<FeatureToml<CurrentTimeReminderConfigToml>>,
     #[serde(default, rename = "apps_mcp_path_override", skip_serializing)]
     #[schemars(skip)]
     removed_apps_mcp_path_override: Option<FeatureToml<RemovedAppsMcpPathOverrideConfigToml>>,
@@ -591,7 +465,19 @@ impl FeaturesToml {
     /// behavior or belong in newly materialized config.
     pub fn clear_removed_compatibility_entries(&mut self) {
         self.removed_apps_mcp_path_override = None;
-        self.entries.remove("apps_mcp_path_override");
+        for key in [
+            "apps_mcp_path_override",
+            "direct_runtime",
+            "current_time_reminder",
+            "web_search",
+            "web_search_request",
+            "web_search_cached",
+            "prevent_idle_sleep",
+            "non_prefixed_mcp_tool_names",
+            "terminal_visualization_instructions",
+        ] {
+            self.entries.remove(key);
+        }
     }
 
     pub fn entries(&self) -> BTreeMap<String, bool> {
@@ -602,13 +488,6 @@ impl FeaturesToml {
         if let Some(enabled) = self.multi_agent_v2.as_ref().and_then(FeatureToml::enabled) {
             entries.insert(Feature::MultiAgentV2.key().to_string(), enabled);
         }
-        if let Some(enabled) = self
-            .current_time_reminder
-            .as_ref()
-            .and_then(FeatureToml::enabled)
-        {
-            entries.insert(Feature::CurrentTimeReminder.key().to_string(), enabled);
-        }
         entries
     }
 
@@ -617,7 +496,6 @@ impl FeaturesToml {
         let Self {
             code_mode,
             multi_agent_v2,
-            current_time_reminder,
             removed_apps_mcp_path_override: _,
             entries,
         } = self;
@@ -633,9 +511,6 @@ impl FeaturesToml {
             } else if spec.id == Feature::MultiAgentV2 {
                 entries.remove(spec.key);
                 materialize_resolved_feature_enabled(multi_agent_v2, enabled);
-            } else if spec.id == Feature::CurrentTimeReminder {
-                entries.remove(spec.key);
-                materialize_resolved_feature_enabled(current_time_reminder, enabled);
             } else {
                 entries.insert(spec.key.to_string(), enabled);
             }
@@ -661,9 +536,6 @@ impl From<BTreeMap<String, bool>> for FeaturesToml {
                 .map(FeatureToml::Enabled),
             multi_agent_v2: entries
                 .remove(Feature::MultiAgentV2.key())
-                .map(FeatureToml::Enabled),
-            current_time_reminder: entries
-                .remove(Feature::CurrentTimeReminder.key())
                 .map(FeatureToml::Enabled),
             removed_apps_mcp_path_override: entries
                 .remove("apps_mcp_path_override")
@@ -803,12 +675,6 @@ define_features! {
         default_enabled: true,
     },
     FeatureSpec {
-        id: Feature::DirectRuntime,
-        key: "direct_runtime",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
         id: Feature::ShellSnapshot,
         key: "shell_snapshot",
         stage: Stage::Stable,
@@ -839,18 +705,6 @@ define_features! {
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::WebSearchRequest,
-        key: "web_search_request",
-        stage: Stage::Deprecated,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::WebSearchCached,
-        key: "web_search_cached",
-        stage: Stage::Deprecated,
-        default_enabled: false,
-    },
-    FeatureSpec {
         id: Feature::StandaloneWebSearch,
         key: "standalone_web_search",
         stage: Stage::UnderDevelopment,
@@ -866,7 +720,7 @@ define_features! {
         id: Feature::RolloutActivity,
         key: "rollout_activity",
         stage: Stage::UnderDevelopment,
-        default_enabled: false,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::LocalThreadStoreCompression,
@@ -945,12 +799,6 @@ define_features! {
         key: "apps",
         stage: Stage::Stable,
         default_enabled: true,
-    },
-    FeatureSpec {
-        id: Feature::NonPrefixedMcpToolNames,
-        key: "non_prefixed_mcp_tool_names",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::ToolSuggest,
@@ -1064,18 +912,6 @@ define_features! {
         default_enabled: true,
     },
     FeatureSpec {
-        id: Feature::TerminalVisualizationInstructions,
-        key: "terminal_visualization_instructions",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::CurrentTimeReminder,
-        key: "current_time_reminder",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
         id: Feature::ToolCallMcpElicitation,
         key: "tool_call_mcp_elicitation",
         stage: Stage::Stable,
@@ -1098,16 +934,6 @@ define_features! {
         key: "fast_mode",
         stage: Stage::Stable,
         default_enabled: true,
-    },
-    FeatureSpec {
-        id: Feature::PreventIdleSleep,
-        key: "prevent_idle_sleep",
-        stage: Stage::Experimental {
-            name: "Prevent sleep while running",
-            menu_description: "Keep your computer awake while Codex is running a thread.",
-            announcement: "NEW: Prevent sleep while running is now available in /experimental.",
-        },
-        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::UseAgentIdentity,
@@ -1163,7 +989,11 @@ pub fn unknown_features_warning_event_with_origins(
     let compatibility = unknown.iter().map(|key| {
         let removed = matches!(key.as_str(), "memories" | "memory_tool" | "auto_review"
             | "guardian_approval" | "artifact" | "enable_mcp_apps" | "realtime_conversation"
-            | "analytics_plan_history" | "token_budget" | "context_management");
+            | "analytics_plan_history" | "token_budget" | "context_management"
+            | "direct_runtime" | "current_time_reminder"
+            | "web_search" | "web_search_request" | "web_search_cached"
+            | "prevent_idle_sleep" | "non_prefixed_mcp_tool_names"
+            | "terminal_visualization_instructions");
         let origin = origins.get(key).and_then(Option::as_deref);
         serde_json::json!({
             "key": key,
@@ -1213,7 +1043,7 @@ pub fn unstable_features_warning_event(
     }
 
     // Resolve each configured value with its feature's own toggle field (for example
-    // `current_time_reminder.enabled`), exactly as feature resolution does.
+    // `code_mode.enabled`), exactly as feature resolution does.
     let configured_entries = effective_features
         .and_then(|table| {
             toml::Value::Table(table.clone())

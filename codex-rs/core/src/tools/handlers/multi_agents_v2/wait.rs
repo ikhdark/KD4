@@ -135,6 +135,10 @@ impl Handler {
             receiver: activity_rx,
         };
         let wait_started = Instant::now();
+        let observation = codex_protocol::timing::observations::Span::start(
+            "agent_wait", &session.thread_id.to_string(), &turn.sub_id, &call_id,
+            json!({"explicit_targets":args.targets.is_some(), "mailbox_only":args.mailbox_only,
+                "dependencies_only":args.dependencies_only}));
 
         session
             .emit_turn_item_started(
@@ -1000,6 +1004,9 @@ impl Handler {
             receivers = wait_receivers(&session, result, &mailbox_authors).await;
         }
 
+        observation.finish(if result.is_ok() {"returned"} else {"failed"},
+            json!({"receiver_thread_ids":receivers.thread_ids,
+                "join_scope":"observed_wait_result_not_all_descendants"}));
         session
             .emit_turn_item_completed(
                 &turn,

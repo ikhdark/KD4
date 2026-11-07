@@ -180,6 +180,7 @@ impl PersistedThreadSettingsReducer {
             }
             RolloutItem::SessionMeta(_)
             | RolloutItem::ToolManifest(_)
+            | RolloutItem::ContextReplay { .. }
             | RolloutItem::SamplingBoundary(_)
             | RolloutItem::ResponseItem(_)
             | RolloutItem::InterAgentCommunication(_)

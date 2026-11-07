@@ -385,12 +385,13 @@ async fn run_cell<H: CellHost>(
                             task_failure_handler.clone(),
                         );
                     }
-                    RuntimeEvent::ToolCall { id, name, kind, input, timeout_ms } => {
+                    RuntimeEvent::ToolCall { id, causal_predecessors, name, kind, input, timeout_ms } => {
                         spawn_tool(
                             &mut tool_tasks,
                             Arc::clone(&host),
                             CellToolCall {
                                 id,
+                                causal_predecessors,
                                 name: CellToolName {
                                     name: name.name,
                                     namespace: name.namespace,

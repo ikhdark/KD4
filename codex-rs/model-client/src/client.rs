@@ -91,6 +91,7 @@ use codex_protocol::auth::AuthMode;
 
 use codex_conversation::stable_context::StableContextManifest;
 use codex_conversation::stable_context::short_hash;
+use codex_protocol::ResponseItemId;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
@@ -1304,7 +1305,7 @@ fn measure_responses_request_after_dispatch(
             // Publish before token categories so calibration never sees those
             // categories without their matching model fingerprint.
             if !blocking_cancellation.is_cancelled()
-                && let Some((timing, identity)) = payload_timing
+                && let Some((timing, identity)) = payload_timing.as_ref()
                 && let Some(encoded) = encoded_request.as_deref()
             {
                 timing.record_model_request_sections(
@@ -1366,6 +1367,18 @@ fn measure_responses_request_after_dispatch(
                     });
                 Ok::<_, serde_json::Error>(measurements)
             })();
+            if let (Ok(measured), Some((timing, identity))) = (&measurements, payload_timing.as_ref()) {
+                // Persist only the missing request/representation links. Reuse
+                // the existing per-inclusion hashes; do not serialize, hash or
+                // tokenize the old tool results a second time.
+                let outputs = measured.tool_result_attribution.iter().take(1024).map(|output| {
+                    serde_json::json!({"call_id_sha256":output.call_id_sha256,
+                        "representation_sha256":output.representation_sha256,
+                        "serialized_bytes":output.serialized_bytes})
+                }).collect();
+                timing.record_model_output_exposures(&identity.sampling_request_id,
+                    &identity.physical_attempt_id, outputs, measured.tool_result_attribution.len() <= 1024);
+            }
             let stable_context_manifest =
                 if measurements.is_ok() && !blocking_cancellation.is_cancelled() {
                     #[derive(Deserialize)]
@@ -1437,6 +1450,12 @@ struct ProviderObservations {
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_diagnostics: Option<serde_json::Value>,
     prompt_cache_diagnostics_invalid: bool,
+    /// First server-reported timing report for this attempt (`responsesapi.websocket_timing`).
+    /// Present only when the provider sent one (runtime metrics requested); never client-derived.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_timing: Option<serde_json::Value>,
+    server_timing_events: u64,
+    server_timing_invalid: bool,
     // Preserve the contributing labels BEFORE collapsing disagreement to unknown.
     // Fixed-size per-attempt inventory; overflow remains explicit, never a pass.
     service_tier_observations: Vec<ProviderTierObservation>,
@@ -1447,6 +1466,15 @@ struct ProviderObservations {
     safety_buffering_events: u64,
     first_safety_buffering_us: Option<u64>,
     phases: std::collections::BTreeMap<&'static str, ProviderPhaseReceipt>,
+    /// Summed arrival spans of paired provider reasoning items (`output_item.added` to
+    /// `output_item.done`), for any number of strictly alternating items. Observed at the
+    /// client like `phases`; never derived from reasoning tokens. An unpaired or
+    /// overlapping boundary sets `reasoning_item_spans_invalid` instead of guessing.
+    reasoning_item_span_us: u64,
+    reasoning_item_spans_paired: u64,
+    reasoning_item_spans_invalid: bool,
+    #[serde(skip)]
+    reasoning_item_open_us: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1462,6 +1490,10 @@ struct ProviderTierObservation {
 struct ModelAttemptOffsets {
     provider_observations: Option<ProviderObservations>,
     prompt_cache_comparison_response_id: Option<String>,
+    /// Routing hint the carrying transport sent: the HTTP request's own header, or the
+    /// handshake header of the WebSocket connection that carried this attempt.
+    routing_hint_carrier: Option<&'static str>,
+    routing_hint: Option<String>,
     token_receipts: Option<ModelTokenReceipts>,
     stream_delivery_json: Option<String>,
     transport_attempt: u64,
@@ -1500,6 +1532,16 @@ impl ModelAttemptClock {
         }
     }
 
+    /// `carrier` names who sent the hint; `None` means that carrier sent no hint.
+    fn record_routing_hint(&self, carrier: &'static str, hint: Option<&HeaderValue>) {
+        let mut offsets = self.offsets.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        offsets.routing_hint_carrier = Some(carrier);
+        offsets.routing_hint = hint
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| value.len() <= 256)
+            .map(str::to_owned);
+    }
+
     fn record_provider_observation(&self, observation: codex_api::ProviderObservation) {
         if let Some(count) = observation.output_token_receipts {
             let now_us = self.elapsed_us();
@@ -1515,7 +1557,7 @@ impl ModelAttemptClock {
         // this existing clock lock without IO, awaits or nested locks.
         if !matches!(observation.phase, "created" | "queued" | "in_progress" | "completed"
             | "failed" | "incomplete" | "reasoning_started" | "reasoning_finished" | "safety_buffering"
-            | "scoped_output_tokens") {
+            | "scoped_output_tokens" | "server_timing") {
             return;
         }
         let now_us = self.elapsed_us();
@@ -1557,6 +1599,16 @@ impl ModelAttemptClock {
                 evidence.prompt_cache_diagnostics.get_or_insert(diagnostics);
             }
         }
+        if observation.phase == "server_timing" {
+            evidence.server_timing_events = evidence.server_timing_events.saturating_add(1);
+            evidence.server_timing_invalid |= observation.server_timing_invalid;
+            if let Some(timing) = observation.server_timing {
+                // Keep the first report; a differing repeat is explicit, never merged.
+                evidence.server_timing_invalid |= evidence.server_timing
+                    .as_ref().is_some_and(|previous| previous != &timing);
+                evidence.server_timing.get_or_insert(timing);
+            }
+        }
         if observation.response_service_tier.is_some() || observation.response_service_tier_invalid {
             if evidence.service_tier_observations.len() < 16 {
                 evidence.service_tier_observations.push(ProviderTierObservation {
@@ -1595,6 +1647,22 @@ impl ModelAttemptClock {
             evidence.safety_buffering_events = evidence.safety_buffering_events.saturating_add(1);
             evidence.first_safety_buffering_us.get_or_insert(now_us);
             evidence.invalid |= evidence.safety_buffering_events == u64::MAX;
+        }
+        match observation.phase {
+            "reasoning_started" => {
+                evidence.reasoning_item_spans_invalid |=
+                    evidence.reasoning_item_open_us.replace(now_us).is_some();
+            }
+            "reasoning_finished" => match evidence.reasoning_item_open_us.take() {
+                Some(started) if started <= now_us => {
+                    evidence.reasoning_item_span_us =
+                        evidence.reasoning_item_span_us.saturating_add(now_us - started);
+                    evidence.reasoning_item_spans_paired =
+                        evidence.reasoning_item_spans_paired.saturating_add(1);
+                }
+                _ => evidence.reasoning_item_spans_invalid = true,
+            },
+            _ => {}
         }
         let phase = evidence.phases.entry(observation.phase).or_default();
         if phase.count == 0 {
@@ -1878,6 +1946,11 @@ struct ModelStreamDelivery {
     version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     requested_service_tier: Option<String>,
+    /// `http_request` or `websocket_handshake`; with no `routing_hint`, that carrier sent none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    routing_hint_carrier: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    routing_hint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_comparison_response_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2007,16 +2080,14 @@ impl ModelStreamDeliveryObserver {
         self.summary.provider_processing_us = offsets.provider_processing_us;
         self.summary.provider_observations = offsets.provider_observations.clone();
         self.summary.prompt_cache_comparison_response_id = offsets.prompt_cache_comparison_response_id.clone();
+        self.summary.routing_hint_carrier = offsets.routing_hint_carrier;
+        self.summary.routing_hint = offsets.routing_hint.clone();
         self.summary.token_receipts = offsets.token_receipts.clone().map(|mut receipts| {
             receipts.complete &= complete;
             receipts.text_complete &= complete;
             receipts
         });
-        self.summary.physical_attempt_id = if offsets.transport_attempt == 0 {
-            identity.physical_attempt_id.clone()
-        } else {
-            format!("{}:http-{}", identity.physical_attempt_id, offsets.transport_attempt)
-        };
+        self.summary.physical_attempt_id = identity.physical_attempt_id.clone();
         let json = serde_json::to_string(&self.summary).unwrap_or_default();
         offsets.stream_delivery_json = Some(json.clone());
         drop(offsets);
@@ -2129,6 +2200,20 @@ impl ModelAttemptGuard {
         }
     }
 
+    fn physical_response_identity(&self) -> ResponseAttemptIdentity {
+        let mut identity = self.response_identity();
+        let transport_attempt = self
+            .clock
+            .offsets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .transport_attempt;
+        if transport_attempt != 0 {
+            identity.physical_attempt_id = format!("{}:http-{transport_attempt}", self.attempt_id);
+        }
+        identity
+    }
+
     fn tool_token_count(&self) -> i64 {
         self.measurements.tool_token_count
     }
@@ -2146,15 +2231,16 @@ impl ModelAttemptGuard {
         self.response_id = response_id.map(str::to_owned);
         self.terminal_usage = usage.cloned();
         if let Some(timing) = self.turn_timing.as_ref() {
+            let identity = self.physical_response_identity();
             if let Some(usage) = usage {
                 timing.record_model_attempt_token_usage(
                     &self.sampling_request_id,
-                    &self.attempt_id,
+                    &identity.physical_attempt_id,
                     usage,
                 );
             }
             if let Some(response_id) = response_id {
-                timing.record_model_response_id(&self.attempt_id, response_id);
+                timing.record_model_response_id(&identity.physical_attempt_id, response_id);
             }
         }
     }
@@ -2186,12 +2272,15 @@ impl ModelAttemptGuard {
             timing.record_model_attempt_outcome(&physical_attempt, outcome, progress, self.terminal_usage.as_ref());
         }
         if self.provider_completed && let Some(timing) = &self.turn_timing {
-            timing.record_provider_terminal(&self.sampling_request_id, &self.attempt_id);
+            timing.record_provider_terminal(
+                &self.sampling_request_id,
+                &self.physical_response_identity().physical_attempt_id,
+            );
         }
-        let uncached_input_tokens = input_tokens
-            .zip(cached_input_tokens)
-            .and_then(|(input, cached)| input.checked_sub(cached))
-            .filter(|uncached| *uncached >= 0);
+        let uncached_input_tokens = self
+            .terminal_usage
+            .as_ref()
+            .and_then(TokenUsage::known_non_cached_input);
         if let Some(cache_coverage_bps) = cache_coverage_below_matched_task_baseline(
             self.measurements.matched_task_reuse_eligible(),
             outcome,
@@ -2606,8 +2695,8 @@ impl ModelAttemptState {
 
     fn response_identity(&self) -> ResponseAttemptIdentity {
         match self {
-            Self::Ready(attempt) => attempt.response_identity(),
-            Self::Pending(pending) => pending.identity.clone(),
+            Self::Ready(attempt) => attempt.physical_response_identity(),
+            Self::Pending(pending) => pending.essential.physical_response_identity(),
         }
     }
 
@@ -2968,6 +3057,7 @@ struct ModelClientState {
     /// as the model or service tier, an ordered prefix section, or a fixed prefix item changed.
     prompt_context_measurements: Arc<StdMutex<PromptContextMeasurements>>,
     startup_timing: Option<Arc<codex_turn_timing::startup_timing::StartupTimingState>>,
+    retained_capture: StdMutex<RetainedRequestCaptureSink>,
 }
 
 #[derive(Debug, Default)]
@@ -3154,6 +3244,33 @@ pub type AttemptPreparedCallback = Arc<
         + Send
         + Sync,
 >;
+
+/// Local-only evidence from the selected, normalized request, before transport I/O.
+/// The core sink owns persistence; no HTTP headers or authentication are captured.
+#[derive(Debug)]
+pub struct RetainedRequestCapture {
+    pub identity: ResponseAttemptIdentity,
+    pub turn_id: Option<String>,
+    pub transport: &'static str,
+    pub selected_representation: &'static str,
+    pub has_sampling_boundary: bool,
+    pub logical_request: ResponsesApiRequest,
+    pub transport_request: Option<ResponsesWsRequest>,
+    pub replay_snapshot: Option<codex_conversation::context_manager::SamplingReplaySnapshot>,
+}
+
+pub type RetainedRequestCaptureCallback = Arc<
+    dyn Fn(RetainedRequestCapture) -> futures::future::BoxFuture<'static, Result<()>> + Send + Sync,
+>;
+
+#[derive(Default)]
+struct RetainedRequestCaptureSink(Option<RetainedRequestCaptureCallback>);
+
+impl std::fmt::Debug for RetainedRequestCaptureSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetainedRequestCaptureSink").field("enabled", &self.0.is_some()).finish()
+    }
+}
 
 #[derive(Clone, Copy)]
 struct RequestRouteTelemetry {
@@ -3362,6 +3479,8 @@ struct WebsocketSession {
     startup_observation: Option<codex_turn_timing::startup_timing::StartupConnectionObservation>,
     /// When `connection` was established; drives rotation before the server's age limit.
     connected_at: Option<Instant>,
+    /// `x-codex-routing-hint` sent in this connection's handshake (diagnostic receipt only).
+    routing_hint: Option<HeaderValue>,
     setup_fingerprint: Option<WebsocketSetupFingerprint>,
     last_request: Option<ResponsesApiRequest>,
     last_request_history: Option<WebsocketHistoryBaseline>,
@@ -3711,10 +3830,28 @@ impl ModelClient {
                 request_schema_cache: StdMutex::new(RequestSchemaSerializationCache::default()),
                 prompt_context_measurements: Arc::default(),
                 startup_timing: None,
+                retained_capture: StdMutex::default(),
             }),
             agent_identity_policy,
             http_client_factory,
         }
+    }
+
+    /// Install the persistent-session capture owner, shared by normal and auxiliary requests.
+    pub fn set_retained_request_capture(&self, callback: RetainedRequestCaptureCallback) {
+        self.state.retained_capture.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner).0 = Some(callback);
+    }
+
+    async fn retain_request_capture(&self, capture: RetainedRequestCapture) -> Result<()> {
+        let callback = self.state.retained_capture.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner).0.clone();
+        // No client/session lock survives this await. Core uses a weak Session
+        // reference, so retained captures cannot keep a session/task alive.
+        if let Some(callback) = callback {
+            callback(capture).await?;
+        }
+        Ok(())
     }
 
     /// Attach shared transports immediately after construction, before cloning the client.
@@ -4561,6 +4698,7 @@ impl ModelClientSession {
             observation.release("connection_reset");
         }
         self.websocket_session.connected_at = None;
+        self.websocket_session.routing_hint = None;
         self.websocket_session.setup_fingerprint = None;
         self.invalidate_incremental_history("websocket reset");
         self.websocket_session
@@ -5446,7 +5584,7 @@ impl ModelClientSession {
                     responses_metadata,
                     auth_context,
                     request_route_telemetry,
-                    routing_hint,
+                    routing_hint.clone(),
                 )
                 .await
             {
@@ -5460,6 +5598,9 @@ impl ModelClientSession {
                 }
             };
             self.websocket_session.connection = Some(new_conn);
+            // The handshake header stays fixed for this connection's lifetime; reused
+            // requests are attributed to it, not to the hint their own request would build.
+            self.websocket_session.routing_hint = routing_hint;
             self.websocket_session.adopted_startup_dial = false;
             if let Some(observation) = self.websocket_session.startup_observation.take() {
                 observation.release("connection_replaced");
@@ -5557,7 +5698,7 @@ impl ModelClientSession {
                     self.dispatched_account = client_setup.auth.as_ref()
                         .and_then(crate::account_identity::AccountChangeIdentity::from_auth);
                     let compression = self.responses_request_compression(client_setup.auth.as_ref());
-                    let options = self
+                    let mut options = self
                         .build_responses_options(
                             responses_metadata,
                             compression,
@@ -5580,6 +5721,23 @@ impl ModelClientSession {
                     )?;
                     self.client
                         .prepare_response_items_for_request(&mut request.input);
+                    // Same routing hint as the WebSocket handshake, so an HTTP request routes
+                    // with its own model and service tier (upstream sends it on both transports).
+                    let routing_hint = build_routing_hint_header(
+                        client_setup
+                            .auth
+                            .as_ref()
+                            .filter(|_| self.client.state.provider.info().is_openai()),
+                        &client_setup.api_provider,
+                        &request.model,
+                        request.service_tier.as_deref(),
+                    );
+                    attempt_clock.record_routing_hint("http_request", routing_hint.as_ref());
+                    if let Some(routing_hint) = routing_hint {
+                        options
+                            .extra_headers
+                            .insert(X_CODEX_ROUTING_HINT_HEADER, routing_hint);
+                    }
                     attempt_clock.record_prompt_cache_comparison(request.prompt_cache_options.as_ref());
                     drop(request_transformation_guard);
                     let request_session_telemetry = session_telemetry_for_request(session_telemetry, &request, self.turn_timing.as_ref());
@@ -5627,6 +5785,19 @@ impl ModelClientSession {
                     };
                     attempt_clock.mark_queue_finished();
                     let _sampling_admission = sampling_admission?;
+                    let retained_capture_guard = self.turn_timing.as_ref()
+                        .map(|timing| timing.begin_local_phase(TurnLocalPhase::Persistence));
+                    self.client.retain_request_capture(RetainedRequestCapture {
+                        identity: attempt_identity.clone(),
+                        turn_id: responses_metadata.turn_id.clone(),
+                        transport: "responses_http",
+                        selected_representation: "http_selected",
+                        has_sampling_boundary: attempt_prepared.is_some(),
+                        logical_request: request.clone(),
+                        transport_request: None,
+                        replay_snapshot: prompt.replay_snapshot.clone(),
+                    }).await?;
+                    drop(retained_capture_guard);
                     let mut api_provider = client_setup.api_provider;
                     if let Some(timeout) = prompt.stream_progress_timeout {
                         api_provider.stream_idle_timeout = timeout;
@@ -6023,6 +6194,12 @@ impl ModelClientSession {
                 .await.map(|_| ());
             if let Some(clock) = attempt_clock.as_ref() {
                 clock.mark_connection_setup_finished();
+                if connection_result.is_ok() {
+                    clock.record_routing_hint(
+                        "websocket_handshake",
+                        self.websocket_session.routing_hint.as_ref(),
+                    );
+                }
             }
             if !warmup && let (Some(timing), Some(identity)) = (&self.turn_timing, &attempt_identity) {
                 let kind = if connection_result.is_ok() {
@@ -6244,6 +6421,21 @@ impl ModelClientSession {
                 clock.mark_queue_finished();
             }
             let _sampling_admission = sampling_admission?;
+            if !warmup && let Some(identity) = attempt_identity.as_ref() {
+                let retained_capture_guard = self.turn_timing.as_ref()
+                    .map(|timing| timing.begin_local_phase(TurnLocalPhase::Persistence));
+                self.client.retain_request_capture(RetainedRequestCapture {
+                    identity: identity.clone(),
+                    turn_id: responses_metadata.turn_id.clone(),
+                    transport: "responses_websocket",
+                    selected_representation: selected_representation.as_str(),
+                    has_sampling_boundary: attempt_prepared.is_some(),
+                    logical_request: request.clone(),
+                    transport_request: Some(ws_request.clone()),
+                    replay_snapshot: prompt.replay_snapshot.clone(),
+                }).await?;
+                drop(retained_capture_guard);
+            }
             let turn_timing = self.turn_timing.clone();
             let serialization_timing_guard = self
                 .turn_timing
@@ -7085,6 +7277,9 @@ where
                 session_telemetry.requested_service_tier().map(str::to_owned),
             );
             let mut items_added: Vec<ResponseItem> = Vec::new();
+            // Assign missing call item IDs before history and the turn receive
+            // separate copies. Otherwise core's local ID breaks the next delta.
+            let mut local_call_item_ids: HashMap<String, ResponseItemId> = HashMap::new();
             let mut ttft_ms = None;
             // First-event telemetry is one-shot. Once recorded, later deltas must
             // not reacquire the timing mutex or clone the clock's Arc.
@@ -7108,6 +7303,31 @@ where
                     break;
                 };
                 let mut event: codex_api::response_event_channel::ChargedResponseEvent<ApiError> = event.into();
+                if let Ok(ResponseEvent::OutputItemAdded(item)) = event.event()
+                    && let ResponseItem::FunctionCall { call_id, .. }
+                        | ResponseItem::CustomToolCall { call_id, .. } = item
+                    && !call_id.is_empty()
+                    && let Some(id) = item.id().filter(|id| !id.is_empty())
+                {
+                    local_call_item_ids.insert(call_id.clone(), id.clone());
+                }
+                if let Ok(ResponseEvent::OutputItemAdded(item) | ResponseEvent::OutputItemDone(item)) = event.event()
+                    && !item.id().is_some_and(|id| !id.is_empty())
+                    && let ResponseItem::FunctionCall { call_id, .. }
+                        | ResponseItem::CustomToolCall { call_id, .. } = item
+                    && !call_id.is_empty()
+                {
+                    let id = local_call_item_ids
+                        .entry(call_id.clone())
+                        .or_insert_with(|| ResponseItemId::new(item.id_prefix().unwrap_or("fc")))
+                        .clone();
+                    event = event.map(|mut event| {
+                        if let Ok(ResponseEvent::OutputItemAdded(item) | ResponseEvent::OutputItemDone(item)) = &mut event {
+                            item.set_id(Some(id));
+                        }
+                        event
+                    });
+                }
                 if let Ok(
                     ResponseEvent::OutputItemAdded(item) | ResponseEvent::OutputItemDone(item),
                 ) = event.event()
@@ -7844,6 +8064,16 @@ impl RequestTelemetry for ApiTelemetry {
             observation.provenance,
             observation.unavailable_reason,
         );
+    }
+
+    fn on_transport_interval(&self, attempt: u64, observation: codex_client::TransportIntervalObservation) {
+        if let Some(context) = &self.model_request
+            && let Some(timing) = &context.timing
+            && let Some(identity) = self.physical_transport_identity(attempt) {
+            timing.record_transport_interval((&identity.sampling_request_id, &identity.physical_attempt_id),
+                observation.phase, (observation.started_at, observation.completed_at),
+                observation.wire_bytes, observation.provenance);
+        }
     }
 
     fn on_transport_phase_with_timing(

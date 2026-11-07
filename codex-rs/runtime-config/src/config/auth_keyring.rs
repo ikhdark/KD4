@@ -4,7 +4,6 @@ use super::ManagedFeatures;
 use codex_config::types::AuthKeyringBackendKind;
 use codex_features::Feature;
 use codex_features::FeatureConfigSource;
-use codex_features::FeatureOverrides;
 use codex_features::Features;
 
 impl Config {
@@ -28,7 +27,6 @@ pub fn resolve_bootstrap_auth_keyring_backend_kind(
             features: config_toml.features.as_ref(),
         },
         FeatureConfigSource::default(),
-        FeatureOverrides::default(),
     );
     let managed_features = ManagedFeatures::from_configured(
         features,

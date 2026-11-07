@@ -33,9 +33,12 @@ def _integer(env, name, default, minimum=1, maximum=None):
 def resource_root(env):
     owner = Path(__file__).resolve().parents[2]
     kdr = owner if owner.name.lower() == "kdr" else owner.parent / "KDR"
-    return Path(env.get(PREFIX + "RESOURCE_ROOT", str(
-        kdr / ".local/benchmarks/builds/resources"
-    ))).absolute()
+    if PREFIX + "RESOURCE_ROOT" in env:
+        return Path(env[PREFIX + "RESOURCE_ROOT"]).absolute()
+    legacy = kdr / ".local/benchmarks/builds"
+    if legacy.exists():
+        raise ValueError(f"managed build storage must be moved from {legacy} to {kdr / '.builds'}; refusing a second resource pool")
+    return (kdr / ".builds/resources").absolute()
 
 
 def policy(env):

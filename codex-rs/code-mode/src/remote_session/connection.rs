@@ -232,6 +232,9 @@ impl Connection {
                     catalog_capability.clone(),
                     state_capability.clone(),
                     receipt_capability.clone(),
+                    codex_code_mode_protocol::host::Capability::new(
+                        codex_code_mode_protocol::host::CAUSAL_INPUTS_CAPABILITY,
+                    ).map_err(|error| error.to_string())?,
                 ])
                 .map_err(|error| error.to_string())?,
             )

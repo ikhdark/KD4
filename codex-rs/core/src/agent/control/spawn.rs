@@ -502,6 +502,7 @@ fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item:
         RolloutItem::TurnContext(_) | RolloutItem::WorldState(_) => preserve_reference_context_item,
         RolloutItem::Compacted(_)
         | RolloutItem::AdditionalContextState { .. }
+        | RolloutItem::ContextReplay { .. }
         | RolloutItem::SamplingBoundary(_)
         | RolloutItem::EventMsg(_)
         | RolloutItem::SessionMeta(_) => true,
@@ -1401,6 +1402,11 @@ impl AgentControl {
         // possible-start boundary onward its deadline also covers a stalled
         // publication/metadata handoff. Timeout drops the existing rollback
         // owner, never an unowned running child.
+        let causal_spawn = crate::tools::tool_dispatch_trace::active_tool_dispatch_timing()
+            .and_then(|timing| timing.turn_timing_state().map(|turn| {
+                let at = turn.monotonic_offset_ms();
+                (turn, timing.execution_id().0.clone(), at)
+            }));
         let execution_started_at = tokio::time::Instant::now();
         let execution_deadline = options
             .agent_job_binding
@@ -1446,6 +1452,9 @@ impl AgentControl {
             };
             if let Err(err) = initial_submission_result {
                 return Err(pending_cleanup.rollback(err).await);
+            }
+            if let Some((turn, execution, at)) = &causal_spawn {
+                turn.record_causal_agent("spawn", &new_thread.thread_id.to_string(), execution, *at);
             }
             agent_metadata.last_task_message = initial_last_task_message;
             #[expect(

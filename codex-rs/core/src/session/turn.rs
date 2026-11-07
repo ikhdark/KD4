@@ -784,10 +784,9 @@ pub(crate) fn run_turn(
             };
             logical_generation_ordinal = logical_generation_ordinal.saturating_add(1);
             let sampling_request_result: CodexResult<_> = async {
-                super::time_reminder::maybe_record_current_time_reminder(
+                super::workflow_checkpoint::maybe_record_workflow_checkpoint(
                     sess.as_ref(),
                     turn_context.as_ref(),
-                    &window_id,
                 )
                 .await?;
 
@@ -1898,7 +1897,9 @@ pub(crate) fn run_turn(
     })
 }
 
-fn validation_mode_base_instructions(turn: &TurnContext) -> Arc<BaseInstructions> {
+/// The instructions every sampling request of this turn sends. Compaction requests
+/// send the same text so the provider can reuse the turn's cached prefix.
+pub(crate) fn validation_mode_base_instructions(turn: &TurnContext) -> Arc<BaseInstructions> {
     let directive = match turn.validation_mode {
         codex_protocol::validation::ValidationMode::Off =>
             "OFF: No validation or validation-only continuation.",
@@ -4421,13 +4422,14 @@ async fn retire_consumed_tool_outputs_before_limit(
         u64::try_from(status.auto_compact_scope_tokens.saturating_sub(target)).unwrap_or(0);
     let (call_ids, saved, carried, history) = {
         let mut state = sess.state.lock().await;
-        let (call_ids, saved) = if excess == 0 {
-            (Vec::new(), 0)
+        let (call_ids, saved, decisions) = if excess == 0 {
+            (Vec::new(), 0, serde_json::Value::Null)
         } else {
             state
                 .history
-                .pressure_retirement_selection(CONTEXT_PRESSURE_KEPT_GENERATIONS, excess)
+                .pressure_retirement_decision(CONTEXT_PRESSURE_KEPT_GENERATIONS, excess)
         };
+        observation.output_decisions = decisions;
         if call_ids.is_empty() || saved == 0 {
             // No request is re-sending retirable outputs, so no charge accrues.
             state.proactive_retirement_carried_tokens = 0;
@@ -4462,6 +4464,12 @@ async fn retire_consumed_tool_outputs_before_limit(
     let rewritten = u64::try_from(history_tokens)
         .unwrap_or(0)
         .saturating_sub(saved);
+    observation.supporting_state = serde_json::json!({
+        "target_tokens":target, "excess_tokens":excess,
+        "carried_tokens":carried, "rewritten_tokens":rewritten,
+        "cached_cost_numerator":CACHED_INPUT_COST_NUMERATOR,
+        "cached_cost_denominator":CACHED_INPUT_COST_DENOMINATOR,
+    });
     if u128::from(carried) * CACHED_INPUT_COST_NUMERATOR
         < u128::from(rewritten) * (CACHED_INPUT_COST_DENOMINATOR - CACHED_INPUT_COST_NUMERATOR)
     {
@@ -4477,6 +4485,7 @@ async fn retire_consumed_tool_outputs_before_limit(
     let checkpoint = crate::tool_history::pressure_retirement_checkpoint(
         &call_ids,
         crate::tool_history::PressureRetirementTrigger::Proactive,
+        observation.checkpoint_evidence(),
     );
     if let Err(error) = sess
         .record_conversation_items(turn_context, &[checkpoint])
@@ -4488,6 +4497,7 @@ async fn retire_consumed_tool_outputs_before_limit(
         return false;
     }
     sess.state.lock().await.proactive_retirement_carried_tokens = 0;
+    observation.published = true;
     let saved_tokens = i64::try_from(saved).unwrap_or(i64::MAX);
     sess.discount_retired_context_tokens(saved_tokens).await;
     sess.send_token_count_event(turn_context).await;
@@ -4533,9 +4543,14 @@ enum ContextPressureRelief {
     Compaction,
 }
 
-/// Content-free observations only: no new persistence, work queues or policy.
+/// Content-free observations attached to existing turn timing; no new queues or policy.
 /// Drop also records cancellation without calling an abandoned attempt a success.
 struct RetirementAttemptObservation<'a> {
+    timing: &'a codex_turn_timing::turn_timing::TurnTimingState,
+    event_id: String,
+    output_decisions: serde_json::Value,
+    supporting_state: serde_json::Value,
+    published: bool,
     thread_id: &'a codex_protocol::ThreadId,
     turn_id: &'a str,
     started: std::time::Instant,
@@ -4562,6 +4577,11 @@ impl<'a> RetirementAttemptObservation<'a> {
         kept_generations: usize,
     ) -> Self {
         Self {
+            timing: &turn.turn_timing_state,
+            event_id: format!("retirement:{}:{}", turn.sub_id, uuid::Uuid::new_v4()),
+            output_decisions: serde_json::Value::Null,
+            supporting_state: serde_json::Value::Null,
+            published: false,
             thread_id: &sess.thread_id,
             turn_id: &turn.sub_id,
             started: std::time::Instant::now(),
@@ -4591,12 +4611,40 @@ impl<'a> RetirementAttemptObservation<'a> {
         self.scope_limit = status.auto_compact_scope_limit;
         self.full_limit = status.full_context_window_limit;
     }
+
+    fn checkpoint_evidence(&self) -> serde_json::Value {
+        let outputs = self.output_decisions["rows"].as_array().into_iter().flatten()
+            .filter(|row| row["reason"] == "selected").collect::<Vec<_>>();
+        serde_json::json!({
+            "version":1, "event_id":self.event_id,
+            "trigger":self.trigger, "kept_generations":self.kept_generations,
+            "pressure_tokens":self.limits_observed.then_some(self.pressure_tokens),
+            "scope_tokens":self.limits_observed.then_some(self.scope_tokens),
+            "scope_limit":self.scope_limit, "full_limit":self.full_limit,
+            "supporting_state":self.supporting_state,
+            "selected_outputs_complete":outputs.len() == self.selected_outputs,
+            "outputs":outputs,
+            "semantic_necessity":"unknown; retirement is recoverability, not task completion",
+        })
+    }
 }
 
 impl Drop for RetirementAttemptObservation<'_> {
     fn drop(&mut self) {
+        self.timing.record_context_retirement(&self.event_id, self.started, serde_json::json!({
+            "thread_id":self.thread_id, "turn_id":self.turn_id,
+            "trigger":self.trigger, "outcome":self.outcome, "published":self.published,
+            "projected":self.projected, "kept_generations":self.kept_generations,
+            "limits_observed":self.limits_observed, "pressure_tokens":self.pressure_tokens,
+            "scope_tokens":self.scope_tokens, "scope_limit":self.scope_limit,
+            "full_limit":self.full_limit, "selected_outputs":self.selected_outputs,
+            "estimated_saved_tokens":self.estimate_available.then_some(self.estimated_saved_tokens),
+            "outputs":self.output_decisions,
+            "supporting_state":self.supporting_state,
+        }));
         tracing::debug!(
             event.name = "codex.context_retirement.attempt_finished",
+            retirement_event_id = self.event_id.as_str(),
             thread_id = %self.thread_id,
             turn_id = self.turn_id,
             trigger = self.trigger,
@@ -4675,7 +4723,8 @@ async fn retire_consumed_tool_outputs_for_context_pressure(
         return false;
     }
     let mut candidate = sess.clone_history().await;
-    let (call_ids, _) = candidate.pressure_retirement_selection(kept_generations, excess);
+    let (call_ids, _, decisions) = candidate.pressure_retirement_decision(kept_generations, excess);
+    observation.output_decisions = decisions;
     observation.selected_outputs = call_ids.len();
     if call_ids.is_empty() {
         observation.outcome = "no_eligible_outputs";
@@ -4684,6 +4733,10 @@ async fn retire_consumed_tool_outputs_for_context_pressure(
     let checkpoint = crate::tool_history::pressure_retirement_checkpoint(
         &call_ids,
         crate::tool_history::PressureRetirementTrigger::ContextLimit,
+        {
+            observation.supporting_state = serde_json::json!({"target_tokens":target, "excess_tokens":excess});
+            observation.checkpoint_evidence()
+        },
     );
     let Some(before) = candidate.estimate_token_count(&turn_context.model_info.input_modalities, turn_context.base_instructions.as_ref()) else {
         observation.outcome = "estimate_unavailable";
@@ -4729,6 +4782,7 @@ async fn retire_consumed_tool_outputs_for_context_pressure(
         return false;
     }
     // The rewrite starts a new prefix, so proactive carrying restarts too.
+    observation.published = true;
     sess.state.lock().await.proactive_retirement_carried_tokens = 0;
     sess.discount_retired_context_tokens(saved).await;
     sess.send_token_count_event(turn_context).await;
@@ -5285,6 +5339,7 @@ fn run_sampling_request<'a>(
             retry_state.begin_attempt(&turn_context, ResponsesStreamRequest::Sampling);
             let mut attempt_progress = SamplingAttemptProgress::default();
             let dispatch_before = turn_context.turn_timing_state.latest_model_dispatch_identity();
+            let request_owner = turn_context.turn_timing_state.begin_model_request_owner();
             // The streaming/tool state machine is large in debug builds. Keep its
             // storage off the enclosing turn future without changing poll ownership.
             let attempt_result = Box::pin(try_run_sampling_request(
@@ -5310,6 +5365,7 @@ fn run_sampling_request<'a>(
                 outer_retry_reason,
                 model = %turn_context.model_info.slug))
             .await;
+            drop(request_owner);
             let dispatch_after = turn_context.turn_timing_state.latest_model_dispatch_identity();
             let mcp_auth_scope_changed =
                 matches!(&attempt_result, Err(CodexErr::McpAuthScopeChanged));
@@ -7217,6 +7273,8 @@ fn try_run_sampling_request<'a>(
             final_message_candidate: final_message_candidate.map(|mut candidate| {
                 candidate.completion_attempt_id =
                     format!("{}:{}", generation_id.turn_id, generation_id.ordinal);
+                turn_context.turn_timing_state.record_final_candidate(
+                    &candidate.completion_attempt_id, &candidate.item_id);
                 candidate
             }),
             settled_state,

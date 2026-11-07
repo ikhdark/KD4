@@ -11,7 +11,6 @@ use codex_config::Sourced;
 use codex_config::config_toml::ConfigToml;
 use codex_features::Feature;
 use codex_features::FeatureConfigSource;
-use codex_features::FeatureOverrides;
 use codex_features::Features;
 use codex_features::feature_requirement_for_key;
 use codex_features::user_settable_feature_for_key;
@@ -297,7 +296,6 @@ pub(crate) fn validate_feature_requirements_in_config_toml(
             features: cfg.features.as_ref(),
         },
         FeatureConfigSource::default(),
-        FeatureOverrides::default(),
     );
     ManagedFeatures::from_configured(configured_features, feature_requirements.cloned()).map(|_| ())
 }

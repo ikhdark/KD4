@@ -89,6 +89,11 @@ pub trait RequestTelemetry: Send + Sync {
     /// fabricated duration or reuse result.
     fn on_transport_phase(&self, _attempt: u64, _observation: TransportPhaseObservation) {}
 
+    /// Only connector/socket-sourced endpoints; the opaque default driver
+    /// emits no intervals rather than deriving them from application waits.
+    fn on_transport_interval(&self, _attempt: u64,
+        _observation: codex_http_client::TransportIntervalObservation) {}
+
     /// Enriches an existing phase callback, not an additional telemetry event.
     fn on_transport_phase_with_timing(
         &self,

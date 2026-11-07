@@ -784,6 +784,7 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
                     cell_id: self.cell_id.clone(),
                     parent_tool_call_id: self.parent_tool_call_id.clone(),
                     runtime_tool_call_id: invocation.id,
+                    causal_predecessors: invocation.causal_predecessors,
                     buffered_output_bytes: invocation.buffered_output_bytes,
                     tool_name: invocation.name,
                     tool_kind: invocation.kind,

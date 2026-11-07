@@ -219,7 +219,6 @@ async fn handle_spawn_agent(
     let session_source = turn.session_source.clone();
     let child_depth = next_thread_spawn_depth(&session_source);
     let mut config = build_agent_spawn_config_for_step(&step_context)?;
-    let parent_service_tier = inherit_live_service_tier(&session, &mut config).await;
     // Admission and worktree allocation are host-only. Resolve the same step
     // authority used by native tools before touching the local task store.
     let primary = crate::tools::handlers::wait_for_observed_tool_environment(
@@ -266,7 +265,6 @@ async fn handle_spawn_agent(
         &session,
         turn.as_ref(),
         &mut config,
-        parent_service_tier.as_deref(),
         args.service_tier.as_deref(),
     )
     .await?;
@@ -727,6 +725,12 @@ async fn handle_spawn_agent(
     }
     typed_reservation_metric.mark_retained();
     let new_thread_id = spawned_agent.thread_id;
+    if codex_protocol::timing::observations::enabled() {
+        turn.turn_timing_state.observe_runtime("agent_spawned", &call_id, serde_json::json!({
+            "parent_thread_id":session.thread_id, "parent_turn_id":turn.sub_id,
+            "child_thread_id":new_thread_id, "assignment_id":typed_task.0.assignment_id.to_string(),
+            "agent_path":new_agent_path.to_string()}));
+    }
     let agent_snapshot = session
         .services
         .agent_control

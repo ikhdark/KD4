@@ -8,7 +8,6 @@ use crate::codex_thread::CodexThread;
 use crate::config::Config;
 use crate::config::PermissionProfileSnapshot;
 use crate::config::ThreadStoreConfig;
-use crate::current_time::TimeProvider;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::environment_selection::default_thread_environment_selections;
 use crate::mcp::McpManager;
@@ -289,6 +288,9 @@ pub(crate) struct ResumeThreadWithHistoryOptions {
 pub(crate) struct ThreadManagerState {
     threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>,
     pub(crate) model_http_clients: Arc<crate::client::SharedModelHttpClients>,
+    root_service_tiers: std::sync::Mutex<
+        HashMap<codex_protocol::SessionId, std::sync::Weak<arc_swap::ArcSwapOption<String>>>,
+    >,
     thread_registry_leases: std::sync::Mutex<HashMap<ThreadId, std::sync::Weak<AsyncMutex<()>>>>,
     removing_threads: Arc<std::sync::Mutex<HashSet<ThreadId>>>,
     thread_created_tx: broadcast::Sender<ThreadId>,
@@ -307,7 +309,6 @@ pub(crate) struct ThreadManagerState {
     thread_store: Arc<dyn ThreadStore>,
     agent_graph_store: Option<Arc<dyn AgentGraphStore>>,
     attestation_provider: Option<Arc<dyn AttestationProvider>>,
-    external_time_provider: Option<Arc<dyn TimeProvider>>,
     session_source: SessionSource,
     installation_id: String,
     analytics_events_client: Option<AnalyticsEventsClient>,
@@ -599,7 +600,6 @@ impl ThreadManager {
         agent_graph_store: Option<Arc<dyn AgentGraphStore>>,
         installation_id: String,
         attestation_provider: Option<Arc<dyn AttestationProvider>>,
-        external_time_provider: Option<Arc<dyn TimeProvider>>,
     ) -> Self {
         let codex_home = config.codex_home.clone();
         let restriction_product = session_source.restriction_product();
@@ -622,6 +622,7 @@ impl ThreadManager {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 model_http_clients: Default::default(),
+                root_service_tiers: Default::default(),
                 thread_registry_leases: std::sync::Mutex::new(HashMap::new()),
                 thread_created_tx,
                 thread_created_instances: std::sync::Mutex::new(HashMap::new()),
@@ -643,7 +644,6 @@ impl ThreadManager {
                 thread_store,
                 agent_graph_store,
                 attestation_provider,
-                external_time_provider,
                 auth_manager,
                 session_source,
                 installation_id,
@@ -1510,6 +1510,27 @@ impl ThreadManager {
 }
 
 impl ThreadManagerState {
+    /// Reattached workers can have a fresh control handle, but must retain the
+    /// same root preference. Weak entries do not keep closed trees alive.
+    pub(crate) fn root_service_tier_for_session(
+        &self,
+        session_id: codex_protocol::SessionId,
+    ) -> Arc<arc_swap::ArcSwapOption<String>> {
+        let mut tiers = self
+            .root_service_tiers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tiers.retain(|_, tier| tier.strong_count() > 0);
+        tiers
+            .get(&session_id)
+            .and_then(std::sync::Weak::upgrade)
+            .unwrap_or_else(|| {
+                let tier = Arc::new(arc_swap::ArcSwapOption::default());
+                tiers.insert(session_id, Arc::downgrade(&tier));
+                tier
+            })
+    }
+
     pub(crate) async fn enqueue_queue_only_communication(
         &self,
         _thread_id: ThreadId,
@@ -2528,7 +2549,6 @@ impl ThreadManagerState {
             analytics_events_client: self.analytics_events_client.clone(),
             thread_store: Arc::clone(&self.thread_store),
             attestation_provider: self.attestation_provider.clone(),
-            external_time_provider: self.external_time_provider.clone(),
             inherited_multi_agent_version: multi_agent_version,
         }))
         .await?;

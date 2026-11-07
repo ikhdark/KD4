@@ -33,6 +33,7 @@ const MAX_QUEUED_DISPATCHES: usize = 128;
 /// One terminal observation per dequeued invocation, including gate refusal,
 /// cancellation, task abort and unwinding before a child starts.
 struct NestedDispatchObservation {
+    journal: Option<codex_protocol::timing::observations::Span>,
     turn_id: String,
     cell_id: String,
     call_id: String,
@@ -44,6 +45,10 @@ struct NestedDispatchObservation {
 
 impl Drop for NestedDispatchObservation {
     fn drop(&mut self) {
+        if let Some(journal) = self.journal.take() {
+            journal.finish(self.outcome, serde_json::json!({"phase":self.phase,
+                "shared_ns":codex_code_mode::shared_monotonic_now()}));
+        }
         info!(event.name = "codex.code_mode_nested_tool.attempt_terminal",
             turn_id = %self.turn_id, runtime_cell_id = %self.cell_id,
             runtime_tool_call_id = %self.call_id, tool_name = %self.tool_name,
@@ -300,6 +305,12 @@ impl CodeModeDispatchBroker {
                             let runtime_tool_call_id = invocation.runtime_tool_call_id.clone();
                             let tool_name = invocation.tool_name.clone();
                             let mut observation = NestedDispatchObservation {
+                                journal: codex_protocol::timing::observations::enabled().then(||
+                                    codex_protocol::timing::observations::Span::start("nested_dispatch",
+                                        &host.exec.session.thread_id.to_string(), &host.exec.turn.sub_id,
+                                        &runtime_tool_call_id, serde_json::json!({"cell_id":cell_id.to_string(),
+                                            "shared_ns":codex_code_mode::shared_monotonic_now(),
+                                            "queue_started_process_ns":codex_protocol::timing::process_monotonic_ns_at(enqueued_at)}))),
                                 turn_id: host.exec.turn.sub_id.clone(),
                                 cell_id: cell_id.to_string(),
                                 call_id: runtime_tool_call_id.clone(),

@@ -8,6 +8,7 @@ const LIMIT: usize = 1024;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct Capture {
+    pub(super) observation_scope: String,
     pub(super) app_server: super::app_server::Capture,
     pub(super) performance: super::performance::Capture,
     pub(super) operations: super::operations::Capture,
@@ -19,6 +20,9 @@ pub(super) struct Capture {
     outputs: BTreeMap<String, Value>,
     annotations: BTreeMap<String, Value>,
     dependency_annotations: BTreeMap<String, Value>,
+    nested_dependencies: BTreeMap<String, Value>,
+    causal_agents: Vec<Value>,
+    dropped_causal_records: u64,
     recovery_evidence: Option<Value>,
     dropped_attempts: u64,
     dropped_outputs: u64,
@@ -28,6 +32,18 @@ pub(super) struct Capture {
     actual_artifact_recoveries: u64,
     artifact_recoveries: BTreeMap<String, Value>,
     dropped_artifact_recoveries: u64,
+    actual_context_retirements: u64,
+    context_retirements: BTreeMap<String, Value>,
+    dropped_context_retirements: u64,
+    actual_input_prefixes: u64,
+    input_prefixes: BTreeMap<String, Value>,
+    dropped_input_prefixes: u64,
+    output_exposures: BTreeMap<String, Value>,
+    output_exposure_edges: usize,
+    dropped_output_exposures: u64,
+    final_candidates: BTreeMap<String, Value>,
+    pub(super) request_owner_ends: BTreeMap<String, Value>,
+    pub(super) request_owner_end_count: u64,
 }
 
 fn digest(value: &impl serde::Serialize) -> Option<String> {
@@ -39,6 +55,17 @@ fn text(value: Option<&Value>) -> bool {
 }
 
 impl Capture {
+    pub(super) fn input_prefix(&mut self, attempt: &str, evidence: Value) {
+        self.enabled = true;
+        if self.input_prefixes.contains_key(attempt) { return; }
+        self.actual_input_prefixes = self.actual_input_prefixes.saturating_add(1);
+        if self.input_prefixes.len() >= LIMIT {
+            self.dropped_input_prefixes = self.dropped_input_prefixes.saturating_add(1);
+            return;
+        }
+        self.input_prefixes.insert(attempt.to_owned(), evidence);
+    }
+
     pub(super) fn logical_request(&mut self) {
         self.enabled = true;
         self.actual_logical_requests = self.actual_logical_requests.saturating_add(1);
@@ -242,6 +269,10 @@ impl Capture {
         (Some(json!({
             "schemaVersion":1,
             "dependencyNodes":self.dependency_annotations.values().collect::<Vec<_>>(),
+            "nestedDependencies":{"complete":self.dropped_causal_records == 0,
+                "rows":self.nested_dependencies.values().collect::<Vec<_>>()},
+            "causalAgents":{"complete":self.dropped_causal_records == 0,
+                "rows":self.causal_agents},
             "requests":{"complete":annotations.len() as u64 == self.actual_logical_requests,
                         "actualCount":self.actual_logical_requests, "rows":annotations},
             "outputs":{"complete":self.dropped_outputs == 0, "actualCount":self.actual_outputs,
@@ -250,17 +281,205 @@ impl Capture {
                 "actualCount":self.actual_nested_results,
                 "rows":self.nested_results.values().collect::<Vec<_>>(),
                 "scope":"settled_native_code_mode_results_before_script_and_outer_display_projection"},
+            "requestOwnerClosures":{"schemaVersion":1,
+                "complete":self.request_owner_ends.len() as u64 == self.request_owner_end_count,
+                "actualCount":self.request_owner_end_count,
+                "rows":self.request_owner_ends.values().collect::<Vec<_>>()},
             "artifactRecoveries":{"complete":self.dropped_artifact_recoveries == 0 && self.actual_artifact_recoveries != u64::MAX,
                 "actualCount":self.actual_artifact_recoveries,
                 "rows":self.artifact_recoveries.values().collect::<Vec<_>>(),
                 "scope":"read_tool_output_attempts; audit_only excluded; not exhaustive recovery"},
+            "contextRetirements":{"complete":self.dropped_context_retirements == 0 && self.actual_context_retirements != u64::MAX,
+                "actualCount":self.actual_context_retirements,
+                "rows":self.context_retirements.values().collect::<Vec<_>>(),
+                "scope":"runtime pressure/proactive selection; explicit phase checkpoints and compaction are separate owners"},
+            "requestInputPrefixes":{"complete":self.dropped_input_prefixes == 0 && self.actual_input_prefixes != u64::MAX,
+                "actualCount":self.actual_input_prefixes,
+                "rows":self.input_prefixes.values().collect::<Vec<_>>(),
+                "scope":"optional actual transport input comparison; websocket deltas are not full logical prompts"},
+            "requestOutputExposures":{"complete":self.dropped_output_exposures == 0,
+                "rows":self.output_exposures.values().collect::<Vec<_>>(),
+                "droppedRequests":self.dropped_output_exposures,
+                "scope":"optional effective logical input of dispatched attempts; missing rows are unknown"},
             "capture":{"scope":"tool_runtime_results_before_caller_display", "droppedOutputs":self.dropped_outputs,
                 "semanticLabels":"explicit_referenced_assertions_not_automatic_waste_verdicts"}
         })), Some(recovery))
     }
 }
 
+/// Logical sampling-future ownership, not HTTP headers or provider completion.
+#[must_use]
+pub struct ModelRequestOwnerGuard {
+    timing: Arc<TurnTimingState>,
+    generation: Option<u32>,
+}
+
+impl Drop for ModelRequestOwnerGuard {
+    fn drop(&mut self) {
+        self.timing.record_sampling_future_end(self.generation);
+    }
+}
+
 impl TurnTimingState {
+    pub fn begin_model_request_owner(self: &Arc<Self>) -> ModelRequestOwnerGuard {
+        let generation = self.state().current_generation_index;
+        ModelRequestOwnerGuard { timing: Arc::clone(self), generation }
+    }
+
+    fn record_sampling_future_end(&self, generation: Option<u32>) {
+        let sample = self.clock.sample();
+        let mut state = self.state();
+        let end_ms = state
+            .elapsed_since_start(sample.time.monotonic_ns)
+            .map(u128_to_u64_ms);
+        state.measurements.request_owner_end_count = state.measurements.request_owner_end_count.saturating_add(1);
+        let closure = state.model_requests.last()
+            .filter(|request| Some(request.generation_index) == generation)
+            .and_then(|request| Some((request.sampling_request_id.clone()?, json!({
+                "samplingRequestId":request.sampling_request_id,
+                "physicalAttemptIds":request.physical_attempt_ids,
+                "dispatchMs":request.dispatch_ns.map(u128_to_u64_ms), "ownerEndMs":end_ms,
+                "providerCompleted":request.completed_ns.is_some(),
+                "basis":"sampling_future_scope_exit"}))));
+        if let Some((id, closure)) = closure {
+            if state.measurements.request_owner_ends.len() < LIMIT {
+                state.measurements.request_owner_ends.insert(id.clone(), closure.clone());
+            }
+            drop(state);
+            self.observe_runtime("model_owner_finished", &id, closure);
+        } else {
+            drop(state);
+            self.observe_runtime("model_owner_unidentified", "", json!({"generation":generation}));
+        }
+    }
+
+    /// Runtime-owned async provenance, independent of model arguments or text.
+    pub fn record_nested_dependencies(&self, cell: &str, call: &str, parent: Option<&str>,
+                                      predecessors: Option<Vec<String>>) {
+        let mut state = self.state();
+        if state.completed_snapshot.is_some() { return; }
+        let capture = &mut state.measurements;
+        capture.enabled = true;
+        let key = format!("{cell}:{call}");
+        if capture.nested_dependencies.len() >= LIMIT || capture.nested_dependencies.contains_key(&key) {
+            capture.dropped_causal_records = capture.dropped_causal_records.saturating_add(1);
+            return;
+        }
+        let predecessors = predecessors.filter(|rows| rows.len() <= 128
+            && rows.iter().all(|id| !id.is_empty() && id.len() <= 256));
+        capture.nested_dependencies.insert(key, json!({"cellId":cell, "runtimeCallId":call,
+            "parentCallId":parent, "predecessors":predecessors}));
+    }
+
+    pub fn record_nested_result_release(&self, cell: &str, call: &str) {
+        let at = self.monotonic_offset_ms();
+        let mut state = self.state();
+        if state.completed_snapshot.is_some() { return; }
+        if let Some(row) = state.measurements.nested_dependencies.get_mut(&format!("{cell}:{call}")) {
+            row["releasedAtMs"] = json!(at);
+        }
+    }
+
+    /// The spawn/wait owner supplies the actual child identity and execution.
+    /// `at_ms` is captured before launch for forks, at observed settlement for joins.
+    pub fn record_causal_agent(&self, kind: &str, child: &str, execution: &str, at_ms: u64) {
+        let mut state = self.state();
+        if state.completed_snapshot.is_some() { return; }
+        let capture = &mut state.measurements;
+        capture.enabled = true;
+        if capture.causal_agents.len() >= LIMIT || !matches!(kind, "spawn" | "join") {
+            capture.dropped_causal_records = capture.dropped_causal_records.saturating_add(1);
+            return;
+        }
+        capture.causal_agents.push(json!({"kind":kind, "childSession":child,
+            "executionId":execution, "atMs":at_ms}));
+    }
+
+    pub fn observe_runtime(&self, kind: &str, operation: &str, data: Value) {
+        if !codex_protocol::timing::observations::enabled() { return; }
+        let scope = self.state().measurements.observation_scope.clone();
+        if !scope.is_empty() {
+            let _ = codex_protocol::timing::observations::record(kind, "", &scope, operation, data);
+        }
+    }
+
+    pub fn bind_runtime_observations(&self, thread: &str, turn: &str) {
+        if !codex_protocol::timing::observations::enabled() { return; }
+        let state = self.state();
+        let scope = state.measurements.observation_scope.clone();
+        let origin = state.started_sample.map(|sample| sample.time.monotonic_ns);
+        drop(state);
+        let _ = codex_protocol::timing::observations::record("scope_bound", thread, turn, &scope,
+            json!({"origin_ns":origin}));
+    }
+
+    /// Bind the output at its originating completion owner, before later
+    /// completion hooks/steering can accept or discard it. Never pick the last
+    /// request at terminal publication as a substitute for this association.
+    pub fn record_final_candidate(&self, completion: &str, item: &str) {
+        let Some(identity) = self.latest_model_dispatch_identity() else { return; };
+        let mut state = self.state();
+        if state.measurements.final_candidates.len() < LIMIT {
+            state.measurements.final_candidates.insert(completion.into(), json!({
+                "completionAttemptId":completion, "itemId":item,
+                "samplingRequestId":identity.sampling_request_id,
+                "physicalAttemptId":identity.physical_attempt_id,
+                "basis":"native_originating_completion_owner_v1"}));
+        }
+    }
+
+    pub fn accepted_final_request(&self, message: Option<&codex_protocol::protocol::AcceptedFinalMessage>) -> Value {
+        let Some(message) = message else { return json!({"status":"no_accepted_message"}); };
+        let state = self.state();
+        match state.measurements.final_candidates.get(&message.completion_attempt_id)
+            .filter(|row| row["itemId"].as_str() == Some(message.item_id.as_str())) {
+            Some(row) => { let mut row = row.clone(); row["status"] = json!("accepted"); row },
+            None => json!({"status":"unavailable", "reason":"originating_request_not_recorded"}),
+        }
+    }
+
+    pub fn record_model_output_exposures(&self, request: &str, attempt: &str, outputs: Vec<Value>, complete: bool) {
+        let mut state = self.state();
+        let capture = &mut state.measurements;
+        capture.enabled = true;
+        if capture.output_exposures.contains_key(attempt) { return; }
+        if capture.output_exposures.len() >= LIMIT || capture.output_exposure_edges + outputs.len() > 16_384 {
+            capture.dropped_output_exposures = capture.dropped_output_exposures.saturating_add(1);
+            return;
+        }
+        capture.output_exposure_edges += outputs.len();
+        capture.output_exposures.insert(attempt.to_owned(), json!({
+            "request_id":request, "attempt_id":attempt, "outputs":outputs, "complete":complete,
+            "basis":"effective_logical_input_for_dispatched_attempt_v1",
+        }));
+        state.refresh_completed_request_diagnostics();
+    }
+
+    pub fn record_context_retirement(&self, event: &str, started: std::time::Instant, facts: Value) {
+        let mut state = self.state();
+        if state.completed_snapshot.is_some() { return; }
+        let start_ns = codex_protocol::timing::process_monotonic_ns_at(started)
+            .filter(|_| self.clock.domain_id() == Some(codex_protocol::timing::process_clock_domain_id()))
+            .and_then(|at| at.checked_sub(state.started_sample?.time.monotonic_ns));
+        let end_ms = state.started_sample.and_then(|start| self.clock.sample().time.monotonic_ns
+            .checked_sub(start.time.monotonic_ns)).map(u128_to_u64_ms);
+        let preceding = start_ns.and_then(|at| state.model_requests.iter().rev()
+            .find(|request| request.dispatch_ns.is_some_and(|dispatch| dispatch <= at)))
+            .and_then(|request| request.sampling_request_id.clone());
+        let capture = &mut state.measurements;
+        capture.enabled = true;
+        capture.actual_context_retirements = capture.actual_context_retirements.saturating_add(1);
+        if capture.context_retirements.len() >= LIMIT || capture.context_retirements.contains_key(event) {
+            capture.dropped_context_retirements = capture.dropped_context_retirements.saturating_add(1);
+            return;
+        }
+        capture.context_retirements.insert(event.to_owned(), json!({
+            "event_id":event, "after_request_id":preceding,
+            "start_ms":start_ns.map(u128_to_u64_ms), "end_ms":end_ms,
+            "clock_id":self.clock.domain_id(), "facts":facts,
+        }));
+    }
+
     /// Reuse the byte count from the actual nested-result serializer. This is
     /// not canonical artifact size, caller-visible text, or provider tokens.
     pub fn record_native_nested_result(&self, call: &str, cell: &str, runtime_call: &str,
@@ -287,11 +506,14 @@ impl TurnTimingState {
     pub fn record_artifact_recovery(&self, call: &str, started: std::time::Instant, facts: Value) {
         let mut state = self.state();
         if state.completed_snapshot.is_some() { return; }
-        let start_ms = codex_protocol::timing::process_monotonic_ns_at(started)
+        let start_ns = codex_protocol::timing::process_monotonic_ns_at(started)
             .filter(|_| self.clock.domain_id() == Some(codex_protocol::timing::process_clock_domain_id()))
-            .and_then(|at| at.checked_sub(state.started_sample?.time.monotonic_ns)).map(u128_to_u64_ms);
+            .and_then(|at| at.checked_sub(state.started_sample?.time.monotonic_ns));
         let end_ms = state.started_sample.and_then(|start| self.clock.sample().time.monotonic_ns
             .checked_sub(start.time.monotonic_ns)).map(u128_to_u64_ms);
+        let preceding = start_ns.and_then(|at| state.model_requests.iter().rev()
+            .find(|request| request.dispatch_ns.is_some_and(|dispatch| dispatch <= at)))
+            .and_then(|request| request.sampling_request_id.clone());
         let capture = &mut state.measurements;
         capture.enabled = true;
         capture.actual_artifact_recoveries = capture.actual_artifact_recoveries.saturating_add(1);
@@ -301,15 +523,32 @@ impl TurnTimingState {
         }
         capture.artifact_recoveries.insert(call.to_owned(), json!({
             "event_id":format!("artifact:{call}"), "call_id":call,
-            "mechanism":"artifact_retrieval", "start_ms":start_ms, "end_ms":end_ms,
+            "after_request_id":preceding,
+            "mechanism":"artifact_retrieval", "start_ms":start_ns.map(u128_to_u64_ms), "end_ms":end_ms,
             "clock_id":self.clock.domain_id(), "facts":facts,
             "evidence_ref":format!("native:artifact-recovery:{call}")
         }));
+        drop(state);
+        if codex_protocol::timing::observations::enabled() {
+            self.observe_runtime("recovery_artifact_attempt", call, json!({
+                "started_ms":start_ns.map(u128_to_u64_ms), "ended_ms":end_ms,
+                "basis":"read_tool_output_owner_includes_failed_and_abandoned_attempts"}));
+        }
     }
 
     pub fn record_model_context_sha256(&self, hash: String) {
-        if let Some(request) = self.state().model_requests.last_mut() {
-            request.logical_context_sha256 = Some(hash);
+        let mut state = self.state();
+        let generation = state.current_generation_index;
+        let request = state.model_requests.last_mut()
+            .filter(|request| Some(request.generation_index) == generation);
+        let identity = if let Some(request) = request {
+            request.logical_context_sha256 = Some(hash.clone());
+            request.sampling_request_id.clone()
+        } else { None };
+        drop(state);
+        if codex_protocol::timing::observations::enabled() {
+            self.observe_runtime("model_logical_identity", identity.as_deref().unwrap_or_default(),
+                json!({"logical_context_sha256":hash, "basis":"full_logical_prompt_v1_before_transport_delta"}));
         }
     }
 

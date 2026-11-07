@@ -19,6 +19,7 @@ use codex_protocol::protocol::SessionSource;
 use serde_json::Value;
 use serde_json::json;
 use std::error::Error;
+use std::collections::BTreeSet;
 use std::io::BufRead;
 use std::io::Read;
 use std::io::Write;
@@ -151,6 +152,9 @@ async fn run() -> Result<(), Failure> {
     let mut failure: Option<Failure> = None;
     let mut cleanup_failures = Vec::new();
     let mut input_closed = false;
+    let mut eof_deadline = None;
+    let mut started_threads = BTreeSet::new();
+    let mut pending_thread_starts = BTreeSet::new();
     loop {
         let result: Result<bool, Failure> = async {
             tokio::select! {
@@ -159,8 +163,18 @@ async fn run() -> Result<(), Failure> {
                     output.map_err(|_| "stdout owner dropped")??;
                     return Err("stdout owner ended before admission closed".into());
                 }
+                _ = async {
+                    match eof_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                }, if input_closed => return Err("admitted EOF request/event drain exceeded five seconds".into()),
                 incoming = input_rx.recv(), if !input_closed => {
-                    let Some(incoming) = incoming else { input_closed = true; return Ok(true) };
+                    let Some(incoming) = incoming else {
+                        input_closed = true;
+                        eof_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(5));
+                        return Ok(true)
+                    };
                     let value: Value = incoming.map_err(std::io::Error::other)?;
                     let id = value.get("id").cloned().unwrap_or(Value::Null);
                     match value.get("method").and_then(Value::as_str) {
@@ -198,13 +212,15 @@ async fn run() -> Result<(), Failure> {
                                 return Ok(true);
                             }
                             let request: ClientRequest = serde_json::from_value(value)?;
+                            let starts_thread = request.method_name() == "thread/start";
                             let handle = client.as_ref().ok_or("client retired")?.request_handle();
                             requests.spawn(async move {
-                                match handle.request(request).await {
+                                let response = match handle.request(request).await {
                                     Ok(Ok(result)) => json!({"id":id,"result":result}),
                                     Ok(Err(error)) => json!({"id":id,"error":error}),
                                     Err(error) => json!({"id":id,"error":{"code":-32000,"message":error.to_string()}}),
-                                }
+                                };
+                                (response, starts_thread)
                             });
                         },
                         None => {
@@ -221,7 +237,16 @@ async fn run() -> Result<(), Failure> {
                     Some(client) => client.next_event().await,
                     None => std::future::pending().await,
                 }} => match event {
-                    Some(InProcessServerEvent::ServerNotification(notification)) => emit(&output_tx, serde_json::to_value(notification)?)?,
+                    Some(InProcessServerEvent::ServerNotification(notification)) => {
+                        let value = serde_json::to_value(notification)?;
+                        if value["method"] == "thread/started"
+                            && let Some(thread) = value["params"]["thread"]["id"].as_str()
+                            && !pending_thread_starts.remove(thread)
+                        {
+                            started_threads.insert(thread.to_owned());
+                        }
+                        emit(&output_tx, value)?;
+                    },
                     Some(InProcessServerEvent::ServerRequest(request)) => {
                         if input_closed {
                             client.as_ref().ok_or("client retired")?.reject_server_request(request.id().clone(),
@@ -232,7 +257,13 @@ async fn run() -> Result<(), Failure> {
                     None => return Err("in-process event stream ended before shutdown".into()),
                 },
                 result = requests.join_next(), if !requests.is_empty() => {
-                    emit(&output_tx, result.ok_or("missing request owner")??)?;
+                    let (response, starts_thread) = result.ok_or("missing request owner")??;
+                    if starts_thread && let Some(thread) = response["result"]["thread"]["id"].as_str()
+                        && !started_threads.remove(thread)
+                    {
+                        pending_thread_starts.insert(thread.to_owned());
+                    }
+                    emit(&output_tx, response)?;
                 },
             }
             Ok(true)
@@ -245,7 +276,7 @@ async fn run() -> Result<(), Failure> {
                 break;
             }
         }
-        if input_closed && requests.is_empty() {
+        if input_closed && requests.is_empty() && pending_thread_starts.is_empty() {
             if let Some(client) = client.as_mut() {
                 // Drain already admitted final events before explicit retirement.
                 while let Some(Some(event)) = client.next_event().now_or_never() {
@@ -270,7 +301,7 @@ async fn run() -> Result<(), Failure> {
         else { cleanup_failures.push(error.to_string()); }
     }
     while let Some(result) = requests.join_next().await {
-        let result = result.map_err(|error| -> Failure { error.into() }).and_then(|value| emit(&output_tx, value));
+        let result = result.map_err(|error| -> Failure { error.into() }).and_then(|(value, _)| emit(&output_tx, value));
         if let Err(error) = result {
             if failure.is_none() { failure = Some(error); }
             else { cleanup_failures.push(error.to_string()); }

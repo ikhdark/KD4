@@ -15,7 +15,7 @@ use crate::context::world_state::WorldStateSnapshot;
 use crate::context_manager::ContextManager;
 use crate::session::PreviousTurnSettings;
 use crate::session::session::SessionConfiguration;
-use crate::session::time_reminder::CurrentTimeReminderState;
+use crate::session::workflow_checkpoint::WorkflowCheckpointState;
 use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
 use crate::session_startup_prewarm::SessionStartupTransportHandle;
 use crate::tool_history::ModelGenerationId;
@@ -192,7 +192,7 @@ pub(crate) struct SessionState {
     pub(crate) startup_prewarm: Option<SessionStartupPrewarmHandle>,
     /// Transport-only preconnect scheduled before MCP/tool initialization.
     pub(crate) startup_transport: Option<SessionStartupTransportHandle>,
-    pub(crate) current_time_reminder: CurrentTimeReminderState,
+    pub(crate) workflow_checkpoint: WorkflowCheckpointState,
     pub(crate) active_connector_selection: HashSet<String>,
     pub(crate) pending_session_start_sources: VecDeque<codex_hooks::SessionStartSource>,
     granted_permissions_by_approval_scope_id: HashMap<String, UriAdditionalPermissionProfile>,
@@ -223,7 +223,7 @@ impl SessionState {
             auto_compact_window: AutoCompactWindow::new_with_ids(auto_compact_window_ids),
             startup_prewarm: None,
             startup_transport: None,
-            current_time_reminder: CurrentTimeReminderState::default(),
+            workflow_checkpoint: WorkflowCheckpointState::default(),
             active_connector_selection: HashSet::new(),
             pending_session_start_sources: VecDeque::new(),
             granted_permissions_by_approval_scope_id: HashMap::new(),

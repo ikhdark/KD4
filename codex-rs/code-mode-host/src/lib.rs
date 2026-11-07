@@ -70,13 +70,16 @@ where
 {
     let mut reader = FramedReader::new(reader);
     let mut writer = FramedWriter::new(writer);
-    if !negotiate(&mut reader, &mut writer).await? {
+    let Some(capabilities) = negotiate(&mut reader, &mut writer).await? else {
         return Ok(());
-    }
+    };
 
     let (outgoing_tx, mut outgoing_rx) =
         mpsc::channel::<peer::OutgoingFrame>(OUTGOING_FRAME_CAPACITY);
-    let peer = Arc::new(HostPeer::new(outgoing_tx));
+    let causal_capability = codex_code_mode_protocol::host::Capability::new(
+        codex_code_mode_protocol::host::CAUSAL_INPUTS_CAPABILITY,
+    )?;
+    let peer = Arc::new(HostPeer::new(outgoing_tx, capabilities.contains(&causal_capability)));
     let state = Arc::new(HostState {
         catalogs: Mutex::new(HashMap::new()),
         sessions: Mutex::new(HashMap::new()),
@@ -185,7 +188,7 @@ where
     Ok(())
 }
 
-async fn negotiate<R, W>(reader: &mut FramedReader<R>, writer: &mut FramedWriter<W>) -> Result<bool>
+async fn negotiate<R, W>(reader: &mut FramedReader<R>, writer: &mut FramedWriter<W>) -> Result<Option<CapabilitySet>>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -195,7 +198,7 @@ where
         .await
         .context("failed to read code-mode client hello")?
     else {
-        return Ok(false);
+        return Ok(None);
     };
     let ClientToHost::ClientHello(client_hello) = first_message else {
         writer
@@ -206,7 +209,7 @@ where
             })
             .await
             .context("failed to reject invalid code-mode client hello")?;
-        return Ok(false);
+        return Ok(None);
     };
 
     let supported_versions = SupportedProtocolVersions::try_new([ProtocolVersion::V1])?;
@@ -220,7 +223,7 @@ where
             })
             .await
             .context("failed to reject incompatible code-mode client")?;
-        return Ok(false);
+        return Ok(None);
     }
 
     let catalog_capability = codex_code_mode_protocol::host::Capability::new(
@@ -232,8 +235,12 @@ where
     let receipt_capability = codex_code_mode_protocol::host::Capability::new(
         codex_code_mode_protocol::host::RECEIPT_RECOVERY_CAPABILITY,
     )?;
-    let supported_capabilities =
-        CapabilitySet::try_new([catalog_capability, state_capability, receipt_capability])?;
+    let causal_capability = codex_code_mode_protocol::host::Capability::new(
+        codex_code_mode_protocol::host::CAUSAL_INPUTS_CAPABILITY,
+    )?;
+    let supported_capabilities = CapabilitySet::try_new([
+        catalog_capability, state_capability, receipt_capability, causal_capability,
+    ])?;
     if let Some(capability) = client_hello
         .required_capabilities()
         .iter()
@@ -247,7 +254,7 @@ where
             })
             .await
             .context("failed to reject unsupported code-mode capability")?;
-        return Ok(false);
+        return Ok(None);
     }
 
     let host_capabilities = CapabilitySet::try_new(
@@ -262,11 +269,11 @@ where
     writer
         .write(&HostToClient::HostHello(HostHello::new(
             ProtocolVersion::V1,
-            host_capabilities,
+            host_capabilities.clone(),
         )))
         .await
         .context("failed to write code-mode host hello")?;
-    Ok(true)
+    Ok(Some(host_capabilities))
 }
 
 // None is a closing-session tombstone: registration cannot recreate a catalog

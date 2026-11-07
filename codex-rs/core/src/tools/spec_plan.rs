@@ -17,7 +17,6 @@ use crate::tools::handlers::ClassifyPathsHandler;
 use crate::tools::handlers::CodeModeExecuteHandler;
 use crate::tools::handlers::CodeModeWaitHandler;
 use crate::tools::handlers::CompareArtifactsHandler;
-use crate::tools::handlers::CurrentTimeHandler;
 use crate::tools::handlers::DynamicToolHandler;
 use crate::tools::handlers::ExecCommandHandler;
 use crate::tools::handlers::ExecCommandHandlerOptions;
@@ -39,7 +38,6 @@ use crate::tools::handlers::RequestPluginInstallHandler;
 use crate::tools::handlers::RequestUserInputHandler;
 use crate::tools::handlers::ShellCommandHandler;
 use crate::tools::handlers::ShellCommandHandlerOptions;
-use crate::tools::handlers::SleepHandler;
 use crate::tools::handlers::ToolSearchHandler;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::ViewImageHandler;
@@ -1633,19 +1631,6 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     {
         planned_tools
             .add_with_authorization_class(RequestPermissionsHandler, TypedToolClass::OwnTask);
-    }
-
-    if features.enabled(Feature::CurrentTimeReminder) {
-        planned_tools.add_with_authorization_class(CurrentTimeHandler, TypedToolClass::ReadSearch);
-        if turn_context
-            .config
-            .current_time_reminder
-            .as_ref()
-            .is_some_and(|config| config.sleep_tool)
-        {
-            planned_tools
-                .add_with_authorization_class(SleepHandler, TypedToolClass::CodeModeControl);
-        }
     }
 
     let plugin_install_exposure = if search_tool_enabled(turn_context) {

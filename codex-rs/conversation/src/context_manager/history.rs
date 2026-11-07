@@ -177,6 +177,14 @@ impl PreparedPromptItems {
 
 pub type SharedPromptProjections = [Arc<[ResponseItem]>; 4];
 
+/// Immutable preparation inputs for offline retirement/request reconstruction.
+/// This sidecar never enters a provider prompt or mutates the live ledger.
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+pub struct SamplingReplaySnapshot {
+    pub canonical_history: Arc<Vec<ResponseItem>>,
+    pub tool_history_state: Arc<ToolHistoryState>,
+}
+
 #[derive(Clone, Debug)]
 pub struct PreparedPromptInput {
     items: PreparedPromptItems,
@@ -189,9 +197,14 @@ pub struct PreparedPromptInput {
     prompt_provenance: PromptProvenanceSidecar,
     fingerprint: Option<PreparedHistoryFingerprint>,
     policy: PreparedHistoryPolicy,
+    replay_snapshot: SamplingReplaySnapshot,
 }
 
 impl PreparedPromptInput {
+    pub fn sampling_replay_snapshot(&self) -> SamplingReplaySnapshot {
+        self.replay_snapshot.clone()
+    }
+
     pub fn items(&self) -> &[ResponseItem] {
         self.items.as_slice()
     }
@@ -263,7 +276,7 @@ impl PreparedHistoryFingerprint {
             StableContextTarget::Sampling => 1,
             StableContextTarget::FailOpen => 0,
         }]);
-        // Hashed only when enabled so default fingerprints stay unchanged.
+        // Keep disabled-policy fingerprints compatible with pre-feature history.
         if policy.pressure_reasoning_retirement {
             hasher.update(b"pressure_reasoning_retirement");
         }
@@ -438,7 +451,7 @@ pub struct ContextManager {
     realized_context_baseline: RealizedContextBaseline,
     /// World state most recently appended to model-visible history.
     world_state_baseline: Option<Arc<WorldStateSnapshot>>,
-    /// Opt-in `pressure_reasoning_retirement`: sampling prompts leave out
+    /// When `pressure_reasoning_retirement` is enabled, sampling prompts leave out
     /// reasoning older than the generations the latest context-pressure
     /// retirement kept. Stored history keeps every item.
     pressure_reasoning_retirement: bool,
@@ -647,6 +660,7 @@ impl ContextManager {
         input_modalities: &[InputModality],
         stable_context_target: StableContextTarget,
     ) -> PreparedPromptInput {
+        let replay_snapshot = self.sampling_replay_snapshot();
         let policy = PreparedHistoryPolicy {
             version: PREPARED_HISTORY_POLICY_VERSION,
             supports_images: input_modalities.contains(&InputModality::Image),
@@ -672,10 +686,12 @@ impl ContextManager {
                     .with_local_reused(/*local_reused*/ true);
                 entry.prepared.clone()
             });
-        if let Some(prepared) = prepared {
+        if let Some(mut prepared) = prepared {
             if let Some(metrics) = codex_otel::global() {
                 let _ = metrics.counter("codex.history.prepared_cache", 1, &[("result", "hit")]);
             }
+            // Consumption/failure state can advance without changing prompt bytes.
+            prepared.replay_snapshot = replay_snapshot;
             return prepared;
         }
         if let Some(metrics) = codex_otel::global() {
@@ -759,6 +775,7 @@ impl ContextManager {
             prompt_provenance,
             fingerprint,
             policy,
+            replay_snapshot,
         };
         if prepared.fingerprint.is_some() {
             *self
@@ -1016,6 +1033,13 @@ impl ContextManager {
         &self.tool_history
     }
 
+    pub fn sampling_replay_snapshot(&self) -> SamplingReplaySnapshot {
+        SamplingReplaySnapshot {
+            canonical_history: Arc::clone(&self.items),
+            tool_history_state: Arc::clone(&self.tool_history),
+        }
+    }
+
     pub fn read_status_page(
         &self,
         paths: &[std::path::PathBuf],
@@ -1141,6 +1165,16 @@ impl ContextManager {
             self.items.as_slice(),
             keep_generations,
             target_tokens,
+        )
+    }
+
+    pub fn pressure_retirement_decision(
+        &self,
+        keep_generations: usize,
+        target_tokens: u64,
+    ) -> (Vec<String>, u64, serde_json::Value) {
+        self.tool_history.pressure_retirement_decision(
+            self.items.as_slice(), keep_generations, target_tokens, true,
         )
     }
 
@@ -2006,6 +2040,7 @@ impl ContextManager {
                 prompt_provenance,
                 fingerprint: Some(fingerprint),
                 policy: entry.prepared.policy,
+                replay_snapshot: self.sampling_replay_snapshot(),
             },
             pending_source_items: None,
             pending_append: Vec::new(),

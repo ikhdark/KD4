@@ -54,12 +54,8 @@ use codex_core_plugins::PluginsConfigInput;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::LOCAL_FS;
 use codex_features::CodeModeConfigToml;
-use codex_features::CurrentTimeReminderConfigToml;
-use codex_features::CurrentTimeReminderDeliveryMode;
-use codex_features::CurrentTimeSource;
 use codex_features::Feature;
 use codex_features::FeatureConfigSource;
-use codex_features::FeatureOverrides;
 use codex_features::FeatureToml;
 use codex_features::Features;
 use codex_features::FeaturesToml;
@@ -578,7 +574,7 @@ pub struct Config {
     pub hide_agent_reasoning: bool,
 
     /// When set to `true`, `AgentReasoningRawContentEvent` events will be shown in the UI/output.
-    /// Defaults to `false`.
+    /// Defaults to `true`.
     pub show_raw_agent_reasoning: bool,
 
     /// Base instructions override.
@@ -763,9 +759,9 @@ pub struct Config {
     /// for manually managed history. Canonical rollout items are never changed.
     pub completed_tool_history_projection: bool,
 
-    /// Opt-in: a context-pressure retirement also leaves reasoning older than
+    /// A context-pressure retirement also leaves reasoning older than
     /// its kept generations out of sampling requests. Stored history is
-    /// unchanged. Off until matched real-model A/B benchmarks qualify it.
+    /// unchanged. Enabled by default; set false to retain older reasoning.
     pub pressure_reasoning_retirement: bool,
 
     /// User-configured maximum number of agent threads that can be open concurrently.
@@ -890,9 +886,6 @@ pub struct Config {
     /// Settings specific to the task-path-based multi-agent tool surface.
     pub multi_agent_v2: MultiAgentV2Config,
 
-    /// Current-time reminder and clock tool configuration, when enabled.
-    pub current_time_reminder: Option<CurrentTimeReminderConfig>,
-
     /// Centralized feature flags; source of truth for feature gating.
     pub features: ManagedFeatures,
 
@@ -935,26 +928,6 @@ pub struct Config {
 pub struct CodeModeConfig {
     pub excluded_tool_namespaces: Vec<String>,
     pub direct_only_tool_namespaces: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct CurrentTimeReminderConfig {
-    pub reminder_interval_seconds: u64,
-    pub clock_source: CurrentTimeSource,
-    pub delivery_mode: CurrentTimeReminderDeliveryMode,
-    /// Whether to expose the input-interruptible `clock.sleep` tool.
-    pub sleep_tool: bool,
-}
-
-impl Default for CurrentTimeReminderConfig {
-    fn default() -> Self {
-        Self {
-            reminder_interval_seconds: 1,
-            clock_source: CurrentTimeSource::System,
-            delivery_mode: CurrentTimeReminderDeliveryMode::AnyInference,
-            sleep_tool: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1434,7 +1407,7 @@ impl Config {
                 .enabled(Feature::SkillMcpDependencyInstall),
             approval_policy: self.permissions.approval_policy.clone(),
             apps_enabled: self.features.enabled(Feature::Apps),
-            prefix_mcp_tool_names: self.prefix_mcp_tool_names(),
+            prefix_mcp_tool_names: true,
             client_elicitation_capability: if self.features.enabled(Feature::AuthElicitation) {
                 ElicitationCapability::new()
                     .with_form(FormElicitationCapability::new())
@@ -1450,10 +1423,6 @@ impl Config {
                     loaded_plugins.capability_summaries(),
                 ),
         }
-    }
-
-    pub fn prefix_mcp_tool_names(&self) -> bool {
-        !self.features.enabled(Feature::NonPrefixedMcpToolNames)
     }
 
     pub async fn rebuild_preserving_session_layers(
@@ -2176,7 +2145,6 @@ pub struct ConfigOverrides {
     pub personality: Option<Personality>,
     pub compact_prompt: Option<String>,
     pub show_raw_agent_reasoning: Option<bool>,
-    pub tools_web_search_request: Option<bool>,
     pub ephemeral: Option<bool>,
     pub bypass_hook_trust: Option<bool>,
     /// Additional directories that should be treated as writable roots for this session.
@@ -2227,20 +2195,6 @@ pub fn resolve_oss_provider(
     } else {
         config_toml.oss_provider.clone()
     }
-}
-
-/// Resolve the web search mode from explicit config and feature flags.
-fn resolve_web_search_mode(config_toml: &ConfigToml, features: &Features) -> Option<WebSearchMode> {
-    if let Some(mode) = config_toml.web_search {
-        return Some(mode);
-    }
-    if features.enabled(Feature::WebSearchCached) {
-        return Some(WebSearchMode::Cached);
-    }
-    if features.enabled(Feature::WebSearchRequest) {
-        return Some(WebSearchMode::Live);
-    }
-    None
 }
 
 fn resolve_web_search_config(config_toml: &ConfigToml) -> Option<WebSearchConfig> {
@@ -2348,34 +2302,6 @@ fn resolve_multi_agent_v2_config(config_toml: &ConfigToml) -> MultiAgentV2Config
     }
 }
 
-fn resolve_current_time_reminder_config(
-    config_toml: &ConfigToml,
-    features: &ManagedFeatures,
-) -> std::io::Result<Option<CurrentTimeReminderConfig>> {
-    if !features.enabled(Feature::CurrentTimeReminder) {
-        return Ok(None);
-    }
-
-    let base = current_time_reminder_toml_config(config_toml.features.as_ref());
-    let default = CurrentTimeReminderConfig::default();
-    let reminder_interval_seconds = base
-        .and_then(|config| config.reminder_interval_seconds)
-        .unwrap_or(default.reminder_interval_seconds);
-
-    Ok(Some(CurrentTimeReminderConfig {
-        reminder_interval_seconds,
-        clock_source: base
-            .and_then(|config| config.clock_source)
-            .unwrap_or(default.clock_source),
-        delivery_mode: base
-            .and_then(|config| config.delivery_mode)
-            .unwrap_or(default.delivery_mode),
-        sleep_tool: base
-            .and_then(|config| config.sleep_tool)
-            .unwrap_or(default.sleep_tool),
-    }))
-}
-
 fn resolve_terminal_resize_reflow_config(config_toml: &ConfigToml) -> TerminalResizeReflowConfig {
     let Some(tui) = config_toml.tui.as_ref() else {
         return TerminalResizeReflowConfig::default();
@@ -2422,15 +2348,6 @@ fn multi_agent_v2_toml_config(features: Option<&FeaturesToml>) -> Option<&MultiA
     }
 }
 
-fn current_time_reminder_toml_config(
-    features: Option<&FeaturesToml>,
-) -> Option<&CurrentTimeReminderConfigToml> {
-    match features?.current_time_reminder.as_ref()? {
-        FeatureToml::Enabled(_) => None,
-        FeatureToml::Config(config) => Some(config),
-    }
-}
-
 
 /// Resolves configured feature values without constructing a complete [`Config`].
 ///
@@ -2445,7 +2362,6 @@ pub fn resolve_configured_features(
             features: cfg.features.as_ref(),
         },
         FeatureConfigSource::default(),
-        FeatureOverrides::default(),
     );
     let features =
         ManagedFeatures::from_configured(configured_features, feature_requirements.cloned())?;
@@ -2675,7 +2591,6 @@ impl Config {
             personality,
             compact_prompt,
             show_raw_agent_reasoning,
-            tools_web_search_request: override_tools_web_search_request,
             ephemeral,
             bypass_hook_trust,
             additional_writable_roots,
@@ -2709,10 +2624,6 @@ impl Config {
             ));
         }
         let tool_suggest = resolve_tool_suggest_config(&cfg, &config_layer_stack);
-        let feature_overrides = FeatureOverrides {
-            web_search_request: override_tools_web_search_request,
-        };
-
         let configured_features = Features::from_sources(
             FeatureConfigSource {
                 features: cfg.features.as_ref(),
@@ -2720,7 +2631,6 @@ impl Config {
             FeatureConfigSource {
                 ..Default::default()
             },
-            feature_overrides,
         );
         let features = ManagedFeatures::from_configured_with_warnings(
             configured_features,
@@ -3007,14 +2917,12 @@ impl Config {
             );
             approval_policy = constrained_approval_policy.value();
         }
-        let web_search_mode =
-            resolve_web_search_mode(&cfg, &features).unwrap_or(WebSearchMode::Cached);
+        let web_search_mode = cfg.web_search.unwrap_or(WebSearchMode::Cached);
         let web_search_config = resolve_web_search_config(&cfg);
         let experimental_request_user_input_enabled =
             resolve_experimental_request_user_input_enabled(&cfg);
         let code_mode = resolve_code_mode_config(&cfg);
         let multi_agent_v2 = resolve_multi_agent_v2_config(&cfg);
-        let current_time_reminder = resolve_current_time_reminder_config(&cfg, &features)?;
         let terminal_resize_reflow = resolve_terminal_resize_reflow_config(&cfg);
 
         let agent_roles =
@@ -3432,7 +3340,7 @@ impl Config {
             completed_tool_history_projection: cfg
                 .completed_tool_history_projection
                 .unwrap_or(true),
-            pressure_reasoning_retirement: cfg.pressure_reasoning_retirement.unwrap_or(false),
+            pressure_reasoning_retirement: cfg.pressure_reasoning_retirement.unwrap_or(true),
             agent_max_threads,
             agent_max_depth,
             agent_roles,
@@ -3470,7 +3378,7 @@ impl Config {
             hide_agent_reasoning: cfg.hide_agent_reasoning.unwrap_or(false),
             show_raw_agent_reasoning: show_raw_agent_reasoning
                 .or(cfg.show_raw_agent_reasoning)
-                .unwrap_or(false),
+                .unwrap_or(true),
             model_reasoning_effort: cfg.model_reasoning_effort,
             plan_mode_reasoning_effort: cfg.plan_mode_reasoning_effort,
             model_reasoning_summary: cfg.model_reasoning_summary,
@@ -3493,7 +3401,6 @@ impl Config {
             code_mode,
             background_terminal_max_timeout,
             multi_agent_v2,
-            current_time_reminder,
             features,
             suppress_unstable_features_warning: cfg
                 .suppress_unstable_features_warning

@@ -440,6 +440,9 @@ impl InProcessClientHandle {
     }
 
     async fn shutdown_owned(mut self) -> IoResult<()> {
+        let observation = codex_protocol::timing::observations::Span::start(
+            "runtime_shutdown", "", "", &self.observation_id.to_string(),
+            serde_json::json!({"custody":"retained_runtime_owner"}));
         let observation_id = self.observation_id;
         codex_protocol::timing::client_probe::record(101, observation_id, 0, 0, 0, [0; 4]);
         // Explicit shutdown abandons unread events. Close the receiver first so
@@ -467,6 +470,7 @@ impl InProcessClientHandle {
             Ok(Err(error)) | Err(error) => Err(error),
         };
         codex_protocol::timing::client_probe::record(102, observation_id, 0, 0, 0, [u64::from(result.is_ok()), 0, 0, 0]);
+        observation.finish(if result.is_ok() {"joined"} else {"failed"}, serde_json::Value::Null);
         result
     }
 

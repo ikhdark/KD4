@@ -88,7 +88,7 @@ Other positive-integer `CODEX_CARGO_BUILD_` settings are `MAX_COLD`,
 `MEMORY_PER_JOB_MIB`, `COLD_BASE_MIB`, `WARM_BASE_MIB`,
 `PHYSICAL_RESERVE_MIB`, and `COMMIT_RESERVE_MIB`. Concurrent callers use the
 strictest active CPU/count/reserve settings. The pool and per-build telemetry
-receipts live under `KDR/.local/benchmarks/builds/resources/`. `RESOURCE_ROOT`
+receipts live under `KDR/.builds/resources/`. `RESOURCE_ROOT`
 overrides that location for an isolated measurement; different roots are separate
 budgets, so ordinary callers must share the default. No service or provisioning
 is needed. Admission sleeps without holding coordination; cancellation and

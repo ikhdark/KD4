@@ -557,6 +557,8 @@ impl Session {
         let task_kind = task.kind();
         let span_name = task.span_name();
         let turn_started_at_unix_ms = turn_context.turn_timing_state.mark_turn_started();
+        turn_context.turn_timing_state.bind_runtime_observations(
+            &self.thread_id.to_string(), &turn_context.sub_id);
         turn_context
             .turn_metadata_state
             .set_turn_started_at_unix_ms(turn_started_at_unix_ms);
@@ -941,13 +943,19 @@ impl Session {
         turn_id: &str,
         reason: TurnAbortReason,
     ) -> CodexResult<bool> {
+        let observation = codex_protocol::timing::observations::Span::start(
+            "cancel_request", &self.thread_id.to_string(), turn_id, turn_id,
+            serde_json::json!({"reason":reason}));
         let schedule = self
             .schedule_turn_terminal(Some(turn_id), TurnTerminalOutcome::Aborted(reason))
             .await;
         // Scheduling accepts cancellation; it does not declare the turn settled.
         // The app-server listener owns the response after terminal persistence
         // and queue pausing. Its wait must not become a spurious core error.
-        Ok(schedule.matched())
+        let matched = schedule.matched();
+        observation.finish("scheduled", serde_json::json!({"matched":matched,
+            "settlement":"terminal_persistence_and_listener_ack_are_separate"}));
+        Ok(matched)
     }
 
     fn schedule_turn_terminal<'a>(
@@ -1591,6 +1599,9 @@ impl Session {
                     None
                 },
             });
+            let message = timing.final_answer.as_ref().and_then(|answer| answer.message.as_ref());
+            timing.measurement_evidence.get_or_insert_with(|| serde_json::json!({"schemaVersion":1}))["finalRequest"] =
+                turn_context.turn_timing_state.accepted_final_request(message);
         }
         if let Some(disposition) = turn_context.extension_data.get::<codex_protocol::protocol::TurnTaskDisposition>() {
             timing.completion_assessment.get_or_insert_with(Default::default)

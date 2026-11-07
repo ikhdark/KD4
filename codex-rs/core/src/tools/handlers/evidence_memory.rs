@@ -206,6 +206,21 @@ pub(super) async fn source_read(invocation: &ToolInvocation, packet: &Value) -> 
     }).await.ok().flatten();
     let (text, reservations, id) = found?;
     let bytes = text.len();
+    // Consult accepted current history, not a permanent per-thread seen set:
+    // compaction/removal must allow a later turn to deliver the evidence again.
+    let history = invocation.session.clone_history().await;
+    if history.raw_items().iter().any(|item| matches!(item,
+        ResponseItem::Message { role, content, .. } if role == "developer"
+            && matches!(content.as_slice(), [ContentItem::InputText { text: present }] if present == &text)
+    )) {
+        // The notice is already available; keep this turn's reservations but
+        // don't spend its injection allowance on a body we did not inject.
+        let mut state = ledger.0.lock().await;
+        state.bytes = state.bytes.saturating_sub(bytes);
+        return Some(json!({"schema_version":1,"id":id,"status":"context_reused",
+            "bytes":0,"existing_bytes":bytes,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0,
+            "consideration":"not_observed"}));
+    }
     let item = ResponseItem::Message { id:None, role:"developer".into(),
         content:vec![ContentItem::InputText { text }], phase:None,
         internal_chat_message_metadata_passthrough:None };

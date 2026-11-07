@@ -96,19 +96,22 @@ pub(super) fn tool_callback(
         (tool.tool_name.clone(), tool.kind)
     };
 
-    let Some(state) = scope.get_slot_mut::<RuntimeState>() else {
-        throw_type_error(scope, "runtime state unavailable");
-        return;
+    let (id, event_tx) = {
+        let Some(state) = scope.get_slot_mut::<RuntimeState>() else {
+            throw_type_error(scope, "runtime state unavailable");
+            return;
+        };
+        let id = format!("{}:tool-{}", state.tool_call_id, state.next_tool_call_id);
+        state.next_tool_call_id = state.next_tool_call_id.saturating_add(1);
+        let event_tx = state.event_tx.clone();
+        state.pending_tool_calls.insert(id.clone(), (resolver, tool_name.clone()));
+        (id, event_tx)
     };
-    let id = format!("{}:tool-{}", state.tool_call_id, state.next_tool_call_id);
-    state.next_tool_call_id = state.next_tool_call_id.saturating_add(1);
-    let event_tx = state.event_tx.clone();
-    state
-        .pending_tool_calls
-        .insert(id.clone(), (resolver, tool_name.clone()));
+    let causal_predecessors = super::causal::tool(scope, promise, &id);
     if event_tx
         .send(RuntimeEvent::ToolCall {
             id: id.clone(),
+            causal_predecessors,
             name: tool_name,
             kind: tool_kind,
             input,
@@ -116,10 +119,85 @@ pub(super) fn tool_callback(
         })
         .is_err()
     {
-        state.pending_tool_calls.remove(&id);
+        if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
+            state.pending_tool_calls.remove(&id);
+        }
         scope.terminate_execution();
     }
+    if codex_protocol::timing::observations::enabled() {
+        let cell = scope.get_slot::<RuntimeState>().map(|state| state.tool_call_id.clone());
+        let context = scope.get_continuation_preserved_embedder_data();
+        let graph_node = v8::Local::<v8::String>::try_from(context).ok()
+            .map(|value| value.to_rust_string_lossy(scope));
+        let _ = codex_protocol::timing::observations::record("nested_tool_dispatched", "", "", &id,
+            serde_json::json!({"cell_call_id":cell, "graph_node":graph_node,
+                "shared_ns":codex_code_mode_protocol::shared_monotonic_now()}));
+    }
     retval.set(promise.into());
+}
+
+/// Private adapter captured by the validated run_graph helper and then removed
+/// from globals. V8 preserves this tag across async continuations, including
+/// awaits and Promise.all. It changes no scheduling, admission or tool result.
+pub(super) fn graph_observation_callback(
+    scope: &mut v8::PinScope<'_, '_>, args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue<v8::Value>,
+) {
+    let kind = args.get(0).to_rust_string_lossy(scope);
+    let key = if kind == "graph" { format!("graph-{}", uuid::Uuid::new_v4()) }
+        else { args.get(1).to_rust_string_lossy(scope) };
+    let cell = scope.get_slot::<RuntimeState>().map(|state| state.tool_call_id.clone()).unwrap_or_default();
+    match kind.as_str() {
+        "graph" => {
+            let definition = v8_value_to_json(scope, args.get(1)).ok().flatten();
+            if let Some(state) = scope.get_slot_mut::<RuntimeState>()
+                && let Some(definition) = definition.as_ref() {
+                state.causal.graph(&key, definition);
+            }
+            let observation = codex_protocol::timing::observations::Span::start("graph", "", "", &key,
+                serde_json::json!({"cell_call_id":cell, "definition":definition,
+                    "shared_ns":codex_code_mode_protocol::shared_monotonic_now()}));
+            if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
+                if state.graph_observations.len() < 1024 { state.graph_observations.insert(key.clone(), observation); }
+            }
+            if let Some(value) = v8::String::new(scope, &key) { retval.set(value.into()); }
+        }
+        "enter" => {
+            let node = args.get(2).to_rust_string_lossy(scope);
+            let operation = format!("{key}:{node}");
+            let previous = scope.get_continuation_preserved_embedder_data();
+            let observation = codex_protocol::timing::observations::Span::start("graph_node", "", "", &operation,
+                serde_json::json!({"graph_id":key, "node_id":node, "cell_call_id":cell,
+                    "shared_ns":codex_code_mode_protocol::shared_monotonic_now()}));
+            if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
+                if state.graph_observations.len() < 1024 { state.graph_observations.insert(operation.clone(), observation); }
+            }
+            if let Some(value) = v8::String::new(scope, &operation) {
+                scope.set_continuation_preserved_embedder_data(value.into());
+            }
+            retval.set(previous);
+        }
+        "leave" => {
+            let node = args.get(2).to_rust_string_lossy(scope);
+            if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
+                state.causal.graph_finished(format!("{key}:{node}"));
+            }
+            let outcome = args.get(4).to_rust_string_lossy(scope);
+            if let Some(observation) = scope.get_slot_mut::<RuntimeState>()
+                .and_then(|state| state.graph_observations.remove(&format!("{key}:{node}"))) {
+                observation.finish(&outcome, serde_json::json!({"shared_ns":codex_code_mode_protocol::shared_monotonic_now()}));
+            }
+            scope.set_continuation_preserved_embedder_data(args.get(3));
+        }
+        "finish" => {
+            let outcome = args.get(2).to_rust_string_lossy(scope);
+            if let Some(observation) = scope.get_slot_mut::<RuntimeState>()
+                .and_then(|state| state.graph_observations.remove(&key)) {
+                observation.finish(&outcome, serde_json::json!({"shared_ns":codex_code_mode_protocol::shared_monotonic_now()}));
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Explicit presentation for cloned, annotated or stored results. The caller

@@ -17,6 +17,7 @@ pub fn is_persisted_rollout_item(item: &RolloutItem, history_mode: ThreadHistory
         | RolloutItem::WorldState(_)
         | RolloutItem::AdditionalContextState { .. }
         | RolloutItem::ToolManifest(_)
+        | RolloutItem::ContextReplay { .. }
         | RolloutItem::SamplingBoundary(_)
         | RolloutItem::SessionMeta(_) => true,
     }

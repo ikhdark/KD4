@@ -1,4 +1,5 @@
 mod callbacks;
+mod causal;
 mod display_metrics;
 mod globals;
 mod module_loader;
@@ -86,6 +87,7 @@ pub(crate) enum RuntimeEvent {
     YieldRequested,
     ToolCall {
         id: String,
+        causal_predecessors: Option<Vec<String>>,
         name: ToolName,
         kind: CodeModeToolKind,
         input: Option<JsonValue>,
@@ -332,6 +334,7 @@ fn create_spare_runtime() -> std::io::Result<std_mpsc::Sender<RuntimeStart>> {
                 module_loader::dynamic_import_callback,
             );
             isolate.set_promise_reject_callback(module_loader::promise_rejected);
+            isolate.set_promise_hook(causal::promise_hook);
             v8::scope!(let scope, isolate);
             let context = v8::Context::new(scope, Default::default());
             let scope = &mut v8::ContextScope::new(scope, context);
@@ -879,8 +882,10 @@ impl EnabledToolCatalog {
 
 pub(super) struct RuntimeState {
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    causal: causal::Capture,
     monotonic_origin: std::time::Instant,
     pending_tool_calls: HashMap<String, (v8::Global<v8::PromiseResolver>, ToolName)>,
+    graph_observations: HashMap<String, codex_protocol::timing::observations::Span>,
     output_projector: v8::Global<v8::Function>,
     pending_notifications: HashMap<String, v8::Global<v8::PromiseResolver>>,
     pending_timeouts: HashMap<u64, timers::ScheduledTimeout>,
@@ -1038,8 +1043,10 @@ fn run_runtime(
         .fold(0usize, |total, stored| total.saturating_add(stored.bytes));
     scope.set_slot(RuntimeState {
         event_tx: event_tx.clone(),
+        causal: causal::Capture::default(),
         monotonic_origin: std::time::Instant::now(),
         pending_tool_calls: HashMap::new(),
+        graph_observations: HashMap::new(),
         output_projector: projector,
         pending_notifications: HashMap::new(),
         pending_timeouts: HashMap::new(),
@@ -1062,6 +1069,7 @@ fn run_runtime(
         output_admission: config.output_admission,
     });
 
+    causal::install(scope);
     if let Err(error_text) = globals::install_globals(scope) {
         send_result(scope, &event_tx, HashMap::new(), Some(error_text));
         return;

@@ -101,6 +101,7 @@ fn apply_non_setting_rollout_item(metadata: &mut ThreadMetadata, item: &RolloutI
         | RolloutItem::InterAgentCommunicationMetadata { .. } => {}
         RolloutItem::Compacted(_)
         | RolloutItem::ToolManifest(_)
+        | RolloutItem::ContextReplay { .. }
         | RolloutItem::SamplingBoundary(_) => {}
         RolloutItem::WorldState(_) | RolloutItem::AdditionalContextState { .. } => {}
     }
@@ -128,6 +129,7 @@ pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::Compacted(_)
         | RolloutItem::ToolManifest(_)
+        | RolloutItem::ContextReplay { .. }
         | RolloutItem::SamplingBoundary(_)
         | RolloutItem::WorldState(_)
         | RolloutItem::AdditionalContextState { .. } => false,

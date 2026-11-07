@@ -199,13 +199,12 @@ impl CodexResponsesMetadata {
         self.session_id.clone()
     }
 
-    /// Prompt-cache routing identity, sent as `prompt_cache_key`. Threads of one installation
-    /// share their instructions and tools, but only requests routed alike can reuse them: a
-    /// per-session value leaves nearly every first request cold. One value for the whole
-    /// installation overloads routing instead: cache misses double once a key passes about 60
-    /// requests a minute, which concurrent sessions reach. So each session picks one of a few
-    /// installation-wide buckets, and its agent tree follows it. Requests without an
-    /// installation identity, such as auxiliary work, keep their own session.
+    /// Prompt-cache routing identity, sent as `prompt_cache_key`. Shared installation
+    /// buckets aim to reuse common instructions/tools without concentrating all traffic
+    /// on one key. This routing policy establishes neither provider cache residency nor
+    /// miss causes, an overload threshold, or guaranteed reuse. Each session picks a
+    /// bucket and its agent tree follows it. Requests without an installation identity,
+    /// such as auxiliary work, keep their own session.
     pub(crate) fn prompt_cache_routing_id(&self) -> String {
         if self.installation_id.is_empty() {
             return self.session_id.clone();

@@ -472,6 +472,7 @@ pub(crate) fn is_artifact_candidate(item: &RolloutItem) -> bool {
     match item {
         RolloutItem::SessionMeta(_) | RolloutItem::ToolManifest(_) => true,
         RolloutItem::SamplingBoundary(boundary) => boundary.timing_checkpoint.is_some(),
+        RolloutItem::ContextReplay { .. } => true,
         RolloutItem::EventMsg(event) => matches!(
             event,
             EventMsg::PatchApplyEnd(_) | EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)

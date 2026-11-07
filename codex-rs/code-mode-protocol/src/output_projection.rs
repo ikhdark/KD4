@@ -451,6 +451,7 @@ fn compact_complete_read(raw: &Value, printed: &mut serde_json::Map<String, Valu
         row.remove("status");
         row.remove("complete");
         compact_structured_row(row);
+        compact_outline_row(row);
         // Hydrated search ranges resolve against their parent, so those rows stay as they are.
         if row.get("text").is_none() {
             continue;
@@ -466,6 +467,45 @@ fn compact_complete_read(raw: &Value, printed: &mut serde_json::Map<String, Valu
             row.remove("selector");
         }
         row.remove("canonical_range");
+    }
+}
+
+/// Outline navigation keeps exact section IDs, signatures, source ranges and all
+/// parse/test diagnostics. Only exact aliases and negative truncation markers
+/// disappear from printing; the native result remains unchanged.
+fn compact_outline_row(row: &mut serde_json::Map<String, Value>) {
+    let outline = row.get("selector").is_some_and(|selector| {
+        selector["kind"] == "section"
+            && selector["id"].as_str().is_some_and(|id| {
+                id == "outline" || id.starts_with("outline:")
+            })
+    });
+    if !outline {
+        return;
+    }
+    let Some(items) = row.get_mut("value")
+        .and_then(|value| value.get_mut("details"))
+        .and_then(|details| details.get_mut("items"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for item in items.iter_mut().filter_map(Value::as_object_mut) {
+        if item.get("name").is_some_and(Value::is_string)
+            && item.get("qualified_name") == item.get("name")
+        {
+            item.remove("qualified_name");
+        }
+        if item.get("start_line").is_some_and(Value::is_u64)
+            && item.get("definition_line") == item.get("start_line")
+        {
+            item.remove("definition_line");
+        }
+        for key in ["signature_truncated", "title_truncated"] {
+            if item.get(key) == Some(&Value::Bool(false)) {
+                item.remove(key);
+            }
+        }
     }
 }
 
@@ -836,7 +876,8 @@ fn plan_receipt(raw: &Value) -> Option<Value> {
             matches!(
                 key.as_str(),
                 "message" | "effect" | "no_progress" | "revision" | "step_ids"
-                    | "obligations" | "remaining_requirements"
+                    | "obligations" | "completion_authority" | "lineage_complete"
+                    | "pinned_requirements" | "remaining_requirements"
             )
         })
         .map(|(key, value)| (key.clone(), value.clone()))

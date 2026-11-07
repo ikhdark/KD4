@@ -17,7 +17,6 @@ const COMPLETION_MESSAGE_MAX_TOKENS: usize = 4_000;
 const COMPLETION_MESSAGE_ENVELOPE_TOKEN_RESERVE: usize = 100;
 const ERROR_MAX_TOKENS: usize =
     COMPLETION_MESSAGE_MAX_TOKENS - COMPLETION_MESSAGE_ENVELOPE_TOKEN_RESERVE;
-const OVERSIZED_REPORT_EXCERPT_TOKENS: usize = 1_000;
 const ERROR_NEXT_ACTION: &str = "This agent's turn failed. The full sealed error remains available through get_agent_task; retrieve it with the assignment id returned by spawn_agent before deciding whether to retry. If you still need this agent, use the available collaboration tools to give it another task.";
 const TYPED_COMPLETION_NEXT_ACTION: &str = "The full sealed receipt remains available through get_agent_task; retrieve it with the assignment id returned by spawn_agent.";
 
@@ -279,12 +278,18 @@ fn format_bounded_inter_agent_completion_message(
         }
     }
 
+    let omission = if retrieval_guidance == ERROR_NEXT_ACTION {
+        "Agent errored; authored error omitted. Retrieve the full result before deciding whether to retry."
+    } else {
+        "Authored report omitted. Retrieve the full result before accepting or integrating it."
+    };
     let retrieval_guidance = if receipt.is_some() {
         "The full sealed receipt remains available at the exact receipt locator above; no automatic retrieval was performed."
     } else {
         retrieval_guidance
     };
-    if approx_token_count(&render(retrieval_guidance, &protected)) >= COMPLETION_MESSAGE_MAX_TOKENS
+    let recovery_notice = format!("{omission}\n{retrieval_guidance}");
+    if approx_token_count(&render(&recovery_notice, &protected)) >= COMPLETION_MESSAGE_MAX_TOKENS
     {
         // Preserve an explicit material-omission notice and exact recovery
         // identity rather than silently dropping the tail of host diagnostics.
@@ -293,26 +298,9 @@ fn format_bounded_inter_agent_completion_message(
             truncate_text(&protected, TruncationPolicy::Tokens(512))
         );
     }
-    // The recipient is told to retrieve the whole result, so a long excerpt is
-    // delivered twice. Keep only enough to identify the report and its outcome.
-    let mut payload_budget = OVERSIZED_REPORT_EXCERPT_TOKENS
-        .min(ERROR_MAX_TOKENS.saturating_sub(approx_token_count(&protected)));
-    loop {
-        let payload = truncate_text(payload, TruncationPolicy::Tokens(payload_budget));
-        let payload = format!("{payload}\n\n{retrieval_guidance}");
-        let message = render(&payload, &protected);
-        let message_tokens = approx_token_count(&message);
-        if message_tokens < COMPLETION_MESSAGE_MAX_TOKENS || payload_budget == 0 {
-            return (message, false);
-        }
-
-        // Rendering adds the typed envelope and can expand escaped control characters. Tighten
-        // the source budget until the complete model-visible notification fits the ceiling.
-        let next_budget = payload_budget
-            .saturating_mul(COMPLETION_MESSAGE_MAX_TOKENS.saturating_sub(1))
-            / message_tokens;
-        payload_budget = next_budget.min(payload_budget.saturating_sub(1));
-    }
+    // Mandatory full recovery would deliver any authored excerpt twice. Keep
+    // only host diagnostics, outcome and the exact existing recovery identity.
+    (render(&recovery_notice, &protected), false)
 }
 
 pub(crate) fn format_subagent_context_line(

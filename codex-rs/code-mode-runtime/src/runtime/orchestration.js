@@ -602,6 +602,17 @@
         });
       } catch (cause) {
         evidence.cause = cause;
+        const capture = cause?.tool_failure?.details;
+        if (typeof nativeSearch === "function" &&
+            capture?.search_backend === "native_file_search" &&
+            capture.capture_failure === "exact_capture_overflow") {
+          evidence.result = capture;
+          evidence.coverage = { ...capture.coverage,
+            scope: __codex_search_scope(scopeOptions, capture) };
+          evidence.delivery = capture.delivery;
+          evidence.recovery = capture.captures;
+          fail("search output exceeded exact capture; recover retained prefixes, then narrow paths or globs", evidence);
+        }
         fail(
           `search_files could not run rg (ripgrep): ${cause?.message ?? cause}`,
           evidence,

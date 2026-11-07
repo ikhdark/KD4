@@ -3,6 +3,7 @@ mod normalize;
 
 pub use history::ContextManager;
 pub use history::PreparedPromptInput;
+pub use history::SamplingReplaySnapshot;
 pub use history::completed_turn_boundary;
 pub use history::current_turn_advice_items;
 pub use history::estimate_item_token_count;

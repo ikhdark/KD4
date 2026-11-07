@@ -394,6 +394,11 @@ impl<'a> SandboxAttempt<'a> {
         command: SandboxCommand,
         options: ExecOptions,
     ) -> Result<crate::sandboxing::ExecRequest, CodexErr> {
+        let execution = crate::tools::tool_dispatch_trace::active_tool_dispatch_timing()
+            .map(|timing| timing.execution_id().0.clone()).unwrap_or_default();
+        let observation = codex_protocol::timing::observations::Span::start(
+            "sandbox_preparation", "", "", &execution,
+            serde_json::json!({"boundary":"queue_through_prepared_request"}));
         let permissions = self.permissions.clone();
         let sandbox = self.sandbox;
         let sandbox_cwd = self.sandbox_cwd.clone();
@@ -401,7 +406,11 @@ impl<'a> SandboxAttempt<'a> {
         let windows_sandbox_private_desktop = self.windows_sandbox_private_desktop;
         let workspace_roots = self.workspace_roots.to_vec();
         let codex_home = self.codex_home.clone();
-        tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
+            let worker = codex_protocol::timing::observations::Span::start(
+                "sandbox_transform", "", "", &execution,
+                serde_json::json!({"boundary":"worker_only_excludes_queue_and_process_spawn"}));
+            let result = (|| {
             let request = transform(SandboxTransformRequest {
                 command,
                 permissions: &permissions,
@@ -417,9 +426,14 @@ impl<'a> SandboxAttempt<'a> {
                 workspace_roots,
                 codex_home,
             )
+            })();
+            worker.finish(if result.is_ok() {"success"} else {"failed"}, serde_json::Value::Null);
+            result
         })
         .await
-        .map_err(|error| CodexErr::Fatal(format!("sandbox preparation worker failed: {error}")))?
+        .map_err(|error| CodexErr::Fatal(format!("sandbox preparation worker failed: {error}")));
+        observation.finish(if matches!(&result, Ok(Ok(_))) {"success"} else {"failed"}, serde_json::Value::Null);
+        result?
     }
 
     pub fn env_for_exec_server(
@@ -428,6 +442,11 @@ impl<'a> SandboxAttempt<'a> {
         options: ExecOptions,
         additional_permissions_uri: Option<&UriAdditionalPermissionProfile>,
     ) -> Result<crate::sandboxing::ExecRequest, CodexErr> {
+        let execution = crate::tools::tool_dispatch_trace::active_tool_dispatch_timing()
+            .map(|timing| timing.execution_id().0.clone()).unwrap_or_default();
+        let observation = codex_protocol::timing::observations::Span::start(
+            "sandbox_remote_preparation", "", "", &execution,
+            serde_json::json!({"boundary":"local_envelope_only_not_remote_sandbox"}));
         let exec_server_permissions = effective_permission_profile_uri(
             self.exec_server_permissions,
             additional_permissions_uri,
@@ -457,6 +476,7 @@ impl<'a> SandboxAttempt<'a> {
                 windows_sandbox_private_desktop: self.windows_sandbox_private_desktop,
             });
         }
+        observation.finish("success", serde_json::Value::Null);
         Ok(exec_request)
     }
 }

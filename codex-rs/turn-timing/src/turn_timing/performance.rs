@@ -12,6 +12,9 @@ pub(super) struct Capture {
     latest: Option<ResourceSample>,
     connections: Vec<Value>,
     transport_phases: Vec<Value>,
+    transport_intervals: Vec<Value>,
+    actual_transport_intervals: u64,
+    dropped_transport_intervals: u64,
     startup_dial: Option<Value>,
     dropped_connections: u64,
     dropped_transport_phases: u64,
@@ -85,6 +88,11 @@ impl Capture {
         json!({"schemaVersion":1, "clockDomainId":timeline.clock_domain_id,
             "observedThroughMs":timeline.duration_ns as f64 / 1e6,
             "connections":self.connections, "transportPhases":self.transport_phases,
+            "transportIntervals":self.transport_intervals,
+            "transportIntervalCapture":{"available":self.transport_intervals.iter().any(|row| row["available"].as_bool() == Some(true)),
+                "actualCount":self.actual_transport_intervals,
+                "retentionComplete":self.dropped_transport_intervals == 0 && self.actual_transport_intervals != u64::MAX,
+                "scope":"explicit_connector_callbacks_only; no opaque-driver or provider inference"},
             "startupDial":self.startup_dial,
             "resources":resources, "execution":self.execution,
             "capture":{"droppedConnections":self.dropped_connections,
@@ -97,6 +105,39 @@ impl Capture {
 }
 
 impl TurnTimingState {
+    pub fn record_transport_interval(&self, identity: (&str, &str), phase: &str,
+        interval: (std::time::Instant, std::time::Instant), wire_bytes: Option<u64>, provenance: &str) {
+        let duration = interval.1.checked_duration_since(interval.0);
+        let duration_ns = duration.and_then(|value| u64::try_from(value.as_nanos()).ok());
+        let supported = matches!(phase, "dns_lookup" | "tcp_connect" | "tls_handshake" | "request_upload"
+            | "response_download" | "tcp_round_trip");
+        let started = codex_protocol::timing::process_monotonic_ns_at(interval.0)
+            .and_then(|value| u64::try_from(value).ok());
+        let completed = codex_protocol::timing::process_monotonic_ns_at(interval.1)
+            .and_then(|value| u64::try_from(value).ok());
+        let valid = duration_ns.is_some() && interval.1 <= std::time::Instant::now() && supported
+            && completed.zip(started).and_then(|(end, start)| end.checked_sub(start)) == duration_ns
+            && !provenance.is_empty() && provenance.len() <= 256;
+        let row = json!({"samplingRequestId":identity.0, "physicalAttemptId":identity.1,
+            "phase":if supported {phase} else {"unsupported_connector_phase"},
+            "clockDomainId":codex_protocol::timing::process_clock_domain_id(),
+            "startedAtNs":started.filter(|_| valid), "completedAtNs":completed.filter(|_| valid),
+            "durationNs":duration_ns.filter(|_| valid),
+            "wireBytes":wire_bytes, "provenance":if provenance.len() <= 256 {provenance} else {"invalid_source_label"},
+            "available":valid, "unavailableReason":(!valid).then_some("invalid_connector_interval")});
+        let mut state = self.state();
+        let after_terminal = state.completed_snapshot.is_some();
+        if !after_terminal {
+            let capture = &mut state.measurements.performance;
+            capture.actual_transport_intervals = capture.actual_transport_intervals.saturating_add(1);
+            if capture.transport_intervals.len() < LIMIT { capture.transport_intervals.push(row.clone()); }
+            else { capture.dropped_transport_intervals = capture.dropped_transport_intervals.saturating_add(1); }
+        }
+        drop(state);
+        self.observe_runtime("transport_interval", identity.1,
+            json!({"interval":row, "after_terminal":after_terminal}));
+    }
+
     /// Selection is separate from transport entry: adopting a socket does not
     /// prove that it served a request. Missing observations remain unknown.
     pub fn record_startup_dial_outcome(&self, outcome: &str, hedge_started: bool) {

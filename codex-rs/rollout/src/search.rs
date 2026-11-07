@@ -520,6 +520,7 @@ fn conversation_text_from_item(item: &RolloutItem) -> Option<String> {
         }
         RolloutItem::SessionMeta(_)
         | RolloutItem::ToolManifest(_)
+        | RolloutItem::ContextReplay { .. }
         | RolloutItem::SamplingBoundary(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::EventMsg(_)

@@ -306,6 +306,7 @@ impl Session {
         let startup_timing = Arc::clone(&self.startup_timing);
         let config = self.get_config().await;
         let thread_config = self.thread_config_snapshot().await;
+        let configured_service_tier = self.configured_service_tier().await;
         let models_manager = Arc::clone(&self.services.models_manager);
         let mut responses_metadata = CodexResponsesMetadata::new(
             self.installation_id.clone(),
@@ -319,12 +320,12 @@ impl Session {
         let task = tokio::spawn(async move {
             let _preconnect = startup_timing.begin_phase(StartupPhase::TransportPreconnect);
             // Resolve routing without building a turn context or waiting for tool discovery.
-            // The thread snapshot includes the tier inherited by spawned agents.
+            // Unpinned workers use the same root preference as actual sampling.
             let model_info = models_manager
                 .get_model_info(&thread_config.model, &config.to_models_manager_config())
                 .await;
             let service_tier = crate::session::get_service_tier(
-                thread_config.service_tier,
+                configured_service_tier,
                 config.features.enabled(Feature::FastMode),
                 &model_info,
             );

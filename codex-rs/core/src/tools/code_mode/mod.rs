@@ -3067,11 +3067,29 @@ async fn call_nested_tool(
     invocation: CodeModeNestedToolCall,
     cancellation: NestedCancellation,
 ) -> Result<JsonValue, FunctionCallError> {
+    let cell = invocation.cell_id.to_string();
+    let call = invocation.runtime_tool_call_id.clone();
+    let timing = Arc::clone(&exec.turn.turn_timing_state);
+    let result = call_nested_tool_inner(exec, tool_runtime, invocation, cancellation).await;
+    // This is the core adapter's release, not model relay delivery or a claim
+    // that the remote JS promise has already resumed. A cancelled future never
+    // reaches this boundary and stays censored.
+    timing.record_nested_result_release(&cell, &call);
+    result
+}
+
+async fn call_nested_tool_inner(
+    exec: ExecContext,
+    tool_runtime: ToolCallRuntime,
+    invocation: CodeModeNestedToolCall,
+    cancellation: NestedCancellation,
+) -> Result<JsonValue, FunctionCallError> {
     let cancellation_token = cancellation.token().clone();
     let CodeModeNestedToolCall {
         cell_id,
         parent_tool_call_id,
         runtime_tool_call_id,
+        causal_predecessors,
         tool_name,
         tool_kind,
         input,
@@ -3198,6 +3216,8 @@ async fn call_nested_tool(
         return Err(FunctionCallError::RespondToModel(message));
     }
 
+    exec.turn.turn_timing_state.record_nested_dependencies(cell_id.as_str(),
+        &runtime_tool_call_id, parent_tool_call_id.as_deref(), causal_predecessors);
     let call = ToolCall {
         tool_name: tool_name.clone(),
         call_id: nested_call_id.clone(),

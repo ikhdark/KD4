@@ -64,6 +64,7 @@ mod blocking;
 mod dependency;
 mod detail_archive;
 mod measurements;
+pub use measurements::ModelRequestOwnerGuard;
 mod operations;
 mod performance;
 pub mod retries;
@@ -205,33 +206,72 @@ pub struct TurnTimingState {
 
 /// One bounded optional diagnostic baseline, never an authority/cache receipt.
 struct CanonicalInputSection {
+    attempt_id: String,
     raw_items: Vec<String>,
     before_close: Sha256,
+    tool_outputs: Vec<serde_json::Value>,
+    tool_output_count: usize,
 }
 
 impl CanonicalInputSection {
-    fn hash(cache: &mut Option<Self>, raw: &serde_json::value::RawValue) -> Option<String> {
+    fn hash(cache: &mut Option<Self>, raw: &serde_json::value::RawValue, attempt_id: &str) -> Option<(String, serde_json::Value)> {
         let items: Vec<&serde_json::value::RawValue> = serde_json::from_str(raw.get()).ok()?;
-        let prior = cache.as_ref().filter(|previous| {
-            previous.raw_items.len() <= items.len()
-                && previous.raw_items.iter().zip(&items).all(|(a, b)| a == b.get())
-        });
+        let previous = cache.as_ref();
+        let shared = previous.map_or(0, |previous| previous.raw_items.iter().zip(&items)
+            .take_while(|(a, b)| a.as_str() == b.get()).count());
+        let prior = previous.filter(|previous| shared == previous.raw_items.len());
         let start = prior.map_or(0, |previous| previous.raw_items.len());
+        let mut tool_outputs = prior.map_or_else(Vec::new, |previous| previous.tool_outputs.clone());
+        let mut tool_output_count = prior.map_or(0, |previous| previous.tool_output_count);
         let mut hasher = prior.map_or_else(|| {
             let mut hasher = Sha256::new(); hasher.update(b"["); hasher
         }, |previous| previous.before_close.clone());
+        let mut prefix = hasher.clone();
         for (index, item) in items.iter().enumerate().skip(start) {
             if index != 0 { hasher.update(b","); }
             let value: serde_json::Value = serde_json::from_str(item.get()).ok()?;
+            if matches!(value["type"].as_str(), Some("function_call_output" | "custom_tool_call_output")) {
+                tool_output_count = tool_output_count.saturating_add(1);
+                if tool_outputs.len() < 1024 {
+                    let text = value["output"].as_str();
+                    tool_outputs.push(serde_json::json!({
+                        "item_index":index, "call_id":value["call_id"],
+                        "output_sha256":text.map(|text| hex::encode(Sha256::digest(text.as_bytes()))),
+                        "text_bytes":text.map(str::len),
+                    }));
+                }
+            }
             hasher.update(value.to_string().as_bytes());
+            if index + 1 == shared { prefix = hasher.clone(); }
         }
         let mut finished = hasher.clone(); finished.update(b"]");
+        prefix.update(b"]");
+        let hash = hex::encode(finished.finalize());
+        // Persist only new output identities on an append. The existing
+        // predecessor/prefix receipt recovers unchanged identities without
+        // copying an ever-growing inventory into every timing observation.
+        let new_tool_outputs = tool_outputs.iter().filter(|row|
+            row["item_index"].as_u64().is_some_and(|index| index >= start as u64)
+        ).collect::<Vec<_>>();
+        let evidence = serde_json::json!({
+            "attempt_id":attempt_id, "previous_attempt_id":previous.map(|previous| &previous.attempt_id),
+            "input_items":items.len(), "previous_input_items":previous.map(|previous| previous.raw_items.len()),
+            "shared_prefix_items":previous.map(|_| shared),
+            "shared_prefix_sha256":previous.map(|_| hex::encode(prefix.finalize())),
+            "input_sha256":hash, "basis":"canonical_json_transport_input_v1",
+            "tool_outputs":{"complete":tool_output_count == tool_outputs.len(),
+                "actual_count":tool_output_count, "rows":new_tool_outputs,
+                "inherited_from_attempt_id":prior.map(|previous| &previous.attempt_id),
+                "inherited_prefix_items":start,
+                "scope":"transport input only; absence does not prove absence from provider-held logical history"},
+        });
         // Both retained payload and per-item overhead are bounded. A replacement,
         // unknown encoding, or oversized baseline takes the exact cold path.
         if raw.get().len() <= 8 * 1024 * 1024 && items.len() <= 16_384 {
-            *cache = Some(Self { raw_items: items.iter().map(|item| item.get().to_owned()).collect(), before_close: hasher });
+            *cache = Some(Self { attempt_id:attempt_id.to_owned(), raw_items: items.iter().map(|item| item.get().to_owned()).collect(), before_close: hasher,
+                tool_outputs, tool_output_count });
         } else { *cache = None; }
-        Some(hex::encode(finished.finalize()))
+        Some((hash, evidence))
     }
 }
 
@@ -1828,7 +1868,10 @@ impl ActiveSet {
             return self.model == 0 && self.tool == 0 && self.retry == 0;
         }
         if self.retry > 0 {
-            return self.model == 0 && self.tool == 0;
+            // A lower HTTP retry retains the outer request-wait envelope.
+            // It is not provider/model work once that transport attempt ended.
+            return self.model == self.model_request_wait
+                && !self.provider_model_active() && self.tool == 0;
         }
         true
     }
@@ -2140,6 +2183,9 @@ impl TurnTimingState {
         let started_at = state.start(sample);
         state.activity_timeline.clock_domain_id = self.clock.domain_id().map(str::to_owned);
         if first_start {
+            if codex_protocol::timing::observations::enabled() {
+                state.measurements.observation_scope = uuid::Uuid::new_v4().to_string();
+            }
             state.measurements.performance.start();
             state.measurements.app_server.start(sample.time.monotonic_ns, self.clock.domain_id());
         }
@@ -2167,6 +2213,11 @@ impl TurnTimingState {
         bytes: &[u8],
     ) {
         let hash = hex::encode(Sha256::digest(bytes));
+        if codex_protocol::timing::observations::enabled() {
+        self.observe_runtime("model_request_identity", physical_attempt_id, serde_json::json!({
+            "sampling_request_id":sampling_request_id, "physical_attempt_id":physical_attempt_id,
+            "wire_sha256":hash, "bytes":bytes.len(), "basis":"exact_dispatched_bytes"}));
+        }
         let mut state = self.state();
         if let Some(request) = state.model_requests.iter_mut().find(|request| {
             request.sampling_request_id.as_deref() == Some(sampling_request_id)
@@ -2190,6 +2241,7 @@ impl TurnTimingState {
         physical_attempt_id: &str,
         bytes: &[u8],
     ) {
+        let mut prefix_evidence = None;
         let sections = serde_json::from_slice::<BTreeMap<String, &serde_json::value::RawValue>>(bytes)
             .ok()
             .map(|fields| {
@@ -2198,8 +2250,9 @@ impl TurnTimingState {
                     .filter_map(|(key, value)| {
                         let digest = if key == "input" {
                             CanonicalInputSection::hash(
-                                &mut self.canonical_input_section.lock().unwrap_or_else(std::sync::PoisonError::into_inner), value,
-                            ).or_else(|| serde_json::from_str::<serde_json::Value>(value.get()).ok()
+                                &mut self.canonical_input_section.lock().unwrap_or_else(std::sync::PoisonError::into_inner), value, physical_attempt_id,
+                            ).map(|(hash, evidence)| { prefix_evidence = Some(evidence); hash })
+                            .or_else(|| serde_json::from_str::<serde_json::Value>(value.get()).ok()
                                 .map(|value| hex::encode(Sha256::digest(value.to_string().as_bytes()))))
                         } else {
                             serde_json::from_str::<serde_json::Value>(value.get()).ok()
@@ -2210,6 +2263,9 @@ impl TurnTimingState {
                     .collect()
             });
         let mut state = self.state();
+        if let Some(evidence) = prefix_evidence {
+            state.measurements.input_prefix(physical_attempt_id, evidence);
+        }
         if let Some(request) = state.model_requests.iter_mut().find(|request| {
             request.sampling_request_id.as_deref() == Some(sampling_request_id)
                 && request
@@ -2527,6 +2583,8 @@ impl TurnTimingState {
                 .map(|index| format!("generation-{index}"))
                 .unwrap_or_else(|| "generation-pending".to_string()),
         );
+        let observation_generation = codex_protocol::timing::observations::enabled()
+            .then(|| sampling_generation_id.0.clone());
         let is_new = !state.tool_closure.entries.contains_key(execution_id);
         let accepted = state
             .tool_closure
@@ -2569,6 +2627,12 @@ impl TurnTimingState {
         }
         drop(state);
         if accepted {
+            if is_new && let Some(generation) = observation_generation {
+            self.observe_runtime("tool_accepted", &execution_id.0, serde_json::json!({
+                "call_id":call_id, "parent_call_id":parent_call_id, "source":source,
+                "tool":tool_name, "owner_at_ns":sample.time.monotonic_ns,
+                "generation_id":generation}));
+            }
             self.signal_tool_closure_changed();
         }
         accepted
@@ -2951,6 +3015,13 @@ impl TurnTimingState {
         if let Some(process_exit) = pending_process_exit {
             record_tool_process_exit(&mut tool_call, &process_exit);
         }
+        let observation = codex_protocol::timing::observations::enabled().then(|| serde_json::json!({
+            "call_id":tool_call.call_id, "generation_id":tool_call.sampling_generation_id,
+            "source":tool_call.source, "parent_call_id":tool_call.parent_call_id,
+            "parent_cell_id":tool_call.parent_cell_id, "runtime_tool_call_id":tool_call.runtime_tool_call_id,
+            "outcome":tool_call.outcome, "accepted_ms":tool_call.accepted_at_ms,
+            "delivered_ms":tool_call.delivered_at_ms, "lifecycle":tool_call.lifecycle_events,
+            "execution_id":tool_call.execution_id}));
         let detail = if state.tool_calls.len() >= MAX_TOOL_CALL_TIMINGS {
             state.tool_call_timing_overflow = state.tool_call_timing_overflow.saturating_add(1);
             state.archive_record(serde_json::json!({"kind":"tool_call", "call":tool_call}), true)
@@ -2959,6 +3030,9 @@ impl TurnTimingState {
             None
         };
         drop(state);
+        if let Some(observation) = observation {
+            self.observe_runtime("tool_settled", observation["execution_id"].as_str().unwrap_or_default(), observation.clone());
+        }
         detail_archive::write(dependency_archive);
         detail_archive::write(detail);
     }
@@ -4097,6 +4171,11 @@ impl TurnTimingState {
         action: retries::RetryAction,
         backoff: Option<Duration>,
     ) {
+        if codex_protocol::timing::observations::enabled() {
+            self.observe_runtime("recovery_retry_decision", "", serde_json::json!({
+                "trigger":trigger, "http_status":http_status, "action":action,
+                "requested_backoff_ns":backoff.map(|delay| delay.as_nanos())}));
+        }
         let mut state = self.state();
         if state.completed_snapshot.is_some() {
             return;
@@ -4295,6 +4374,23 @@ impl TurnTimingState {
         &self,
         event: &ResponseEvent,
     ) -> Option<Duration> {
+        if codex_protocol::timing::observations::enabled() {
+            let observed = match event {
+                ResponseEvent::OutputTextDelta(text) => Some(("text_delta", text.len())),
+                ResponseEvent::ToolCallInputDelta { delta, .. } => Some(("tool_input_delta", delta.len())),
+                ResponseEvent::ReasoningContentDelta { delta, .. }
+                    | ResponseEvent::ReasoningSummaryDelta { delta, .. } => Some(("reasoning_delta", delta.len())),
+                ResponseEvent::OutputItemDone(_) => Some(("output_item_done", 0)),
+                ResponseEvent::Completed { .. } => Some(("provider_completed", 0)),
+                _ => None,
+            };
+            if let Some((kind, bytes)) = observed {
+                let identity = self.latest_model_dispatch_identity();
+                self.observe_runtime("model_stream_event", identity.as_ref().map(|id| id.physical_attempt_id.as_str()).unwrap_or_default(),
+                    serde_json::json!({"sampling_request_id":identity.as_ref().map(|id| &id.sampling_request_id),
+                        "kind":kind, "bytes":bytes, "boundary":"core_response_event_not_token_or_client_paint"}));
+            }
+        }
         let records_model_output = response_event_records_model_output(event);
         let records_model_content = response_event_records_model_content(event);
         let records_actionable_output = response_event_records_actionable_output(event);
@@ -4484,6 +4580,7 @@ impl TurnTimingState {
     ) -> Option<codex_api::ResponseAttemptIdentity> {
         let state = self.state();
         let request = state.model_requests.last()?;
+        if state.current_generation_index != Some(request.generation_index) { return None; }
         let physical_attempt_id = request.physical_attempt_ids.iter().rev()
             .find(|id| request.dispatched_attempt_ids.contains(*id))?;
         Some(codex_api::ResponseAttemptIdentity {
@@ -4528,8 +4625,15 @@ impl TurnTimingState {
             request.attempt_kind
         };
         request.dispatched_attempt_count = request.dispatched_attempt_count.saturating_add(1);
+        let first_dispatch = request.dispatch_ns.is_none();
         let generation_index = request.generation_index;
         let resumed_generation_id = format!("generation-{}", request.generation_index);
+        // The sampling owner advances generations only after the preceding
+        // request closes. Retain that control edge, including continuations
+        // without a tool result; physical retries do not add it again.
+        let previous_generation = first_dispatch.then(|| state.model_requests.iter().rev().skip(1)
+            .find(|request| request.completed_ns.is_some())
+            .map(|request| format!("generation-{}", request.generation_index))).flatten();
         let sample = self.clock.sample();
         state.retry_decisions.finish(sample.time.monotonic_ns, Some(retries::RetryExecution {
             generation_index: Some(generation_index),
@@ -4591,6 +4695,10 @@ impl TurnTimingState {
         let unrecorded_consumptions = std::mem::take(&mut state.unrecorded_tool_result_consumptions);
         let mut dropped_dependencies = Vec::new();
         if let Some(evidence) = state.activity_timeline.blocking.as_mut() {
+            if let Some(previous) = previous_generation {
+                dropped_dependencies.extend(blocking::record_dependency(evidence,
+                    resumed_generation_id.clone(), previous, "continues_generation"));
+            }
             for execution_id in consumed_tools {
                 dropped_dependencies.extend(blocking::record_dependency(evidence, resumed_generation_id.clone(), execution_id, "consumes_tool_result"));
             }
@@ -4658,6 +4766,12 @@ impl TurnTimingState {
         }
         state.counters.model_request_count = state.counters.model_request_count.saturating_add(1);
         drop(state);
+        if codex_protocol::timing::observations::enabled() {
+            self.observe_runtime("model_dispatched", physical_attempt_id, serde_json::json!({
+                "sampling_request_id":sampling_request_id, "physical_attempt_id":physical_attempt_id,
+                "generation_id":format!("generation-{generation_index}"), "internal_retry":internal_retry,
+                "owner_at_ns":sample.time.monotonic_ns}));
+        }
         for record in archive_records { record.write(); }
     }
 
@@ -5333,6 +5447,7 @@ impl TurnTimingStateInner {
 
     fn refresh_completed_request_diagnostics(&mut self) {
         if let Some(snapshot) = self.completed_snapshot.as_mut() {
+            snapshot.profile.measurements = self.measurements.clone();
             for request in &mut snapshot.profile.model_requests {
                 if let Some(current) = self.model_requests.iter().find(|current| {
                     current.sampling_request_id == request.sampling_request_id

@@ -34,7 +34,6 @@ use crate::context::PersonalitySpecInstructions;
 use crate::context::SkillsUsageInstructions;
 use crate::context::world_state::WorldState;
 use crate::context::world_state::WorldStateSnapshot;
-use crate::current_time::TimeProvider;
 use crate::default_skill_metadata_budget;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::exec_policy::ExecPolicyManager;
@@ -229,7 +228,7 @@ mod rollout_reconstruction;
 #[allow(clippy::module_inception)]
 pub(crate) mod session;
 pub(crate) mod step_context;
-pub(crate) mod time_reminder;
+pub(crate) mod workflow_checkpoint;
 pub(crate) mod turn;
 pub(crate) mod turn_context;
 pub(crate) mod turn_execution;
@@ -603,7 +602,6 @@ pub(crate) struct CodexSpawnArgs {
     pub(crate) analytics_events_client: Option<AnalyticsEventsClient>,
     pub(crate) thread_store: Arc<dyn ThreadStore>,
     pub(crate) attestation_provider: Option<Arc<dyn AttestationProvider>>,
-    pub(crate) external_time_provider: Option<Arc<dyn TimeProvider>>,
     pub(crate) inherited_multi_agent_version: Option<MultiAgentVersion>,
 }
 
@@ -697,7 +695,6 @@ impl Codex {
             analytics_events_client,
             thread_store,
             attestation_provider,
-            external_time_provider,
             inherited_multi_agent_version,
         } = args;
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
@@ -900,7 +897,6 @@ impl Codex {
             analytics_events_client,
             thread_store,
             attestation_provider,
-            external_time_provider,
             multi_agent_version,
         ))
         .await
@@ -908,6 +904,14 @@ impl Codex {
             error!("Failed to create session: {e:#}");
             map_session_init_error(&e)
         })?;
+        // Initialization may rejoin a tree with live workers. Publish only
+        // after it succeeds, using the session-bound shared preference.
+        if session.session_id() == SessionId::from(session.thread_id) {
+            session
+                .services
+                .agent_control
+                .set_root_service_tier(config.service_tier.clone());
+        }
         if let Some(message) = initial_service_tier_warning {
             // The ordered writer retains this even before the lazy rollout
             // exists; the normal persistence barrier will write it later.
@@ -2447,6 +2451,13 @@ impl Session {
             }
             // Publish the new configuration only after its durable write succeeds.
             state.session_configuration = updated.clone();
+            if updates.service_tier.is_some()
+                && self.session_id() == SessionId::from(self.thread_id)
+            {
+                self.services
+                    .agent_control
+                    .set_root_service_tier(updated.service_tier.clone());
+            }
             // Publish live policy at the accepted settings boundary, never from
             // an async context builder (including speculative startup previews).
             let mcp_runtime = self.services.latest_mcp_runtime();
@@ -2881,17 +2892,23 @@ impl Session {
                 EventMsg::TurnAborted(event) => event.timing.as_mut(),
                 _ => None,
             };
-            if let Some(timing) = timing
-                && let Some(trace) = turn_context.turn_timing_state.close_native_app_server_trace(
-                    &self.thread_id.to_string(), &turn_context.sub_id) {
+            if let Some(timing) = timing {
                 let evidence = timing.measurement_evidence.get_or_insert_with(|| serde_json::json!({"schemaVersion":1}));
-                if evidence.is_object() { evidence["appServerTrace"] = trace; }
+                if evidence.is_object() {
+                    evidence["causalIdentity"] = serde_json::json!({"session":self.thread_id.to_string(), "turn":turn_context.sub_id});
+                    if let Some(trace) = turn_context.turn_timing_state.close_native_app_server_trace(
+                        &self.thread_id.to_string(), &turn_context.sub_id) {
+                        evidence["appServerTrace"] = trace;
+                    }
+                }
             }
         }
         // Runner cohort metadata is qualified by the operational terminal, not
         // by plan completion or a fabricated success at snapshot time.
         match &mut msg {
             EventMsg::TurnComplete(event) => {
+                turn_context.turn_timing_state.observe_runtime("core_terminal", &turn_context.sub_id,
+                    serde_json::json!({"outcome":if event.error.is_some() {"failed"} else {"success"}, "persist":persist}));
                 if let Some(execution) = event.timing.as_mut()
                     .and_then(|timing| timing.performance_observations.as_mut())
                     .and_then(|packet| packet.get_mut("execution"))
@@ -2900,6 +2917,8 @@ impl Session {
                 }
             }
             EventMsg::TurnAborted(event) => {
+                turn_context.turn_timing_state.observe_runtime("core_terminal", &turn_context.sub_id,
+                    serde_json::json!({"outcome":"cancelled", "reason":event.reason, "persist":persist}));
                 if let Some(execution) = event.timing.as_mut()
                     .and_then(|timing| timing.performance_observations.as_mut())
                     .and_then(|packet| packet.get_mut("execution"))
@@ -4547,7 +4566,7 @@ impl Session {
         self.persist_rollout_items_ordered(&rollout_items).await?;
         {
             let mut state = self.state.lock().await;
-            state.current_time_reminder.note_recorded_items(items);
+            state.workflow_checkpoint.note_recorded_items(items);
             state.record_items(
                 items.iter(),
                 turn_context.model_info.truncation_policy.into(),
@@ -4796,7 +4815,7 @@ impl Session {
                     .await?;
                 {
                     let mut state = session.state.lock().await;
-                    state.current_time_reminder.note_recorded_items(&items);
+                    state.workflow_checkpoint.note_recorded_items(&items);
                     state.record_items(
                         items.iter(),
                         turn_context.model_info.truncation_policy.into(),
@@ -5142,7 +5161,7 @@ impl Session {
                 .await?;
             {
                 let mut state = session.state.lock().await;
-                state.current_time_reminder.note_recorded_items(&items);
+                state.workflow_checkpoint.note_recorded_items(&items);
                 state.record_items(
                     items.iter(),
                     turn_context.model_info.truncation_policy.into(),
@@ -6281,6 +6300,60 @@ impl Session {
         Ok(())
     }
 
+    async fn retain_context_replay_capture(
+        &self,
+        capture: codex_model_client::client::RetainedRequestCapture,
+    ) -> CodexResult<()> {
+        // Respect deliberately non-persistent sessions. Persistent sessions
+        // cannot dispatch past a failed capture/flush, just like sampling prefixes.
+        if self.live_thread().is_none() {
+            return Ok(());
+        }
+        let prepared = capture.replay_snapshot.is_some();
+        let snapshot = match capture.replay_snapshot.clone() {
+            Some(snapshot) => snapshot,
+            None => self.clone_history().await.sampling_replay_snapshot(),
+        };
+        let thread_id = self.thread_id.to_string();
+        let item = tokio::task::spawn_blocking(move || -> Result<RolloutItem, serde_json::Error> {
+            let logical = serde_json::to_string(&capture.logical_request)?;
+            let transport = capture.transport_request.as_ref().map(serde_json::to_string).transpose()?;
+            let digest = |text: &str| hex::encode(<sha2::Sha256 as sha2::Digest>::digest(text.as_bytes()));
+            let decisions = [3usize, 1].into_iter().map(|keep| {
+                let (_, _, decision) = snapshot.tool_history_state.pressure_retirement_decision(
+                    &snapshot.canonical_history, keep, u64::MAX, true,
+                );
+                (keep.to_string(), decision)
+            }).collect::<serde_json::Map<_, _>>();
+            Ok(RolloutItem::ContextReplay {
+                version: 1,
+                turn_id: capture.turn_id,
+                sampling_request_id: capture.identity.sampling_request_id,
+                physical_attempt_id: capture.identity.physical_attempt_id,
+                capture: serde_json::json!({
+                    "schema_version":1,
+                    "thread_id":thread_id,
+                    "transport":capture.transport,
+                    "selected_representation":capture.selected_representation,
+                    "has_sampling_boundary":capture.has_sampling_boundary,
+                    "snapshot_basis":if prepared { "immutable_prompt_preparation" } else { "live_session_at_auxiliary_dispatch" },
+                    "native_snapshot":snapshot,
+                    "retirement_decisions":decisions,
+                    "logical_request_sha256":digest(&logical),
+                    "transport_request_sha256":digest(transport.as_deref().unwrap_or(&logical)),
+                    "logical_request_json":logical,
+                    "transport_request_json":transport,
+                    "stage":"retained_before_transport; dispatch/acceptance require attempt timing"
+                }),
+            })
+        }).await.map_err(|error| CodexErr::Fatal(format!("context replay capture task failed: {error}")))?
+            .map_err(|error| CodexErr::Fatal(format!("context replay capture serialization failed: {error}")))?;
+        self.persist_rollout_items_ordered(&[item]).await
+            .map_err(|error| CodexErr::Fatal(format!("context replay capture persistence failed: {error}")))?;
+        self.flush_rollout().await
+            .map_err(|error| CodexErr::Fatal(format!("context replay capture flush failed: {error}")))
+    }
+
     pub(crate) async fn bind_context_baseline_candidate(
         &self,
         sampling_request_id: &str,
@@ -6364,6 +6437,12 @@ impl Session {
 
     pub(crate) async fn clone_history(&self) -> ContextManager {
         self.state.lock().await.clone_history()
+    }
+
+    pub(crate) async fn tool_history_recovery_context(&self, artifact_id: &str) -> serde_json::Value {
+        let state = self.state.lock().await;
+        state.history.tool_history_state_ref()
+            .retirement_recovery_context(artifact_id, state.history.raw_items())
     }
 
     /// Pinning and scope retirement need input provenance. Hold the existing history
@@ -7417,7 +7496,7 @@ impl Session {
                 .persist_rollout_items_ordered(&rollout_items)
                 .await?;
             state
-                .current_time_reminder
+                .workflow_checkpoint
                 .note_recorded_items(&context_items);
             state.record_items(
                 context_items.iter(),

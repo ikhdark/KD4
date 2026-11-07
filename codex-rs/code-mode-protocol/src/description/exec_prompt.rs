@@ -5,7 +5,7 @@ const LAZY_NESTED_TOOL_SCHEMA_GUIDANCE: &str = r#"Stable built-in contracts may 
 /// `read_file(path="context:exec-reference")`.
 pub const EXEC_REFERENCE: &str = include_str!("exec_reference.md");
 pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript as an ES module, not JSON/Markdown; top-level await is supported, top-level return is invalid (use conditional blocks or return inside a function). No browser/Node globals or filesystem/network.
-- Nested tools: const r = await tools.exec_command({cmd:"..."}); text(r); console.log aliases text. Chain dependent steps in order in one cell: const p = await tools.apply_patch(patch); text(p); if (p.success) { text(await tools.exec_command({program:"python",args:["app.py"]})); text(await tools.read_file({path:"out.json"})); }
+- Nested tools: const r = await tools.exec_command({cmd:"..."}); text(r); console.log aliases text. Batch required ranges and known continuations; when whole files are required: const reads = await read_files(["a.rs", "b.rs"], {full:true}); text(reads); Check per-file completeness/failures before using their contents. Keep known dependent steps in that cell; return to the model only when interpretation changes the next action.
 - {{delivery_guidance}}
 - Paths resolve against the session cwd: use relative paths and omit workdir when working there.
 - Edit via apply_patch: nested if registered, otherwise direct (*** Begin Patch envelope); never pipe patches through shell.

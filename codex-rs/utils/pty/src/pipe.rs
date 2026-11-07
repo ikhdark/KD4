@@ -188,6 +188,23 @@ async fn spawn_process_with_stdin_mode(
     #[cfg(not(unix))]
     let _ = inherited_fds;
 
+    // Windows resolves a qualified executable before applying current_dir.
+    // Anchor relative paths to the requested cwd, but leave bare PATH lookups
+    // and absolute paths unchanged, matching ConPTY's qualified-path boundary.
+    #[cfg(windows)]
+    let program_path = {
+        let path = Path::new(program);
+        if path.is_relative()
+            && (path.components().count() != 1 || program.contains(['/', '\\']))
+        {
+            std::borrow::Cow::Owned(std::path::absolute(cwd.join(path))?)
+        } else {
+            std::borrow::Cow::Borrowed(path)
+        }
+    };
+    #[cfg(windows)]
+    let mut command = Command::new(program_path.as_os_str());
+    #[cfg(not(windows))]
     let mut command = Command::new(program);
     #[cfg(unix)]
     if let Some(arg0) = arg0 {

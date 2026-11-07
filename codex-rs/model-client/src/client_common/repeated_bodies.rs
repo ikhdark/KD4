@@ -23,6 +23,7 @@ struct IncludedBody {
 #[derive(Default)]
 struct IncludedContent {
     exact: HashMap<[u8; 32], Vec<IncludedBody>>,
+    requirements: HashMap<String, Vec<IncludedBody>>,
     sources: HashMap<String, Vec<(usize, IncludedBody)>>,
     artifact_sources: HashMap<(String, String), String>,
 }
@@ -30,6 +31,7 @@ struct IncludedContent {
 #[derive(Clone)]
 struct FrameSource {
     source: String,
+    body: Option<u64>,
     selector: Value,
     range: Value,
 }
@@ -172,10 +174,17 @@ impl IncludedContent {
                     let body = &text[line_end..end];
                     let key = self.source_key(&label).or_else(|| {
                         let mut candidates = frames.iter().filter(|frame: &&FrameSource| {
-                            frame.selector == label["selector"]
-                                && frame.range == label["canonical_range"]
+                            if let Some(body) = frame.body {
+                                label["body"].as_u64() == Some(body)
+                            } else {
+                                frame.selector == label["selector"]
+                                    && frame.range == label["canonical_range"]
+                            }
                         });
                         let first = candidates.next()?;
+                        if first.body.is_some() {
+                            return candidates.next().is_none().then(|| first.source.clone());
+                        }
                         candidates
                             .all(|other| other.source == first.source)
                             .then(|| first.source.clone())
@@ -240,6 +249,36 @@ impl IncludedContent {
         match value {
             Value::Object(object) => {
                 changed |= compact_listing_cutoffs(object);
+                changed |= self.project_requirements(object, location);
+                let spawn_capabilities = object.get("task_name").is_some_and(Value::is_string)
+                    && object.get("assignment_id").is_some_and(Value::is_string)
+                    && object.get("integration_plan").is_some_and(Value::is_string)
+                    && object.get("overlap_warnings").is_some_and(Value::is_array)
+                    && object.get("effective_capabilities").is_some_and(Value::is_object);
+                if spawn_capabilities {
+                    let text = object["effective_capabilities"].to_string();
+                    let mut origin = location.clone();
+                    origin["field"] = json!("effective_capabilities");
+                    if let Some(reference) = self.project_body(&text, &origin) {
+                        object.insert("effective_capabilities".into(),
+                            json!({"already_in_context":reference,"json_value":true}));
+                        changed = true;
+                    }
+                }
+                // Indexed read frames keep their coordinates in the body label,
+                // not twice in the header. Bind only an unambiguous native source.
+                if let Some(body) = object.get("body").and_then(Value::as_u64).filter(|n| *n > 0)
+                    && !object.contains_key("text")
+                    && !object.contains_key("canonical_range")
+                    && let Some(key) = key
+                {
+                    frames.push(FrameSource {
+                        source: key.to_string(),
+                        body: Some(body),
+                        selector: Value::Null,
+                        range: Value::Null,
+                    });
+                }
                 // Only exact acquired source rows qualify for range sharing.
                 if object.contains_key("canonical_range")
                     && object.get("complete") != Some(&Value::Bool(false))
@@ -256,6 +295,7 @@ impl IncludedContent {
                     } else if object.contains_key("text_lines") {
                         frames.push(FrameSource {
                             source: key.to_string(),
+                            body: None,
                             selector: object.get("selector").cloned().unwrap_or(Value::Null),
                             range: object["canonical_range"].clone(),
                         });
@@ -273,7 +313,9 @@ impl IncludedContent {
                     }
                 }
                 for (name, child) in object.iter_mut() {
-                    if name != "included_content" {
+                    // A capability owner must remain literal; never reference an
+                    // original whose nested fields this traversal rewrites later.
+                    if name != "included_content" && !(spawn_capabilities && name == "effective_capabilities") {
                         changed |= self.project_json(child, key, location, frames);
                     }
                 }
@@ -284,6 +326,59 @@ impl IncludedContent {
                 }
             }
             _ => {}
+        }
+        changed
+    }
+
+    fn project_requirements(
+        &mut self,
+        object: &mut serde_json::Map<String, Value>,
+        location: &Value,
+    ) -> bool {
+        // Restrict sharing to the successful producer receipt and its active
+        // obligation IDs, never arbitrary text with a similarly named field.
+        if !object.get("revision").and_then(Value::as_str).is_some_and(|revision| {
+            revision.len() == 64 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) || !object.get("no_progress").is_some_and(Value::is_boolean)
+            || !object.get("effect").and_then(Value::as_str).is_some_and(|effect| {
+                matches!(effect, "initial" | "structural_revision" | "status_only" | "no_op")
+            })
+            || !object.get("step_ids").is_some_and(Value::is_array)
+        {
+            return false;
+        }
+        let Some(unresolved) = object.get("obligations")
+            .and_then(|obligations| obligations.get("unresolved"))
+            .and_then(Value::as_array).cloned()
+        else {
+            return false;
+        };
+        let Some(requirements) = object.get_mut("remaining_requirements")
+            .and_then(Value::as_object_mut)
+        else {
+            return false;
+        };
+        let mut changed = false;
+        for (id, value) in requirements {
+            let Some(text) = value.as_str().filter(|text| text.len() >= MIN_BODY_BYTES) else {
+                continue;
+            };
+            if !unresolved.iter().any(|identity| identity.as_str() == Some(id)) {
+                continue;
+            }
+            let owners = self.requirements.entry(id.clone()).or_default();
+            if let Some(owner) = owners.iter().find(|owner| owner.text == text) {
+                let repeated = json!({"active":true,
+                    "already_in_context":reference(&owner.location, text)});
+                if repeated.to_string().len() + 64 < text.len() {
+                    *value = repeated;
+                    changed = true;
+                }
+            } else {
+                let mut owner = location.clone();
+                owner["requirement_id"] = Value::String(id.clone());
+                owners.push(IncludedBody { text: text.to_string(), location: owner });
+            }
         }
         changed
     }

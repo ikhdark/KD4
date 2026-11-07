@@ -32,7 +32,6 @@ use crate::tools::events::ToolEventCtx;
 use crate::tools::events::ToolEventStage;
 use crate::tools::tool_dispatch_trace::ToolDispatchTiming;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
-use codex_features::Feature;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
@@ -294,20 +293,6 @@ pub(super) async fn wait_for_process_output_finalization(
     closed.await;
 }
 
-pub(super) async fn wait_for_process_output_for_result(
-    direct_runtime: bool,
-    output_drained: &CancellationToken,
-    output_closed: &AtomicBool,
-    output_closed_notify: &Notify,
-) {
-    if direct_runtime {
-        wait_for_process_output_drain(output_drained).await;
-    } else {
-        wait_for_process_output_finalization(output_drained, output_closed, output_closed_notify)
-            .await;
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn emit_process_terminal_event(
     process: &Arc<UnifiedExecProcess>,
@@ -466,9 +451,7 @@ pub(crate) fn spawn_exit_watcher(
         );
         let output_wait_started_at_ms = turn_ref.turn_timing_state.monotonic_offset_ms();
         let output_handles = process.output_handles();
-        let direct_runtime = turn_ref.config.features.enabled(Feature::DirectRuntime);
-        wait_for_process_output_for_result(
-            direct_runtime,
+        wait_for_process_output_finalization(
             &output_drained,
             output_handles.output_closed.as_ref(),
             output_handles.output_closed_notify.as_ref(),
@@ -489,38 +472,6 @@ pub(crate) fn spawn_exit_watcher(
             });
         }
 
-        let mut delivered_at = None;
-        let mut terminal_result = Ok(());
-        if direct_runtime {
-            terminal_result = emit_process_terminal_event(
-                &process,
-                &session_ref,
-                &turn_ref,
-                &call_id,
-                &command,
-                &cwd,
-                process_id,
-                &transcript,
-                failure_message.as_deref(),
-                tty,
-                classified_search,
-                false,
-                duration,
-                &source,
-                tracker.as_ref(),
-                Some(&parent_tool_execution_id.0),
-            )
-            .await;
-            delivered_at = Some(Instant::now());
-
-            wait_for_process_output_finalization(
-                &output_drained,
-                output_handles.output_closed.as_ref(),
-                output_handles.output_closed_notify.as_ref(),
-            )
-            .await;
-        }
-
         if !tracked {
             tracing::debug!(
                 process_id,
@@ -535,28 +486,26 @@ pub(crate) fn spawn_exit_watcher(
                 .update_running_artifact(process_id, finalized_artifact)
                 .await;
         }
-        if !direct_runtime {
-            terminal_result = emit_process_terminal_event(
-                &process,
-                &session_ref,
-                &turn_ref,
-                &call_id,
-                &command,
-                &cwd,
-                process_id,
-                &transcript,
-                failure_message.as_deref(),
-                tty,
-                classified_search,
-                false,
-                duration,
-                &source,
-                tracker.as_ref(),
-                Some(&parent_tool_execution_id.0),
-            )
-            .await;
-            delivered_at = Some(Instant::now());
-        }
+        let terminal_result = emit_process_terminal_event(
+            &process,
+            &session_ref,
+            &turn_ref,
+            &call_id,
+            &command,
+            &cwd,
+            process_id,
+            &transcript,
+            failure_message.as_deref(),
+            tty,
+            classified_search,
+            false,
+            duration,
+            &source,
+            tracker.as_ref(),
+            Some(&parent_tool_execution_id.0),
+        )
+        .await;
+        let delivered_at = Instant::now();
         let finalization = session_ref
             .services
             .command_execution
@@ -597,7 +546,6 @@ pub(crate) fn spawn_exit_watcher(
             previous_completion.is_none(),
             "watcher completion is published once"
         );
-        let delivered_at = delivered_at.unwrap_or_else(Instant::now);
         let lifecycle = tool_dispatch_timing
             .as_ref()
             .map(|timing| timing.snapshot(delivered_at));

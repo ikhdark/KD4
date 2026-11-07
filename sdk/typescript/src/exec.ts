@@ -36,7 +36,7 @@ export type CodexExecArgs = {
   networkAccessEnabled?: boolean;
   // --config web_search
   webSearchMode?: WebSearchMode;
-  // legacy --config features.web_search_request
+  // Boolean shorthand for --config web_search (live/disabled)
   webSearchEnabled?: boolean;
   // --config approval_policy
   approvalPolicy?: ApprovalMode;

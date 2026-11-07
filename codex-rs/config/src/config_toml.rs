@@ -137,6 +137,10 @@ const fn default_hide_agent_reasoning() -> Option<bool> {
     Some(false)
 }
 
+const fn default_show_raw_agent_reasoning() -> Option<bool> {
+    Some(true)
+}
+
 const fn default_true() -> bool {
     true
 }
@@ -378,9 +382,9 @@ pub struct ConfigToml {
     /// exactly retrievable receipts in manually managed prompt history.
     pub completed_tool_history_projection: Option<bool>,
 
-    /// Opt-in: when a context-pressure retirement rewrites prompt history,
+    /// When a context-pressure retirement rewrites prompt history,
     /// also leave reasoning older than the newest kept generations out of
-    /// sampling requests. Stored history is unchanged. Default: false.
+    /// sampling requests. Stored history is unchanged. Default: true.
     pub pressure_reasoning_retirement: Option<bool>,
 
     /// Maximum poll window for background terminal output (`write_stdin`), in milliseconds.
@@ -416,7 +420,8 @@ pub struct ConfigToml {
     pub hide_agent_reasoning: Option<bool>,
 
     /// When set to `true`, `AgentReasoningRawContentEvent` events will be shown in the UI/output.
-    /// Defaults to `false`.
+    /// Defaults to `true`.
+    #[serde(default = "default_show_raw_agent_reasoning")]
     pub show_raw_agent_reasoning: Option<bool>,
 
     pub model_reasoning_effort: Option<ReasoningEffort>,

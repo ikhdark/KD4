@@ -240,7 +240,6 @@ pub async fn preflight_invocation_with_equivalent_repair_async(
 
 pub async fn preflight_invocation_for_kd4_runtime(
     kd4_runtime: bool,
-    direct_runtime: bool,
     invocation: &CommandInvocation,
     command: &[String],
     shell_type: Option<ShellType>,
@@ -255,7 +254,7 @@ pub async fn preflight_invocation_for_kd4_runtime(
         });
     }
     let mut outcome =
-        match preflight_invocation_for_runtime(direct_runtime, invocation, command, shell_type)
+        match preflight_invocation_with_equivalent_repair_async(invocation, command, shell_type)
             .await
         {
             Ok(outcome) => outcome,
@@ -264,7 +263,6 @@ pub async fn preflight_invocation_for_kd4_runtime(
                 // single-directory, read-only argv search; scripts retain their
                 // advisory so pipelines, expansion and side effects are untouched.
                 let repaired = if cfg!(windows)
-                    && !direct_runtime
                     && let Some(cwd) = local_cwd
                     && invocation.is_argv()
                 {
@@ -282,9 +280,8 @@ pub async fn preflight_invocation_for_kd4_runtime(
                 repaired.ok_or(error)?
             }
         };
-    // Never inspect the host filesystem for a remote command. Direct-runtime
-    // bypass remains authoritative, including for optional advisories.
-    if !direct_runtime && let Some(cwd) = local_cwd {
+    // Never inspect the host filesystem for a remote command.
+    if let Some(cwd) = local_cwd {
         if cfg!(windows)
             && !outcome.repaired()
             && outcome
@@ -519,23 +516,6 @@ fn source_paging_advisory(
     (reads > 0 && paged).then_some(
         "Source-read advisory: this paged shell read runs unchanged. For subsequent UTF-8 source inspection, prefer read_file with batched line selectors (1-based, inclusive); PowerShell -Skip N starts at line N+1. Check every result and file_complete; recover omitted bytes from the returned snapshot instead of rereading pages. Keep shell reads when their encoding, streaming, or transformation semantics are required. Do not reread already delivered evidence solely to change tools.",
     )
-}
-
-pub async fn preflight_invocation_for_runtime(
-    direct_runtime: bool,
-    invocation: &CommandInvocation,
-    command: &[String],
-    shell_type: Option<ShellType>,
-) -> Result<CommandPreflightOutcome, String> {
-    if direct_runtime {
-        return Ok(CommandPreflightOutcome {
-            invocation: invocation.clone(),
-            validation_invocations: Vec::new(),
-            repair_notice: None,
-            advisory: None,
-        });
-    }
-    preflight_invocation_with_equivalent_repair_async(invocation, command, shell_type).await
 }
 
 fn preflight_invocation_with_equivalent_repair_detailed(

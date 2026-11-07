@@ -507,7 +507,6 @@ const LEGACY_FEATURE_ALIASES: &[(&str, &str)] = &[
     ("connectors", "apps"),
     ("experimental_use_unified_exec_tool", "unified_exec"),
     ("request_permissions", "exec_permission_approvals"),
-    ("web_search", "web_search_request"),
     ("imagegenext", "image_generation"),
     ("collab", "multi_agent"),
     ("codex_hooks", "hooks"),

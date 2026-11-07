@@ -85,6 +85,7 @@ pub fn builder_from_items(
         RolloutItem::SessionMeta(meta_line) => Some(meta_line),
         RolloutItem::ResponseItem(_)
         | RolloutItem::ToolManifest(_)
+        | RolloutItem::ContextReplay { .. }
         | RolloutItem::SamplingBoundary(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
@@ -322,6 +323,7 @@ fn metadata_record_needs_parse(line: &[u8]) -> bool {
         | b"compacted"
         | b"tool_manifest"
         | b"sampling_boundary"
+        | b"context_replay"
         | b"inter_agent_communication"
         | b"inter_agent_communication_metadata"
         | b"additional_context_state" => false,
@@ -395,7 +397,7 @@ fn reference_record_needs_parse(rest: &[u8]) -> bool {
     match take_string_field(&rest[digits..], br#","item_type":""#) {
         // Writers offload only patch ends, terminal events, manifests and timing
         // checkpoints besides session metadata; none of those affect metadata.
-        Some((b"tool_manifest" | b"sampling_boundary" | b"event_msg", _)) => false,
+        Some((b"tool_manifest" | b"sampling_boundary" | b"context_replay" | b"event_msg", _)) => false,
         _ => true,
     }
 }

@@ -1520,7 +1520,7 @@ async fn read_head_summary(
                         }
                     }
                     RolloutItem::ToolManifest(_) => {}
-                    RolloutItem::SamplingBoundary(_) => {}
+                    RolloutItem::SamplingBoundary(_) | RolloutItem::ContextReplay { .. } => {}
                     RolloutItem::ResponseItem(_) | RolloutItem::InterAgentCommunication(_) => {
                         // A listing requires SessionMeta, which supplies the canonical created_at.
                     }
@@ -1623,6 +1623,7 @@ pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Va
                 }
                 RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::ToolManifest(_)
+                | RolloutItem::ContextReplay { .. }
                 | RolloutItem::SamplingBoundary(_)
                 | RolloutItem::Compacted(_)
                 | RolloutItem::TurnContext(_)

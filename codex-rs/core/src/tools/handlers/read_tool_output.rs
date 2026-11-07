@@ -181,6 +181,10 @@ struct RecoveryAttemptObservation<'a> {
     selection_successful: bool,
     selection_complete: bool,
     retained_artifact_complete: bool,
+    requested_selectors: serde_json::Value,
+    prior_evidence: serde_json::Value,
+    selected_identity: serde_json::Value,
+    native_response_bytes: Option<u64>,
 }
 
 impl Drop for RecoveryAttemptObservation<'_> {
@@ -194,6 +198,11 @@ impl Drop for RecoveryAttemptObservation<'_> {
                 "selection_complete":self.selection_complete,
                 "retained_artifact_complete":self.retained_artifact_complete,
                 "delivery_scope":self.delivery_scope, "model_delivery_verified":false,
+                "requested_selectors":self.requested_selectors,
+                "prior_evidence":self.prior_evidence,
+                "selected_identity":self.selected_identity,
+                "native_response_bytes":self.native_response_bytes,
+                "response_scope":"native selection response, not model-visible tokens",
             }));
         }
         tracing::info!(event.name = "codex.tool_output_recovery.attempt_finished",
@@ -206,6 +215,9 @@ impl Drop for RecoveryAttemptObservation<'_> {
             selection_complete = self.selection_complete,
             retained_artifact_complete = self.retained_artifact_complete,
             model_delivery_verified = false,
+            requested_selectors_json = %self.requested_selectors,
+            prior_evidence_json = %self.prior_evidence,
+            native_response_bytes = self.native_response_bytes,
             elapsed_us = u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX),
             elapsed_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "output recovery attempt settled (including failed and abandoned attempts)");
@@ -246,6 +258,10 @@ async fn handle_read_tool_output(
         selection_successful: false,
         selection_complete: false,
         retained_artifact_complete: false,
+        requested_selectors: serde_json::Value::Null,
+        prior_evidence: serde_json::Value::Null,
+        selected_identity: serde_json::Value::Null,
+        native_response_bytes: None,
     };
     let ToolPayload::Function { ref arguments } = invocation.payload else {
         return Err(FunctionCallError::RespondToModel(
@@ -289,6 +305,10 @@ async fn handle_read_tool_output(
         return result;
     }
     let selectors = resolved_selectors(&args)?;
+    attempt.requested_selectors = serde_json::to_value(&selectors).unwrap_or_default();
+    if !foreign_source {
+        attempt.prior_evidence = invocation.session.tool_history_recovery_context(&args.artifact_id).await;
+    }
     let code_mode_recovery = matches!(&invocation.source, ToolCallSource::CodeMode { .. });
     attempt.delivery_scope = if code_mode_recovery { "code_mode" } else { "direct" };
     let delivery_policy = if code_mode_recovery {
@@ -417,7 +437,9 @@ async fn handle_read_tool_output(
         attempt.selection_successful = success;
         attempt.selection_complete = output["complete"] == true;
         attempt.retained_artifact_complete = output["retained_artifact_complete"] == true;
+        attempt.selected_identity = evidence.as_ref().map(|evidence| evidence["identity"].clone()).unwrap_or_default();
         attempt.phase = "command_delivery";
+        attempt.native_response_bytes = Some(envelope_bytes as u64);
         let mut result = JsonToolOutput::with_success(output, Some(success))
             .with_code_mode_failure_as_data();
         if let Some(evidence) = evidence {
@@ -528,6 +550,7 @@ async fn handle_read_tool_output(
             "identity": identity,
         })
     });
+    attempt.selected_identity = evidence.as_ref().map(|evidence| evidence["identity"].clone()).unwrap_or_default();
     let mut selectors = output.delivered_ranges().into_iter().map(|(start, end)|
         serde_json::json!({"kind":"bytes", "start":start, "end":end, "source_inspection":false})
     ).collect::<Vec<_>>();
@@ -559,6 +582,7 @@ async fn handle_read_tool_output(
     let acquired_source_bytes = !acquired.is_empty();
     selectors.extend(acquired);
     let mut inner = recovery_tool_output(output, successful, evidence.clone());
+    attempt.native_response_bytes = Some(inner.value().to_string().len() as u64);
     attempt.phase = "delivery";
     crate::tools::context::ensure_exact_model_delivery(&inner, &invocation)?;
     if (evidence.is_some() || !selectors.is_empty()) && !foreign_source {

@@ -221,6 +221,7 @@ fn rollout_filter_decisions(
             RolloutItem::TurnContext(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::Compacted(_)
+            | RolloutItem::ContextReplay { .. }
             | RolloutItem::SamplingBoundary(_)
             | RolloutItem::AdditionalContextState { .. }
             | RolloutItem::ResponseItem(_) if retained && !instruction_boundary => {

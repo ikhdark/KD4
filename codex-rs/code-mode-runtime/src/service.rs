@@ -249,6 +249,7 @@ impl runtime::SessionRuntimeDelegate for ProtocolDelegate {
                     cell_id: protocol_cell_id(&invocation.cell_id),
                     parent_tool_call_id: Some(invocation.parent_tool_call_id),
                     runtime_tool_call_id: invocation.runtime_tool_call_id,
+                    causal_predecessors: invocation.causal_predecessors,
                     buffered_output_bytes: invocation.buffered_output_bytes,
                     tool_name: codex_protocol::ToolName {
                         name: invocation.tool_name.name,

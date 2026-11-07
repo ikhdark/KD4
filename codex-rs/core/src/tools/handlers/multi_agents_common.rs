@@ -153,6 +153,10 @@ pub(crate) fn thread_spawn_source(
 pub(crate) fn build_agent_spawn_config(turn: &TurnContext) -> Result<Config, FunctionCallError> {
     let mut config = build_agent_shared_config(turn)?;
     config.base_instructions = Some(turn.base_instructions.text.clone());
+    // Do not freeze an inherited preference into a local override. None is
+    // persisted as such, so reloaded workers still follow the root. Explicit
+    // per-spawn tiers are applied below after the model has been resolved.
+    config.service_tier = None;
     Ok(config)
 }
 
@@ -351,18 +355,6 @@ pub(crate) async fn apply_spawn_agent_model_defaults_and_overrides(
     Ok(())
 }
 
-/// A child inherits the parent's service tier as the parent's next request
-/// would use it. A settings update during the turn changes the session, not
-/// the configuration captured when the turn started.
-pub(crate) async fn inherit_live_service_tier(
-    session: &Session,
-    config: &mut Config,
-) -> Option<String> {
-    let live = session.configured_service_tier().await;
-    config.service_tier = live.clone();
-    live
-}
-
 /// An explicit `default` is a valid choice for every model: it selects the
 /// default tier rather than inheriting one.
 fn spawn_service_tier_is_supported(
@@ -376,13 +368,11 @@ pub(crate) async fn apply_spawn_agent_service_tier(
     session: &Session,
     turn: &TurnContext,
     config: &mut Config,
-    parent_service_tier: Option<&str>,
     requested_service_tier: Option<&str>,
 ) -> Result<(), FunctionCallError> {
     let candidate_service_tiers = [
         config.service_tier.clone(),
         requested_service_tier.map(str::to_string),
-        parent_service_tier.map(str::to_string),
     ];
     if candidate_service_tiers.iter().all(Option::is_none) {
         config.service_tier = None;

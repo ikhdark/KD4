@@ -108,6 +108,8 @@ pub struct FormattedPromptInput {
 pub struct Prompt {
     /// Conversation context input items.
     pub input: Arc<[ResponseItem]>,
+    /// Exact pre-projection retirement state, retained locally at dispatch only.
+    pub replay_snapshot: Option<codex_conversation::context_manager::SamplingReplaySnapshot>,
     // Admission and dispatch share the selected immutable request projections.
     // Weak source identity fences later mutations without retaining old histories.
     pub formatted_inputs: Arc<Mutex<Vec<FormattedPromptInput>>>,
@@ -175,6 +177,7 @@ impl Default for Prompt {
     fn default() -> Self {
         Self {
             input: Arc::from([]),
+            replay_snapshot: None,
             formatted_inputs: Arc::new(Mutex::new(Vec::new())),
             stable_context_fallback_input: Arc::from([]),
             tool_history_fallback_input: Arc::from([]),

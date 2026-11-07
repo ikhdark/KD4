@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use codex_tools::{JsonSchema, JsonToolOutput, ResponsesApiTool, ToolName, ToolSpec};
+use codex_protocol::tool_failure::{ToolFailure, ToolFailureCode};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -216,9 +217,10 @@ impl ToolExecutor<ToolInvocation> for FileSearchHandler {
             .map_err(|e| {
                 FunctionCallError::RespondToModel(format!("file search launch failed: {e}"))
             })?;
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let mut capture_overflowed = false;
             let collect = async {
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
                 let (mut out_open, mut err_open) = (true, true);
                 while out_open || err_open {
                     let (packet, target, open) = tokio::select! {
@@ -227,6 +229,9 @@ impl ToolExecutor<ToolInvocation> for FileSearchHandler {
                     };
                     if let Some(packet) = packet {
                         if target.len() + packet.len() > 8 * 1024 * 1024 {
+                            let remaining = 8 * 1024 * 1024 - target.len();
+                            target.extend_from_slice(&packet[..remaining]);
+                            capture_overflowed = true;
                             return Err(
                                 "file search exceeded exact capture; narrow paths or globs"
                                     .to_owned(),
@@ -241,11 +246,7 @@ impl ToolExecutor<ToolInvocation> for FileSearchHandler {
                 if !process.session.output_capture().complete() {
                     return Err("file search producer did not certify both stream ends".to_owned());
                 }
-                Ok((
-                    code,
-                    String::from_utf8(stdout).map_err(|e| e.to_string())?,
-                    String::from_utf8(stderr).map_err(|e| e.to_string())?,
-                ))
+                Ok(code)
             };
             let result = tokio::select! {
                 biased;
@@ -254,10 +255,7 @@ impl ToolExecutor<ToolInvocation> for FileSearchHandler {
             };
             // Confirm custody settlement even after a successful root exit; a PATH
             // shim must not leave a descendant behind this read-only operation.
-            process.session.terminate().map_err(|e| {
-                FunctionCallError::RespondToModel(format!("file search cleanup failed: {e}"))
-            })?;
-            let (exit_code, stdout, stderr) = result.map_err(FunctionCallError::RespondToModel)?;
+            let cleanup_error = process.session.terminate().err().map(|error| error.to_string());
             let roots = args.paths.iter().map(|requested| {
                 let resolved = environment.cwd().join(requested);
                 match resolved {
@@ -265,17 +263,88 @@ impl ToolExecutor<ToolInvocation> for FileSearchHandler {
                     Err(error) => json!({"requested":requested,"resolved":null,"error":error.to_string()}),
                 }
             }).collect::<Vec<_>>();
+            let environment_receipt = json!({"roots":[{"environment":{
+                "environment_id":environment.environment_id,
+                "cwd":environment.cwd(),"search_roots":roots}}]});
+            if capture_overflowed {
+                let mut captures = Vec::new();
+                for (stream, bytes) in [("stdout", stdout), ("stderr", stderr)] {
+                    if !bytes.is_empty() {
+                        captures.push(retain_capture(&invocation, stream, bytes).await);
+                    }
+                }
+                let mut failure = ToolFailure::new(
+                    ToolFailureCode::Failed,
+                    "file search exceeded exact capture; recover the retained prefix, then narrow paths or globs",
+                ).with_completed_execution();
+                failure.safe_next_actions = vec![
+                    "Inspect retained captured prefixes; they do not establish complete search coverage. Narrow paths/globs or omit lines for further authorized acquisition; do not automatically replay this search.".into(),
+                ];
+                failure.details = Some(json!({
+                    "search_backend":"native_file_search",
+                    "capture_failure":"exact_capture_overflow",
+                    "streams_complete":false,
+                    "execution_state":if cleanup_error.is_none() { "exited" } else { "unknown" },
+                    "process_exited":cleanup_error.as_ref().map(|_| serde_json::Value::Null).unwrap_or(json!(true)),
+                    "cleanup_error":cleanup_error,
+                    "environment_receipt":environment_receipt,
+                    "coverage":{"complete":false,"lower_bound":true,"scope_exhausted":null,
+                        "result_limit_hit":null,"read_errors":{"present":null},
+                        "reasons":["exact_capture_incomplete"]},
+                    "delivery":{"complete":false,"truncated":true,"exact_capture_complete":false},
+                    "captures":captures,
+                }));
+                return Err(FunctionCallError::structured(failure));
+            }
+            if let Some(error) = cleanup_error {
+                return Err(FunctionCallError::RespondToModel(format!("file search cleanup failed: {error}")));
+            }
+            let exit_code = result.map_err(FunctionCallError::RespondToModel)?;
+            let stdout = String::from_utf8(stdout)
+                .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+            let stderr = String::from_utf8(stderr)
+                .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
             let output = JsonToolOutput::new(
                 json!({"exit_code":exit_code,"stdout":stdout,"stderr":stderr,
                 "search_backend":"native_file_search",
                 "streams_complete":true,"execution_state":"exited","process_exited":true,
-                "environment_receipt":{"roots":[{"environment":{"environment_id":environment.environment_id,
-                    "cwd":environment.cwd(),"search_roots":roots}}]}}),
+                "environment_receipt":environment_receipt}),
             );
             crate::tools::context::ensure_exact_model_delivery(&output, &invocation)?;
             Ok(boxed_tool_output(output))
         })
     }
+}
+
+/// Retain exact bytes, including a possible split UTF-8/JSON record, through the
+/// existing artifact owner. A complete retained prefix is not a complete search.
+async fn retain_capture(invocation: &ToolInvocation, stream: &str, bytes: Vec<u8>) -> serde_json::Value {
+    let canonical = codex_tools::CanonicalToolResult::bytes(bytes);
+    let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
+        invocation.step_context.turn.config.codex_home.as_path(),
+        &invocation.session.thread_id.to_string(),
+        &canonical,
+    ).await;
+    let mut receipt = json!({"stream":stream,"captured_bytes":canonical.exact_bytes,
+        "canonical_sha256":canonical.sha256,"capture_complete":false,
+        "retention_status":"unavailable"});
+    if let Some(id) = artifact.artifact_id().filter(|_| artifact.complete) {
+        match invocation.session.try_register_tool_artifact_origin(
+            id.clone(), invocation.call_id.clone(), canonical.exact_bytes, canonical.sha256.clone(),
+        ).await {
+            Ok(()) => {
+                receipt["retention_status"] = json!("retained");
+                receipt["artifact_id"] = json!(id);
+                receipt["recovery"] = json!({"tool":"read_tool_output","arguments":{
+                    "artifact_id":id,"selectors":[{"kind":"bytes","start":0,
+                        "end":canonical.exact_bytes.min(4096)}]}});
+            }
+            Err(error) => receipt["error"] = json!(error.to_string()),
+        }
+    } else {
+        receipt["error"] = json!(artifact.error);
+    }
+    receipt
 }
 
 impl CoreToolRuntime for FileSearchHandler {

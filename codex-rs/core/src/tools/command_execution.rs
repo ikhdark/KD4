@@ -572,6 +572,15 @@ impl CommandExecutionLedger {
         repaired: bool,
         force_fresh: bool,
     ) -> Result<(), CommandAttemptBlocked> {
+        if codex_protocol::timing::observations::enabled() {
+            if let Some(dispatch) = crate::tools::tool_dispatch_trace::active_tool_dispatch_timing()
+                && let Some(timing) = dispatch.turn_timing_state() {
+            timing.observe_runtime("command_attempt_admission", &dispatch.execution_id().0,
+                serde_json::json!({"attempt_fingerprint":key.fingerprint(),
+                    "repaired":repaired, "force_fresh":force_fresh,
+                    "state_coverage":"owner_observed_revisions_not_arbitrary_external_state"}));
+            }
+        }
         let mut state = self.state.lock().await;
         if !repaired && !force_fresh {
             if let Some(prior_failure) = state

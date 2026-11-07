@@ -252,13 +252,6 @@ server_request_definitions! {
         response: v2::AttestationGenerateResponse,
     },
 
-    #[experimental("currentTime/read")]
-    /// Read the current time from an external clock owned by the client.
-    CurrentTimeRead => "currentTime/read" {
-        params: v2::CurrentTimeReadParams,
-        response: v2::CurrentTimeReadResponse,
-    },
-
     /// DEPRECATED APIs below
     /// Request to approve a patch.
     /// This request is used for Turns started via the legacy APIs (i.e. SendUserTurn, SendUserMessage).

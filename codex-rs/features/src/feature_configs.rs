@@ -115,48 +115,4 @@ impl FeatureConfig for MultiAgentV2ConfigToml {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum CurrentTimeSource {
-    #[default]
-    System,
-    External,
-}
-
-/// Which inference boundaries may receive current-time reminders.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum CurrentTimeReminderDeliveryMode {
-    /// Allow a reminder before any inference request once the interval is due.
-    #[default]
-    AnyInference,
-    /// Allow reminders after user input or tool output; new context windows still force one.
-    AfterUserOrToolOutput,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CurrentTimeReminderConfigToml {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reminder_interval_seconds: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub clock_source: Option<CurrentTimeSource>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub delivery_mode: Option<CurrentTimeReminderDeliveryMode>,
-    /// Expose the input-interruptible `clock.sleep` tool.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sleep_tool: Option<bool>,
-}
-
-impl FeatureConfig for CurrentTimeReminderConfigToml {
-    fn enabled(&self) -> Option<bool> {
-        self.enabled
-    }
-
-    fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = Some(enabled);
-    }
-}
 

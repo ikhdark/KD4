@@ -112,6 +112,7 @@ pub(crate) struct NestedToolCall {
     pub(crate) cell_id: CellId,
     pub(crate) parent_tool_call_id: String,
     pub(crate) runtime_tool_call_id: String,
+    pub(crate) causal_predecessors: Option<Vec<String>>,
     pub(crate) buffered_output_bytes: usize,
     pub(crate) tool_name: ToolName,
     pub(crate) tool_kind: ToolKind,

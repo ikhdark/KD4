@@ -499,6 +499,7 @@ impl ThreadHistoryBuilder {
             RolloutItem::InterAgentCommunication(_) => self.mark_user_turn(),
             RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::ToolManifest(_)
+            | RolloutItem::ContextReplay { .. }
             | RolloutItem::SamplingBoundary(_)
             | RolloutItem::TurnContext(_)
             | RolloutItem::WorldState(_)

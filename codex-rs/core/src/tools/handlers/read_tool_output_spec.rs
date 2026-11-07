@@ -157,7 +157,7 @@ fn selector_schema() -> JsonSchema {
                     ),
                     (
                         "regex".to_string(),
-                        JsonSchema::boolean(Some(format!("Defaults to false; Rust byte-regex syntax without lookaround or backreferences. ASCII classes/case folding by default (inline Unicode flags allowed). At most {ARTIFACT_REGEX_MAX_SEARCH_BYTES} retained subject bytes, 1 MiB compiled/DFA limits and nesting limit 64. Non-overlapping matches; encountering a zero-width match rejects the selector. Anchors/boundaries refer to the original subject, not start_byte. Examines at most max_results+1 matches per page; match_count_complete:false makes total_matches/remaining_match_count lower bounds. Follow continuation, not the producer."))),
+                        JsonSchema::boolean(Some(format!("Defaults to false; Rust byte-regex syntax without lookaround or backreferences, with (?m) needed for ^/$ line anchors. ASCII classes/case folding by default (inline Unicode flags allowed). At most {ARTIFACT_REGEX_MAX_SEARCH_BYTES} retained subject bytes, 1 MiB compiled/DFA limits and nesting limit 64. Non-overlapping matches; encountering a zero-width match rejects the selector. Anchors/boundaries refer to the original subject, not start_byte. Examines at most max_results+1 matches per page; match_count_complete:false makes total_matches/remaining_match_count lower bounds. Follow continuation, not the producer."))),
                     ),
                     (
                         "case_insensitive".to_string(),

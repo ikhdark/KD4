@@ -113,6 +113,19 @@ impl AgentControl {
                     if attempt.state == AttemptState::Active {
                         index += 1;
                     } else {
+                        if let Some(child) = binding.thread_id.as_deref()
+                            && let Some(timing) = crate::tools::tool_dispatch_trace::active_tool_dispatch_timing()
+                            && let Some(turn) = timing.turn_timing_state()
+                        {
+                            turn.record_causal_agent("join", child,
+                                &timing.execution_id().0, turn.monotonic_offset_ms());
+                            if codex_protocol::timing::observations::enabled() {
+                                turn.observe_runtime("agent_joined", &timing.execution_id().0,
+                                    json!({"child_thread_id":child, "assignment_id":binding.assignment_id,
+                                        "attempt_id":binding.attempt_id, "state":attempt.state,
+                                        "receipt_available":receipt.is_some()}));
+                            }
+                        }
                         result.outcomes.push(json!({
                             "task_name": binding.agent_path, "thread_id": binding.thread_id,
                             "assignment_id": binding.assignment_id, "attempt_id": binding.attempt_id,

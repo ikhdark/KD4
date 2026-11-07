@@ -110,6 +110,9 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
         super::callbacks::monotonic_now_callback,
     )?;
     set_global(scope, global, "__codex_monotonic_now", monotonic_now.into())?;
+    let observe_graph = helper_function(scope, "__codex_graph_observation",
+        super::callbacks::graph_observation_callback)?;
+    set_global(scope, global, "__codex_graph_observation", observe_graph.into())?;
     let is_proxy = helper_function(
         scope,
         "__codex_is_proxy",

@@ -292,9 +292,30 @@ enum ForwardEventResult {
 ///
 /// If a dropped event is a `ServerRequest`, `reject_server_request` is called
 /// so the server does not wait for a response that will never come.
+struct QueuedClientEvent {
+    event: InProcessServerEvent,
+    receipt: Option<Box<codex_protocol::timing::observations::ClientRenderReceipt>>,
+}
+
+impl QueuedClientEvent {
+    fn new(event: InProcessServerEvent) -> Self {
+        let receipt = if let InProcessServerEvent::ServerNotification(
+            ServerNotification::AgentMessageDelta(delta)) = &event {
+            codex_protocol::timing::observations::ClientRenderReceipt::received(
+                &delta.thread_id, &delta.turn_id, &delta.item_id, "native_notification_occurrence").map(Box::new)
+        } else if let InProcessServerEvent::ServerNotification(ServerNotification::ItemCompleted(item)) = &event {
+            if matches!(&item.item, codex_app_server_protocol_types::ThreadItem::AgentMessage { .. }) {
+                codex_protocol::timing::observations::ClientRenderReceipt::received(
+                    &item.thread_id, &item.turn_id, item.item.id(), "native_canonical_notification_occurrence").map(Box::new)
+            } else { None }
+        } else { None };
+        Self { event, receipt }
+    }
+}
+
 fn forward_in_process_event<F>(
-    event_tx: &mpsc::Sender<InProcessServerEvent>,
-    pending_delivery: &mut std::collections::VecDeque<InProcessServerEvent>,
+    event_tx: &mpsc::Sender<QueuedClientEvent>,
+    pending_delivery: &mut std::collections::VecDeque<QueuedClientEvent>,
     skipped_events: &mut usize,
     event: InProcessServerEvent,
     mut reject_server_request: F,
@@ -302,13 +323,14 @@ fn forward_in_process_event<F>(
 where
     F: FnMut(ServerRequest),
 {
+    let event = QueuedClientEvent::new(event);
     if event_tx.is_closed() {
-        if let InProcessServerEvent::ServerRequest(request) = event {
+        if let InProcessServerEvent::ServerRequest(request) = event.event {
             reject_server_request(request);
         }
         return ForwardEventResult::DisableStream;
     }
-    if event_requires_delivery(&event) {
+    if event_requires_delivery(&event.event) {
         // Avoid another worker select pass when no retained event or lag marker
         // needs to precede this one. A full channel still keeps delivery lossless.
         let event = if pending_delivery.is_empty() && *skipped_events == 0 {
@@ -323,9 +345,9 @@ where
             event
         };
         if *skipped_events > 0 {
-            pending_delivery.push_back(InProcessServerEvent::Lagged {
+            pending_delivery.push_back(QueuedClientEvent::new(InProcessServerEvent::Lagged {
                 skipped: *skipped_events,
-            });
+            }));
             *skipped_events = 0;
         }
         pending_delivery.push_back(event);
@@ -333,22 +355,22 @@ where
     }
     let mut sent_lagged = false;
     if *skipped_events > 0 {
-        match event_tx.try_send(InProcessServerEvent::Lagged {
+        match event_tx.try_send(QueuedClientEvent::new(InProcessServerEvent::Lagged {
             skipped: *skipped_events,
-        }) {
+        })) {
             Ok(()) => {
                 *skipped_events = 0;
                 sent_lagged = true;
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
-                *skipped_events = skipped_events.saturating_add(skipped_event_count(&event));
-                if let InProcessServerEvent::ServerRequest(request) = event {
+                *skipped_events = skipped_events.saturating_add(skipped_event_count(&event.event));
+                if let InProcessServerEvent::ServerRequest(request) = event.event {
                     reject_server_request(request);
                 }
                 return ForwardEventResult::Continue;
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                if let InProcessServerEvent::ServerRequest(request) = event {
+                if let InProcessServerEvent::ServerRequest(request) = event.event {
                     reject_server_request(request);
                 }
                 return ForwardEventResult::DisableStream;
@@ -359,22 +381,22 @@ where
     match event_tx.try_send(event) {
         Ok(()) => ForwardEventResult::Continue,
         Err(mpsc::error::TrySendError::Full(event)) => {
-            if sent_lagged && matches!(&event, InProcessServerEvent::ServerRequest(_)) {
+            if sent_lagged && matches!(&event.event, InProcessServerEvent::ServerRequest(_)) {
                 // The advisory marker consumed capacity this request could have
                 // used. Retain just its adjacent request, in order, rather than
                 // manufacturing overload. The worker pauses reads while retained.
                 pending_delivery.push_back(event);
                 return ForwardEventResult::Continue;
             }
-            *skipped_events = skipped_events.saturating_add(skipped_event_count(&event));
+            *skipped_events = skipped_events.saturating_add(skipped_event_count(&event.event));
             warn!("dropping in-process app-server event because consumer queue is full");
-            if let InProcessServerEvent::ServerRequest(request) = event {
+            if let InProcessServerEvent::ServerRequest(request) = event.event {
                 reject_server_request(request);
             }
             ForwardEventResult::Continue
         }
         Err(mpsc::error::TrySendError::Closed(event)) => {
-            if let InProcessServerEvent::ServerRequest(request) = event {
+            if let InProcessServerEvent::ServerRequest(request) = event.event {
                 reject_server_request(request);
             }
             ForwardEventResult::DisableStream
@@ -618,7 +640,7 @@ impl ClientCommand {
 pub struct InProcessAppServerClient {
     observation_id: u64,
     command_tx: mpsc::Sender<ClientCommand>,
-    event_rx: mpsc::Receiver<InProcessServerEvent>,
+    event_rx: mpsc::Receiver<QueuedClientEvent>,
     initialize_response: AppServerInitializeResponse,
     worker_handle: tokio::task::JoinHandle<IoResult<()>>,
 }
@@ -656,7 +678,7 @@ impl InProcessAppServerClient {
             .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "missing initialize response"))?;
         let request_sender = handle.sender();
         let (command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(channel_capacity);
-        let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
+        let (event_tx, event_rx) = mpsc::channel::<QueuedClientEvent>(channel_capacity);
 
         let worker_handle = tokio::spawn(async move {
             let mut shutdown_ack = None;
@@ -674,7 +696,7 @@ impl InProcessAppServerClient {
                                 if let Some(event) = pending_delivery.pop_front() {
                                     permit.send(event);
                                 } else {
-                                    permit.send(InProcessServerEvent::Lagged { skipped: std::mem::take(&mut skipped_events) });
+                                    permit.send(QueuedClientEvent::new(InProcessServerEvent::Lagged { skipped: std::mem::take(&mut skipped_events) }));
                                 }
                             }
                             Err(_) => {
@@ -933,15 +955,24 @@ impl InProcessAppServerClient {
     /// the worker emits [`InProcessServerEvent::Lagged`] markers and may reject
     /// pending server requests rather than letting approval flows hang.
     pub async fn next_event(&mut self) -> Option<InProcessServerEvent> {
-        let event = self.event_rx.recv().await;
+        self.next_event_with_observation().await.map(|(event, _)| event)
+    }
+
+    /// Preserve the receipt with the exact output revision through UI dequeue
+    /// and paint. The library never substitutes notification handling for paint.
+    pub async fn next_event_with_observation(&mut self) -> Option<(InProcessServerEvent,
+        Option<codex_protocol::timing::observations::ClientRenderReceipt>)> {
+        let queued = self.event_rx.recv().await?;
+        let event = queued.event;
         if codex_protocol::timing::client_probe::enabled()
-            && let Some(InProcessServerEvent::ServerNotification(ServerNotification::Warning(warning))) = &event
+            && let InProcessServerEvent::ServerNotification(ServerNotification::Warning(warning)) = &event
         {
             use codex_protocol::timing::client_probe::{key, record};
             record(121, self.observation_id, warning.thread_id.as_deref().map(key).unwrap_or(0),
                 0, key(&warning.message), [1, 0, 0, 0]);
         }
-        event
+        let receipt = queued.receipt.map(|receipt| { receipt.dequeued(); *receipt });
+        Some((event, receipt))
     }
 
     /// Shuts down worker and in-process runtime with bounded wait.

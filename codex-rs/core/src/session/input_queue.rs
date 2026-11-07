@@ -199,21 +199,6 @@ impl InputQueue {
         (activity_rx, pending_activity)
     }
 
-    pub(crate) async fn subscribe_activity(
-        &self,
-        turn_state: Option<&Mutex<TurnState>>,
-        has_internal_completion: bool,
-    ) -> (
-        watch::Receiver<InputQueueActivity>,
-        Option<InputQueueActivity>,
-    ) {
-        let (receiver, pending) = self.subscribe_agent_activity(turn_state).await;
-        (
-            receiver,
-            pending.or(has_internal_completion.then_some(InputQueueActivity::InternalCompletion)),
-        )
-    }
-
     /// Agent waits retain their original policy: any mailbox message wakes them.
     pub(crate) async fn subscribe_agent_activity(
         &self,

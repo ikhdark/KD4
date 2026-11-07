@@ -4,6 +4,7 @@
 //! timestamps, provider clocks, or evidence of task acceptance/client rendering.
 
 pub mod client_probe;
+pub mod observations;
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;

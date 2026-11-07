@@ -468,6 +468,8 @@ pub struct WireNestedToolCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_tool_call_id: Option<String>,
     pub runtime_tool_call_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causal_predecessors: Option<Vec<String>>,
     #[serde(default)]
     pub buffered_output_bytes: usize,
     pub tool_name: WireToolName,
@@ -513,6 +515,7 @@ impl From<CodeModeNestedToolCall> for WireNestedToolCall {
             cell_id: value.cell_id.into(),
             parent_tool_call_id: value.parent_tool_call_id,
             runtime_tool_call_id: value.runtime_tool_call_id,
+            causal_predecessors: value.causal_predecessors,
             buffered_output_bytes: value.buffered_output_bytes,
             tool_name: value.tool_name.into(),
             tool_kind: value.tool_kind.into(),
@@ -529,6 +532,7 @@ impl From<WireNestedToolCall> for CodeModeNestedToolCall {
             cell_id: value.cell_id.into(),
             parent_tool_call_id: value.parent_tool_call_id,
             runtime_tool_call_id: value.runtime_tool_call_id,
+            causal_predecessors: value.causal_predecessors,
             buffered_output_bytes: value.buffered_output_bytes,
             tool_name: value.tool_name.into(),
             tool_kind: value.tool_kind.into(),

@@ -811,6 +811,8 @@ pub(crate) struct SessionConfiguration {
 
     pub(super) collaboration_mode: CollaborationMode,
     pub(super) model_reasoning_summary: Option<ReasoningSummaryConfig>,
+    /// Unset workers follow the root; a concrete value, including `default`,
+    /// is a persistent thread-local override.
     pub(super) service_tier: Option<String>,
     pub(super) validation_mode: codex_protocol::validation::ValidationMode,
     pub(super) validation_root_turn: Option<(String, String)>,
@@ -1287,15 +1289,20 @@ impl Session {
         state.session_configuration.originator.clone()
     }
 
-    /// The service tier as configured now, including settings updates applied
-    /// after the current turn was constructed.
+    /// The current preference, including accepted updates after turn creation.
+    /// Unpinned workers read the tree's root preference at each request boundary.
     pub(crate) async fn configured_service_tier(&self) -> Option<String> {
-        self.state
+        let service_tier = self.state
             .lock()
             .await
             .session_configuration
             .service_tier
-            .clone()
+            .clone();
+        if service_tier.is_none() && self.session_id() != SessionId::from(self.thread_id) {
+            self.services.agent_control.root_service_tier()
+        } else {
+            service_tier
+        }
     }
 
     #[instrument(name = "session_init", level = "info", skip_all)]
@@ -1326,7 +1333,6 @@ impl Session {
         analytics_events_client: Option<AnalyticsEventsClient>,
         thread_store: Arc<dyn ThreadStore>,
         attestation_provider: Option<Arc<dyn AttestationProvider>>,
-        external_time_provider: Option<Arc<dyn TimeProvider>>,
         multi_agent_version: Option<MultiAgentVersion>,
     ) -> anyhow::Result<Arc<Self>> {
         debug!(
@@ -1401,10 +1407,6 @@ impl Session {
                 .effective_agent_max_threads(MultiAgentVersion::V2)
                 .unwrap_or(usize::MAX),
         );
-        let time_provider = crate::current_time::resolve_time_provider(
-            config.current_time_reminder.as_ref(),
-            external_time_provider,
-        )?;
         let selected_capability_roots =
             match thread_extension_init.get::<Vec<SelectedCapabilityRoot>>() {
                 Some(roots) => roots.as_ref().clone(),
@@ -1697,17 +1699,6 @@ impl Session {
             phases.mark("coordination");
             let mut post_session_configured_events = Vec::<Event>::new();
 
-            for usage in config.features.legacy_feature_usages() {
-                post_session_configured_events.push(Event {
-                    id: INITIAL_SUBMIT_ID.to_owned(),
-                    msg: EventMsg::DeprecationNotice(
-                        codex_protocol::protocol::DeprecationNoticeEvent {
-                            summary: usage.summary.clone(),
-                            details: usage.details.clone(),
-                        },
-                    ),
-                });
-            }
             for message in &config.startup_warnings {
                 post_session_configured_events.push(Event {
                     id: "".to_owned(),
@@ -2047,7 +2038,6 @@ impl Session {
                 live_thread: live_thread_init.as_ref().cloned(),
                 thread_store: Arc::clone(&thread_store),
                 attestation_provider: attestation_provider.clone(),
-                time_provider,
                 model_client: ModelClient::new(
                     Some(Arc::clone(&auth_manager)),
                     if config.features.enabled(Feature::UseAgentIdentity) {
@@ -2144,6 +2134,14 @@ impl Session {
                 next_internal_sub_id: AtomicU64::new(0),
             });
             phases.mark("hooks_services");
+            let capture_session = Arc::downgrade(&sess);
+            sess.services.model_client.set_retained_request_capture(Arc::new(move |capture| {
+                let session = capture_session.clone();
+                Box::pin(async move {
+                    let session = session.upgrade().ok_or(CodexErr::TurnAborted)?;
+                    session.retain_context_replay_capture(capture).await
+                })
+            }));
             runtime_init.0 = Some(Arc::clone(&sess));
             sess.schedule_startup_transport_preconnect().await;
             // Dispatch the SessionConfiguredEvent first and then report any errors.
@@ -2216,7 +2214,7 @@ impl Session {
                     &mcp_projection.config.chatgpt_base_url,
                     mcp_projection.config.apps_mcp_product_sku.as_deref(),
                 ),
-                config.prefix_mcp_tool_names(),
+                /*prefix_mcp_tool_names*/ true,
                 mcp_projection.config.client_elicitation_capability.clone(),
                 sess.services
                     .supports_openai_form_elicitation

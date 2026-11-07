@@ -61,7 +61,6 @@ pub async fn build_prompt_input(
             crate::local_agent_graph_store_from_state_db(state_db.as_ref()),
             installation_id,
             /*attestation_provider*/ None,
-            /*external_time_provider*/ None,
         );
         (thread_manager, config)
     })

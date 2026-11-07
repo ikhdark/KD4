@@ -1,5 +1,8 @@
 // Cell-local dependency execution. Tool dispatch, permissions, cancellation and
 // resource admission remain owned by the normal nested-tool runtime.
+(() => {
+const observeGraph = globalThis.__codex_graph_observation;
+delete globalThis.__codex_graph_observation;
 Object.defineProperty(globalThis, "run_graph", {
   value: async function run_graph(nodes, { concurrency = 4, targets } = {}) {
     if (!Array.isArray(nodes) || nodes.length === 0 || nodes.length > 256) {
@@ -227,6 +230,7 @@ Object.defineProperty(globalThis, "run_graph", {
           graph.get(a).ordinal - graph.get(b).ordinal,
       );
     const results = Object.create(null);
+    const observation = observeGraph?.("graph", admissionOrder.map((id) => ({id, deps: graph.get(id).deps})));
     const priority = new Map(admissionOrder.map((id, i) => [id, i]));
     const remainingDeps = new Map(
       admissionOrder.map((id) => [id, graph.get(id).deps.length]),
@@ -291,6 +295,7 @@ Object.defineProperty(globalThis, "run_graph", {
       for (const key of lease.write) writers.delete(key);
     }
     async function execute(id, node) {
+      const previousContext = observeGraph?.("enter", observation, id);
       let value,
         produced = false;
       try {
@@ -317,6 +322,8 @@ Object.defineProperty(globalThis, "run_graph", {
         results[id] = produced
           ? { status: "rejected", value, reason }
           : { status: "rejected", reason };
+      } finally {
+        observeGraph?.("leave", observation, id, previousContext, results[id]?.status ?? "interrupted");
       }
     }
     while (remaining) {
@@ -379,6 +386,8 @@ Object.defineProperty(globalThis, "run_graph", {
         throw new Error("dependency graph cannot make progress; no nodes are running");
     }
     const ordered = Object.create(null);
+    observeGraph?.("finish", observation,
+      Object.values(results).every((result) => result.status === "fulfilled") ? "success" : "failed");
     for (const [id, node] of graph) {
       if (!selected.has(id)) continue;
       ordered[id] = results[id];
@@ -399,3 +408,4 @@ Object.defineProperty(globalThis, "run_graph", {
     return ordered;
   },
 });
+})();

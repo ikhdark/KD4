@@ -239,6 +239,7 @@ fn rollout_item_type(item: &RolloutItem) -> Cow<'static, str> {
         RolloutItem::SessionMeta(_) => Cow::Borrowed("session_meta"),
         RolloutItem::ToolManifest(_) => Cow::Borrowed("tool_manifest"),
         RolloutItem::SamplingBoundary(_) => Cow::Borrowed("sampling_boundary"),
+        RolloutItem::ContextReplay { .. } => Cow::Borrowed("context_replay"),
         RolloutItem::ResponseItem(item) => Cow::Borrowed(response_item_type(item)),
         RolloutItem::InterAgentCommunication(_) => Cow::Borrowed("inter_agent_communication"),
         RolloutItem::InterAgentCommunicationMetadata { .. } => {

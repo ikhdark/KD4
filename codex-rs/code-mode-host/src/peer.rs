@@ -37,6 +37,7 @@ pub(super) struct OutgoingFrame {
 }
 
 pub(super) struct HostPeer {
+    pub(super) causal_inputs: bool,
     outgoing_tx: mpsc::Sender<OutgoingFrame>,
     outgoing_bytes: Arc<Semaphore>,
     failure_bytes: Arc<Semaphore>,
@@ -119,8 +120,9 @@ enum CellMessage {
 }
 
 impl HostPeer {
-    pub(super) fn new(outgoing_tx: mpsc::Sender<OutgoingFrame>) -> Self {
+    pub(super) fn new(outgoing_tx: mpsc::Sender<OutgoingFrame>, causal_inputs: bool) -> Self {
         Self {
+            causal_inputs,
             outgoing_tx,
             outgoing_bytes: Arc::new(Semaphore::new(OUTGOING_DATA_BYTES)),
             failure_bytes: Arc::new(Semaphore::new(OUTGOING_FAILURE_BYTES)),

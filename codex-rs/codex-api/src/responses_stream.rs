@@ -464,6 +464,8 @@ pub(crate) struct ResponsesStreamEvent<'a> {
     content_index: Option<i64>,
     output_index: Option<u64>,
     safety_buffering: Option<Value>,
+    /// Server timing extension carried by `responsesapi.websocket_timing` frames.
+    timing_metrics: Option<Value>,
     #[serde(borrow)]
     logprobs: Option<&'a serde_json::value::RawValue>,
     #[serde(borrow)]
@@ -523,6 +525,36 @@ pub(crate) fn decode_diagnostic(context: &str, error: &serde_json::Error) -> Str
     )
 }
 
+
+/// Server-reported timing (`timing_metrics` of `responsesapi.websocket_timing`).
+/// Keeps only finite numbers, booleans and short labels under safe names, so the
+/// receipt stays content-free and bounded; a malformed extension never rejects the
+/// response. Field names are the provider's own (for example `engine_service_total_ms`).
+const SERVER_TIMING_MAX_FIELDS: usize = 32;
+
+fn parse_server_timing_metrics(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    let safe = |text: &str, extra: &[u8]| {
+        !text.is_empty() && text.len() <= 64
+            && text.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || extra.contains(&byte))
+    };
+    let mut result = serde_json::Map::new();
+    for (name, value) in object {
+        if result.len() == SERVER_TIMING_MAX_FIELDS {
+            break;
+        }
+        let keep = safe(name, &[]) && match value {
+            Value::Number(number) => number.as_f64().is_some_and(f64::is_finite),
+            Value::Bool(_) => true,
+            Value::String(label) => safe(label, b"-."),
+            _ => false,
+        };
+        if keep {
+            result.insert(name.clone(), value.clone());
+        }
+    }
+    (!result.is_empty()).then_some(Value::Object(result))
+}
 
 /// Retain only content-free diagnostic fields. Malformed extensions must not
 /// reject an otherwise valid model response or invalidate unrelated measurements.
@@ -806,6 +838,7 @@ impl ResponsesStreamEvent<'_> {
                 .and_then(Value::as_str) == Some("reasoning") => "reasoning_started",
             "response.output_item.done" if self.item.as_ref().and_then(|v| v.get("type"))
                 .and_then(Value::as_str) == Some("reasoning") => "reasoning_finished",
+            "responsesapi.websocket_timing" => "server_timing",
             _ if safety_buffering => "safety_buffering",
             _ => return None,
         };
@@ -829,7 +862,13 @@ impl ResponsesStreamEvent<'_> {
             .and_then(|response| response.prompt_cache_diagnostics.as_ref())
             .filter(|value| !value.is_null());
         let prompt_cache_diagnostics = raw_diagnostics.and_then(parse_prompt_cache_diagnostics);
+        let server_timing = self.timing_metrics.as_ref()
+            .filter(|_| phase == "server_timing")
+            .and_then(parse_server_timing_metrics);
         Some(crate::telemetry::ProviderObservation {
+            // A timing frame without usable metrics stays explicit rather than absent.
+            server_timing_invalid: phase == "server_timing" && server_timing.is_none(),
+            server_timing,
             phase, response_id: response_id.map(str::to_owned), created_at, completed_at,
             response_service_tier: response_service_tier.map(str::to_owned),
             response_service_tier_invalid: raw_tier.is_some_and(|value| !value.is_null())

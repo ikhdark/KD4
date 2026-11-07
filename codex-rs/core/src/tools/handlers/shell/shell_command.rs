@@ -339,7 +339,6 @@ impl ShellCommandHandler {
         }
         let preflight = preflight_invocation_for_kd4_runtime(
             turn.config.features.enabled(Feature::Kd4Runtime),
-            false,
             &original_invocation,
             &original_safety_command,
             original_shell_type,

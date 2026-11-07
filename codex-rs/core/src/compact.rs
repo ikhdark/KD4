@@ -781,7 +781,9 @@ async fn run_compact_task_inner_impl(
                     tools: tool_router.model_visible_schemas_for_turn(turn_context.as_ref()),
                     parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
                     tool_calls_disabled: true,
-                    base_instructions: turn_context.base_instructions.as_ref().clone(),
+                    base_instructions: crate::session::turn::validation_mode_base_instructions(&turn_context)
+                        .as_ref()
+                        .clone(),
                     output_schema: local_compaction_output_schema(
                         turn_context.provider.info().is_openai(),
                         turn_context.config.compact_prompt.is_some(), rebase_enabled,
@@ -789,19 +791,8 @@ async fn run_compact_task_inner_impl(
                     output_schema_strict: true,
                     ..Default::default()
                 };
-                if local_compaction_input_exceeds_window(
-                    &prompt,
-                    turn_context.model_context_window(),
-                ) {
-                    prompt.input = local_compaction_prompt_items(
-                        &history.for_local_compaction_prompt_with_checkpoint_pins(
-                            &turn_context.model_info.input_modalities,
-                            workspace_identity.as_ref(),
-                            &sess.services.git_workspace,
-                        ),
-                    )
-                    .into();
-                }
+                let source_input_len = prompt.input.len();
+                let mut pin_source = Some(history);
                 if prompt.output_schema.is_some() {
                     let mut input = prompt.input.to_vec();
                     input.push(ResponseItem::from(ResponseInputItem::from(vec![UserInput::Text {
@@ -815,6 +806,25 @@ async fn run_compact_task_inner_impl(
                 let mut retried_invalid_summary = false;
                 loop {
                     retry_state.check_retry_budget(cancellation_token)?;
+                    // Size the complete request, including format and repair
+                    // instructions, before starting another provider attempt.
+                    if local_compaction_input_exceeds_window(
+                        &prompt, turn_context.model_context_window(),
+                    ) && let Some(history) = pin_source.take() {
+                        let mut pinned_input = local_compaction_prompt_items(
+                            &history.for_local_compaction_prompt_with_checkpoint_pins(
+                                &turn_context.model_info.input_modalities,
+                                workspace_identity.as_ref(),
+                                &sess.services.git_workspace,
+                            ),
+                        );
+                        pinned_input.extend(prompt.input.iter().skip(source_input_len).cloned());
+                        prompt.input = pinned_input.into();
+                    }
+                    if local_compaction_input_exceeds_window(&prompt, turn_context.model_context_window()) {
+                        sess.set_total_tokens_full(turn_context.as_ref()).await;
+                        return Err(CodexErr::ContextWindowExceeded);
+                    }
                     retry_state.begin_attempt(&turn_context, ResponsesStreamRequest::LocalCompaction);
                     let attempt_result = drain_to_completed(
                         &sess,
@@ -828,6 +838,9 @@ async fn run_compact_task_inner_impl(
 
                     match attempt_result {
                         Ok(output) => {
+                            if let Some(usage) = output.token_usage.as_ref() {
+                                analytics_details.record_compaction_receipt(usage);
+                            }
                             sess.record_compaction_token_usage(
                                 turn_context.as_ref(),
                                 output.token_usage.as_ref(),

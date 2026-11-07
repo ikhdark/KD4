@@ -123,6 +123,10 @@ pub struct CodeModeNestedToolCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_tool_call_id: Option<String>,
     pub runtime_tool_call_id: String,
+    /// Runtime-owned causal result inputs; None is unobserved/unsupported flow.
+    /// Empty certifies a root fork, not a guessed absence of dependencies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causal_predecessors: Option<Vec<String>>,
     /// Encoded output already buffered in the cell at dispatch. Nested display
     /// projection uses this estimate; unprinted tool results are not charged.
     #[serde(default)]
