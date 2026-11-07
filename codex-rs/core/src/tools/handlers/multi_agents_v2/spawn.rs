@@ -246,7 +246,37 @@ async fn handle_spawn_agent(
         .cwd()
         .to_abs_path()
         .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+    let admission_cwd = if let Some(cwd) = args.cwd.as_deref() {
+        let selected = tokio::fs::canonicalize(cwd).await.map_err(|error| {
+            FunctionCallError::RespondToModel(format!("spawn_agent: cannot resolve cwd {cwd}: {error}"))
+        })?;
+        if !tokio::fs::metadata(&selected).await.is_ok_and(|metadata| metadata.is_dir()) {
+            return Err(FunctionCallError::RespondToModel("spawn_agent: cwd must be an existing local directory".into()));
+        }
+        if !config.permissions.file_system_sandbox_policy()
+            .can_read_path_with_cwd(&selected, admission_cwd.as_path())
+        {
+            return Err(FunctionCallError::RespondToModel("spawn_agent: selected cwd is outside inherited read permissions".into()));
+        }
+        // Changing a task's location is not a permission grant. Pin any implicit
+        // project root to the parent's directory before changing the child cwd.
+        if config.permissions.workspace_roots().is_empty() {
+            config.permissions.set_workspace_roots(vec![admission_cwd.clone()]);
+        }
+        if config.workspace_roots.is_empty() {
+            config.workspace_roots = config.permissions.workspace_roots().to_vec();
+        }
+        AbsolutePathBuf::from_absolute_path(selected)
+            .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
+    } else {
+        admission_cwd
+    };
     let mut spawn_environments = Some(step_context.environments.to_selections());
+    if args.cwd.is_some()
+        && let Some(primary) = spawn_environments.as_mut().and_then(|environments| environments.first_mut())
+    {
+        primary.cwd = codex_utils_path_uri::PathUri::from_abs_path(&admission_cwd);
+    }
     let mut isolated_workspace: Option<IsolatedWorkspace> = None;
     if let Some(service_tier) = args.service_tier.as_ref() {
         config.service_tier = Some(service_tier.clone());
@@ -1498,6 +1528,7 @@ struct SpawnAgentArgs {
     // Required for writable tasks. Message-only calls are enforced read-only.
     assignment: Option<TypedAssignmentArgs>,
     task_name: String,
+    cwd: Option<String>,
     #[serde(default)]
     independent_verification: bool,
     workspace_strategy: Option<WorkspaceStrategy>,
@@ -1511,6 +1542,9 @@ struct SpawnAgentArgs {
 
 impl SpawnAgentArgs {
     fn validate_generic(&self) -> Result<(), FunctionCallError> {
+        if self.cwd.as_deref().is_some_and(|cwd| !Path::new(cwd).is_absolute()) {
+            return Err(FunctionCallError::RespondToModel("spawn_agent: cwd must be an absolute local directory; assignment scopes remain repository-relative".into()));
+        }
         if self.agent_type.is_some() {
             return Err(FunctionCallError::RespondToModel(
                 "spawn_agent: specialized roles are no longer supported; use an explicit typed assignment for writable work or message for read-only work".to_string(),

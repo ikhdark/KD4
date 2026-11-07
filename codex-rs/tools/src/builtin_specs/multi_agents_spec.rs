@@ -587,6 +587,10 @@ fn spawn_agent_common_properties_v2() -> BTreeMap<String, JsonSchema> {
     BTreeMap::from([
         ("assignment".into(), writable_assignment_schema()),
         (
+            "cwd".into(),
+            JsonSchema::string(Some("Optional absolute local repository directory for this child. Use it when the parent is projectless or targets another already-authorized repository. Assignment scopes remain repository-relative. Omit to inherit the selected environment's cwd. This does not add workspace roots or broaden inherited permissions.".into())),
+        ),
+        (
             "independent_verification".to_string(),
             JsonSchema::boolean(Some("Default false. Declare intentionally independent verification rather than redundant implementation. Changes advisory overlap classification only, not permissions, runtime profile or acceptance.".into())),
         ),
