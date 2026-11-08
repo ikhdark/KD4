@@ -583,9 +583,6 @@ pub(crate) fn run_turn(
         let mut next_step_context = Some(first_step_context);
         let mut initial_mailbox_pending = true;
         let mut first_router = Some(first_router);
-        // The turn owns its fully rendered instructions; the scaffold clones the
-        // text only on a cache miss.
-        let base_instructions = validation_mode_base_instructions(&turn_context);
         'sampling_loop: loop {
             // Metadata belongs to this attempt, while underlying evidence stays in
             // the turn execution owner across repairs and pending-input continuations.
@@ -832,6 +829,7 @@ pub(crate) fn run_turn(
                     context_pressure_events,
                 )
                 .await?;
+                sess.record_reasoning_effort_override(&turn_context).await?;
                 // Keep this future lazy: the finalized router must record its source
                 // notice before we snapshot and normalize history, so source changes
                 // cannot discard a prematurely prepared snapshot.
@@ -864,6 +862,9 @@ pub(crate) fn run_turn(
                     window_id,
                     CodexResponsesRequestKind::Turn,
                 );
+                // Read before each logical request, not just at turn creation.
+                // Changed text also invalidates the existing request scaffold.
+                let base_instructions = validation_mode_base_instructions(&turn_context);
                 Box::pin(run_sampling_request(
                     Arc::clone(&sess),
                     Arc::clone(&step_context),
@@ -1897,8 +1898,8 @@ pub(crate) fn run_turn(
     })
 }
 
-/// The instructions every sampling request of this turn sends. Compaction requests
-/// send the same text so the provider can reuse the turn's cached prefix.
+/// Refresh the default policy for normal sampling and compaction alike. Explicit
+/// overrides and authored catalog policies retain their replacement semantics.
 pub(crate) fn validation_mode_base_instructions(turn: &TurnContext) -> Arc<BaseInstructions> {
     let directive = match turn.validation_mode {
         codex_protocol::validation::ValidationMode::Off =>
@@ -1911,6 +1912,9 @@ pub(crate) fn validation_mode_base_instructions(turn: &TurnContext) -> Arc<BaseI
             "FULL: Only task-authorized validation using existing tests; do not create tests of any type.",
     };
     let mut instructions = (*turn.base_instructions).clone();
+    if turn.model_info.uses_default_base_instructions {
+        instructions.text = codex_protocol::models::default_base_instructions();
+    }
     instructions.text.push_str(&format!(
         "\n\n<validation_mode>\n{directive}\nFollow the base instructions for validation authorization, retry, evidence, and completion rules.\nThere is no validation attempt cap. When compilation is authorized, repair recompiles require changed relevant inputs. Explicit user restrictions still apply. Consume already-running work through its owner without launching duplicates.\n</validation_mode>",
     ));
@@ -6139,7 +6143,7 @@ fn try_run_sampling_request<'a>(
             return Err(CodexErr::TurnAborted);
         }
         admit_prepared_prompt(&sess, &turn_context, prompt).await?;
-        let request_effort = turn_context.request_reasoning_effort();
+        let request_effort = sess.request_reasoning_effort(&turn_context).await;
         let service_tier = service_tier_for_sampling(&sess, &turn_context).await;
         feedback_tags!(
             model = turn_context.model_info.slug.clone(),

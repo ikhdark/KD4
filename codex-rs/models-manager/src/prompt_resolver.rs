@@ -2,6 +2,7 @@ use crate::model_info::clear_instruction_messages;
 use crate::model_info::matches_model_slug;
 use crate::model_info::namespaced_model_suffix;
 use codex_protocol::openai_models::ModelInfo;
+use std::borrow::Cow;
 use tracing::debug;
 
 /// Authoritative registration for models that use the fork's local prompt policy.
@@ -42,12 +43,12 @@ pub(crate) enum PromptNormalization {
     Trim,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResolvedPrompt<'a> {
     pub id: PromptId,
     pub source: PromptSource,
     pub normalization: PromptNormalization,
-    pub content: &'a str,
+    pub content: Cow<'a, str>,
     pub clears_instruction_template: bool,
 }
 
@@ -69,7 +70,7 @@ pub(crate) fn resolve_prompt<'a>(
             id: PromptId::LocalPolicy,
             source: PromptSource::LocalModelPolicy,
             normalization: PromptNormalization::Trim,
-            content: codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim(),
+            content: Cow::Owned(codex_protocol::models::default_base_instructions()),
             clears_instruction_template: true,
         };
     }
@@ -79,7 +80,7 @@ pub(crate) fn resolve_prompt<'a>(
             id: PromptId::Catalog,
             source: PromptSource::Catalog,
             normalization: PromptNormalization::Preserve,
-            content,
+            content: Cow::Borrowed(content),
             clears_instruction_template: false,
         };
     }
@@ -88,7 +89,7 @@ pub(crate) fn resolve_prompt<'a>(
         id: PromptId::ProtocolDefault,
         source: PromptSource::ProtocolDefault,
         normalization: PromptNormalization::Trim,
-        content: codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim(),
+        content: Cow::Owned(codex_protocol::models::default_base_instructions()),
         clears_instruction_template: false,
     }
 }
@@ -111,6 +112,7 @@ pub(crate) fn apply_prompt_policy(models: &mut [ModelInfo]) {
         });
         if let Some((base_instructions, clears_instruction_template)) = local_policy {
             model.base_instructions = base_instructions;
+            model.uses_default_base_instructions = true;
             if clears_instruction_template {
                 clear_instruction_messages(model);
             }

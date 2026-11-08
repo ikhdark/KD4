@@ -1775,6 +1775,9 @@ fn construct_model_info_from_normalized(
     } else {
         model_info::model_info_from_slug(model)
     };
+    if model_info.uses_default_base_instructions {
+        model_info.base_instructions = codex_protocol::models::default_base_instructions();
+    }
     model_info::apply_local_personality_messages(&mut model_info, model);
     model_info::with_config_overrides(model_info, config)
 }

@@ -536,6 +536,7 @@ fn recent_images(history: &[ResponseItem], count: usize) -> Vec<ImageUrl> {
             | ResponseItem::ImageGenerationCall { .. }
             | ResponseItem::Compaction { .. }
             | ResponseItem::CompactionTrigger { .. }
+            | ResponseItem::ConfigurationUpdate { .. }
             | ResponseItem::ContextCompaction { .. }
             | ResponseItem::Other => {}
         }
@@ -591,6 +592,7 @@ fn recent_images(history: &[ResponseItem], count: usize) -> Vec<ImageUrl> {
             | ResponseItem::ImageGenerationCall { .. }
             | ResponseItem::Compaction { .. }
             | ResponseItem::CompactionTrigger { .. }
+            | ResponseItem::ConfigurationUpdate { .. }
             | ResponseItem::ContextCompaction { .. }
             | ResponseItem::Other => {}
         }

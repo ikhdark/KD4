@@ -106,11 +106,12 @@ impl Capture {
 
 impl TurnTimingState {
     pub fn record_transport_interval(&self, identity: (&str, &str), phase: &str,
-        interval: (std::time::Instant, std::time::Instant), wire_bytes: Option<u64>, provenance: &str) {
+        interval: (std::time::Instant, std::time::Instant), wire_bytes: Option<u64>, provenance: &str,
+        connection_id: Option<u64>, connection_scoped: bool, outcome: &str) {
         let duration = interval.1.checked_duration_since(interval.0);
         let duration_ns = duration.and_then(|value| u64::try_from(value.as_nanos()).ok());
         let supported = matches!(phase, "dns_lookup" | "tcp_connect" | "tls_handshake" | "request_upload"
-            | "response_download" | "tcp_round_trip");
+            | "response_download" | "tcp_round_trip" | "socket_read" | "socket_write" | "socket_capture_overflow");
         let started = codex_protocol::timing::process_monotonic_ns_at(interval.0)
             .and_then(|value| u64::try_from(value).ok());
         let completed = codex_protocol::timing::process_monotonic_ns_at(interval.1)
@@ -119,6 +120,8 @@ impl TurnTimingState {
             && completed.zip(started).and_then(|(end, start)| end.checked_sub(start)) == duration_ns
             && !provenance.is_empty() && provenance.len() <= 256;
         let row = json!({"samplingRequestId":identity.0, "physicalAttemptId":identity.1,
+            "connectionId":connection_id, "connectionScoped":connection_scoped,
+            "outcome":outcome,
             "phase":if supported {phase} else {"unsupported_connector_phase"},
             "clockDomainId":codex_protocol::timing::process_clock_domain_id(),
             "startedAtNs":started.filter(|_| valid), "completedAtNs":completed.filter(|_| valid),

@@ -417,6 +417,7 @@ fn validate_response_item_image_urls(items: &[ResponseItem]) -> Result<(), JSONR
         | ResponseItem::ImageGenerationCall { .. }
         | ResponseItem::Compaction { .. }
         | ResponseItem::CompactionTrigger { .. }
+        | ResponseItem::ConfigurationUpdate { .. }
         | ResponseItem::ContextCompaction { .. }
         | ResponseItem::AdditionalTools { .. }
         | ResponseItem::Other => None,
@@ -1719,6 +1720,10 @@ impl TurnRequestProcessor {
         let (thread_uuid, thread) = self.load_thread(&thread_id).await?;
 
         if is_startup_interrupt {
+            let observation = codex_protocol::timing::observations::Span::start(
+                "cancel_startup", &thread_id, "", &request_id.request_id.to_string(),
+                serde_json::json!({"connection_id":request_id.connection_id.0,
+                    "boundary":"startup_installation_fence_not_unbounded_cleanup"}));
             let active_turn = {
                 let state = self.thread_state_manager.thread_state(thread_uuid).await;
                 state.lock().await.in_progress_turn_id().map(str::to_owned)
@@ -1743,6 +1748,7 @@ impl TurnRequestProcessor {
                 })?;
             }
             queue.pause_with_result(thread_uuid).await?;
+            observation.finish("fenced_and_queue_paused", serde_json::Value::Null);
             return Ok(Some(TurnInterruptResponse {}));
         }
 
@@ -1767,6 +1773,10 @@ impl TurnRequestProcessor {
         };
         // Core checks identity while claiming terminal ownership. A completed
         // target must never turn this request into an interrupt of its successor.
+        let observation = codex_protocol::timing::observations::Span::start(
+            "cancel_turn", &thread_id, &turn_id, &request_id.request_id.to_string(),
+            serde_json::json!({"connection_id":request_id.connection_id.0,
+                "boundary":"core_interrupt_owner_not_client_ack"}));
         let interrupted = match thread.interrupt_turn_if_active(&turn_id).await {
             Ok(interrupted) => interrupted,
             Err(error) => {
@@ -1780,6 +1790,8 @@ impl TurnRequestProcessor {
                 };
             }
         };
+        observation.finish(if interrupted { "interrupt_claimed" } else { "target_no_longer_active" },
+            serde_json::Value::Null);
         if interrupted {
             // Let the listener acknowledge after terminal side effects (including
             // pausing queued prompts) have been persisted.

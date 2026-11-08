@@ -50,6 +50,24 @@ export type CodeModeCellItem = {
   error: string;
 };
 
+/** An owner-produced nested operation receipt, not a process-exit assertion. */
+export type CodeModeToolCallItem = {
+  id: string;
+  type: "code_mode_tool_call";
+  call_id: string;
+  parent_call_id: string | null;
+  parent_cell_id: string;
+  runtime_tool_call_id: string;
+  tool: string;
+  status: "in_progress" | "completed" | "failed";
+  /** Executed payload and native result, or a canonical reference/explicit gap. */
+  content_items:
+    ({ type: "inputText"; text: string } | { type: "inputImage"; imageUrl: string })[] | null;
+  success: boolean | null;
+  error: string | null;
+  duration_ms: number | null;
+};
+
 /** Indicates the type of the file change. */
 export type PatchChangeKind = "add" | "delete" | "update";
 
@@ -227,6 +245,7 @@ export type ThreadItem =
   | ContextCompactionItem
   | CommandExecutionItem
   | CodeModeCellItem
+  | CodeModeToolCallItem
   | FileChangeItem
   | McpToolCallItem
   | CollabToolCallItem

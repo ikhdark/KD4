@@ -152,7 +152,8 @@ pub(crate) fn thread_spawn_source(
 /// the wrong provider or runtime policy.
 pub(crate) fn build_agent_spawn_config(turn: &TurnContext) -> Result<Config, FunctionCallError> {
     let mut config = build_agent_shared_config(turn)?;
-    config.base_instructions = Some(turn.base_instructions.text.clone());
+    config.base_instructions = (!turn.model_info.uses_default_base_instructions)
+        .then(|| turn.base_instructions.text.clone());
     // Do not freeze an inherited preference into a local override. None is
     // persisted as such, so reloaded workers still follow the root. Explicit
     // per-spawn tiers are applied below after the model has been resolved.

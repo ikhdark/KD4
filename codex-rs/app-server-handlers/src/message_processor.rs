@@ -697,8 +697,23 @@ impl MessageProcessor {
         connection_id: ConnectionId,
         notification: JSONRPCNotification,
     ) {
-        // Currently, we do not expect to receive any notifications from the
-        // client, so we just log them.
+        // Untrusted diagnostic claims are optional and have no runtime effect.
+        // Do not mix the frontend clock with this process's receipt clock.
+        if notification.method == "diagnostics/clientOutput" {
+            if codex_protocol::timing::observations::enabled()
+                && let Some(params) = notification.params.as_ref()
+                && let Ok(observation) = serde_json::from_value::<
+                    codex_app_server_protocol_types::ClientOutputObservation>(params.clone())
+                && observation.valid() {
+                let _ = codex_protocol::timing::observations::record(
+                    "client_output_acknowledged", &observation.thread_id,
+                    &observation.turn_id, &observation.output_id,
+                    serde_json::json!({"connection_id":connection_id.0,
+                        "source":"client_reported_not_server_verified",
+                        "observation":observation}));
+            }
+            return;
+        }
         let metadata = notification_log_metadata(connection_id, &notification);
         tracing::info!(
             connection_id = ?metadata.connection_id,

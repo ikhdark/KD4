@@ -372,6 +372,11 @@ pub struct ModelInfo {
     pub availability_nux: Option<ModelAvailabilityNux>,
     pub upgrade: Option<ModelInfoUpgrade>,
     pub base_instructions: String,
+    /// Runtime provenance only: authored catalog/config text must never be refreshed.
+    #[serde(skip)]
+    #[schemars(skip)]
+    #[ts(skip)]
+    pub uses_default_base_instructions: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_messages: Option<ModelMessages>,
     #[serde(default)]
@@ -384,6 +389,9 @@ pub struct ModelInfo {
     #[serde(default = "default_true")]
     pub include_plugin_usage_instructions: bool,
     pub supports_reasoning_summaries: bool,
+    /// Whether positional configuration updates can change effort without rebasing the prompt.
+    #[serde(default)]
+    pub supports_reasoning_effort_updates: bool,
     #[serde(default)]
     pub default_reasoning_summary: ReasoningSummary,
     pub support_verbosity: bool,
@@ -460,12 +468,14 @@ impl ModelInfo {
             default_service_tier: None,
             availability_nux: None,
             upgrade: None,
-            base_instructions: crate::models::BASE_INSTRUCTIONS_DEFAULT.to_string(),
+            base_instructions: crate::models::default_base_instructions(),
+            uses_default_base_instructions: true,
             model_messages: None,
             include_skills_usage_instructions: true,
             include_apps_usage_instructions: true,
             include_plugin_usage_instructions: true,
             supports_reasoning_summaries: false,
+            supports_reasoning_effort_updates: false,
             default_reasoning_summary: ReasoningSummary::Auto,
             support_verbosity: false,
             default_verbosity: None,

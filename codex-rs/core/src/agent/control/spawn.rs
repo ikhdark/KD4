@@ -490,6 +490,7 @@ fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item:
             | ResponseItem::ImageGenerationCall { .. }
             | ResponseItem::Compaction { .. }
             | ResponseItem::CompactionTrigger { .. }
+            | ResponseItem::ConfigurationUpdate { .. }
             | ResponseItem::ContextCompaction { .. }
             | ResponseItem::Other,
         ) => false,

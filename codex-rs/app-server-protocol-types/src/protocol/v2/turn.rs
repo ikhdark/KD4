@@ -229,6 +229,50 @@ pub struct TurnInterruptParams {
 #[ts(export_to = "v2/")]
 pub struct TurnInterruptResponse {}
 
+/// One frontend-owned output occurrence, measured entirely on its own clock.
+/// Revision is a content-free revision ID or digest, never output text. An
+/// acknowledgement for a coalesced-away revision must not be reported as paint.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct ClientOutputObservation {
+    pub observation_id: String,
+    pub client_clock_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub output_id: String,
+    pub revision: String,
+    pub received_at_ns: u64,
+    pub dequeued_at_ns: Option<u64>,
+    pub scheduled_at_ns: Option<u64>,
+    pub painted_at_ns: Option<u64>,
+    pub displayed_thread_id: Option<String>,
+    pub ui_id: Option<String>,
+    pub active_sessions: Option<u32>,
+}
+
+impl ClientOutputObservation {
+    /// Bound content-free identifiers and check only client-local ordering.
+    /// Receipt of this payload never grants thread access or mutates runtime.
+    pub fn valid(&self) -> bool {
+        let text = |value: &str| !value.trim().is_empty() && value.len() <= 256;
+        if ![&self.observation_id, &self.client_clock_id, &self.thread_id,
+            &self.turn_id, &self.output_id, &self.revision].into_iter().all(|s| text(s))
+            || self.displayed_thread_id.as_deref().is_some_and(|s| !text(s))
+            || self.ui_id.as_deref().is_some_and(|s| !text(s)) {
+            return false;
+        }
+        let mut previous = self.received_at_ns;
+        for endpoint in [self.dequeued_at_ns, self.scheduled_at_ns, self.painted_at_ns]
+            .into_iter().flatten() {
+            if endpoint < previous { return false; }
+            previous = endpoint;
+        }
+        previous < (1_u64 << 53)
+            && (self.painted_at_ns.is_none() || self.displayed_thread_id.is_some())
+    }
+}
+
 // User input types
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]

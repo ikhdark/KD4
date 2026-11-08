@@ -12,6 +12,15 @@ pub const REVIEW_PROMPT: &str = concat!(
     include_str!("../templates/review/rubric.md"),
 );
 
+/// Capture the current canonical policy when a dedicated review starts.
+pub fn review_base_instructions() -> String {
+    format!(
+        "{}\n\n{}",
+        codex_protocol::models::default_base_instructions(),
+        include_str!("../templates/review/rubric.md")
+    )
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedReviewRequest {
     pub target: ReviewTarget,

@@ -42,6 +42,11 @@ macro_rules! server_request_definitions {
         }
 
         impl ServerRequest {
+            /// Content-free registered wire method, without serializing params.
+            pub fn method(&self) -> &'static str {
+                match self { $(Self::$variant { .. } => $wire,)* }
+            }
+
             /// Whether this registry recognizes a method, independent of parameter validity.
             pub fn is_known_method(method: &str) -> bool {
                 matches!(method, $($wire)|*)

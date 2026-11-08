@@ -131,6 +131,8 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     v8::Script::compile(scope, graph_source, None)
         .and_then(|script| script.run(scope))
         .ok_or_else(|| "failed to install dependency graph helper".to_string())?;
+    // A separate private closure capability for owned mechanical helpers.
+    set_global(scope, global, "__codex_helper_observation", observe_graph.into())?;
     let pagination = v8::String::new(scope, include_str!("search_pagination.js"))
         .ok_or_else(|| "failed to allocate search pagination helper".to_string())?;
     v8::Script::compile(scope, pagination, None)

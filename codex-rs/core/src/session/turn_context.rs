@@ -1101,6 +1101,82 @@ fn local_time_context() -> (String, String) {
 }
 
 impl Session {
+    fn supports_effort_updates(turn: &TurnContext) -> bool {
+        turn.provider.info().is_openai()
+            && turn.model_info.use_responses_lite
+            && turn.model_info.supports_reasoning_effort_updates
+            && !turn.session_source.is_non_root_agent()
+            && !matches!(turn.session_source, SessionSource::Internal(_))
+    }
+
+    /// Append rather than rewrite the prefix. Only this runtime's successful
+    /// commits establish a pin; replay/import and history replacement start fresh.
+    pub(crate) async fn record_reasoning_effort_override(
+        &self,
+        turn: &TurnContext,
+    ) -> std::io::Result<()> {
+        let selected = turn.request_reasoning_effort();
+        let Some(selected) = selected.filter(|effort| {
+            Self::supports_effort_updates(turn)
+                && !matches!(effort, ReasoningEffortConfig::Custom(_))
+        }) else {
+            self.state.lock().await.reasoning_effort_pin = None;
+            return Ok(());
+        };
+        let (baseline, history_version) = {
+            let state = self.state.lock().await;
+            let history_version = state.history.history_version();
+            match state.reasoning_effort_pin.as_ref() {
+                Some((model, version, baseline, latest))
+                    if model == &turn.model_info.slug
+                        && *version == history_version
+                        && turn.model_info.supported_reasoning_levels.iter()
+                            .any(|level| &level.effort == baseline) =>
+                {
+                    if latest == &selected {
+                        return Ok(());
+                    }
+                    (baseline.clone(), history_version)
+                }
+                _ => (selected.clone(), history_version),
+            }
+        };
+        self.record_conversation_items(
+            turn,
+            &[ResponseItem::ConfigurationUpdate {
+                reasoning: codex_protocol::models::ConfigurationReasoning {
+                    effort: selected.clone(),
+                },
+            }],
+        )
+        .await?;
+        self.state.lock().await.reasoning_effort_pin = Some((
+            turn.model_info.slug.clone(),
+            history_version,
+            baseline,
+            selected,
+        ));
+        Ok(())
+    }
+
+    /// Read the sampling baseline without changing the user's selected effort.
+    pub(crate) async fn request_reasoning_effort(
+        &self,
+        turn: &TurnContext,
+    ) -> Option<ReasoningEffortConfig> {
+        if Self::supports_effort_updates(turn)
+            && let state = self.state.lock().await
+            && let Some((model, version, baseline, _)) = &state.reasoning_effort_pin
+            && model == &turn.model_info.slug
+            && *version == state.history.history_version()
+            && turn.model_info.supported_reasoning_levels.iter()
+                .any(|level| &level.effort == baseline)
+        {
+            return Some(baseline.clone());
+        }
+        turn.request_reasoning_effort()
+    }
+
     /// Don't expand the number of mutated arguments on config. We are in the process of getting rid of it.
     pub(crate) fn build_per_turn_config(
         session_configuration: &SessionConfiguration,

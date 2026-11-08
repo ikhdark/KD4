@@ -1,5 +1,6 @@
 begin_patch: "*** Begin Patch" LF
 operation_id: "*** Operation ID: " /[A-Za-z0-9_.:-]{1,128}/ LF
+evidence_review: "*** Evidence Review:" /[^\r\n]+/? LF
 end_patch: "*** End Patch" LF?
 
 revision_guard: "*** Guard File: " filename LF "*** Expect: " revision LF

@@ -515,6 +515,9 @@ inherits = "release"
 incremental = false
 
 [patch.crates-io]
+reqwest = { path = "../third_party/reqwest" }
+hyper-util = { path = "../third_party/hyper-util" }
+hyper-rustls = { path = "../third_party/hyper-rustls" }
 notify = { path = "../third_party/notify" }
 # Keep the locked release; narrowly repair UDP wildcard endpoint binding and port pinning.
 tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }

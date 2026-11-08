@@ -178,6 +178,8 @@ pub enum ThreadItemDetails {
     /// Records a failed code-mode cell, including stable call/cell identifiers
     /// and the runtime's error text.
     CodeModeCell(CodeModeCellItem),
+    /// Owner-produced nested operation evidence, independent of cell stdout.
+    CodeModeToolCall(CodeModeToolCallItem),
     /// Represents a set of file changes by the agent, from application start through completion.
     FileChange(FileChangeItem),
     /// Represents a call to an MCP tool. The item starts when the invocation is
@@ -294,6 +296,23 @@ pub struct CodeModeCellItem {
     pub cell_id: String,
     pub status: CodeModeCellStatus,
     pub error: String,
+}
+
+/// A settled nested operation, not a claim that its process tree has exited.
+/// Content retains the executed payload and native result (or an explicitly
+/// identified canonical receipt reference/retention gap).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+pub struct CodeModeToolCallItem {
+    pub call_id: String,
+    pub parent_call_id: Option<String>,
+    pub parent_cell_id: String,
+    pub runtime_tool_call_id: String,
+    pub tool: String,
+    pub status: codex_app_server_protocol::DynamicToolCallStatus,
+    pub content_items: Option<Vec<codex_app_server_protocol::DynamicToolCallOutputContentItem>>,
+    pub success: Option<bool>,
+    pub error: Option<String>,
+    pub duration_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]

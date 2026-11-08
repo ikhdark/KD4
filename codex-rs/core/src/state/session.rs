@@ -169,6 +169,13 @@ struct CompactionReceipt {
 pub(crate) struct SessionState {
     pub(crate) session_configuration: SessionConfiguration,
     pub(crate) history: ContextManager,
+    /// Runtime-authored pin only: imported/replayed controls never establish it.
+    pub(crate) reasoning_effort_pin: Option<(
+        String,
+        u64,
+        codex_protocol::openai_models::ReasoningEffort,
+        codex_protocol::openai_models::ReasoningEffort,
+    )>,
     rate_limits: HashMap<String, RateLimitSnapshot>,
     active_rate_limit_id: Option<String>,
     rate_limit_account: Option<crate::responses_retry::AccountChangeIdentity>,
@@ -210,6 +217,7 @@ impl SessionState {
         Self {
             session_configuration,
             history,
+            reasoning_effort_pin: None,
             rate_limits: HashMap::new(),
             active_rate_limit_id: None,
             rate_limit_account: None,
@@ -300,6 +308,7 @@ impl SessionState {
     ) {
         self.additional_context.reconcile_history(&items);
         self.history.replace(items);
+        self.reasoning_effort_pin = None;
         self.history
             .set_reference_context_item(reference_context_item);
         self.auto_compact_window.clear_prefill();

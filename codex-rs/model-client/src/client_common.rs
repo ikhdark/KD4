@@ -452,6 +452,7 @@ fn strip_image_details(items: &mut [ResponseItem]) {
             | ResponseItem::ImageGenerationCall { .. }
             | ResponseItem::Compaction { .. }
             | ResponseItem::CompactionTrigger { .. }
+            | ResponseItem::ConfigurationUpdate { .. }
             | ResponseItem::ContextCompaction { .. }
             | ResponseItem::Other => {}
         }

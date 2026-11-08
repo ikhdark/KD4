@@ -895,7 +895,8 @@ impl TurnTimingSnapshot {
             &profile.retry_measurements,
         );
         if let Some(evidence) = measurement_evidence.as_mut() {
-            evidence["operations"] = profile.measurements.operations.snapshot(&profile.tool_calls);
+            evidence["operations"] = profile.measurements.operations.snapshot(
+                &profile.tool_calls, &evidence["nestedDependencies"]);
         }
         let mut timing = TurnTiming {
             stop_cause: None,
@@ -5868,6 +5869,7 @@ fn response_item_records_visible_output(item: &ResponseItem) -> bool {
         | ResponseItem::Compaction { .. }
         | ResponseItem::ContextCompaction { .. }
         | ResponseItem::CompactionTrigger { .. }
+        | ResponseItem::ConfigurationUpdate { .. }
         | ResponseItem::AdditionalTools { .. }
         | ResponseItem::FunctionCallOutput { .. }
         | ResponseItem::CustomToolCallOutput { .. }

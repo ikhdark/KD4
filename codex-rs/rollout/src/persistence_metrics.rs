@@ -297,6 +297,7 @@ fn response_item_type(item: &ResponseItem) -> &'static str {
         ResponseItem::WebSearchCall { .. } => "response.web_search_call",
         ResponseItem::ImageGenerationCall { .. } => "response.image_generation_call",
         ResponseItem::Compaction { .. } => "response.compaction",
+        ResponseItem::ConfigurationUpdate { .. } => "response.configuration_update",
         ResponseItem::CompactionTrigger { .. } => "response.compaction_trigger",
         ResponseItem::ContextCompaction { .. } => "response.context_compaction",
         ResponseItem::Other => "response.other",

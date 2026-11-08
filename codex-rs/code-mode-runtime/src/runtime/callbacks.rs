@@ -148,6 +148,24 @@ pub(super) fn graph_observation_callback(
         else { args.get(1).to_rust_string_lossy(scope) };
     let cell = scope.get_slot::<RuntimeState>().map(|state| state.tool_call_id.clone()).unwrap_or_default();
     match kind.as_str() {
+        "helper" => {
+            let id = format!("helper-{}", uuid::Uuid::new_v4());
+            let context = scope.get_continuation_preserved_embedder_data();
+            let context = v8::Local::<v8::String>::try_from(context).ok()
+                .map(|value| value.to_rust_string_lossy(scope));
+            if let Some(state) = scope.get_slot_mut::<RuntimeState>() { state.causal.helper(id.clone(), context.as_deref()); }
+            if let Some(value) = v8::String::new(scope, &id) { retval.set(value.into()); }
+        }
+        "helper_bind" => super::causal::bind_helper(scope, args.get(2), key),
+        "helper_enter" => {
+            let branch = args.get(2).uint32_value(scope).unwrap_or(u32::MAX);
+            let previous = scope.get_continuation_preserved_embedder_data();
+            if branch < 32 && let Some(value) = v8::String::new(scope, &format!("{key}/{branch}")) {
+                scope.set_continuation_preserved_embedder_data(value.into());
+            }
+            retval.set(previous);
+        }
+        "helper_leave" => scope.set_continuation_preserved_embedder_data(args.get(2)),
         "graph" => {
             let definition = v8_value_to_json(scope, args.get(1)).ok().flatten();
             if let Some(state) = scope.get_slot_mut::<RuntimeState>()

@@ -28,6 +28,7 @@ use crate::event_processor::handle_last_message;
 use crate::exec_events::AgentMessageItem;
 use crate::exec_events::CodeModeCellItem;
 use crate::exec_events::CodeModeCellStatus;
+use crate::exec_events::CodeModeToolCallItem;
 use crate::exec_events::CollabAgentState;
 use crate::exec_events::CollabAgentStatus;
 use crate::exec_events::CollabTool;
@@ -309,6 +310,33 @@ impl EventProcessorWithJsonOutput {
                             },
                         },
                         error: error.unwrap_or_default(),
+                    }),
+                })
+            }
+            ThreadItem::DynamicToolCall {
+                namespace: Some(namespace),
+                tool,
+                arguments,
+                status,
+                content_items,
+                success,
+                error,
+                duration_ms,
+                ..
+            } if namespace == "codex.internal" && tool == "code_mode_tool_call" => {
+                Some(ExecThreadItem {
+                    id: make_id(),
+                    details: ThreadItemDetails::CodeModeToolCall(CodeModeToolCallItem {
+                        call_id: arguments.get("call_id")?.as_str()?.to_string(),
+                        parent_call_id: arguments.get("parent_call_id").and_then(|v| v.as_str()).map(str::to_string),
+                        parent_cell_id: arguments.get("parent_cell_id")?.as_str()?.to_string(),
+                        runtime_tool_call_id: arguments.get("runtime_tool_call_id")?.as_str()?.to_string(),
+                        tool: arguments.get("tool_name")?.as_str()?.to_string(),
+                        status,
+                        content_items,
+                        success,
+                        error,
+                        duration_ms,
                     }),
                 })
             }

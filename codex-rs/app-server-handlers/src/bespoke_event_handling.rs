@@ -1912,6 +1912,11 @@ async fn on_command_execution_request_approval_response(
     thread_state: Arc<Mutex<ThreadState>>,
     permission_guard: ThreadWatchActiveGuard,
 ) {
+    let observation = codex_protocol::timing::observations::Span::start(
+        "approval_command_resume", &conversation_id.to_string(), &event_turn_id, &item_id,
+        serde_json::json!({"request_id":pending_request_id,
+            "scope":"client_response_to_core_approval_submission_not_process_start",
+            "policy_deadline":"none_waits_for_user_or_turn_transition"}));
     let response = receiver.await;
     if let Some(pending_request_id) = pending_request_id
         && let Err(error) =
@@ -2026,6 +2031,9 @@ async fn on_command_execution_request_approval_response(
         .await
     {
         error!("failed to submit ExecApproval: {err}");
+        observation.finish("core_submission_failed", serde_json::Value::Null);
+    } else {
+        observation.finish("core_submission_accepted", serde_json::Value::Null);
     }
 }
 

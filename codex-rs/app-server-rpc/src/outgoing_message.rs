@@ -1278,6 +1278,14 @@ impl OutgoingMessageSender {
             (requests, active_connections[&connection_id].delivery_failure.clone())
         };
         let delivery_deadline = tokio::time::Instant::now() + RESOURCE_DELIVERY_TIMEOUT;
+        if codex_protocol::timing::observations::enabled() {
+            let _ = codex_protocol::timing::observations::record("request_replay_inventory",
+                &thread_id.to_string(), "", &connection_id.0.to_string(), serde_json::json!({
+                    "actual_count":request_ids.len(), "retention_complete":request_ids.len() <= 8192,
+                    "expected_request_ids":request_ids.iter().take(8192).map(|(id, _)| id).collect::<Vec<_>>(),
+                    "scope":"eligible_pending_requests_at_snapshot; settlement_can_remove_before_enqueue",
+                    "budget_ms":RESOURCE_DELIVERY_TIMEOUT.as_millis()}));
+        }
         for (request_id, settlement) in request_ids {
             let permit = tokio::select! {
                 biased;
@@ -1349,6 +1357,13 @@ impl OutgoingMessageSender {
 
         match entry {
             TakeCallbackResult::Taken(id, entry) => {
+                if codex_protocol::timing::observations::enabled() {
+                    let _ = codex_protocol::timing::observations::record("approval_response_received",
+                        &entry.thread_id.map(|id| id.to_string()).unwrap_or_default(), "", &id.to_string(),
+                        serde_json::json!({"connection_id":connection_id.0,
+                            "scope":"server_request_response_not_runtime_resume",
+                            "method":entry.request.method()}));
+                }
                 let completed_at_ms = now_unix_timestamp_ms();
                 self.analytics_events_client.track_server_response(
                     completed_at_ms,
@@ -1873,6 +1888,15 @@ impl OutgoingMessageSender {
             "app-server terminal event: {notification}"
         );
         let dispatch_started = Instant::now();
+        let emission = codex_protocol::timing::observations::Span::start(
+            "terminal_emission", &thread_id.to_string(), &turn_id, &turn_id,
+            serde_json::json!({"scope":"one_terminal_dispatch_not_client_receipt",
+                "actual_targets":target_connection_ids.len(),
+                "targets":target_connection_ids.iter().take(8192).map(|id| id.0).collect::<Vec<_>>(),
+                "targets_complete":target_connection_ids.len() <= 8192,
+                "origin_connection":origin_connection_id.map(|id| id.0),
+                "status":match &notification {
+                    ServerNotification::TurnCompleted(completed) => Some(&completed.turn.status), _ => None }}));
         tracing::info!(target: "codex_task_observation", schema_version = 1,
             %thread_id, %turn_id, phase = "server_notification_dispatch_started",
             at_unix_ms = chrono::Utc::now().timestamp_millis(), clock = "unix_wall_ms",
@@ -1916,6 +1940,7 @@ impl OutgoingMessageSender {
         }
 
         if receipts.is_empty() {
+            emission.finish("no_targets", serde_json::Value::Null);
             self.analytics_events_client
                 .track_turn_delivery(aggregate_turn_delivery(
                     thread_id,
@@ -1939,6 +1964,11 @@ impl OutgoingMessageSender {
                     delivery_shutdown,
                 )
                 .await;
+                emission.finish("writer_observation_complete", serde_json::json!({
+                    "actual_outcomes":outcomes.len(),
+                    "outcomes":outcomes.iter().take(8192).map(|outcome| serde_json::json!({
+                        "connection_id":outcome.connection_id.0,
+                        "outcome":format!("{:?}", outcome.kind)})).collect::<Vec<_>>()}));
                 analytics_events_client.track_turn_delivery(aggregate_turn_delivery(
                     thread_id,
                     turn_id,
@@ -1949,6 +1979,8 @@ impl OutgoingMessageSender {
             return;
         }
         drop(accepting);
+
+        emission.finish("shutdown_not_accepting_receipts", serde_json::Value::Null);
 
         let outcomes = receipts
             .into_iter()

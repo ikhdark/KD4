@@ -9,6 +9,7 @@ pub(crate) mod config;
 pub(crate) mod list;
 pub(crate) mod metadata;
 mod payload_artifact;
+mod diagnostic_revision;
 mod persistence_metrics;
 pub(crate) mod policy;
 pub(crate) mod recorder;

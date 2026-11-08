@@ -121,10 +121,51 @@ when moving request-owned I/O to another task. The existing request telemetry
 adapter binds the callback to the physical retry attempt. Local `Instant`
 endpoints, wire-byte counts and static provenance flow into
 `performanceObservations.transportIntervals` and the native journal. DNS, TCP,
-TLS, upload/download and TCP round-trip callbacks are supported. The opaque
-reqwest driver emits none: application waits never stand in for socket events.
-Callbacks are request-bound and must not be reused for pooled-socket traffic
-belonging to later requests. Invalid endpoints remain unavailable.
+TLS, upload/download and TCP round-trip callbacks are supported. The local
+reqwest/hyper-util/hyper-rustls forks now emit real DNS resolution, individual
+TCP connection attempts and Rustls handshakes, including proxy TLS and tunneled
+destination TLS. No application wait stands in for one of these phases.
+Raw TCP read/write callbacks include encrypted/framing bytes, pending-I/O waits
+and potentially multiplexed traffic; they are explicitly `connectionScoped`
+and must not be interpreted as a request's upload/download or TCP RTT. Each
+connection retains at most 64 socket completions plus an overflow marker.
+Pooled sockets and executor tasks retain weak observers, not turn owners. The
+response body's observer lifetime permits observations after headers; a later
+request never acquires attribution for an earlier connection's shared traffic.
+Invalid endpoints, unsupported transports and missing phases remain unavailable.
+
+`operations.schemaVersion: 2` retains the legacy whole-inventory gate and adds
+independent `readInventory`/`commandInventory` counts and qualification. Immutable
+reads retain all delivered ranges; KDR normalizes each delivery before counting
+overlap with preceding successful reads. Nested endpoints use the actual runtime
+result release, not the outer cell's later model delivery. Commands still do not
+claim exact external filesystem/network input state from argv equivalence.
+
+Owned `read_files` branches and their recovery continuations carry bounded
+fork/join provenance without replacing Promise builtins or changing admission.
+Awaiting the helper joins all recorded branches, including rejected ones. Raw
+unsupported aggregates remain explicitly unknown. `requestOwnerClosures` can
+close a dependency lane when a sampling scope stops without provider completion;
+its evidence reference and KDR endpoint basis preserve that distinction.
+
+The optional `diagnostics/clientOutput` client notification carries a
+content-free occurrence/revision, client-local receipt/dequeue/schedule/paint
+times and observed target view. Server validation bounds identifiers and checks
+ordering; it grants no thread access and never changes runtime execution.
+`native-observations.remote_client_observations` keeps these client-reported
+claims separate from server-verified delivery and in-process native paint tokens.
+Real frontend integration is required; transport flush is not paint.
+
+Independent owner journals now include terminal emission/writer outcome spans,
+cancel claim and startup fences, replay candidate inventories, command approval
+submission and bounded shutdown inventories/dispositions. Timeouts do not imply
+that retained cleanup owners were aborted. Optional durable index checkpoints
+and reload streams use the same normalized-record digest before payload
+hydration. Payload references retain their existing hashes; payload bytes are
+not rehashed. Checkpoints are bounded to 64 MiB and reuse unchanged writer
+observations; cache invalidates on append/reopen. Capture errors do not change
+durability outcomes. Reload streams are not declared atomic snapshots, and
+these owner facts do not automatically advertise additional AS guarantees.
 
 `measurementEvidence.requestOwnerClosures` records the sampling-future scope
 end independently of successful provider completion, including abandoned/error

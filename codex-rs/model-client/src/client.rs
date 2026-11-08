@@ -4250,6 +4250,27 @@ impl ModelClient {
         } else {
             prompt.get_formatted_input_for_request(model_info.use_responses_lite)
         };
+        // Saved updates remain durable, but must not reach an unsupported model/provider.
+        if (!self.state.provider.info().is_openai()
+            || !model_info.use_responses_lite
+            || !model_info.supports_reasoning_effort_updates
+            || self.state.session_source.is_non_root_agent()
+            || matches!(self.state.session_source, SessionSource::Internal(_))
+            || matches!(effort.as_ref(), Some(ReasoningEffortConfig::Custom(_)))
+            || !matches!(
+                responses_metadata.request_kind,
+                Some(crate::responses_metadata::CodexResponsesRequestKind::Turn)
+            ))
+            && input
+                .iter()
+                .any(|item| matches!(item, ResponseItem::ConfigurationUpdate { .. }))
+        {
+            input = input
+                .iter()
+                .filter(|item| !matches!(item, ResponseItem::ConfigurationUpdate { .. }))
+                .cloned()
+                .collect();
+        }
         let image_count = crate::image_preparation::image_input_count(&input);
         if image_count != 0 && !model_info.input_modalities
             .contains(&codex_protocol::openai_models::InputModality::Image)
@@ -5565,6 +5586,9 @@ impl ModelClientSession {
             Some(conn) => {
                 setup_fingerprint.is_none()
                     || self.websocket_session.setup_fingerprint != setup_fingerprint
+                    // The handshake routing hint is immutable for a socket. A
+                    // model/tier transition must not keep the previous pool's route.
+                    || self.websocket_session.routing_hint != routing_hint
                     || websocket_connection_expiring(
                         self.websocket_session.connected_at,
                         Instant::now(),
@@ -8092,7 +8116,8 @@ impl RequestTelemetry for ApiTelemetry {
             && let Some(identity) = self.physical_transport_identity(attempt) {
             timing.record_transport_interval((&identity.sampling_request_id, &identity.physical_attempt_id),
                 observation.phase, (observation.started_at, observation.completed_at),
-                observation.wire_bytes, observation.provenance);
+                observation.wire_bytes, observation.provenance, observation.connection_id,
+                observation.connection_scoped, observation.outcome);
         }
     }
 

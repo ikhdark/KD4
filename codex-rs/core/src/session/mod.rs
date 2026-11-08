@@ -1506,6 +1506,7 @@ fn response_item_needs_turn_id(item: &ResponseItem) -> bool {
     !matches!(
         item,
         ResponseItem::AdditionalTools { .. }
+            | ResponseItem::ConfigurationUpdate { .. }
             | ResponseItem::CompactionTrigger { .. }
             | ResponseItem::Other
     ) && item.turn_id().is_none()

@@ -168,7 +168,8 @@ impl ToolArgumentDiffConsumer for ApplyPatchArgumentDiffConsumer {
 impl ApplyPatchArgumentDiffConsumer {
     fn push_delta(&mut self, call_id: String, delta: &str) -> Option<PatchApplyUpdatedEvent> {
         self.input.push_str(delta);
-        if self.input.contains("*** Operation ID:") || apply_patch_retries::is_retry(&self.input) || self.parse_error.is_some() {
+        if self.input.contains("*** Operation ID:") || self.input.contains("*** Evidence Review:")
+            || apply_patch_retries::is_retry(&self.input) || self.parse_error.is_some() {
             return None;
         }
         match self.parser.push_delta_in_place(delta) {
@@ -206,7 +207,7 @@ impl ApplyPatchArgumentDiffConsumer {
         &mut self,
     ) -> Result<Option<PatchApplyUpdatedEvent>, FunctionCallError> {
         let (operation, patch) = apply_patch_operations::split(&self.input)?;
-        if operation.is_some() {
+        if operation.is_some() || apply_patch_operations::evidence_review(&self.input).is_some() {
             if !apply_patch_retries::is_retry(&patch) {
                 codex_apply_patch::parse_patch(&patch).map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
             }
@@ -545,6 +546,7 @@ impl ToolExecutor<ToolInvocation> for ApplyPatchHandler {
                 return self.handle_call(invocation).await.map(boxed_tool_output);
             };
             let original = input.clone();
+            let review = apply_patch_operations::evidence_review(input).map(str::to_owned);
             let (declared_id, patch) = apply_patch_operations::split(input)?;
             let operation_id = declared_id.unwrap_or_else(|| invocation.call_id.clone());
             let scope = invocation.step_context.environments.turn_environments.iter().map(|e|
@@ -572,6 +574,9 @@ impl ToolExecutor<ToolInvocation> for ApplyPatchHandler {
             // durable receipt write after filesystem finalization.
             terminal_tasks.spawn(async move {
             let cancellation = invocation.cancellation_token.clone();
+            // Capture before dispatch, never while holding a workspace/mutation gate.
+            // Missing or invalid self-reports affect diagnostics only.
+            let review = super::evidence_memory::before_patch(&invocation, review.as_deref()).await;
             let result = match handler.handle_call(invocation).await {
                 Err(FunctionCallError::Structured(failure)) if !cancellation.is_cancelled() => {
                     Ok(ApplyPatchToolOutput::from_delta(
@@ -592,6 +597,7 @@ impl ToolExecutor<ToolInvocation> for ApplyPatchHandler {
             let mut result = result;
             if let Ok(output) = &mut result {
                 output.operation_id = operation_id;
+                output.diagnostics.insert(0, review);
                 let receipt = output.structured_result();
                 tokio::task::spawn_blocking(move || operation.finish(&receipt)).await
                     .map_err(|e| FunctionCallError::Fatal(format!("Patch receipt owner failed: {e}")))??;

@@ -1,6 +1,8 @@
 // Mechanical continuations only. These helpers use normal nested-tool dispatch;
 // they do not grant permissions, retry effects, or establish semantic completion.
 (() => {
+  const observeHelper = globalThis.__codex_helper_observation;
+  delete globalThis.__codex_helper_observation;
   const fail = (message, evidence) => {
     const error = new Error(message);
     error.evidence = evidence;
@@ -261,9 +263,11 @@
   });
 
   Object.defineProperty(globalThis, "read_files", {
-    value: async function read_files(
+    value: (() => {
+      const implementation = async function read_files(
       paths,
       { concurrency = 4, full = false, revision, source_hashes, environment_id } = {},
+      helper,
     ) {
       // Strings deliberately exclude ambiguous selector merges and environment
       // aliases. Repeated exact paths share one observation only within this batch.
@@ -309,12 +313,18 @@
       // allowing queued initial reads to overlap the first file's recovery.
       let activeCalls = 0;
       const queue = [];
-      const schedule = (action) =>
+      const schedule = (action, branch) =>
         new Promise((resolve, reject) => {
           const start = async () => {
             ++activeCalls;
             try {
-              resolve(await action());
+              // Tag only the synchronous native dispatch. Never leave the
+              // caller or a queued sibling in another branch's context.
+              const previous = observeHelper?.("helper_enter", helper, branch);
+              let pending;
+              try { pending = action(); }
+              finally { observeHelper?.("helper_leave", helper, previous); }
+              resolve(await pending);
             } catch (error) {
               reject(error);
             } finally {
@@ -326,8 +336,8 @@
           else queue.push(start);
         });
       const settled = await Promise.allSettled(
-        unique.map(async (path) => {
-          const initial = await schedule(() => read({ path, revision, environment_id }));
+        unique.map(async (path, branch) => {
+          const initial = await schedule(() => read({ path, revision, environment_id }), branch);
           const evidence = {
             initial,
             pages: [],
@@ -466,6 +476,7 @@
                   selectors: [{ kind: "bytes", start: offset, end: size }],
                   max_bytes: 1024 * 1024,
                 }),
+                branch,
               );
             } catch (cause) {
               evidence.cause = cause;
@@ -525,7 +536,14 @@
       // Retain all started work, including failures and successful siblings.
       const byPath = new Map(unique.map((path, i) => [path, settled[i]]));
       return requested.map((path) => ({ path, ...byPath.get(path) }));
-    },
+      };
+      return function read_files(paths, options) {
+        const helper = observeHelper?.("helper");
+        const promise = implementation(paths, options, helper);
+        observeHelper?.("helper_bind", helper, promise);
+        return promise;
+      };
+    })(),
   });
 
   Object.defineProperty(globalThis, "search_files", {

@@ -63,7 +63,6 @@ fn readiness_catalogs() -> &'static Mutex<Vec<ReadinessCatalog>> {
 fn descriptors(ids: Vec<String>) -> Vec<ModelInfo> {
     ids.into_iter().map(|id| {
         let mut info = codex_models_manager::model_info::model_info_from_slug(&id);
-        info.base_instructions = codex_models_manager::model_info::BASE_INSTRUCTIONS.to_owned();
         info.model_messages = None;
         info.visibility = ModelVisibility::List;
         info.description = Some("Installed local model; capabilities are unknown unless configured in model_catalog_json.".into());

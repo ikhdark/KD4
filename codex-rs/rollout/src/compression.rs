@@ -743,6 +743,8 @@ pub struct RolloutLineReader {
     inner: RolloutLineReaderInner,
     path: PathBuf,
     last_line_terminated: bool,
+    source_revision: Option<crate::diagnostic_revision::Revision>,
+    source_only: bool,
     enroll_payloads: bool,
     unresolved_payloads: usize,
     payload_versions: Option<
@@ -761,6 +763,13 @@ struct BlockingRolloutLineReader {
 }
 
 impl RolloutLineReader {
+    pub(crate) fn capture_source_revision(&mut self, source_only: bool) {
+        self.source_revision = Some(Default::default());
+        self.source_only = source_only;
+    }
+    pub(crate) fn source_revision(&self) -> Option<serde_json::Value> {
+        self.source_revision.as_ref().map(crate::diagnostic_revision::Revision::value)
+    }
     pub(crate) fn capture_payload_versions(&mut self) {
         self.payload_versions = Some(Default::default());
     }
@@ -811,7 +820,8 @@ impl RolloutLineReader {
             return Ok(None);
         };
         self.last_line_terminated = terminated;
-        if !crate::payload_artifact::may_be_reference(&line) {
+        if let Some(revision) = self.source_revision.as_mut() { revision.push(&line, terminated); }
+        if self.source_only || !crate::payload_artifact::may_be_reference(&line) {
             return Ok(Some(line));
         }
         let path = self.path.clone();
@@ -1818,6 +1828,8 @@ mod reader {
             return Ok(RolloutLineReader {
                 path: source_path,
                 last_line_terminated: true,
+                source_revision: None,
+                source_only: false,
                 enroll_payloads: false,
                 unresolved_payloads: 0,
                 payload_versions: None,
@@ -1831,6 +1843,8 @@ mod reader {
         Ok(RolloutLineReader {
             path: source_path,
             last_line_terminated: true,
+            source_revision: None,
+            source_only: false,
             enroll_payloads: false,
             unresolved_payloads: 0,
             payload_versions: None,

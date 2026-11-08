@@ -148,7 +148,9 @@ impl ModelsCacheManager {
             fetched_at = ?header.fetched_at,
             "models cache: loaded cache file"
         );
-        if header.client_version.as_deref() != Some(expected_version) {
+        if header.client_version.as_deref() != Some(expected_version)
+            || header.effort_updates_schema != Some(1)
+        {
             info!(
                 cache_path = %self.cache_path.display(),
                 expected_version,
@@ -261,12 +263,17 @@ impl ModelsCacheManager {
             return CacheWriteOutcome::RevisionConflict;
         }
         let cache = ModelsCache {
+            effort_updates_schema: Some(1),
             revision: Some(next_revision(&current_basis.disk_revision)),
             fetched_at: Utc::now(),
             etag,
             client_version: Some(client_version),
             provider_cache_identity: Some(current_identity),
             models: models.to_vec(),
+            default_instruction_slugs: models.iter()
+                .filter(|model| model.uses_default_base_instructions)
+                .map(|model| model.slug.clone())
+                .collect(),
         };
         if !self.identity_is_current(expected_identity) {
             info!(
@@ -318,6 +325,7 @@ impl ModelsCacheManager {
             ));
         }
         if header.client_version.as_deref() != Some(expected_version)
+            || header.effort_updates_schema != Some(1)
             || header.provider_cache_identity.as_deref() != Some(expected_identity)
             || header.etag.as_deref() != Some(expected_etag)
         {
@@ -432,6 +440,9 @@ impl ModelsCacheManager {
 /// Serialized snapshot of models and metadata cached on disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ModelsCache {
+    // Older writers discarded supports_reasoning_effort_updates from model metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effort_updates_schema: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) revision: Option<u64>,
     pub(crate) fetched_at: DateTime<Utc>,
@@ -442,12 +453,16 @@ pub(crate) struct ModelsCache {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) provider_cache_identity: Option<String>,
     pub(crate) models: Vec<ModelInfo>,
+    // Keep runtime provenance in the private cache, never the public catalog schema.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    default_instruction_slugs: Vec<String>,
 }
 
 /// Entry metadata decoded without the model list, which dominates the file.
 /// It decides whether an entry is usable, renewable, or safely replaceable.
 #[derive(Deserialize)]
 struct ModelsCacheHeader<'a> {
+    effort_updates_schema: Option<u32>,
     revision: Option<u64>,
     fetched_at: Option<DateTime<Utc>>,
     etag: Option<String>,
@@ -565,12 +580,13 @@ fn write_basis_from_snapshot(
 }
 
 fn decode_cache(contents: &[u8]) -> io::Result<ModelsCache> {
-    let cache: ModelsCache = serde_json::from_slice(contents)
+    let mut cache: ModelsCache = serde_json::from_slice(contents)
         .map_err(|err| io::Error::new(ErrorKind::InvalidData, err.to_string()))?;
-    for model in &cache.models {
+    for model in &mut cache.models {
         model
             .validate_capabilities()
             .map_err(|err| io::Error::new(ErrorKind::InvalidData, err))?;
+        model.uses_default_base_instructions = cache.default_instruction_slugs.contains(&model.slug);
     }
     Ok(cache)
 }

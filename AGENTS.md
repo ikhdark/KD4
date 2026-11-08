@@ -2,8 +2,8 @@
 
 Keep this file identical in both checkouts, keep project context.
 
-- Leave no gaps in your edits.
-- Look for previous edits to the area you are implementing, if those exist, read them and make sure you are not putting back a regression. ("C:\Users\kuh\Desktop\KDR\learning\history.json")
+
+- Leave no gaps.
 
 ## Read first
 
@@ -30,6 +30,7 @@ Keep command syntax, inventories and storage maps in those guides, not duplicate
 
 - Use the README-linked storage and diagnostics guides for learning paths and registry/journal contracts; keep KD4's registry separate from KDR's.
 - Before behavioral edits, establish a real defect or meaningful improvement, understand the current design and inspect relevant prior fixes/benchmark history. Weigh retained benefits, regressions, complexity and workflow impact; explicitly reason whether the evidence supports preserving, modifying or rejecting the prior approach.
+- For consequential changes informed by prior fixes, record relevant fix IDs, preserve/modify/reject decisions and an evidence-backed rationale before mutation. Use the existing patch assessment metadata when available, following the diagnostics guide; otherwise give a brief pre-edit explanation. Distinguish delivered context, observed reads and reported consideration. Missing records remain unknown, never an edit gate; do not create a separate per-fix artifact workflow.
 - Advisories are selective and non-blocking, not approval gates or proof of complete coverage. Do not make registry checks, historical reversal, proposal patches, per-fix receipts or unrelated benchmark campaigns routine prerequisites.
 
 ## Reporting

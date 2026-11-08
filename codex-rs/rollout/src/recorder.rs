@@ -1319,6 +1319,7 @@ impl RolloutRecorder {
         trace!("Resuming rollout from {path:?}");
         let mut decoder = RolloutRecordDecoder::default();
         let mut reader = compression::open_rollout_line_reader(path).await?;
+        if codex_protocol::timing::observations::enabled() { reader.capture_source_revision(false); }
         if capture_payload_versions {
             reader.capture_payload_versions();
         }
@@ -1334,6 +1335,16 @@ impl RolloutRecorder {
             }
         }
         let thread_id = decoder.finish(path)?;
+        if let Some(revision) = reader.source_revision() {
+            let _ = codex_protocol::timing::observations::record("reload_rollout_observed",
+                &thread_id.map(|id| id.to_string()).unwrap_or_default(), "", "source_reconstruction",
+                serde_json::json!({"store_id":crate::diagnostic_revision::store_id(path),
+                    "revision":revision, "parse_errors":decoder.parse_errors,
+                    "partial_tail":decoder.last_record_partial,
+                    "unresolved_payloads":reader.unresolved_payloads(),
+                    "atomic_snapshot":false,
+                    "scope":"exact_index_record_stream_read; concurrent_append_may_extend_source"}));
+        }
         Ok((
             thread_id,
             decoder.parse_errors,
@@ -1702,6 +1713,7 @@ impl LockedRolloutFile {
             _payload_sync_owner: self.payload_sync_owner,
             _append_lock: Arc::new(self.append_lock),
             _payload_retention: Arc::new(self.payload_retention),
+            diagnostic_revision: None,
         }
     }
 }
@@ -1888,6 +1900,10 @@ impl RolloutWriterState {
     }
 
     async fn flush_durable(&mut self) -> std::io::Result<()> {
+        let observation = codex_protocol::timing::observations::Span::start(
+            "durable_rollout", &self.meta.as_ref().map(|meta| meta.id.to_string()).unwrap_or_default(),
+            "", "writer_barrier", serde_json::json!({
+                "scope":"ordered_rollout_and_payload_sync_not_a_state_db_or_client_ack"}));
         self.flush().await?;
         crate::payload_artifact::sync_payload_artifacts(&self.rollout_path).await?;
         if let Some(writer) = self.writer.as_ref() {
@@ -1901,6 +1917,16 @@ impl RolloutWriterState {
                 self.namespace_sync_pending = false;
             }
         }
+        let revision = if codex_protocol::timing::observations::enabled()
+            && let Some(writer) = self.writer.as_mut() {
+            match writer.diagnostic_checkpoint().await {
+                Ok(value) => value,
+                Err(error) => serde_json::json!({"available":false,
+                    "reason":"index_checkpoint_capture_failed", "error_kind":format!("{:?}", error.kind())}),
+            }
+        } else { Value::Null };
+        observation.finish("synced", serde_json::json!({"checkpoint":revision, "materialized":self.writer.is_some(),
+            "pending_items":self.pending_items.len(), "namespace_sync_pending":self.namespace_sync_pending}));
         Ok(())
     }
 
@@ -2015,6 +2041,7 @@ impl RolloutWriterState {
                 _payload_sync_owner: Arc::clone(&self.payload_sync_owner),
                 _append_lock: Arc::clone(append_lock),
                 _payload_retention: Arc::clone(payload_retention),
+                diagnostic_revision: None,
             }
         } else {
             tokio::task::spawn_blocking(move || open_log_file(path.as_path()))
@@ -2458,6 +2485,8 @@ struct JsonlWriter {
     _payload_sync_owner: Arc<crate::payload_artifact::PayloadSyncOwner>,
     _append_lock: Arc<compression::RolloutAppendLock>,
     _payload_retention: Arc<std::fs::File>,
+    // Cleared by every owned append, and checked against observed file version.
+    diagnostic_revision: Option<(u64, Option<std::time::SystemTime>, serde_json::Value)>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -2522,6 +2551,36 @@ impl Write for InlineRolloutLine {
 }
 
 impl JsonlWriter {
+    async fn diagnostic_checkpoint(&mut self) -> std::io::Result<Value> {
+        let path = self.path.clone();
+        let _lock = tokio::task::spawn_blocking(move || compression::lock_rollout_for_write_blocking(&path))
+            .await.map_err(IoError::other)??;
+        let before = self.file.metadata().await?;
+        if let Some((size, modified, value)) = &self.diagnostic_revision
+            && *size == before.len() && *modified == before.modified().ok() {
+            return Ok(value.clone());
+        }
+        // This scope does not claim durability of another writer's payloads.
+        // Sync the observed index under the append fence before hashing it.
+        self.file.sync_data().await?;
+        if before.len() > 64 * 1024 * 1024 {
+            return Ok(serde_json::json!({"available":false, "reason":"index_capture_limit_64_mib"}));
+        }
+        let mut reader = compression::open_rollout_line_reader(&self.path).await?;
+        reader.capture_source_revision(true);
+        while reader.next_line().await?.is_some() {}
+        let after = self.file.metadata().await?;
+        if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+            return Ok(serde_json::json!({"available":false, "reason":"source_changed_during_capture"}));
+        }
+        let value = serde_json::json!({"available":true,
+            "store_id":crate::diagnostic_revision::store_id(&self.path),
+            "revision":reader.source_revision(), "index_bytes":after.len(),
+            "basis":"index_synced_under_cooperative_write_fence"});
+        self.diagnostic_revision = Some((after.len(), after.modified().ok(), value.clone()));
+        Ok(value)
+    }
+
     async fn write_rollout_item(&mut self, rollout_item: &RolloutItem) -> std::io::Result<()> {
         // A direct append has no queue between capture and write.
         let captured = CapturedRolloutItem::new(rollout_item.clone(), OffsetDateTime::now_utc());
@@ -2618,6 +2677,7 @@ impl JsonlWriter {
     }
 
     async fn write_transaction(&mut self, bytes: &[u8], append_start: u64) -> std::io::Result<u64> {
+        self.diagnostic_revision = None;
         let committed_end = append_start.checked_add(bytes.len() as u64)
             .ok_or_else(|| IoError::other("rollout append offset overflow"))?;
         let write_result = self.write_line_bytes(bytes).await;

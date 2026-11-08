@@ -35,6 +35,10 @@ pub struct TransportIntervalObservation {
     pub wire_bytes: Option<u64>,
     /// Static source label only; never a URL, header or payload.
     pub provenance: &'static str,
+    /// Process-local connector identity; socket traffic is not request-exclusive.
+    pub connection_id: Option<u64>,
+    pub connection_scoped: bool,
+    pub outcome: &'static str,
 }
 
 pub type TransportIntervalObserver = std::sync::Arc<
@@ -44,11 +48,22 @@ pub type TransportIntervalObserver = std::sync::Arc<
 struct TransportTimingContext {
     timing: std::cell::Cell<TransportTiming>,
     interval_observer: Option<TransportIntervalObserver>,
+    connector_observer: Option<reqwest::kd4_timing::Observer>,
 }
 
 impl TransportTimingContext {
     fn new(interval_observer: Option<TransportIntervalObserver>) -> Self {
-        Self { timing: std::cell::Cell::new(TransportTiming::default()), interval_observer }
+        let connector_observer = interval_observer.as_ref().map(|observer| {
+            let observer = observer.clone();
+            std::sync::Arc::new(move |event: reqwest::kd4_timing::Event| {
+                observer(TransportIntervalObservation { phase: event.phase,
+                    started_at: event.started_at, completed_at: event.completed_at,
+                    wire_bytes: event.wire_bytes, provenance: "kd4_transport_fork_v1",
+                    connection_id: Some(event.connection_id),
+                    connection_scoped: event.connection_scoped, outcome: event.outcome });
+            }) as reqwest::kd4_timing::Observer
+        });
+        Self { timing: std::cell::Cell::new(TransportTiming::default()), interval_observer, connector_observer }
     }
 }
 
@@ -88,15 +103,16 @@ pub async fn capture_transport_timing<F: std::future::Future>(
 pub async fn capture_transport_timing_observed<F: std::future::Future>(
     future: F, observer: Option<TransportIntervalObserver>,
 ) -> (F::Output, TransportTiming) {
-    TRANSPORT_TIMING
+    let context = TransportTimingContext::new(observer);
+    let connector = context.connector_observer.as_ref().map(reqwest::kd4_timing::request);
+    reqwest::kd4_timing::scope(connector, TRANSPORT_TIMING
         .scope(
-            TransportTimingContext::new(observer),
+            context,
             async move {
                 let result = future.await;
                 (result, TRANSPORT_TIMING.with(|context| context.timing.get()))
             },
-        )
-        .await
+        )).await
 }
 
 fn record_response_header_time(duration: std::time::Duration) {
@@ -273,7 +289,15 @@ impl ReqwestTransport {
         }
         let stream = resp
             .bytes_stream()
-            .map(|result| result.map_err(Self::map_error));
+            .map({
+                // Only this body retains its initiating observer. Pooled sockets
+                // and driver tasks hold weak references and cannot retain turns.
+                let observer = TRANSPORT_TIMING.try_with(|context| context.connector_observer.clone()).ok().flatten();
+                move |result| {
+                    let _keep_until_body_drop = &observer;
+                    result.map_err(Self::map_error)
+                }
+            });
         Ok(StreamResponse {
             status,
             headers,

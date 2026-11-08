@@ -4,6 +4,9 @@ node_modules
 .pnpm-store
 .pnpm-debug.log
 
+# Vendored third-party sources (tracked files stay tracked).
+/third_party/
+
 # Keep pnpm-lock.yaml
 !pnpm-lock.yaml
 

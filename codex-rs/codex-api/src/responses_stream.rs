@@ -1237,6 +1237,7 @@ fn parse_required_response_item(
         | ResponseItem::AgentMessage { .. }
         | ResponseItem::FunctionCallOutput { .. }
         | ResponseItem::CustomToolCallOutput { .. }
+        | ResponseItem::ConfigurationUpdate { .. }
         | ResponseItem::CompactionTrigger { .. }
         | ResponseItem::Other => false,
     };

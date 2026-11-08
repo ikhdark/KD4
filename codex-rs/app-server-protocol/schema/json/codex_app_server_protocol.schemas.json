@@ -249,6 +249,27 @@
           ],
           "title": "InitializedNotification",
           "type": "object"
+        },
+        {
+          "description": "Optional content-free frontend measurements. Not a server clock or a claim that the server independently verified the painted revision.",
+          "properties": {
+            "method": {
+              "enum": [
+                "diagnostics/clientOutput"
+              ],
+              "title": "Diagnostics/clientOutputNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ClientOutputObservation"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Diagnostics/clientOutputNotification",
+          "type": "object"
         }
       ],
       "title": "ClientNotification"
@@ -26298,6 +26319,91 @@
         ],
         "type": "string"
       }
+    },
+    "v2/ClientOutputObservation": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "description": "One frontend-owned output occurrence, measured entirely on its own clock. Revision is a content-free revision ID or digest, never output text. An acknowledgement for a coalesced-away revision must not be reported as paint.",
+      "properties": {
+        "activeSessions": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "clientClockId": {
+          "type": "string"
+        },
+        "dequeuedAtNs": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "displayedThreadId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "observationId": {
+          "type": "string"
+        },
+        "outputId": {
+          "type": "string"
+        },
+        "paintedAtNs": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "receivedAtNs": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "revision": {
+          "type": "string"
+        },
+        "scheduledAtNs": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        },
+        "uiId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "clientClockId",
+        "observationId",
+        "outputId",
+        "receivedAtNs",
+        "revision",
+        "threadId",
+        "turnId"
+      ],
+      "title": "ClientOutputObservation",
+      "type": "object"
     }
   },
   "title": "CodexAppServerProtocol",

@@ -23,6 +23,7 @@ export type {
   ContextCompactionItem,
   CommandExecutionItem,
   CodeModeCellItem,
+  CodeModeToolCallItem,
   FileChangeItem,
   FileChangeEffect,
   FileChangeEffects,

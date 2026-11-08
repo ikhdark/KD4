@@ -92,6 +92,7 @@ pub fn should_persist_response_item(item: &ResponseItem) -> bool {
         | ResponseItem::WebSearchCall { .. }
         | ResponseItem::ImageGenerationCall { .. }
         | ResponseItem::Compaction { .. }
+        | ResponseItem::ConfigurationUpdate { .. }
         | ResponseItem::ContextCompaction { .. } => true,
         ResponseItem::AdditionalTools { .. }
         | ResponseItem::CompactionTrigger { .. }

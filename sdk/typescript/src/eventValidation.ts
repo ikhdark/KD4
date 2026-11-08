@@ -69,6 +69,26 @@ function validItem(value: unknown): boolean {
           String(value.status),
         )
       );
+    case "code_mode_tool_call":
+      return (
+        identity(value.call_id) &&
+        (value.parent_call_id === null || identity(value.parent_call_id)) &&
+        identity(value.parent_cell_id) &&
+        identity(value.runtime_tool_call_id) &&
+        identity(value.tool) &&
+        ["in_progress", "completed", "failed"].includes(String(value.status)) &&
+        (value.success === null || typeof value.success === "boolean") &&
+        (value.error === null || text(value.error)) &&
+        (value.duration_ms === null || count(value.duration_ms)) &&
+        (value.content_items === null ||
+          (Array.isArray(value.content_items) &&
+            value.content_items.every(
+              (item) =>
+                object(item) &&
+                ((item.type === "inputText" && text(item.text)) ||
+                  (item.type === "inputImage" && text(item.imageUrl))),
+            )))
+      );
     case "file_change":
       return (
         ["in_progress", "completed", "failed", "declined"].includes(String(value.status)) &&

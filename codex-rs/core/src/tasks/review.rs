@@ -180,7 +180,7 @@ async fn start_review_conversation(
     let config = ctx.config.clone();
     let mut sub_agent_config = config.as_ref().clone();
     // Set explicit review rubric for the sub-agent
-    sub_agent_config.base_instructions = Some(crate::REVIEW_PROMPT.to_string());
+    sub_agent_config.base_instructions = Some(codex_prompts::review_base_instructions());
 
     let model = config
         .review_model

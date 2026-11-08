@@ -1,0 +1,85 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "description": "One frontend-owned output occurrence, measured entirely on its own clock. Revision is a content-free revision ID or digest, never output text. An acknowledgement for a coalesced-away revision must not be reported as paint.",
+  "properties": {
+    "activeSessions": {
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "clientClockId": {
+      "type": "string"
+    },
+    "dequeuedAtNs": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "displayedThreadId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "observationId": {
+      "type": "string"
+    },
+    "outputId": {
+      "type": "string"
+    },
+    "paintedAtNs": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "receivedAtNs": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "revision": {
+      "type": "string"
+    },
+    "scheduledAtNs": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "threadId": {
+      "type": "string"
+    },
+    "turnId": {
+      "type": "string"
+    },
+    "uiId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "clientClockId",
+    "observationId",
+    "outputId",
+    "receivedAtNs",
+    "revision",
+    "threadId",
+    "turnId"
+  ],
+  "title": "ClientOutputObservation",
+  "type": "object"
+}

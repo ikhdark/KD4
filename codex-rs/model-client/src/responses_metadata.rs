@@ -26,9 +26,9 @@ use crate::client::X_CODEX_WINDOW_ID_HEADER;
 use crate::client::X_OPENAI_SUBAGENT_HEADER;
 use codex_git_utils::GitWorkspaceMetadata;
 
-/// Installation-wide prompt-cache keys. Replaying five days of real traffic, eight keep as few
-/// requests over the overload point as one key per session does; fewer do not, and more leave
-/// fewer first requests able to reuse another session's prefix.
+/// Installation-wide prompt-cache buckets share reusable prefixes while spreading traffic.
+/// Eight is the current policy, not a measured provider overload threshold or an established
+/// optimum; modeled key-load scenarios do not establish cache residency or actual savings.
 const PROMPT_CACHE_BUCKETS: u8 = 8;
 
 pub(crate) const INSTALLATION_ID_KEY: &str = "installation_id";

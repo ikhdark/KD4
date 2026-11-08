@@ -2,6 +2,7 @@ mod delegate;
 mod delivery_recovery;
 mod execute_handler;
 pub(crate) mod execute_spec;
+mod operation_evidence;
 mod response_adapter;
 mod wait_handler;
 pub(crate) mod wait_spec;
@@ -3232,6 +3233,7 @@ async fn call_nested_tool_inner(
     // that finish while this nested call waits for its lease.
     let admitted_revision = Arc::new(std::sync::Mutex::new(None));
 
+    let dispatch_started_at = std::time::Instant::now();
     let result = tool_runtime
         .clone()
         .handle_tool_call_with_admitted_revision(
@@ -3256,6 +3258,30 @@ async fn call_nested_tool_inner(
         Ok(result) => result,
         Err(error) => {
             let message = error.model_message();
+            // No post-hook payload was returned on this path. Name the
+            // attempted payload as such instead of asserting it executed.
+            let failure_result = serde_json::json!({
+                "tool_failure": error.failure(), "payload_authority": "requested",
+            });
+            let previous = operation_evidence::publish(
+                &exec,
+                &cell_id,
+                &nested_call_id,
+                parent_tool_call_id.as_deref(),
+                &runtime_tool_call_id,
+                &tool_name,
+                &payload,
+                &failure_result,
+                true,
+                dispatch_started_at.elapsed(),
+            );
+            if let Some(previous) = previous {
+                tokio::select! {
+                    biased;
+                    _ = previous => {}
+                    _ = cancellation.token().cancelled() => {}
+                }
+            }
             let (retained_output, output_truncated, _) = bounded_failed_nested_text(&message);
             let (failure_fingerprint, failure_identity) =
                 nested_failure_evidence(&nested_call_id, &message);
@@ -3582,12 +3608,33 @@ async fn call_nested_tool_inner(
     } else {
         retention.await;
     }
-    let script_result = large_result_receipt.unwrap_or_else(|| script_visible_nested_result(
-        &tool_name,
-        result_value.clone(),
+    let previous_publication = operation_evidence::publish(
+        &exec,
+        &cell_id,
         &nested_call_id,
-        packet_ordinal,
-    ));
+        parent_tool_call_id.as_deref(),
+        &runtime_tool_call_id,
+        &tool_name,
+        &payload,
+        &result_value,
+        nested_failed,
+        dispatch_started_at.elapsed(),
+    );
+    if let Some(previous) = previous_publication {
+        tokio::select! {
+            biased;
+            _ = previous => {}
+            _ = cancellation.token().cancelled() => {}
+        }
+    }
+    let script_result = large_result_receipt.unwrap_or_else(|| {
+        script_visible_nested_result(
+            &tool_name,
+            result_value.clone(),
+            &nested_call_id,
+            packet_ordinal,
+        )
+    });
     let nested_result = CodeModeNestedResultEvidence {
         failed: !matches!(
             outcome_context.outcome,

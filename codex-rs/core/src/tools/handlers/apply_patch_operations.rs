@@ -19,8 +19,8 @@ fn unknown(message: impl Into<String>) -> FunctionCallError {
     FunctionCallError::structured(ToolFailure::new(ToolFailureCode::UncertainEffects, message))
 }
 
-/// The operation declaration belongs to this tool, not the patch language used
-/// by standalone/shell callers. Strip exactly one header, never hunk contents.
+/// Dedicated-tool headers are not part of the standalone/shell patch language.
+/// Strip only envelope headers, never hunk contents.
 pub(super) fn split(input: &str) -> Result<(Option<String>, String), FunctionCallError> {
     let mut lines = input.split_inclusive('\n');
     let Some(first) = lines.next() else {
@@ -32,30 +32,43 @@ pub(super) fn split(input: &str) -> Result<(Option<String>, String), FunctionCal
     if first.trim_end_matches(['\r', '\n']) != "*** Begin Patch" {
         return Ok((None, input.into()));
     }
-    let Some(id) = second
+    let declaration = second
         .trim_end_matches(['\r', '\n'])
-        .strip_prefix("*** Operation ID: ")
-    else {
-        return Ok((None, input.into()));
-    };
-    if id.is_empty()
+        .strip_prefix("*** Operation ID: ");
+    if let Some(id) = declaration
+        && (id.is_empty()
         || id.len() > 128
         || !id
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b)))
     {
         return Err(FunctionCallError::structured(ToolFailure::no_effects(
             ToolFailureCode::InvalidInput,
             "Operation ID must be 1..128 ASCII letters, digits, -, _, . or :.",
         )));
     }
-    Ok((
-        Some(id.into()),
-        format!("{first}{}", lines.collect::<String>()),
-    ))
+    let next = if declaration.is_some() { lines.next() } else { Some(second) };
+    let mut patch = first.to_string();
+    if let Some(next) = next
+        && !next.starts_with("*** Evidence Review:")
+    {
+        patch.push_str(next);
+    }
+    patch.extend(lines);
+    Ok((declaration.map(str::to_owned), patch))
+}
+
+/// Optional, untrusted self-report; malformed metadata must not reject an edit.
+pub(super) fn evidence_review(input: &str) -> Option<&str> {
+    let mut lines = input.lines();
+    if lines.next()? != "*** Begin Patch" { return None; }
+    let mut next = lines.next()?;
+    if next.starts_with("*** Operation ID: ") { next = lines.next()?; }
+    next.strip_prefix("*** Evidence Review:").map(str::trim)
 }
 
 pub(super) fn with_id(input: &str, id: Option<&str>) -> Result<String, FunctionCallError> {
+    let review = evidence_review(input);
     let (updated_id, patch) = split(input)?;
     if updated_id
         .as_deref()
@@ -66,6 +79,11 @@ pub(super) fn with_id(input: &str, id: Option<&str>) -> Result<String, FunctionC
             "A patch hook cannot replace the declared operation identity.",
         )));
     }
+    let patch = if let Some(review) = review {
+        let (first, rest) = patch.split_once('\n')
+            .ok_or_else(|| unknown("Hook returned an invalid patch envelope"))?;
+        format!("{first}\n*** Evidence Review: {review}\n{rest}")
+    } else { patch };
     match id {
         Some(id) => {
             let (first, rest) = patch

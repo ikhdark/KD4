@@ -1073,6 +1073,11 @@ impl ContextManager {
     }
 
     /// Returns raw items in the history.
+    /// Identity of destructive history changes, independent of append-only growth.
+    pub fn history_version(&self) -> u64 {
+        self.history_version
+    }
+
     pub fn raw_items(&self) -> &[ResponseItem] {
         &self.items
     }
@@ -1632,6 +1637,7 @@ impl ContextManager {
             | ResponseItem::ImageGenerationCall { .. }
             | ResponseItem::CustomToolCall { .. }
             | ResponseItem::Compaction { .. }
+            | ResponseItem::ConfigurationUpdate { .. }
             | ResponseItem::CompactionTrigger { .. }
             | ResponseItem::ContextCompaction { .. }
             | ResponseItem::Other => item.clone(),
@@ -2247,6 +2253,7 @@ fn is_api_message(message: &ResponseItem) -> bool {
         | ResponseItem::WebSearchCall { .. }
         | ResponseItem::ImageGenerationCall { .. }
         | ResponseItem::Compaction { .. }
+        | ResponseItem::ConfigurationUpdate { .. }
         | ResponseItem::ContextCompaction { .. } => true,
         ResponseItem::CompactionTrigger { .. } => false,
         ResponseItem::Other => false,
@@ -2394,6 +2401,7 @@ fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
             ..
         }
         | ResponseItem::CompactionTrigger {}
+        | ResponseItem::ConfigurationUpdate { .. }
         | ResponseItem::Other => 0,
     }
 }
@@ -2552,7 +2560,7 @@ fn is_model_generated_item(item: &ResponseItem) -> bool {
         | ResponseItem::LocalShellCall { .. }
         | ResponseItem::Compaction { .. }
         | ResponseItem::ContextCompaction { .. } => true,
-        ResponseItem::CompactionTrigger { .. } => false,
+        ResponseItem::ConfigurationUpdate { .. } | ResponseItem::CompactionTrigger { .. } => false,
         ResponseItem::AdditionalTools { .. }
         | ResponseItem::FunctionCallOutput { .. }
         | ResponseItem::ToolSearchOutput { .. }

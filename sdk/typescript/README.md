@@ -64,6 +64,15 @@ always drain the process and inspect its outcome.
 If the stream reaches EOF without `turn.completed` or `turn.failed`, iteration
 throws after delivering the events already received; partial output is not completion.
 
+`code_mode_tool_call` items retain owner-produced nested operation receipts,
+independently of cell stdout. Their `content_items` contain JSON with the executed
+`payload` and native `result`; dispatched errors explicitly identify a requested
+payload when the executed arguments are unknown. Large receipts instead carry
+an `evidence_reference` with canonical identity and `read_tool_output` recovery;
+failed retention is an explicit `evidence_unavailable` gap. These references need
+the originating thread's retained artifacts. Item/cell completion and root exit
+alone do not establish descendant cleanup: inspect the native shutdown receipt.
+
 Live model text arrives as `item.progress` with `kind: "agent_message"` and `delta`.
 It shares `item_id` with the enclosing `item.started` / `item.completed` records.
 Each progress text payload is capped at 16 KiB of UTF-8 before JSON encoding and marks

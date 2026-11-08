@@ -25,6 +25,23 @@ fn ns(ms: Option<u64>) -> Option<u64> {
     ms.and_then(|ms| ms.checked_mul(1_000_000))
 }
 
+// A stopped local sampling owner has an exact endpoint even when the provider
+// never completed. Keep that evidence reference; do not populate completedMs.
+fn request_end(timing: &TurnTiming, request: &codex_protocol::protocol::TurnTimingModelRequest) -> Option<u64> {
+    if request.completed_ms.is_some() { return request.completed_ms; }
+    let packet = timing.measurement_evidence.as_ref()?.get("requestOwnerClosures")?;
+    if packet["complete"] != true || packet["schemaVersion"] != 1 { return None; }
+    let rows = packet["rows"].as_array()?;
+    if packet["actualCount"].as_u64()? != rows.len() as u64 { return None; }
+    let matches = rows.iter().filter(|row| row["samplingRequestId"].as_str() == request.sampling_request_id.as_deref())
+        .collect::<Vec<_>>();
+    if matches.len() != 1 { return None; }
+    let row = matches[0];
+    if row["basis"] != "sampling_future_scope_exit" || row["providerCompleted"] != false
+        || row["dispatchMs"].as_u64() != request.dispatch_ms { return None; }
+    row["ownerEndMs"].as_u64()
+}
+
 struct Lane {
     kind: Kind,
     start: u64,
@@ -77,7 +94,7 @@ pub(super) fn snapshot(timing: &TurnTiming) -> Option<TurnTimingDependencyGraph>
     let mut lanes = BTreeMap::new();
     for (index, request) in timing.model_requests.iter().enumerate() {
         let id = format!("generation-{}", request.generation_index);
-        let (Some(start), Some(end)) = (ns(request.dispatch_ms), ns(request.completed_ms)) else {
+        let (Some(start), Some(end)) = (ns(request.dispatch_ms), ns(request_end(timing, request))) else {
             reasons.insert("missing_request_endpoint");
             continue;
         };
@@ -211,6 +228,10 @@ pub(super) fn snapshot(timing: &TurnTiming) -> Option<TurnTimingDependencyGraph>
             let segment = if index == 0 { id.clone() } else { format!("{id}:segment-{index}") };
             let mut work = node(segment.clone(), lane.kind, start, end, vec![previous.clone()]);
             work.sampling_request_id = lane.request.clone();
+            if lane.kind == Kind::Model && timing.model_requests.iter().any(|request|
+                request.sampling_request_id == lane.request && request.completed_ms.is_none()) {
+                work.evidence_ref = lane.request.as_ref().map(|id| format!("requestOwnerClosures:{id}"));
+            }
             nodes.insert(segment.clone(), work);
             let boundary = format!("{id}:at-{end}");
             if boundary == previous {

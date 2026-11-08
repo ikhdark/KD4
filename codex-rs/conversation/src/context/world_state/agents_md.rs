@@ -267,11 +267,7 @@ impl WorldStateSection for AgentsMdState {
                 .rev()
                 .find(|text| text.starts_with("<repository_observation>"));
             let expected = observation_text(previous);
-            return if previous.freshness == AgentsMdFreshness::Refreshed {
-                observation.is_none_or(|text| text == expected)
-            } else {
-                observation.is_some_and(|text| text == expected)
-            };
+            return observation.is_some_and(|text| text == expected);
         };
         if parse_update(text).is_some() {
             if !update_chain_supported(previous, items,
@@ -383,7 +379,14 @@ impl WorldStateSection for AgentsMdState {
                 directory: None,
                 text: Self::REMOVAL_NOTICE.to_string(),
             },
-            (None, false) => return None,
+            (None, false) => {
+                return Some(Box::new(
+                    codex_context_fragments::RenderedContextFragment::new(
+                        "developer",
+                        observation_text(&current),
+                    ),
+                ));
+            }
         };
         Some(Box::new(instructions))
     }
@@ -393,7 +396,7 @@ impl WorldStateSection for AgentsMdState {
         previous: PreviousSectionState<'_, Self::Snapshot>,
     ) -> Vec<Box<dyn ContextualUserFragment>> {
         let mut fragments = self.render_diff(previous).into_iter().collect::<Vec<_>>();
-        if self.freshness != AgentsMdFreshness::Refreshed
+        if (self.freshness != AgentsMdFreshness::Refreshed || self.instructions.is_none())
             && fragments
                 .first()
                 .is_some_and(|fragment| fragment.role() == "user")
@@ -410,6 +413,15 @@ impl WorldStateSection for AgentsMdState {
 }
 
 fn observation_text(snapshot: &AgentsMdSnapshot) -> String {
+    if snapshot.text.is_none() && snapshot.freshness == AgentsMdFreshness::Refreshed {
+        return concat!(
+            "<repository_observation>\n",
+            "The current harness AGENTS.md snapshot supplies no instructions. ",
+            "This is an observed empty snapshot, not a missing discovery result. ",
+            "It does not cover nested directories.\n</repository_observation>",
+        )
+        .to_string();
+    }
     if snapshot.text.is_none() && snapshot.freshness != AgentsMdFreshness::Refreshed {
         return format!(
             "<repository_observation>\nAGENTS.md observation unavailable: {} This is not an instruction removal. Previously accepted instructions retain their original scope; applicability to a new scope is unverified. No automatic retry is requested.\n</repository_observation>",

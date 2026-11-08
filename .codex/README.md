@@ -13,13 +13,16 @@ The [root README](../README.md) indexes the active product and development guide
 | [audits/](audits/README.md) | Retained historical reports/captures; new investigation reports use [KDR/audits](../../KDR/audits/README.md). |
 | [fix-evidence/](fix-evidence/index.json) | Existing KD4 fix-to-receipt bindings; moved KDR evidence and shared benchmark learning are linked without copies. |
 | `gitdiff/` (when present) | Runtime output path for named patch receipts from the diff-saving tool. |
-| `benchmark-runs/` (when present) | Historical benchmark captures; new output uses KDR's `.local/benchmarks/`. |
+| `benchmark-runs/` (when present) | Historical benchmark captures; new output uses KDR's `benchmarks/`. |
 | [locks/](locks/) | Tool-managed coordination files; not disposable audit clutter. |
 
 New investigation evidence, proposals and benchmark learning use
-[KDR's canonical owners](../../KDR/docs/STORAGE_LAYOUT.md), not new stores here.
-Both fix indexes link KDR's `.local/benchmarks/learning/advisories/` projection.
+[KDR's canonical owners](../../KDR/docs/operations/STORAGE_LAYOUT.md), not new stores here.
+Both fix indexes link KDR's `learning/advisories/` projection, backed by
+`learning/history.json`. KD4 keeps its separate fix registry.
 Preserve existing receipt bytes and historical locations; do not mirror them.
+See [evidence memory](../../KDR/docs/operations/DIAGNOSTICS.md#evidence-memory-over-time)
+for selective behavioral constraints and warning-only advisories, not work-refusal gates.
 
 ## Current repository state
 

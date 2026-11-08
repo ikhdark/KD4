@@ -48,6 +48,7 @@ pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig)
 
     if let Some(base_instructions) = &config.base_instructions {
         model.base_instructions = base_instructions.clone();
+        model.uses_default_base_instructions = false;
         clear_instruction_messages(&mut model);
     } else {
         if let Some(template) = model
@@ -126,12 +127,14 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
         availability_nux: None,
         upgrade: None,
         base_instructions,
+        uses_default_base_instructions: true,
         model_messages,
         // Unknown models cannot be assumed to know how to load the skills catalog.
         include_skills_usage_instructions: true,
         include_apps_usage_instructions: true,
         include_plugin_usage_instructions: true,
         supports_reasoning_summaries: false,
+        supports_reasoning_effort_updates: false,
         default_reasoning_summary: ReasoningSummary::Auto,
         support_verbosity: false,
         default_verbosity: None,

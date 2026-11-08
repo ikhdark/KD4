@@ -961,6 +961,11 @@ impl InternalChatMessageMetadataPassthrough {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
+pub struct ConfigurationReasoning {
+    pub effort: crate::openai_models::ReasoningEffort,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseItem {
     #[schemars(skip)]
@@ -1184,6 +1189,10 @@ pub enum ResponseItem {
         #[ts(optional)]
         internal_chat_message_metadata_passthrough: Option<InternalChatMessageMetadataPassthrough>,
     },
+    /// A positional input control, authored by the harness after accepted input.
+    ConfigurationUpdate {
+        reasoning: ConfigurationReasoning,
+    },
     // Compaction triggers are request controls, not durable response items.
     CompactionTrigger {},
     ContextCompaction {
@@ -1225,7 +1234,7 @@ impl ResponseItem {
             | Self::ImageGenerationCall { id, .. }
             | Self::Compaction { id, .. }
             | Self::ContextCompaction { id, .. } => id.as_ref(),
-            Self::CompactionTrigger { .. } | Self::Other => None,
+            Self::ConfigurationUpdate { .. } | Self::CompactionTrigger { .. } | Self::Other => None,
         }
     }
 
@@ -1247,7 +1256,7 @@ impl ResponseItem {
             | Self::ImageGenerationCall { id, .. }
             | Self::Compaction { id, .. }
             | Self::ContextCompaction { id, .. } => *id = new_id,
-            Self::CompactionTrigger { .. } | Self::Other => {}
+            Self::ConfigurationUpdate { .. } | Self::CompactionTrigger { .. } | Self::Other => {}
         }
     }
 
@@ -1268,7 +1277,7 @@ impl ResponseItem {
             Self::WebSearchCall { .. } => Some("ws"),
             Self::ImageGenerationCall { .. } => Some("ig"),
             Self::Compaction { .. } | Self::ContextCompaction { .. } => Some("cmp"),
-            Self::CompactionTrigger { .. } | Self::Other => None,
+            Self::ConfigurationUpdate { .. } | Self::CompactionTrigger { .. } | Self::Other => None,
         }
     }
 
@@ -1404,9 +1413,10 @@ impl ResponseItem {
                 "context_compaction", id if id.is_some(),
                 encrypted_content if encrypted_content.is_some(),
             ),
-            Self::AdditionalTools { .. } | Self::CompactionTrigger { .. } | Self::Other => {
-                self.serialize(serializer)
-            }
+            Self::ConfigurationUpdate { .. }
+            | Self::AdditionalTools { .. }
+            | Self::CompactionTrigger { .. }
+            | Self::Other => self.serialize(serializer),
         }
     }
 
@@ -1470,7 +1480,10 @@ impl ResponseItem {
                 internal_chat_message_metadata_passthrough: metadata,
                 ..
             } => metadata.as_ref(),
-            Self::CompactionTrigger { .. } | Self::AdditionalTools { .. } | Self::Other => None,
+            Self::ConfigurationUpdate { .. }
+            | Self::CompactionTrigger { .. }
+            | Self::AdditionalTools { .. }
+            | Self::Other => None,
         }
     }
 
@@ -1534,12 +1547,16 @@ impl ResponseItem {
                 internal_chat_message_metadata_passthrough: metadata,
                 ..
             } => Some(metadata),
-            Self::CompactionTrigger { .. } | Self::AdditionalTools { .. } | Self::Other => None,
+            Self::ConfigurationUpdate { .. }
+            | Self::CompactionTrigger { .. }
+            | Self::AdditionalTools { .. }
+            | Self::Other => None,
         }
     }
 }
 
 pub const BASE_INSTRUCTIONS_DEFAULT: &str = include_str!("prompts/base_instructions/default.md");
+pub use crate::default_instructions::default_base_instructions;
 
 /// Base instructions for the model in a thread. Corresponds to the `instructions` field in the ResponsesAPI.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]
@@ -1551,7 +1568,7 @@ pub struct BaseInstructions {
 impl Default for BaseInstructions {
     fn default() -> Self {
         Self {
-            text: BASE_INSTRUCTIONS_DEFAULT.trim().to_string(),
+            text: default_base_instructions(),
         }
     }
 }

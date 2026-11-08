@@ -168,6 +168,7 @@ fn prepare_response_items_with_detail_policy(items: &mut [ResponseItem], support
             | ResponseItem::ImageGenerationCall { .. }
             | ResponseItem::Compaction { .. }
             | ResponseItem::CompactionTrigger { .. }
+            | ResponseItem::ConfigurationUpdate { .. }
             | ResponseItem::ContextCompaction { .. }
             | ResponseItem::Other => {}
         }
@@ -199,6 +200,7 @@ pub fn response_items_need_preparation(items: &[ResponseItem]) -> bool {
         | ResponseItem::ImageGenerationCall { .. }
         | ResponseItem::Compaction { .. }
         | ResponseItem::CompactionTrigger { .. }
+        | ResponseItem::ConfigurationUpdate { .. }
         | ResponseItem::ContextCompaction { .. }
         | ResponseItem::Other => false,
     })

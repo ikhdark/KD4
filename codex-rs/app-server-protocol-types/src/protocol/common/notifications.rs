@@ -170,7 +170,7 @@ macro_rules! client_notification_definitions {
         #[doc(hidden)]
         pub fn export_client_notification_schemas(
         ) -> ::anyhow::Result<Vec<RawSchemaEntry>> {
-            let schemas = Vec::new();
+            let mut schemas = Vec::new();
             $( $(schemas.push(crate::schema_support::generate_raw_json_schema::<$payload>(stringify!($payload))?);)? )*
             Ok(schemas)
         }
@@ -281,4 +281,10 @@ server_notification_definitions! {
 
 client_notification_definitions! {
     Initialized,
+    /// Optional content-free frontend measurements. Not a server clock or a
+    /// claim that the server independently verified the painted revision.
+    #[serde(rename = "diagnostics/clientOutput")]
+    #[ts(rename = "diagnostics/clientOutput")]
+    #[strum(serialize = "diagnostics/clientOutput")]
+    ClientOutputObserved(v2::ClientOutputObservation),
 }
