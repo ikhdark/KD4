@@ -253,10 +253,6 @@ impl ClaudeHooksEngine {
         &self.warnings
     }
 
-    pub(crate) fn has_handlers(&self) -> bool {
-        !self.handlers.is_empty()
-    }
-
     pub(crate) fn has_handler_for(&self, event_name: HookEventName) -> bool {
         self.handlers
             .iter()

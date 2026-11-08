@@ -142,13 +142,6 @@ impl ToolOrchestrator {
             .unwrap_or_else(|| turn_ctx.cwd_uri());
         let workspace_roots = turn_ctx.effective_workspace_roots();
         let initial_attempt = SandboxAttempt {
-            workspace_launch: tool_ctx
-                .session
-                .services
-                .agent_control
-                .workspace_launch
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade),
             codex_home: &turn_ctx.config.codex_home,
             sandbox: initial_sandbox,
             sandbox_requested,

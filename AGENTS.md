@@ -3,7 +3,7 @@
 Keep this file identical in both checkouts, keep project context.
 
 - Leave no gaps in your edits.
-- Look for previous edits to the area you are implementing, if those exist, read them and make sure you are not putting back a regression.
+- Look for previous edits to the area you are implementing, if those exist, read them and make sure you are not putting back a regression. ("C:\Users\kuh\Desktop\KDR\learning\history.json")
 
 ## Read first
 

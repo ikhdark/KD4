@@ -600,13 +600,6 @@ fn spawn_agent_common_properties_v2() -> BTreeMap<String, JsonSchema> {
             )),
         ),
         (
-            "workspace_strategy".to_string(),
-            JsonSchema::string_enum(
-                vec![json!("shared"), json!("isolated")],
-                Some("Optional workspace choice. Omitted or shared uses the current checkout. Isolated creates a detached worktree with the captured source overlay; changes remain there for integration. This does not broaden inherited authority.".to_string()),
-            ),
-        ),
-        (
             "fork_turns".to_string(),
             JsonSchema::string(Some(format!(
                 "Optional fork mode. Omitted or `none` creates a lineage-preserving TaskCapsule fork with no parent conversation; prefer this for self-contained tasks. Use the smallest sufficient integer string from 1 through 5 only when prior conversation is needed. {SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE}"
@@ -680,7 +673,6 @@ fn writable_assignment_schema() -> JsonSchema {
             ("risk_hints".into(), strings.clone()),
             ("contract_claims".into(), strings.clone()),
             ("dependencies".into(), strings),
-            ("workspace_strategy".into(), JsonSchema::string_enum(vec![json!("shared"), json!("isolated")], None)),
         ]), Some(vec!["objective".into(), "acceptance_criteria".into(), "read_scope".into(), "write_scope".into(), "stop_condition".into(), "required_evidence".into(), "prohibited_changes".into()]), Some(false.into()))
     }
 }

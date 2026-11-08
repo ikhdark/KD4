@@ -49,7 +49,6 @@ mod exec_policy;
 mod git_workspace;
 mod hook_runtime;
 mod hook_mcp_executor;
-mod isolated_workspace;
 pub(crate) use codex_model_client::image_preparation;
 mod installation_id;
 

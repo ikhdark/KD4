@@ -133,7 +133,6 @@ impl Handler {
                     "agent_path": binding.agent_path,
                     "task_name": binding.task_name,
                     "workspace_id": task.assignment.workspace_id,
-                    "workspace_strategy": task.assignment.workspace_strategy,
                     "epoch": task.workspace_status.epoch,
                     "last_progress_at": task.workspace_status.last_progress_at,
                     "lease_state": task.workspace_status.lease_state,

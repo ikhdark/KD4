@@ -7,8 +7,6 @@ use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::context::ContextualUserFragment;
 use crate::context::TaskCapsuleFragment;
-use crate::isolated_workspace::WorkspaceLaunch;
-use crate::isolated_workspace::cleanup_workspace_launch;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::create_spawn_agent_tool_v2;
 use crate::tools::handlers::multi_agents_v2::message_tool::message_content;
@@ -31,7 +29,6 @@ use codex_agent_task_store::StoreError;
 use codex_agent_task_store::TaskActor;
 use codex_agent_task_store::TaskCapsuleHandle;
 use codex_agent_task_store::TaskCapsuleV1;
-use codex_agent_task_store::WorkspaceStrategy;
 use codex_agent_task_store::normalize_repo_path;
 use codex_agent_task_store::repo_path_identity_keys;
 use codex_context_fragments::ModelContextBudget;
@@ -142,7 +139,7 @@ async fn handle_spawn_agent(
     } = invocation;
     let turn = Arc::clone(&step_context.turn);
     // Enforce persistence intent even for a stale/deferred tool invocation,
-    // before reservations, task admission, capsules or worktrees can be created.
+    // before reservations, task admission or capsules can be created.
     if turn.config.ephemeral {
         return Err(FunctionCallError::RespondToModel(
             "spawn_agent: unavailable in ephemeral sessions because task coordination requires disk persistence; no agent was started".to_string(),
@@ -151,15 +148,11 @@ async fn handle_spawn_agent(
     let arguments = function_arguments(payload)?;
     let mut args: SpawnAgentArgs = parse_arguments(&arguments)?;
     // Reject the canonical lexical domain before configuration, environment
-    // observation, task-store startup or workspace preparation can run.
+    // observation or task-store startup can run.
     AgentPath::root()
         .join(&args.task_name)
         .map_err(FunctionCallError::RespondToModel)?;
     args.validate_generic()?;
-    let workspace_strategy = args
-        .workspace_strategy
-        .or_else(|| args.assignment.as_ref().map(|assignment| assignment.workspace_strategy))
-        .unwrap_or(WorkspaceStrategy::Shared);
     // Writable work requires a typed contract; prose never grants write authority.
     let typed_role = AgentRole::Worker;
     let fork_mode = args.fork_mode(turn.config.multi_agent_v2.allow_full_history_forks)?;
@@ -203,7 +196,7 @@ async fn handle_spawn_agent(
     let session_source = turn.session_source.clone();
     let child_depth = next_thread_spawn_depth(&session_source);
     let mut config = build_agent_spawn_config_for_step(&step_context)?;
-    // Admission and worktree allocation are host-only. Resolve the same step
+    // Durable assignment admission is host-only. Resolve the same step
     // authority used by native tools before touching the local task store.
     let primary = crate::tools::handlers::wait_for_observed_tool_environment(
         &step_context.environments,
@@ -223,7 +216,7 @@ async fn handle_spawn_agent(
     }
     if primary.environment.is_remote() {
         return Err(FunctionCallError::RespondToModel(
-            "spawn_agent: durable assignments and isolated worktrees require a local primary environment; remote native tools remain available".to_string(),
+            "spawn_agent: durable assignments require a local primary environment; remote native tools remain available".to_string(),
         ));
     }
     let admission_cwd = primary
@@ -263,7 +256,6 @@ async fn handle_spawn_agent(
     {
         primary.cwd = codex_utils_path_uri::PathUri::from_abs_path(&admission_cwd);
     }
-    let mut isolated_workspace: Option<WorkspaceLaunch>;
     if let Some(service_tier) = args.service_tier.as_ref() {
         config.service_tier = Some(service_tier.clone());
     }
@@ -303,7 +295,7 @@ async fn handle_spawn_agent(
     })?;
 
     // Typed spawns reserve execution, registry identity, and V2 residency before any
-    // worktree or durable assignment preparation. The token holds only logical RAII
+    // durable assignment preparation. The token holds only logical RAII
     // reservations; all synchronization guards used to create it have already been released.
     let typed_role_metric = agent_role_metric_label(typed_role);
     turn.session_telemetry.counter(
@@ -377,29 +369,7 @@ async fn handle_spawn_agent(
             .await
             .map_err(typed_task_store_error)?;
         let cwd = admission_cwd.to_path_buf();
-        let main_repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
-        let writable = args
-            .assignment
-            .as_ref()
-            .is_some_and(|assignment| !assignment.write_scope.is_empty());
-        let mut environments = spawn_environments.take().unwrap_or_default();
-        isolated_workspace = crate::isolated_workspace::prepare_workspace_launch(
-            &mut config,
-            &mut environments,
-            writable,
-            workspace_strategy == WorkspaceStrategy::Isolated,
-            &cancellation_token,
-            &session.terminal_tasks,
-        )
-        .await?;
-        spawn_environments = Some(environments);
-        let automatic_isolation = isolated_workspace
-            .as_ref()
-            .is_some_and(|workspace| workspace.is_isolated())
-            && workspace_strategy != WorkspaceStrategy::Isolated;
-        let repo_root = isolated_workspace
-            .as_ref()
-            .map_or(main_repo_root, |workspace| workspace.workspace_root.clone());
+        let repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
         let (mut draft, relevant_handles) = match args.assignment.take() {
             Some(assignment_args) => {
                 let relevant_handles = assignment_args.relevant_handles.clone();
@@ -417,24 +387,12 @@ async fn handle_spawn_agent(
                         )
                     })?,
                     legacy_parent_assignment_id,
-                    workspace_strategy,
                 ),
                 Vec::new(),
             ),
         };
         draft.independent_verification = args.independent_verification;
-        if isolated_workspace
-            .as_ref()
-            .is_some_and(|workspace| workspace.is_isolated())
-        {
-            draft.workspace_strategy = WorkspaceStrategy::Isolated;
-        }
         if cancellation_token.is_cancelled() {
-            if let Some(workspace) = isolated_workspace.take()
-                && let Err(error) = cleanup_workspace_launch(&workspace).await
-            {
-                tracing::warn!(path = %workspace.workspace_root.display(), %error, "failed to clean cancelled isolated worktree");
-            }
             return Err(FunctionCallError::RespondToModel(
                 "spawn_agent cancelled".to_string(),
             ));
@@ -452,15 +410,6 @@ async fn handle_spawn_agent(
         {
             Ok(consumed) => Some(consumed),
             Err(error) => {
-                if let Some(workspace) = isolated_workspace.take()
-                    && let Err(cleanup_error) = cleanup_workspace_launch(&workspace).await
-                {
-                    tracing::warn!(
-                        path = %workspace.workspace_root.display(),
-                        %cleanup_error,
-                        "failed to clean isolated worktree after typed reservation revalidation failure"
-                    );
-                }
                 return Err(collab_spawn_error(error));
             }
         };
@@ -468,11 +417,6 @@ async fn handle_spawn_agent(
             .create_admitted_assignment(
                 &repo_root,
                 draft,
-                if automatic_isolation {
-                    codex_agent_task_store::IsolationIntegrationOwner::Root
-                } else {
-                    codex_agent_task_store::IsolationIntegrationOwner::Unavailable
-                },
                 new_agent_path.to_string(),
                 args.task_name.clone(),
             )
@@ -481,15 +425,6 @@ async fn handle_spawn_agent(
             Ok(task) => task,
             Err(error) => {
                 emit_admission_rejection_metric(&turn.session_telemetry, &error);
-                if let Some(workspace) = isolated_workspace.take()
-                    && let Err(cleanup_error) = cleanup_workspace_launch(&workspace).await
-                {
-                    tracing::warn!(
-                        path = %workspace.workspace_root.display(),
-                        %cleanup_error,
-                        "failed to clean isolated worktree after assignment creation failure"
-                    );
-                }
                 return Err(typed_task_store_error(error));
             }
         };
@@ -534,15 +469,6 @@ async fn handle_spawn_agent(
                             &turn.session_telemetry,
                         )
                         .await;
-                    if let Some(workspace) = isolated_workspace.take()
-                        && let Err(cleanup_error) = cleanup_workspace_launch(&workspace).await
-                    {
-                        tracing::warn!(
-                            path = %workspace.workspace_root.display(),
-                            %cleanup_error,
-                            "failed to clean isolated worktree after TaskCapsule failure"
-                        );
-                    }
                     return Err(typed_task_store_error(error));
                 }
             };
@@ -559,9 +485,7 @@ async fn handle_spawn_agent(
         }
         instructions.push_str(TYPED_RECEIPT_LIFECYCLE);
     }
-    let prepared_workspace = Arc::new(std::sync::Mutex::new(isolated_workspace.take()));
     let options = SpawnAgentOptions {
-        prepared_workspace: Some(Arc::clone(&prepared_workspace)),
         fork_parent_spawn_call_id: Some(call_id.clone()),
         fork_mode: Some(fork_mode),
         parent_thread_id: Some(session.thread_id),
@@ -703,15 +627,6 @@ async fn handle_spawn_agent(
                             .maybe_emit_terminal_metrics(assignment_id, &telemetry)
                             .await;
                     }
-                }
-                if let Some(workspace) = isolated_workspace.take()
-                    && let Err(cleanup_error) = cleanup_workspace_launch(&workspace).await
-                {
-                    tracing::warn!(
-                        path = %workspace.workspace_root.display(),
-                        %cleanup_error,
-                        "failed to clean isolated worktree after spawn failure"
-                    );
                 }
             };
             if child_thread_id.is_some() {
@@ -875,9 +790,6 @@ fn emit_admission_rejection_metric(session_telemetry: &SessionTelemetry, error: 
                 Some("reusable_sealed_investigation"),
                 1,
             ),
-            AdmissionRejectionReason::IsolatedIntegratorUnavailable => {
-                ("isolated_integrator_unavailable", None, 0)
-            }
         },
         _ => ("other", None, 0),
     };
@@ -936,7 +848,6 @@ struct SpawnAgentArgs {
     cwd: Option<String>,
     #[serde(default)]
     independent_verification: bool,
-    workspace_strategy: Option<WorkspaceStrategy>,
     agent_type: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<ReasoningEffort>,
@@ -959,16 +870,6 @@ impl SpawnAgentArgs {
             return Err(FunctionCallError::RespondToModel(format!(
                 "spawn_agent: model and reasoning overrides are not supported; subagents use {DEFAULT_SPAWN_AGENT_MODEL} with {DEFAULT_SPAWN_AGENT_REASONING_EFFORT} reasoning"
             )));
-        }
-        if self.workspace_strategy == Some(WorkspaceStrategy::Auto) {
-            return Err(FunctionCallError::RespondToModel(
-                "spawn_agent: workspace_strategy must be shared or isolated; omit it to use shared".to_string(),
-            ));
-        }
-        if self.workspace_strategy.is_some() && self.assignment.is_some() {
-            return Err(FunctionCallError::RespondToModel(
-                "spawn_agent: workspace_strategy cannot be combined with assignment; use assignment.workspace_strategy".to_string(),
-            ));
         }
         Ok(())
     }
@@ -1044,8 +945,6 @@ struct TypedAssignmentArgs {
     contract_claims: Vec<String>,
     #[serde(default)]
     relevant_handles: Vec<RelevantHandle>,
-    #[serde(default)]
-    workspace_strategy: WorkspaceStrategy,
     relation: Option<AssignmentRelation>,
     #[serde(default)]
     architecture_contract_ref: Option<ArchitectureContractRef>,
@@ -1069,7 +968,6 @@ impl TypedAssignmentArgs {
             required_evidence: self.required_evidence,
             prohibited_changes: self.prohibited_changes,
             contract_claims: self.contract_claims,
-            workspace_strategy: self.workspace_strategy,
             relation: self.relation,
             architecture_contract_ref: self.architecture_contract_ref,
         }
@@ -1082,7 +980,6 @@ fn legacy_message_draft(
     root_session_id: String,
     message: &str,
     parent_assignment_id: Option<AssignmentId>,
-    workspace_strategy: WorkspaceStrategy,
 ) -> AssignmentDraft {
     let role = AgentRole::Explorer;
     let read_scope = vec![RepoScope { path: ".".into(), recursive: true }];
@@ -1110,7 +1007,6 @@ fn legacy_message_draft(
         required_evidence: Vec::new(),
         prohibited_changes: Vec::new(),
         contract_claims: Vec::new(),
-        workspace_strategy,
         relation: None,
         architecture_contract_ref: None,
     }
@@ -1157,7 +1053,6 @@ async fn construct_and_attach_task_capsule(
         dependencies: assignment.dependencies.clone(),
         risk_hints: assignment.risk_hints.clone(),
         contract_claims: assignment.contract_claims.clone(),
-        workspace_strategy: Some(assignment.workspace_strategy),
         relation: assignment.relation.clone(),
         architecture_contract_ref: assignment.architecture_contract_ref.clone(),
         integration_plan: assignment.integration_plan,
@@ -1307,7 +1202,7 @@ fn typed_assignment_message(
             "Integration plan: root_owned; limit changes to the assigned scope and submit a receipt for root reconciliation."
         }
         IntegrationPlan::TypedIntegratorRequired => {
-            "Integration plan: typed_integrator_required; work only in the isolated workspace and submit a receipt for the typed integrator to reconcile independently."
+            "Integration plan: typed_integrator_required; submit a receipt for the typed integrator to reconcile independently."
         }
     };
     let effective = assignment.effective_contract(attempt.amendment.as_ref());
@@ -1326,7 +1221,6 @@ fn typed_assignment_message(
         "required_evidence": assignment.required_evidence,
         "prohibited_changes": assignment.prohibited_changes,
         "contract_claims": assignment.contract_claims,
-        "workspace_strategy": assignment.workspace_strategy,
         "relation": assignment.relation,
         "architecture_contract_ref": assignment.architecture_contract_ref,
         "integration_plan": assignment.integration_plan,

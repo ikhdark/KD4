@@ -563,7 +563,7 @@ fn is_multi_agent_v2_usage_hint_message(item: &ResponseItem, usage_hint_texts: &
 
 impl AgentControl {
     /// Reserves all bounded logical capacity needed by a typed spawn before any durable
-    /// assignment or isolated worktree is created.
+    /// assignment is created.
     pub(crate) async fn prepare_typed_spawn(
         &self,
         config: &Config,
@@ -1088,7 +1088,6 @@ impl AgentControl {
             .or(session_source.as_ref());
         let state = self.upgrade()?;
         let mut child_control = self.clone();
-        child_control.prepared_workspace = options.prepared_workspace.clone();
         if let Some(parent) = options.parent_thread_id.or(match effective_source {
             Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn { parent_thread_id, .. })) => {
                 Some(*parent_thread_id)

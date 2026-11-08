@@ -236,33 +236,6 @@ pub struct ArchitectureContractRef {
     pub contract_sha256: String,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkspaceStrategy {
-    #[default]
-    Auto,
-    Shared,
-    Isolated,
-}
-
-/// Host-selected integration ownership. This is not an agent-supplied contract field.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IsolationIntegrationOwner {
-    Unavailable,
-    TypedIntegrator,
-    Root,
-}
-
-impl From<bool> for IsolationIntegrationOwner {
-    fn from(available: bool) -> Self {
-        if available {
-            Self::TypedIntegrator
-        } else {
-            Self::Unavailable
-        }
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AssignmentDraft {
     pub root_session_id: String,
@@ -290,8 +263,6 @@ pub struct AssignmentDraft {
     pub prohibited_changes: Vec<crate::WriteProhibition>,
     #[serde(default)]
     pub contract_claims: Vec<String>,
-    #[serde(default)]
-    pub workspace_strategy: WorkspaceStrategy,
     pub relation: Option<AssignmentRelation>,
     #[serde(default)]
     pub architecture_contract_ref: Option<ArchitectureContractRef>,
@@ -333,7 +304,6 @@ pub enum AdmissionRejectionReason {
     /// Retained for compatibility; admission no longer emits this reason.
     /// Seal-time fingerprints cannot certify the inputs a producer observed.
     ReusableSealedInvestigation,
-    IsolatedIntegratorUnavailable,
 }
 
 impl std::fmt::Display for AdmissionRejectionReason {
@@ -341,7 +311,6 @@ impl std::fmt::Display for AdmissionRejectionReason {
         let value = match self {
             Self::DuplicateExplorerInvestigation => "duplicate_explorer_investigation",
             Self::ReusableSealedInvestigation => "reusable_sealed_investigation",
-            Self::IsolatedIntegratorUnavailable => "isolated_integrator_unavailable",
         };
         formatter.write_str(value)
     }
@@ -466,7 +435,6 @@ impl AssignmentDraft {
             required_evidence: self.required_evidence,
             prohibited_changes: crate::normalize_write_prohibitions(repo_root, &self.prohibited_changes)?,
             contract_claims: self.contract_claims,
-            workspace_strategy: self.workspace_strategy,
             workspace_id: String::new(),
             start_epoch: 0,
             relation: self.relation,
@@ -494,7 +462,7 @@ pub struct Assignment {
     /// absolute worktree root is stored separately and never included in task-facing JSON.
     #[serde(default)]
     pub repository_id: String,
-    /// Stable identity of the concrete shared or isolated worktree.
+    /// Stable identity of the selected checkout.
     #[serde(default)]
     pub workspace_id: String,
     pub role: AgentRole,
@@ -510,8 +478,6 @@ pub struct Assignment {
     pub prohibited_changes: Vec<crate::WriteProhibition>,
     #[serde(default)]
     pub contract_claims: Vec<String>,
-    #[serde(default)]
-    pub workspace_strategy: WorkspaceStrategy,
     #[serde(default)]
     pub start_epoch: u64,
     pub relation: Option<AssignmentRelation>,
@@ -608,8 +574,6 @@ pub struct TaskCapsuleV1 {
     pub risk_hints: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contract_claims: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_strategy: Option<WorkspaceStrategy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relation: Option<AssignmentRelation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

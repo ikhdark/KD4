@@ -1971,22 +1971,6 @@ impl ToolRegistry {
                 }
             };
 
-        if external_tool {
-            if let Some(workspace) = invocation
-                .session
-                .services
-                .agent_control
-                .workspace_launch
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade)
-            {
-                workspace.require_exclusive().map_err(|error| {
-                    FunctionCallError::RespondToModel(format!(
-                        "external tool cannot enforce concurrent-workspace confinement: {error}"
-                    ))
-                })?;
-            }
-        }
         let telemetry_tags = tool.telemetry_tags(&invocation).await;
         let mut tool_result_tags =
             Vec::with_capacity(base_tool_result_tags.len() + telemetry_tags.len());

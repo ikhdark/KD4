@@ -52,7 +52,6 @@ use tokio::sync::watch;
 
 use crate::ARCHITECTURE_CONTRACT_V1_SCHEMA_VERSION;
 use crate::AdmissionOverlapSummary;
-use crate::AdmissionRejectionReason;
 use crate::AdmittedAssignment;
 use crate::AgentGate;
 use crate::AgentReceipt;
@@ -99,7 +98,6 @@ use crate::WakeEvent;
 use crate::WakeEventId;
 use crate::WakeRead;
 use crate::WakeReadStatus;
-use crate::WorkspaceStrategy;
 use crate::WorkspaceTaskStatus;
 use crate::scope::CandidateScopeCase;
 use crate::scope::RepositoryIdentity;
@@ -513,7 +511,7 @@ impl LocalAgentTaskStore {
         draft: AssignmentDraft,
     ) -> StoreResult<(Assignment, Attempt)> {
         let admitted = self
-            .create_assignment_with_admission_impl(repo_root, draft, false, crate::IsolationIntegrationOwner::Unavailable, None)
+            .create_assignment_with_admission_impl(repo_root, draft, false, None)
             .await?;
         Ok((admitted.assignment, admitted.attempt))
     }
@@ -523,10 +521,8 @@ impl LocalAgentTaskStore {
         repo_root: &Path,
         draft: AssignmentDraft,
         selective: bool,
-        isolated_integrator_available: impl Into<crate::IsolationIntegrationOwner>,
         launch: Option<(String, String, String)>,
     ) -> StoreResult<AdmittedAssignment> {
-        let isolated_integrator_available = isolated_integrator_available.into();
         let root = repo_root.to_path_buf();
         let (repository, mut assignment, scope_case) = tokio::task::spawn_blocking(move || {
             let repository = repository_identity(&root)?;
@@ -552,9 +548,6 @@ impl LocalAgentTaskStore {
             ));
         }
         assignment.workspace_id = repository.workspace_id.clone();
-        if assignment.workspace_strategy == WorkspaceStrategy::Auto {
-            assignment.workspace_strategy = WorkspaceStrategy::Shared;
-        }
         let attempt = Attempt {
             attempt_id: AttemptId::new(),
             assignment_id: assignment.assignment_id,
@@ -584,7 +577,6 @@ impl LocalAgentTaskStore {
                 &mut transaction,
                 &assignment,
                 &scope_case,
-                isolated_integrator_available,
             )
             .await?
         } else {
@@ -662,7 +654,9 @@ impl LocalAgentTaskStore {
         .bind(encode(&crate::WorkspaceActorKind::Typed)?)
         .bind(assignment.assignment_id.to_string())
         .bind(attempt.attempt_id.to_string())
-        .bind(encode(&assignment.workspace_strategy)?)
+        // Keep the existing storage column readable by older databases; launches
+        // no longer select or create a workspace strategy.
+        .bind(encode(&"shared")?)
         .bind(encode(&attempt.created_at)?)
         .bind(encode(
             &(attempt.created_at
@@ -1681,11 +1675,9 @@ LIMIT 1
             if !matches!(
                 assignment.admission_origin,
                 crate::AssignmentAdmissionOrigin::LegacyMessage { .. }
-            ) || !matches!(assignment.workspace_strategy,
-                crate::WorkspaceStrategy::Shared | crate::WorkspaceStrategy::Isolated)
-            {
+            ) {
                 return Err(StoreError::InvalidAssignment(
-                    "host turn outcomes require a plain-message assignment with a concrete workspace strategy".to_string(),
+                    "host turn outcomes require a plain-message assignment".to_string(),
                 ));
             }
             // A final response establishes turn completion, not acceptance or validation.
@@ -1802,14 +1794,13 @@ LIMIT 1
         actor.require_root_for(&assignment.root_session_id)?;
         amendment.validate_for_assignment(&assignment)?;
         if host_legacy_followup
-            && (!matches!(
+            && !matches!(
                 assignment.admission_origin,
                 crate::AssignmentAdmissionOrigin::LegacyMessage { .. }
-            ) || !matches!(assignment.workspace_strategy,
-                crate::WorkspaceStrategy::Shared | crate::WorkspaceStrategy::Isolated))
+            )
         {
             return Err(StoreError::InvalidAssignment(
-                "host follow-up attempts require a plain-message assignment with a concrete workspace strategy".to_string(),
+                "host follow-up attempts require a plain-message assignment".to_string(),
             ));
         }
         if assignment.role != AgentRole::Worker
@@ -3008,7 +2999,6 @@ impl LocalAgentTaskStore {
         &'a self,
         repo_root: &'a Path,
         draft: AssignmentDraft,
-        isolated_integrator_available: impl Into<crate::IsolationIntegrationOwner> + Send + 'a,
         agent_path: String,
         task_name: String,
         owner: String,
@@ -3019,7 +3009,6 @@ impl LocalAgentTaskStore {
                     repo_root,
                     draft,
                     true,
-                    isolated_integrator_available,
                     Some((agent_path, task_name, owner)),
                 )
                 .await;
@@ -3158,7 +3147,6 @@ impl LocalAgentTaskStore {
         &'a self,
         repo_root: &'a Path,
         draft: AssignmentDraft,
-        isolated_integrator_available: impl Into<crate::IsolationIntegrationOwner> + Send + 'a,
     ) -> TaskStoreFuture<'a, AdmittedAssignment> {
         Box::pin(async move {
             let result = self
@@ -3166,7 +3154,6 @@ impl LocalAgentTaskStore {
                     repo_root,
                     draft,
                     true,
-                    isolated_integrator_available,
                     None,
                 )
                 .await;
@@ -4354,11 +4341,6 @@ async fn validate_capsule_contract_tx(
     capsule: &TaskCapsuleV1,
 ) -> StoreResult<()> {
     let attempt = load_attempt_tx(transaction, capsule.attempt_id).await?;
-    // Missing legacy strategy means Auto, which admission resolves to Shared.
-    let workspace_strategy = match capsule.workspace_strategy.unwrap_or_default() {
-        WorkspaceStrategy::Auto => WorkspaceStrategy::Shared,
-        strategy => strategy,
-    };
     // Corrections keep the original immutable capsule, not the current attempt.
     if capsule.schema_version != 1 || capsule.assignment_id != assignment.assignment_id
         || attempt.assignment_id != assignment.assignment_id || attempt.ordinal != 0
@@ -4370,7 +4352,6 @@ async fn validate_capsule_contract_tx(
         || capsule.stop_condition != assignment.stop_condition
         || capsule.dependencies != assignment.dependencies || capsule.risk_hints != assignment.risk_hints
         || capsule.contract_claims != assignment.contract_claims
-        || workspace_strategy != assignment.workspace_strategy
         || capsule.relation != assignment.relation
         || capsule.architecture_contract_ref != assignment.architecture_contract_ref
         || capsule.integration_plan != assignment.integration_plan
@@ -5280,14 +5261,13 @@ async fn selective_admission_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     assignment: &Assignment,
     scope_case: &CandidateScopeCase,
-    isolated_integrator_available: crate::IsolationIntegrationOwner,
 ) -> StoreResult<(AdmissionOverlapSummary, IntegrationPlan)> {
     // Admission and integration planning concern this root's team only.
     // Other sessions in the checkout do not constrain spawning.
     let observed = tracing::enabled!(target: "codex_storage_runtime", tracing::Level::TRACE)
         .then(std::time::Instant::now);
     let rows = sqlx::query(
-        "SELECT assignments.body_json, repositories.workspace_id,
+        "SELECT assignments.body_json,
                 attempts.attempt_id, attempts.amendment_json,
                 bindings.task_name, bindings.agent_path, bindings.thread_id
          FROM assignments
@@ -5317,10 +5297,8 @@ async fn selective_admission_tx(
 
     let mut overlaps = AdmissionOverlapSummary::default();
     let mut conflicting_writer_count = 0_u32;
-    let mut conflicting_writer_in_another_workspace = false;
     for row in rows {
         let existing: Assignment = decode(row.get::<String, _>("body_json").as_str())?;
-        let existing_workspace_id = row.get::<String, _>("workspace_id");
         let read_overlaps = existing.read_scope.iter().any(|existing_scope| {
             assignment
                 .read_scope
@@ -5391,44 +5369,14 @@ async fn selective_admission_tx(
         });
         if write_scope_overlaps || contract_overlaps {
             conflicting_writer_count = conflicting_writer_count.saturating_add(1);
-            conflicting_writer_in_another_workspace |=
-                existing_workspace_id != assignment.workspace_id;
         }
     }
 
-    let integration_plan = if assignment.write_scope.is_empty() {
+    let integration_plan = if conflicting_writer_count == 0 {
         IntegrationPlan::SingleWriter
-    } else if assignment.workspace_strategy == WorkspaceStrategy::Isolated {
-        if matches!(assignment.admission_origin,
-            crate::AssignmentAdmissionOrigin::LegacyMessage { .. })
-        {
-            // Public message spawns report an outcome to their root; they do
-            // not certify integration or invent an available typed integrator.
-            IntegrationPlan::RootOwned
-        } else if isolated_integrator_available == crate::IsolationIntegrationOwner::Root {
-            // Automatic launch isolation keeps integration explicitly with the root.
-            // A sealed worker receipt proves work in its checkout, not destination integration.
-            IntegrationPlan::RootOwned
-        } else {
-            if isolated_integrator_available == crate::IsolationIntegrationOwner::Unavailable {
-                return Err(StoreError::AdmissionRejected {
-                    reason: AdmissionRejectionReason::IsolatedIntegratorUnavailable,
-                    reusable_assignment_id: None,
-                });
-            }
-            IntegrationPlan::TypedIntegratorRequired
-        }
-    } else if conflicting_writer_count == 0 {
-        IntegrationPlan::SingleWriter
-    } else if conflicting_writer_in_another_workspace {
-        if isolated_integrator_available == crate::IsolationIntegrationOwner::Unavailable {
-            return Err(StoreError::AdmissionRejected {
-                reason: AdmissionRejectionReason::IsolatedIntegratorUnavailable,
-                reusable_assignment_id: None,
-            });
-        }
-        IntegrationPlan::TypedIntegratorRequired
     } else {
+        // Overlaps are advisory. Root reconciliation does not reserve paths or
+        // reject a launch because another writer is active.
         IntegrationPlan::RootOwned
     };
     Ok((overlaps, integration_plan))

@@ -325,19 +325,15 @@ impl AgentTaskCoordinator {
         &self,
         repo_root: &Path,
         draft: AssignmentDraft,
-        isolated_integrator_available: impl Into<codex_agent_task_store::IsolationIntegrationOwner>,
         agent_path: String,
         task_name: String,
     ) -> StoreResult<AdmittedAssignment> {
         self.require_root_scope(&draft.root_session_id)?;
         let store = self.required_store()?;
-        let isolated_integrator_available: codex_agent_task_store::IsolationIntegrationOwner =
-            isolated_integrator_available.into();
         let admitted = store
             .create_admitted_assignment_for_agent(
                 repo_root,
                 draft,
-                isolated_integrator_available,
                 agent_path.clone(),
                 task_name.clone(),
                 self.store

@@ -484,15 +484,6 @@ async fn effective_patch_permissions(
             return external_patch_permissions(turn, file_paths).ok_or(error);
         }
     };
-    if let Some(workspace) = session
-        .services
-        .agent_control
-        .workspace_launch
-        .as_ref()
-        .and_then(std::sync::Weak::upgrade)
-    {
-        workspace.validate_write_paths(&native_file_paths, native_cwd.as_path())?;
-    }
     let effective_additional_permissions = apply_granted_turn_permissions(
         session,
         approval_scope_id,

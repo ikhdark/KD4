@@ -306,12 +306,6 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
         attempt: &SandboxAttempt<'_>,
         ctx: &ToolCtx,
     ) -> Result<ApplyPatchRuntimeOutput, ToolError> {
-        attempt
-            .validate_workspace_permissions(&effective_permission_profile(
-                attempt.permissions,
-                req.additional_permissions.as_ref(),
-            ))
-            .map_err(ToolError::Codex)?;
         self.mutation_in_progress
             .store(true, std::sync::atomic::Ordering::Release);
         let result = async {

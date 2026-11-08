@@ -682,14 +682,14 @@ impl Codex {
             parent_thread_id,
             thread_source,
             originator,
-            mut agent_control,
+            agent_control,
             dynamic_tools,
             metrics_service_name,
             user_shell_override,
             inherited_exec_policy,
             inherited_environments,
             parent_trace: _,
-            mut environment_selections,
+            environment_selections,
             thread_extension_init,
             supports_openai_form_elicitation,
             analytics_events_client,
@@ -738,43 +738,6 @@ impl Codex {
                 .map_err(CodexErr::InvalidRequest)?;
             dynamic_tools
         };
-        let prepared_workspace = agent_control
-            .prepared_workspace
-            .take()
-            .and_then(|prepared| {
-                prepared
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take()
-            });
-        let workspace_tasks = tokio_util::task::TaskTracker::new();
-        let workspace_launch = match prepared_workspace {
-            Some(prepared) => Some(prepared),
-            None => {
-                let policy = config.permissions.file_system_sandbox_policy();
-                let writable = policy.has_full_disk_write_access()
-                    || policy.entries.iter().any(|entry| entry.access.can_write());
-                crate::isolated_workspace::prepare_workspace_launch(
-                    &mut config,
-                    &mut environment_selections,
-                    writable,
-                    false,
-                    &tokio_util::sync::CancellationToken::new(),
-                    &workspace_tasks,
-                )
-                .await
-                .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?
-            }
-        };
-        let workspace_launch = workspace_launch.map(Arc::new);
-        agent_control.workspace_launch = workspace_launch.as_ref().map(Arc::downgrade);
-        if (!dynamic_tools.is_empty() || !config.mcp_servers.is_empty() || config.notify.is_some())
-            && let Some(workspace) = &workspace_launch
-        {
-            workspace.require_exclusive().map_err(|error| {
-                CodexErr::InvalidRequest(format!("unconfined extension launch refused: {error}"))
-            })?;
-        }
         let config = Arc::new(config);
         let refresh_strategy = if session_source.is_non_root_agent() {
             codex_models_manager::manager::RefreshStrategy::Offline
@@ -882,7 +845,6 @@ impl Codex {
             compact_prompt: config.compact_prompt.clone(),
             approval_policy: config.permissions.approval_policy.clone(),
             permission_profile_state: session_permission_profile_state_from_config(&config)?,
-            workspace_launch: workspace_launch.as_ref().map(Arc::downgrade),
             windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
             environments: TurnEnvironmentSelections::new(
                 config.cwd.clone(),
@@ -965,16 +927,11 @@ impl Codex {
         // This task will run until Op::Shutdown is received.
         let session_for_loop = Arc::clone(&session);
         let session_loop_handle = tokio::spawn(async move {
-            if let Some(workspace) = &workspace_launch {
-                workspace.retain();
-            }
             submission_loop(Arc::clone(&session_for_loop), config, rx_sub)
                 .instrument(info_span!("session_loop", thread_id = %thread_id))
                 .await;
             session_for_loop.terminal_tasks.close();
             session_for_loop.terminal_tasks.wait().await;
-            // Retain checkout ownership until the session's submission loop has drained.
-            drop(workspace_launch);
         });
         let codex = Codex {
             tx_sub,
@@ -2671,18 +2628,6 @@ impl Session {
             }
         };
 
-        if hooks.has_unconfined_handlers()
-            && let Some(workspace) = self
-                .services
-                .agent_control
-                .workspace_launch
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade)
-            && let Err(error) = workspace.require_exclusive()
-        {
-            tracing::error!(%error, "hook refresh refused by concurrent workspace confinement; keeping accepted hooks");
-            return;
-        }
         let (previous_config, new_config) = {
             let mut state = self.state.lock().await;
             let previous_config = notify_config_contributors
