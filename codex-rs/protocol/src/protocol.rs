@@ -5024,7 +5024,9 @@ pub enum RolloutItem {
         turn_id: Option<String>,
         sampling_request_id: String,
         physical_attempt_id: String,
-        capture: serde_json::Value,
+        // Immutable evidence is shared across persistence/projection owners;
+        // cloning a rollout item must not copy the entire request snapshot.
+        capture: Arc<serde_json::Value>,
     },
     ResponseItem(ResponseItem),
     /// Legacy delivery item reconstructed as a model-visible `agent_message`.

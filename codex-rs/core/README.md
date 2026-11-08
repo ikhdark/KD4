@@ -53,6 +53,15 @@ modules for the implementation rather than expanding the orchestration files.
 
 ## Follow facades to their owners
 
+Checkout admission lives in [isolated_workspace.rs](src/isolated_workspace.rs),
+entered by the common session spawn boundary for app-server roots, CLI and workers.
+Uncontended sessions keep their checkout; competing confined writers receive
+dirty-state worktrees. Unrestricted incumbents and unsupported enforcement refuse
+conflicting writers rather than downgrading to shared access. Permission expansion,
+external tools and command hooks must acquire exclusive admission. Ownership lasts
+through session/process cleanup; worktree integration is explicit and conflict-checked.
+Read-only launches do not request writable snapshots unless explicitly selected.
+
 Core retains adapters and re-exports for these extracted responsibilities:
 
 | Workspace crate | Implementation responsibility |

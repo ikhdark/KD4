@@ -7,6 +7,8 @@ use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::context::ContextualUserFragment;
 use crate::context::TaskCapsuleFragment;
+use crate::isolated_workspace::WorkspaceLaunch;
+use crate::isolated_workspace::cleanup_workspace_launch;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::create_spawn_agent_tool_v2;
 use crate::tools::handlers::multi_agents_v2::message_tool::message_content;
@@ -42,29 +44,11 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_tools::ToolSpec;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use sha2::Digest;
-use sha2::Sha256;
 use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::Path;
-use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
-use uuid::Uuid;
-
-const MAX_OVERLAY_SNAPSHOT_FILE_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_OVERLAY_SNAPSHOT_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_WORKTREE_GIT_STDOUT_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_WORKTREE_GIT_STDERR_BYTES: u64 = 1024 * 1024;
-const WORKTREE_GIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Default)]
 pub(crate) struct Handler {
@@ -251,12 +235,14 @@ async fn handle_spawn_agent(
             FunctionCallError::RespondToModel(format!("spawn_agent: cannot resolve cwd {cwd}: {error}"))
         })?;
         if !tokio::fs::metadata(&selected).await.is_ok_and(|metadata| metadata.is_dir()) {
-            return Err(FunctionCallError::RespondToModel("spawn_agent: cwd must be an existing local directory".into()));
+            return Err(FunctionCallError::RespondToModel("spawn_agent: cwd must be an existing local directory".into(),
+            ));
         }
         if !config.permissions.file_system_sandbox_policy()
             .can_read_path_with_cwd(&selected, admission_cwd.as_path())
         {
-            return Err(FunctionCallError::RespondToModel("spawn_agent: selected cwd is outside inherited read permissions".into()));
+            return Err(FunctionCallError::RespondToModel("spawn_agent: selected cwd is outside inherited read permissions".into(),
+            ));
         }
         // Changing a task's location is not a permission grant. Pin any implicit
         // project root to the parent's directory before changing the child cwd.
@@ -277,7 +263,7 @@ async fn handle_spawn_agent(
     {
         primary.cwd = codex_utils_path_uri::PathUri::from_abs_path(&admission_cwd);
     }
-    let mut isolated_workspace: Option<IsolatedWorkspace> = None;
+    let mut isolated_workspace: Option<WorkspaceLaunch>;
     if let Some(service_tier) = args.service_tier.as_ref() {
         config.service_tier = Some(service_tier.clone());
     }
@@ -392,50 +378,28 @@ async fn handle_spawn_agent(
             .map_err(typed_task_store_error)?;
         let cwd = admission_cwd.to_path_buf();
         let main_repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
-        let repo_root = if workspace_strategy == WorkspaceStrategy::Isolated {
-            let workspace = Box::pin(create_isolated_worktree(
-                &main_repo_root,
-                config.codex_home.as_path(),
-                &args.task_name,
-                &cancellation_token,
-                &session.terminal_tasks,
-            ))
-            .await?;
-            config.cwd = match AbsolutePathBuf::from_absolute_path(&workspace.path) {
-                Ok(path) => path,
-                Err(error) => {
-                    if let Err(cleanup_error) = cleanup_isolated_worktree(&workspace).await {
-                        tracing::warn!(
-                            path = %workspace.path.display(),
-                            %cleanup_error,
-                            "failed to clean isolated worktree after path conversion failure"
-                        );
-                    }
-                    return Err(FunctionCallError::RespondToModel(format!(
-                        "spawn_agent: isolated worktree path is invalid: {error}"
-                    )));
-                }
-            };
-            let mut roots = config.workspace_roots.clone();
-            // Isolation changes the working directory, not inherited authority.
-            // Keep root's workspace permissions and add the worker's worktree.
-            roots.push(config.cwd.clone());
-            let mut seen = HashSet::new();
-            roots.retain(|root| seen.insert(root.clone()));
-            config.workspace_roots = roots.clone();
-            config.permissions.set_workspace_roots(roots);
-            if let Some(environments) = &mut spawn_environments {
-                // Retarget only the local primary, never remote secondaries.
-                if let Some(primary) = environments.first_mut() {
-                    primary.cwd = codex_utils_path_uri::PathUri::from_abs_path(&config.cwd);
-                }
-            }
-            let repo_root = workspace.path.clone();
-            isolated_workspace = Some(workspace);
-            repo_root
-        } else {
-            main_repo_root
-        };
+        let writable = args
+            .assignment
+            .as_ref()
+            .is_some_and(|assignment| !assignment.write_scope.is_empty());
+        let mut environments = spawn_environments.take().unwrap_or_default();
+        isolated_workspace = crate::isolated_workspace::prepare_workspace_launch(
+            &mut config,
+            &mut environments,
+            writable,
+            workspace_strategy == WorkspaceStrategy::Isolated,
+            &cancellation_token,
+            &session.terminal_tasks,
+        )
+        .await?;
+        spawn_environments = Some(environments);
+        let automatic_isolation = isolated_workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.is_isolated())
+            && workspace_strategy != WorkspaceStrategy::Isolated;
+        let repo_root = isolated_workspace
+            .as_ref()
+            .map_or(main_repo_root, |workspace| workspace.workspace_root.clone());
         let (mut draft, relevant_handles) = match args.assignment.take() {
             Some(assignment_args) => {
                 let relevant_handles = assignment_args.relevant_handles.clone();
@@ -459,11 +423,17 @@ async fn handle_spawn_agent(
             ),
         };
         draft.independent_verification = args.independent_verification;
+        if isolated_workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.is_isolated())
+        {
+            draft.workspace_strategy = WorkspaceStrategy::Isolated;
+        }
         if cancellation_token.is_cancelled() {
             if let Some(workspace) = isolated_workspace.take()
-                && let Err(error) = cleanup_isolated_worktree(&workspace).await
+                && let Err(error) = cleanup_workspace_launch(&workspace).await
             {
-                tracing::warn!(path = %workspace.path.display(), %error, "failed to clean cancelled isolated worktree");
+                tracing::warn!(path = %workspace.workspace_root.display(), %error, "failed to clean cancelled isolated worktree");
             }
             return Err(FunctionCallError::RespondToModel(
                 "spawn_agent cancelled".to_string(),
@@ -472,16 +442,21 @@ async fn handle_spawn_agent(
         consumed_typed_spawn = match session
             .services
             .agent_control
-            .consume_prepared_typed_spawn(prepared_typed_spawn, &config, &spawn_source, Some(session.thread_id))
+            .consume_prepared_typed_spawn(
+                prepared_typed_spawn,
+                &config,
+                &spawn_source,
+                Some(session.thread_id),
+            )
             .await
         {
             Ok(consumed) => Some(consumed),
             Err(error) => {
                 if let Some(workspace) = isolated_workspace.take()
-                    && let Err(cleanup_error) = cleanup_isolated_worktree(&workspace).await
+                    && let Err(cleanup_error) = cleanup_workspace_launch(&workspace).await
                 {
                     tracing::warn!(
-                        path = %workspace.path.display(),
+                        path = %workspace.workspace_root.display(),
                         %cleanup_error,
                         "failed to clean isolated worktree after typed reservation revalidation failure"
                     );
@@ -493,7 +468,11 @@ async fn handle_spawn_agent(
             .create_admitted_assignment(
                 &repo_root,
                 draft,
-                false,
+                if automatic_isolation {
+                    codex_agent_task_store::IsolationIntegrationOwner::Root
+                } else {
+                    codex_agent_task_store::IsolationIntegrationOwner::Unavailable
+                },
                 new_agent_path.to_string(),
                 args.task_name.clone(),
             )
@@ -503,10 +482,10 @@ async fn handle_spawn_agent(
             Err(error) => {
                 emit_admission_rejection_metric(&turn.session_telemetry, &error);
                 if let Some(workspace) = isolated_workspace.take()
-                    && let Err(cleanup_error) = cleanup_isolated_worktree(&workspace).await
+                    && let Err(cleanup_error) = cleanup_workspace_launch(&workspace).await
                 {
                     tracing::warn!(
-                        path = %workspace.path.display(),
+                        path = %workspace.workspace_root.display(),
                         %cleanup_error,
                         "failed to clean isolated worktree after assignment creation failure"
                     );
@@ -556,10 +535,10 @@ async fn handle_spawn_agent(
                         )
                         .await;
                     if let Some(workspace) = isolated_workspace.take()
-                        && let Err(cleanup_error) = cleanup_isolated_worktree(&workspace).await
+                        && let Err(cleanup_error) = cleanup_workspace_launch(&workspace).await
                     {
                         tracing::warn!(
-                            path = %workspace.path.display(),
+                            path = %workspace.workspace_root.display(),
                             %cleanup_error,
                             "failed to clean isolated worktree after TaskCapsule failure"
                         );
@@ -580,7 +559,9 @@ async fn handle_spawn_agent(
         }
         instructions.push_str(TYPED_RECEIPT_LIFECYCLE);
     }
+    let prepared_workspace = Arc::new(std::sync::Mutex::new(isolated_workspace.take()));
     let options = SpawnAgentOptions {
+        prepared_workspace: Some(Arc::clone(&prepared_workspace)),
         fork_parent_spawn_call_id: Some(call_id.clone()),
         fork_mode: Some(fork_mode),
         parent_thread_id: Some(session.thread_id),
@@ -724,10 +705,10 @@ async fn handle_spawn_agent(
                     }
                 }
                 if let Some(workspace) = isolated_workspace.take()
-                    && let Err(cleanup_error) = cleanup_isolated_worktree(&workspace).await
+                    && let Err(cleanup_error) = cleanup_workspace_launch(&workspace).await
                 {
                     tracing::warn!(
-                        path = %workspace.path.display(),
+                        path = %workspace.workspace_root.display(),
                         %cleanup_error,
                         "failed to clean isolated worktree after spawn failure"
                     );
@@ -749,10 +730,7 @@ async fn handle_spawn_agent(
     };
     admitted_launch_guard.armed = false;
     drop(admitted_launch_guard);
-    if let Some(workspace) = &isolated_workspace {
-        // The successfully started agent now owns the worktree lifetime.
-        workspace.cleanup_required.store(false, Ordering::Release);
-    }
+
     typed_reservation_metric.mark_retained();
     let new_thread_id = spawned_agent.thread_id;
     if codex_protocol::timing::observations::enabled() {
@@ -918,542 +896,7 @@ fn emit_admission_rejection_metric(session_telemetry: &SessionTelemetry, error: 
 }
 
 
-#[derive(Debug)]
-struct IsolatedWorkspace {
-    main_repo_root: PathBuf,
-    path: PathBuf,
-    cleanup_required: AtomicBool,
-    terminal_tasks: TaskTracker,
-}
 
-impl Drop for IsolatedWorkspace {
-    fn drop(&mut self) {
-        if !self.cleanup_required.swap(false, Ordering::AcqRel) {
-            return;
-        }
-        let repo_root = self.main_repo_root.clone();
-        let path = self.path.clone();
-        // The handler can be dropped between two awaited admission steps.
-        // Preserve rollback ownership even when there is no caller left to await it.
-        let terminal_tasks = self.terminal_tasks.clone();
-        self.terminal_tasks.spawn(async move {
-            if let Err(error) = cleanup_isolated_worktree_paths(&repo_root, &path, &terminal_tasks).await {
-                tracing::warn!(path = %path.display(), %error, "failed to roll back isolated worktree");
-            }
-        });
-    }
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct WorkspaceOverlay {
-    head: String,
-    tracked_diff: Vec<u8>,
-    working_files: Vec<(PathBuf, Vec<u8>)>,
-}
-
-async fn create_isolated_worktree(
-    repo_root: &Path,
-    codex_home: &Path,
-    task_name: &str,
-    cancellation_token: &CancellationToken,
-    terminal_tasks: &TaskTracker,
-) -> Result<IsolatedWorkspace, FunctionCallError> {
-    let mut initial_overlay =
-        capture_workspace_overlay(repo_root, cancellation_token, terminal_tasks).await?;
-    let repository_key = hex::encode(Sha256::digest(repo_root.to_string_lossy().as_bytes()));
-    let safe_task_name = task_name
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
-        .take(24)
-        .collect::<String>();
-    let leaf = format!(
-        "{}-{}",
-        if safe_task_name.is_empty() {
-            "task"
-        } else {
-            &safe_task_name
-        },
-        Uuid::now_v7()
-    );
-    let parent = codex_home
-        .join("isolated-worktrees")
-        .join(&repository_key[..16]);
-    tokio::fs::create_dir_all(&parent).await.map_err(|error| {
-        FunctionCallError::RespondToModel(format!(
-            "spawn_agent: could not create isolated-worktree directory: {error}"
-        ))
-    })?;
-    let path = parent.join(leaf);
-    let workspace = Arc::new(IsolatedWorkspace {
-        main_repo_root: repo_root.to_path_buf(),
-        path,
-        cleanup_required: AtomicBool::new(true),
-        terminal_tasks: terminal_tasks.clone(),
-    });
-    let mut command = Command::new(codex_git_utils::git_executable_async().await);
-    command
-        .arg("-C")
-        .arg(repo_root)
-        .args(["-c", "checkout.workers=0"])
-        .arg("-c")
-        .arg(format!("core.hooksPath={}", codex_git_utils::DISABLED_HOOKS_PATH))
-        .args(["worktree", "add", "--detach"])
-        .arg(&workspace.path)
-        .arg(&initial_overlay.head);
-    let output = run_worktree_git(command, None, cancellation_token, terminal_tasks).await;
-    let error = match output {
-        Ok(output) if output.status.success() => None,
-        Ok(output) => Some(format!(
-            "spawn_agent: git worktree add failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )),
-        Err(error) => Some(format!(
-            "spawn_agent: could not complete git worktree add: {error}"
-        )),
-    };
-    if let Some(error) = error {
-        if let Err(cleanup_error) = cleanup_isolated_worktree(&workspace).await {
-            tracing::warn!(path = %workspace.path.display(), %cleanup_error, "failed to clean isolated worktree after checkout failure");
-        }
-        return Err(FunctionCallError::RespondToModel(error));
-    }
-    let populate_result = Box::pin(async {
-        // Nothing has been applied yet. Absorb a short writer burst here rather
-        // than spending a model generation recreating the same empty worktree.
-        for attempt in 0..=2 {
-            let current_overlay = capture_workspace_overlay(repo_root, cancellation_token, terminal_tasks).await?;
-            if current_overlay == initial_overlay {
-                break;
-            }
-            if attempt == 2 || current_overlay.head != initial_overlay.head {
-                return Err(FunctionCallError::RespondToModel(
-                    "spawn_agent: the shared worktree did not stabilize during bounded snapshot retries; retry after the current writer finishes".to_string(),
-                ));
-            }
-            initial_overlay = current_overlay;
-            tokio::select! {
-                biased;
-                _ = cancellation_token.cancelled() => return Err(FunctionCallError::RespondToModel(
-                    "spawn_agent: cancelled while waiting for a stable workspace snapshot".into())),
-                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
-            }
-        }
-        let expected_overlay = Arc::new(initial_overlay);
-        if !expected_overlay.tracked_diff.is_empty() {
-            let mut command = Command::new(codex_git_utils::git_executable_async().await);
-            // Keep snapshot additions in the child's tracked-path inventory so
-            // validation can compare the overlay independently of parent staging.
-            command.arg("-C")
-                .arg(&workspace.path)
-                .args(["apply", "--intent-to-add", "--binary", "--whitespace=nowarn", "-"]);
-            let output = run_worktree_git(command, Some(&expected_overlay.tracked_diff), cancellation_token, terminal_tasks)
-                .await
-                .map_err(|error| {
-                    FunctionCallError::RespondToModel(format!(
-                        "spawn_agent: could not apply the shared-worktree snapshot: {error}"
-                    ))
-                })?;
-            if !output.status.success() {
-                return Err(FunctionCallError::RespondToModel(format!(
-                    "spawn_agent: isolated snapshot apply failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )));
-            }
-        }
-        use futures::StreamExt;
-        let copies = futures::stream::iter((0..expected_overlay.working_files.len()).map(|index| {
-            let workspace = Arc::clone(&workspace);
-            let expected_overlay = Arc::clone(&expected_overlay);
-            async move {
-                tokio::task::spawn_blocking(move || {
-                    // Keep rollback ownership in the blocking worker, including
-                    // when the caller is cancelled while this write is in flight.
-                    let (relative_path, bytes) = &expected_overlay.working_files[index];
-                    let target = workspace.path.join(relative_path);
-                    if let Some(parent) = target.parent() {
-                        std::fs::create_dir_all(parent).map_err(|error| {
-                            FunctionCallError::RespondToModel(format!(
-                                "spawn_agent: could not create an isolated snapshot directory: {error}"
-                            ))
-                        })?;
-                    }
-                    std::fs::write(&target, bytes).map_err(|error| {
-                        FunctionCallError::RespondToModel(format!(
-                            "spawn_agent: could not copy a working file into the isolated snapshot: {error}"
-                        ))
-                    })
-                })
-                .await
-                .map_err(|error| FunctionCallError::RespondToModel(format!(
-                    "spawn_agent: isolated snapshot copy worker failed: {error}"
-                )))?
-            }
-        }))
-        .buffer_unordered(std::thread::available_parallelism().map_or(4, usize::from))
-        .collect::<Vec<_>>()
-        .await;
-        // Drain every write before rollback: dropping an in-flight Tokio file
-        // operation does not cancel the underlying blocking filesystem call.
-        for result in copies {
-            result?;
-        }
-        let isolated_overlay =
-            capture_workspace_overlay(&workspace.path, cancellation_token, terminal_tasks).await?;
-        if isolated_overlay != *expected_overlay {
-            return Err(FunctionCallError::RespondToModel(
-                "spawn_agent: the isolated worktree does not match the captured source snapshot".into(),
-            ));
-        }
-        Ok(())
-    })
-    .await;
-    if let Err(error) = populate_result {
-        if let Err(cleanup_error) = cleanup_isolated_worktree(&workspace).await {
-            tracing::warn!(
-                path = %workspace.path.display(),
-                %cleanup_error,
-                "failed to clean isolated worktree after snapshot failure"
-            );
-        }
-        return Err(error);
-    }
-    Arc::into_inner(workspace).ok_or_else(|| {
-        FunctionCallError::RespondToModel(
-            "spawn_agent: isolated snapshot copy is still in progress".to_string(),
-        )
-    })
-}
-
-async fn capture_workspace_overlay(
-    repo_root: &Path,
-    cancellation_token: &CancellationToken,
-    terminal_tasks: &TaskTracker,
-) -> Result<WorkspaceOverlay, FunctionCallError> {
-    let mut index_command = Command::new(codex_git_utils::git_executable_async().await);
-    index_command.arg("-C").arg(repo_root).args(["ls-files", "--stage", "-z"]);
-    let index = run_worktree_git(index_command, None, cancellation_token, terminal_tasks)
-        .await.map_err(|error| FunctionCallError::RespondToModel(format!("spawn_agent: snapshot index capture failed: {error}")))?;
-    if !index.status.success() {
-        return Err(FunctionCallError::RespondToModel("spawn_agent: could not inspect snapshot index".into()));
-    }
-    if index.stdout.split(|byte| *byte == 0).any(|entry| entry.starts_with(b"160000 ")) {
-        return Err(FunctionCallError::RespondToModel(
-            "spawn_agent: unsupported_snapshot_submodule: isolated snapshots do not materialize submodules; use a shared workspace or an explicitly prepared checkout".into(),
-        ));
-    }
-    let mut head_command = Command::new(codex_git_utils::git_executable_async().await);
-    head_command
-        .arg("-C")
-        .arg(repo_root)
-        .args(["rev-parse", "--verify", "HEAD"]);
-    let head = run_worktree_git(head_command, None, cancellation_token, terminal_tasks)
-        .await
-        .map_err(|error| {
-            FunctionCallError::RespondToModel(format!(
-                "spawn_agent: could not capture snapshot HEAD: {error}"
-            ))
-        })?;
-    if !head.status.success() {
-        return Err(FunctionCallError::RespondToModel(
-            "spawn_agent: could not resolve snapshot HEAD".into(),
-        ));
-    }
-    let head = String::from_utf8(head.stdout).map_err(|error| {
-        FunctionCallError::RespondToModel(format!("spawn_agent: invalid snapshot HEAD: {error}"))
-    })?;
-    let head = head.trim().to_string();
-    let mut diff_command = Command::new(codex_git_utils::git_executable_async().await);
-    diff_command
-        .arg("-C")
-        .arg(repo_root)
-        .args(["diff", "--binary", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/", &head, "--"]);
-    let mut untracked_command = Command::new(codex_git_utils::git_executable_async().await);
-    untracked_command.arg("-C").arg(repo_root).args([
-        "ls-files",
-        "--others",
-        "--exclude-standard",
-        "-z",
-    ]);
-    let mut tracked_paths_command = Command::new(codex_git_utils::git_executable_async().await);
-    tracked_paths_command.arg("-C").arg(repo_root).args([
-        "diff",
-        "--name-only",
-        "--no-renames",
-        "--diff-filter=ACMRT",
-        "-z",
-        &head,
-        "--",
-    ]);
-    let (diff, untracked, tracked_paths) = tokio::join!(
-        run_worktree_git(diff_command, None, cancellation_token, terminal_tasks),
-        run_worktree_git(untracked_command, None, cancellation_token, terminal_tasks),
-        run_worktree_git(
-            tracked_paths_command,
-            None,
-            cancellation_token,
-            terminal_tasks
-        ),
-    );
-    let diff = diff.map_err(|error| {
-        FunctionCallError::RespondToModel(format!(
-            "spawn_agent: could not capture tracked workspace changes: {error}"
-        ))
-    })?;
-    if !diff.status.success() {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "spawn_agent: git diff failed while creating an isolated snapshot: {}",
-            String::from_utf8_lossy(&diff.stderr).trim()
-        )));
-    }
-    let untracked = untracked.map_err(|error| {
-        FunctionCallError::RespondToModel(format!(
-            "spawn_agent: could not enumerate untracked workspace files: {error}"
-        ))
-    })?;
-    if !untracked.status.success() {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "spawn_agent: git ls-files failed while creating an isolated snapshot: {}",
-            String::from_utf8_lossy(&untracked.stderr).trim()
-        )));
-    }
-    let tracked_paths = tracked_paths.map_err(|error| {
-        FunctionCallError::RespondToModel(format!(
-            "spawn_agent: could not enumerate changed tracked files: {error}"
-        ))
-    })?;
-    if !tracked_paths.status.success() {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "spawn_agent: git diff could not enumerate changed tracked files: {}",
-            String::from_utf8_lossy(&tracked_paths.stderr).trim()
-        )));
-    }
-    let repo_root = repo_root.to_path_buf();
-    let cancellation = cancellation_token.child_token();
-    let _cancel_on_drop = cancellation.clone().drop_guard();
-    // One tracked blocking job per capture, not metadata/open/read jobs for every
-    // file. Observer drops cancel read-only work between files.
-    let working_files = terminal_tasks
-        .spawn_blocking(move || {
-            let paths = untracked
-                .stdout
-                .split(|byte| *byte == 0)
-                .map(|path| (path, false))
-                .chain(
-                    tracked_paths
-                        .stdout
-                        .split(|byte| *byte == 0)
-                        .map(|path| (path, true)),
-                );
-            capture_working_file_snapshot(&repo_root, paths, &cancellation)
-        })
-        .await
-        .map_err(|error| {
-            FunctionCallError::RespondToModel(format!(
-                "spawn_agent: working file snapshot worker failed: {error}"
-            ))
-        })??;
-    Ok(WorkspaceOverlay {
-        head,
-        tracked_diff: diff.stdout,
-        working_files,
-    })
-}
-
-fn capture_working_file_snapshot<'a>(
-    repo_root: &Path,
-    paths: impl IntoIterator<Item = (&'a [u8], bool)>,
-    cancellation_token: &CancellationToken,
-) -> Result<Vec<(PathBuf, Vec<u8>)>, FunctionCallError> {
-    use std::io::Read;
-
-    let mut working_files = Vec::new();
-    let mut total_file_bytes = 0u64;
-    // Git patches handle deletes, modes and tracked symlinks. Preserve the
-    // original regular-file bytes, including under clean filters/CRLF settings.
-    for (raw_path, tracked) in paths {
-        if cancellation_token.is_cancelled() {
-            return Err(FunctionCallError::RespondToModel(
-                "spawn_agent: working file snapshot cancelled".to_string(),
-            ));
-        }
-        if raw_path.is_empty() {
-            continue;
-        }
-        let path = PathBuf::from(String::from_utf8(raw_path.to_vec()).map_err(|_| {
-            FunctionCallError::RespondToModel(
-                "spawn_agent: a working file path is not valid UTF-8".to_string(),
-            )
-        })?);
-        let source = repo_root.join(&path);
-        let metadata = std::fs::symlink_metadata(&source).map_err(|error| {
-            FunctionCallError::RespondToModel(format!(
-                "spawn_agent: could not inspect working file {}: {error}",
-                path.display()
-            ))
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-            if tracked {
-                continue;
-            }
-            return Err(FunctionCallError::RespondToModel(format!(
-                "spawn_agent: isolated snapshots reject untracked symlinks and special files: {}",
-                path.display()
-            )));
-        }
-        if metadata.len() > MAX_OVERLAY_SNAPSHOT_FILE_BYTES {
-            return Err(FunctionCallError::RespondToModel(format!(
-                "spawn_agent: working file {} is too large for an isolated snapshot ({} bytes, max {})",
-                path.display(),
-                metadata.len(),
-                MAX_OVERLAY_SNAPSHOT_FILE_BYTES
-            )));
-        }
-        total_file_bytes = total_file_bytes
-            .checked_add(metadata.len())
-            .ok_or_else(|| {
-                FunctionCallError::RespondToModel(
-                    "spawn_agent: working file snapshot size overflowed".to_string(),
-                )
-            })?;
-        if total_file_bytes > MAX_OVERLAY_SNAPSHOT_TOTAL_BYTES {
-            return Err(FunctionCallError::RespondToModel(format!(
-                "spawn_agent: working files exceed the isolated snapshot limit of {MAX_OVERLAY_SNAPSHOT_TOTAL_BYTES} bytes"
-            )));
-        }
-        let file = std::fs::File::open(&source).map_err(|error| {
-            FunctionCallError::RespondToModel(format!(
-                "spawn_agent: could not snapshot working file {}: {error}",
-                path.display()
-            ))
-        })?;
-        let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-        file.take(MAX_OVERLAY_SNAPSHOT_FILE_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|error| {
-                FunctionCallError::RespondToModel(format!(
-                    "spawn_agent: could not snapshot working file {}: {error}",
-                    path.display()
-                ))
-            })?;
-        if bytes.len() as u64 != metadata.len() {
-            return Err(FunctionCallError::RespondToModel(format!(
-                "spawn_agent: working file {} changed while the isolated snapshot was captured",
-                path.display()
-            )));
-        }
-        working_files.push((path, bytes));
-    }
-    working_files.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(working_files)
-}
-
-#[cfg(unix)]
-struct WorktreeProcessGroup(u32);
-
-#[cfg(unix)]
-impl Drop for WorktreeProcessGroup {
-    fn drop(&mut self) {
-        let _ = codex_utils_pty::process_group::kill_process_group(self.0);
-    }
-}
-
-#[expect(
-    clippy::expect_used,
-    reason = "Successful spawn creates both handles configured with Stdio::piped"
-)]
-async fn run_worktree_git(
-    mut command: Command,
-    input: Option<&[u8]>,
-    cancellation_token: &CancellationToken,
-    terminal_tasks: &TaskTracker,
-) -> std::io::Result<std::process::Output> {
-    command
-        .kill_on_drop(true)
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    command.process_group(0);
-    #[cfg(windows)]
-    command.creation_flags(codex_utils_pty::WINDOWS_CREATE_SUSPENDED);
-    let input = input.map(<[u8]>::to_vec);
-    let cancellation = cancellation_token.child_token();
-    let _cancel_on_drop = cancellation.clone().drop_guard();
-    // A session-owned worker retains the process through termination and reaping,
-    // including cancellation while Command::spawn is on the blocking pool.
-    terminal_tasks.spawn(async move {
-        #[cfg(windows)]
-        let managed = codex_utils_pty::ManagedRootProcess::reserve_with_reclaim().await?;
-        #[cfg(windows)]
-        managed.require_descendant_containment()?;
-        if cancellation.is_cancelled() {
-            return Err(std::io::Error::new(ErrorKind::Interrupted, "worktree Git command cancelled"));
-        }
-        let mut child = tokio::task::spawn_blocking(move || command.spawn())
-            .await.map_err(std::io::Error::other)??;
-        let pid = child.id().ok_or_else(|| std::io::Error::other("missing worktree Git pid"))?;
-        #[cfg(unix)]
-        let _process_group = WorktreeProcessGroup(pid);
-        #[cfg(windows)]
-        if let Err(error) = managed.attach_and_resume(pid) {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            return Err(error);
-        }
-        let stdin = child.stdin.take();
-        let mut stdout = child.stdout.take().expect("piped worktree stdout");
-        let mut stderr = child.stderr.take().expect("piped worktree stderr");
-        let mut stdout_bytes = Vec::new();
-        let mut stderr_bytes = Vec::new();
-        let result = {
-            let operation = async {
-                let write_input = async {
-                    if let (Some(mut stdin), Some(input)) = (stdin, input) {
-                        stdin.write_all(&input).await?;
-                        stdin.shutdown().await?;
-                    }
-                    Ok::<(), std::io::Error>(())
-                };
-                let (_, _, _, status) = tokio::try_join!(write_input,
-                    read_worktree_output(&mut stdout, &mut stdout_bytes, MAX_WORKTREE_GIT_STDOUT_BYTES),
-                    read_worktree_output(&mut stderr, &mut stderr_bytes, MAX_WORKTREE_GIT_STDERR_BYTES), child.wait())?;
-                Ok(status)
-            };
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => Err(std::io::Error::new(ErrorKind::Interrupted, "worktree Git command cancelled")),
-                result = tokio::time::timeout(WORKTREE_GIT_TIMEOUT, operation) => {
-                    result.unwrap_or_else(|_| Err(std::io::Error::new(ErrorKind::TimedOut, "worktree Git command timed out")))
-                }
-            }
-        };
-        if result.is_err() {
-            #[cfg(windows)]
-            let _ = managed.terminate();
-            #[cfg(unix)]
-            let _ = codex_utils_pty::process_group::kill_process_group(pid);
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
-        result.map(|status| std::process::Output {status, stdout: stdout_bytes, stderr: stderr_bytes})
-    }).await.map_err(std::io::Error::other)?
-}
-
-async fn read_worktree_output(
-    reader: &mut (impl tokio::io::AsyncRead + Unpin),
-    bytes: &mut Vec<u8>,
-    limit: u64,
-) -> std::io::Result<()> {
-    reader.take(limit + 1).read_to_end(bytes).await?;
-    if bytes.len() as u64 > limit {
-        return Err(std::io::Error::other("snapshot_git_output_limit: Git output exceeded its independent byte budget"));
-    }
-    Ok(())
-}
 
 async fn await_spawn_or_cancel<T>(
     cancellation_token: &CancellationToken,
@@ -1463,44 +906,6 @@ async fn await_spawn_or_cancel<T>(
         biased;
         _ = cancellation_token.cancelled() => Err(CodexErr::TurnAborted),
         result = spawn => result,
-    }
-}
-
-
-async fn cleanup_isolated_worktree(workspace: &IsolatedWorkspace) -> Result<(), std::io::Error> {
-    let result = cleanup_isolated_worktree_paths(
-        &workspace.main_repo_root,
-        &workspace.path,
-        &workspace.terminal_tasks,
-    )
-    .await;
-    if result.is_ok() {
-        workspace.cleanup_required.store(false, Ordering::Release);
-    }
-    result
-}
-
-async fn cleanup_isolated_worktree_paths(
-    repo_root: &Path,
-    path: &Path,
-    terminal_tasks: &TaskTracker,
-) -> std::io::Result<()> {
-    let mut command = Command::new(codex_git_utils::git_executable_async().await);
-    command
-        .arg("-C")
-        .arg(repo_root)
-        .arg("-c")
-        .arg(format!("core.hooksPath={}", codex_git_utils::DISABLED_HOOKS_PATH))
-        .args(["worktree", "remove", "--force"])
-        .arg(path);
-    let output = run_worktree_git(command, None, &CancellationToken::new(), terminal_tasks).await?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "git worktree remove failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )))
     }
 }
 
@@ -1990,6 +1395,3 @@ impl ToolOutput for SpawnAgentResult {
         tool_output_code_mode_result(self, "spawn_agent")
     }
 }
-
-
-

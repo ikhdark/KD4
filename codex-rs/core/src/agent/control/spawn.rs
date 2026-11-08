@@ -1088,6 +1088,7 @@ impl AgentControl {
             .or(session_source.as_ref());
         let state = self.upgrade()?;
         let mut child_control = self.clone();
+        child_control.prepared_workspace = options.prepared_workspace.clone();
         if let Some(parent) = options.parent_thread_id.or(match effective_source {
             Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn { parent_thread_id, .. })) => {
                 Some(*parent_thread_id)
@@ -1843,4 +1844,3 @@ impl AgentControl {
             .await
     }
 }
-

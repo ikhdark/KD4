@@ -836,6 +836,8 @@ pub(crate) struct SessionConfiguration {
     /// active profile id, and profile-defined workspace roots in sync by using
     /// the methods below instead of mutating the fields independently.
     pub(super) permission_profile_state: PermissionProfileState,
+    pub(super) workspace_launch:
+        Option<std::sync::Weak<crate::isolated_workspace::WorkspaceLaunch>>,
     pub(super) windows_sandbox_level: WindowsSandboxLevel,
 
     /// Sticky thread-level environment selections plus the legacy cwd used
@@ -1131,6 +1133,23 @@ impl SessionConfiguration {
         }
         if let Some(app_server_client_version) = updates.app_server_client_version.clone() {
             next_configuration.app_server_client_version = Some(app_server_client_version);
+        }
+        if next_configuration.permission_profile() != self.permission_profile()
+            || next_configuration.workspace_roots != self.workspace_roots
+            || next_configuration.windows_sandbox_level != self.windows_sandbox_level
+            || cwd_changed
+        {
+            if let Some(workspace) = self
+                .workspace_launch
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+            {
+                workspace.require_exclusive().map_err(|error| {
+                    codex_config::ConstraintError::UpdateRejected {
+                        reason: error.to_string(),
+                    }
+                })?;
+            }
         }
         Ok(next_configuration)
     }
@@ -1931,6 +1950,14 @@ impl Session {
             )
             .await
             .map_err(|err| anyhow::Error::new(err).context("hook discovery worker failed"))?;
+            if hooks.has_unconfined_handlers()
+                && let Some(workspace) = session_configuration
+                    .workspace_launch
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade)
+            {
+                workspace.require_exclusive().map_err(anyhow::Error::new)?;
+            }
             for warning in hooks.startup_warnings() {
                 post_session_configured_events.push(Event {
                     id: INITIAL_SUBMIT_ID.to_owned(),

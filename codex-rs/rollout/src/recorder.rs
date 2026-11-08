@@ -140,18 +140,39 @@ pub enum RolloutRecorderParams {
 #[derive(Clone, Debug)]
 struct CapturedRolloutItem {
     captured_at: OffsetDateTime,
-    item: RolloutItem,
+    item: CapturedRolloutPayload,
     // Shared batch admission follows canonical records from enqueue through
     // persistence, including retries and in-place manifest compaction.
     admission: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+}
+
+#[derive(Clone, Debug)]
+enum CapturedRolloutPayload {
+    Canonical(RolloutItem),
+    Artifact(Arc<CapturedRolloutArtifact>),
+}
+
+#[derive(Debug)]
+struct CapturedRolloutArtifact {
+    line: Vec<u8>,
+    // Custody covers publication, queueing, retries and terminal durability.
+    _retention: File,
+    _sync_owner: Arc<crate::payload_artifact::PayloadSyncOwner>,
 }
 
 impl CapturedRolloutItem {
     fn new(item: RolloutItem, captured_at: OffsetDateTime) -> Self {
         Self {
             captured_at,
-            item,
+            item: CapturedRolloutPayload::Canonical(item),
             admission: None,
+        }
+    }
+
+    fn canonical_item(&self) -> Option<&RolloutItem> {
+        match &self.item {
+            CapturedRolloutPayload::Canonical(item) => Some(item),
+            CapturedRolloutPayload::Artifact(_) => None,
         }
     }
 
@@ -160,7 +181,7 @@ impl CapturedRolloutItem {
     fn with_item(&self, item: RolloutItem) -> Self {
         Self {
             captured_at: self.captured_at,
-            item,
+            item: CapturedRolloutPayload::Canonical(item),
             admission: self.admission.clone(),
         }
     }
@@ -906,17 +927,43 @@ impl RolloutRecorder {
         if admission_bytes.is_err() {
             // Validate every individual item before accepting any prefix. Bulk
             // inheritance may exceed admission even though each record fits.
-            let charges = items.iter()
-                .map(|item| rollout_admission_bytes(std::slice::from_ref(item)))
+            let charges = items
+                .iter()
+                .map(|item| match rollout_admission_bytes(std::slice::from_ref(item)) {
+                    Ok(charge) => Ok(charge),
+                    Err(_) if matches!(item, RolloutItem::ContextReplay { .. }) => {
+                        crate::payload_artifact::validate_replay_size(item)?;
+                        Ok(0) // Spool this record instead of cloning its body into the queue.
+                    }
+                    Err(error) => Err(error),
+                })
                 .collect::<std::io::Result<Vec<_>>>()?;
             let mut start = 0;
             let mut charge = 0usize;
             for (index, next) in charges.into_iter().enumerate() {
+                if next == 0 {
+                    if index > start {
+                        self.record_canonical_items_with_admission(
+                            &items[start..index],
+                            Some(charge as u32),
+                        )
+                        .await?;
+                    }
+                    // Release preceding lazy/failed-write admission before staging.
+                    self.persist().await?;
+                    self.record_replay_artifact(&items[index]).await?;
+                    self.persist().await?;
+                    start = index + 1;
+                    charge = 0;
+                    continue;
+                }
                 let next = next as usize;
                 if index > start && charge.saturating_add(next) > MAX_PENDING_ROLLOUT_BYTES / 2 {
                     self.record_canonical_items_with_admission(
-                        &items[start..index], Some(charge as u32),
-                    ).await?;
+                        &items[start..index],
+                        Some(charge as u32),
+                    )
+                    .await?;
                     // Lazy pending items release admission only after materialization.
                     // No enqueue gate is held across this barrier.
                     self.persist().await?;
@@ -925,9 +972,10 @@ impl RolloutRecorder {
                 }
                 charge = charge.saturating_add(next);
             }
-            self.record_canonical_items_with_admission(
-                &items[start..], Some(charge as u32),
-            ).await?;
+            if start < items.len() {
+                self.record_canonical_items_with_admission(&items[start..], Some(charge as u32))
+                    .await?;
+            }
             return self.persist().await;
         }
         // Queue admission transfers ownership and preserves ordering with
@@ -935,6 +983,69 @@ impl RolloutRecorder {
         // disk writes here; durability still requires an explicit barrier.
         self.record_canonical_items_with_admission(items, Some(admission_bytes?))
             .await
+    }
+
+    async fn record_replay_artifact(&self, item: &RolloutItem) -> std::io::Result<()> {
+        let enqueue_guard = Arc::clone(&self.writer_task.enqueue_gate)
+            .acquire_owned()
+            .await
+            .map_err(|_| IoError::other("rollout enqueue gate is closed"))?;
+        self.writer_task.ensure_active("record context replay")?;
+        // Only the small reference is retained in pending memory. The enqueue
+        // gate bounds staging to one streaming publisher per writer, including
+        // cancellation while its blocking filesystem operation is still live.
+        let reference_charge = (crate::payload_artifact::INLINE_BYTES * 4
+            + std::mem::size_of::<CapturedRolloutItem>()
+            + 256) as u32;
+        let admission = Arc::new(
+            Arc::clone(&self.writer_task.pending_bytes)
+                .try_acquire_many_owned(reference_charge)
+                .map_err(|_| {
+                    IoError::other("rollout pending byte budget exhausted; no items accepted")
+                })?,
+        );
+        let path = self.rollout_path.clone();
+        // ContextReplay shares its immutable capture; this clone does not copy
+        // the large snapshot while moving filesystem work off the async runtime.
+        let item = item.clone();
+        let captured_at = OffsetDateTime::now_utc();
+        let tx = self.tx.clone();
+        let (captured, enqueue_guard, tx) = tokio::task::spawn_blocking(move || {
+            let retention = crate::payload_artifact::lock_publication(&path)?;
+            let sync_owner = crate::payload_artifact::PayloadSyncOwner::new(&path);
+            let line = RolloutLineRef::new(&item, captured_at)?;
+            let reference = crate::payload_artifact::store_replay(
+                &path,
+                &item,
+                line.timestamp,
+                line.format_version,
+            )?;
+            Ok::<_, IoError>((
+                CapturedRolloutItem {
+                    captured_at,
+                    item: CapturedRolloutPayload::Artifact(Arc::new(CapturedRolloutArtifact {
+                        line: reference,
+                        _retention: retention,
+                        _sync_owner: sync_owner,
+                    })),
+                    admission: Some(admission),
+                },
+                enqueue_guard,
+                tx,
+            ))
+        })
+        .await
+        .map_err(IoError::other)??;
+        let result = tx
+            .send(RolloutCmd::AddItems { items: vec![captured] })
+            .await
+            .map_err(|error| {
+                self.writer_task.terminal_failure().unwrap_or_else(|| {
+                    IoError::other(format!("failed to queue context replay: {error}"))
+                })
+            });
+        drop(enqueue_guard);
+        result
     }
 
     async fn record_canonical_items_with_admission(
@@ -1697,9 +1808,9 @@ impl RolloutWriterState {
     fn add_items(&mut self, items: Vec<CapturedRolloutItem>) {
         for captured in items {
             if let Some(expected) = self.pending_agent_message_mirrors.pop_front() {
-                if let RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::AgentMessage(
+                if let Some(RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::AgentMessage(
                     actual,
-                )) = &captured.item
+                ))) = captured.canonical_item()
                     && expected.message == actual.message
                     && expected.phase == actual.phase
                 {
@@ -1707,15 +1818,17 @@ impl RolloutWriterState {
                 }
                 self.pending_agent_message_mirrors.clear();
             }
-            match &captured.item {
+            match captured.canonical_item() {
                 // The recorder owns the single canonical metadata slot. Inherited history must
                 // never append another session_meta record.
-                RolloutItem::SessionMeta(_) => {
+                Some(RolloutItem::SessionMeta(_)) => {
                     trace!(
                         "ignoring inherited session metadata; recorder owns the canonical record"
                     );
                 }
-                RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::ItemCompleted(event)) => {
+                Some(RolloutItem::EventMsg(
+                    codex_protocol::protocol::EventMsg::ItemCompleted(event),
+                )) => {
                     if let codex_protocol::items::TurnItem::AgentMessage(message) = &event.item {
                         self.pending_agent_message_mirrors = message
                             .as_legacy_events()
@@ -1730,7 +1843,7 @@ impl RolloutWriterState {
                     }
                     self.pending_items.push(captured);
                 }
-                RolloutItem::ToolManifest(manifest) => {
+                Some(RolloutItem::ToolManifest(manifest)) => {
                     // Encoding rewrites the payload, never when it happened.
                     let encoded = match self.tool_manifests.encode_item(manifest) {
                         Ok(encoded) => encoded,
@@ -1934,7 +2047,9 @@ impl RolloutWriterState {
             // dictionary; each record keeps the capture time it arrived with.
             let mut rebased_items = self.pending_items.clone();
             for captured in &mut rebased_items {
-                let RolloutItem::ToolManifest(manifest) = &mut captured.item else {
+                let CapturedRolloutPayload::Canonical(RolloutItem::ToolManifest(manifest)) =
+                    &mut captured.item
+                else {
                     continue;
                 };
                 let Some(full) = known_manifests.manifest(&manifest.hash).cloned() else {
@@ -2018,9 +2133,9 @@ impl RolloutWriterState {
         };
         let mut compacted = Vec::with_capacity(self.pending_items.len());
         for captured in &self.pending_items {
-            if let RolloutItem::EventMsg(
+            if let Some(RolloutItem::EventMsg(
                 codex_protocol::protocol::EventMsg::ThreadSettingsApplied(settings),
-            ) = &captured.item
+            )) = captured.canonical_item()
             {
                 let value = serde_json::to_value(settings).map_err(IoError::other)?;
                 if last_settings.as_ref() == Some(&value) {
@@ -2442,11 +2557,18 @@ impl JsonlWriter {
         }
         let mut bytes = Vec::new();
         for captured in rollout_items {
-            if !crate::payload_artifact::is_artifact_candidate(&captured.item) {
-                Self::serialize_rollout_item(&mut bytes, &captured.item, captured.captured_at)?;
+            let item = match &captured.item {
+                CapturedRolloutPayload::Canonical(item) => item,
+                CapturedRolloutPayload::Artifact(artifact) => {
+                    bytes.extend_from_slice(&artifact.line);
+                    continue;
+                }
+            };
+            if !crate::payload_artifact::is_artifact_candidate(item) {
+                Self::serialize_rollout_item(&mut bytes, item, captured.captured_at)?;
                 continue;
             }
-            let line = RolloutLineRef::new(&captured.item, captured.captured_at)?;
+            let line = RolloutLineRef::new(item, captured.captured_at)?;
             let mut inline = InlineRolloutLine::default();
             let serialized = line.write_jsonl(&mut inline);
             if !inline.limit_reached {

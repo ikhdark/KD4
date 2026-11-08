@@ -142,6 +142,124 @@
     },
   });
 
+  Object.defineProperty(globalThis, "recover_output", {
+    value: async function recover_output(initial, { max_calls = 64, max_bytes = 8 * 1024 * 1024 } = {}) {
+      integer(max_calls, 1, 64, "max_calls");
+      integer(max_bytes, 1, 8 * 1024 * 1024, "max_bytes");
+      const evidence = { initial, pages: [], selection_complete: false };
+      const reject = (message) => fail(`recover_output: ${message}`, evidence);
+      const id = initial?.artifact_id, hash = initial?.canonical_sha256;
+      const size = initial?.canonical_bytes, owner = initial?.source_thread_id;
+      if (typeof id !== "string" || !id || typeof hash !== "string" ||
+          !/^[a-f0-9]{64}$/.test(hash) || !Number.isSafeInteger(size) || size < 0 ||
+          (owner !== undefined && (typeof owner !== "string" || !owner)))
+        reject("an original authenticated snapshot recovery receipt is required");
+      const inside = (range, scope) => scope.some(r => range.start >= r.start && range.end <= r.end);
+      const normalized = (ranges) => {
+        const result = [];
+        for (const r of [...ranges].sort((a, b) => a.start - b.start)) {
+          const prior = result.at(-1);
+          if (prior && r.start < prior.end) reject("overlapping byte selections");
+          if (prior && r.start === prior.end) prior.end = r.end;
+          else result.push({ start: r.start, end: r.end });
+        }
+        return result;
+      };
+      const range = (r) => {
+        if (!r || !Number.isSafeInteger(r.start) || !Number.isSafeInteger(r.end) ||
+            r.start < 0 || r.end <= r.start || r.end > size)
+          reject("a nonempty bounded byte selection is required");
+        return { start: r.start, end: r.end };
+      };
+      let retained = 0;
+      const consume = (packet, scope) => {
+        if (packet?.artifact_id !== id || packet.canonical_sha256 !== hash ||
+            packet.canonical_bytes !== size || packet.source_thread_id !== owner ||
+            packet.historical_authenticity !== "authenticated" ||
+            packet.retained_artifact_complete !== true || packet.unavailable_ranges?.length ||
+            !Array.isArray(packet.results) || !packet.results.length)
+          reject("snapshot identity, authority or retention is incomplete");
+        retained += bytes(nativeStringify(packet));
+        if (retained > max_bytes) reject("aggregate byte limit reached");
+        const delivered = [];
+        for (const part of packet.results) {
+          if (part.selector?.kind !== "bytes") reject("only native byte-selection receipts are supported");
+          const selected = range(part.selector);
+          // Native oversized/omitted owners carry no source; their successful
+          // fragments and exact remaining selectors are checked separately.
+          if (["selector_too_large", "aggregate_omitted"].includes(part.status) &&
+              part.complete === false && part.text === undefined) continue;
+          const r = range(part.canonical_range);
+          if (part.status !== "ok" || part.complete !== true || typeof part.text !== "string" ||
+              bytes(part.text) !== r.end - r.start || !inside(r, [selected]) ||
+              (scope && !inside(r, scope)))
+            reject("incomplete or out-of-scope source bytes");
+          delivered.push(r);
+        }
+        return normalized(delivered);
+      };
+      const remaining = (packet) => {
+        const stop = packet.continuation_stop;
+        if (!stop && packet.delivered_selection_complete === true) return [];
+        // Cancelled and still-writing receipts can be resumable too. They
+        // require their owner/user decision, never an automatic retry here.
+        if (stop?.resumable !== true || !["budget", "page_limit"].includes(stop.reason) ||
+            !Array.isArray(stop.remaining_selectors) || !stop.remaining_selectors.length ||
+            stop.remaining_selectors.length > 64)
+          reject("recovery needs a decision");
+        return stop.remaining_selectors.map(selector => {
+          if (selector.kind !== "bytes") reject("only exact remaining byte selectors are supported");
+          return { kind: "bytes", ...range(selector) };
+        });
+      };
+      const subtract = (scope, delivered) => scope.flatMap(r => {
+        const pending = [];
+        let offset = r.start;
+        for (const part of delivered) {
+          if (part.end <= r.start || part.start >= r.end) continue;
+          if (part.start > offset) pending.push({ start: offset, end: part.start });
+          offset = part.end;
+        }
+        if (offset < r.end) pending.push({ start: offset, end: r.end });
+        return pending;
+      });
+      const first = consume(initial);
+      let work = remaining(initial), scope = normalized(work);
+      normalized([...first, ...scope]); // Previously acquired bytes cannot be requested again.
+      let recover;
+      for (let call = 0; work.length; ++call) {
+        // Reserve one maximum native packet before dispatch. A smaller helper
+        // bound never increases native recovery's 1 MiB source/serialized caps.
+        if (call >= max_calls || max_bytes - retained < 1024 * 1024) {
+          evidence.recovery = { tool: "read_tool_output", arguments: {
+            artifact_id: id, ...(owner === undefined ? {} : { source_thread_id: owner }),
+            selectors: work, max_bytes: 1024 * 1024,
+          } };
+          reject("recovery call or aggregate byte limit reached");
+        }
+        let page;
+        try {
+          recover ??= capability("read_tool_output");
+          page = await recover({ artifact_id: id,
+            ...(owner === undefined ? {} : { source_thread_id: owner }),
+            selectors: work, max_bytes: 1024 * 1024 });
+        } catch (cause) {
+          evidence.cause = cause;
+          reject("native recovery failed; inspect its owner receipt before resuming");
+        }
+        evidence.pages.push(page); // Keep successful siblings even on the failure path.
+        const delivered = consume(page, scope), next = remaining(page);
+        const rest = normalized(next), expected = subtract(scope, delivered);
+        if (!delivered.length || nativeStringify(rest) !== nativeStringify(expected))
+          reject("continuation did not advance exactly within its original selection");
+        work = next;
+        scope = rest;
+      }
+      evidence.selection_complete = true;
+      return evidence;
+    },
+  });
+
   Object.defineProperty(globalThis, "read_files", {
     value: async function read_files(
       paths,

@@ -208,6 +208,7 @@ fn pending_sync() -> &'static std::sync::Mutex<PendingSync> {
 
 /// Custody spans handle recovery and accepted blocking publications. A successor
 /// writer re-enrolls persisted references; a failed barrier keeps this owner alive.
+#[derive(Debug)]
 pub(crate) struct PayloadSyncOwner {
     rollout: PathBuf,
 }
@@ -502,32 +503,152 @@ pub(crate) fn store_value(
         return Ok(None);
     }
     let sha256 = digest(&bytes);
+    // Preserve the existing fast path: a verified object needs no new stage.
+    publish_payload(path, &sha256, bytes.len() as u64, || {
+        let mut temporary = payload_stage(&root(path))?;
+        temporary.write_all(&bytes)?;
+        Ok(temporary)
+    })?;
+    payload_reference(
+        sha256,
+        bytes.len() as u64,
+        item["type"].clone(),
+        timestamp,
+        format_version,
+    )
+    .map(Some)
+}
+
+/// Validate before accepting any prefix of a bulk append. This counts without
+/// allocating a serialized copy or publishing an artifact.
+pub(crate) fn validate_replay_size(item: &RolloutItem) -> io::Result<()> {
+    struct Counter(u64);
+    impl Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len() as u64);
+            if self.0 > MAX_PAYLOAD_BYTES {
+                return Err(io::Error::other("rollout payload exceeds 256 MiB size limit"));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(&mut Counter(0), item).map_err(io::Error::other)
+}
+
+/// Spool an immutable replay directly to the existing artifact owner before
+/// queue admission. Its body never becomes an unbounded pending-memory record.
+pub(crate) fn store_replay(
+    path: &Path,
+    item: &RolloutItem,
+    timestamp: String,
+    format_version: u32,
+) -> io::Result<Vec<u8>> {
+    if !matches!(item, RolloutItem::ContextReplay { .. }) {
+        return Err(io::Error::other("expected context replay payload"));
+    }
+    store_serialized(
+        path,
+        item,
+        serde_json::json!("context_replay"),
+        Some(timestamp.into()),
+        Some(format_version.into()),
+    )?
+    .ok_or_else(|| io::Error::other("context replay exceeds rollout payload size limit"))
+}
+
+struct PayloadWriter<W> {
+    writer: W,
+    bytes: u64,
+    hasher: Sha256,
+    limit_reached: bool,
+}
+
+impl<W: Write> PayloadWriter<W> {
+    fn new(writer: W) -> Self {
+        Self {
+            writer,
+            bytes: 0,
+            hasher: Sha256::new(),
+            limit_reached: false,
+        }
+    }
+}
+
+impl<W: Write> Write for PayloadWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.bytes.saturating_add(bytes.len() as u64) > MAX_PAYLOAD_BYTES {
+            self.limit_reached = true;
+            return Err(io::Error::other("rollout payload exceeds 256 MiB size limit"));
+        }
+        let written = self.writer.write(bytes)?;
+        self.bytes += written as u64;
+        self.hasher.update(&bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+fn store_serialized(
+    path: &Path,
+    item: &impl serde::Serialize,
+    item_type: serde_json::Value,
+    timestamp: Option<serde_json::Value>,
+    format_version: Option<serde_json::Value>,
+) -> io::Result<Option<Vec<u8>>> {
+    let directory = root(path);
+    std::fs::create_dir_all(&directory)?;
+    let mut temporary = payload_stage(&directory)?;
+    let mut writer = PayloadWriter::new(io::BufWriter::new(temporary.as_file_mut()));
+    let serialized = serde_json::to_writer(&mut writer, item);
+    if writer.limit_reached {
+        return Ok(None);
+    }
+    serialized?;
+    writer.flush()?;
+    let bytes = writer.bytes;
+    let sha256 = hex::encode(writer.hasher.clone().finalize());
+    drop(writer);
+    publish_payload(path, &sha256, bytes, || Ok(temporary))?;
+    payload_reference(sha256, bytes, item_type, timestamp, format_version).map(Some)
+}
+
+fn publish_payload(
+    path: &Path,
+    sha256: &str,
+    bytes: u64,
+    stage: impl FnOnce() -> io::Result<tempfile::NamedTempFile>,
+) -> io::Result<()> {
     let directory = root(path);
     std::fs::create_dir_all(&directory)?;
     let destination = directory.join(format!("{sha256}.json"));
-    let mut published_here = false;
-    if !destination.exists() {
-        let mut temporary = payload_stage(&directory)?;
-        temporary.write_all(&bytes)?;
-        match temporary.persist_noclobber(&destination) {
+    if destination.exists() {
+        if read_payload(&directory, sha256, bytes).is_err() {
+            stage()?.persist(&destination).map_err(|error| error.error)?;
+        }
+    } else {
+        match stage()?.persist_noclobber(&destination) {
             // The destination is exactly the complete temporary file we wrote.
-            Ok(_) => published_here = true,
-            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {}
+            Ok(_) => {}
+            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+                if read_payload(&directory, sha256, bytes).is_err() {
+                    error
+                        .file
+                        .persist(&destination)
+                        .map_err(|error| error.error)?;
+                }
+            }
             Err(error) => return Err(error.error),
         }
     }
     // A preexisting object or a concurrent writer that won admission is
     // verified: never reference a partial, corrupted, or substituted object,
     // including a preexisting symlink.
-    if !published_here && read_payload(&directory, &sha256, bytes.len() as u64).is_err() {
-        // Repair the shared directory entry atomically, without truncating it
-        // or following a substituted symlink.
-        let mut temporary = payload_stage(&directory)?;
-        temporary.write_all(&bytes)?;
-        temporary
-            .persist(&destination)
-            .map_err(|error| error.error)?;
-    }
     let mut pending = pending_sync()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -537,14 +658,24 @@ pub(crate) fn store_value(
         .paths
         .insert((path.to_path_buf(), destination), sequence);
     drop(pending);
+    Ok(())
+}
+
+fn payload_reference(
+    sha256: String,
+    bytes: u64,
+    item_type: serde_json::Value,
+    timestamp: Option<serde_json::Value>,
+    format_version: Option<serde_json::Value>,
+) -> io::Result<Vec<u8>> {
     let mut reference = serde_json::json!({
         "timestamp": timestamp, "format_version": format_version,
-        "type": KIND, "payload": {"sha256": sha256, "bytes": bytes.len()}
+        "type": KIND, "payload": {"sha256": sha256, "bytes": bytes}
     });
-    reference["payload"]["item_type"] = item["type"].clone();
+    reference["payload"]["item_type"] = item_type;
     let mut serialized = serde_json::to_vec(&reference)?;
     serialized.push(b'\n');
-    Ok(Some(serialized))
+    Ok(serialized)
 }
 
 fn read_payload(directory: &Path, sha256: &str, bytes: u64) -> io::Result<Vec<u8>> {

@@ -1265,6 +1265,15 @@ struct SelectedInputRepresentation {
 }
 
 impl SelectedInputRepresentation {
+    fn source_input(self, prompt: &Prompt) -> Arc<[ResponseItem]> {
+        Arc::clone(match (self.stable_context_fallback, self.tool_history_fallback) {
+            (false, false) => &prompt.input,
+            (true, false) => &prompt.stable_context_fallback_input,
+            (false, true) => &prompt.tool_history_fallback_input,
+            (true, true) => &prompt.stable_context_tool_history_fallback_input,
+        })
+    }
+
     fn as_str(self) -> &'static str {
         match (self.stable_context_fallback, self.tool_history_fallback) {
             (false, false) => "projected",
@@ -3341,6 +3350,9 @@ pub struct ModelClientSession {
     /// or pre-dispatch connection recovery may retry WebSockets after the shared cooldown.
     http_for_turn: bool,
     effective_input: Option<Arc<[ResponseItem]>>,
+    /// Exact source of the selected full logical input, before lossless request-local
+    /// body sharing. Transport suffixes and unselected fallbacks are not consumption.
+    effective_consumption_input: Option<Arc<[ResponseItem]>>,
     turn_timing: Option<Arc<TurnTimingState>>,
     startup_timing: Option<Arc<codex_turn_timing::startup_timing::StartupTimingState>>,
     logical_sampling_request_count: u32,
@@ -3915,6 +3927,7 @@ impl ModelClient {
             last_stream_transport: None,
             http_for_turn: false,
             effective_input: None,
+            effective_consumption_input: None,
             turn_timing: None,
             startup_timing: self.state.startup_timing.clone(),
             logical_sampling_request_count: 0,
@@ -3941,6 +3954,7 @@ impl ModelClient {
             last_stream_transport: None,
             http_for_turn: false,
             effective_input: None,
+            effective_consumption_input: None,
             turn_timing: None,
             startup_timing: None,
             logical_sampling_request_count: 0,
@@ -5847,6 +5861,7 @@ impl ModelClientSession {
                         }
                     }
                     self.effective_input = Some(Arc::clone(&request.input));
+                    self.effective_consumption_input = Some(Arc::clone(&prompt.input));
                     let prompt_cache_key = request.prompt_cache_key.clone();
                     let dispatched_request = dispatched_request.get().cloned();
                     let logical_request_bytes = dispatched_request
@@ -6711,6 +6726,7 @@ impl ModelClientSession {
                 verified_history,
             );
             self.effective_input = Some(Arc::clone(&request.input));
+            self.effective_consumption_input = Some(selected_representation.source_input(prompt));
             self.websocket_session.last_request = Some(request);
             self.websocket_session.last_response_from_untraced_warmup = warmup;
             let (stream, last_request_rx) = map_response_stream(
@@ -7048,6 +7064,10 @@ impl ModelClientSession {
 
     pub fn effective_input_shared(&self) -> Option<Arc<[ResponseItem]>> {
         self.effective_input.as_ref().map(Arc::clone)
+    }
+
+    pub fn effective_consumption_input(&self) -> Option<&[ResponseItem]> {
+        self.effective_consumption_input.as_deref()
     }
 
     /// Pauses WebSockets for the maximum cooldown and resets WebSocket state.

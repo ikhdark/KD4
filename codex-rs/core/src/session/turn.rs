@@ -6891,12 +6891,14 @@ fn try_run_sampling_request<'a>(
                             .turn_timing_state
                             .record_model_response_id(&identity.physical_attempt_id, &response_id);
                     }
-                    sess.mark_tool_history_consumed(
-                        &turn_context,
-                        client_session.effective_input().unwrap_or(&prompt.input),
-                        generation_id.clone(),
-                    )
-                    .await;
+                    if let Some(input) = client_session.effective_consumption_input() {
+                        sess.mark_tool_history_consumed(
+                            &turn_context,
+                            input,
+                            generation_id.clone(),
+                        )
+                        .await;
+                    }
                     turn_context
                         .turn_timing_state
                         .record_generation_token_usage(token_usage.as_ref());

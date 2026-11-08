@@ -1,8 +1,9 @@
 # KD4 and KDR
 
-Keep this file identical in both checkouts.
+Keep this file identical in both checkouts, keep project context.
 
-- Leave no gaps.
+- Leave no gaps in your edits.
+- Look for previous edits to the area you are implementing, if those exist, read them and make sure you are not putting back a regression.
 
 ## Read first
 

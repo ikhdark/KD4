@@ -8,11 +8,43 @@
 - Nested deadlines: { timeout_ms } overrides the host default. Expiry reports `tool_failure.code="timed_out"`, not cancellation or process exit; the process may still run. Inspect late evidence on `error.results.completed.value` and any live handle before considering a retry.
 - `operation_history` (on results or `tool_failure.details`) retains attempt provenance and surfaces earlier outcomes for the same exact input. Its typed-context fingerprint is not proof of a shared cause; external state may be unknown. Memory is advisory, not a retry ban or permission: changed conditions or transient failures can justify retry after checking effects/live handles. Retry-owner budget receipts distinguish reserved retries, entered attempts, transport scope and agent attempts; unlimited and unknown values are explicit.
 
+## Deterministic recipes
+
+Compose only when the requested transform and next action are already known. Do not guess a repair, infer permission, parse a display as exact data, or declare arbitrary tool success to be task completion. The existing delivery, plan, schema, pending-input and recovery gates still apply. Do not read this reference just to rediscover an eager contract.
+
+- A declared extraction can read a native structured result, check its completeness, call `extract_result` with known pointers, and deliver its text in the same cell. Preserve the returned provenance; extraction is not source-completeness proof.
+- A declared edit can construct a hash-bound patch from that cell's source receipt rather than regenerating old lines. For example, only for a request to set `settings.json`'s existing boolean `/enabled` to true:
+
+```js
+// @exec: {"deliver": true}
+const source = await tools.read_file({path:"settings.json", selectors:[{kind:"json_pointer",pointer:"/enabled"}]});
+const row = source.results?.[0];
+if (source.complete !== true || source.results?.length !== 1 || row?.status !== "ok" ||
+    row.complete !== true || typeof row.value !== "boolean" || typeof source.source_sha256 !== "string")
+  throw new Error("complete current boolean selection required");
+const operations = [{op:"replace",path:"/enabled",value:true}];
+const patch = "*** Begin Patch\n*** Update File: settings.json\n@@ codex-json sha256:" +
+  source.source_sha256 + "\n+" + JSON.stringify(operations) + "\n*** End Patch";
+const changed = await tools.apply_patch(patch);
+if (changed.success !== true || changed.changes_exact !== true)
+  throw new Error("edit rejected or effects uncertain; retain its receipt before repair");
+text("Set settings.json /enabled to true.");
+```
+
+- If requested verification/readback is mechanical, await it after the successful operation and before delivery; do not stop merely to have the model announce the next known call. A failed prerequisite stops dependent work, not independent receipt recovery.
+- For whole required files use `read_files(paths,{full:true})`, check every row's status and `file_complete`, and consume only that original snapshot. For known ranges batch selectors. For retained output invoke the producer's `recovery.arguments` with `read_tool_output` in the same cell, narrowing to the required records; follow only required, resumable `remaining_selectors`. Do not reacquire the source or relaunch a producer to recover its output.
+- Start authorized independent reads/root work before awaiting a long-lived dependency. Use `Promise.allSettled` for independent fallible operations and `run_graph` for declared dependency/postcondition edges; keep shared writers and builds exclusive. Once dependent work is all that remains, use its existing command/worker wait owner rather than model-mediated polling.
+
 ## Stored values
 
 - JS bindings reset per exec; store(key,value)/load(key) retain JSON-serializable data, native results included (exact integers survive; functions and other non-JSON values do not). Store a compact projection when the quota matters. Native integers are JS numbers unless they exceed 2^53, where they become BigInt and JSON.stringify throws; prefer text(result) to print a whole result. Load large JSON once per computation and compare stable keys, not object references across loads. Keep one working body, retiring obsolete copies before storing replacements. Summarize already-consumed machine data without reprinting it. deleteStored(key) drops duplicates. Failed quota cells discard staged stores; check listKeys before resuming. listKeys({after?,limit?}): 1-64, default 32; continue next_after. First-line // @exec: {"persist":true} preserves completed values across host restart.
 
 ## Helpers
+
+- `await recover_output(initial, {max_calls?, max_bytes?})`: explicitly continue one original native `read_tool_output` snapshot receipt for nonempty byte selections. Pass the complete receipt, not a printed projection, command log, `read_file` envelope or reconstructed recipe. Returns `{initial,pages,selection_complete}`; pages contain exact native results, not concatenated text. Completion concerns only those original selections, not the whole artifact or task. A complete initial receipt dispatches nothing. On failure, `.evidence` retains the initial packet, every received page and any native cause; a helper limit additionally retains the last verified `recovery` recipe. No retry, producer replay, file reopening, checkpoint publication or permission grant occurs.
+  - Call this after the initial read/store cell has successfully completed when that acquisition must survive interruption. This helper uses the existing cell transaction: cancellation does not commit new named-state writes or erase the earlier checkpoint. Catch ordinary errors to retain/inspect `.evidence`; resume interrupted work through the original owner, never infer rollback or successful completion.
+  - Only authenticated complete retained snapshots with fixed artifact/hash/size/source-thread identity are eligible. It follows exact advancing `budget`/`page_limit` byte remainders through normal native dispatch. Cancelled/still-writing stops, drift, unavailable bytes, terminal/invalid selectors, overlap and non-progress stop with evidence. `resumable:true` alone is not sufficient. Other selector families remain available through the native tool, not this helper.
+  - `max_calls` is 1–64 (default 64); `max_bytes` is 1–8388608 (default 8388608), the aggregate serialized packet budget including `initial`. One maximum 1 MiB native packet is reserved before each dispatch; a tighter remaining budget can stop before a smaller page that might fit. Native source/page/serialized limits remain unchanged. The failing native packet is retained even if it exceeds the helper bound; no further call is launched. Limits are not display budgets.
 
 Prefer these over equivalent read/search/poll plumbing; preserve scope, budgets and failure evidence.
 `search_files` uses the registered read-only `file_search` backend (also `inspect_files(search)`) in local full-disk-read environments. It constructs fixed ripgrep arguments, not a shell command, and owns bounded capture/cancellation; worker shell permissions do not change. Older or unsupported hosts retain the command-backed helper and its existing execution-permission requirement. Native `read_file` search selectors remain available for known files without command execution.

@@ -513,7 +513,7 @@ impl LocalAgentTaskStore {
         draft: AssignmentDraft,
     ) -> StoreResult<(Assignment, Attempt)> {
         let admitted = self
-            .create_assignment_with_admission_impl(repo_root, draft, false, false, None)
+            .create_assignment_with_admission_impl(repo_root, draft, false, crate::IsolationIntegrationOwner::Unavailable, None)
             .await?;
         Ok((admitted.assignment, admitted.attempt))
     }
@@ -523,9 +523,10 @@ impl LocalAgentTaskStore {
         repo_root: &Path,
         draft: AssignmentDraft,
         selective: bool,
-        isolated_integrator_available: bool,
+        isolated_integrator_available: impl Into<crate::IsolationIntegrationOwner>,
         launch: Option<(String, String, String)>,
     ) -> StoreResult<AdmittedAssignment> {
+        let isolated_integrator_available = isolated_integrator_available.into();
         let root = repo_root.to_path_buf();
         let (repository, mut assignment, scope_case) = tokio::task::spawn_blocking(move || {
             let repository = repository_identity(&root)?;
@@ -3007,7 +3008,7 @@ impl LocalAgentTaskStore {
         &'a self,
         repo_root: &'a Path,
         draft: AssignmentDraft,
-        isolated_integrator_available: bool,
+        isolated_integrator_available: impl Into<crate::IsolationIntegrationOwner> + Send + 'a,
         agent_path: String,
         task_name: String,
         owner: String,
@@ -3157,7 +3158,7 @@ impl LocalAgentTaskStore {
         &'a self,
         repo_root: &'a Path,
         draft: AssignmentDraft,
-        isolated_integrator_available: bool,
+        isolated_integrator_available: impl Into<crate::IsolationIntegrationOwner> + Send + 'a,
     ) -> TaskStoreFuture<'a, AdmittedAssignment> {
         Box::pin(async move {
             let result = self
@@ -5279,7 +5280,7 @@ async fn selective_admission_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     assignment: &Assignment,
     scope_case: &CandidateScopeCase,
-    isolated_integrator_available: bool,
+    isolated_integrator_available: crate::IsolationIntegrationOwner,
 ) -> StoreResult<(AdmissionOverlapSummary, IntegrationPlan)> {
     // Admission and integration planning concern this root's team only.
     // Other sessions in the checkout do not constrain spawning.
@@ -5404,8 +5405,12 @@ async fn selective_admission_tx(
             // Public message spawns report an outcome to their root; they do
             // not certify integration or invent an available typed integrator.
             IntegrationPlan::RootOwned
+        } else if isolated_integrator_available == crate::IsolationIntegrationOwner::Root {
+            // Automatic launch isolation keeps integration explicitly with the root.
+            // A sealed worker receipt proves work in its checkout, not destination integration.
+            IntegrationPlan::RootOwned
         } else {
-            if !isolated_integrator_available {
+            if isolated_integrator_available == crate::IsolationIntegrationOwner::Unavailable {
                 return Err(StoreError::AdmissionRejected {
                     reason: AdmissionRejectionReason::IsolatedIntegratorUnavailable,
                     reusable_assignment_id: None,
@@ -5416,7 +5421,7 @@ async fn selective_admission_tx(
     } else if conflicting_writer_count == 0 {
         IntegrationPlan::SingleWriter
     } else if conflicting_writer_in_another_workspace {
-        if !isolated_integrator_available {
+        if isolated_integrator_available == crate::IsolationIntegrationOwner::Unavailable {
             return Err(StoreError::AdmissionRejected {
                 reason: AdmissionRejectionReason::IsolatedIntegratorUnavailable,
                 reusable_assignment_id: None,

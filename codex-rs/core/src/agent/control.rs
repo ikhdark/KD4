@@ -99,6 +99,8 @@ impl std::fmt::Debug for AgentJobBinding {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SpawnAgentOptions {
+    pub(crate) prepared_workspace:
+        Option<Arc<std::sync::Mutex<Option<crate::isolated_workspace::WorkspaceLaunch>>>>,
     pub(crate) fork_parent_spawn_call_id: Option<String>,
     pub(crate) fork_mode: Option<SpawnAgentForkMode>,
     pub(crate) parent_thread_id: Option<ThreadId>,
@@ -277,6 +279,9 @@ enum V2AgentLoadCompletion {
 /// which keeps the registry scoped to that root thread rather than the entire `ThreadManager`.
 #[derive(Clone, Default)]
 pub(crate) struct AgentControl {
+    pub(crate) workspace_launch: Option<Weak<crate::isolated_workspace::WorkspaceLaunch>>,
+    pub(crate) prepared_workspace:
+        Option<Arc<std::sync::Mutex<Option<crate::isolated_workspace::WorkspaceLaunch>>>>,
     /// ID shared by the whole agent control session. This means every sub-agents from a common
     /// root share the same session ID.
     session_id: SessionId,

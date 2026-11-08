@@ -904,7 +904,8 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
                         responsesapi_client_metadata: None,
                         additional_context: None,
                         environments: None,
-                        cwd: Some(default_cwd),
+                        // Preserve the authoritative launch cwd after contention isolation.
+                        cwd: Some(session_configured.cwd.to_path_buf()),
                         runtime_workspace_roots: None,
                         approval_policy: Some(default_approval_policy.into()),
                         sandbox_policy: None,
@@ -2215,4 +2216,3 @@ fn resolve_root_prompt(prompt_arg: Option<String>) -> String {
         maybe_dash => resolve_prompt(maybe_dash),
     }
 }
-

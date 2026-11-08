@@ -374,6 +374,7 @@ pub(crate) trait ToolRuntime<Req, Out>: Approvable<Req> {
 }
 
 pub(crate) struct SandboxAttempt<'a> {
+    pub(crate) workspace_launch: Option<std::sync::Arc<crate::isolated_workspace::WorkspaceLaunch>>,
     pub(crate) codex_home: &'a AbsolutePathBuf,
     pub sandbox: SandboxType,
     /// Whether policy requested sandboxing, independent of this host's concrete wrapper.
@@ -389,11 +390,29 @@ pub(crate) struct SandboxAttempt<'a> {
 
 impl<'a> SandboxAttempt<'a> {
 
+    pub(crate) fn validate_workspace_permissions(
+        &self,
+        permissions: &codex_protocol::models::PermissionProfile,
+    ) -> Result<(), CodexErr> {
+        if let Some(workspace) = &self.workspace_launch {
+            workspace
+                .validate_permissions(permissions, self.sandbox == SandboxType::None)
+                .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
+        }
+        Ok(())
+    }
+
     pub async fn env_for(
         &self,
         command: SandboxCommand,
         options: ExecOptions,
     ) -> Result<crate::sandboxing::ExecRequest, CodexErr> {
+        self.validate_workspace_permissions(
+            &codex_sandboxing::policy_transforms::effective_permission_profile(
+                self.permissions,
+                command.additional_permissions.as_ref(),
+            ),
+        )?;
         let execution = crate::tools::tool_dispatch_trace::active_tool_dispatch_timing()
             .map(|timing| timing.execution_id().0.clone()).unwrap_or_default();
         let observation = codex_protocol::timing::observations::Span::start(
@@ -480,4 +499,3 @@ impl<'a> SandboxAttempt<'a> {
         Ok(exec_request)
     }
 }
-

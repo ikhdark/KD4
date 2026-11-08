@@ -245,6 +245,24 @@ pub enum WorkspaceStrategy {
     Isolated,
 }
 
+/// Host-selected integration ownership. This is not an agent-supplied contract field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IsolationIntegrationOwner {
+    Unavailable,
+    TypedIntegrator,
+    Root,
+}
+
+impl From<bool> for IsolationIntegrationOwner {
+    fn from(available: bool) -> Self {
+        if available {
+            Self::TypedIntegrator
+        } else {
+            Self::Unavailable
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AssignmentDraft {
     pub root_session_id: String,

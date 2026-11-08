@@ -13,7 +13,7 @@ use crate::DEFAULT_SPAWN_AGENT_REASONING_EFFORT;
 
 
 const SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION: &str =
-    "Service tier override for the new agent. Omit unless explicitly requested.";
+    "Optional worker service tier: omit to inherit the root's live tier, `default` selects Standard, `priority` selects Fast. Set only when requested; an explicit override remains local to this worker.";
 const SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE: &str = "Full-history forks (`fork_turns=\"all\"`) are disabled by default; prefer `none` or an integer from 1 through 5.";
 /// `message` and the aliases the V2 handler accepts for the same task text.
 /// Keep these plaintext: durable objectives are rendered inside ordinary capsule
@@ -80,9 +80,7 @@ impl WaitAgentTimeoutOptions {
 
 pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
     let mut properties = spawn_agent_common_properties_v2();
-    if options.hide_agent_metadata {
-        hide_spawn_agent_metadata_options(&mut properties);
-    }
+    // Service tier is an operational override, not agent identity metadata.
     properties.insert(
         "task_name".to_string(),
         JsonSchema {
@@ -687,11 +685,6 @@ fn writable_assignment_schema() -> JsonSchema {
     }
 }
 
-
-
-fn hide_spawn_agent_metadata_options(properties: &mut BTreeMap<String, JsonSchema>) {
-    properties.remove("service_tier");
-}
 
 
 // Keep tool/assignment mechanics here; audit policy belongs to the base instructions,

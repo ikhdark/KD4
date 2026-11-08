@@ -102,6 +102,11 @@ impl Hooks {
         !self.after_agent.is_empty()
     }
 
+    /// Command/MCP hooks do not inherit the tool process sandbox.
+    pub fn has_unconfined_handlers(&self) -> bool {
+        !self.after_agent.is_empty() || self.engine.has_handlers()
+    }
+
     /// Keeps the `once_per` run history of the hook set this one replaces, so a
     /// config refresh does not re-admit handlers that already ran in their scope.
     pub fn with_run_history_from(mut self, previous: &Hooks) -> Self {
