@@ -371,8 +371,8 @@ impl Session {
         {
             return McpServerElicitationOutcome {
                 response: Some(ElicitationResponse {
-                    action: codex_rmcp_client::ElicitationAction::Accept,
-                    content: Some(serde_json::json!({})),
+                    action: codex_rmcp_client::ElicitationAction::Decline,
+                    content: None,
                     meta: None,
                 }),
                 sent: false,

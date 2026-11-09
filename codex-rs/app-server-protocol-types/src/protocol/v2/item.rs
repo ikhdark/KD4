@@ -1304,6 +1304,9 @@ pub struct ToolRequestUserInputParams {
     pub turn_id: String,
     pub item_id: String,
     pub questions: Vec<ToolRequestUserInputQuestion>,
+    /// Keep the prompt open without auto-resolution until the user responds or cancels.
+    #[serde(default)]
+    pub is_blocking: bool,
     #[serde(default)]
     #[ts(type = "number | null")]
     pub auto_resolution_ms: Option<u64>,

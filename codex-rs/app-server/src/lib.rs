@@ -1194,11 +1194,14 @@ async fn run_main_owned(
                                 connection_cleanup_tasks.spawn(async move {
                                     // This guard also runs during unwinding or before
                                     // the worker's first poll if it is aborted.
-                                    let _disconnect_on_exit = disconnect_on_exit;
+                                    let disconnect_on_exit = disconnect_on_exit;
                                     let cancelled = worker_connection.session.rpc_gate.cancellation_token();
                                     tokio::select! {
                                         biased;
-                                        _ = cancelled.cancelled() => return,
+                                        _ = cancelled.cancelled() => {
+                                            disconnect_on_exit.disarm();
+                                            return;
+                                        },
                                         _ = outgoing.connection_opened_with_runtime(
                                             connection_id,
                                             origin,
@@ -1224,6 +1227,9 @@ async fn run_main_owned(
                                         }
                                         drop(queued._credit);
                                     }
+                                    // Planned gate retirement must not preempt terminal
+                                    // write receipts; failure/unwind still drops the guard.
+                                    disconnect_on_exit.disarm();
                                 });
                                 connections.insert(connection_id, connection);
                             }
@@ -1248,6 +1254,12 @@ async fn run_main_owned(
                                 if shutdown_when_no_connections && connections.is_empty() {
                                     break "last_connection_closed";
                                 }
+                            }
+                            TransportEvent::RequestRejected { connection_id, request_id } => {
+                                initialize_notification_sender.send_unregistered_error(
+                                    ConnectionRequestId { connection_id, request_id },
+                                    overloaded_error(OverloadReason::TransportIngress, "Server overloaded; retry later."),
+                                ).await;
                             }
                             TransportEvent::IncomingMessage { connection_id, message, _ingress_permit } => {
                                 match message {
@@ -1337,6 +1349,7 @@ async fn run_main_owned(
             };
 
             init_watchdog_shutdown.cancel();
+            processor.clear_runtime_references();
             thread_attachment_tasks.shutdown().await;
             let disconnect_all = shutdown_state.requested();
             shutdown_state

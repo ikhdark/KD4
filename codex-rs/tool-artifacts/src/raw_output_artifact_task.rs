@@ -474,10 +474,16 @@ pub async fn read_command_log(
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(super::ReadToolOutputError::Io("command log is not a regular file".into()));
         }
-        let status = std::fs::read(path.with_extension("status"))
-            .map_err(|error| if error.kind() == std::io::ErrorKind::NotFound {
+        let (status_file, _) = super::open_regular_artifact(&path.with_extension("status"))
+            .map_err(|error| if matches!(error, super::ReadToolOutputError::Expired) {
                 super::ReadToolOutputError::StillWriting
-            } else { super::ReadToolOutputError::Io(error.to_string()) })?;
+            } else { error })?;
+        let mut status = Vec::new();
+        status_file.take(4097).read_to_end(&mut status)
+            .map_err(|error| super::ReadToolOutputError::Io(error.to_string()))?;
+        if status.len() > 4096 {
+            return Err(super::ReadToolOutputError::Io("command status exceeds its byte limit".into()));
+        }
         let status: serde_json::Value = serde_json::from_slice(&status)
             .map_err(|error| super::ReadToolOutputError::Io(error.to_string()))?;
         let mut remaining = max_bytes;

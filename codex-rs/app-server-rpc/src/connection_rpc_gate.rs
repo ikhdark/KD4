@@ -53,12 +53,14 @@ impl Drop for TaskRegistration {
 /// Closing the gate is a terminal transition: it prevents queued handlers from
 /// starting, publishes cooperative cancellation, and rejects fenced resource
 /// registrations. Shutdown gives active handlers a bounded grace period before
-/// aborting and joining every remaining gate-owned task.
+/// aborting ordinary tasks. Admitted effectful handlers retain their settlement
+/// owner through actual completion, including beyond that observation grace.
 #[derive(Debug)]
 pub struct ConnectionRpcGate {
     state: Arc<Mutex<ConnectionRpcGateState>>,
     cancellation: CancellationToken,
     tasks: TaskTracker,
+    settlements: TaskTracker,
 }
 
 impl ConnectionRpcGate {
@@ -67,15 +69,16 @@ impl ConnectionRpcGate {
             state: Arc::new(Mutex::new(ConnectionRpcGateState::default())),
             cancellation: CancellationToken::new(),
             tasks: TaskTracker::new(),
+            settlements: TaskTracker::new(),
         }
     }
 
-    pub(crate) async fn run<F>(&self, future: F) -> Result<bool, tokio::task::JoinError>
+    pub(crate) async fn run<F>(&self, future: F, retain_settlement: bool) -> Result<bool, tokio::task::JoinError>
     where
         F: Future<Output = ()> + Send + 'static,
     {
         let Some(join_handle) = self
-            .spawn_with_commit(|| Ok::<_, std::convert::Infallible>(future))
+            .spawn_with_commit_policy(|| Ok::<_, std::convert::Infallible>(future), retain_settlement)
             .unwrap_or_else(|never| match never {})
         else {
             return Ok(false);
@@ -89,6 +92,17 @@ impl ConnectionRpcGate {
     pub fn spawn_with_commit<F, E>(
         &self,
         commit: impl FnOnce() -> Result<F, E>,
+    ) -> Result<Option<tokio::task::JoinHandle<()>>, E>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_with_commit_policy(commit, false)
+    }
+
+    fn spawn_with_commit_policy<F, E>(
+        &self,
+        commit: impl FnOnce() -> Result<F, E>,
+        retain_settlement: bool,
     ) -> Result<Option<tokio::task::JoinHandle<()>>, E>
     where
         F: Future<Output = ()> + Send + 'static,
@@ -108,15 +122,16 @@ impl ConnectionRpcGate {
             task_id,
         };
         let (start_tx, start_rx) = tokio::sync::oneshot::channel();
-        let join_handle = self.tasks.spawn(async move {
+        let tracker = if retain_settlement { &self.settlements } else { &self.tasks };
+        let join_handle = tracker.spawn(async move {
             let _registration = registration;
             if start_rx.await.is_ok() {
                 future.await;
             }
         });
-        state
-            .abort_handles
-            .insert(task_id, join_handle.abort_handle());
+        if !retain_settlement {
+            state.abort_handles.insert(task_id, join_handle.abort_handle());
+        }
         let _ = start_tx.send(());
         Ok(Some(join_handle))
     }
@@ -146,6 +161,7 @@ impl ConnectionRpcGate {
         }
         state.accepting = false;
         self.tasks.close();
+        self.settlements.close();
         self.cancellation.cancel();
     }
 
@@ -157,6 +173,7 @@ impl ConnectionRpcGate {
     async fn shutdown_with_grace(&self, grace: Duration) -> usize {
         self.close().await;
         if timeout(grace, self.tasks.wait()).await.is_ok() {
+            self.settlements.wait().await;
             return 0;
         }
 
@@ -182,6 +199,7 @@ impl ConnectionRpcGate {
                 "connection RPC tasks did not stop within the abort join grace period"
             );
         }
+        self.settlements.wait().await;
         aborted_tasks
     }
 

@@ -416,11 +416,12 @@ impl ExecCommandHandler {
         // A foreign cwd cannot seed the AbsolutePathBufGuard used to resolve relative paths in the
         // permissions config below. Consult the configured platform-sandbox requirement before
         // deciding whether parsing may continue without that base path.
+        let command_permissions = crate::tools::sandboxing::command_permission_profile(&turn);
         let sandbox = select_initial(
-            &turn.file_system_sandbox_policy(),
-            turn.network_sandbox_policy(),
+            &command_permissions.file_system_sandbox_policy(),
+            command_permissions.network_sandbox_policy(),
             SandboxablePreference::Auto,
-            turn.windows_sandbox_level,
+            crate::tools::sandboxing::command_windows_sandbox_level(&turn),
             false,
         );
         // `to_abs_path()` alone cannot identify foreign drive paths: `file:///C:/repo` is
@@ -704,11 +705,11 @@ impl ExecCommandHandler {
             &normalized_additional_permissions_uri,
             effective_additional_permissions.permissions_preapproved,
             context.turn.approval_policy.value(),
-            context.turn.windows_sandbox_level,
+            crate::tools::sandboxing::command_windows_sandbox_level(&context.turn),
         );
         let runtime_context = format!(
             "shell={shell_type:?};login={use_login_shell};tty={tty};pipe_stdin={pipe_stdin};stall_timeout_ms={stall_timeout_ms:?};network={:?}",
-            context.turn.network_sandbox_policy(),
+            command_permissions.network_sandbox_policy(),
         );
         let input_context = format!("prefix={prefix_rule:?}");
         let effective_environment = manager.effective_environment(&context);

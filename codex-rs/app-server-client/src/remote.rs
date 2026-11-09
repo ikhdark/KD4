@@ -430,6 +430,7 @@ impl RemoteAppServerClient {
             let mut writer_finished = false;
             let mut closing = false;
             let mut staged_command = None;
+            let mut control_requests = std::collections::HashSet::<RequestId>::new();
             let mut pending_requests =
                 HashMap::<RequestId, oneshot::Sender<IoResult<RequestResult>>>::new();
             let mut pending_delivery = PendingRemoteEvents { events: VecDeque::new(), budget: event_budget };
@@ -546,7 +547,12 @@ impl RemoteAppServerClient {
                                 RemoteClientCommand::Request { request, response_tx } if pending_requests.contains_key(&request.id) => {
                                     let _ = response_tx.send(Err(IoError::new(ErrorKind::InvalidInput, format!("duplicate remote app-server request id `{}`", request.id))));
                                 }
-                                RemoteClientCommand::Request { response_tx, .. } if pending_requests.len() >= channel_capacity => {
+                                RemoteClientCommand::Request { ref request, .. } if
+                                    if codex_app_server_protocol_types::client_request_is_control(&request.method) {
+                                        control_requests.len() >= 8
+                                    } else { pending_requests.len().saturating_sub(control_requests.len()) >= channel_capacity }
+                                => {
+                                    let RemoteClientCommand::Request { response_tx, .. } = command else { unreachable!() };
                                     let _ = response_tx.send(Ok(Err(overloaded_error(OverloadReason::InFlightTaskCapacity, "remote app-server in-flight request capacity reached"))));
                                 }
                                 command => staged_command = Some(command),
@@ -565,7 +571,10 @@ impl RemoteAppServerClient {
                                 }
                                 // Keep dispatched IDs reserved even if their caller is cancelled:
                                 // a late reply must not be routed to a newer request with that ID.
-                                if pending_requests.len() >= channel_capacity {
+                                let control = codex_app_server_protocol_types::client_request_is_control(&request.method);
+                                if if control { control_requests.len() >= 8 } else {
+                                    pending_requests.len().saturating_sub(control_requests.len()) >= channel_capacity
+                                } {
                                     let _ = response_tx.send(Ok(Err(overloaded_error(
                                         OverloadReason::InFlightTaskCapacity,
                                         "remote app-server in-flight request capacity reached",
@@ -573,6 +582,7 @@ impl RemoteAppServerClient {
                                     continue;
                                 }
                                 pending_requests.insert(request_id.clone(), response_tx);
+                                if control { control_requests.insert(request_id.clone()); }
                                 if let Err(err) = queue_remote_write(
                                     &writer_tx,
                                     Some(JSONRPCMessage::Request(*request)),
@@ -675,11 +685,13 @@ impl RemoteAppServerClient {
                                 };
                                 match serde_json::from_str::<JSONRPCMessage>(&text) {
                                     Ok(JSONRPCMessage::Response(response)) => {
+                                        control_requests.remove(&response.id);
                                         if let Some(response_tx) = pending_requests.remove(&response.id) {
                                             let _ = response_tx.send(Ok(Ok(response.result)));
                                         }
                                     }
                                     Ok(JSONRPCMessage::Error(error)) => {
+                                        control_requests.remove(&error.id);
                                         if let Some(response_tx) = pending_requests.remove(&error.id) {
                                             let _ = response_tx.send(Ok(Err(error.error)));
                                         }

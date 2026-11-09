@@ -122,6 +122,7 @@ impl DelegateRuntime {
         id: DelegateRequestId,
         target: DelegateTarget,
         request: DelegateRequest,
+        timeout_pause: bool,
     ) -> Result<(), String> {
         if self.calls.contains_key(&id) || self.seen_requests.contains(&id) {
             return Err(format!("duplicate code-mode delegate request ID {id:?}"));
@@ -146,6 +147,7 @@ impl DelegateRuntime {
         };
         let delegate = target.delegate;
         let task_cancellation = cancellation.clone();
+        let mut pause_state = cancellation.subscribe_timeout_pause();
         let completion_stop = CancellationToken::new();
         self.calls.insert(
             id,
@@ -183,7 +185,7 @@ impl DelegateRuntime {
             };
             let delegate_future = AssertUnwindSafe(delegate_future).catch_unwind();
             tokio::pin!(delegate_future);
-            let result = tokio::select! {
+            let result = loop { tokio::select! {
                 biased;
                 _ = completion_stop.cancelled() => {
                     if !started.load(std::sync::atomic::Ordering::Relaxed) {
@@ -207,11 +209,22 @@ impl DelegateRuntime {
                     }
                     return;
                 },
-                result = &mut delegate_future => match result {
+                changed = pause_state.changed(), if timeout_pause => {
+                    if changed.is_err() { return; }
+                    let paused = pause_state.borrow_and_update().is_paused();
+                    tokio::select! {
+                        biased;
+                        _ = completion_stop.cancelled() => return,
+                        sent = event_tx.send(DriverEvent::DelegateTimeoutPause { id, paused }) => {
+                            if sent.is_err() { return; }
+                        }
+                    }
+                }
+                result = &mut delegate_future => break match result {
                     Ok(result) => result,
                     Err(_) => Err("code-mode delegate task failed: task panicked".to_string()),
                 },
-            };
+            }};
             tokio::select! {
                 biased;
                 _ = completion_stop.cancelled() => {}
@@ -302,7 +315,7 @@ impl ConnectionDriver {
                 return false;
             }
         };
-        if let Err(err) = self.delegates.start(id, target, request) {
+        if let Err(err) = self.delegates.start(id, target, request, self.timeout_pause) {
             self.fail(err);
             return false;
         }
@@ -316,6 +329,19 @@ impl ConnectionDriver {
     ) -> bool {
         let effects = self.delegates.complete(id, result);
         self.apply_delegate_effects(effects)
+    }
+
+    pub(super) fn pause_delegate_timeout(&mut self, id: DelegateRequestId, paused: bool) -> bool {
+        if !self.delegates.calls.contains_key(&id) {
+            return true;
+        }
+        match EncodedFrame::encode(&ClientToHost::DelegateTimeoutPause { id, paused }) {
+            Ok(frame) => self.queue_frame(frame),
+            Err(error) => {
+                self.fail(format!("failed to encode code-mode timeout pause: {error}"));
+                false
+            }
+        }
     }
 
     fn send_delegate_response(

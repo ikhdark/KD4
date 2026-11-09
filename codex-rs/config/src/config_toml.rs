@@ -709,6 +709,18 @@ const fn current_platform_is_windows() -> bool {
 }
 
 impl ConfigToml {
+    pub fn validate_context_limits(&self) -> Result<(), String> {
+        for (field, value) in [
+            ("model_context_window", self.model_context_window),
+            ("model_auto_compact_token_limit", self.model_auto_compact_token_limit),
+        ] {
+            if value.is_some_and(|value| value <= 0) {
+                return Err(format!("{field} must be greater than zero"));
+            }
+        }
+        Ok(())
+    }
+
     /// Derive the effective permission profile from legacy sandbox config.
     ///
     /// Call this only after ruling out `default_permissions`: named

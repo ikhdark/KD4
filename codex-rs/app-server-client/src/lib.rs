@@ -685,6 +685,8 @@ impl InProcessAppServerClient {
             let mut skipped_events = 0usize;
             let mut pending_delivery = std::collections::VecDeque::new();
             let mut forwarding = tokio::task::JoinSet::new();
+            let ordinary_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(channel_capacity));
+            let control_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
             loop {
                 tokio::select! {
                     // A retained request handle cannot keep an input-capable
@@ -709,18 +711,21 @@ impl InProcessAppServerClient {
                         match command {
                             Some(command) if command.is_abandoned_request() => {}
                             Some(ClientCommand::Request { request, trace, response_tx }) => {
-                                if forwarding.len() >= channel_capacity {
+                                let control = codex_app_server_protocol_types::client_request_is_control(request.method_name());
+                                let slot = std::sync::Arc::clone(if control { &control_slots } else { &ordinary_slots }).try_acquire_owned();
+                                let Ok(slot) = slot else {
                                     let _ = response_tx.send(Ok(Err(codex_app_server_protocol_types::overloaded_error(
                                         codex_app_server_protocol_types::OverloadReason::InFlightTaskCapacity,
                                         "in-process facade request capacity reached",
                                     ))));
                                     continue;
-                                }
+                                };
                                 let request_sender = request_sender.clone();
                                 // Request waits happen on a tracked bounded task so
                                 // this loop can keep draining runtime events
                                 // while the request is blocked on client input.
                                 forwarding.spawn(async move {
+                                    let _slot = slot;
                                     let result = request_sender.request_with_trace(*request, trace).await;
                                     let _ = response_tx.send(result);
                                 });
@@ -811,7 +816,7 @@ impl InProcessAppServerClient {
             // preserves custody of committed work through graceful shutdown.
             command_rx.close();
             drop(command_rx);
-            let mut result = handle.shutdown().await;
+            let mut result = handle.shutdown_until_complete().await;
             while let Some(joined) = forwarding.join_next().await {
                 if let Err(error) = joined && result.is_ok() {
                     result = Err(IoError::other(format!("in-process request forwarder failed: {error}")));

@@ -140,6 +140,11 @@ pub enum ClientToHost {
         id: DelegateRequestId,
         result: WireResult<DelegateResponse>,
     },
+    #[serde(rename = "delegate/timeoutPause")]
+    DelegateTimeoutPause {
+        id: DelegateRequestId,
+        paused: bool,
+    },
 }
 
 /// Messages sent from the code-mode host to a client.

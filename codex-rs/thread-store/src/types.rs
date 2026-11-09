@@ -279,6 +279,9 @@ pub struct ThreadPage {
 pub struct StoredThreadSearchResult {
     pub thread: StoredThread,
     pub snippet: String,
+    /// Storage-bound reverse anchor captured before display hydration.
+    #[serde(default)]
+    pub backwards_cursor: Option<String>,
 }
 
 /// A page of thread-search results.

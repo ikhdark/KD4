@@ -1,12 +1,9 @@
 pub mod auth;
 
 use crate::outgoing_message::ConnectionId;
-use crate::outgoing_message::OutgoingError;
 use crate::outgoing_message::OutgoingMessage;
 use crate::outgoing_message::QueuedOutgoingMessage;
 use codex_app_server_protocol_types::JSONRPCMessage;
-use codex_app_server_protocol_types::OverloadReason;
-use codex_app_server_protocol_types::overloaded_error;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_home_dir::find_codex_home;
 use std::net::SocketAddr;
@@ -209,6 +206,10 @@ pub enum TransportEvent {
     ConnectionClosed {
         connection_id: ConnectionId,
     },
+    RequestRejected {
+        connection_id: ConnectionId,
+        request_id: codex_app_server_protocol_types::RequestId,
+    },
     IncomingMessage {
         connection_id: ConnectionId,
         message: JSONRPCMessage,
@@ -259,7 +260,7 @@ async fn enqueue_incoming_message(
 
 async fn enqueue_incoming_message_with_admission(
     transport_event_tx: &mpsc::Sender<TransportEvent>,
-    writer: &mpsc::Sender<QueuedOutgoingMessage>,
+    _writer: &mpsc::Sender<QueuedOutgoingMessage>,
     connection_id: ConnectionId,
     message: JSONRPCMessage,
 ) -> (bool, bool) {
@@ -295,17 +296,14 @@ async fn enqueue_incoming_message_with_admission(
             message: JSONRPCMessage::Request(request),
             ..
         })) => {
-            let overload_error = OutgoingMessage::Error(OutgoingError {
-                id: request.id,
-                error: overloaded_error(
-                    OverloadReason::TransportIngress,
-                    "Server overloaded; retry later.",
-                ),
-            });
-            match writer.try_send(QueuedOutgoingMessage::new(overload_error)) {
+            // The RPC owner must claim the ID, including collisions with live
+            // requests. Rejection work is bounded by reserved event cells.
+            match transport_event_tx.try_send(TransportEvent::RequestRejected {
+                connection_id, request_id: request.id,
+            }) {
                 Ok(()) => (true, false),
                 Err(mpsc::error::TrySendError::Closed(_)) => (false, false),
-                Err(mpsc::error::TrySendError::Full(_overload_error)) => {
+                Err(mpsc::error::TrySendError::Full(_)) => {
                     warn!(
                         "closing connection {:?}: outbound queue cannot accept overload response",
                         connection_id

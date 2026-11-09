@@ -209,6 +209,10 @@ pub struct McpServerOauthLoginParams {
 #[ts(export_to = "v2/")]
 pub struct McpServerOauthLoginResponse {
     pub authorization_url: String,
+    /// Correlates this request with its asynchronous completion; absent on older peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub login_id: Option<String>,
 }
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -231,6 +235,10 @@ pub struct McpToolCallProgressNotification {
 #[ts(export_to = "v2/")]
 pub struct McpServerOauthLoginCompletedNotification {
     pub name: String,
+    /// Matches the explicit login response; automatic plugin login has no request ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub login_id: Option<String>,
     pub thread_id: Option<String>,
     pub success: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -553,6 +553,34 @@ pub(crate) async fn resolve_provider_auth_for_scope(
     }
     Ok(resolved)
 }
+
+/// Account/lifecycle fencing without agent-identity bootstrap. Auxiliary APIs
+/// must not keep a static snapshot of managed credentials until dispatch.
+pub(crate) fn resolve_provider_auth_for_account(
+    manager: &Arc<AuthManager>,
+    auth: Option<&CodexAuth>,
+    provider: &ModelProviderInfo,
+    expected_epoch: u64,
+) -> codex_protocol::error::Result<SharedAuthProvider> {
+    manager.check_auth_load()?;
+    if let Some(override_auth) = bearer_auth_for_provider(provider)? {
+        return Ok(Arc::new(override_auth));
+    }
+    if manager.policy_auth_snapshot()?.0 != expected_epoch {
+        return Err(CodexErr::UnsupportedOperation(
+            "authentication changed while preparing request; rebuild request state".into()));
+    }
+    // Validate unsupported credential modes through the existing resolver.
+    let resolved = resolve_provider_auth(auth, provider)?;
+    let Some(auth) = auth else { return Ok(resolved) };
+    Ok(Arc::new(AuthManagerAuthProvider {
+        auth_manager: Arc::clone(manager),
+        expected_scope: ProviderAccountScope::from_auth(Some(auth)),
+        expected_epoch,
+        projection: matches!(auth, CodexAuth::AgentIdentity(_)).then_some(resolved),
+        last_request_auth_revision: AtomicU64::new(u64::MAX),
+    }))
+}
 async fn resolve_provider_auth_for_scope_inner(
     auth_manager: Option<Arc<AuthManager>>,
     auth: Option<&CodexAuth>,

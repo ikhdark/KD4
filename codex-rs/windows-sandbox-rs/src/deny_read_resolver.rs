@@ -17,13 +17,14 @@ struct GlobScanPlan {
 ///
 /// Windows ACLs do not understand Codex filesystem glob patterns directly. Exact
 /// unreadable roots can be passed through as-is, including paths that do not
-/// exist yet. Glob entries are snapshot-expanded to the files/directories that
-/// already exist under their literal scan root; future exact paths are handled
-/// later by materializing them before the deny ACE is applied.
+/// exist yet, materialized later before the deny ACE is applied. Dynamic globs
+/// are refused: existing matches alone cannot enforce future-object read denial.
 pub fn resolve_windows_deny_read_paths(
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
     cwd: &AbsolutePathBuf,
 ) -> Result<Vec<AbsolutePathBuf>, String> {
+    crate::resolved_permissions::validate_windows_read_policy(file_system_sandbox_policy, cwd.as_path())
+        .map_err(|error| error.to_string())?;
     let mut paths = Vec::new();
     let mut seen = HashSet::new();
 

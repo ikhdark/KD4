@@ -59,8 +59,27 @@ impl Default for Hooks {
 
 impl Hooks {
     pub fn new(config: HooksConfig) -> Self {
+        // Legacy executables obey the same managed provenance rule as the
+        // modern engine, including when that engine's feature is disabled.
+        let managed_only = config.config_layer_stack.as_ref().is_some_and(|stack| {
+            stack.requirements().allow_managed_hooks_only.as_ref().is_some_and(|requirement| requirement.value)
+        });
+        let legacy_allowed = !managed_only || config.config_layer_stack.as_ref().is_some_and(|stack| {
+            stack.layers_high_to_low().into_iter()
+                .find(|layer| layer.config.get("notify").is_some())
+                .is_some_and(|layer| {
+                    let argv: Result<Vec<String>, _> = layer.config["notify"].clone().try_into();
+                    crate::engine::discovery::hook_metadata_for_config_layer_source(&layer.name).1
+                        && argv.ok().as_ref() == config.legacy_notify_argv.as_ref()
+                })
+        });
+        let mut warnings = config.plugin_hook_load_warnings;
+        if !legacy_allowed && config.legacy_notify_argv.as_ref().is_some_and(|argv| !argv.is_empty()) {
+            warnings.push("legacy notify disabled: managed hooks only requires managed configuration provenance".to_owned());
+        }
         let after_agent = config
             .legacy_notify_argv
+            .filter(|_| legacy_allowed)
             .filter(|argv| !argv.is_empty() && !argv[0].is_empty())
             .map(|argv| {
                 if config.mutating_finalizer {
@@ -76,7 +95,7 @@ impl Hooks {
             config.bypass_hook_trust,
             config.config_layer_stack.as_ref(),
             config.plugin_hook_sources,
-            config.plugin_hook_load_warnings,
+            warnings,
             CommandShell {
                 program: config.shell_program.unwrap_or_default(),
                 args: config.shell_args,

@@ -76,18 +76,26 @@ impl FsRequestProcessor {
     pub(crate) async fn read_file(
         &self,
         params: FsReadFileParams,
+        diagnostic_operation: Option<&str>,
     ) -> Result<FsReadFileResponse, JSONRPCErrorError> {
+        let mut observation = fs_observation(diagnostic_operation, "fs/readFile");
         let path = PathUri::from_abs_path(&params.path);
         let bytes = self
-            .file_system()?
+            .file_system()
+            .inspect_err(|_| finish_fs_observation(&mut observation, "filesystem_unavailable", || serde_json::Value::Null))?
             .read_file_bounded(&path, MAX_READ_FILE_BYTES, /*sandbox*/ None)
             .await
+            .inspect_err(|error| observe_fs_error(&mut observation, error))
             .map_err(map_fs_error)?
             .ok_or_else(|| {
+                finish_fs_observation(&mut observation, "size_limit_or_changed_during_read", || {
+                    serde_json::json!({"max_bytes":MAX_READ_FILE_BYTES})
+                });
                 invalid_request(format!(
                     "fs/readFile file exceeds maximum size of {MAX_READ_FILE_BYTES} bytes or changed while reading"
                 ))
             })?;
+        finish_fs_observation(&mut observation, "read", || serde_json::json!({"bytes":bytes.len()}));
         Ok(FsReadFileResponse {
             data_base64: STANDARD.encode(bytes),
         })
@@ -96,16 +104,20 @@ impl FsRequestProcessor {
     pub(crate) async fn read_file_range(
         &self,
         params: FsReadFileRangeParams,
+        diagnostic_operation: Option<&str>,
     ) -> Result<FsReadFileRangeResponse, JSONRPCErrorError> {
+        let mut observation = fs_observation(diagnostic_operation, "fs/readFileRange");
         let max_bytes = codex_file_system::FILE_RANGE_MAX_BYTES;
         if params.len > max_bytes {
+            finish_fs_observation(&mut observation, "range_limit", || serde_json::json!({"max_bytes":max_bytes}));
             return Err(invalid_request(format!(
                 "fs/readFileRange len exceeds maximum of {max_bytes} bytes"
             )));
         }
         let path = PathUri::from_abs_path(&params.path);
         let read = self
-            .file_system()?
+            .file_system()
+            .inspect_err(|_| finish_fs_observation(&mut observation, "filesystem_unavailable", || serde_json::Value::Null))?
             .read_file_range(
                 &path,
                 params.start,
@@ -114,7 +126,12 @@ impl FsRequestProcessor {
                 /*sandbox*/ None,
             )
             .await
+            .inspect_err(|error| observe_fs_error(&mut observation, error))
             .map_err(map_fs_error)?;
+        finish_fs_observation(&mut observation, "read", || serde_json::json!({
+            "bytes":read.bytes.len(), "file_bytes":read.file_bytes,
+            "start":params.start, "requested_bytes":params.len,
+            "expected_revision_supplied":params.expected_revision.is_some()}));
         Ok(FsReadFileRangeResponse {
             data_base64: STANDARD.encode(read.bytes),
             file_bytes: read.file_bytes,
@@ -166,13 +183,20 @@ impl FsRequestProcessor {
     pub(crate) async fn get_metadata(
         &self,
         params: FsGetMetadataParams,
+        diagnostic_operation: Option<&str>,
     ) -> Result<FsGetMetadataResponse, JSONRPCErrorError> {
+        let mut observation = fs_observation(diagnostic_operation, "fs/getMetadata");
         let path = PathUri::from_abs_path(&params.path);
         let metadata = self
-            .file_system()?
+            .file_system()
+            .inspect_err(|_| finish_fs_observation(&mut observation, "filesystem_unavailable", || serde_json::Value::Null))?
             .get_metadata(&path, /*sandbox*/ None)
             .await
+            .inspect_err(|error| observe_fs_error(&mut observation, error))
             .map_err(map_fs_error)?;
+        finish_fs_observation(&mut observation, "metadata_read", || serde_json::json!({
+            "file_bytes":metadata.size, "is_file":metadata.is_file,
+            "is_directory":metadata.is_directory, "is_symlink":metadata.is_symlink}));
         Ok(FsGetMetadataResponse {
             is_directory: metadata.is_directory,
             is_file: metadata.is_file,
@@ -186,19 +210,39 @@ impl FsRequestProcessor {
     pub(crate) async fn read_directory(
         &self,
         params: FsReadDirectoryParams,
+        diagnostic_operation: Option<&str>,
     ) -> Result<FsReadDirectoryResponse, JSONRPCErrorError> {
+        let mut observation = fs_observation(diagnostic_operation, "fs/readDirectory");
+        if let Some(operation) = diagnostic_operation {
+            let _ = codex_protocol::timing::observations::record(
+                "mobile_directory_path_decoded", "", "", operation,
+                Self::directory_path_facts(Some(&params.path.as_path().to_string_lossy())),
+            );
+        }
         let path = PathUri::from_abs_path(&params.path);
-        let entries = self
-            .file_system()?
-            .read_directory(&path, /*sandbox*/ None)
+        let batch = self
+            .file_system()
+            .inspect_err(|_| finish_fs_observation(&mut observation, "filesystem_unavailable", || serde_json::Value::Null))?
+            .read_directory_bounded(&path, MAX_READ_DIRECTORY_ENTRIES + 1, /*sandbox*/ None)
             .await
+            .inspect_err(|error| observe_fs_error(&mut observation, error))
             .map_err(map_fs_error)?;
-        if entries.len() > MAX_READ_DIRECTORY_ENTRIES
+        let entries = batch.entries;
+        if batch.limit_reached || entries.len() > MAX_READ_DIRECTORY_ENTRIES
             || entries.iter().try_fold(0usize, |bytes, entry| bytes.checked_add(entry.file_name.len()))
                 .is_none_or(|bytes| bytes > MAX_READ_DIRECTORY_NAME_BYTES)
         {
+            finish_fs_observation(&mut observation, "response_budget_exceeded", || serde_json::json!({
+                "entry_count":entries.len(), "entry_limit_reached":batch.limit_reached}));
             return Err(invalid_request("fs/readDirectory exceeds the directory response budget"));
         }
+        finish_fs_observation(&mut observation, "directory_read", || {
+            let git_entry = entries.iter().find(|entry| entry.file_name == ".git");
+            serde_json::json!({"entry_count":entries.len(),
+                "git_entry_present":git_entry.is_some(),
+                "git_entry_is_directory":git_entry.map(|entry| entry.is_directory),
+                "git_entry_is_file":git_entry.map(|entry| entry.is_file)})
+        });
         Ok(FsReadDirectoryResponse {
             entries: entries
                 .into_iter()
@@ -209,6 +253,34 @@ impl FsRequestProcessor {
                 })
                 .collect(),
         })
+    }
+
+    // Fingerprint the exact input without recording private paths or other names.
+    // Comparing ingress and decoded facts also exposes Windows path rewriting.
+    pub(crate) fn directory_path_facts(path: Option<&str>) -> serde_json::Value {
+        use sha2::Digest;
+
+        let syntax = path.map(|path| {
+            let bytes = path.as_bytes();
+            if path.starts_with("\\\\?\\") || path.starts_with("//?/") {
+                "windows_verbatim"
+            } else if path.starts_with("file:") {
+                "file_uri"
+            } else if bytes.first().is_some_and(u8::is_ascii_alphabetic)
+                && bytes.get(1) == Some(&b':')
+            {
+                "windows_drive"
+            } else if path.starts_with("\\\\") || path.starts_with("//") {
+                "unc"
+            } else if path.starts_with('/') {
+                "unix_absolute"
+            } else {
+                "relative_or_other"
+            }
+        });
+        serde_json::json!({"is_string":path.is_some(), "syntax":syntax,
+            "bytes":path.map(str::len),
+            "sha256":path.map(|path| hex::encode(sha2::Sha256::digest(path.as_bytes())))})
     }
 
     pub(crate) async fn remove(
@@ -270,6 +342,28 @@ impl FsRequestProcessor {
         self.file_system()?;
         self.fs_watch_manager.unwatch(connection_id, params).await
     }
+}
+
+// Correlate only opaque request occurrences; never journal paths, revisions,
+// file contents or io::Error messages (which may contain all of those).
+fn fs_observation(operation: Option<&str>, method: &str) -> Option<codex_protocol::timing::observations::Span> {
+    operation.map(|operation| codex_protocol::timing::observations::Span::start(
+        "mobile_file_read", "", "", operation, serde_json::json!({"method":method})))
+}
+
+fn finish_fs_observation(
+    observation: &mut Option<codex_protocol::timing::observations::Span>,
+    outcome: &str,
+    facts: impl FnOnce() -> serde_json::Value,
+) {
+    if let Some(observation) = observation.take() {
+        observation.finish(outcome, facts());
+    }
+}
+
+fn observe_fs_error(observation: &mut Option<codex_protocol::timing::observations::Span>, error: &io::Error) {
+    finish_fs_observation(observation, "io_error", || serde_json::json!({
+        "io_error_kind":format!("{:?}", error.kind()), "os_error_code":error.raw_os_error()}));
 }
 
 fn write_file_size_error() -> JSONRPCErrorError {

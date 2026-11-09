@@ -773,8 +773,8 @@ async fn run_exec_like_with_exit_code_inner(
                     command_for_safety: None,
                     execution_context: (!turn_environment.environment.is_remote()).then_some((exec_params.cwd.as_path(), &exec_params.env)),
                     approval_policy: turn.approval_policy.value(),
-                    permission_profile: turn.permission_profile(),
-                    windows_sandbox_level: turn.windows_sandbox_level,
+                    permission_profile: crate::tools::sandboxing::command_permission_profile(&turn),
+                    windows_sandbox_level: crate::tools::sandboxing::command_windows_sandbox_level(&turn),
                     sandbox_permissions: if effective_additional_permissions.permissions_preapproved
                     {
                         codex_protocol::models::SandboxPermissions::UseDefault
@@ -794,8 +794,8 @@ async fn run_exec_like_with_exit_code_inner(
         command_for_safety: Some(&safety_command),
         execution_context: (!turn_environment.environment.is_remote()).then_some((exec_params.cwd.as_path(), &exec_params.env)),
         approval_policy: turn.approval_policy.value(),
-        permission_profile: turn.permission_profile(),
-        windows_sandbox_level: turn.windows_sandbox_level,
+        permission_profile: crate::tools::sandboxing::command_permission_profile(&turn),
+        windows_sandbox_level: crate::tools::sandboxing::command_windows_sandbox_level(&turn),
         sandbox_permissions: if effective_additional_permissions.permissions_preapproved {
             codex_protocol::models::SandboxPermissions::UseDefault
         } else {

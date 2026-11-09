@@ -159,6 +159,9 @@ fn is_full_git_sha(value: &str) -> bool {
 
 fn git_command() -> Command {
     let mut command = Command::new("git");
+    for name in crate::startup_sync::REPOSITORY_LOCAL_GIT_ENVIRONMENT_VARIABLES {
+        command.env_remove(name);
+    }
     command
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0");

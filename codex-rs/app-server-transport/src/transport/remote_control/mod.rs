@@ -3,6 +3,7 @@ mod client_tracker;
 mod clients;
 mod desired_state;
 mod enroll;
+mod preview;
 mod protocol;
 mod segment;
 mod server_api;
@@ -115,6 +116,61 @@ pub(super) struct QueuedServerEnvelope {
     pub(super) stream_id: StreamId,
     pub(super) write_complete_tx: Option<oneshot::Sender<std::time::Instant>>,
     pub(super) delivery_failure: Option<CancellationToken>,
+    // Shared by every segment; released only after physical write and ACK (or
+    // explicit stream retirement). Admission happens in the per-stream owner.
+    pub(super) replay_credit: Arc<ReplayCredit>,
+}
+
+pub(super) struct ReplayCredit {
+    pub(super) _stream: Option<tokio::sync::OwnedSemaphorePermit>,
+    pub(super) _global: tokio::sync::OwnedSemaphorePermit,
+    pub(super) _bytes: tokio::sync::OwnedSemaphorePermit,
+}
+
+const REPLAY_BYTE_BUDGET: usize = 512 * 1024 * 1024;
+
+// Default-off observations of the actual disable owner, not public send clocks.
+// Full digests bind the private workload's request/account identities without
+// recording credentials, account names or message bodies.
+struct DisableObservation(u64);
+
+impl DisableObservation {
+    fn new(request_id: Option<&str>) -> Option<Self> {
+        let request_id = request_id?;
+        let probe = codex_protocol::timing::client_probe::enabled();
+        if !probe {
+            return None;
+        }
+        let observation = Self(codex_protocol::timing::client_probe::key(request_id));
+        observation.record(700, Some(request_id), false);
+        Some(observation)
+    }
+
+    fn record(&self, stage: u64, identity: Option<&str>, committed: bool) {
+        use sha2::Digest;
+        let values = identity
+            .map(|identity| {
+                let digest = sha2::Sha256::digest(identity.as_bytes());
+                std::array::from_fn(|index| {
+                    u64::from_be_bytes(
+                        digest[index * 8..index * 8 + 8].try_into().expect("SHA256 word"),
+                    )
+                })
+            })
+            .unwrap_or([0, 0, 0, u64::from(committed)]);
+        codex_protocol::timing::client_probe::record(
+            stage, 0, u64::from(committed), 0, self.0, values,
+        );
+    }
+}
+
+fn replay_byte_cost(message_bytes: usize, client: &ClientId, stream: &StreamId) -> Option<u32> {
+    // Bound base64 plus escaped routing/metadata for every legal segment before
+    // encoding. A single envelope cannot consume more than half the byte pool.
+    let bytes = message_bytes.checked_mul(2)?.checked_add(
+        client.0.len().checked_add(stream.0.len())?.checked_mul(6)?
+            .checked_add(4096)?.checked_mul(segment::REMOTE_CONTROL_SEGMENT_COUNT_MAX)?)?;
+    (bytes <= REPLAY_BYTE_BUDGET / 2).then(|| u32::try_from(bytes).ok()).flatten()
 }
 
 #[derive(Clone)]
@@ -568,7 +624,25 @@ impl RemoteControlHandle {
         &self,
         app_server_client_name: Option<&str>,
     ) -> io::Result<RemoteControlStatusChangedNotification> {
+        self.disable_observed(app_server_client_name, None).await
+    }
+
+    pub async fn disable_observed(
+        &self,
+        app_server_client_name: Option<&str>,
+        request_id: Option<&str>,
+    ) -> io::Result<RemoteControlStatusChangedNotification> {
+        let observation = DisableObservation::new(request_id);
         self.ensure_remote_control_allowed_io()?;
+        let epoch = self.policy_auth_epoch()?;
+        let auth = load_remote_control_auth(&self.auth_manager).await?;
+        if self.policy_auth_epoch()? != epoch {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "remote control identity changed before disable admission"));
+        }
+        let account_id = auth.account_id;
+        if let Some(probe) = &observation {
+            probe.record(701, Some(&account_id), false);
+        }
         self.current_enrollment.retire_lifecycle();
         let _transition = self
             .desired_state_rpc_lock
@@ -576,12 +650,22 @@ impl RemoteControlHandle {
             .await
             .unwrap_or_else(|_| unreachable!());
         let _persistence = acquire_persistence_lock(&self.desired_state_persistence_lock).await;
+        if let Some(probe) = &observation {
+            probe.record(702, None, false);
+            probe.record(703, Some(&account_id), false);
+        }
+        let disabled = self.publish_disabled();
         self.persist_preference(
             app_server_client_name,
+            &account_id,
             /*remote_control_enabled*/ false,
         )
         .await?;
-        Ok(self.publish_disabled())
+        if let Some(probe) = &observation {
+            probe.record(704, Some(&account_id), true);
+            probe.record(705, None, true);
+        }
+        Ok(disabled)
     }
 
     pub async fn disable_ephemeral(&self) -> RemoteControlStatusChangedNotification {
@@ -621,19 +705,19 @@ impl RemoteControlHandle {
     async fn persist_preference(
         &self,
         app_server_client_name: Option<&str>,
+        account_id: &str,
         remote_control_enabled: bool,
     ) -> io::Result<()> {
         let state_db = self
             .state_db
             .as_deref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, RemoteControlUnavailable))?;
-        let auth = load_remote_control_auth(&self.auth_manager).await?;
         let remote_control_target = normalize_remote_control_url(&self.remote_control_url)?;
         let app_server_client_name = self.pairing_persistence_key(app_server_client_name)?;
         state_db
             .set_remote_control_enabled(
                 &remote_control_target.websocket_url,
-                &auth.account_id,
+                account_id,
                 app_server_client_name.as_deref(),
                 remote_control_enabled,
             )
@@ -1478,15 +1562,21 @@ pub async fn start_remote_control(
     };
     let (status_tx, _status_rx) = watch::channel(initial_status);
     let status_publisher = RemoteControlStatusPublisher::new(status_tx.clone());
+    let remote_control_url_for_log = url::Url::parse(&remote_control_url).map(|mut url| {
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        url.set_query(None);
+        url.set_fragment(None);
+        url.to_string()
+    }).unwrap_or_else(|_| "<invalid endpoint>".into());
     info!(
-        remote_control_url = %remote_control_url,
+        remote_control_url = %remote_control_url_for_log,
         installation_id = %installation_id,
         server_name = %server_name,
         state_db_available,
         ?desired_state,
         "starting app-server remote control websocket task"
     );
-    let remote_control_url_for_log = remote_control_url.clone();
     let handle_remote_control_url = remote_control_url.clone();
     let installation_id_for_log = installation_id.clone();
     let server_name_for_log = server_name.clone();

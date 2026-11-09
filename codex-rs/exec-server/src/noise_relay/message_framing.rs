@@ -1,5 +1,3 @@
-use std::io::Write;
-
 use codex_exec_server_protocol::JSONRPCMessage;
 
 use crate::ExecServerError;
@@ -24,44 +22,14 @@ fn frame_jsonrpc_message_with_limit(
     message: &JSONRPCMessage,
     limit: usize,
 ) -> Result<Vec<u8>, ExecServerError> {
-    let mut framed = vec![0; LENGTH_PREFIX_BYTES];
-    let mut writer = BoundedMessageWriter {
-        framed: &mut framed,
-        remaining: limit,
-        exceeded: false,
-    };
-    let result = serde_json::to_writer(&mut writer, message);
-    if writer.exceeded {
-        return Err(ExecServerError::Protocol(
-            "Noise relay JSON-RPC message exceeds maximum length".to_string(),
-        ));
-    }
-    result?;
-    let message_len = framed.len() - LENGTH_PREFIX_BYTES;
-    framed[..LENGTH_PREFIX_BYTES].copy_from_slice(&(message_len as u32).to_be_bytes());
+    // Match stdio/WebSocket response-overflow semantics: a single oversized
+    // operation result becomes an ID-bound error, not a shared Noise shutdown.
+    // Requests/notifications still fail atomically at the same byte ceiling.
+    let encoded = crate::connection::serialize_jsonrpc_message_with_limit(message, limit)?;
+    let message_len = encoded.len();
+    let mut framed = encoded.into_bytes();
+    framed.splice(..0, (message_len as u32).to_be_bytes());
     Ok(framed)
-}
-
-struct BoundedMessageWriter<'a> {
-    framed: &'a mut Vec<u8>,
-    remaining: usize,
-    exceeded: bool,
-}
-
-impl Write for BoundedMessageWriter<'_> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if bytes.len() > self.remaining {
-            self.exceeded = true;
-            return Err(std::io::Error::other("Noise relay message length exceeded"));
-        }
-        self.framed.extend_from_slice(bytes);
-        self.remaining -= bytes.len();
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 /// Incrementally reconstructs authenticated JSON-RPC messages from Noise records.

@@ -332,6 +332,20 @@ impl ExecutorFileSystem for LocalFileSystem {
         })
     }
 
+    fn mutate_file_if_matches_with_retention<'a>(
+        &'a self,
+        path: &'a PathUri,
+        expected: Option<Vec<u8>>,
+        replacement: Option<Vec<u8>>,
+        retention: codex_file_system::FileMutationRetention,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, codex_file_system::FileMutationOutcome> {
+        Box::pin(async move {
+            let (fs, sandbox) = self.file_system_for(sandbox)?;
+            fs.mutate_file_if_matches_with_retention(path, expected, replacement, retention, sandbox).await
+        })
+    }
+
     fn uses_host_native_paths(&self) -> bool {
         true
     }
@@ -698,6 +712,20 @@ impl ExecutorFileSystem for UnsandboxedFileSystem {
             self.file_system
                 .mutate_file_if_matches(path, expected, replacement, None)
                 .await
+        })
+    }
+
+    fn mutate_file_if_matches_with_retention<'a>(
+        &'a self,
+        path: &'a PathUri,
+        expected: Option<Vec<u8>>,
+        replacement: Option<Vec<u8>>,
+        retention: codex_file_system::FileMutationRetention,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, codex_file_system::FileMutationOutcome> {
+        Box::pin(async move {
+            reject_platform_sandbox_context(sandbox)?;
+            self.file_system.mutate_file_if_matches_with_retention(path, expected, replacement, retention, None).await
         })
     }
 
@@ -1207,6 +1235,17 @@ impl ExecutorFileSystem for DirectFileSystem {
         replacement: Option<Vec<u8>>,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, codex_file_system::FileMutationOutcome> {
+        self.mutate_file_if_matches_with_retention(path, expected, replacement, codex_file_system::FileMutationRetention::None, sandbox)
+    }
+
+    fn mutate_file_if_matches_with_retention<'a>(
+        &'a self,
+        path: &'a PathUri,
+        expected: Option<Vec<u8>>,
+        replacement: Option<Vec<u8>>,
+        retention: codex_file_system::FileMutationRetention,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, codex_file_system::FileMutationOutcome> {
         Box::pin(async move {
             reject_sandbox_context(sandbox)?;
             let path = path.to_abs_path()?;
@@ -1215,15 +1254,19 @@ impl ExecutorFileSystem for DirectFileSystem {
             tokio::task::spawn_blocking(move || {
                 // Preserve existing final-file-symlink write semantics. The
                 // patch delta remains inexact for that nonordinary endpoint.
-                let target = if replacement.is_some() {
+                let target = if replacement.is_some() && matches!(&retention,
+                    codex_file_system::FileMutationRetention::None
+                    | codex_file_system::FileMutationRetention::RetainReplaced
+                    | codex_file_system::FileMutationRetention::RestoreDeleted(_)) {
                     codex_file_system::resolve_symlink_write_paths(path.as_path())?.write_path
                 } else {
                     path.as_path().to_path_buf()
                 };
-                codex_file_system::mutate_file_if_matches(
+                codex_file_system::mutate_file_if_matches_with_retention(
                     &target,
                     expected.as_deref(),
                     replacement.as_deref(),
+                    retention,
                 )
             })
             .await

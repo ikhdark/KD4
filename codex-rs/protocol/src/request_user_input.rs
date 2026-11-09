@@ -32,6 +32,7 @@ pub struct RequestUserInputQuestion {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, JsonSchema, TS)]
 pub struct RequestUserInputArgs {
     pub questions: Vec<RequestUserInputQuestion>,
+    /// Accepted for legacy callers; the session ignores this hint and waits for input.
     #[serde(rename = "autoResolutionMs", skip_serializing_if = "Option::is_none")]
     #[schemars(rename = "autoResolutionMs")]
     pub auto_resolution_ms: Option<u64>,

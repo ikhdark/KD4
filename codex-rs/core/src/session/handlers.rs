@@ -603,6 +603,13 @@ pub async fn exec_approval(
     turn_id: Option<String>,
     decision: ReviewDecision,
 ) {
+    let Some((originating_turn_id, approval)) = sess
+        .take_pending_approval(&approval_id, turn_id.as_deref())
+        .await
+    else {
+        warn!(approval_id, "approval no longer belongs to the live turn");
+        return;
+    };
     let event_turn_id = turn_id.unwrap_or_else(|| approval_id.clone());
     if let ReviewDecision::ApprovedExecpolicyAmendment {
         proposed_execpolicy_amendment,
@@ -633,18 +640,22 @@ pub async fn exec_approval(
     }
     match decision {
         ReviewDecision::Abort => {
-            sess.interrupt_task().await;
+            let _ = sess.abort_turn_if_active(&originating_turn_id, TurnAbortReason::Interrupted).await;
         }
-        other => sess.notify_approval(&approval_id, other).await,
+        other => { let _ = approval.send(other); }
     }
 }
 
 pub async fn patch_approval(sess: &Arc<Session>, id: String, decision: ReviewDecision) {
+    let Some((originating_turn_id, approval)) = sess.take_pending_approval(&id, None).await else {
+        warn!(id, "patch approval no longer belongs to the live turn");
+        return;
+    };
     match decision {
         ReviewDecision::Abort => {
-            sess.interrupt_task().await;
+            let _ = sess.abort_turn_if_active(&originating_turn_id, TurnAbortReason::Interrupted).await;
         }
-        other => sess.notify_approval(&id, other).await,
+        other => { let _ = approval.send(other); }
     }
 }
 

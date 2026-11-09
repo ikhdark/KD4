@@ -653,6 +653,8 @@ impl TurnRequestProcessor {
     ) -> Result<CancellationToken, JSONRPCErrorError> {
         let thread_id = ThreadId::from_string(thread_id)
             .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
+        self.thread_manager.get_thread(thread_id).await
+            .map_err(|err| invalid_request(format!("thread not loaded: {err}")))?;
         Ok(self.thread_state_manager.turn_start_cancellation(thread_id).await)
     }
 
@@ -721,6 +723,7 @@ impl TurnRequestProcessor {
         client_version: Option<String>,
         supports_openai_form_elicitation: bool,
         turn_id: String,
+        cancellation: Option<CancellationToken>,
     ) -> Result<TurnStartResponse, JSONRPCErrorError> {
         Self::validate_queue_input(&params.input)?;
         let additional_context = map_additional_context(params.additional_context.take())?;
@@ -731,7 +734,7 @@ impl TurnRequestProcessor {
             (client_name, client_version),
             supports_openai_form_elicitation,
             Some(turn_id),
-            None,
+            cancellation,
         )
         .await
     }

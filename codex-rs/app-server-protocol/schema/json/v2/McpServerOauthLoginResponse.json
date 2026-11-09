@@ -3,6 +3,13 @@
   "properties": {
     "authorizationUrl": {
       "type": "string"
+    },
+    "loginId": {
+      "description": "Correlates this request with its asynchronous completion; absent on older peers.",
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "required": [

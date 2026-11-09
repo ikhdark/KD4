@@ -256,12 +256,17 @@ impl RemoteFileSystem {
         path: &PathUri,
         expected: Option<Vec<u8>>,
         replacement: Option<Vec<u8>>,
+        retention: codex_file_system::FileMutationRetention,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<codex_file_system::FileMutationOutcome> {
         trace!("remote fs mutate_file_if_matches");
         // Both payloads travel in one request; keep it within the write budget.
+        let security_bytes = match &retention {
+            codex_file_system::FileMutationRetention::CopySourceSecurity { expected, .. } => expected.len(),
+            _ => 0,
+        };
         let payload_bytes =
-            expected.as_ref().map_or(0, Vec::len) + replacement.as_ref().map_or(0, Vec::len);
+            expected.as_ref().map_or(0, Vec::len) + replacement.as_ref().map_or(0, Vec::len) + security_bytes;
         if payload_bytes > MAX_FILE_PAYLOAD_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -276,6 +281,7 @@ impl RemoteFileSystem {
                 path: path.clone(),
                 expected_base64: expected.map(|bytes| STANDARD.encode(bytes)),
                 replacement_base64: replacement.map(|bytes| STANDARD.encode(bytes)),
+                retention,
                 sandbox: remote_sandbox_context(sandbox),
             })
             .await
@@ -517,8 +523,20 @@ impl ExecutorFileSystem for RemoteFileSystem {
             path,
             expected,
             replacement,
+            codex_file_system::FileMutationRetention::None,
             sandbox,
         ))
+    }
+
+    fn mutate_file_if_matches_with_retention<'a>(
+        &'a self,
+        path: &'a PathUri,
+        expected: Option<Vec<u8>>,
+        replacement: Option<Vec<u8>>,
+        retention: codex_file_system::FileMutationRetention,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, codex_file_system::FileMutationOutcome> {
+        Box::pin(RemoteFileSystem::mutate_file_if_matches(self, path, expected, replacement, retention, sandbox))
     }
 
     fn directory_case_sensitive<'a>(

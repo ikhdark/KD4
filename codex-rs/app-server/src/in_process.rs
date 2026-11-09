@@ -439,6 +439,10 @@ impl InProcessClientHandle {
             .map_err(|error| IoError::other(format!("in-process shutdown owner failed: {error}")))?
     }
 
+    pub async fn shutdown_until_complete(self) -> IoResult<()> {
+        self.shutdown_owned().await
+    }
+
     async fn shutdown_owned(mut self) -> IoResult<()> {
         let observation = codex_protocol::timing::observations::Span::start(
             "runtime_shutdown", "", "", &self.observation_id.to_string(),

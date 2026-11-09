@@ -1326,7 +1326,7 @@ impl ThreadRequestProcessor {
             // write for the same reason (`is_projectless`).
             let persisted = if config.config_layer_stack.is_projectless() {
                 false
-            } else if let Err(err) = ConfigEditsBuilder::new(&listener_task_context.codex_home)
+            } else if let Err(err) = ConfigEditsBuilder::for_config(&config)
                 .set_project_trust_level(trust_target.as_path(), TrustLevel::Trusted)
                 .apply()
                 .await
@@ -1575,6 +1575,9 @@ impl ThreadRequestProcessor {
         {
             Ok(EnsureConversationListenerResult::Attached) => {}
             Ok(EnsureConversationListenerResult::ConnectionClosed) => {
+                super::thread_lifecycle::supervise_unsubscribed_thread(
+                    listener_task_context.clone(), thread_id, Arc::clone(&thread),
+                ).await?;
                 return Err(invalid_request(
                     "thread/start connection closed during setup",
                 ));
@@ -2401,6 +2404,10 @@ impl ThreadRequestProcessor {
         &self,
         params: ThreadSearchParams,
     ) -> Result<ThreadSearchResponse, JSONRPCErrorError> {
+        // Content-free, opt-in observation of the actual public search owner.
+        // The disabled path does not read the clock or format query/thread data.
+        let observed_at = tracing::enabled!(target: "codex_storage_search", tracing::Level::TRACE)
+            .then(std::time::Instant::now);
         let ThreadSearchParams {
             cursor,
             limit,
@@ -2423,8 +2430,10 @@ impl ThreadRequestProcessor {
         let mut remaining = requested_page_size;
         let mut search_results = Vec::with_capacity(requested_page_size);
         let mut next_cursor = None;
+        let mut store_search_calls = 0_u64;
 
         while remaining > 0 {
+            store_search_calls += 1;
             let page = self
                 .thread_store
                 .search_threads(StoreSearchThreadsParams {
@@ -2437,7 +2446,14 @@ impl ThreadRequestProcessor {
                     search_term: search_term.clone(),
                 })
                 .await
-                .map_err(thread_store_list_error)?;
+                .map_err(|error| {
+                    if let Some(started) = observed_at {
+                        tracing::trace!(target: "codex_storage_search", stage = "thread_search",
+                            success = false, store_search_calls, returned_rows = 0_u64,
+                            elapsed_us = started.elapsed().as_micros() as u64);
+                    }
+                    thread_store_list_error(error)
+                })?;
 
             for result in page.items {
                 let source = with_thread_spawn_agent_metadata(
@@ -2473,13 +2489,8 @@ impl ThreadRequestProcessor {
             cursor_obj = Some(cursor_val);
         }
 
-        let backwards_cursor = search_results.first().and_then(|result| {
-            thread_backwards_cursor_for_sort_key(
-                &result.thread,
-                store_sort_key,
-                store_sort_direction,
-            )
-        });
+        let backwards_cursor = search_results.first()
+            .and_then(|result| result.backwards_cursor.clone());
         let fallback_provider = self.config.model_provider_id.clone();
         let mut threads = Vec::with_capacity(search_results.len());
         let mut snippets = Vec::with_capacity(search_results.len());
@@ -2493,12 +2504,17 @@ impl ThreadRequestProcessor {
             snippets.push(result.snippet);
         }
         self.refresh_loaded_thread_statuses(&mut threads).await;
-        let data = threads
+        let data: Vec<_> = threads
             .into_iter()
             .zip(snippets)
             .map(|(thread, snippet)| ThreadSearchResult { thread, snippet })
             .collect();
 
+        if let Some(started) = observed_at {
+            tracing::trace!(target: "codex_storage_search", stage = "thread_search",
+                success = true, store_search_calls, returned_rows = data.len() as u64,
+                elapsed_us = started.elapsed().as_micros() as u64);
+        }
         Ok(ThreadSearchResponse {
             data,
             next_cursor,
@@ -3755,7 +3771,12 @@ impl ThreadRequestProcessor {
                     .await
                 {
                     Ok(EnsureConversationListenerResult::Attached) => {}
-                    Ok(EnsureConversationListenerResult::ConnectionClosed) => return Ok(()),
+                    Ok(EnsureConversationListenerResult::ConnectionClosed) => {
+                        super::thread_lifecycle::supervise_unsubscribed_thread(
+                            self.listener_task_context(), thread_id, Arc::clone(&codex_thread),
+                        ).await?;
+                        return Ok(());
+                    }
                     Err(error) => {
                         self.rollback_failed_resumed_thread(
                             thread_id,
@@ -4748,6 +4769,9 @@ impl ThreadRequestProcessor {
         {
             Ok(EnsureConversationListenerResult::Attached) => {}
             Ok(EnsureConversationListenerResult::ConnectionClosed) => {
+                super::thread_lifecycle::supervise_unsubscribed_thread(
+                    self.listener_task_context(), thread_id, Arc::clone(&forked_thread),
+                ).await?;
                 return Err(invalid_request(
                     "thread/fork connection closed during setup",
                 ));

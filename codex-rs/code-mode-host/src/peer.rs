@@ -54,6 +54,7 @@ pub(super) struct HostPeer {
 
 struct PendingDelegate {
     response_tx: oneshot::Sender<Result<DelegateResponse, String>>,
+    cancellation: NestedCancellation,
     dispatched: bool,
     cell_key: (SessionId, CellId),
     _permit: OwnedSemaphorePermit,
@@ -306,6 +307,7 @@ impl HostPeer {
                 id,
                 PendingDelegate {
                     response_tx,
+                    cancellation: cancellation.clone(),
                     dispatched: false,
                     cell_key: cell_key.clone(),
                     _permit: permit,
@@ -381,6 +383,12 @@ impl HostPeer {
     ) {
         if let Some(pending) = self.remove_pending(id) {
             let _ = pending.response_tx.send(response);
+        }
+    }
+
+    pub(super) fn pause_delegate_timeout(&self, id: DelegateRequestId, paused: bool) {
+        if let Some(pending) = self.pending.lock().unwrap_or_else(PoisonError::into_inner).get(&id) {
+            pending.cancellation.set_timeout_paused(paused);
         }
     }
 

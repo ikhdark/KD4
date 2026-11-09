@@ -2532,6 +2532,8 @@ impl Config {
     ) -> std::io::Result<Self> {
         // Keep the large config-construction future off small caller stacks.
         Box::pin(async move {
+        cfg.validate_context_limits().map_err(|message|
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
         if cfg.experimental_thread_store_endpoint.is_some() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -3007,21 +3009,6 @@ impl Config {
             ));
         }
         validate_multi_agent_v2_tool_namespace(multi_agent_v2.tool_namespace.as_deref())?;
-        // A non-positive budget puts every turn over the compaction threshold.
-        for (field, value) in [
-            ("model_context_window", cfg.model_context_window),
-            (
-                "model_auto_compact_token_limit",
-                cfg.model_auto_compact_token_limit,
-            ),
-        ] {
-            if value.is_some_and(|value| value <= 0) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("{field} must be greater than zero"),
-                ));
-            }
-        }
         let agent_max_threads = cfg.agents.as_ref().and_then(|agents| agents.max_threads);
         if agent_max_threads == Some(0) {
             return Err(std::io::Error::new(

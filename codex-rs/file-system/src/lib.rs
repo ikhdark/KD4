@@ -9,13 +9,17 @@ mod text_diagnostics;
 mod walk_gitignore;
 
 pub use conditional_mutation::FileMutationOutcome;
+pub use conditional_mutation::FileMutationRetention;
+pub use conditional_mutation::RetainedFile;
 pub use conditional_mutation::guard_patch_read;
 pub use conditional_mutation::mutate_file_if_matches;
+pub use conditional_mutation::mutate_file_if_matches_with_retention;
 pub use conditional_mutation::prepare_patch_capture;
 pub use conditional_mutation::prepare_patch_capture_namespace;
 pub use conditional_mutation::try_acquire_patch_capture;
 pub use confined_file::directory_case_sensitive;
 pub use confined_file::open_confined_file;
+pub use confined_file::open_regular_file_no_follow;
 pub use confined_file::open_confined_file_with_metadata;
 pub use confined_file::resolved_file_path;
 pub use copy_failure::CopyFailure;
@@ -1047,6 +1051,25 @@ pub trait ExecutorFileSystem: Send + Sync {
                 io::ErrorKind::Unsupported,
                 "conditional file mutation is not supported by this filesystem",
             ))
+        })
+    }
+
+    /// Retained-object settlement must run in the same executor and sandbox as
+    /// deletion. Unsupported peers fail closed, never recreate from bytes.
+    fn mutate_file_if_matches_with_retention<'a>(
+        &'a self,
+        path: &'a PathUri,
+        expected: Option<Vec<u8>>,
+        replacement: Option<Vec<u8>>,
+        retention: FileMutationRetention,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, FileMutationOutcome> {
+        Box::pin(async move {
+            if retention == FileMutationRetention::None {
+                self.mutate_file_if_matches(path, expected, replacement, sandbox).await
+            } else {
+                Err(io::Error::new(io::ErrorKind::Unsupported, "retained file mutation is not supported by this filesystem"))
+            }
         })
     }
 

@@ -238,6 +238,8 @@ impl FollowupTaskHandler {
 }
 
 impl CoreToolRuntime for FollowupTaskHandler {
+    fn waits_for_runtime_cancellation(&self) -> bool { true }
+    fn cancellation_requires_commit_barrier(&self) -> bool { true }
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }
@@ -416,6 +418,11 @@ pub(crate) async fn handle_message_string_tool(
             .await
             .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
     }
+    if cancellation_token.is_cancelled() {
+        return Err(FunctionCallError::RespondToModel("agent message cancelled before admission".into()));
+    }
+    // Once queued, settle acknowledgement and ownership even if the observer
+    // is cancelled. The runtime commit barrier joins this exact handoff.
     let result = session
         .services
         .agent_control

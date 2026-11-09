@@ -99,6 +99,8 @@ pub const FS_REMOVE_METHOD: &str = "fs/remove";
 pub const FS_COPY_METHOD: &str = "fs/copy";
 /// Replace or delete a file only if it still holds the expected preimage.
 pub const FS_MUTATE_FILE_IF_MATCHES_METHOD: &str = "fs/mutateFileIfMatches";
+/// Retained-object extension; older peers reject this method before effects.
+pub const FS_MUTATE_FILE_IF_MATCHES_RETAINED_METHOD: &str = "fs/mutateFileIfMatchesRetained";
 /// JSON-RPC request method for executor-side HTTP requests.
 pub const HTTP_REQUEST_METHOD: &str = "http/request";
 /// Idempotently abandon a streaming body; older peers return method-not-found.
@@ -609,6 +611,8 @@ pub struct FsMutateFileIfMatchesParams {
     pub path: PathUri,
     pub expected_base64: Option<String>,
     pub replacement_base64: Option<String>,
+    #[serde(default)]
+    pub retention: codex_file_system::FileMutationRetention,
     pub sandbox: Option<FileSystemSandboxContext>,
 }
 
@@ -623,6 +627,7 @@ pub struct FsMutateFileIfMatchesResponse {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum FsFileMutationOutcome {
     Committed,
+    CommittedRetained { file: codex_file_system::RetainedFile },
     Unchanged,
     Conflict,
     #[serde(rename_all = "camelCase")]
@@ -636,6 +641,7 @@ impl From<codex_file_system::FileMutationOutcome> for FsFileMutationOutcome {
     fn from(outcome: codex_file_system::FileMutationOutcome) -> Self {
         match outcome {
             codex_file_system::FileMutationOutcome::Committed => Self::Committed,
+            codex_file_system::FileMutationOutcome::CommittedRetained { file } => Self::CommittedRetained { file },
             codex_file_system::FileMutationOutcome::Unchanged => Self::Unchanged,
             codex_file_system::FileMutationOutcome::Conflict => Self::Conflict,
             codex_file_system::FileMutationOutcome::RecoveryRequired {
@@ -653,6 +659,7 @@ impl From<FsFileMutationOutcome> for codex_file_system::FileMutationOutcome {
     fn from(outcome: FsFileMutationOutcome) -> Self {
         match outcome {
             FsFileMutationOutcome::Committed => Self::Committed,
+            FsFileMutationOutcome::CommittedRetained { file } => Self::CommittedRetained { file },
             FsFileMutationOutcome::Unchanged => Self::Unchanged,
             FsFileMutationOutcome::Conflict => Self::Conflict,
             FsFileMutationOutcome::RecoveryRequired {

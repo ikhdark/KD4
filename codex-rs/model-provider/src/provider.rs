@@ -485,6 +485,19 @@ impl ConfiguredModelProvider {
             auth_manager,
         }
     }
+
+    async fn unscoped_auth(&self) -> codex_protocol::error::Result<(Option<CodexAuth>, SharedAuthProvider)> {
+        let epoch = self.auth_manager.as_ref()
+            .map(|manager| manager.policy_auth_snapshot().map(|(epoch, _)| epoch))
+            .transpose()?;
+        let auth = self.auth().await;
+        let resolved = match (&self.auth_manager, epoch) {
+            (Some(manager), Some(epoch)) if provider_uses_first_party_auth_path(&self.info) =>
+                crate::auth::resolve_provider_auth_for_account(manager, auth.as_ref(), &self.info, epoch)?,
+            _ => resolve_provider_auth(auth.as_ref(), &self.info)?,
+        };
+        Ok((auth, resolved))
+    }
 }
 
 impl ModelProvider for ConfiguredModelProvider {
@@ -545,10 +558,10 @@ impl ModelProvider for ConfiguredModelProvider {
     ) -> ModelProviderFuture<'_, codex_protocol::error::Result<(Provider, SharedAuthProvider)>>
     {
         Box::pin(async move {
-            let auth = self.auth().await;
+            let (auth, resolved_auth) = self.unscoped_auth().await?;
             Ok((
                 request_api_provider(&self.info, auth.as_ref().map(CodexAuth::auth_mode))?,
-                resolve_provider_auth(auth.as_ref(), &self.info)?,
+                resolved_auth,
             ))
         })
     }
@@ -560,13 +573,13 @@ impl ModelProvider for ConfiguredModelProvider {
         codex_protocol::error::Result<Option<(Provider, SharedAuthProvider)>>,
     > {
         Box::pin(async move {
-            let auth = self.auth().await;
+            let (auth, resolved_auth) = self.unscoped_auth().await?;
             if !self.info.is_openai() || !auth.as_ref().is_some_and(CodexAuth::uses_codex_backend) {
                 return Ok(None);
             }
             Ok(Some((
                 request_api_provider(&self.info, auth.as_ref().map(CodexAuth::auth_mode))?,
-                resolve_provider_auth(auth.as_ref(), &self.info)?,
+                resolved_auth,
             )))
         })
     }

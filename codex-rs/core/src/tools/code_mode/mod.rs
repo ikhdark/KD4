@@ -2124,6 +2124,14 @@ fn failed_code_mode_cell_item(
         ),
     };
 
+    // A terminal cell has a known empty content list: its payload is carried by
+    // the tool response, not this lifecycle item. Match the persisted response
+    // event's Vec so live and replayed full history serialize identically.
+    // In-progress cells still have unknown content.
+    let content_items = match status {
+        DynamicToolCallStatus::InProgress => None,
+        DynamicToolCallStatus::Completed | DynamicToolCallStatus::Failed => Some(Vec::new()),
+    };
     Some(DynamicToolCallItem {
         id: format!("code-mode-cell:{cell_id}"),
         namespace: Some(FAILED_CELL_ITEM_NAMESPACE.to_string()),
@@ -2139,7 +2147,7 @@ fn failed_code_mode_cell_item(
             DynamicToolCallStatus::Failed => Some(false),
         },
         status,
-        content_items: None,
+        content_items,
         error,
         duration: Some(duration),
     })

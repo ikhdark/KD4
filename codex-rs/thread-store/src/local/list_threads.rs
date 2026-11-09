@@ -459,7 +459,7 @@ pub(super) fn encode_rollout_cursor(
     Ok(bind_cursor(storage_path, &position))
 }
 
-fn bind_cursor(storage_path: ThreadListStoragePath, position: &str) -> String {
+pub(super) fn bind_cursor(storage_path: ThreadListStoragePath, position: &str) -> String {
     let storage_prefix = match storage_path {
         ThreadListStoragePath::StateDb => STATE_DB_CURSOR_PREFIX,
         ThreadListStoragePath::ScanAndRepair => SCAN_AND_REPAIR_CURSOR_PREFIX,
@@ -467,7 +467,7 @@ fn bind_cursor(storage_path: ThreadListStoragePath, position: &str) -> String {
     format!("{THREAD_LIST_CURSOR_PREFIX}{storage_prefix}{position}")
 }
 
-fn backwards_cursor_position(
+pub(super) fn backwards_cursor_position(
     timestamp: chrono::DateTime<chrono::Utc>,
     sort_direction: SortDirection,
 ) -> Option<String> {

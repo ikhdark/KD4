@@ -9,7 +9,6 @@ use crate::cap::workspace_write_root_contains_path;
 use crate::cap::workspace_write_root_overlaps_path;
 use crate::cap::workspace_write_root_specificity;
 use crate::deny_read_state::sync_persistent_deny_read_acls;
-use crate::env::apply_no_network_to_env;
 use crate::env::ensure_non_interactive_pager;
 use crate::env::inherit_path_env;
 use crate::env::normalize_null_device_env;
@@ -89,6 +88,7 @@ pub(crate) fn prepare_legacy_spawn_context(
         )?;
 
     permissions.ensure_read_policy_supported(cwd)?;
+    permissions.ensure_legacy_network_policy_supported()?;
     normalize_null_device_env(env_map);
     ensure_non_interactive_pager(env_map);
 
@@ -99,10 +99,6 @@ pub(crate) fn prepare_legacy_spawn_context(
     log_start(command, logs_base_dir.as_deref());
 
     let uses_write_capabilities = permissions.uses_write_capabilities_for_cwd(cwd, env_map);
-    if permissions.should_apply_network_block() {
-        apply_no_network_to_env(env_map)?;
-    }
-
     Ok(SpawnContext {
         permissions,
         current_dir: cwd.to_path_buf(),

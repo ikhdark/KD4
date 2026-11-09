@@ -1216,7 +1216,6 @@ pub(crate) async fn resolve_server_request_on_thread_listener(
         biased;
         _ = cancellation.cancelled() => false,
         _ = tokio::time::sleep_until(deadline) => {
-            cancellation.cancel();
             return Err(unresolved(unresolved_request_id, ResolveServerRequestFailure::DeliveryTimedOut));
         }
         result = listener_command_tx.send(ThreadListenerCommand::ResolveServerRequest {
@@ -1235,7 +1234,6 @@ pub(crate) async fn resolve_server_request_on_thread_listener(
         biased;
         _ = cancellation.cancelled() => false,
         _ = tokio::time::sleep_until(deadline) => {
-            cancellation.cancel();
             return Err(unresolved(unresolved_request_id, ResolveServerRequestFailure::DeliveryTimedOut));
         }
         result = completion_rx => result.is_ok(),

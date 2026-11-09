@@ -607,7 +607,7 @@ pub(crate) async fn run_direct_request(
             let (expected, replacement) =
                 decode_mutation_payloads(params.expected_base64, params.replacement_base64)?;
             let outcome = file_system
-                .mutate_file_if_matches(&params.path, expected, replacement, /*sandbox*/ None)
+                .mutate_file_if_matches_with_retention(&params.path, expected, replacement, params.retention, /*sandbox*/ None)
                 .await
                 .map_err(map_fs_error)?;
             Ok(FsHelperPayload::MutateFileIfMatches(

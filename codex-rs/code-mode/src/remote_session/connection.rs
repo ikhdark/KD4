@@ -225,6 +225,7 @@ impl Connection {
             )
             .map_err(|error| error.to_string())?;
             let hello = ClientHello::new(
+                // Timeout pause is optional so older matched hosts remain usable.
                 SupportedProtocolVersions::try_new([ProtocolVersion::V1])
                     .map_err(|err| err.to_string())?,
                 CapabilitySet::empty(),
@@ -232,6 +233,9 @@ impl Connection {
                     catalog_capability.clone(),
                     state_capability.clone(),
                     receipt_capability.clone(),
+                    codex_code_mode_protocol::host::Capability::new(
+                        codex_code_mode_protocol::host::TIMEOUT_PAUSE_CAPABILITY,
+                    ).map_err(|error| error.to_string())?,
                     codex_code_mode_protocol::host::Capability::new(
                         codex_code_mode_protocol::host::CAUSAL_INPUTS_CAPABILITY,
                     ).map_err(|error| error.to_string())?,
@@ -255,6 +259,9 @@ impl Connection {
                         hello.capabilities().contains(&catalog_capability),
                         hello.capabilities().contains(&state_capability),
                         hello.capabilities().contains(&receipt_capability),
+                        hello.capabilities().contains(&codex_code_mode_protocol::host::Capability::new(
+                            codex_code_mode_protocol::host::TIMEOUT_PAUSE_CAPABILITY,
+                        ).map_err(|error| error.to_string())?),
                     ))
                 }
                 Some(HostToClient::HandshakeRejected { reason }) => {
@@ -273,7 +280,7 @@ impl Connection {
                 return Err("timed out negotiating with the code-mode host".to_string());
             }
         };
-        let (tool_catalog_references, named_state_snapshots, receipt_recovery) =
+        let (tool_catalog_references, named_state_snapshots, receipt_recovery, timeout_pause) =
             match handshake_result {
                 Ok(enabled) => enabled,
                 Err(err) => {
@@ -313,6 +320,7 @@ impl Connection {
         driver.tool_catalog_references = tool_catalog_references;
         driver.named_state_snapshots = named_state_snapshots;
         driver.receipt_recovery = receipt_recovery;
+        driver.timeout_pause = timeout_pause;
         let driver_task = tokio::spawn(driver.run());
         tokio::spawn(
             ConnectionSupervisor {

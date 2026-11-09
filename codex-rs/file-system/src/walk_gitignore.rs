@@ -184,7 +184,13 @@ impl WalkGitignore {
         };
         let rules = if let Some(bytes) = bytes {
             self.remaining_bytes -= bytes.len();
-            match self.parse_rules(directory, &path, &bytes) {
+            let case_sensitive = file_system.directory_case_sensitive(directory, sandbox).await
+                .map_err(|error| probe_error(directory, error))?;
+            if case_sensitive.is_none() {
+                self.problems.push((path.clone(),
+                    "directory case policy is unknown; ignore matching is conservatively case-sensitive".into()));
+            }
+            match self.parse_rules(directory, &path, &bytes, case_sensitive != Some(false)) {
                 Some(matcher) => Some(Arc::new(WalkIgnoreRules { matcher, parent })),
                 None => parent,
             }
@@ -203,6 +209,7 @@ impl WalkGitignore {
         directory: &PathUri,
         path: &PathUri,
         bytes: &[u8],
+        case_sensitive: bool,
     ) -> Option<Gitignore> {
         if bytes.starts_with(b"\xFF\xFE") || bytes.starts_with(b"\xFE\xFF") {
             self.problems.push((
@@ -214,9 +221,8 @@ impl WalkGitignore {
         let text = String::from_utf8_lossy(bytes);
         let source = path.to_path_buf();
         let mut builder = GitignoreBuilder::new(directory.to_path_buf());
-        // Git for Windows initializes repositories with core.ignorecase=true.
-        // This setter cannot fail; its Result is an API artifact.
-        let _ = builder.case_insensitive(true);
+        // Use the selected filesystem's directory policy, not the host OS.
+        let _ = builder.case_insensitive(!case_sensitive);
         let mut invalid_lines = 0usize;
         let mut first_invalid = None;
         for (index, line) in text.trim_start_matches('\u{feff}').lines().enumerate() {

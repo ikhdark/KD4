@@ -44,3 +44,12 @@ the existing `CODEX_ROLLOUT_TRACE_ROOT` environment variable enables separate
 trace bundles. This feature neither enables those bundles nor copies them into
 the rollout. Completed summaries, plans and tool results already persist
 without either diagnostic option.
+
+Operational history (`RolloutRecorder::load_rollout_items` and the dependency-
+version variant) excludes diagnostic `context_replay` snapshots. Recognized
+current-format references are not opened or integrity-checked on this path:
+they do not contribute session state or public chat history. This prevents
+accumulated request snapshots from being retained while opening a task.
+Ordinary history payloads, unknown formats and malformed references retain
+canonical decoding/error handling. Full `for_each_rollout_item` readers and
+diagnostic/export paths still hydrate and verify the saved diagnostic bodies.

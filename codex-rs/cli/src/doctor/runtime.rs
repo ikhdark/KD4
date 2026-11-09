@@ -758,13 +758,15 @@ async fn desktop_process_probe(
             "-NoProfile",
             "-Command",
             r#"
-$desktopPath = $null
-$package = Get-AppxPackage -Name OpenAI.Codex -ErrorAction Stop | Sort-Object Version -Descending | Select-Object -First 1
-if ($null -ne $package) {
-    [xml]$manifest = Get-Content -LiteralPath (Join-Path $package.InstallLocation 'AppxManifest.xml') -Raw -ErrorAction Stop
-    $application = @($manifest.Package.Applications.Application) | Where-Object { $_.Id -eq 'App' } | Select-Object -First 1
-    if (-not [string]::IsNullOrWhiteSpace([string]$application.Executable)) {
-        $desktopPath = Join-Path $package.InstallLocation ([string]$application.Executable)
+$desktopPath = $env:CODEX_DOCTOR_DESKTOP_PATH
+if ([string]::IsNullOrWhiteSpace($desktopPath)) {
+    $package = Get-AppxPackage -Name OpenAI.Codex -ErrorAction Stop | Sort-Object Version -Descending | Select-Object -First 1
+    if ($null -ne $package) {
+        [xml]$manifest = Get-Content -LiteralPath (Join-Path $package.InstallLocation 'AppxManifest.xml') -Raw -ErrorAction Stop
+        $application = @($manifest.Package.Applications.Application) | Where-Object { $_.Id -eq 'App' } | Select-Object -First 1
+        if (-not [string]::IsNullOrWhiteSpace([string]$application.Executable)) {
+            $desktopPath = Join-Path $package.InstallLocation ([string]$application.Executable)
+        }
     }
 }
 Get-CimInstance Win32_Process -Filter $env:CODEX_DOCTOR_PROCESS_FILTER -OperationTimeoutSec 2 -ErrorAction Stop |

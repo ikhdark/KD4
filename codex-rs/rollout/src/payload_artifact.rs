@@ -25,6 +25,41 @@ pub(crate) fn may_be_reference(line: &str) -> bool {
     line.len() < INLINE_BYTES && line.contains(KIND)
 }
 
+/// Operational history does not consume diagnostic request/context snapshots.
+/// Recognize only a well-formed current reference; unknown formats and damaged
+/// references still go through the canonical reader and its error handling.
+/// Full diagnostic/export readers never use this exclusion.
+pub(crate) fn is_context_replay_reference(line: &str) -> bool {
+    if !may_be_reference(line) || !line.contains("context_replay") {
+        return false;
+    }
+    #[derive(serde::Deserialize)]
+    struct Reference<'a> {
+        timestamp: &'a str,
+        format_version: u32,
+        #[serde(rename = "type")]
+        kind: &'a str,
+        #[serde(borrow)]
+        payload: Payload<'a>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Payload<'a> {
+        sha256: &'a str,
+        bytes: u64,
+        item_type: &'a str,
+    }
+    let Ok(reference) = serde_json::from_str::<Reference<'_>>(line) else {
+        return false;
+    };
+    reference.kind == KIND
+        && reference.format_version == codex_protocol::protocol::CURRENT_ROLLOUT_FORMAT_VERSION
+        && !reference.timestamp.is_empty()
+        && reference.payload.item_type == "context_replay"
+        && reference.payload.bytes > 0
+        && reference.payload.sha256.len() == 64
+        && reference.payload.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PayloadDependencyVersion {
     pub(crate) path: PathBuf,

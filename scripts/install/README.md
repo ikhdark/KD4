@@ -57,7 +57,22 @@ including freshness checks, rollback, Desktop configuration, and restart
 safety. Desktop uses the fork home (`C:\Users\kuh\Desktop\LOCAL-KD`), not the
 upstream home. Publishing can restart Desktop; `-BuildOnly` only prepares the
 bundle. Existing protections may defer activation when invoked inside Codex.
-`just publish-local-codex-final` remains unchanged for runtime-optimized builds.
+`just publish-local-codex-final` also passes `-PublishForkFrontend`: it publishes
+the editable sibling `Codex-Fork` frontend and resolves Desktop restart to that
+fork's executable, never the Store app. Override its location with `-ForkRoot`.
+Its doctor subprocess receives the selected executable through process-only
+`CODEX_DOCTOR_DESKTOP_PATH`; live stdio-peer and process-creation verification
+remain required. Without that explicit selection, doctor retains Store discovery.
+Unchanged reconciled frontend source is a no-op. Changes are syntax-compiled and
+built from the complete canonical working source into a fresh rollback-safe stage
+using the fork's `patches/deployment.py`, then installed with its existing source,
+changelog, baseline-pair, running-app, integrity and rollback safeguards.
+Close the fork safely first; `-Force` does not bypass the frontend installer guard.
+`-DryRun` inspects without staging/installing; `-BuildOnly` remains backend-only.
+Direct publisher calls without `-PublishForkFrontend` retain backend-only/Store
+behavior. Frontend installation precedes backend activation, using separate
+transactions: a later backend failure leaves the verified frontend installed and
+its matched rollback bundle available. No profile or user-data migration occurs.
 
 Build freshness includes the bytes of the automatically selected Cargo Rusty V8
 cache archive, not just explicit archive overrides. A cached archive change

@@ -216,6 +216,13 @@ pub(crate) fn build_router() -> RpcRouter<ExecServerHandler> {
         },
     );
     router.request(
+        crate::protocol::FS_MUTATE_FILE_IF_MATCHES_RETAINED_METHOD,
+        |handler: Arc<ExecServerHandler>,
+         params: crate::protocol::FsMutateFileIfMatchesParams| async move {
+            handler.fs_mutate_file_if_matches(params).await
+        },
+    );
+    router.request(
         FS_CREATE_DIRECTORY_METHOD,
         |handler: Arc<ExecServerHandler>, params: FsCreateDirectoryParams| async move {
             handler.fs_create_directory(params).await

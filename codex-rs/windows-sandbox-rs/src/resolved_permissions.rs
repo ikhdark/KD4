@@ -100,6 +100,14 @@ impl ResolvedWindowsSandboxPermissions {
         !self.network.is_enabled()
     }
 
+    /// Pure admission check: environment conventions do not isolate sockets.
+    /// Network-enabled legacy profiles retain their existing filesystem policy.
+    pub fn ensure_legacy_network_policy_supported(&self) -> Result<()> {
+        anyhow::ensure!(!self.should_apply_network_block(),
+            "network-disabled policies require the elevated Windows sandbox backend; legacy restricted tokens cannot enforce network isolation");
+        Ok(())
+    }
+
     pub(crate) fn network_policy(&self) -> NetworkSandboxPolicy {
         self.network
     }
@@ -169,6 +177,10 @@ impl ResolvedWindowsSandboxPermissions {
 /// SIDs do not restrict reads. Require the unrestricted-read baseline, allowing
 /// separately enforced explicit denies, rather than a single readable volume.
 pub fn validate_windows_read_policy(file_system: &FileSystemSandboxPolicy, cwd: &Path) -> Result<()> {
+    // A launch-time ACL snapshot cannot protect future matching objects. Do not
+    // certify the policy or begin account/ACL setup under a weaker snapshot.
+    anyhow::ensure!(file_system.get_unreadable_globs_with_cwd(cwd).is_empty(),
+        "Windows sandbox cannot enforce dynamic glob read-denies; use exact deny-read roots instead");
     let has_root_baseline = file_system.entries.iter().any(|entry| {
         matches!(
             &entry.path,

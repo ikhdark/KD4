@@ -321,6 +321,150 @@ pub(crate) fn copy_file_security(source: &Path, destination: &Path) -> io::Resul
     Ok(())
 }
 
+/// Close the exclusive handle before unlinking its path, including error exits.
+/// NamedTempFile's path-first drop order cannot unlink a share-denied handle.
+pub(crate) struct SourceDaclPreimage {
+    file: File,
+    path: tempfile::TempPath,
+}
+
+impl SourceDaclPreimage {
+    pub(crate) fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.file.write_all(bytes)
+    }
+
+    pub(crate) fn into_temp_path(self) -> tempfile::TempPath {
+        drop(self.file);
+        self.path
+    }
+}
+
+/// A fallback copy must not expose plaintext under inherited parent defaults.
+/// Install the original DACL at creation (before bytes), without assigning its
+/// owner or requiring WRITE_DAC on a sandbox-owned staged file. Keep the DACL
+/// protected so broader inheritable ACEs cannot be added to the recovery copy.
+pub(crate) fn create_preimage_with_source_dacl(
+    source: &File,
+    parent: &Path,
+) -> io::Result<SourceDaclPreimage> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{
+        GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree,
+    };
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, InitializeSecurityDescriptor, SE_DACL_PROTECTED,
+        SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SetSecurityDescriptorControl,
+        SetSecurityDescriptorDacl,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_TEMPORARY,
+    };
+    struct Descriptor(*mut std::ffi::c_void);
+    impl Drop for Descriptor {
+        fn drop(&mut self) {
+            // SAFETY: GetSecurityInfo allocated this descriptor using LocalAlloc.
+            unsafe {
+                LocalFree(self.0);
+            }
+        }
+    }
+    let mut descriptor = std::ptr::null_mut();
+    let mut dacl = std::ptr::null_mut();
+    // SAFETY: source owns the exclusive READ_CONTROL-capable handle. Reading
+    // security through this handle does not reopen its denied-share pathname.
+    let error = unsafe {
+        GetSecurityInfo(
+            source.as_raw_handle().cast(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if error != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "GetSecurityInfo of exclusive original: {}",
+                io::Error::from_raw_os_error(error as i32)
+            ),
+        ));
+    }
+    let descriptor = Descriptor(descriptor);
+    // GetSecurityInfo's allocation can include owner/group metadata even when
+    // only its DACL was requested. A new copy must use the executor's default
+    // owner, not attempt assignment of an administrative source owner.
+    let mut copy = SECURITY_DESCRIPTOR::default();
+    // SAFETY: initialized native descriptor; the referenced DACL allocation
+    // remains owned by `descriptor` throughout CREATE_NEW.
+    if unsafe { InitializeSecurityDescriptor((&mut copy as *mut SECURITY_DESCRIPTOR).cast(), 1) }
+        == 0
+        || unsafe {
+            SetSecurityDescriptorDacl((&mut copy as *mut SECURITY_DESCRIPTOR).cast(), 1, dacl, 0)
+        } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: initialized, owned security descriptor remains live until after creation.
+    if unsafe {
+        SetSecurityDescriptorControl(
+            (&mut copy as *mut SECURITY_DESCRIPTOR).cast(),
+            SE_DACL_PROTECTED,
+            SE_DACL_PROTECTED,
+        )
+    } == 0
+    {
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!("protect source DACL descriptor: {error}"),
+        ));
+    }
+    let security = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: (&mut copy as *mut SECURITY_DESCRIPTOR).cast(),
+        bInheritHandle: 0,
+    };
+    let result = tempfile::Builder::new()
+        .prefix(".codex-patch-preimage-")
+        .make_in(parent, |path| {
+            let path: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+            // SAFETY: valid live security descriptor/path; CREATE_NEW never replaces
+            // an existing object. Exclusive sharing protects bytes until settlement.
+            let handle = unsafe {
+                CreateFileW(
+                    path.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    &security,
+                    CREATE_NEW,
+                    FILE_ATTRIBUTE_TEMPORARY,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                let error = io::Error::last_os_error();
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("CREATE_NEW source-DACL recovery copy: {error}"),
+                ));
+            }
+            // SAFETY: this uniquely owned native handle is transferred exactly once.
+            Ok(unsafe { File::from_raw_handle(handle.cast()) })
+        });
+    drop(descriptor);
+    result.map(|temporary| {
+        let (file, path) = temporary.into_parts();
+        SourceDaclPreimage { file, path }
+    })
+}
+
 fn sync_parent_directory(parent: &Path) -> io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
@@ -344,4 +488,3 @@ fn sync_parent_directory(parent: &Path) -> io::Result<()> {
         Err(error) => Err(error),
     }
 }
-

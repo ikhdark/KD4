@@ -786,6 +786,34 @@ unsafe fn add_deny_ace(path: &Path, psid: *mut c_void, kind: DenyAceKind) -> Res
 /// # Safety
 /// Caller must ensure `psid` points to a valid SID and `path` refers to an existing file or directory.
 pub unsafe fn add_deny_read_ace(path: &Path, psid: *mut c_void) -> Result<bool> {
+    // An inherited ACE cannot cross a protected descendant DACL. Refuse that
+    // directory policy rather than launch with an unenforced exact read deny.
+    // Bound the no-follow preflight and fail closed on inspection errors.
+    if std::fs::symlink_metadata(path)?.is_dir() {
+        let mut pending = vec![path.to_path_buf()];
+        let mut inspected = 0usize;
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(directory)? {
+                inspected += 1;
+                anyhow::ensure!(inspected <= 100_000, "deny-read directory inspection budget exceeded");
+                let entry = entry?;
+                let metadata = std::fs::symlink_metadata(entry.path())?;
+                use std::os::windows::fs::MetadataExt as _;
+                anyhow::ensure!(metadata.file_attributes() & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT == 0,
+                    "deny-read directory contains a reparse point; enforcement cannot be certified");
+                let (_, descriptor) = fetch_dacl_handle(&entry.path())?;
+                let mut control = 0;
+                let mut revision = 0;
+                let result = GetSecurityDescriptorControl(descriptor, &mut control, &mut revision);
+                let error = if result == 0 { Some(std::io::Error::last_os_error()) } else { None };
+                if !descriptor.is_null() { windows_sys::Win32::Foundation::LocalFree(descriptor); }
+                if let Some(error) = error { return Err(error.into()); }
+                anyhow::ensure!(control & SE_DACL_PROTECTED == 0,
+                    "deny-read directory contains protected descendant security; enforcement cannot be certified");
+                if metadata.is_dir() { pending.push(entry.path()); }
+            }
+        }
+    }
     add_deny_ace(path, psid, DenyAceKind::Read)
 }
 

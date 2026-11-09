@@ -15,6 +15,13 @@ pub struct InputReceipt {
 }
 
 impl StateRuntime {
+    /// Keep proven rejection evidence, but release only its unaccepted start key.
+    pub async fn reject_unaccepted_start_receipt(&self, thread_id: ThreadId, turn_id: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE input_receipts SET kind = 'rejected_start', scope = turn_id, consumed = 1 WHERE thread_id = ? AND kind = 'start' AND turn_id = ? AND payload IS NULL")
+            .bind(thread_id.to_string()).bind(turn_id)
+            .execute(&self.input_receipts_pool().await?).await?;
+        Ok(())
+    }
     async fn input_receipts_pool(&self) -> anyhow::Result<sqlx::SqlitePool> {
         let mut pool = self.input_receipts_pool.lock().await;
         anyhow::ensure!(

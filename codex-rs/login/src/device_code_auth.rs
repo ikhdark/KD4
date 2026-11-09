@@ -66,6 +66,9 @@ async fn request_user_code(
     auth_base_url: &str,
     client_id: &str,
 ) -> std::io::Result<UserCodeResp> {
+    // The serialized account owner must not wait forever for a server that
+    // accepts a connection but never finishes headers or its JSON body.
+    tokio::time::timeout(Duration::from_secs(30), async {
     let url = format!("{auth_base_url}/deviceauth/usercode");
     let body = serde_json::to_string(&UserCodeReq {
         client_id: client_id.to_string(),
@@ -95,6 +98,7 @@ async fn request_user_code(
 
     let body = resp.text().await.map_err(std::io::Error::other)?;
     serde_json::from_str(&body).map_err(std::io::Error::other)
+    }).await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "device code request timed out after 30 seconds"))?
 }
 
 /// Poll token endpoint until a code is issued or timeout occurs.

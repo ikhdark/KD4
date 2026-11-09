@@ -1589,6 +1589,11 @@
             "null"
           ]
         },
+        "isBlocking": {
+          "default": false,
+          "description": "Keep the prompt open without auto-resolution until the user responds or cancels.",
+          "type": "boolean"
+        },
         "itemId": {
           "type": "string"
         },

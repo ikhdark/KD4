@@ -36,7 +36,7 @@ use crate::StoredOAuthTokens;
 use crate::WrappedOAuthTokenResponse;
 use crate::oauth::compute_expires_at_millis;
 use crate::oauth_http_client::OAuthHttpClientAdapter;
-use crate::save_oauth_tokens;
+use crate::oauth::save_oauth_login_tokens;
 use crate::utils::build_default_headers;
 use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::OAuthCredentialsStoreMode;
@@ -467,6 +467,7 @@ impl OauthLoginHandle {
 
 struct OauthLoginFlow {
     auth_url: String,
+    login_authority: crate::oauth::OAuthRequestAuthority,
     expected_csrf_state: String,
     oauth_state: OAuthState,
     rx: oneshot::Receiver<CallbackResult>,
@@ -577,6 +578,7 @@ impl OauthLoginFlow {
         timeout_secs: Option<i64>,
     ) -> Result<Self> {
         const DEFAULT_OAUTH_TIMEOUT_SECS: i64 = 300;
+        let login_authority = crate::oauth::begin_oauth_login(codex_home, server_name, server_url).await?;
 
         let bind_host = callback_bind_host(callback_url);
         let callback_port = resolve_callback_port(callback_port)?;
@@ -634,6 +636,7 @@ impl OauthLoginFlow {
 
         Ok(Self {
             auth_url,
+            login_authority,
             expected_csrf_state,
             oauth_state,
             rx,
@@ -715,13 +718,15 @@ impl OauthLoginFlow {
             let server_name = self.server_name.clone();
             let store_mode = self.store_mode;
             let keyring_backend_kind = self.keyring_backend_kind;
+            let login_authority = self.login_authority.clone();
             tokio::task::spawn_blocking(move || {
-                save_oauth_tokens(
+                save_oauth_login_tokens(
                     &codex_home,
                     &server_name,
                     &stored,
                     store_mode,
                     keyring_backend_kind,
+                    &login_authority,
                 )
             })
             .await??;

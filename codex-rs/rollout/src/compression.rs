@@ -745,6 +745,7 @@ pub struct RolloutLineReader {
     last_line_terminated: bool,
     source_revision: Option<crate::diagnostic_revision::Revision>,
     source_only: bool,
+    exclude_context_replay: bool,
     enroll_payloads: bool,
     unresolved_payloads: usize,
     payload_versions: Option<
@@ -763,6 +764,10 @@ struct BlockingRolloutLineReader {
 }
 
 impl RolloutLineReader {
+    pub(crate) fn exclude_context_replay(&mut self) {
+        self.exclude_context_replay = true;
+    }
+
     pub(crate) fn capture_source_revision(&mut self, source_only: bool) {
         self.source_revision = Some(Default::default());
         self.source_only = source_only;
@@ -822,6 +827,13 @@ impl RolloutLineReader {
         self.last_line_terminated = terminated;
         if let Some(revision) = self.source_revision.as_mut() { revision.push(&line, terminated); }
         if self.source_only || !crate::payload_artifact::may_be_reference(&line) {
+            return Ok(Some(line));
+        }
+        if self.exclude_context_replay
+            && crate::payload_artifact::is_context_replay_reference(&line)
+        {
+            // Return the small reference for the operational decoder to account
+            // for its record slot without opening or retaining the diagnostic blob.
             return Ok(Some(line));
         }
         let path = self.path.clone();
@@ -1830,6 +1842,7 @@ mod reader {
                 last_line_terminated: true,
                 source_revision: None,
                 source_only: false,
+                exclude_context_replay: false,
                 enroll_payloads: false,
                 unresolved_payloads: 0,
                 payload_versions: None,
@@ -1845,6 +1858,7 @@ mod reader {
             last_line_terminated: true,
             source_revision: None,
             source_only: false,
+            exclude_context_replay: false,
             enroll_payloads: false,
             unresolved_payloads: 0,
             payload_versions: None,

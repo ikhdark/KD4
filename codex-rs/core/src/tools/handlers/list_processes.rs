@@ -369,6 +369,12 @@ mod platform {
             // SAFETY: as above.
             more = unsafe { Process32NextW(snapshot.0, &mut entry) } != 0;
         }
+        // FALSE is not necessarily EOF. Do not return a partial inventory as
+        // complete if the native enumerator failed after yielding entries.
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(windows_sys::Win32::Foundation::ERROR_NO_MORE_FILES as i32) {
+            return Err(format!("process snapshot enumeration failed: {error}"));
+        }
         if entries.is_empty() {
             return Err(format!("process snapshot was empty: {}", std::io::Error::last_os_error()));
         }

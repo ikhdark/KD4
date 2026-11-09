@@ -33,6 +33,7 @@ impl TypedToolClass {
                 | Self::OwnTask
                 | Self::ReadSearch
                 | Self::CodeModeControl
+                | Self::Shell
                 | Self::StructuredEdit
         )
     }
@@ -358,8 +359,8 @@ impl From<CapabilityDenied> for crate::FunctionCallError {
     }
 }
 
-/// Classes come from host registration, not task prose. Opaque execution cannot
-/// prove source confinement; writable workers use the scope-checked patch owner.
+/// Classes come from host registration, not task prose. Worker commands run in
+/// the runtime's read-only sandbox; source writes use the scope-checked patch owner.
 /// A refusal denies this call only: the worker keeps its turn, so it can use a
 /// permitted route or report the blocker instead of losing its completed work.
 pub(crate) fn authorize_assignment_tool(
@@ -377,7 +378,7 @@ pub(crate) fn authorize_assignment_tool(
         return Err(refused("workers cannot delegate execution authority; ask the root to admit the assignment"));
     }
     match class {
-        TypedToolClass::ReadSearch | TypedToolClass::AgentCommunication
+        TypedToolClass::ReadSearch | TypedToolClass::Shell | TypedToolClass::AgentCommunication
         | TypedToolClass::CodeModeControl => Ok(()),
         TypedToolClass::OwnTask => {
             let grouped_gate = semantic_name == "agent_task" && match payload {
@@ -408,7 +409,7 @@ pub(crate) fn authorize_assignment_tool(
         TypedToolClass::RootTaskControl => Err(refused(
             "subagents cannot create or broaden execution contracts; ask the root to admit work explicitly")),
         _ => Err(refused(
-            "this execution/IO tool cannot enforce the worker's write contract; use native read/search or scoped apply_patch, with root-owned builds/integration")),
+            "this external/IO tool cannot enforce the worker's write contract; use native read/search, read-only sandboxed commands or scoped apply_patch, with root-owned builds/integration")),
     }
 }
 

@@ -655,9 +655,14 @@ impl PluginRequestProcessor {
     }
 
     pub(crate) fn effective_plugins_changed_callback(&self) -> Arc<dyn Fn() + Send + Sync> {
-        let thread_manager = Arc::clone(&self.thread_manager);
+        // The plugin manager stores this callback and is itself owned by the
+        // thread manager. Retaining the latter here pins its RPC sender forever.
+        let thread_manager = Arc::downgrade(&self.thread_manager);
         let config_manager = self.config_manager.clone();
         Arc::new(move || {
+            let Some(thread_manager) = thread_manager.upgrade() else {
+                return;
+            };
             // Fired by background plugin refreshes (startup sync, remote
             // installed-plugin fetch, marketplace auto-upgrade, list-triggered
             // cache refreshes). Config does not depend on plugin state, so these
@@ -665,7 +670,7 @@ impl PluginRequestProcessor {
             // concurrent thread/start admission and force a full retry.
             config_manager.discard_cached_loads();
             Self::clear_plugin_runtime_caches_and_spawn_refresh(
-                Arc::clone(&thread_manager),
+                thread_manager,
                 config_manager.clone(),
             );
         })
@@ -1707,6 +1712,12 @@ impl PluginRequestProcessor {
         &self,
         params: PluginInstallParams,
     ) -> Result<PluginInstallResponse, JSONRPCErrorError> {
+        // This begins before config loading, which can itself wait on the
+        // writer lock. Publication-only probes cannot prove this admission.
+        let observation = codex_protocol::timing::client_probe::instance();
+        if observation != 0 {
+            codex_protocol::timing::client_probe::record(720, observation, 0, 0, 0, [0; 4]);
+        }
         let PluginInstallParams {
             marketplace_path,
             remote_marketplace_name,
@@ -1795,6 +1806,9 @@ impl PluginRequestProcessor {
             )
             .await;
 
+        if observation != 0 {
+            codex_protocol::timing::client_probe::record(721, observation, 0, 0, 0, [0; 4]);
+        }
         Ok(PluginInstallResponse {
             auth_policy: result.auth_policy.into(),
             apps_needing_auth,
@@ -1806,6 +1820,8 @@ impl PluginRequestProcessor {
         remote_marketplace_name: String,
         remote_plugin_id: String,
     ) -> Result<PluginInstallResponse, JSONRPCErrorError> {
+        let auth_epoch = self.auth_manager.with_policy_identity(|identity| identity.current_epoch)
+            .map_err(|error| internal_error(error.to_string()))?;
         let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
         if !config.features.enabled(Feature::Plugins) {
             return Err(invalid_request(format!(
@@ -1946,13 +1962,14 @@ impl PluginRequestProcessor {
             remote_plugin_catalog_error_to_jsonrpc(err, "install remote plugin")
         })?;
 
-        self.thread_manager
-            .plugins_manager()
-            .maybe_start_remote_installed_plugins_cache_refresh_after_mutation(
+        self.auth_manager.with_policy_identity(|identity| {
+            if identity.current_epoch != auth_epoch { return; }
+            self.thread_manager.plugins_manager().maybe_start_remote_installed_plugins_cache_refresh_after_mutation(
                 &config.plugins_config_input(),
                 auth.clone(),
                 Some(self.effective_plugins_changed_callback()),
             );
+        }).map_err(|error| internal_error(error.to_string()))?;
 
         let plugin_metadata = self
             .thread_manager
@@ -2240,6 +2257,7 @@ impl PluginRequestProcessor {
                 let notification = ServerNotification::McpServerOauthLoginCompleted(
                     McpServerOauthLoginCompletedNotification {
                         name: notification_name,
+                        login_id: None,
                         thread_id: None,
                         success,
                         error,
@@ -2331,6 +2349,8 @@ impl PluginRequestProcessor {
         &self,
         plugin_id: String,
     ) -> Result<PluginUninstallResponse, JSONRPCErrorError> {
+        let auth_epoch = self.auth_manager.with_policy_identity(|identity| identity.current_epoch)
+            .map_err(|error| internal_error(error.to_string()))?;
         let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
         if !config.features.enabled(Feature::Plugins) {
             return Err(invalid_request("remote plugin uninstall is not enabled"));
@@ -2378,6 +2398,8 @@ impl PluginRequestProcessor {
         if committed {
             self.analytics_events_client
                 .track_plugin_uninstalled(plugin_telemetry);
+            self.auth_manager.with_policy_identity(|identity| {
+                if identity.current_epoch != auth_epoch { return; }
             if plugins_manager.clear_remote_installed_plugins_cache() {
                 self.on_effective_plugins_changed();
             }
@@ -2391,6 +2413,7 @@ impl PluginRequestProcessor {
                 auth.clone(),
                 Some(self.effective_plugins_changed_callback()),
             );
+            }).map_err(|error| internal_error(error.to_string()))?;
         }
 
         match uninstall_result {

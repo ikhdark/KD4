@@ -369,10 +369,13 @@ impl ConfigManager {
             .with_edits(config_edits)
             .with_expected_version(writer_expected_version);
         let manager = self.clone();
+        let observation = codex_protocol::timing::client_probe::instance();
+        codex_protocol::timing::client_probe::record(710, observation, 0, 0, 0, [0; 4]);
         // Keep policy publication fenced through the existing locked writer.
         // This synchronous guard lives on the blocking owner, never across an
         // async suspension or on the RPC caller's cancellation lifetime.
         let committed_config = tokio::task::spawn_blocking(move || {
+            codex_protocol::timing::client_probe::record(711, observation, 0, 0, 0, [0; 4]);
             manager.with_current_policy(policy_generation, || builder.apply_blocking_with_config())
         })
             .await
@@ -389,6 +392,7 @@ impl ConfigManager {
         // Successful writes must be visible to the next per-cwd read, even
         // when no live thread exists to receive a runtime config refresh.
         self.invalidate_load_cache();
+        codex_protocol::timing::client_probe::record(712, observation, 0, 0, 0, [0; 4]);
 
         // The locked writer captured the exact serialized commit, including
         // implicit empty-table removal. No unlocked or fallible reload follows.
@@ -707,7 +711,8 @@ fn toml_value_to_value(value: &TomlValue) -> anyhow::Result<toml_edit::Value> {
 }
 
 fn validate_config(value: &TomlValue) -> Result<(), toml::de::Error> {
-    let _: ConfigToml = value.clone().try_into()?;
+    let config: ConfigToml = value.clone().try_into()?;
+    config.validate_context_limits().map_err(<toml::de::Error as serde::de::Error>::custom)?;
     Ok(())
 }
 

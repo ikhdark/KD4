@@ -1285,7 +1285,7 @@ impl Session {
                         let rebuilt = compact::build_compacted_history(
                             Vec::new(),
                             &user_messages,
-                            &compacted.message,
+                            &format!("{}\n\nLegacy compaction source boundary: loaded rollout record ordinal {} (zero-based); original user response_item records precede this Compacted record in the same source. Ordinals are in the loaded sequence, not physical file-line numbers.", compacted.message, index),
                         );
                         history.replace(rebuilt);
                     }

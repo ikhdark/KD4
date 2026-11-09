@@ -155,6 +155,13 @@ where
                 ClientToHost::DelegateResponse { id, result } => {
                     peer.complete(id, result.into_result()).await;
                 }
+                ClientToHost::DelegateTimeoutPause { id, paused } => {
+                    let capability = codex_code_mode_protocol::host::Capability::new(
+                        codex_code_mode_protocol::host::TIMEOUT_PAUSE_CAPABILITY,
+                    )?;
+                    anyhow::ensure!(capabilities.contains(&capability), "unnegotiated timeout pause");
+                    peer.pause_delegate_timeout(id, paused);
+                }
             }
         }
         Ok::<(), anyhow::Error>(())
@@ -240,6 +247,9 @@ where
     )?;
     let supported_capabilities = CapabilitySet::try_new([
         catalog_capability, state_capability, receipt_capability, causal_capability,
+        codex_code_mode_protocol::host::Capability::new(
+            codex_code_mode_protocol::host::TIMEOUT_PAUSE_CAPABILITY,
+        )?,
     ])?;
     if let Some(capability) = client_hello
         .required_capabilities()

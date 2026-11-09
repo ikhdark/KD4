@@ -112,6 +112,9 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
             // Extension compatibility events can omit canonical status and errors.
             matches!(history_mode, ThreadHistoryMode::Paginated)
                 || matches!(&event.item, TurnItem::Extension(_))
+                // Activity's legacy mirror lacks its canonical owning turn ID.
+                // Keep ownership for late completions and cold legacy replay.
+                || matches!(&event.item, TurnItem::SubAgentActivity(_))
                 || matches!(event.item, TurnItem::Plan(_) | TurnItem::Sleep(_) | TurnItem::AgentMessage(_) | TurnItem::CommandExecution(_) | TurnItem::ContextCompaction(_) | TurnItem::UserMessage(_) | TurnItem::DynamicToolCall(_) | TurnItem::CollabAgentToolCall(_) | TurnItem::ImageView(_))
         }
         EventMsg::ItemStarted(event) => matches!(&event.item, TurnItem::CommandExecution(item)

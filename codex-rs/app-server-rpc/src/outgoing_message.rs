@@ -51,6 +51,20 @@ pub type ClientRequestResult = std::result::Result<Result, JSONRPCErrorError>;
 
 const TURN_DELIVERY_RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const RESOURCE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Reserve output capacity before locking mutable state. Sending a freshly
+/// captured notification through this permit is synchronous, so publication
+/// cannot race a later state transition while waiting for backpressure.
+pub struct ServerNotificationPermit(mpsc::OwnedPermit<OutgoingEnvelope>);
+
+impl ServerNotificationPermit {
+    pub fn send(self, notification: ServerNotification) {
+        tracing::trace!("app-server event: {notification}");
+        self.0.send(OutgoingEnvelope::Broadcast {
+            message: OutgoingMessage::AppServerNotification(notification),
+        });
+    }
+}
 const NO_ACTIVE_AUTHORIZED_CONNECTIONS_ERROR: &str =
     "client request canceled because no active authorized connections are available";
 const NO_INITIALIZED_CONNECTIONS_ERROR: &str =
@@ -78,6 +92,7 @@ pub struct RequestContext {
     span: Span,
     parent_trace: Option<W3cTraceContext>,
     work_lease: Option<Arc<RequestWorkLease>>,
+    mobile_observation_id: Option<String>,
 }
 
 impl RequestContext {
@@ -92,7 +107,17 @@ impl RequestContext {
             span,
             parent_trace,
             work_lease: None,
+            mobile_observation_id: None,
         }
+    }
+
+    /// Capture-only identity; never participates in request admission or replay.
+    pub fn set_mobile_observation_id(&mut self, id: Option<String>) {
+        self.mobile_observation_id = id;
+    }
+
+    pub fn mobile_observation_id(&self) -> Option<&str> {
+        self.mobile_observation_id.as_deref()
     }
 
     /// Counts the incoming carrier retained with this request, without cloning it.
@@ -828,7 +853,7 @@ impl OutgoingMessageSender {
     async fn response_delivery_error(
         &self,
         connection_id: ConnectionId,
-        response: &OutgoingResponse,
+        response: &mut OutgoingResponse,
     ) -> Option<JSONRPCErrorError> {
         let remote_control = self.active_connections.lock().await
             .get(&connection_id)
@@ -1370,8 +1395,8 @@ impl OutgoingMessageSender {
                     &entry.request,
                     &result,
                 );
-                if let Err(err) = entry.callback.send(Ok(result)) {
-                    warn!("could not notify callback for {id:?} due to: {err:?}");
+                if entry.callback.send(Ok(result)).is_err() {
+                    warn!("could not notify callback for {id:?}: receiver closed");
                 }
             }
             TakeCallbackResult::Unauthorized => {
@@ -1400,8 +1425,8 @@ impl OutgoingMessageSender {
                 warn!("client responded with error for {id:?}: {error:?}");
                 self.analytics_events_client
                     .track_server_request_aborted(now_unix_timestamp_ms(), id.clone());
-                if let Err(err) = entry.callback.send(Err(error)) {
-                    warn!("could not notify callback for {id:?} due to: {err:?}");
+                if entry.callback.send(Err(error)).is_err() {
+                    warn!("could not notify callback for {id:?}: receiver closed");
                 }
             }
             TakeCallbackResult::Unauthorized => {
@@ -1580,9 +1605,9 @@ impl OutgoingMessageSender {
                 return false;
             }
         };
-        let outgoing_response = OutgoingResponse { id, result };
+        let mut outgoing_response = OutgoingResponse { id, result };
         if let Some(error) = self
-            .response_delivery_error(request_id.connection_id, &outgoing_response)
+            .response_delivery_error(request_id.connection_id, &mut outgoing_response)
             .await
         {
             self.send_error(request_id, error).await;
@@ -1724,6 +1749,25 @@ impl OutgoingMessageSender {
     pub async fn send_server_notification(&self, notification: ServerNotification) {
         self.send_server_notification_to_connections(&[], notification)
             .await;
+    }
+
+    pub async fn reserve_server_notification(&self) -> Option<ServerNotificationPermit> {
+        let permit = tokio::select! {
+            biased;
+            _ = self.delivery_shutdown.cancelled() => None,
+            result = tokio::time::timeout(RESOURCE_DELIVERY_TIMEOUT, self.notification_sender().clone().reserve_owned()) => {
+                result.ok().and_then(std::result::Result::ok)
+            }
+        };
+        if let Some(permit) = permit {
+            return Some(ServerNotificationPermit(permit));
+        }
+        warn!("server notification reservation failed or exceeded its budget");
+        let targets: Vec<_> = self.active_connections.lock().await.keys().copied().collect();
+        for target in targets {
+            self.fail_connection_delivery(target).await;
+        }
+        None
     }
 
     pub fn try_send_server_notification(&self, notification: ServerNotification) -> bool {
@@ -2133,8 +2177,8 @@ impl OutgoingMessageSender {
             .map(|connection| (connection.delivery_failure.clone(), connection.remote_control))
             .unwrap_or_default();
         let message = match message {
-            OutgoingMessage::Response(response) if remote_control => {
-                match codex_app_server_transport::remote_control_response_size_error(&response) {
+            OutgoingMessage::Response(mut response) if remote_control => {
+                match codex_app_server_transport::remote_control_response_size_error(&mut response) {
                     Some(error) => OutgoingMessage::Error(OutgoingError { id: response.id, error }),
                     None => OutgoingMessage::Response(response),
                 }

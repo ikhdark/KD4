@@ -281,6 +281,13 @@ pub(super) async fn search_threads(
         thread_item_titles(matching_items.iter().map(|item| &item.item));
     let mut items = Vec::with_capacity(matching_items.len());
     for item in matching_items {
+        let backwards_cursor = cursor_from_thread_search_item(&item, params.sort_key, storage_path)
+            .and_then(|cursor| serde_json::to_value(cursor).ok())
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .and_then(|position| chrono::DateTime::parse_from_rfc3339(position.split('|').next()?).ok())
+            .and_then(|timestamp| super::list_threads::backwards_cursor_position(
+                timestamp.with_timezone(&chrono::Utc), params.sort_direction))
+            .map(|position| super::list_threads::bind_cursor(storage_path, &position));
         let thread = if let Some(metadata) = item.metadata {
             super::read_thread::stored_thread_from_sqlite_metadata_with_name(store, metadata, None)
                 .await?
@@ -291,6 +298,7 @@ pub(super) async fn search_threads(
         items.push(StoredThreadSearchResult {
             thread,
             snippet: item.snippet,
+            backwards_cursor,
         });
     }
     set_thread_search_result_names(store, &mut items, names, resolved_title_ids).await?;
@@ -303,6 +311,16 @@ fn cursor_from_thread_search_item(
     sort_key: ThreadSortKey,
     storage_path: crate::types::ThreadListStoragePath,
 ) -> Option<codex_rollout::Cursor> {
+    if storage_path == crate::types::ThreadListStoragePath::StateDb
+        && let Some(metadata) = &item.metadata
+    {
+        let timestamp = match sort_key {
+            ThreadSortKey::CreatedAt => metadata.created_at,
+            ThreadSortKey::UpdatedAt => metadata.updated_at,
+            ThreadSortKey::RecencyAt => metadata.recency_at,
+        };
+        return parse_cursor(&format!("{}|{}", timestamp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true), metadata.id));
+    }
     let physical_created_at = (storage_path == crate::types::ThreadListStoragePath::ScanAndRepair)
         .then(|| codex_rollout::rollout_created_at_key(&item.item.path))
         .flatten();

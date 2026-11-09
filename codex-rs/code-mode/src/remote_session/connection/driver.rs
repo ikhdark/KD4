@@ -38,6 +38,7 @@ pub(super) struct ConnectionDriver {
     pub(super) tool_catalog_references: bool,
     pub(super) named_state_snapshots: bool,
     pub(super) receipt_recovery: bool,
+    pub(super) timeout_pause: bool,
     catalogs: std::collections::HashMap<
         codex_code_mode_protocol::host::SessionId,
         (u64, Arc<[codex_code_mode_protocol::ToolDefinition]>),
@@ -70,6 +71,7 @@ impl ConnectionDriver {
                 tool_catalog_references: false,
                 named_state_snapshots: false,
                 receipt_recovery: false,
+                timeout_pause: false,
                 catalogs: std::collections::HashMap::new(),
                 command_rx,
                 event_rx,
@@ -157,6 +159,7 @@ impl ConnectionDriver {
         let keep_running = match event {
             DriverEvent::HostMessage(message) => self.handle_host_message(message),
             DriverEvent::DelegateCompleted { id, result } => self.complete_delegate(id, result),
+            DriverEvent::DelegateTimeoutPause { id, paused } => self.pause_delegate_timeout(id, paused),
             DriverEvent::RequestCancelled(id) => self.cancel_request(id),
             DriverEvent::Failed(reason) => {
                 self.fail(reason);

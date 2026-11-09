@@ -1170,7 +1170,10 @@ impl RolloutRecorder {
     }
 
     /// Load valid records plus a bounded, synthetic reconstruction notice when
-    /// records were skipped. Keeping the notice in the existing history carrier
+    /// operational records were skipped. Diagnostic ContextReplay snapshots are
+    /// excluded (including their referenced bodies); use for_each_rollout_item
+    /// for full diagnostic records and payload-integrity inspection.
+    /// Keeping the notice in the existing history carrier
     /// makes gaps visible even to consumers that discard the diagnostic count.
     /// It is not written back to the source rollout by this read.
     pub async fn load_rollout_items(
@@ -1204,11 +1207,16 @@ impl RolloutRecorder {
     )> {
         let mut items = Vec::new();
         let (thread_id, parse_errors, trailing_partial_records, unresolved_payloads, versions) =
-            Self::for_each_rollout_item_with_versions(
+            Self::for_each_rollout_item_with_versions_inner(
                 path,
                 false,
                 capture_payload_versions,
-                |item, _| items.push(item),
+                true,
+                |item, _| {
+                    if !matches!(item, RolloutItem::ContextReplay { .. }) {
+                        items.push(item);
+                    }
+                },
             )
             .await?;
         tracing::debug!(
@@ -1305,6 +1313,23 @@ impl RolloutRecorder {
         path: &Path,
         enroll_dependencies: bool,
         capture_payload_versions: bool,
+        visit: F,
+    ) -> std::io::Result<(
+        Option<ThreadId>, usize, usize, usize, Vec<crate::PayloadDependencyVersion>,
+    )>
+    where
+        F: FnMut(RolloutItem, usize),
+    {
+        Self::for_each_rollout_item_with_versions_inner(
+            path, enroll_dependencies, capture_payload_versions, false, visit,
+        ).await
+    }
+
+    async fn for_each_rollout_item_with_versions_inner<F>(
+        path: &Path,
+        enroll_dependencies: bool,
+        capture_payload_versions: bool,
+        exclude_context_replay: bool,
         mut visit: F,
     ) -> std::io::Result<(
         Option<ThreadId>,
@@ -1319,6 +1344,9 @@ impl RolloutRecorder {
         trace!("Resuming rollout from {path:?}");
         let mut decoder = RolloutRecordDecoder::default();
         let mut reader = compression::open_rollout_line_reader(path).await?;
+        if exclude_context_replay {
+            reader.exclude_context_replay();
+        }
         if codex_protocol::timing::observations::enabled() { reader.capture_source_revision(false); }
         if capture_payload_versions {
             reader.capture_payload_versions();
@@ -1328,6 +1356,10 @@ impl RolloutRecorder {
         }
         while let Some(line) = reader.next_line().await? {
             if line.trim().is_empty() {
+                continue;
+            }
+            if exclude_context_replay && crate::payload_artifact::is_context_replay_reference(&line) {
+                decoder.note_undecoded_record();
                 continue;
             }
             if let Some(item) = decoder.decode(&line, reader.last_line_terminated())? {

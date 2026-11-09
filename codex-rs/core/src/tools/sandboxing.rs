@@ -11,13 +11,18 @@ use crate::session::turn_context::TurnContext;
 use crate::state::SessionServices;
 use crate::tools::hook_names::HookToolName;
 use codex_file_system::FileSystemSandboxContext;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::approvals::ExecPolicyAmendment;
 use codex_protocol::approvals::NetworkApprovalContext;
 use codex_protocol::error::CodexErr;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemSandboxKind;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ReviewDecision;
+use codex_protocol::protocol::SessionSource;
 use codex_protocol::request_permissions::UriAdditionalPermissionProfile;
 use codex_sandboxing::SandboxCommand;
 use codex_sandboxing::SandboxTransformRequest;
@@ -34,6 +39,42 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::Arc;
+
+/// Shared by approval, provenance rechecks and actual launch. Read-only worker
+/// execution must not be mistaken for the parent's unsandboxed execution.
+pub(crate) fn command_permission_profile(turn: &TurnContext) -> PermissionProfile {
+    if matches!(turn.session_source, SessionSource::SubAgent(_)) {
+        read_only_command_permissions(&turn.permission_profile)
+    } else {
+        turn.permission_profile()
+    }
+}
+
+pub(crate) fn command_windows_sandbox_level(turn: &TurnContext) -> WindowsSandboxLevel {
+    if matches!(turn.session_source, SessionSource::SubAgent(_))
+        && turn.windows_sandbox_level == WindowsSandboxLevel::Disabled
+    {
+        // Unelevated isolation does not provision machine-wide sandbox accounts.
+        WindowsSandboxLevel::RestrictedToken
+    } else {
+        turn.windows_sandbox_level
+    }
+}
+
+/// Remove writes while preserving inherited readable roots and deny rules.
+pub(crate) fn read_only_command_permissions(profile: &PermissionProfile) -> PermissionProfile {
+    let mut file_system = profile.file_system_sandbox_policy();
+    if file_system.kind == FileSystemSandboxKind::Restricted {
+        for entry in &mut file_system.entries {
+            if entry.access == FileSystemAccessMode::Write {
+                entry.access = FileSystemAccessMode::Read;
+            }
+        }
+    } else {
+        file_system = FileSystemSandboxPolicy::read_only();
+    }
+    PermissionProfile::from_runtime_permissions(&file_system, NetworkSandboxPolicy::Restricted)
+}
 
 #[derive(Clone, Default, Debug)]
 pub(crate) struct ApprovalStore {
@@ -361,6 +402,11 @@ pub(crate) enum ToolError {
 
 pub(crate) trait ToolRuntime<Req, Out>: Approvable<Req> {
 
+    /// Opaque commands must not inherit a worker's source-write authority.
+    fn read_only_in_subagents(&self) -> bool {
+        false
+    }
+
     fn sandbox_cwd<'a>(&self, _req: &'a Req) -> Option<&'a PathUri> {
         None
     }
@@ -378,6 +424,8 @@ pub(crate) struct SandboxAttempt<'a> {
     pub sandbox: SandboxType,
     /// Whether policy requested sandboxing, independent of this host's concrete wrapper.
     pub sandbox_requested: bool,
+    /// Additional grants must not widen the mandatory worker command sandbox.
+    pub read_only: bool,
     pub permissions: &'a codex_protocol::models::PermissionProfile,
     /// Canonical permissions before this host materializes workspace roots.
     pub exec_server_permissions: &'a codex_protocol::models::PermissionProfile,
@@ -394,6 +442,11 @@ impl<'a> SandboxAttempt<'a> {
         command: SandboxCommand,
         options: ExecOptions,
     ) -> Result<crate::sandboxing::ExecRequest, CodexErr> {
+        if self.read_only && command.additional_permissions.is_some() {
+            return Err(CodexErr::UnsupportedOperation(
+                "Worker verification commands cannot request additional permissions".into(),
+            ));
+        }
         let execution = crate::tools::tool_dispatch_trace::active_tool_dispatch_timing()
             .map(|timing| timing.execution_id().0.clone()).unwrap_or_default();
         let observation = codex_protocol::timing::observations::Span::start(
@@ -442,6 +495,13 @@ impl<'a> SandboxAttempt<'a> {
         options: ExecOptions,
         additional_permissions_uri: Option<&UriAdditionalPermissionProfile>,
     ) -> Result<crate::sandboxing::ExecRequest, CodexErr> {
+        if self.read_only
+            && (command.additional_permissions.is_some() || additional_permissions_uri.is_some())
+        {
+            return Err(CodexErr::UnsupportedOperation(
+                "Worker verification commands cannot request additional permissions".into(),
+            ));
+        }
         let execution = crate::tools::tool_dispatch_trace::active_tool_dispatch_timing()
             .map(|timing| timing.execution_id().0.clone()).unwrap_or_default();
         let observation = codex_protocol::timing::observations::Span::start(

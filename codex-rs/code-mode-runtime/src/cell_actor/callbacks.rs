@@ -122,6 +122,7 @@ pub(super) fn spawn_tool<H: CellHost>(
         // yield cooperatively knows exactly how long it has.
         let deadline = (!timeout.is_zero()).then(|| tokio::time::Instant::now() + timeout);
         invocation.deadline = deadline.map(tokio::time::Instant::into_std);
+        let timer_cancellation = cancellation.clone();
         let callback = AssertUnwindSafe(async move {
             tokio::select! {
                 response = host.invoke_tool(invocation, cancellation) => response,
@@ -129,7 +130,23 @@ pub(super) fn spawn_tool<H: CellHost>(
                     if let Some(deadline) = deadline {
                         // Future construction and its first poll may consume
                         // time. Never restart the already-published budget.
-                        tokio::time::sleep_until(deadline).await;
+                        let mut pause = timer_cancellation.subscribe_timeout_pause();
+                        loop {
+                            let adjusted = pause.borrow_and_update().deadline(deadline.into_std());
+                            tokio::select! {
+                                biased;
+                                changed = pause.changed() => {
+                                    if changed.is_err() { std::future::pending::<()>().await; }
+                                }
+                                _ = async {
+                                    if let Some(adjusted) = adjusted {
+                                        tokio::time::sleep_until(adjusted.into()).await;
+                                    } else {
+                                        std::future::pending::<()>().await;
+                                    }
+                                } => break,
+                            }
+                        }
                     } else {
                         std::future::pending::<()>().await;
                     }
@@ -155,7 +172,9 @@ pub(super) fn spawn_tool<H: CellHost>(
         .await;
         // A callback's construction or first poll can synchronously cross the
         // deadline and still return Ready. Recheck when accepting its receipt.
-        let overdue = deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline);
+        let overdue = deadline.and_then(|deadline| receipt_cancellation.subscribe_timeout_pause()
+            .borrow().deadline(deadline.into_std()))
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline);
         if overdue {
             receipt_cancellation.cancel_with(CancellationCause::NestedDeadline);
         }

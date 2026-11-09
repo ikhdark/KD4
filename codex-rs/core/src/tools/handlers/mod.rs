@@ -14,7 +14,7 @@ mod checksum_file;
 mod classify_paths;
 mod compare_artifacts;
 mod dynamic;
-mod evidence_memory;
+pub(crate) mod evidence_memory;
 pub(crate) mod extension_tools;
 mod git_blame;
 mod git_conflicts;

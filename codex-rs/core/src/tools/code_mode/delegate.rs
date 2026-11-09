@@ -759,9 +759,22 @@ impl CoreTurnHost {
             .tool_runtime
             .clone()
             .with_code_mode_user_intent(invocation.cell_id.as_str(), authoring_epoch);
-        call_nested_tool(self.exec.clone(), tool_runtime, invocation, cancellation)
-            .await
-            .map_err(|error| error.model_message())
+        let mut paused = self.exec.session.subscribe_elicitation_pause_state();
+        let timeout_cancellation = cancellation.clone();
+        let call = call_nested_tool(self.exec.clone(), tool_runtime, invocation, cancellation);
+        tokio::pin!(call);
+        loop {
+            timeout_cancellation.set_timeout_paused(*paused.borrow_and_update());
+            tokio::select! {
+                biased;
+                changed = paused.changed() => {
+                    if changed.is_err() {
+                        return call.await.map_err(|error| error.model_message());
+                    }
+                }
+                result = &mut call => return result.map_err(|error| error.model_message()),
+            }
+        }
     }
 
     async fn notify(&self, call_id: String, cell_id: CellId, text: String) -> Result<(), String> {

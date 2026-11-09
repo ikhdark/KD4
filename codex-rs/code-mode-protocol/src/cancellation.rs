@@ -115,6 +115,24 @@ impl Eq for CancellationCauseCell {}
 pub struct NestedCancellation {
     token: CancellationToken,
     cause: Arc<CancellationCauseCell>,
+    timeout_pause: tokio::sync::watch::Sender<NestedTimeoutPause>,
+}
+
+/// Call-local timeout accounting. Human wait time is not machine execution time.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NestedTimeoutPause {
+    started: Option<std::time::Instant>,
+    completed: std::time::Duration,
+}
+
+impl NestedTimeoutPause {
+    pub fn is_paused(self) -> bool {
+        self.started.is_some()
+    }
+
+    pub fn deadline(self, original: std::time::Instant) -> Option<std::time::Instant> {
+        (!self.is_paused()).then(|| original.checked_add(self.completed).unwrap_or(original))
+    }
 }
 
 impl NestedCancellation {
@@ -122,6 +140,7 @@ impl NestedCancellation {
         Self {
             token,
             cause: Arc::new(CancellationCauseCell::new()),
+            timeout_pause: tokio::sync::watch::channel(NestedTimeoutPause::default()).0,
         }
     }
 
@@ -132,11 +151,30 @@ impl NestedCancellation {
         Self {
             token,
             cause: Arc::new(CancellationCauseCell::inherited(Arc::clone(&self.cause))),
+            timeout_pause: tokio::sync::watch::channel(NestedTimeoutPause::default()).0,
         }
     }
 
     pub fn token(&self) -> &CancellationToken {
         &self.token
+    }
+
+    pub fn subscribe_timeout_pause(&self) -> tokio::sync::watch::Receiver<NestedTimeoutPause> {
+        self.timeout_pause.subscribe()
+    }
+
+    pub fn set_timeout_paused(&self, paused: bool) {
+        self.timeout_pause.send_if_modified(|state| {
+            if paused == state.is_paused() {
+                return false;
+            }
+            if paused {
+                state.started = Some(std::time::Instant::now());
+            } else if let Some(started) = state.started.take() {
+                state.completed = state.completed.saturating_add(started.elapsed());
+            }
+            true
+        });
     }
 
     /// The shared cell, for an origin that signals a different token derived

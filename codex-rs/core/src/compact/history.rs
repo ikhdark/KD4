@@ -996,7 +996,8 @@ pub(crate) fn build_compacted_history(
     user_messages: &[CompactedUserMessage],
     summary_text: &str,
 ) -> Vec<ResponseItem> {
-    let (mut history, _retained_image_count, omitted_image_count, _selected_indices) =
+    let initial_len = initial_context.len();
+    let (mut history, _retained_image_count, omitted_image_count, selected_indices) =
         append_bounded_user_messages(
             initial_context,
             user_messages,
@@ -1013,6 +1014,28 @@ pub(crate) fn build_compacted_history(
     if omitted_image_count > 0 {
         summary_text.push_str("\n\n");
         summary_text.push_str(&compaction_image_omission_marker(omitted_image_count));
+    }
+
+    let retained = &history[initial_len..];
+    let incomplete = user_messages.iter().enumerate().filter(|(index, original)| {
+        let selected = selected_indices.iter().position(|selected| selected == index);
+        let original_text = original.content.iter().filter_map(|part| match part {
+            UserInput::Text { text, .. } => Some(text.as_str()), _ => None,
+        });
+        let selected_text = selected.and_then(|selected| retained.get(selected))
+            .into_iter().flat_map(|item| match item {
+                ResponseItem::Message { content, .. } => content.as_slice(), _ => &[],
+            }).filter_map(|part| match part {
+                ContentItem::InputText { text } | ContentItem::OutputText { text } => Some(text.as_str()), _ => None,
+            });
+        !original_text.eq(selected_text)
+    }).collect::<Vec<_>>();
+    if !incomplete.is_empty() {
+        // Bound the receipt independently of the historical message count.
+        let selectors = incomplete.iter().take(16).map(|(index, message)| {
+            serde_json::json!({"user_message_index": index, "response_item_id": message.source_item_id})
+        }).collect::<Vec<_>>();
+        summary_text.push_str(&format!("\n\n<legacy_user_text_omission incomplete_messages=\"{}\" selectors_shown=\"{}\">Earlier requirements are not superseded by omission. The active user-message text is incomplete. Recover exact originals from preceding user response_item records in this same rollout before relying on omitted wording. Indexes are zero-based within the pre-compaction user-message sequence; response item IDs, when present, are exact source search selectors: {}.</legacy_user_text_omission>", incomplete.len(), selectors.len(), serde_json::to_string(&selectors).unwrap_or_default()));
     }
 
     history.push(compaction_summary_item(summary_text));

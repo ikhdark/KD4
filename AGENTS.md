@@ -2,8 +2,14 @@
 
 Keep this file identical in both checkouts, keep project context.
 
+## Completion and workflow blockers
 
-- Leave no gaps.
+- Leave no gaps: keep the full requested outcome and every review item active until resolved. Partial, unverified and blocked items are unfinished, not a completed handoff; status questions do not cancel remaining work.
+- Treat any workflow blocker as work to resolve. Diagnose and repair its cause in the owning component, add missing reusable diagnostics/capture/replay/workload support when needed, then resume the original task. Do not stop at a blocker list or substitute a smaller successful task.
+- Reconcile each review item against current owning code and evidence. Close it only with a verified fix or an evidence-backed no-defect/not-applicable disposition; do not force speculative changes to clear counts.
+- Verify the requested behavior and affected valid behavior using permitted checks. Compilation, syntax checks, offline evidence and component success do not establish coverage of behavior they did not exercise.
+- Do not close code items as "source-checked" on inspection alone. Source-only verification is acceptable only for documentation or when it clearly and directly proves the exact acceptance claim; explain why it is sufficient. Otherwise verify the affected behavior with permitted execution, or keep the item unverified and resolve the verification blocker.
+- If a blocker genuinely requires a user decision, permission, credentials or unavailable external input, finish independent work, keep affected items open, and state the verified cause, attempted repairs and exact intervention needed. Do not bypass safeguards, expand permissions or claim completion by merely disclosing the gap.
 
 ## Read first
 
@@ -16,6 +22,20 @@ Before acting, read the README(s) relevant to the task and follow their linked a
 - [Reports and storage](../KDR/audits/README.md): output ownership, evidence retention and learning locations.
 
 Keep command syntax, inventories and storage maps in those guides, not duplicated here.
+
+### KDR usage
+
+Use KDR proactively whenever its existing diagnostics, benchmarks, or saved evidence can materially improve an investigation, implementation, or verification.
+
+- Discover and select relevant KDR capabilities rather than requiring the user to name them.
+- Prefer existing evidence and targeted diagnostics. Reuse completed analysis instead of rerunning it.
+- Run appropriate benchmarks when performance claims require measurement.
+- Do not run blanket scans, unrelated diagnostics, or redundant verification.
+- Opt-in diagnostic flags do not independently require user approval when their use is already authorized by the task.
+- Respect explicit restrictions on background monitoring, destructive operations, application control, and paid-model execution.
+- Preserve evidence uncertainty and distinguish observations from verified conclusions.
+
+KDR is a normal investigation and verification tool, not a mandatory step for every task.
 
 ## Working rules
 
@@ -33,6 +53,7 @@ Keep command syntax, inventories and storage maps in those guides, not duplicate
 - Before behavioral edits, establish a real defect or meaningful improvement, understand the current design and inspect relevant prior fixes/benchmark history. Weigh retained benefits, regressions, complexity and workflow impact; explicitly reason whether the evidence supports preserving, modifying or rejecting the prior approach.
 - For consequential changes informed by prior fixes, record relevant fix IDs, preserve/modify/reject decisions and an evidence-backed rationale before mutation. Use the existing patch assessment metadata when available, following the diagnostics guide; otherwise give a brief pre-edit explanation. Distinguish delivered context, observed reads and reported consideration. Missing records remain unknown, never an edit gate; do not create a separate per-fix artifact workflow.
 - Advisories are selective and non-blocking, not approval gates or proof of complete coverage. Do not make registry checks, historical reversal, proposal patches, per-fix receipts or unrelated benchmark campaigns routine prerequisites.
+- Use the [persistent fix ledger](../KDR/docs/operations/FIX_LEDGER.md) for registered findings: select unresolved work, require KDR behavioral evidence for verified closure, and preserve closed fixes unless relevant changes or new behavioral evidence invalidate affected proof. Overlap warnings never refuse edits, lock sessions or restrict normal write paths.
 
 ## Reporting
 

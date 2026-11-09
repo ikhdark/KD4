@@ -373,7 +373,7 @@ pub(crate) fn run_turn(
         if run_pending_session_start_hooks(&sess, &turn_context).await {
             return Ok(finish_stopped_session_start(&sess, &turn_context, input).await);
         }
-        let inspected = inspect_inputs(&sess, &turn_context, &input).await;
+        let inspected = inspect_inputs(&sess, &turn_context, &input).await?;
         if let Some(state) = sess
             .input_queue
             .turn_state_for_sub_id(&sess.active_turn, &turn_context.sub_id)
@@ -2646,7 +2646,7 @@ async fn inspect_and_record_owned_input(
     let inspected = inspect_inputs(owner, turn, &input)
         .or_cancel(cancellation)
         .await
-        .map_err(|_| CodexErr::TurnAborted)?;
+        .map_err(|_| CodexErr::TurnAborted)??;
     if cancellation.is_cancelled() {
         return Err(CodexErr::TurnAborted);
     }
@@ -2731,7 +2731,7 @@ async fn inspect_inputs(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     input: &[TurnInput],
-) -> InspectedInputs {
+) -> CodexResult<InspectedInputs> {
     let mut items = Vec::new();
     let mut blocked_input = false;
     let mut accepted_context_input = false;
@@ -2747,6 +2747,12 @@ async fn inspect_inputs(
         }
         let hook_outcome = inspect_pending_input(sess, turn_context, input_item).await;
         if hook_outcome.should_stop {
+            if let TurnInput::UserInput { content, client_id, .. } = input_item
+                && let Some((receipt, suffix)) = sess.pending_receipt_for_input(content, client_id.as_deref()).await?
+            {
+                // Rejection is a durable disposition, not runnable recovery.
+                sess.complete_input_receipt(&receipt, &suffix).await?;
+            }
             blocked_input = true;
             emit_hook_stop_reason(
                 sess,
@@ -2778,7 +2784,7 @@ async fn inspect_inputs(
                 .map(TurnInput::InternalResponseItem),
         );
     }
-    InspectedInputs {
+    Ok(InspectedInputs {
         items,
         outcome: RecordedInputOutcome {
             should_stop: blocked_input && !accepted_context_input,
@@ -2788,7 +2794,7 @@ async fn inspect_inputs(
             instructions_changed: renews_budget,
             renews_generation_budget: renews_budget,
         },
-    }
+    })
 }
 
 struct PendingTurnPlan {

@@ -1809,6 +1809,9 @@ fn clone_git_plugin_source(
 
 fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<(), String> {
     let mut command = Command::new("git");
+    for name in crate::startup_sync::REPOSITORY_LOCAL_GIT_ENVIRONMENT_VARIABLES {
+        command.env_remove(name);
+    }
     command.args(args);
     command.env("GIT_TERMINAL_PROMPT", "0");
     if let Some(cwd) = cwd {

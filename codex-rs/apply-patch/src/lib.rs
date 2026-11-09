@@ -619,6 +619,7 @@ async fn apply_hunks_with_verified_action(
     verified: Option<&ApplyPatchAction>,
 ) -> Result<AppliedPatchDelta, ApplyPatchFailure> {
     let mut delta = AppliedPatchDelta::unattempted(hunks, cwd);
+    let mut retained_deletions = RetainedDeletions::new();
     // Keep endpoint ownership alive through failure reconciliation and rollback,
     // not just the successful write path. Preflight has no filesystem effects.
     let mut _transaction = None;
@@ -649,11 +650,31 @@ async fn apply_hunks_with_verified_action(
             }
             ensure_rebased_updates_keep_their_sites(hunks, cwd, &previous_updates, &prepared, action)?;
         }
-        apply_hunks_to_files(hunks, revision_guards, cwd, fs, sandbox, &mut delta, prepared, &destinations, is_cancelled, verified.is_some() || !revision_guards.is_empty()).await
+        apply_hunks_to_files(hunks, revision_guards, cwd, fs, sandbox, &mut delta, &mut retained_deletions, prepared, &destinations, is_cancelled, verified.is_some() || !revision_guards.is_empty()).await
     }
     .await;
     match result {
         Ok(()) => {
+            // Settlement is after all hunks commit. Never roll back after some
+            // originals have been discarded; retain failed cleanup locators.
+            let mut errors = Vec::new();
+            for (path, files) in retained_deletions {
+                for (file, content) in files {
+                let retained_path = file.path.clone();
+                if let Err(error) = conditional_mutation_with_retention(
+                    fs, &path, Some(&content), None,
+                    codex_exec_server::FileMutationRetention::DiscardDeleted(file),
+                    sandbox, &mut delta.exact, &mut delta.manifest,
+                ).await {
+                    errors.push(format!("{error:#}; original object retained at {}", retained_path.display()));
+                }
+                }
+            }
+            if !errors.is_empty() {
+                let error = io::Error::other(format!("patch committed, but original-object settlement requires recovery: {}", errors.join("; ")));
+                let _ = writeln!(stderr, "{error}\n{}", delta.failure_summary());
+                return Err(ApplyPatchFailure::new(error.into(), delta));
+            }
             let summary = if delta.is_exact() && delta.is_empty() {
                 writeln!(stdout, "Success. unchanged: no file bytes were written.")
             } else {
@@ -677,7 +698,7 @@ async fn apply_hunks_with_verified_action(
                 .downcast_ref::<PatchRecoveryRequired>()
                 .map(|recovery| &recovery.path);
             let rollback_errors =
-                rollback_committed_changes(&mut delta, fs, sandbox, recovery_path).await;
+                rollback_committed_changes(&mut delta, &mut retained_deletions, fs, sandbox, recovery_path).await;
             delta.manifest.rolling_back = false;
             let error = if rollback_errors.is_empty() {
                 error
@@ -716,6 +737,7 @@ async fn apply_hunks_with_verified_action(
 /// edit or guess at originals that could not be captured as text.
 async fn rollback_committed_changes(
     delta: &mut AppliedPatchDelta,
+    retained_deletions: &mut RetainedDeletions,
     fs: &dyn ExecutorFileSystem,
     sandbox: Option<&FileSystemSandboxContext>,
     recovery_path: Option<&PathUri>,
@@ -823,18 +845,28 @@ async fn rollback_committed_changes(
             delta.manifest.uncertain(path);
             continue;
         }
-        let restored = conditional_mutation(
-            fs,
-            path,
-            expected,
-            original.map(|content| content.as_bytes().to_vec()),
-            sandbox,
-            &mut delta.exact,
-            &mut delta.manifest,
-        )
-        .await;
+        let retained = retained_deletions.get(path).and_then(|files| files.last());
+        let restored = if retained.is_some() || matches!(applied.change, AppliedPatchFileChange::Delete { .. }) {
+            if let Some((file, _)) = retained {
+                conditional_mutation_with_retention(
+                    fs, path, expected, original.map(|content| content.as_bytes().to_vec()),
+                    codex_exec_server::FileMutationRetention::RestoreDeleted(file.clone()),
+                    sandbox, &mut delta.exact, &mut delta.manifest,
+                ).await.map(|(receipt, _)| receipt)
+            } else {
+                delta.exact = false;
+                delta.manifest.uncertain(path);
+                Err(anyhow::anyhow!("deleted object is unavailable; refusing byte-only recreation of {path}"))
+            }
+        } else {
+            conditional_mutation(
+                fs, path, expected, original.map(|content| content.as_bytes().to_vec()),
+                sandbox, &mut delta.exact, &mut delta.manifest,
+            ).await
+        };
         match restored {
             Ok(_) => {
+                if let Some(files) = retained_deletions.get_mut(path) { files.pop(); }
                 delta.changes.remove(index);
             }
             Err(error) => {
@@ -845,7 +877,35 @@ async fn rollback_committed_changes(
             }
         }
     }
+    for (path, files) in retained_deletions.iter() {
+        for (file, _) in files {
+        errors.push(format!("original object for {path} retained at {}; do not overwrite competing edits", file.path.display()));
+        }
+    }
     errors
+}
+
+type RetainedDeletions = HashMap<PathUri, Vec<(codex_exec_server::RetainedFile, String)>>;
+
+async fn retain_deletion(
+    fs: &dyn ExecutorFileSystem,
+    path: &PathUri,
+    content: &str,
+    sandbox: Option<&FileSystemSandboxContext>,
+    delta: &mut AppliedPatchDelta,
+    retained_deletions: &mut RetainedDeletions,
+) -> anyhow::Result<()> {
+    let (_, file) = conditional_mutation_with_retention(
+        fs, path, Some(content), None, codex_exec_server::FileMutationRetention::RetainDeleted,
+        sandbox, &mut delta.exact, &mut delta.manifest,
+    ).await?;
+    let Some(file) = file else {
+        delta.exact = false;
+        delta.manifest.uncertain(path);
+        anyhow::bail!("executor did not retain the deleted object for {path}; refusing byte-only rollback");
+    };
+    retained_deletions.entry(path.clone()).or_default().push((file, content.to_owned()));
+    Ok(())
 }
 
 /// Apply the hunks to the filesystem, recording committed changes in the delta.
@@ -861,6 +921,7 @@ async fn apply_hunks_to_files(
     fs: &dyn ExecutorFileSystem,
     sandbox: Option<&FileSystemSandboxContext>,
     delta: &mut AppliedPatchDelta,
+    retained_deletions: &mut RetainedDeletions,
     mut prepared: Vec<Option<AppliedPatch>>,
     destinations: &HashMap<PathUri, Option<String>>,
     is_cancelled: &(dyn Fn() -> bool + Sync),
@@ -987,9 +1048,11 @@ async fn apply_hunks_to_files(
                         &path_uri,
                         overwritten_content.as_deref(),
                         contents.clone().into_bytes(),
+                        codex_exec_server::FileMutationRetention::None,
                         sandbox,
                         &mut delta.exact,
                         &mut delta.manifest,
+                        retained_deletions,
                     )
                     .await,
                     &path_uri,
@@ -1027,15 +1090,7 @@ async fn apply_hunks_to_files(
                     "source changed after patch preparation; refusing to delete {}",
                     path_uri.inferred_native_path_string()
                 );
-                if let Err(error) = conditional_mutation(
-                    fs,
-                    &path_uri,
-                    Some(&deleted_content),
-                    None,
-                    sandbox,
-                    &mut delta.exact,
-                    &mut delta.manifest,
-                )
+                if let Err(error) = retain_deletion(fs, &path_uri, &deleted_content, sandbox, delta, retained_deletions)
                 .await
                 .with_context(|| {
                     format!(
@@ -1119,9 +1174,18 @@ async fn apply_hunks_to_files(
                             &dest_uri,
                             overwritten_move_content.as_deref(),
                             new_contents.clone().into_bytes(),
+                            if overwritten_move_content.is_none() {
+                                codex_exec_server::FileMutationRetention::CopySourceSecurity {
+                                    source: path_uri.clone(),
+                                    expected: original_contents.as_bytes().to_vec(),
+                                }
+                            } else {
+                                codex_exec_server::FileMutationRetention::RetainReplaced
+                            },
                             sandbox,
                             &mut delta.exact,
                             &mut delta.manifest,
+                            retained_deletions,
                         )
                         .await,
                         &dest_uri,
@@ -1165,15 +1229,7 @@ async fn apply_hunks_to_files(
                         "move source changed during destination publication; refusing to remove {}",
                         path_uri.inferred_native_path_string()
                     );
-                    if let Err(error) = conditional_mutation(
-                        fs,
-                        &path_uri,
-                        Some(&original_contents),
-                        None,
-                        sandbox,
-                        &mut delta.exact,
-                        &mut delta.manifest,
-                    )
+                    if let Err(error) = retain_deletion(fs, &path_uri, &original_contents, sandbox, delta, retained_deletions)
                     .await
                     .with_context(|| {
                         format!(
@@ -1206,12 +1262,13 @@ async fn apply_hunks_to_files(
                 } else {
                     // An update requires the source to remain present; unlike add/move,
                     // it must not recreate a parent removed after the source read.
-                    let write_receipt = try_write!(
-                        conditional_mutation(
+                    let (write_receipt, retained) = try_write!(
+                        conditional_mutation_with_retention(
                             fs,
                             &path_uri,
                             Some(&original_contents),
                             Some(new_contents.clone().into_bytes()),
+                            codex_exec_server::FileMutationRetention::RetainReplaced,
                             sandbox,
                             &mut delta.exact,
                             &mut delta.manifest,
@@ -1227,6 +1284,9 @@ async fn apply_hunks_to_files(
                     if write_receipt.is_none() {
                         delta.manifest.finish_hunk();
                         continue;
+                    }
+                    if let Some(file) = retained {
+                        retained_deletions.entry(path_uri.clone()).or_default().push((file, original_contents.clone()));
                     }
                     delta.changes.push(AppliedPatchChange {
                         path: path_uri.to_path_buf(),
@@ -1727,12 +1787,19 @@ async fn write_file_with_missing_parent_retry(
     path: &PathUri,
     expected: Option<&str>,
     contents: Vec<u8>,
+    retention: codex_exec_server::FileMutationRetention,
     sandbox: Option<&FileSystemSandboxContext>,
     exact: &mut bool,
     manifest: &mut manifest::PatchManifest,
+    retained_deletions: &mut RetainedDeletions,
 ) -> anyhow::Result<Option<AppliedPatchWriteReceipt>> {
-    match conditional_mutation(fs, path, expected, Some(contents.clone()), sandbox, exact, manifest).await {
-        Ok(receipt) => Ok(receipt),
+    match conditional_mutation_with_retention(fs, path, expected, Some(contents.clone()), retention.clone(), sandbox, exact, manifest).await {
+        Ok((receipt, file)) => {
+            if let (Some(file), Some(content)) = (file, expected) {
+                retained_deletions.entry(path.clone()).or_default().push((file, content.to_owned()));
+            }
+            Ok(receipt)
+        }
         Err(err)
             if err
                 .downcast_ref::<io::Error>()
@@ -1748,8 +1815,14 @@ async fn write_file_with_missing_parent_retry(
                         )
                     })?;
             }
-            conditional_mutation(fs, path, expected, Some(contents), sandbox, exact, manifest)
+            conditional_mutation_with_retention(fs, path, expected, Some(contents), retention, sandbox, exact, manifest)
                 .await
+                .map(|(receipt, file)| {
+                    if let (Some(file), Some(content)) = (file, expected) {
+                        retained_deletions.entry(path.clone()).or_default().push((file, content.to_owned()));
+                    }
+                    receipt
+                })
                 .with_context(|| {
                     format!(
                         "Failed to write file {}",
@@ -1791,6 +1864,21 @@ async fn conditional_mutation(
     exact: &mut bool,
     manifest: &mut manifest::PatchManifest,
 ) -> anyhow::Result<Option<AppliedPatchWriteReceipt>> {
+    conditional_mutation_with_retention(fs, path, expected, replacement, codex_exec_server::FileMutationRetention::None, sandbox, exact, manifest)
+        .await.map(|(receipt, _)| receipt)
+}
+
+#[expect(clippy::too_many_arguments, reason = "Mutation settlement retains executor, sandbox and manifest ownership")]
+async fn conditional_mutation_with_retention(
+    fs: &dyn ExecutorFileSystem,
+    path: &PathUri,
+    expected: Option<&str>,
+    replacement: Option<Vec<u8>>,
+    retention: codex_exec_server::FileMutationRetention,
+    sandbox: Option<&FileSystemSandboxContext>,
+    exact: &mut bool,
+    manifest: &mut manifest::PatchManifest,
+) -> anyhow::Result<(Option<AppliedPatchWriteReceipt>, Option<codex_exec_server::RetainedFile>)> {
     use codex_exec_server::FileMutationOutcome;
     // Hash the actual raw write buffer, including BOM/encoding and terminators.
     // Publish it only on Committed; no subsequent path read can certify this write.
@@ -1799,10 +1887,11 @@ async fn conditional_mutation(
         bytes: bytes.len(),
     });
     let outcome = match fs
-        .mutate_file_if_matches(
+        .mutate_file_if_matches_with_retention(
             path,
             expected.map(|text| text.as_bytes().to_vec()),
             replacement,
+            retention,
             sandbox,
         )
         .await {
@@ -1814,8 +1903,9 @@ async fn conditional_mutation(
         };
     manifest.record(path, expected, receipt.as_ref(), &outcome);
     match outcome {
-        FileMutationOutcome::Committed => Ok(receipt),
-        FileMutationOutcome::Unchanged => Ok(None),
+        FileMutationOutcome::Committed => Ok((receipt, None)),
+        FileMutationOutcome::CommittedRetained { file } => Ok((receipt, Some(file))),
+        FileMutationOutcome::Unchanged => Ok((None, None)),
         FileMutationOutcome::Conflict => Err(PatchNoWriteConflict { path: path.clone() }.into()),
         FileMutationOutcome::RecoveryRequired {
             retained_path,

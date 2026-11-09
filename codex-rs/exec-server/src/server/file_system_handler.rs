@@ -213,7 +213,7 @@ impl FileSystemHandler {
         )?;
         let outcome = self
             .file_system
-            .mutate_file_if_matches(&params.path, expected, replacement, params.sandbox.as_ref())
+            .mutate_file_if_matches_with_retention(&params.path, expected, replacement, params.retention, params.sandbox.as_ref())
             .await
             .map_err(map_fs_error)?;
         Ok(crate::protocol::FsMutateFileIfMatchesResponse {

@@ -983,8 +983,14 @@ impl ExecServerClient {
         &self,
         params: crate::protocol::FsMutateFileIfMatchesParams,
     ) -> Result<crate::protocol::FsMutateFileIfMatchesResponse, ExecServerError> {
-        self.call(crate::protocol::FS_MUTATE_FILE_IF_MATCHES_METHOD, &params)
-            .await
+        let method = if params.retention == codex_file_system::FileMutationRetention::None {
+            crate::protocol::FS_MUTATE_FILE_IF_MATCHES_METHOD
+        } else {
+            // Old peers must reject before deletion, not silently ignore an
+            // unknown retention field and destroy the rollback object.
+            crate::protocol::FS_MUTATE_FILE_IF_MATCHES_RETAINED_METHOD
+        };
+        self.call(method, &params).await
     }
 
     pub async fn fs_create_directory(

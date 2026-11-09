@@ -149,7 +149,7 @@ impl ModelsCacheManager {
             "models cache: loaded cache file"
         );
         if header.client_version.as_deref() != Some(expected_version)
-            || header.effort_updates_schema != Some(1)
+            || header.effort_updates_schema != Some(2)
         {
             info!(
                 cache_path = %self.cache_path.display(),
@@ -263,13 +263,16 @@ impl ModelsCacheManager {
             return CacheWriteOutcome::RevisionConflict;
         }
         let cache = ModelsCache {
-            effort_updates_schema: Some(1),
+            effort_updates_schema: Some(2),
             revision: Some(next_revision(&current_basis.disk_revision)),
             fetched_at: Utc::now(),
             etag,
             client_version: Some(client_version),
             provider_cache_identity: Some(current_identity),
             models: models.to_vec(),
+            fallback_metadata_slugs: models.iter()
+                .filter(|model| model.used_fallback_model_metadata)
+                .map(|model| model.slug.clone()).collect(),
             default_instruction_slugs: models.iter()
                 .filter(|model| model.uses_default_base_instructions)
                 .map(|model| model.slug.clone())
@@ -325,7 +328,7 @@ impl ModelsCacheManager {
             ));
         }
         if header.client_version.as_deref() != Some(expected_version)
-            || header.effort_updates_schema != Some(1)
+            || header.effort_updates_schema != Some(2)
             || header.provider_cache_identity.as_deref() != Some(expected_identity)
             || header.etag.as_deref() != Some(expected_etag)
         {
@@ -456,6 +459,8 @@ pub(crate) struct ModelsCache {
     // Keep runtime provenance in the private cache, never the public catalog schema.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     default_instruction_slugs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fallback_metadata_slugs: Vec<String>,
 }
 
 /// Entry metadata decoded without the model list, which dominates the file.
@@ -587,6 +592,7 @@ fn decode_cache(contents: &[u8]) -> io::Result<ModelsCache> {
             .validate_capabilities()
             .map_err(|err| io::Error::new(ErrorKind::InvalidData, err))?;
         model.uses_default_base_instructions = cache.default_instruction_slugs.contains(&model.slug);
+        model.used_fallback_model_metadata = cache.fallback_metadata_slugs.contains(&model.slug);
     }
     Ok(cache)
 }

@@ -122,6 +122,7 @@ struct InitializedClientMetadata {
     supports_openai_form_elicitation: bool,
     rpc_gate: Arc<ConnectionRpcGate>,
     turn_start_cancellation: Option<CancellationToken>,
+    mobile_observation_id: Option<String>,
 }
 
 fn deserialize_client_request(request: JSONRPCRequest) -> Result<ClientRequest, JSONRPCErrorError> {
@@ -557,6 +558,32 @@ impl MessageProcessor {
         session: Arc<ConnectionSessionState>,
     ) {
         let request_method = request.method.as_str();
+        // Only the transport owner can establish a remote-control connection.
+        // Never infer phone provenance from a self-reported client name.
+        let mobile_observation_id = if codex_protocol::timing::observations::enabled()
+            && self.outgoing.connection_is_remote_control(connection_id).await
+        {
+            let operation = uuid::Uuid::now_v7().to_string();
+            let method = match request_method {
+                "initialize" | "fs/readFile" | "fs/readFileRange" | "fs/getMetadata"
+                | "fs/readDirectory" | "fs/writeFile" | "thread/read" | "thread/resume"
+                | "thread/turns/list" | "turn/start" | "turn/interrupt" => request_method,
+                _ => "other",
+            };
+            let _ = codex_protocol::timing::observations::record(
+                "mobile_rpc_received", "", "", &operation,
+                serde_json::json!({"schema_version":1, "connection_id":connection_id.0,
+                    "method":method, "boundary":"remote_control_server_ingress_not_phone_tap",
+                    "directory_path_facts":(request_method == "fs/readDirectory").then(|| {
+                        FsRequestProcessor::directory_path_facts(request.params.as_ref()
+                            .and_then(|params| params.get("path"))
+                            .and_then(serde_json::Value::as_str))
+                    })}),
+            );
+            Some(operation)
+        } else {
+            None
+        };
         tracing::trace!(
             ?connection_id,
             request_id = ?request.id,
@@ -568,6 +595,12 @@ impl MessageProcessor {
             || codex_app_server_protocol_types::client_request_is_control(&request.method))
             && serialized_request_bytes_up_to(&request, 64 * 1024) > 64 * 1024
         {
+            if let Some(operation) = mobile_observation_id.as_deref() {
+                let _ = codex_protocol::timing::observations::record(
+                    "mobile_rpc_rejected", "", "", operation,
+                    serde_json::json!({"reason":"control_envelope_too_large"}),
+                );
+            }
             self.outgoing
                 .send_unregistered_error(
                     ConnectionRequestId {
@@ -592,11 +625,18 @@ impl MessageProcessor {
             traceparent: trace.traceparent.clone(),
             tracestate: trace.tracestate.clone(),
         });
-        let request_context = RequestContext::new(request_id.clone(), request_span, request_trace);
+        let mut request_context = RequestContext::new(request_id.clone(), request_span, request_trace);
+        request_context.set_mobile_observation_id(mobile_observation_id);
         Self::run_request_with_context(
             Arc::clone(&self.outgoing),
             request_context.clone(),
             async {
+                let observation = request_context.mobile_observation_id().map(|operation| {
+                    codex_protocol::timing::observations::Span::start(
+                        "mobile_rpc_admission", "", "", operation,
+                        serde_json::json!({"boundary":"decode_and_dispatch_not_handler_completion"}),
+                    )
+                });
                 let codex_request = deserialize_client_request(request);
                 let result = match codex_request {
                     Ok(codex_request) => {
@@ -615,6 +655,10 @@ impl MessageProcessor {
                     }
                     Err(error) => Err(error),
                 };
+                if let Some(observation) = observation {
+                    observation.finish(if result.is_ok() { "dispatched_or_initialized" } else { "rejected" },
+                        serde_json::json!({"error_code":result.as_ref().err().map(|error| error.code)}));
+                }
                 if let Err(error) = result {
                     self.outgoing.queue_error(request_id.clone(), error).await;
                 }
@@ -974,6 +1018,9 @@ impl MessageProcessor {
             ClientRequest::TurnStart { params, .. } => {
                 Some(self.turn_processor.turn_start_cancellation(&params.thread_id).await?)
             }
+            ClientRequest::ThreadQueueStart { params, .. } => {
+                Some(self.turn_processor.turn_start_cancellation(&params.thread_id).await?)
+            }
             _ => None,
         };
         let client_metadata = InitializedClientMetadata {
@@ -982,12 +1029,22 @@ impl MessageProcessor {
             supports_openai_form_elicitation: session.supports_openai_form_elicitation(),
             rpc_gate: Arc::clone(&session.rpc_gate),
             turn_start_cancellation,
+            mobile_observation_id: request_context.mobile_observation_id().map(str::to_string),
         };
         let admission_error_request_id = connection_request_id.request_id.clone();
         let error_request_id = connection_request_id.clone();
         let rpc_gate = Arc::clone(&session.rpc_gate);
         let rpc_cancellation = rpc_gate.cancellation_token();
         let handler_rpc_gate = Arc::clone(&rpc_gate);
+        // These handlers can transfer effects to blocking/durable owners. Keep
+        // their publication and reconciliation in the serialized request owner.
+        let retain_settlement = matches!(&codex_request,
+            ClientRequest::ConfigValueWrite { .. } | ClientRequest::ConfigBatchWrite { .. }
+            | ClientRequest::SkillsExtraRootsSet { .. } | ClientRequest::SkillsConfigWrite { .. }
+            | ClientRequest::PluginInstall { .. } | ClientRequest::PluginUninstall { .. }
+            | ClientRequest::MarketplaceRemove { .. }
+            | ClientRequest::ThreadStart { .. } | ClientRequest::ThreadFork { .. }
+            | ClientRequest::ThreadResume { .. } | ClientRequest::ThreadInjectItems { .. });
         let processor = Arc::clone(self);
         let span = request_context.span();
         let request = QueuedInitializedRequest::new_with_estimated_bytes(
@@ -995,9 +1052,10 @@ impl MessageProcessor {
             estimated_request_bytes,
             async move {
                 let processor_for_request = Arc::clone(&processor);
+                if rpc_cancellation.is_cancelled() { return; }
                 tokio::select! {
                     biased;
-                    _ = rpc_cancellation.cancelled() => {}
+                    _ = rpc_cancellation.cancelled(), if !retain_settlement => {}
                     result = AssertUnwindSafe(processor_for_request.handle_initialized_client_request(
                         connection_request_id,
                         codex_request,
@@ -1023,7 +1081,7 @@ impl MessageProcessor {
                 }
             }
             .instrument(span),
-        );
+        ).retain_settlement(retain_settlement);
 
         if let Some(scope) = serialization_scope {
             let preparation_processor = Arc::clone(self);
@@ -1168,12 +1226,20 @@ impl MessageProcessor {
                 supports_openai_form_elicitation,
                 rpc_gate,
                 turn_start_cancellation,
+                mobile_observation_id,
             } = client_metadata;
             let connection_id = connection_request_id.connection_id;
             let request_id = ConnectionRequestId {
                 connection_id,
                 request_id: codex_request.id().clone(),
             };
+            let observation = mobile_observation_id.as_deref().map(|operation| {
+                codex_protocol::timing::observations::Span::start(
+                    "mobile_rpc_handler", "", "", operation,
+                    serde_json::json!({"method":codex_request.method_name(),
+                        "connection_id":connection_id.0, "boundary":"initialized_handler"}),
+                )
+            });
 
             let result: Result<Option<ClientResponsePayload>, JSONRPCErrorError> =
                 match codex_request {
@@ -1229,6 +1295,7 @@ impl MessageProcessor {
                         .disable(
                             params.is_some_and(|params| params.ephemeral),
                             app_server_client_name.as_deref(),
+                            &request_id.request_id.to_string(),
                         )
                         .await
                         .map(|response| Some(response.into())),
@@ -1266,12 +1333,12 @@ impl MessageProcessor {
                     }
                     ClientRequest::FsReadFile { params, .. } => self
                         .fs_processor
-                        .read_file(params)
+                        .read_file(params, mobile_observation_id.as_deref())
                         .await
                         .map(|response| Some(response.into())),
                     ClientRequest::FsReadFileRange { params, .. } => self
                         .fs_processor
-                        .read_file_range(params)
+                        .read_file_range(params, mobile_observation_id.as_deref())
                         .await
                         .map(|response| Some(response.into())),
                     ClientRequest::FsWriteFile { params, .. } => self
@@ -1286,12 +1353,12 @@ impl MessageProcessor {
                         .map(|response| Some(response.into())),
                     ClientRequest::FsGetMetadata { params, .. } => self
                         .fs_processor
-                        .get_metadata(params)
+                        .get_metadata(params, mobile_observation_id.as_deref())
                         .await
                         .map(|response| Some(response.into())),
                     ClientRequest::FsReadDirectory { params, .. } => self
                         .fs_processor
-                        .read_directory(params)
+                        .read_directory(params, mobile_observation_id.as_deref())
                         .await
                         .map(|response| Some(response.into())),
                     ClientRequest::FsRemove { params, .. } => self
@@ -1474,6 +1541,7 @@ impl MessageProcessor {
                                 client_version: client_version.clone(),
                                 supports_openai_form_elicitation,
                             },
+                            turn_start_cancellation,
                         )
                         .await
                         .map(|response| Some(response.into())),
@@ -1786,6 +1854,16 @@ impl MessageProcessor {
                     }
                 };
 
+            if let Some(observation) = observation {
+                observation.finish(if result.is_ok() { "handler_returned" } else { "error" },
+                    serde_json::json!({"error_code":result.as_ref().err().map(|error| error.code),
+                        "inline_response_payload":matches!(&result, Ok(Some(_)))}));
+            }
+            let response_observation = mobile_observation_id.as_deref()
+                .filter(|_| !matches!(&result, Ok(None)))
+                .map(|operation| codex_protocol::timing::observations::Span::start(
+                    "mobile_rpc_response", "", "", operation,
+                    serde_json::json!({"boundary":"response_owner_not_peer_receipt"})));
             match result {
                 Ok(Some(response)) => {
                     self.outgoing
@@ -1796,6 +1874,9 @@ impl MessageProcessor {
                 Err(error) => {
                     self.outgoing.send_error(request_id.clone(), error).await;
                 }
+            }
+            if let Some(observation) = response_observation {
+                observation.finish("owner_returned_not_peer_receipt", serde_json::Value::Null);
             }
             Ok(())
         })

@@ -29,6 +29,8 @@ param(
     [switch]$AllowRustyV8Download,
     [string]$RustyV8Archive,
     [switch]$ConfigureDesktopLocalCli,
+    [switch]$PublishForkFrontend,
+    [string]$ForkRoot,
     [switch]$RestartDesktop,
     [switch]$RestartDesktopIfNeeded,
     # Explicitly permit stopping live runtime/Desktop processes across homes.
@@ -481,18 +483,19 @@ function Get-DefaultLocalCodexSqliteHome {
 function Get-LocalPublishCommand {
     param([string]$Profile)
 
-    if ($Profile -eq "release") {
-        return "just publish-local-codex-final"
+    if ($Profile -eq "release" -and $PublishForkFrontend) {
+        return "just publish-local-codex-final -ForkRoot `"$ForkRoot`""
     }
 
     $publisherPath = Join-Path $PSScriptRoot "publish-local-codex.ps1"
+    $frontendArgs = if ($PublishForkFrontend) { " -PublishForkFrontend -ForkRoot `"$ForkRoot`"" } else { "" }
     if ($Profile -eq "pgo" -and -not [string]::IsNullOrWhiteSpace($PgoGenerateDirectory)) {
         return "powershell -NoProfile -ExecutionPolicy Bypass -File `"$publisherPath`" -Concise -AutoSkipBuild -NoSccache -BuildOnly -Profile $Profile -PgoGenerateDirectory `"$PgoGenerateDirectory`""
     }
     if ($Profile -eq "pgo") {
-        return "powershell -NoProfile -ExecutionPolicy Bypass -File `"$publisherPath`" -Concise -SkipBuild -NoSccache -Profile $Profile -PgoProfileData `"$PgoProfileData`" -ConfigureDesktopLocalCli -RestartDesktopIfNeeded"
+        return "powershell -NoProfile -ExecutionPolicy Bypass -File `"$publisherPath`" -Concise -SkipBuild -NoSccache -Profile $Profile -PgoProfileData `"$PgoProfileData`" -ConfigureDesktopLocalCli -RestartDesktopIfNeeded$frontendArgs"
     }
-    return "powershell -NoProfile -ExecutionPolicy Bypass -File `"$publisherPath`" -Concise -AutoSkipBuild -Profile $Profile -ConfigureDesktopLocalCli -RestartDesktopIfNeeded"
+    return "powershell -NoProfile -ExecutionPolicy Bypass -File `"$publisherPath`" -Concise -AutoSkipBuild -Profile $Profile -ConfigureDesktopLocalCli -RestartDesktopIfNeeded$frontendArgs"
 }
 
 function Get-LocalPublishBuildTarget {
@@ -1561,10 +1564,16 @@ function Write-ProofLine {
 }
 
 function Get-CodexDesktopLaunchCommand {
+    if ($PublishForkFrontend) {
+        return ('"{0}"' -f (Join-Path $ForkRoot "Launch Codex Fork.cmd"))
+    }
     return "explorer.exe shell:AppsFolder\$CodexDesktopAppId"
 }
 
 function Get-CodexDesktopPackageProof {
+    if ($PublishForkFrontend) {
+        return "local fork: $ForkRoot"
+    }
     $package = Get-CodexDesktopPackage
     if ($package -is [string]) {
         return $package
@@ -1610,6 +1619,9 @@ function Get-CodexDesktopPackage {
 }
 
 function Get-CodexDesktopExecutableProof {
+    if ($PublishForkFrontend) {
+        return (Join-Path $ForkRoot "app\ChatGPT.exe")
+    }
     $package = Get-CodexDesktopPackage
     if ($package -is [string]) {
         return $package
@@ -1649,6 +1661,23 @@ function Get-CodexDesktopExecutableProof {
     }
 
     return $path
+}
+
+function Invoke-ForkFrontendPublish {
+    # The fork owns cumulative packaging, source freshness, integrity and rollback.
+    # Never copy app.asar here or close the fork to bypass its running-app guard.
+    $arguments = @("-B", (Join-Path $ForkRoot "patches\deployment.py"), "publish")
+    if ($DryRun) { $arguments += "--dry-run" }
+    $output = @(& python @arguments)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Fork frontend publish failed; no Desktop restart attempted. $($output -join [Environment]::NewLine)"
+    }
+    $result = $output[-1] | ConvertFrom-Json
+    foreach ($line in @($output | Select-Object -SkipLast 1)) { Write-Host $line }
+    $state = if ($DryRun -and $result.changed) { "would install" } elseif ($result.changed) { "installed" } else { "already current" }
+    Write-Host "frontendPublish: $state KD v$($result.kdVersion)"
+    if ($result.bundle) { Write-Host "frontendRollbackBundle: $($result.bundle)" }
+    return [bool]$result.changed
 }
 
 function Write-DesktopProof {
@@ -2218,6 +2247,11 @@ function Test-DesktopRuntimeProof {
         $process.StartInfo.FileName = $TargetPath
         $process.StartInfo.Arguments = "doctor --json --summary --runtime-only"
         $process.StartInfo.EnvironmentVariables["CODEX_CLI_PATH"] = $TargetPath
+        if ($PublishForkFrontend) {
+            # Select the expected peer, not an attestation: doctor still verifies
+            # live stdio handles, executable and creation identities itself.
+            $process.StartInfo.EnvironmentVariables["CODEX_DOCTOR_DESKTOP_PATH"] = Get-CodexDesktopExecutableProof
+        }
         if (-not [string]::IsNullOrWhiteSpace($LocalCodexHome)) {
             $process.StartInfo.EnvironmentVariables["CODEX_HOME"] = $LocalCodexHome
         }
@@ -3699,6 +3733,19 @@ if ($ImportOnly) {
 }
 
 $repoRoot = Get-RepoRoot -Override $RepoRoot
+if ($PublishForkFrontend) {
+    if ([string]::IsNullOrWhiteSpace($ForkRoot)) {
+        $ForkRoot = Join-Path (Split-Path -Parent $repoRoot) "Codex-Fork"
+    }
+    $ForkRoot = Resolve-AbsolutePath $ForkRoot
+    if (-not $BuildOnly -and -not $PrintBuiltCodexPath) {
+        foreach ($member in @("patches\deployment.py", "app\ChatGPT.exe", "Launch Codex Fork.cmd")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $ForkRoot $member) -PathType Leaf)) {
+                throw "Fork frontend is unavailable: $ForkRoot\$member. Select the editable installation with -ForkRoot."
+            }
+        }
+    }
+}
 $pgoConfiguration = Get-LocalPublishPgoConfiguration -RepoRoot $repoRoot -Profile $Profile `
     -GenerateDirectory $PgoGenerateDirectory -ProfileData $PgoProfileData
 if ($null -ne $pgoConfiguration -and $pgoConfiguration.mode -eq "generate" -and -not $BuildOnly -and -not $PrintBuiltCodexPath) {
@@ -4271,6 +4318,16 @@ if (-not $DryRun -and $binaryChanged -and -not $AllowRunningTarget) {
     Assert-CodexProcessesMayBeStopped -Processes $runningTargetProcesses -Force:$Force
 }
 
+$frontendChanged = $false
+if ($PublishForkFrontend) {
+    if ($skipBuildBlockedByStaleSource -and -not $DryRun) {
+        Write-Host "frontendPublish: skipped: backend source build stale"
+    }
+    else {
+        $frontendChanged = Invoke-ForkFrontendPublish
+    }
+}
+
 $desktopRoutingResult = [pscustomobject]@{
     Changed = $false
     RestartRequired = $false
@@ -4297,7 +4354,7 @@ if ($ConfigureDesktopLocalCli) {
 
 $desktopRuntimeProofUnavailable = $false
 if ($RestartDesktopIfNeeded -and -not $RestartDesktop) {
-    $RestartDesktop = $binaryChanged -or $desktopRoutingResult.RestartRequired
+    $RestartDesktop = $binaryChanged -or $frontendChanged -or $desktopRoutingResult.RestartRequired
     if (-not $RestartDesktop -and -not $DryRun) {
         $desktopRuntimeProofFailure = $null
         $runtimeMatches = Test-DesktopRuntimeProof `
@@ -4342,7 +4399,7 @@ if ($DryRun) {
     }
     else {
         Write-ProofLine "replace" $(if ($binaryChanged) { "not run" } else { "not run: target already current" })
-        Write-ProofLine "restartRequired" $(if ($binaryChanged -or $desktopRoutingResult.RestartRequired) { "true" } else { "false" })
+        Write-ProofLine "restartRequired" $(if ($binaryChanged -or $frontendChanged -or $desktopRoutingResult.RestartRequired) { "true" } else { "false" })
     }
 
     if ($RestartDesktop) {
@@ -4401,7 +4458,7 @@ if (-not $binaryChanged) {
     Write-ProofLine "codeModeHostBackupSha256" "<none: target already current>"
     Write-ProofLine "windowsSandboxSetupBackupSha256" "<none: target already current>"
     Write-ProofLine "commandRunnerBackupSha256" "<none: target already current>"
-    Write-ProofLine "restartRequired" $(if ($desktopRoutingResult.RestartRequired) { "true" } else { "false" })
+    Write-ProofLine "restartRequired" $(if ($frontendChanged -or $desktopRoutingResult.RestartRequired) { "true" } else { "false" })
 
     $publishCommitted = $true
     Write-ProofLine "publishCommitted" "true"

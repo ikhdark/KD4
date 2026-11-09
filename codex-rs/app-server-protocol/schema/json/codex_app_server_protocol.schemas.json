@@ -6351,6 +6351,11 @@
             "null"
           ]
         },
+        "isBlocking": {
+          "default": false,
+          "description": "Keep the prompt open without auto-resolution until the user responds or cancels.",
+          "type": "boolean"
+        },
         "itemId": {
           "type": "string"
         },
@@ -13295,6 +13300,13 @@
               "string",
               "null"
             ]
+          },
+          "loginId": {
+            "description": "Matches the explicit login response; automatic plugin login has no request ID.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -13344,6 +13356,13 @@
         "properties": {
           "authorizationUrl": {
             "type": "string"
+          },
+          "loginId": {
+            "description": "Correlates this request with its asynchronous completion; absent on older peers.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [

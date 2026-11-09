@@ -45,7 +45,7 @@ const COMMAND_MAX_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CURATED_PLUGINS_STALE_TEMP_DIR_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 // These variables can redirect Git away from the repository selected by `-C`,
 // or inject command-scoped configuration into the sync commands.
-const REPOSITORY_LOCAL_GIT_ENVIRONMENT_VARIABLES: &[&str] = &[
+pub(crate) const REPOSITORY_LOCAL_GIT_ENVIRONMENT_VARIABLES: &[&str] = &[
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_CEILING_DIRECTORIES",
     "GIT_COMMON_DIR",

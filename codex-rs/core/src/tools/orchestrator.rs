@@ -13,7 +13,10 @@ use crate::tools::sandboxing::SandboxOverride;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::ToolRuntime;
+use crate::tools::sandboxing::command_permission_profile;
+use crate::tools::sandboxing::command_windows_sandbox_level;
 use crate::tools::sandboxing::default_exec_approval_requirement;
+use crate::tools::sandboxing::read_only_command_permissions;
 use crate::tools::sandboxing::sandbox_override_for_first_attempt;
 use codex_hooks::PermissionRequestDecision;
 use codex_otel::ToolDecisionSource;
@@ -21,6 +24,7 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ReviewDecision;
+use codex_protocol::protocol::SessionSource;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
 use codex_sandboxing::select_initial;
@@ -68,9 +72,35 @@ impl ToolOrchestrator {
         let otel_tn = flat_tool_name(&tool_ctx.tool_name).into_owned();
         let otel_ci = &tool_ctx.call_id;
 
-        // 1) Approval
-        let file_system_sandbox_policy = turn_ctx.file_system_sandbox_policy();
-        let network_sandbox_policy = turn_ctx.network_sandbox_policy();
+        // Shell permission is permission to verify, not to implement fixes.
+        // Keep patch scopes independent, and constrain both local and remote
+        // launches even when the parent runs without a sandbox.
+        let read_only = tool.read_only_in_subagents()
+            && matches!(turn_ctx.session_source, SessionSource::SubAgent(_));
+        if read_only && tool.sandbox_permissions(req).requires_escalated_permissions() {
+            return Err(ToolError::Denied(
+                "Worker verification commands cannot bypass the read-only sandbox".into(),
+            ));
+        }
+        let permissions = if read_only {
+            command_permission_profile(turn_ctx)
+        } else {
+            turn_ctx.permission_profile()
+        };
+        let exec_server_permissions = if read_only {
+            read_only_command_permissions(turn_ctx.config.permissions.permission_profile())
+        } else {
+            turn_ctx.config.permissions.permission_profile().clone()
+        };
+        let windows_sandbox_level = if read_only {
+            command_windows_sandbox_level(turn_ctx)
+        } else {
+            turn_ctx.windows_sandbox_level
+        };
+
+        // 1) Approval. Existing prohibitions and approval policy remain in force.
+        let file_system_sandbox_policy = permissions.file_system_sandbox_policy();
+        let network_sandbox_policy = permissions.network_sandbox_policy();
         let requirement = tool.exec_approval_requirement(req).unwrap_or_else(|| {
             default_exec_approval_requirement(approval_policy, &file_system_sandbox_policy)
         });
@@ -109,11 +139,15 @@ impl ToolOrchestrator {
         }
 
         // 2) First attempt under the selected sandbox.
-        let sandbox_override = sandbox_override_for_first_attempt(
-            tool.sandbox_permissions(req),
-            &requirement,
-            &file_system_sandbox_policy,
-        );
+        let sandbox_override = if read_only {
+            SandboxOverride::NoOverride
+        } else {
+            sandbox_override_for_first_attempt(
+                tool.sandbox_permissions(req),
+                &requirement,
+                &file_system_sandbox_policy,
+            )
+        };
         let sandbox_preference = SandboxablePreference::Auto;
         let sandbox_requested = match sandbox_override {
             SandboxOverride::BypassSandboxFirstAttempt => false,
@@ -129,7 +163,7 @@ impl ToolOrchestrator {
                 &file_system_sandbox_policy,
                 network_sandbox_policy,
                 sandbox_preference,
-                turn_ctx.windows_sandbox_level,
+                windows_sandbox_level,
                 false,
             )
         } else {
@@ -145,11 +179,12 @@ impl ToolOrchestrator {
             codex_home: &turn_ctx.config.codex_home,
             sandbox: initial_sandbox,
             sandbox_requested,
-            permissions: &turn_ctx.permission_profile,
-            exec_server_permissions: turn_ctx.config.permissions.permission_profile(),
+            read_only,
+            permissions: &permissions,
+            exec_server_permissions: &exec_server_permissions,
             sandbox_cwd: &sandbox_policy_cwd,
             workspace_roots,
-            windows_sandbox_level: turn_ctx.windows_sandbox_level,
+            windows_sandbox_level,
             windows_sandbox_private_desktop: turn_ctx
                 .config
                 .permissions

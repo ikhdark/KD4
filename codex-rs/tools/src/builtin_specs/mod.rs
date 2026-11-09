@@ -30,8 +30,6 @@ pub use multi_agents_spec::create_spawn_agent_tool_v2;
 pub use multi_agents_spec::create_wait_agent_tool_v2;
 pub use multi_agents_spec::criterion_evidence_policy_schema;
 pub use plan_spec::create_update_plan_tool;
-pub use request_user_input_spec::MAX_AUTO_RESOLUTION_MS;
-pub use request_user_input_spec::MIN_AUTO_RESOLUTION_MS;
 pub use request_user_input_spec::REQUEST_USER_INPUT_TOOL_NAME;
 pub use request_user_input_spec::create_request_user_input_tool;
 pub use request_user_input_spec::normalize_request_user_input_args;

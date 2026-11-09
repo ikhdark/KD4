@@ -97,12 +97,13 @@ struct BufferedServerEnvelope {
     segment_id: Option<usize>,
     payload: tungstenite::Utf8Bytes,
     delivery_failure: Option<CancellationToken>,
+    replay_credit: Arc<super::ReplayCredit>,
 }
 
 impl BufferedServerEnvelope {
 
 
-    fn from_payload(encoded: EncodedServerPayload, delivery_failure: Option<CancellationToken>) -> Self {
+    fn from_payload(encoded: EncodedServerPayload, delivery_failure: Option<CancellationToken>, replay_credit: Arc<super::ReplayCredit>) -> Self {
         Self {
             client_id: encoded.client_id,
             stream_id: encoded.stream_id,
@@ -110,6 +111,7 @@ impl BufferedServerEnvelope {
             segment_id: encoded.segment_id,
             payload: encoded.payload.into(),
             delivery_failure,
+            replay_credit,
         }
     }
 }
@@ -119,6 +121,25 @@ struct ScheduledServerFrame {
     payload: tungstenite::Utf8Bytes,
     completion: Option<oneshot::Sender<std::time::Instant>>,
     delivery_failure: Option<CancellationToken>,
+    _replay_credit: Arc<super::ReplayCredit>,
+}
+
+// Custody survives a socket worker's cancellation. At most one envelope is
+// removed from the channel before it reaches replay, including its encoder.
+struct ServerEventReceiver {
+    receiver: mpsc::Receiver<super::QueuedServerEnvelope>,
+    queued: Option<super::QueuedServerEnvelope>,
+    encoding: Option<PendingServerEncoding>,
+}
+
+struct PendingServerEncoding {
+    key: (ClientId, StreamId),
+    seq_id: u64,
+    completion: Option<oneshot::Sender<std::time::Instant>>,
+    delivery_failure: Option<CancellationToken>,
+    task: AbortOnDropHandle<io::Result<Vec<EncodedServerPayload>>>,
+    encoded: Option<io::Result<Vec<EncodedServerPayload>>>,
+    replay_credit: Arc<super::ReplayCredit>,
 }
 
 // Sequence tombstones protect reconnect replay until the transport generation
@@ -136,10 +157,10 @@ impl ServerWriterQueue {
     fn is_empty(&self) -> bool { self.ready.is_empty() }
 
     fn push(&mut self, key: (ClientId, StreamId), payload: tungstenite::Utf8Bytes,
-        completion: Option<oneshot::Sender<std::time::Instant>>, delivery_failure: Option<CancellationToken>) {
+        completion: Option<oneshot::Sender<std::time::Instant>>, delivery_failure: Option<CancellationToken>, replay_credit: Arc<super::ReplayCredit>) {
         let stream = self.streams.entry(key.clone()).or_default();
         if stream.is_empty() { self.ready.push_back(key); }
-        stream.push_back(ScheduledServerFrame { payload, completion, delivery_failure });
+        stream.push_back(ScheduledServerFrame { payload, completion, delivery_failure, _replay_credit: replay_credit });
     }
 
     fn pop(&mut self) -> Option<ScheduledServerFrame> {
@@ -154,76 +175,81 @@ impl ServerWriterQueue {
     async fn enqueue(
         &mut self,
         state: &Mutex<WebsocketState>,
-        queued: super::QueuedServerEnvelope,
+        receiver: &mut ServerEventReceiver,
         ping_interval: &mut tokio::time::Interval,
         websocket_writer: &mut (impl futures::Sink<tungstenite::Message, Error = tungstenite::Error> + Unpin),
         shutdown: &CancellationToken,
     ) -> io::Result<Option<((ClientId, StreamId), u64)>> {
-        if queued.delivery_failure.as_ref().is_some_and(CancellationToken::is_cancelled) {
-            return Ok(None);
-        }
-        let key = (queued.client_id.clone(), queued.stream_id.clone());
-        let seq_id = {
+        if receiver.encoding.is_none() {
+            // Leave the original in shared custody across this await as well.
             let state = state.lock().await;
+            let Some(queued) = receiver.queued.as_ref() else { return Ok(None) };
+            if queued.delivery_failure.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                receiver.queued = None;
+                return Ok(None);
+            }
+            let key = (queued.client_id.clone(), queued.stream_id.clone());
             if state.next_seq_id_by_stream.len() >= MAX_TRANSPORT_STREAM_IDENTITIES
                 && !state.next_seq_id_by_stream.contains_key(&key)
             {
                 return Err(io::Error::new(ErrorKind::WouldBlock, "remote control stream identity capacity reached; retiring transport generation"));
             }
-            *state.next_seq_id_by_stream.get(&key).unwrap_or(&1)
-        };
-        let envelope = ServerEnvelope {
-            event: queued.event, client_id: queued.client_id, stream_id: queued.stream_id, seq_id,
-        };
-        // Complete encoding before publishing any sequence/replay mutation.
-        let encoding_admission = state.lock().await.encoding_admission.clone();
-        let encoding = async move {
-            let permit = encoding_admission.acquire_owned().await.map_err(io::Error::other)?;
-            tokio::task::spawn_blocking(move || {
-                // Retain the permit in the actual blocking owner even if the
-                // socket generation is canceled while encoding is in progress.
-                let _permit = permit;
-                encode_server_payloads_for_transport(envelope)
-            }).await.map_err(io::Error::other)?
-        };
-        tokio::pin!(encoding);
-        let encoded = loop {
+            let seq_id = *state.next_seq_id_by_stream.get(&key).unwrap_or(&1);
+            let encoding_admission = state.encoding_admission.clone();
+            let Some(queued) = receiver.queued.take() else { return Ok(None) };
+            let envelope = ServerEnvelope {
+                event: queued.event, client_id: queued.client_id, stream_id: queued.stream_id, seq_id,
+            };
+            receiver.encoding = Some(PendingServerEncoding {
+                key, seq_id, completion: queued.write_complete_tx,
+                delivery_failure: queued.delivery_failure,
+                encoded: None,
+                replay_credit: queued.replay_credit,
+                task: AbortOnDropHandle::new(tokio::spawn(async move {
+                    let permit = encoding_admission.acquire_owned().await.map_err(io::Error::other)?;
+                    tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        encode_server_payloads_for_transport(envelope)
+                    }).await.map_err(io::Error::other)?
+                })),
+            });
+        }
+        let Some(encoding) = receiver.encoding.as_mut() else { return Ok(None) };
+        while encoding.encoded.is_none() {
             tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => return Ok(None),
                 _ = ping_interval.tick() => {
                     writer_operation(shutdown, websocket_writer.send(tungstenite::Message::Ping(Vec::new().into()))).await?;
                 }
-                result = &mut encoding => break result,
+                result = &mut encoding.task => {
+                    // Retain even a completed result before the replay lock await.
+                    encoding.encoded = Some(result.map_err(io::Error::other).and_then(|result| result));
+                }
             }
-        };
+        }
+        let mut state = state.lock().await;
+        let Some(mut encoding) = receiver.encoding.take() else { return Ok(None) };
+        let Some(encoded) = encoding.encoded.take() else { return Ok(None) };
+        let key = encoding.key;
+        let seq_id = encoding.seq_id;
         let encoded = match encoded {
             Ok(encoded) => encoded,
             Err(error) => {
-                // No sequence/replay entry exists yet. Retire only the owning
-                // virtual connection and drop its unsuccessful write receipt;
-                // restarting the shared socket cannot recover this envelope.
                 warn!(client_id = %key.0.0, stream_id = %key.1.0, %error,
                     "retiring remote client after outbound encoding failure");
-                if let Some(failure) = queued.delivery_failure {
-                    failure.cancel();
-                }
+                if let Some(failure) = encoding.delivery_failure { failure.cancel(); }
                 return Ok(None);
             }
         };
-        let count = encoded.len();
-        let mut completion = queued.write_complete_tx;
-        let mut state = state.lock().await;
-        if queued.delivery_failure.as_ref().is_some_and(CancellationToken::is_cancelled) {
+        if encoding.delivery_failure.as_ref().is_some_and(CancellationToken::is_cancelled) {
             return Ok(None);
         }
-        if *state.outbound_buffer.used_tx.borrow() >= super::CHANNEL_CAPACITY {
-            state.outbound_buffer.fairness_overdraft = Some((key.clone(), seq_id));
-        }
+        let count = encoded.len();
         for (index, encoded) in encoded.into_iter().enumerate() {
-            let buffered = BufferedServerEnvelope::from_payload(encoded, queued.delivery_failure.clone());
+            let buffered = BufferedServerEnvelope::from_payload(encoded, encoding.delivery_failure.clone(), Arc::clone(&encoding.replay_credit));
             self.push(key.clone(), buffered.payload.clone(),
-                if index + 1 == count { completion.take() } else { None }, buffered.delivery_failure.clone());
+                if index + 1 == count { encoding.completion.take() } else { None }, buffered.delivery_failure.clone(), Arc::clone(&buffered.replay_credit));
             state.outbound_buffer.insert_encoded(buffered);
         }
         state.next_seq_id_by_stream.insert(key.clone(), seq_id.saturating_add(1));
@@ -250,7 +276,6 @@ async fn writer_operation(
 struct BoundedOutboundBuffer {
     buffer_by_stream: HashMap<(ClientId, StreamId), VecDeque<BufferedServerEnvelope>>,
     used_tx: watch::Sender<usize>,
-    fairness_overdraft: Option<((ClientId, StreamId), u64)>,
 }
 
 impl BoundedOutboundBuffer {
@@ -259,13 +284,12 @@ impl BoundedOutboundBuffer {
         let buffer = Self {
             buffer_by_stream: HashMap::new(),
             used_tx,
-            fairness_overdraft: None,
         };
         (buffer, used_rx)
     }
 
 
-    fn has_capacity(&mut self) -> bool {
+    fn reap_retired(&mut self) {
         let mut removed = 0;
         self.buffer_by_stream.retain(|_, frames| {
             frames.retain(|frame| {
@@ -277,14 +301,6 @@ impl BoundedOutboundBuffer {
             !frames.is_empty()
         });
         if removed != 0 { self.used_tx.send_modify(|used| *used -= removed); }
-        if *self.used_tx.borrow() < super::CHANNEL_CAPACITY
-            || self.fairness_overdraft.as_ref().is_some_and(|(key, seq_id)| {
-                !self.buffer_by_stream.get(key).is_some_and(|frames| frames.iter().any(|frame| frame.seq_id == *seq_id))
-            })
-        {
-            self.fairness_overdraft = None;
-        }
-        *self.used_tx.borrow() < super::CHANNEL_CAPACITY || self.fairness_overdraft.is_none()
     }
 
     fn insert_encoded(&mut self, server_envelope: BufferedServerEnvelope) {
@@ -364,6 +380,7 @@ struct PendingClientDelivery {
     ordinal: usize,
     completion: oneshot::Receiver<Result<bool, super::client_tracker::Stopped>>,
     bytes: usize,
+    control: bool,
     committed: oneshot::Sender<()>,
 }
 
@@ -549,7 +566,7 @@ pub(crate) struct RemoteControlWebsocket {
     pairing_persistence_key: RemoteControlPairingPersistenceKey,
     client_tracker: Arc<Mutex<ClientTracker>>,
     state: Arc<Mutex<WebsocketState>>,
-    server_event_rx: Arc<Mutex<mpsc::Receiver<super::QueuedServerEnvelope>>>,
+    server_event_rx: Arc<Mutex<ServerEventReceiver>>,
     used_rx: watch::Receiver<usize>,
     desired_state_tx: Arc<watch::Sender<RemoteControlDesiredState>>,
     desired_state_rx: watch::Receiver<RemoteControlDesiredState>,
@@ -774,7 +791,9 @@ impl RemoteControlWebsocket {
                 client_segment_reassembler: ClientSegmentReassembler::default(),
                 encoding_admission: Arc::new(Semaphore::new(1)),
             })),
-            server_event_rx: Arc::new(Mutex::new(server_event_rx)),
+            server_event_rx: Arc::new(Mutex::new(ServerEventReceiver {
+                receiver: server_event_rx, queued: None, encoding: None,
+            })),
             used_rx,
             desired_state_tx,
             desired_state_rx,
@@ -1343,12 +1362,13 @@ impl RemoteControlWebsocket {
         self.client_tracker.lock().await.retire_clients();
         {
             let mut queued = self.server_event_rx.lock().await;
-            while queued.try_recv().is_ok() {}
+            queued.queued = None;
+            queued.encoding = None;
+            while queued.receiver.try_recv().is_ok() {}
         }
         let mut state = self.state.lock().await;
         state.outbound_buffer.buffer_by_stream.clear();
         state.outbound_buffer.used_tx.send_replace(0);
-        state.outbound_buffer.fairness_overdraft = None;
         state.subscribe_cursor = None;
         state.next_seq_id_by_stream.clear();
         state.last_ack_activity_by_stream.clear();
@@ -1382,7 +1402,7 @@ impl RemoteControlWebsocket {
 
     async fn run_server_writer(
         state: Arc<Mutex<WebsocketState>>,
-        server_event_rx: Arc<Mutex<mpsc::Receiver<super::QueuedServerEnvelope>>>,
+        server_event_rx: Arc<Mutex<ServerEventReceiver>>,
         used_rx: watch::Receiver<usize>,
         websocket_writer: SplitSink<
             WebSocketConnection,
@@ -1413,7 +1433,7 @@ impl RemoteControlWebsocket {
     )]
     async fn run_server_writer_inner(
         state: Arc<Mutex<WebsocketState>>,
-        server_event_rx: Arc<Mutex<mpsc::Receiver<super::QueuedServerEnvelope>>>,
+        server_event_rx: Arc<Mutex<ServerEventReceiver>>,
         mut used_rx: watch::Receiver<usize>,
         mut websocket_writer: impl futures::Sink<tungstenite::Message, Error = tungstenite::Error>
         + Unpin,
@@ -1430,6 +1450,7 @@ impl RemoteControlWebsocket {
                         envelope.payload.clone(),
                         None,
                         envelope.delivery_failure.clone(),
+                        Arc::clone(&envelope.replay_credit),
                     );
                 }
             }
@@ -1439,6 +1460,11 @@ impl RemoteControlWebsocket {
             tokio::time::interval_at(tokio::time::Instant::now() + ping_interval, ping_interval);
         ping_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut server_event_rx = server_event_rx.lock().await;
+        // Finish the same retained encoder before admitting newer output.
+        if server_event_rx.queued.is_some() || server_event_rx.encoding.is_some() {
+            pending.enqueue(&state, &mut server_event_rx, &mut ping_interval, &mut websocket_writer, &shutdown_token).await?;
+            if shutdown_token.is_cancelled() { return Ok(()); }
+        }
         // One additional logical envelope may compete with a saturated replay
         // backlog. Its existing per-envelope frame/byte bounds still apply;
         // another cannot enter until this envelope is ACKed or capacity returns.
@@ -1446,12 +1472,12 @@ impl RemoteControlWebsocket {
             // Drain only already-ready work. Never wait to fill a batch, and never
             // admit more original envelopes after the replay capacity is consumed.
             for _ in 0..REMOTE_CONTROL_REPLAY_BATCH_MESSAGES {
-                if !state.lock().await.outbound_buffer.has_capacity() {
-                    break;
-                }
-                match server_event_rx.try_recv() {
+                state.lock().await.outbound_buffer.reap_retired();
+                match server_event_rx.receiver.try_recv() {
                     Ok(envelope) => {
-                        pending.enqueue(&state, envelope, &mut ping_interval, &mut websocket_writer, &shutdown_token).await?;
+                        server_event_rx.queued = Some(envelope);
+                        pending.enqueue(&state, &mut server_event_rx, &mut ping_interval, &mut websocket_writer, &shutdown_token).await?;
+                        if shutdown_token.is_cancelled() { return Ok(()); }
                     }
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) if pending.is_empty() => {
@@ -1461,7 +1487,7 @@ impl RemoteControlWebsocket {
                 }
             }
 
-            let outbound_has_capacity = state.lock().await.outbound_buffer.has_capacity();
+            state.lock().await.outbound_buffer.reap_retired();
             tokio::select! {
                 biased;
                 _ = shutdown_token.cancelled() => return Ok(()),
@@ -1470,13 +1496,14 @@ impl RemoteControlWebsocket {
                     continue;
                 }
                 _ = std::future::ready(()), if !pending.is_empty() => {}
-                changed = used_rx.changed(), if !outbound_has_capacity => {
+                changed = used_rx.changed() => {
                     changed.map_err(|_| io::Error::new(ErrorKind::UnexpectedEof, "outbound buffer usage channel closed"))?;
                     continue;
                 }
-                envelope = server_event_rx.recv(), if outbound_has_capacity => {
+                envelope = server_event_rx.receiver.recv() => {
                     let envelope = envelope.ok_or_else(|| io::Error::new(ErrorKind::UnexpectedEof, "server event channel closed"))?;
-                    pending.enqueue(&state, envelope, &mut ping_interval, &mut websocket_writer, &shutdown_token).await?;
+                    server_event_rx.queued = Some(envelope);
+                    pending.enqueue(&state, &mut server_event_rx, &mut ping_interval, &mut websocket_writer, &shutdown_token).await?;
                     continue;
                 }
             }
@@ -1548,7 +1575,7 @@ impl RemoteControlWebsocket {
         pong_timeout: std::time::Duration,
         shutdown_token: CancellationToken,
     ) -> io::Result<()> {
-        let (ingress_tx, ingress_rx) = mpsc::channel(super::CHANNEL_CAPACITY);
+        let (ingress_tx, ingress_rx) = mpsc::channel(crate::transport::INGRESS_CAPACITY);
         let mut ingress_worker = AbortOnDropHandle::new(tokio::spawn(run_client_ingress(
             client_tracker, state.clone(), ingress_rx, shutdown_token.clone(),
         )));
@@ -1558,6 +1585,8 @@ impl RemoteControlWebsocket {
         let mut in_flight_chunks = HashMap::new();
         let mut next_delivery_ordinal = 0usize;
         let mut pending_bytes = 0usize;
+        let mut control_count = 0usize;
+        let mut control_bytes = 0usize;
         let mut assembly_sweep = tokio::time::interval(REMOTE_CONTROL_IDLE_SWEEP_INTERVAL);
         assembly_sweep.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let pong_deadline = tokio::time::sleep(pong_timeout);
@@ -1584,6 +1613,10 @@ impl RemoteControlWebsocket {
                         .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "remote control ingress admission failed"))?;
                     let mut delivery = pending.pop_front().expect("completed frontier");
                     pending_bytes -= delivery.bytes;
+                    if delivery.control {
+                        control_count -= 1;
+                        control_bytes -= delivery.bytes;
+                    }
                     if let Some(key) = delivery.client_message_key.as_ref() {
                         if in_flight_chunks.get(key) == Some(&delivery.ordinal) {
                             in_flight_chunks.remove(key);
@@ -1711,8 +1744,16 @@ impl RemoteControlWebsocket {
             }
             // Bound both queued operations and their declared/reassembled byte cost.
             // Overflow is explicit failure; no unadmitted message commits its cursor.
-            if pending.len() >= super::CHANNEL_CAPACITY
-                || bytes > super::segment::REMOTE_CONTROL_REASSEMBLED_MAX_BYTES.saturating_sub(pending_bytes)
+            let control = bytes <= 64 * 1024 && matches!(&client_envelope.event,
+                ClientEvent::ClientMessage { message } if crate::transport::ingress_message_is_control(message));
+            let exhausted = if control {
+                control_count >= crate::transport::CONTROL_INGRESS_RESERVE
+                    || bytes > (crate::transport::CONTROL_INGRESS_RESERVE * 64 * 1024).saturating_sub(control_bytes)
+            } else {
+                pending.len() - control_count >= super::CHANNEL_CAPACITY
+                    || bytes > super::segment::REMOTE_CONTROL_REASSEMBLED_MAX_BYTES.saturating_sub(pending_bytes - control_bytes)
+            };
+            if exhausted
             {
                 return Err(io::Error::new(ErrorKind::WouldBlock, "remote control ingress forwarding queue exhausted"));
             }
@@ -1721,12 +1762,16 @@ impl RemoteControlWebsocket {
             ingress_tx.try_send((client_envelope, completion_tx, commit_rx))
                 .map_err(|_| io::Error::new(ErrorKind::WouldBlock, "remote control ingress forwarding unavailable"))?;
             pending_bytes += bytes;
+            if control {
+                control_count += 1;
+                control_bytes += bytes;
+            }
             let ordinal = next_delivery_ordinal;
             next_delivery_ordinal += 1;
             if let Some(key) = client_message_key.as_ref() {
                 in_flight_chunks.insert(key.clone(), ordinal);
             }
-            pending.push_back(PendingClientDelivery { delivery, client_message_key, ordinal, completion, bytes, committed });
+            pending.push_back(PendingClientDelivery { delivery, client_message_key, ordinal, completion, bytes, control, committed });
         }
     }
 }

@@ -156,7 +156,7 @@ async fn build_refresh_config(
     config_manager: &ConfigManager,
     refresh_runtime_config: bool,
 ) -> io::Result<McpServerRefreshConfig> {
-    let thread_config = thread.config().await;
+    let thread_config = thread.config_for_project_discovery().await;
     let config = config_manager
         .load_latest_config_for_thread(thread_config.as_ref())
         .await?;

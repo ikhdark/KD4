@@ -334,7 +334,8 @@ fn read_prefix(path: &Path) -> Result<Option<String>, String> {
     if !metadata.is_file() || metadata.is_symlink() {
         return Ok(None);
     }
-    let file = std::fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let file = codex_file_system::open_regular_file_no_follow(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
     let mut bytes = Vec::new();
     file.take(HEADER_LIMIT)
         .read_to_end(&mut bytes)

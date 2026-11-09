@@ -4,7 +4,7 @@ Runtime: unified exec
 Handles approval + sandbox orchestration for unified exec requests, delegating to
 the process manager to spawn PTYs once an ExecRequest is prepared.
 */
-use crate::command_canonicalization::canonicalize_command_for_approval;
+use crate::command_canonicalization::approval_command_for_cache;
 use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecExpiration;
 use crate::sandboxing::ExecOptions;
@@ -106,7 +106,7 @@ fn unified_exec_approval_reason(
 pub struct UnifiedExecApprovalKey {
     pub environment_id: String,
     pub approval_scope_id: String,
-    pub command: Vec<String>,
+    pub command: crate::command_canonicalization::ApprovalCommand,
     pub environment_overrides: std::collections::BTreeMap<String, String>,
     pub cwd: PathUri,
     pub tty: bool,
@@ -152,7 +152,7 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
                 .environment
                 .approval_scope_id()
                 .to_string(),
-            command: canonicalize_command_for_approval(&req.command_for_approval),
+            command: approval_command_for_cache(&req.command_for_approval),
             environment_overrides: req.explicit_env_overrides.clone().into_iter().collect(),
             cwd: req.cwd.clone(),
             tty: req.tty,
@@ -248,6 +248,10 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
 }
 
 impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExecRuntime<'a> {
+    fn read_only_in_subagents(&self) -> bool {
+        true
+    }
+
     fn sandbox_cwd<'b>(&self, req: &'b UnifiedExecRequest) -> Option<&'b PathUri> {
         Some(&req.sandbox_cwd)
     }

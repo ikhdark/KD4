@@ -5856,7 +5856,22 @@ fn read_logical_range(
             metadata.retained_bytes
         )));
     }
-    let mut output = Vec::with_capacity(range.len() as usize);
+    if metadata.retained_bytes > MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD.min(MAX_RETAINED_ARTIFACT_BYTES_TOTAL) {
+        return Err(ReadToolOutputError::Io("artifact exceeds its retained-byte limit".into()));
+    }
+    let mut covered = 0;
+    for segment in &metadata.segments {
+        if segment.range.start != covered || segment.range.end < covered
+            || segment.range.end > metadata.retained_bytes
+        {
+            return Err(ReadToolOutputError::Io("artifact segment coverage is invalid".into()));
+        }
+        covered = segment.range.end;
+    }
+    if covered != metadata.retained_bytes {
+        return Err(ReadToolOutputError::Io("artifact segments do not cover retained bytes".into()));
+    }
+    let mut output = Vec::new();
     for segment in &metadata.segments {
         // Validate size and read bytes through the same opened regular file.
         // Snapshot recovery used to open every segment once for validation and
@@ -5877,7 +5892,10 @@ fn read_logical_range(
         }
         file.seek(SeekFrom::Start(start - segment.range.start))
             .map_err(|err| ReadToolOutputError::Io(format!("failed to seek artifact: {err}")))?;
-        let length = (end - start) as usize;
+        let length = usize::try_from(end - start)
+            .map_err(|_| ReadToolOutputError::Io("artifact range exceeds addressable memory".into()))?;
+        output.try_reserve(length)
+            .map_err(|_| ReadToolOutputError::Io("artifact range allocation failed".into()))?;
         let offset = output.len();
         output.resize(offset + length, 0);
         file.read_exact(&mut output[offset..])

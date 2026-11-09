@@ -817,6 +817,11 @@ async fn run_process(params: RunProcessParams) {
             .fail_connection_delivery(request_id.connection_id)
             .await;
     }
+    // Root exit and output settlement are observed; release without signalling
+    // intentionally surviving descendants on the normal completion path.
+    if expiration_outcome.is_none() && !connection_cancellation.is_cancelled() {
+        session.finish();
+    }
     terminal_cleanup
         .sessions
         .lock()

@@ -239,6 +239,8 @@ impl McpRequestProcessor {
         .await
         .map_err(|err| internal_error(format!("failed to login to MCP server '{name}': {err}")))?;
         let authorization_url = handle.authorization_url().to_string();
+        let login_id = uuid::Uuid::new_v4().to_string();
+        let notification_login_id = login_id.clone();
         let notification_name = name.clone();
         let notification_thread_id = thread_id;
         let outgoing = Arc::clone(&self.outgoing);
@@ -252,6 +254,7 @@ impl McpRequestProcessor {
             let notification = ServerNotification::McpServerOauthLoginCompleted(
                 McpServerOauthLoginCompletedNotification {
                     name: notification_name,
+                    login_id: Some(notification_login_id),
                     thread_id: notification_thread_id,
                     success,
                     error,
@@ -260,7 +263,7 @@ impl McpRequestProcessor {
             outgoing.send_server_notification(notification).await;
         });
 
-        Ok(McpServerOauthLoginResponse { authorization_url })
+        Ok(McpServerOauthLoginResponse { authorization_url, login_id: Some(login_id) })
     }
 
     async fn list_mcp_server_status(
@@ -271,7 +274,7 @@ impl McpRequestProcessor {
         let (config, thread) = match params.thread_id.as_deref() {
             Some(thread_id) => {
                 let (_, thread) = self.load_thread(thread_id).await?;
-                let thread_config = thread.config().await;
+                let thread_config = thread.config_for_project_discovery().await;
                 let config = self
                     .config_manager
                     .load_latest_config_for_thread(thread_config.as_ref())

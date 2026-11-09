@@ -774,6 +774,10 @@ async fn exec_windows_sandbox(
     // pipe must not prevent the other from reaching its recovery owner.
     let live_output_enabled = Arc::new([AtomicBool::new(true), AtomicBool::new(true)]);
     let live_output_enabled_for_sink = Arc::clone(&live_output_enabled);
+    let pending_utf8 = Arc::new(std::sync::Mutex::new([Vec::new(), Vec::new()]));
+    let pending_utf8_for_sink = Arc::clone(&pending_utf8);
+    let stream_for_flush = stdout_stream.clone();
+    let limiter_for_flush = Arc::clone(&limiter);
     let output_sink = Some(
         Arc::new(move |capture_stream: CaptureOutputStream, chunk: &[u8]| {
             // The sandbox invokes this sink on blocking capture threads. Keep
@@ -802,14 +806,15 @@ async fn exec_windows_sandbox(
             if !live_output_enabled.load(Ordering::Acquire) {
                 return;
             }
-            if try_send_limited_output_delta(
-                stream,
-                is_stderr,
-                chunk.to_vec(),
-                &limiter,
-            ) == OutputDeltaSendOutcome::Stop
-            {
-                live_output_enabled.store(false, Ordering::Release);
+            let mut pending = pending_utf8_for_sink.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let pending = &mut pending[usize::from(is_stderr)];
+            pending.extend_from_slice(chunk);
+            while let Some(chunk) = take_utf8_safe_output_chunk(pending, false) {
+                if try_send_limited_output_delta(stream, is_stderr, chunk, &limiter) == OutputDeltaSendOutcome::Stop {
+                    live_output_enabled.store(false, Ordering::Release);
+                    pending.clear();
+                    break;
+                }
             }
         }) as CaptureOutputSink,
     );
@@ -865,6 +870,16 @@ async fn exec_windows_sandbox(
     })
     .await;
 
+    if let Some(stream) = &stream_for_flush {
+        let mut pending = pending_utf8.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (index, pending) in pending.iter_mut().enumerate() {
+            if live_output_enabled[index].load(Ordering::Acquire) {
+                while let Some(chunk) = take_utf8_safe_output_chunk(pending, true) {
+                    if try_send_limited_output_delta(stream, index == 1, chunk, &limiter_for_flush) == OutputDeltaSendOutcome::Stop { break; }
+                }
+            }
+        }
+    }
     let capture = match spawn_res {
         Ok(Ok(v)) => v,
         Ok(Err(err)) => {
@@ -1128,7 +1143,14 @@ async fn exec(
         ))
     })?;
     let arg0_ref = arg0.as_deref();
+    let cancellations = expiration.cancellation_tokens();
+    if cancellations.iter().any(CancellationToken::is_cancelled) {
+        return Err(CodexErr::Io(io::Error::new(io::ErrorKind::Interrupted, "execution cancelled before spawn")));
+    }
     let managed_root = ManagedRootProcess::reserve_with_reclaim().await?;
+    if cancellations.iter().any(CancellationToken::is_cancelled) {
+        return Err(CodexErr::Io(io::Error::new(io::ErrorKind::Interrupted, "execution cancelled before spawn")));
+    }
     let (child, observation) = spawn_child_with_observation_async(SpawnChildRequest {
         program: PathBuf::from(program),
         args: args.into(),

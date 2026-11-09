@@ -241,7 +241,11 @@ pub(super) async fn complete_partial_plan_items(
     turn_context: &TurnContext,
     state: &mut PlanModeStreamState,
 ) {
-    for (_, item) in std::mem::take(&mut state.started_agent_message_items) {
+    for (_, mut item) in std::mem::take(&mut state.started_agent_message_items) {
+        if let TurnItem::AgentMessage(message) = &mut item {
+            message.phase = None;
+            message.interruption = Some("Stream interrupted before provider item finalization".to_string());
+        }
         sess.emit_turn_item_completed(turn_context, item).await;
     }
     let plan_text = std::mem::take(&mut state.plan_item_state.streamed_text);

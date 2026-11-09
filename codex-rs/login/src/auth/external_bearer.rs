@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
@@ -126,10 +127,27 @@ async fn run_provider_auth_command(config: &ModelProviderAuthInfo) -> io::Result
         .current_dir(config.cwd.as_path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        // No raw helper stderr is surfaced; discard it without buffering it.
+        .stderr(Stdio::null())
         .kill_on_drop(true);
 
-    let output = tokio::time::timeout(config.timeout(), command.output())
+    let mut child = command.spawn().map_err(|err| {
+        io::Error::other(format!("provider auth command `{}` failed to start: {err}", config.command))
+    })?;
+    let mut stdout = child.stdout.take().ok_or_else(|| io::Error::other("provider auth stdout was not captured"))?;
+    // A bearer token is a bounded credential, not an arbitrary output artifact.
+    // Keep stdout bytes exact and reject overflow atomically. kill_on_drop
+    // retains the existing cleanup behavior on timeout/error/caller drop.
+    const MAX_TOKEN_BYTES: u64 = 1024 * 1024;
+    let (status, stdout) = tokio::time::timeout(config.timeout(), async {
+        let mut bytes = Vec::new();
+        (&mut stdout).take(MAX_TOKEN_BYTES + 1).read_to_end(&mut bytes).await?;
+        if bytes.len() as u64 > MAX_TOKEN_BYTES {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "provider auth token exceeds 1 MiB byte limit"));
+        }
+        let status = child.wait().await?;
+        Ok::<_, io::Error>((status, bytes))
+    })
         .await
         .map_err(|_| {
             io::Error::other(format!(
@@ -140,26 +158,19 @@ async fn run_provider_auth_command(config: &ModelProviderAuthInfo) -> io::Result
         })?
         .map_err(|err| {
             io::Error::other(format!(
-                "provider auth command `{}` failed to start: {err}",
+                "provider auth command `{}` failed: {err}",
                 config.command
             ))
         })?;
 
-    if !output.status.success() {
-        let status = output.status;
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stderr_suffix = if stderr.is_empty() {
-            String::new()
-        } else {
-            format!(": {stderr}")
-        };
+    if !status.success() {
         return Err(io::Error::other(format!(
-            "provider auth command `{}` exited with status {status}{stderr_suffix}",
+            "provider auth command `{}` exited with status {status} (stderr withheld)",
             config.command
         )));
     }
 
-    let stdout = String::from_utf8(output.stdout).map_err(|_| {
+    let stdout = String::from_utf8(stdout).map_err(|_| {
         io::Error::other(format!(
             "provider auth command `{}` wrote non-UTF-8 data to stdout",
             config.command

@@ -41,6 +41,13 @@ pub fn create_cwd_junction(requested_cwd: &Path, log_dir: Option<&Path>) -> Opti
         // cheap and avoids repeatedly shelling out to mklink.
         match std::fs::symlink_metadata(&junction_path) {
             Ok(md) if (md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 => {
+                if std::fs::canonicalize(&junction_path).ok() != std::fs::canonicalize(requested_cwd).ok()
+                    || std::fs::canonicalize(requested_cwd).is_err()
+                {
+                    // Decline this optional workaround rather than delete an
+                    // unowned/retargeted object or execute under a stale cwd.
+                    return None;
+                }
                 log_note(
                     &format!("junction: reusing existing {}", junction_path.display()),
                     log_dir,

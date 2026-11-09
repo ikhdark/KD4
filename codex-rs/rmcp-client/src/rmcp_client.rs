@@ -1606,6 +1606,9 @@ impl RmcpClient {
             Ok(result) => Ok(result),
             Err(error) if Self::is_session_expired_404(&error) => {
                 self.reinitialize_after_session_expiry(&service).await?;
+                if label == "tools/call" {
+                    anyhow::bail!("MCP session was replaced; refresh tool contracts and obtain fresh authorization before calling the tool again");
+                }
                 let recovered_service = self.service().await?;
                 Self::run_service_operation_with_transient_retries(
                     recovered_service,

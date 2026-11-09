@@ -13,6 +13,7 @@ use crate::transport::ConnectionOrigin;
 use crate::transport::remote_control::QueuedServerEnvelope;
 use codex_app_server_protocol_types::JSONRPCMessage;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -49,6 +50,9 @@ pub(crate) struct ClientTracker {
     join_set: JoinSet<(ClientId, StreamId, ConnectionId)>,
     cleanup: Vec<JoinHandle<Result<(), Stopped>>>,
     server_event_tx: mpsc::Sender<QueuedServerEnvelope>,
+    replay_slots: Arc<tokio::sync::Semaphore>,
+    replay_bytes: Arc<tokio::sync::Semaphore>,
+    unknown_replay: Arc<tokio::sync::Semaphore>,
     transport_event_tx: mpsc::Sender<TransportEvent>,
     // Unlike the child below, this is not cancelled by tracker-only shutdown.
     transport_shutdown_token: CancellationToken,
@@ -67,6 +71,9 @@ impl ClientTracker {
             join_set: JoinSet::new(),
             cleanup: Vec::new(),
             server_event_tx,
+            replay_slots: Arc::new(tokio::sync::Semaphore::new(super::CHANNEL_CAPACITY)),
+            replay_bytes: Arc::new(tokio::sync::Semaphore::new(super::REPLAY_BYTE_BUDGET)),
+            unknown_replay: Arc::new(tokio::sync::Semaphore::new(1)),
             transport_event_tx,
             transport_shutdown_token: shutdown_token.clone(),
             shutdown_token: shutdown_token.child_token(),
@@ -263,6 +270,8 @@ impl ClientTracker {
                     stream_id.clone(),
                     connection_id,
                     self.server_event_tx.clone(),
+                    Arc::clone(&self.replay_slots),
+                    Arc::clone(&self.replay_bytes),
                     writer_rx,
                     status_rx,
                     disconnect_token.clone(),
@@ -317,6 +326,10 @@ impl ClientTracker {
 
                 // Unknown heartbeats are best effort. Waiting here would prevent the
                 // reader from handling ACKs that free outbound capacity.
+                let Some(cost) = super::replay_byte_cost(256, &client_id, &stream_id) else { return Ok(()) };
+                let Ok(unknown) = Arc::clone(&self.unknown_replay).try_acquire_owned() else { return Ok(()) };
+                let Ok(slot) = Arc::clone(&self.replay_slots).try_acquire_owned() else { return Ok(()) };
+                let Ok(bytes) = Arc::clone(&self.replay_bytes).try_acquire_many_owned(cost) else { return Ok(()) };
                 let _ = self.server_event_tx.try_send(QueuedServerEnvelope {
                     event: ServerEvent::Pong {
                         status: PongStatus::Unknown,
@@ -325,6 +338,7 @@ impl ClientTracker {
                     stream_id,
                     write_complete_tx: None,
                     delivery_failure: None,
+                    replay_credit: Arc::new(super::ReplayCredit { _stream: Some(unknown), _global: slot, _bytes: bytes }),
                 });
                 Ok(())
             }
@@ -337,31 +351,62 @@ impl ClientTracker {
         stream_id: StreamId,
         connection_id: ConnectionId,
         server_event_tx: mpsc::Sender<QueuedServerEnvelope>,
+        replay_slots: Arc<tokio::sync::Semaphore>,
+        replay_bytes: Arc<tokio::sync::Semaphore>,
         mut writer_rx: mpsc::Receiver<QueuedOutgoingMessage>,
         mut status_rx: watch::Receiver<PongStatus>,
         disconnect_token: CancellationToken,
     ) -> (ClientId, StreamId, ConnectionId) {
+        // One unacknowledged logical envelope per stream. A stalled client
+        // waits here, never at the common encoder ahead of another client.
+        let stream_slot = Arc::new(tokio::sync::Semaphore::new(1));
         loop {
-            let (event, write_complete_tx) = tokio::select! {
+            let stream_credit = tokio::select! {
+                _ = disconnect_token.cancelled() => break,
+                permit = Arc::clone(&stream_slot).acquire_owned() => match permit { Ok(permit) => permit, Err(_) => break },
+            };
+            let (event, write_complete_tx, message_bytes) = tokio::select! {
                 _ = disconnect_token.cancelled() => {
                     break;
                 }
                 queued_message = writer_rx.recv() => {
-                    let Some(queued_message) = queued_message else {
+                    let Some(mut queued_message) = queued_message else {
                         break;
+                    };
+                     // This is the Remote connection's owned copy, after fanout.
+                     // Never reuse an encoding prepared before the display preview.
+                     if matches!(&queued_message.message, crate::outgoing_message::OutgoingMessage::AppServerNotification(_)) {
+                         super::preview::outgoing(&mut queued_message.message);
+                         queued_message.encoded_json = None;
+                     }
+                    let bytes = match queued_message.encoded_json.as_ref() {
+                        Some(encoded) => encoded.streamed_len.unwrap_or(encoded.bytes.len()),
+                        None => match queued_message.prepare_stdio_json(0) { Ok(bytes) => bytes, Err(_) => break },
                     };
                     let event = ServerEvent::ServerMessage {
                         message: Box::new(queued_message.message),
                     };
-                    (event, queued_message.write_complete_tx)
+                    (event, queued_message.write_complete_tx, bytes)
                 }
                 changed = status_rx.changed() => {
                     if changed.is_err() {
                         break;
                     }
                     let event = ServerEvent::Pong { status: status_rx.borrow().clone() };
-                    (event, None)
+                    (event, None, 256)
                 }
+            };
+            let Some(cost) = super::replay_byte_cost(message_bytes, &client_id, &stream_id) else {
+                disconnect_token.cancel();
+                break;
+            };
+            let credit = tokio::select! {
+                _ = disconnect_token.cancelled() => break,
+                permit = async {
+                    let bytes = Arc::clone(&replay_bytes).acquire_many_owned(cost).await.ok()?;
+                    let global = Arc::clone(&replay_slots).acquire_owned().await.ok()?;
+                    Some(Arc::new(super::ReplayCredit { _stream: Some(stream_credit), _global: global, _bytes: bytes }))
+                } => match permit { Some(permit) => permit, None => break },
             };
             let send_result = tokio::select! {
                 _ = disconnect_token.cancelled() => {
@@ -373,6 +418,7 @@ impl ClientTracker {
                     stream_id: stream_id.clone(),
                     write_complete_tx,
                     delivery_failure: Some(disconnect_token.clone()),
+                    replay_credit: credit,
                 }) => send_result,
             };
             if send_result.is_err() {
@@ -522,6 +568,7 @@ fn transport_event_name(event: &TransportEvent) -> &'static str {
         TransportEvent::ConnectionOpened { .. } => "connection_opened",
         TransportEvent::ConnectionClosed { .. } => "connection_closed",
         TransportEvent::IncomingMessage { .. } => "incoming_message",
+        TransportEvent::RequestRejected { .. } => "request_rejected",
     }
 }
 

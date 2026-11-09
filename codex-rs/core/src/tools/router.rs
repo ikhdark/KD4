@@ -770,9 +770,12 @@ impl ToolRouter {
         authorization_result?;
         // Only work that yields evidence can stand in for a refused operation.
         // A Code Mode cell is not that work; its nested calls arrive here themselves.
-        let refusals = matches!(class, TypedToolClass::ReadSearch | TypedToolClass::StructuredEdit)
-            .then(|| step_context.turn.extension_data.get::<CapabilityRefusals>())
-            .flatten();
+        let refusals = matches!(
+            class,
+            TypedToolClass::ReadSearch | TypedToolClass::Shell | TypedToolClass::StructuredEdit
+        )
+        .then(|| step_context.turn.extension_data.get::<CapabilityRefusals>())
+        .flatten();
         let ToolCall {
             tool_name,
             call_id,

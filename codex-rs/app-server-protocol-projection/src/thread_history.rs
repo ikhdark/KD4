@@ -94,6 +94,11 @@ pub fn build_turns_from_rollout_items_with_items_view<'a>(
 enum LegacyItemMirror {
     ContextCompaction,
     Item(ThreadItem),
+    AgentMessage {
+        content: std::vec::IntoIter<String>,
+        phase: Option<MessagePhase>,
+    },
+    SubAgentActivity(codex_protocol::items::SubAgentActivityItem),
     Reasoning {
         summary: std::vec::IntoIter<String>,
         content: std::vec::IntoIter<String>,
@@ -305,9 +310,14 @@ impl ThreadHistoryBuilder {
         // Consume only that mirror; later messages and compactions remain distinct items.
         if let Some(mut item) = self.pending_legacy_item_mirror.take() {
             let is_mirror = match (&mut item, event) {
-                (LegacyItemMirror::Item(ThreadItem::AgentMessage { text, phase, .. }), EventMsg::AgentMessage(payload)) => {
-                    payload.message == *text && payload.phase == *phase
+                (LegacyItemMirror::AgentMessage { content, phase }, EventMsg::AgentMessage(payload))
+                    if payload.phase == *phase && content.as_slice().first().is_some_and(|text| text == &payload.message) => {
+                    content.next();
+                    true
                 }
+                (LegacyItemMirror::SubAgentActivity(item), EventMsg::SubAgentActivity(payload)) =>
+                    item.id == payload.event_id && item.agent_thread_id == payload.agent_thread_id
+                        && item.agent_path == payload.agent_path && item.kind == payload.kind,
                 (LegacyItemMirror::ContextCompaction, EventMsg::ContextCompacted(_)) => true,
                 (LegacyItemMirror::Item(ThreadItem::WebSearch(item)), EventMsg::WebSearchEnd(payload)) => {
                     item.id == payload.call_id
@@ -332,7 +342,8 @@ impl ThreadHistoryBuilder {
                 _ => false,
             };
             if is_mirror {
-                if matches!(&item, LegacyItemMirror::Reasoning { summary, content } if summary.len() > 0 || content.len() > 0) {
+                if matches!(&item, LegacyItemMirror::Reasoning { summary, content } if summary.len() > 0 || content.len() > 0)
+                    || matches!(&item, LegacyItemMirror::AgentMessage { content, .. } if content.len() > 0) {
                     self.pending_legacy_item_mirror = Some(item);
                 }
                 return;
@@ -718,6 +729,7 @@ impl ThreadHistoryBuilder {
             codex_protocol::items::TurnItem::FileChange(item) => Some(LegacyItemMirror::FileChange(item.id.clone())),
             codex_protocol::items::TurnItem::McpToolCall(item) => Some(LegacyItemMirror::McpToolCall(item.id.clone())),
             codex_protocol::items::TurnItem::ImageGeneration(item) => Some(LegacyItemMirror::ImageGeneration(item.id.clone())),
+            codex_protocol::items::TurnItem::SubAgentActivity(item) => Some(LegacyItemMirror::SubAgentActivity(item.clone())),
             _ => None,
         };
         if let Some(mirror) = mirror {
@@ -736,10 +748,19 @@ impl ThreadHistoryBuilder {
                 )
         ) {
             let item = self.materialize_item(&payload.item);
-            if !matches!(&item, ThreadItem::AgentMessage { text, .. } if text.is_empty()) {
+            if !matches!(&item, ThreadItem::AgentMessage { text, interruption: None, .. } if text.is_empty()) {
                 self.pending_legacy_item_mirror = match &item {
                     ThreadItem::ContextCompaction { .. } => Some(LegacyItemMirror::ContextCompaction),
-                    ThreadItem::AgentMessage { interruption: Some(_), .. } => None,
+                    ThreadItem::AgentMessage { .. } => match &payload.item {
+                        codex_protocol::items::TurnItem::AgentMessage(agent) if agent.interruption.is_none() =>
+                            Some(LegacyItemMirror::AgentMessage {
+                                content: agent.content.iter().map(|entry| match entry {
+                                    codex_protocol::items::AgentMessageContent::Text { text } => text.clone(),
+                                }).collect::<Vec<_>>().into_iter(),
+                                phase: agent.phase.clone(),
+                            }),
+                        _ => None,
+                    },
                     _ => Some(LegacyItemMirror::Item(item.clone())),
                 };
                 self.upsert_item_in_turn_id(&payload.turn_id, item);

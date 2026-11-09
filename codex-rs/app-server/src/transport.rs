@@ -413,19 +413,6 @@ async fn send_message_to_connection(
             result = writer.send(queued_message) => result.is_ok(),
         };
         if delivered { false } else { disconnect_connection(connections, connection_id) }
-    } else if !connection_state.is_stdio {
-        match writer.try_send(queued_message) {
-            Ok(()) => false,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                warn!(
-                    "disconnecting slow connection after outbound queue filled: {connection_id:?}"
-                );
-                disconnect_connection(connections, connection_id)
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                disconnect_connection(connections, connection_id)
-            }
-        }
     } else {
         // Stdio has an independent bounded delivery owner. Queue admission is
         // nonblocking here; encoding and byte-credit waits belong to that owner.

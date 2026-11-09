@@ -19,6 +19,117 @@ const HISTORY_BYTES: usize = 512 * 1024;
 const NOTICE_BYTES: usize = 4096;
 const TURN_BYTES: usize = 8192;
 
+/// A recorded work queue, not a fresh behavioral pass or a source-write gate.
+/// Captured through the same world-state owner on new turns and resumes.
+pub(crate) async fn ledger_context(step: &crate::session::step_context::StepContext)
+    -> Option<codex_extension_api::WorldStateSectionContribution>
+{
+    use codex_extension_api::{PreviousWorldStateSection, RenderedWorldStateFragment, WorldStateSectionContribution};
+    if !step.turn.file_system_sandbox_policy().has_full_disk_read_access() { return None; }
+    let capture = async {
+        let mut repositories = Vec::new();
+        for environment in step.environments.turn_environments.iter().take(8) {
+            if environment.environment.is_remote() { continue; }
+            let fs = environment.environment.get_filesystem();
+            let sandbox = step.turn.file_system_sandbox_context(None, environment.cwd());
+            let cwd = environment.cwd().clone();
+            let root = codex_file_system::find_nearest_ancestor_with_markers(fs.as_ref(), &cwd,
+                vec![".git".into(), ".local/evidence/fixes/ledger-view.json".into(), ".codex/fix-evidence/ledger-view.json".into()],
+                FindUpErrorPolicy::Ignore, Some(&sandbox)).await.ok().flatten();
+            let Some(root) = root else { continue; };
+            let paths = [root.join(".local/evidence/fixes/ledger-view.json").ok()?,
+                root.join(".codex/fix-evidence/ledger-view.json").ok()?];
+            let Some(path) = fs.first_regular_file(&paths, Some(&sandbox)).await.ok().flatten() else { continue; };
+            let Some((view, _)) = read_json(fs.as_ref(), &path, INDEX_BYTES, &sandbox).await else {
+                repositories.push(json!({"ledger":path.to_string(),"coverage":"unavailable"})); continue;
+            };
+            let fixes = view["fixes"].as_array()?;
+            let unresolved: Vec<Value> = fixes.iter().filter(|f| f["status"] != "verified_closed")
+                .take(8).map(|f| json!({"id":f["id"],"status":f["status"],"missing_conditions":f["missing_conditions"]})).collect();
+            repositories.push(json!({"ledger":path.to_string(),"revision":view["revision"],
+                "recorded_at_ns":view["recorded_at_ns"],"unresolved":unresolved,
+                "unresolved_omitted":fixes.iter().filter(|f| f["status"] != "verified_closed").count().saturating_sub(8),
+                "closed_count":fixes.iter().filter(|f| f["status"] == "verified_closed").count(),
+                "evidence_gaps":view["evidence_gaps"]}));
+        }
+        if repositories.is_empty() { return None; }
+        let snapshot = json!({"repositories":repositories});
+        let body = format!("Recorded KDR verification ledger, not fresh source reconciliation. Query `kdr fix-ledger status --repo REPO --unresolved` before selecting work; it reconciles relevant drift without running behavioral checks. Work on unresolved findings. Preserve verified fixes unless relevant changes or new behavioral evidence invalidate their proof. Overlap warnings never refuse edits, lock sessions or restrict normal writes. Only affected proof needs KDR reverification; closure requires passing KDR evidence for the declared contract. Missing coverage is unknown.\n{snapshot}");
+        if body.len() > NOTICE_BYTES { return None; }
+        let rendered = snapshot.clone();
+        Some(WorldStateSectionContribution::new("verification_ledger", snapshot, move |previous| {
+            if matches!(previous, PreviousWorldStateSection::Known(old) if old == &rendered) { return None; }
+            Some(RenderedWorldStateFragment::new("developer", ("<verification_ledger>", "</verification_ledger>"), body.clone()))
+        }))
+    };
+    tokio::time::timeout(Duration::from_millis(50), capture).await.ok().flatten()
+}
+
+/// Optional durable observations. No source mutation, permission changes or
+/// session locks; errors remain diagnostics on the already-completed edit.
+async fn record_ledger_overlap(req: &ApplyPatchRequest, turn: &TurnContext, change: &Change) -> Option<Value> {
+    let fs = req.turn_environment.environment.get_filesystem();
+    let sandbox = turn.file_system_sandbox_context(None, req.turn_environment.cwd());
+    let directory = change.before_path.parent()?;
+    let root = codex_file_system::find_nearest_ancestor_with_markers(fs.as_ref(), &directory,
+        vec![".git".into(), ".local/evidence/fixes/ledger-view.json".into(), ".codex/fix-evidence/ledger-view.json".into()],
+        FindUpErrorPolicy::Ignore, Some(&sandbox)).await.ok().flatten()?;
+    let paths = [root.join(".local/evidence/fixes/ledger-view.json").ok()?, root.join(".codex/fix-evidence/ledger-view.json").ok()?];
+    let path = fs.first_regular_file(&paths, Some(&sandbox)).await.ok().flatten()?;
+    let (view, _) = read_json(fs.as_ref(), &path, INDEX_BYTES, &sandbox).await?;
+    let root_native = root.to_abs_path().ok()?;
+    let relative = change.before_path.to_abs_path().ok()?.as_path().strip_prefix(root_native.as_path()).ok()?.to_string_lossy().replace('\\', "/");
+    let after_relative = change.path.to_abs_path().ok()?.as_path().strip_prefix(root_native.as_path()).ok()?.to_string_lossy().replace('\\', "/");
+    let moved = !same_path(&relative, &after_relative);
+    let deadline = Instant::now() + Duration::from_millis(15);
+    let before = codex_tool_artifacts::source::code_sections::function_bodies(&change.before_path.to_string(), &change.before, deadline);
+    let after = codex_tool_artifacts::source::code_sections::function_bodies(&change.path.to_string(), &change.after, deadline);
+    let mut affected = Vec::new();
+    let mut overlaps = Vec::new();
+    for fix in view["fixes"].as_array()? {
+        let mut conditions = Vec::new();
+        for condition in fix["contract"].as_array().into_iter().flatten() {
+            for scope in condition["scopes"].as_array().into_iter().flatten() {
+                if !scope["path"].as_str().is_some_and(|p| same_path(p, &relative)) { continue; }
+                let changed = if moved { Some(true) }
+                else if let Some(symbol) = scope["symbol"].as_str() {
+                    match (BehaviorChange::body(&before, symbol), BehaviorChange::body(&after, symbol)) {
+                        (Some(old), Some(new)) => Some(old != new), (Some(_), None) => Some(true), _ => None,
+                    }
+                } else if let Some(text) = scope["text"].as_str() {
+                    Some(change.before.matches(text).count() == 1 && change.after.matches(text).count() != 1)
+                } else { Some(change.before != change.after || change.before_path != change.path) };
+                overlaps.push(json!({"fix":fix["id"],"condition":condition["id"],"scope":scope,
+                    "assessment":match changed { Some(true)=>"changes",Some(false)=>"preserves",None=>"unknown" }}));
+                if changed == Some(true) && !conditions.contains(&condition["id"]) { conditions.push(condition["id"].clone()); }
+            }
+        }
+        if !conditions.is_empty() { affected.push(json!({"fix":fix["id"],"conditions":conditions})); }
+    }
+    if overlaps.is_empty() { return None; }
+    let observed_at_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+    let observation = json!({"schema_version":1,"kind":"fix_overlap","advisory_only":true,
+        "ledger_revision":view["revision"],"observed_at_ns":observed_at_ns.to_string(),
+        "before_path":relative,"after_path":change.path.to_string(),
+        "before_sha256":hex::encode(Sha256::digest(change.before.as_bytes())),
+        "after_sha256":hex::encode(Sha256::digest(change.after.as_bytes())),
+        "overlaps":overlaps,"affected":affected,"warning_delivery":"patch_diagnostic; provider delivery unmeasured"});
+    let bytes = serde_json::to_vec(&observation).ok()?;
+    if bytes.len() > 256*1024 { return Some(json!({"kind":"fix_ledger_overlap","advisory_only":true,"persistence":"unavailable_oversized"})); }
+    let destination = path.parent()?.join("overlaps").ok()?;
+    let event_path = destination.join(&format!("{}.json",uuid::Uuid::new_v4())).ok()?;
+    let saved = async {
+        fs.create_directory(&destination, codex_file_system::CreateDirectoryOptions { recursive:true }, Some(&sandbox)).await?;
+        match fs.mutate_file_if_matches(&event_path, None, Some(bytes), Some(&sandbox)).await? {
+            codex_file_system::FileMutationOutcome::Committed => Ok(()),
+            other => Err(std::io::Error::other(format!("overlap publication incomplete: {other:?}"))),
+        }
+    }.await;
+    Some(json!({"kind":"fix_ledger_overlap","advisory_only":true,"overlap":observation,
+        "persistence":if saved.is_ok() { "recorded" } else { "unavailable" },"path":event_path.to_string(),
+        "error":saved.err().map(|error|error.to_string()),"source_edit_refused":false}))
+}
+
 struct Memory {
     index: Value,
     path: PathUri,
@@ -142,6 +253,10 @@ fn constraints(fix: &Value, relative: &str, symbol: Option<&str>, change: Option
                     ("potentially_invalidates", "protected anchor or function removed")
                 } else if c.before_path != c.path {
                     ("potentially_invalidates", "owner moved; linkage not established")
+                } else if scope["text"].as_str().is_some_and(|text|
+                    c.change.before.matches(text).count() == 1 && c.change.after.matches(text).count() == 1)
+                {
+                    ("preserves", "registered exact text unchanged; callers and dependencies not proven")
                 } else if old.is_some() && old == new {
                     ("preserves", "registered function bytes unchanged; callers and dependencies not proven")
                 } else if old.is_some() && new.is_some() {
@@ -216,10 +331,36 @@ async fn lookup(
         state.roots.insert(root_key.clone(), None);
         let candidates = [root.join(".local/evidence/fixes/index.json").ok()?,
             root.join(".codex/fix-evidence/index.json").ok()?];
-        let index_path = fs.first_regular_file(&candidates, Some(sandbox)).await.ok()??;
-        let loaded = read_json(fs, &index_path, INDEX_BYTES, sandbox).await
+        let ledger_paths = [root.join(".local/evidence/fixes/ledger-view.json").ok()?,
+            root.join(".codex/fix-evidence/ledger-view.json").ok()?];
+        let ledger_path = fs.first_regular_file(&ledger_paths, Some(sandbox)).await.ok().flatten();
+        let index_path = fs.first_regular_file(&candidates, Some(sandbox)).await.ok().flatten();
+        let path = index_path.clone().or_else(|| ledger_path.clone())?;
+        let mut loaded = match index_path {
+            Some(index_path) => read_json(fs, &index_path, INDEX_BYTES, sandbox).await,
+            None => Some((json!({"schema_version":1,"fixes":[]}), String::new())),
+        };
+        if let Some(ledger_path) = ledger_path
+            && let Some((view, view_hash)) = read_json(fs, &ledger_path, INDEX_BYTES, sandbox).await
+            && let Some((index, hash)) = loaded.as_mut()
+        {
+            for fix in view["fixes"].as_array().into_iter().flatten() {
+                let rows: Vec<Value> = fix["contract"].as_array().into_iter().flatten().map(|condition|
+                    json!({"id":condition["id"],"broken_behavior":condition["behavior"],
+                        "correction":"Recorded KDR behavioral verification; preserve the declared contract.",
+                        "must_remain_true":condition["behavior"],"scopes":condition["scopes"]})).collect();
+                let paths: Vec<Value> = fix["contract"].as_array().into_iter().flatten()
+                    .flat_map(|c| c["scopes"].as_array().into_iter().flatten().map(|s|s["path"].clone())).collect();
+                if let Some(fixes) = index["fixes"].as_array_mut() {
+                    fixes.push(json!({"id":fix["id"],"paths":paths,"receipts":[],
+                        "behavioral_constraints":rows,"ledger_status":fix["status"],"ledger_revision":view["revision"]}));
+                }
+            }
+            if hash.is_empty() { *hash = view_hash; }
+        }
+        let loaded = loaded
             .filter(|(v, _)| v["schema_version"] == 1 && v["fixes"].is_array())
-            .map(|(index, hash)| Memory { index, path: index_path, hash,
+            .map(|(index, hash)| Memory { index, path, hash,
                 history: None, history_loaded: false });
         state.roots.insert(root_key.clone(), loaded);
     }
@@ -266,6 +407,7 @@ async fn lookup(
         }
     }
     let priority = |fix: &Value| {
+        if !fix["ledger_status"].is_null() { return -2; }
         if !constraints(fix, &relative, symbol, behavior.as_ref()).is_empty() { return -1; }
         fix["receipts"].as_array().into_iter().flatten().filter_map(|r| r["sha256"].as_str())
             .flat_map(|hash| memory.history.as_ref().and_then(|h| h["by_receipt_sha256"][hash].as_array()).into_iter().flatten())
@@ -331,6 +473,11 @@ async fn lookup(
                 "unknown: path overlap without recorded behavioral constraints"
             } else { "see registered scopes" },
             "benchmark_history": benchmarks, "benchmark_observations":benchmark_observations});
+        if !fix["ledger_status"].is_null() {
+            row["recorded_ledger_status"] = fix["ledger_status"].clone();
+            row["ledger_revision"] = fix["ledger_revision"].clone();
+            row["work_policy"] = json!("Closed fixes are preservation context, not investigation assignments. Reopen only affected proof with relevant cause; conflicts are advisory.");
+        }
         if protected.is_empty() && has_constraints {
             row.as_object_mut()?.remove("behavioral_constraints");
             row.as_object_mut()?.remove("conflict_assessment");
@@ -478,6 +625,15 @@ pub(super) async fn changed_behavior(
     let sandbox = turn.file_system_sandbox_context(None, req.turn_environment.cwd());
     let ledger = turn.extension_data.get_or_init(EvidenceMemory::default);
     let mut result = Vec::new();
+    // Independent of advisory display/deduplication budgets. Lost observations
+    // stay explicit; KDR also reconciles scopes for shell/external writes.
+    for change in &changes {
+        match tokio::time::timeout(Duration::from_millis(100), record_ledger_overlap(req, turn, change)).await {
+            Ok(Some(observation)) => result.push(observation),
+            Err(_) => result.push(json!({"kind":"fix_ledger_overlap","advisory_only":true,"persistence":"unknown_timeout"})),
+            _ => {}
+        }
+    }
     let completed = tokio::time::timeout(Duration::from_millis(50), async {
         let mut state = ledger.0.lock().await;
         state.budget_exhausted = false;

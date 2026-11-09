@@ -6,4 +6,8 @@ import type { ToolRequestUserInputQuestion } from "./ToolRequestUserInputQuestio
 /**
  * Params sent with a request_user_input event.
  */
-export type ToolRequestUserInputParams = { threadId: string, turnId: string, itemId: string, questions: Array<ToolRequestUserInputQuestion>, autoResolutionMs: number | null, };
+export type ToolRequestUserInputParams = { threadId: string, turnId: string, itemId: string, questions: Array<ToolRequestUserInputQuestion>,
+/**
+ * Keep the prompt open without auto-resolution until the user responds or cancels.
+ */
+isBlocking: boolean, autoResolutionMs: number | null, };

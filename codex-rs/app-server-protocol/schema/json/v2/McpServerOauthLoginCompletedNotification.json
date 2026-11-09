@@ -18,6 +18,13 @@
         "string",
         "null"
       ]
+    },
+    "loginId": {
+      "description": "Matches the explicit login response; automatic plugin login has no request ID.",
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "required": [

@@ -96,8 +96,9 @@ pub(crate) async fn recheck_readonly_command_before_launch(
     requirement: &ExecApprovalRequirement,
     ctx: &ToolCtx,
 ) -> Result<Option<Vec<String>>, ToolError> {
-    let profile = ctx.turn.permission_profile();
-    let managed_without_backend = ctx.turn.windows_sandbox_level == WindowsSandboxLevel::Disabled
+    let profile = crate::tools::sandboxing::command_permission_profile(&ctx.turn);
+    let windows_sandbox_level = crate::tools::sandboxing::command_windows_sandbox_level(&ctx.turn);
+    let managed_without_backend = windows_sandbox_level == WindowsSandboxLevel::Disabled
         && crate::exec_policy::profile_has_managed_filesystem_restrictions(&profile);
     let heuristic_readonly = matches!(
         requirement,
@@ -121,7 +122,7 @@ pub(crate) async fn recheck_readonly_command_before_launch(
         execution_context: Some((&cwd, env)),
         approval_policy: ctx.turn.approval_policy.value(),
         permission_profile: profile,
-        windows_sandbox_level: ctx.turn.windows_sandbox_level,
+        windows_sandbox_level,
         sandbox_permissions,
         prefix_rule: None,
     };

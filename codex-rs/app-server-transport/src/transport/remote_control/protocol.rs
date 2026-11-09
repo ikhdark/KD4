@@ -228,7 +228,7 @@ pub(super) fn normalize_remote_control_url(
     let map_url_parse_error = |err: url::ParseError| -> io::Error {
         io::Error::new(
             ErrorKind::InvalidInput,
-            format!("invalid remote control URL `{remote_control_url}`: {err}"),
+            format!("invalid remote control URL (details withheld): {err}"),
         )
     };
 
@@ -273,14 +273,14 @@ pub(super) fn normalize_remote_control_base_url(remote_control_url: &str) -> io:
     let map_url_parse_error = |err: url::ParseError| -> io::Error {
         io::Error::new(
             ErrorKind::InvalidInput,
-            format!("invalid remote control URL `{remote_control_url}`: {err}"),
+            format!("invalid remote control URL (details withheld): {err}"),
         )
     };
     let map_scheme_error = |_: ()| -> io::Error {
         io::Error::new(
             ErrorKind::InvalidInput,
             format!(
-                "invalid remote control URL `{remote_control_url}`; expected HTTPS URL for chatgpt.com or chatgpt-staging.com, or HTTP/HTTPS URL for localhost"
+                "invalid remote control URL; expected HTTPS URL for chatgpt.com or chatgpt-staging.com, or HTTP/HTTPS URL for localhost"
             ),
         )
     };

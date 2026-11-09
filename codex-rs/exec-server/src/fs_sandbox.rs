@@ -64,6 +64,9 @@ impl FileSystemSandboxRunner {
         sandbox: &FileSystemSandboxContext,
         request: FsHelperRequest,
     ) -> Result<FsHelperPayload, JSONRPCErrorError> {
+        let mutation = matches!(&request, FsHelperRequest::WriteFile(_)
+            | FsHelperRequest::CreateDirectory(_) | FsHelperRequest::Remove(_)
+            | FsHelperRequest::Copy(_) | FsHelperRequest::MutateFileIfMatches(_));
         let preparation_cancelled = tokio_util::sync::CancellationToken::new();
         // Only pure preparation is cancellable. Once a helper starts, its
         // existing native/mutation custodian owns settlement and cleanup.
@@ -92,7 +95,15 @@ impl FileSystemSandboxRunner {
             internal_error(format!("fs sandbox preparation task failed: {error}"))
         })??;
         drop(preparation_guard);
-        run_command(command, request_json).await
+        if mutation {
+            // Dropping the RPC observer must not kill the helper between native
+            // capture and publication/rollback. This owner retains its session
+            // through output drain, helper settlement and process cleanup.
+            tokio::spawn(run_command(command, request_json)).await
+                .map_err(|error| internal_error(format!("fs mutation settlement task failed: {error}")))?
+        } else {
+            run_command(command, request_json).await
+        }
     }
 
     fn prepare_command(

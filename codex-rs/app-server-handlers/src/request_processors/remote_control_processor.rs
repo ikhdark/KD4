@@ -50,13 +50,14 @@ impl RemoteControlRequestProcessor {
         &self,
         ephemeral: bool,
         app_server_client_name: Option<&str>,
+        request_id: &str,
     ) -> Result<RemoteControlDisableResponse, JSONRPCErrorError> {
         let handle = self.handle()?;
         let status = if ephemeral {
             handle.disable_ephemeral().await
         } else {
             handle
-                .disable(app_server_client_name)
+                .disable_observed(app_server_client_name, Some(request_id))
                 .await
                 .map_err(map_update_error)?
         };

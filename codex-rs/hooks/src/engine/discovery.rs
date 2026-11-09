@@ -705,7 +705,7 @@ fn hook_trusted_hash(is_managed: bool, state: Option<&HookStateToml>) -> Option<
         .flatten()
 }
 
-fn hook_metadata_for_config_layer_source(source: &ConfigLayerSource) -> (HookSource, bool) {
+pub(crate) fn hook_metadata_for_config_layer_source(source: &ConfigLayerSource) -> (HookSource, bool) {
     match source {
         ConfigLayerSource::System { .. } => (HookSource::System, true),
         ConfigLayerSource::User { .. } => (HookSource::User, false),

@@ -156,6 +156,20 @@ ordering; it grants no thread access and never changes runtime execution.
 claims separate from server-verified delivery and in-process native paint tokens.
 Real frontend integration is required; transport flush is not paint.
 
+Remote-control requests additionally emit `mobile_rpc_received` and bounded
+`mobile_rpc_admission`, `mobile_rpc_handler`, `mobile_file_read` and
+`mobile_rpc_response` spans in the same opt-in journal. An opaque occurrence
+links ingress, dispatch, file reads and response attempts without recording wire
+request IDs, paths, file contents, credentials or raw error messages. File reads
+retain byte counts, OS/error-kind codes, limit/revision failures and filesystem
+availability. The connection owner establishes remote-control provenance; client
+names are not proof of a phone. Unknown ingress methods are recorded as `other`.
+These are server boundaries, not relay-write, phone-receipt, tap or preview
+acknowledgements. A response owner returning does not establish delivery. KDR's
+`tools diagnose native-observations --capture PATH` exposes these under `mobile`;
+legacy journals remain unavailable for that coverage. Missing requests alone
+cannot establish that the phone ignored a tap.
+
 The editable sibling Codex-Fork now supplies opt-in transcript receipt/application
 observations through the existing privileged host connection. Initialization
 advertises diagnostics schema/journal availability. Journaled live assistant-text

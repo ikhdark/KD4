@@ -104,6 +104,21 @@ pub(super) fn fingerprint(value: &impl Serialize) -> std::io::Result<String> {
 }
 
 impl Session {
+    pub(crate) async fn reject_unaccepted_start_receipt(&self, turn_id: &str) -> CodexResult<()> {
+        match self.receipt_db()? {
+            InputReceiptStore::Durable(db) => db.reject_unaccepted_start_receipt(self.thread_id, turn_id)
+                .await.map_err(std::io::Error::other)?,
+            InputReceiptStore::Volatile(receipts) => {
+                for (receipt, consumed) in receipts.lock().await.iter_mut().filter(|(receipt, _)|
+                    receipt.kind == "start" && receipt.turn_id == turn_id && receipt.payload.is_none()) {
+                    receipt.kind = "rejected_start".into();
+                    receipt.scope = receipt.turn_id.clone();
+                    *consumed = true;
+                }
+            }
+        }
+        Ok(())
+    }
     pub(crate) async fn cancel_turn_receipts(&self, turn_id: &str) -> CodexResult<()> {
         // Optional-state fallback remains usable for ordinary submissions. An
         // explicit durable identity could not have been admitted in this mode.

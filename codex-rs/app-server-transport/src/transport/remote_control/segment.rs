@@ -369,11 +369,13 @@ pub(super) struct EncodedServerPayload {
     pub(super) payload: String,
 }
 
-/// Reject a response while its request still owns the bounded error path.
+/// Prepare display-only previews, then reject any still-oversized response
+/// while its request still owns the bounded error path.
 /// Keep this budget identical to the encoder's inner-message ceiling.
 pub fn remote_control_response_size_error(
-    response: &crate::outgoing_message::OutgoingResponse,
+    response: &mut crate::outgoing_message::OutgoingResponse,
 ) -> Option<codex_app_server_protocol_types::JSONRPCErrorError> {
+    super::preview::response(&mut response.result);
     (crate::transport::serialized_request_bytes_up_to(
         response,
         REMOTE_CONTROL_REASSEMBLED_MAX_BYTES,

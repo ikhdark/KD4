@@ -84,6 +84,7 @@ pub(crate) struct OAuthRequestAuthority {
     server_name: String,
     url: String,
     expected: Arc<std::sync::Mutex<Option<CredentialAuthority>>>,
+    login_attempt: Option<u64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -92,6 +93,9 @@ struct OAuthAuthorityChanged;
 
 impl OAuthRequestAuthority {
     fn check_with_lock_held(&self, state: &CredentialAuthorities, key: &str) -> Result<()> {
+        if self.login_attempt.is_some_and(|attempt| state.login_attempts.get(key) != Some(&attempt)) {
+            return Err(OAuthAuthorityChanged.into());
+        }
         let expected = self.expected.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.entries.get(key) != expected.as_ref() {
             return Err(OAuthAuthorityChanged.into());
@@ -124,6 +128,8 @@ impl OAuthRequestAuthority {
 struct CredentialAuthorities {
     version: u32,
     entries: BTreeMap<String, CredentialAuthority>,
+    #[serde(default)]
+    login_attempts: BTreeMap<String, u64>,
 }
 
 fn read_credential_authorities(home: &Path) -> Result<CredentialAuthorities> {
@@ -133,7 +139,7 @@ fn read_credential_authorities(home: &Path) -> Result<CredentialAuthorities> {
             anyhow::ensure!(state.version == 1, "unsupported OAuth credential authority version");
             Ok(state)
         }
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(CredentialAuthorities { version: 1, entries: BTreeMap::new() }),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(CredentialAuthorities { version: 1, entries: BTreeMap::new(), login_attempts: BTreeMap::new() }),
         Err(err) => Err(err).context("read OAuth credential authority"),
     }
 }
@@ -222,6 +228,7 @@ fn load_oauth_tokens_coordinated<K: KeyringStore + Clone + 'static>(
     let _transaction = OAuthStoreLock::acquire(codex_home, OAuthStore::Authority)?;
     let authority = read_credential_authorities(codex_home)?;
     let request_authority = OAuthRequestAuthority {
+        login_attempt: None,
         codex_home: codex_home.to_path_buf(),
         server_name: server_name.to_string(),
         url: url.to_string(),
@@ -430,6 +437,29 @@ pub fn save_oauth_tokens(
 ) -> Result<()> {
     let keyring_store = DefaultKeyringStore;
     save_oauth_tokens_coordinated(&keyring_store, codex_home, keyring_backend_kind, server_name, tokens, store_mode, None)
+}
+
+pub(crate) async fn begin_oauth_login(home: &Path, server: &str, url: &str) -> Result<OAuthRequestAuthority> {
+    let (home, server, url) = (home.to_path_buf(), server.to_string(), url.to_string());
+    tokio::task::spawn_blocking(move || {
+        let _transaction = OAuthStoreLock::acquire(&home, OAuthStore::Authority)?;
+        let mut state = read_credential_authorities(&home)?;
+        let key = compute_store_key(&server, &url)?;
+        let attempt = state.login_attempts.get(&key).copied().unwrap_or(0)
+            .checked_add(1).context("MCP OAuth login generation exhausted")?;
+        state.login_attempts.insert(key.clone(), attempt);
+        commit_credential_authority(&home, &state)?;
+        Ok(OAuthRequestAuthority { codex_home: home, server_name: server, url,
+            expected: Arc::new(std::sync::Mutex::new(state.entries.get(&key).cloned())),
+            login_attempt: Some(attempt) })
+    }).await.context("MCP OAuth login admission failed")?
+}
+
+pub(crate) fn save_oauth_login_tokens(
+    home: &Path, server: &str, tokens: &StoredOAuthTokens,
+    mode: OAuthCredentialsStoreMode, backend: AuthKeyringBackendKind, authority: &OAuthRequestAuthority,
+) -> Result<()> {
+    save_oauth_tokens_coordinated(&DefaultKeyringStore, home, backend, server, tokens, mode, Some(authority))
 }
 
 fn save_oauth_tokens_with_keyring<K: KeyringStore + Clone + 'static>(

@@ -1769,7 +1769,6 @@ fn construct_model_info_from_normalized(
     let mut model_info = if let Some(remote) = remote {
         ModelInfo {
             slug: model.to_string(),
-            used_fallback_model_metadata: false,
             ..remote.clone()
         }
     } else {

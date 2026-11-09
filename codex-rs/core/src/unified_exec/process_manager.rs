@@ -2614,8 +2614,8 @@ impl UnifiedExecProcessManager {
                                 command_for_safety: None,
                                 execution_context: request.normalization_cwd.as_deref().map(|cwd| (cwd, &env)),
                                 approval_policy: context.turn.approval_policy.value(),
-                                permission_profile: context.turn.permission_profile(),
-                                windows_sandbox_level: context.turn.windows_sandbox_level,
+                                permission_profile: crate::tools::sandboxing::command_permission_profile(&context.turn),
+                                windows_sandbox_level: crate::tools::sandboxing::command_windows_sandbox_level(&context.turn),
                                 sandbox_permissions: if request.additional_permissions_preapproved {
                                     crate::sandboxing::SandboxPermissions::UseDefault
                                 } else {
@@ -2635,8 +2635,8 @@ impl UnifiedExecProcessManager {
             command_for_safety: Some(&request.command_for_safety),
             execution_context: request.normalization_cwd.as_deref().map(|cwd| (cwd, &env)),
             approval_policy: context.turn.approval_policy.value(),
-            permission_profile: context.turn.permission_profile(),
-            windows_sandbox_level: context.turn.windows_sandbox_level,
+            permission_profile: crate::tools::sandboxing::command_permission_profile(&context.turn),
+            windows_sandbox_level: crate::tools::sandboxing::command_windows_sandbox_level(&context.turn),
             sandbox_permissions: if request.additional_permissions_preapproved {
                 crate::sandboxing::SandboxPermissions::UseDefault
             } else {

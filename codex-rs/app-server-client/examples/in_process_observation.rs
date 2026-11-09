@@ -46,7 +46,8 @@ async fn start(
         std::env::var_os("CODEX_HOME").ok_or("explicit private CODEX_HOME required")?,
     );
     let config = ConfigBuilder::default()
-        .codex_home(home)
+        .codex_home(home.clone())
+        .loader_overrides(observation_loader(&home)?)
         .cli_overrides(overrides.to_vec())
         .harness_overrides(ConfigOverrides {
             codex_self_exe: Some(cli.clone()),
@@ -63,13 +64,14 @@ async fn start(
     .await?;
     let state_db = codex_core::init_state_db(&config).await;
     let capabilities = initialize.capabilities.clone().unwrap_or_default();
+    let loader_overrides = observation_loader(&config.codex_home)?;
     Ok(InProcessAppServerClient::start(InProcessClientStartArgs {
         arg0_paths: Arg0DispatchPaths {
             codex_self_exe: Some(cli.clone()),
         },
         config: Arc::new(config),
         cli_overrides: overrides.to_vec(),
-        loader_overrides: LoaderOverrides::default(),
+        loader_overrides,
         strict_config: false,
         cloud_config_bundle: CloudConfigBundleLoader::default(),
         feedback: CodexFeedback::new(),
@@ -91,12 +93,11 @@ async fn start(
 
 async fn run() -> Result<(), Failure> {
     let mut arguments = std::env::args().skip(1);
-    let cli = PathBuf::from(
-        arguments
-            .next()
-            .ok_or("explicit matched Codex executable required")?,
-    )
-    .canonicalize()?;
+    let first = arguments.next().ok_or("explicit matched Codex executable required")?;
+    let cli = if first == "app-server" {
+        if arguments.next().as_deref() != Some("--stdio") { return Err("stdio adapter required".into()); }
+        PathBuf::from(std::env::var_os("CODEX_OBSERVATION_CLI").ok_or("explicit matched CLI environment required")?)
+    } else { PathBuf::from(first) }.canonicalize()?;
     let mut overrides = Vec::new();
     while let Some(flag) = arguments.next() {
         if flag != "-c" {
@@ -332,6 +333,24 @@ async fn run() -> Result<(), Failure> {
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+/// Private diagnostic inputs only. Never redirects machine-managed files or
+/// changes the production loader's authority or fallback behavior.
+fn observation_loader(home: &std::path::Path) -> Result<LoaderOverrides, Failure> {
+    let home = home.canonicalize()?;
+    let mut loader = LoaderOverrides::default();
+    for (name, slot) in [
+        ("CODEX_OBSERVATION_REQUIREMENTS", &mut loader.system_requirements_path),
+        ("CODEX_OBSERVATION_MANAGED", &mut loader.managed_config_path),
+    ] {
+        if let Some(path) = std::env::var_os(name) {
+            let path = PathBuf::from(path).canonicalize()?;
+            if !path.starts_with(&home) || !path.is_file() { return Err("observation input must be a regular private-home file".into()); }
+            *slot = Some(path);
+        }
+    }
+    Ok(loader)
 }
 
 fn main() -> Result<(), Failure> {

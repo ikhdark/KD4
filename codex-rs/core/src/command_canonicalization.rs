@@ -9,6 +9,13 @@ const CANONICAL_POWERSHELL_SCRIPT_PREFIX: &str = "__codex_powershell_script__";
 const POWERSHELL_NO_PROFILE_MODE: &str = "no-profile";
 const POWERSHELL_PROFILES_ENABLED_MODE: &str = "profiles-enabled";
 
+#[derive(serde::Serialize, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum ApprovalCommand {
+    RawArgv(Vec<String>),
+    BashScript(Vec<String>),
+    PowerShellScript(Vec<String>),
+}
+
 /// Canonicalize command argv for approval-cache matching.
 ///
 /// Plain Bash-like scripts receive stable tokenization, while the exact shell
@@ -67,4 +74,19 @@ pub(crate) fn canonicalize_command_for_approval(command: &[String]) -> Vec<Strin
     }
 
     command.to_vec()
+}
+
+pub(crate) fn approval_command_for_cache(command: &[String]) -> ApprovalCommand {
+    let canonical = canonicalize_command_for_approval(command);
+    // Determine provenance from the original argv, never from magic strings
+    // in the canonical result. Preserve the existing canonicalizer's API.
+    if extract_bash_command(command).is_some() {
+        ApprovalCommand::BashScript(canonical)
+    } else if extract_powershell_command(command)
+        .is_some_and(|(shell, _)| is_trusted_powershell_executable(shell))
+    {
+        ApprovalCommand::PowerShellScript(canonical)
+    } else {
+        ApprovalCommand::RawArgv(canonical)
+    }
 }

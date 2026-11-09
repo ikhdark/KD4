@@ -769,9 +769,11 @@ class TurnHandle:
     id: str
     _closed: bool = field(default=False, init=False, repr=False)
     _epoch: int = field(init=False, repr=False)
+    _router: MessageRouter = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._epoch = self._client.process_epoch
+        self._router = self._client._router
 
     def _ensure_current(self) -> None:
         if self._closed:
@@ -788,8 +790,7 @@ class TurnHandle:
                 self.interrupt()
         finally:
             self._closed = True
-            if self._client.process_epoch == self._epoch:
-                self._client.unregister_turn_notifications(self.id)
+            self._router.unregister_turn(self.id)
 
     abandon = close
 

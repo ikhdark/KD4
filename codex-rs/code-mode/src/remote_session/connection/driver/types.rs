@@ -64,6 +64,10 @@ pub(in crate::remote_session::connection) enum DriverEvent {
         id: DelegateRequestId,
         result: Result<DelegateResponse, String>,
     },
+    DelegateTimeoutPause {
+        id: DelegateRequestId,
+        paused: bool,
+    },
     RequestCancelled(RequestId),
     Failed(String),
 }

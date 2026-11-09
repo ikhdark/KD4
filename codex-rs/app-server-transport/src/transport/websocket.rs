@@ -420,9 +420,22 @@ async fn run_websocket_outbound_loop<M, SinkError>(
                 };
                 let mut batch_bytes = 0;
                 let mut write_complete_tx = None;
+                let mut delivery_credits = Vec::new();
                 for index in 0..MAX_WEBSOCKET_BATCH_MESSAGES {
                     let flush_boundary = !queued_message.message.can_batch();
-                    if let Some(json) = serialize_outgoing_message(queued_message.message) {
+                    let encoded = queued_message.encoded_json.take();
+                    let json = match encoded {
+                        Some(mut encoded) => {
+                            delivery_credits.extend(encoded.delivery_credit.take());
+                            if encoded.streamed_len.is_some() {
+                                serialize_outgoing_message(queued_message.message)
+                            } else {
+                                String::from_utf8(encoded.bytes).ok()
+                            }
+                        }
+                        None => serialize_outgoing_message(queued_message.message),
+                    };
+                    if let Some(json) = json {
                         batch_bytes += json.len();
                         if websocket_writer.feed(M::text(json)).await.is_err() {
                             break 'writer;

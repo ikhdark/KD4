@@ -28,3 +28,35 @@ consumers do not depend on that tooling facade.
 
 The [thread follow-up queue contract](THREAD_QUEUE.md) is implemented by the
 handlers crate. This source refactor does not publish or activate a local binary.
+
+## MCP OAuth completion correlation
+
+Explicit `mcpServer/oauth/login` responses include an optional `loginId`, echoed
+by `mcpServer/oauthLogin/completed`. Match attempts by this ID rather than server
+name or arrival order; overlapping attempts can finish out of order. Older peers
+and automatic plugin logins may omit it. Existing server/thread fields remain.
+
+## Opt-in mobile folder/Git discovery diagnostics
+
+After separately publishing the backend, enable the existing runtime journal in
+the backend's launch environment with `CODEX_RUNTIME_OBSERVATIONS=1` and
+`CODEX_RUNTIME_OBSERVATIONS_DIR` pointing to an existing absolute private capture
+directory (normally under `KDR/captures/`). Publishing alone does not enable it.
+These launch-time settings require a new backend process; do not interrupt a
+running app or chat without authorization. No phone-app replacement is needed.
+
+Reopen the phone's Git panel and switch workspaces. The journal correlates
+`mobile_rpc_received`, admission/handler outcomes, `mobile_directory_path_decoded`
+and `mobile_file_read_*` records by `operation_id`. Directory observations retain
+the incoming/decoded path's SHA-256, byte count and syntax class, filesystem error
+kind/OS code, response-budget failures, entry count and whether `.git` was returned
+as a file or directory. Hash the exact known workspace-path UTF-8 string to compare
+its fingerprint. No raw paths, other entry names, contents, commands, credentials
+or error-message bodies are added by these diagnostics.
+
+Only transport-identified remote-control requests receive these observations.
+Existing journal caps and failure behavior remain in force. An abandoned span,
+overflow, missing events or absent phone observations is incomplete evidence,
+not a successful lookup. Handler completion is not a phone-rendering or delivery
+acknowledgment. This instrumentation diagnoses discovery; it does not itself fix
+the mobile Git failure or change filesystem responses, permissions or limits.

@@ -467,8 +467,18 @@ pub(crate) fn private_index_copy(
     // std opens files share-delete, so Git's lock-and-rename updates proceed.
     match std::fs::File::open(live) {
         Ok(mut source) => {
+            let modified = source
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .map_err(|error| error.to_string())?;
             let mut target = std::fs::File::create(&copy).map_err(|error| error.to_string())?;
             std::io::copy(&mut source, &mut target).map_err(|error| error.to_string())?;
+            // Git uses the index timestamp to detect racily-clean entries.
+            // A fresh timestamp can hide same-size worktree edits whose stat
+            // data matches the cache. Preserve it on the private copy only.
+            target
+                .set_times(std::fs::FileTimes::new().set_modified(modified))
+                .map_err(|error| error.to_string())?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("cannot copy the Git index: {error}")),

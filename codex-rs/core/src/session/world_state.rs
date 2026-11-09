@@ -58,6 +58,11 @@ impl Session {
                 None
             };
         let mut world_state = WorldState::default();
+        if let Some(section) = crate::tools::handlers::evidence_memory::ledger_context(step_context).await {
+            let previous = previous_world_state.as_ref()
+                .and_then(|state| state.rendered_extension("verification_ledger"));
+            world_state.add_extension_section_with_previous(section, previous);
+        }
         world_state.add_section(
             agents_md_state(
                 step_context.loaded_agents_md.as_deref(),

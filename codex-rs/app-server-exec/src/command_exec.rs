@@ -885,11 +885,13 @@ async fn run_command(params: RunCommandParams) {
                 } else {
                     std::future::pending::<()>().await;
                 }
-            }, if !termination_reported => {
+            }, if termination_deadline.is_some() => {
                 // A failed kill remains retryable in ProcessHandle. Report an
                 // honest unknown outcome, but keep this run, process ID, native
                 // waiter and admission owned until exit is actually observed.
                 let retry_error = session.request_terminate().err().map(|error| error.to_string());
+                termination_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(1));
+                if termination_reported { continue; }
                 let mut error = internal_error("command expiration requested termination, but process exit is not confirmed; cleanup remains pending; do not repeat the command");
                 error.data = Some(serde_json::json!({
                     "kind": "process_exit_unconfirmed", "cleanupPending": true,
@@ -984,6 +986,9 @@ async fn run_command(params: RunCommandParams) {
         }
     };
 
+    if expiration_outcome.is_none() {
+        session.finish();
+    }
     if termination_reported {
         if let Some(delivery) = termination_delivery { delivery.await; }
         return;

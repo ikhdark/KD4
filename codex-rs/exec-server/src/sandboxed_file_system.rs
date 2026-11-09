@@ -254,6 +254,7 @@ impl SandboxedFileSystem {
         path: &PathUri,
         expected: Option<Vec<u8>>,
         replacement: Option<Vec<u8>>,
+        retention: codex_file_system::FileMutationRetention,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<codex_file_system::FileMutationOutcome> {
         let sandbox = require_platform_sandbox(sandbox)?;
@@ -267,6 +268,7 @@ impl SandboxedFileSystem {
                     path: path.clone(),
                     expected_base64: expected.map(|bytes| STANDARD.encode(bytes)),
                     replacement_base64: replacement.map(|bytes| STANDARD.encode(bytes)),
+                    retention,
                     sandbox: None,
                 }),
             )
@@ -595,8 +597,20 @@ impl ExecutorFileSystem for SandboxedFileSystem {
             path,
             expected,
             replacement,
+            codex_file_system::FileMutationRetention::None,
             sandbox,
         ))
+    }
+
+    fn mutate_file_if_matches_with_retention<'a>(
+        &'a self,
+        path: &'a PathUri,
+        expected: Option<Vec<u8>>,
+        replacement: Option<Vec<u8>>,
+        retention: codex_file_system::FileMutationRetention,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, codex_file_system::FileMutationOutcome> {
+        Box::pin(SandboxedFileSystem::mutate_file_if_matches(self, path, expected, replacement, retention, sandbox))
     }
 
     fn uses_host_native_paths(&self) -> bool {

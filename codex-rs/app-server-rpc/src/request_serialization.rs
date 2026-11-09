@@ -193,6 +193,7 @@ fn canonical_thread_key(thread_id: String) -> String {
 pub struct QueuedInitializedRequest {
     gate: Arc<ConnectionRpcGate>,
     estimated_bytes: usize,
+    retain_settlement: bool,
     future: BoxFutureUnit,
 }
 
@@ -206,13 +207,19 @@ impl QueuedInitializedRequest {
         Self {
             gate,
             estimated_bytes,
+            retain_settlement: false,
             future: Box::pin(future),
         }
     }
 
+    pub fn retain_settlement(mut self, retain: bool) -> Self {
+        self.retain_settlement = retain;
+        self
+    }
+
     pub async fn run(self) {
-        let Self { gate, future, .. } = self;
-        if let Err(error) = gate.run(future).await {
+        let Self { gate, future, retain_settlement, .. } = self;
+        if let Err(error) = gate.run(future, retain_settlement).await {
             tracing::error!(?error, "initialized request handler task failed");
         }
     }

@@ -1086,6 +1086,7 @@ mod windows_impl {
             return Ok(());
         };
         permissions.ensure_read_policy_supported(cwd)?;
+        permissions.ensure_legacy_network_policy_supported()?;
         super::ensure_legacy_delete_child_safety(legacy_restricted_token_enforces_delete_child())?;
         if !permissions.uses_write_capabilities_for_cwd(cwd, env_map) {
             return Ok(());

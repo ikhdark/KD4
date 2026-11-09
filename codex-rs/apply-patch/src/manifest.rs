@@ -274,7 +274,7 @@ impl PatchManifest {
             return;
         };
         match outcome {
-            FileMutationOutcome::Committed | FileMutationOutcome::Unchanged => {
+            FileMutationOutcome::Committed | FileMutationOutcome::CommittedRetained { .. } | FileMutationOutcome::Unchanged => {
                 // Only a successful conditional receipt validates the expected bytes.
                 if !rolling_back {
                     entry.before = PatchByteIdentity::from_content(expected);

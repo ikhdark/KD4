@@ -686,7 +686,7 @@ fn serialize_jsonrpc_message(message: &JSONRPCMessage) -> Result<String, serde_j
     serialize_jsonrpc_message_with_limit(message, MAX_JSONRPC_MESSAGE_LEN)
 }
 
-fn serialize_jsonrpc_message_with_limit(message: &JSONRPCMessage, limit: usize) -> Result<String, serde_json::Error> {
+pub(crate) fn serialize_jsonrpc_message_with_limit(message: &JSONRPCMessage, limit: usize) -> Result<String, serde_json::Error> {
     let encode = |message: &JSONRPCMessage| {
         let mut buffer = BoundedJsonBuffer { bytes: Vec::new(), limit };
         serde_json::to_writer(&mut buffer, message)?;

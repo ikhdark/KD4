@@ -4,7 +4,7 @@ Runtime: shell
 Executes shell requests under the orchestrator: asks for approval when needed,
 builds sandbox transform inputs, and runs them under the current SandboxAttempt.
 */
-use crate::command_canonicalization::canonicalize_command_for_approval;
+use crate::command_canonicalization::approval_command_for_cache;
 use crate::exec::CommandProgress;
 use crate::exec::ExecCapturePolicy;
 use crate::sandboxing::ExecOptions;
@@ -72,7 +72,7 @@ pub struct ShellRuntime {
 pub(crate) struct ApprovalKey {
     environment_id: String,
     approval_scope_id: String,
-    command: Vec<String>,
+    command: crate::command_canonicalization::ApprovalCommand,
     cwd: AbsolutePathBuf,
     sandbox_permissions: SandboxPermissions,
     additional_permissions: Option<AdditionalPermissionProfile>,
@@ -155,7 +155,7 @@ impl Approvable<ShellRequest> for ShellRuntime {
                 .environment
                 .approval_scope_id()
                 .to_string(),
-            command: canonicalize_command_for_approval(&req.command_for_approval),
+            command: approval_command_for_cache(&req.command_for_approval),
             cwd: req.cwd.clone(),
             sandbox_permissions: req.sandbox_permissions,
             additional_permissions: req.additional_permissions.clone(),
@@ -220,6 +220,10 @@ impl Approvable<ShellRequest> for ShellRuntime {
 }
 
 impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
+    fn read_only_in_subagents(&self) -> bool {
+        true
+    }
+
     async fn run(
         &mut self,
         req: &ShellRequest,

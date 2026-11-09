@@ -60,6 +60,8 @@ class MessageRouter:
         self._pending_turn_notifications: dict[str, deque[tuple[Notification, int]]] = {}
         self._abandoned_turns: set[str] = set()
         self._terminal_turns: set[str] = set()
+        # Retirement evidence only; never used to certify retained completion.
+        self._observed_terminal_turns: set[str] = set()
         self._goal_operations: dict[str, _GoalOperationState] = {}
         # Includes handle-owned completed queues and routes being unregistered,
         # so their still-charged backlog cannot be blamed on an unrelated sender.
@@ -282,8 +284,9 @@ class MessageRouter:
         with self._lock:
             turn_queue = self._turn_notifications.pop(turn_id, None)
             self._discard_pending(self._pending_turn_notifications.pop(turn_id, deque()))
-            if turn_id in self._terminal_turns:
-                self._terminal_turns.remove(turn_id)
+            if turn_id in self._observed_terminal_turns or turn_id in self._terminal_turns:
+                self._terminal_turns.discard(turn_id)
+                self._observed_terminal_turns.discard(turn_id)
             elif turn_id not in self._abandoned_turns:
                 self._check_route_capacity("turn", turn_id)
                 self._abandoned_turns.add(turn_id)
@@ -537,6 +540,9 @@ class MessageRouter:
                     self._abandoned_turns.remove(turn_id)
                 return
             turn_queue = self._turn_notifications.get(turn_id)
+            if notification.method == "turn/completed":
+                self._check_route_capacity("turn", turn_id)
+                self._observed_terminal_turns.add(turn_id)
             if turn_queue is None:
                 if turn_id not in self._pending_turn_notifications:
                     self._check_route_capacity("turn", turn_id)

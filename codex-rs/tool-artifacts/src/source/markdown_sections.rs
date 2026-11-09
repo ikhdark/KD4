@@ -55,11 +55,18 @@ pub(super) fn sections(
             Event::Start(Tag::Heading { level, .. }) => {
                 let level = level as u8;
                 let start_line = line_starts.partition_point(|start| *start <= range.start);
-                let start = line_starts[start_line - 1];
+                // CommonMark also recognizes lone CRs as block boundaries,
+                // while source line selectors intentionally count LF only.
+                // Keep parser byte identity when another heading shares that
+                // LF-delimited line; never alias it to the line's first heading.
+                let line_start = line_starts[start_line - 1];
+                let start = source.as_bytes()[line_start..range.start]
+                    .iter().rposition(|byte| *byte == b'\r')
+                    .map_or(line_start, |offset| line_start + offset + 1);
                 while stack.last().is_some_and(|index| headings[*index].level >= level) {
                     let index = stack.pop()?;
                     headings[index].canonical_range.end = start as u64;
-                    headings[index].end_line = start_line - 1;
+                    headings[index].end_line = line_starts.partition_point(|line| *line < start).max(1);
                 }
                 let index = headings.len();
                 headings.push(Heading {

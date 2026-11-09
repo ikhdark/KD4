@@ -30,6 +30,7 @@ pub struct Policy {
     network_rules: Vec<NetworkRule>,
     basename_rules: MultiMap<String, RuleRef>,
     host_executables_by_name: Arc<HashMap<String, Arc<[AbsolutePathBuf]>>>,
+    managed_basename_rules: Vec<RuleRef>,
 }
 
 impl Policy {
@@ -69,6 +70,7 @@ impl Policy {
             network_rules,
             basename_rules,
             host_executables_by_name,
+            managed_basename_rules: Vec::new(),
         }
     }
 
@@ -161,11 +163,22 @@ impl Policy {
                 .map(|(name, paths)| (name.clone(), paths.clone())),
         );
 
-        Policy::from_shared_parts(
+        let mut combined = Policy::from_shared_parts(
             combined_rules,
             combined_network_rules,
             host_executables_by_name,
-        )
+        );
+        combined.managed_basename_rules = self.managed_basename_rules.clone();
+        combined.managed_basename_rules.extend(overlay.managed_basename_rules.iter().cloned());
+        combined
+    }
+
+    /// Requirements retain their own executable authority, independent of user mappings.
+    pub fn merge_requirements(&self, requirements: &Policy) -> Policy {
+        let mut combined = self.merge_overlay(requirements);
+        combined.managed_basename_rules.extend(requirements.basename_rules.iter_all()
+            .flat_map(|(_, rules)| rules.iter().filter(|rule| rule.decision == Decision::Forbidden).cloned()));
+        combined
     }
 
     /// Projects rules into the proxy's host-wide permissions. Protocol records the
@@ -343,16 +356,17 @@ impl Policy {
             return matched;
         };
         let basename = executable_lookup_key(filename);
-        if let Some(program) = &program
-            && let Some(paths) = self.host_executables_by_name.get(&basename)
-            && !paths.iter().any(|path| path == program)
-        {
-            return matched;
-        }
+        let host_matches = program.as_ref().is_none_or(|program| {
+            self.host_executables_by_name.get(&basename)
+                .is_none_or(|paths| paths.iter().any(|path| path == program))
+        });
         let Some(rules) = self.basename_rules.get_vec(&basename) else {
             return matched;
         };
         for rule in rules {
+            if !host_matches && !self.managed_basename_rules.iter().any(|managed| Arc::ptr_eq(managed, rule)) {
+                continue;
+            }
             // Rules keyed by this exact spelling were visited above.
             if rule.program() == first {
                 continue;

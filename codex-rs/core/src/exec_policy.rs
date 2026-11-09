@@ -719,7 +719,7 @@ pub async fn load_exec_policy(config_stack: &ConfigLayerStack) -> Result<Policy,
     tracing::trace!(rules = ?policy, "exec policy rules loaded");
 
     let policy = match config_stack.requirements().exec_policy.as_deref() {
-        Some(requirements_policy) => policy.merge_overlay(requirements_policy.as_ref()),
+        Some(requirements_policy) => policy.merge_requirements(requirements_policy.as_ref()),
         None => policy,
     };
     if !policy.network_rules().is_empty() {

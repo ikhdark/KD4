@@ -108,6 +108,32 @@ fn ensure_regular_file(file: File, path: &Path) -> io::Result<(File, std::fs::Me
     Ok((file, metadata))
 }
 
+/// Opens the addressed regular object without following any reparse component.
+/// Parent handles pin the walk until the final no-delete-sharing handle opens.
+pub fn open_regular_file_no_follow(path: &Path) -> io::Result<File> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
+    use windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
+
+    let parent = path.parent().ok_or_else(outside_root_error)?;
+    let _parents = crate::lock_directory_chain(parent)?;
+    let file = OpenOptions::new().read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .security_qos_flags(SECURITY_IDENTIFICATION).open(path)?;
+    let (file, metadata) = ensure_regular_file(file, path)?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+            "regular file read refuses a reparse point"));
+    }
+    Ok(file)
+}
+
 fn open_confined_file_impl(
     root: &Path,
     path: &Path,

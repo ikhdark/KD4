@@ -35,12 +35,39 @@ use windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle;
 #[derive(Debug)]
 pub enum FileMutationOutcome {
     Committed,
+    CommittedRetained {
+        file: RetainedFile,
+    },
     Unchanged,
     Conflict,
     RecoveryRequired {
         retained_path: std::path::PathBuf,
         message: String,
     },
+}
+
+/// Identity of an actual deleted object, not a byte-copy rollback preimage.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetainedFile {
+    pub path: PathBuf,
+    pub volume: u32,
+    pub index: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "file", rename_all = "camelCase")]
+pub enum FileMutationRetention {
+    #[default]
+    None,
+    RetainDeleted,
+    RetainReplaced,
+    CopySourceSecurity {
+        source: codex_utils_path_uri::PathUri,
+        expected: Vec<u8>,
+    },
+    RestoreDeleted(RetainedFile),
+    DiscardDeleted(RetainedFile),
 }
 
 // Native readers must not mistake the deliberate capture/publication interval
@@ -61,8 +88,9 @@ fn patch_capture_lock_path(path: &Path) -> io::Result<PathBuf> {
     identity.hash(&mut hash);
     // Bound the shared namespace without ever unlinking a live lock.
     // Collisions conservatively return transient contention, not absence.
-    Ok(patch_capture_directory()
-        .join(patch_capture_bucket(hash.finish() & (PATCH_CAPTURE_BUCKETS - 1))))
+    Ok(patch_capture_directory().join(patch_capture_bucket(
+        hash.finish() & (PATCH_CAPTURE_BUCKETS - 1),
+    )))
 }
 
 const PATCH_CAPTURE_BUCKETS: u64 = 0x1000;
@@ -209,11 +237,86 @@ pub fn mutate_file_if_matches(
     expected: Option<&[u8]>,
     replacement: Option<&[u8]>,
 ) -> io::Result<FileMutationOutcome> {
+    mutate_file_if_matches_with_retention(path, expected, replacement, FileMutationRetention::None)
+}
+
+pub fn mutate_file_if_matches_with_retention(
+    path: &Path,
+    expected: Option<&[u8]>,
+    replacement: Option<&[u8]>,
+    retention: FileMutationRetention,
+) -> io::Result<FileMutationOutcome> {
     let _capture = try_acquire_patch_capture(path)?;
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent"))?;
     let _parents = crate::lock_directory_chain(parent)?;
+    match &retention {
+        FileMutationRetention::RestoreDeleted(file) => {
+            if replacement.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "restore requires original bytes",
+                ));
+            }
+            return settle_retained(path, file, replacement.unwrap_or_default(), true, expected);
+        }
+        FileMutationRetention::DiscardDeleted(file) => {
+            if expected.is_none() || replacement.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "discard requires original bytes and no replacement",
+                ));
+            }
+            return settle_retained(path, file, expected.unwrap_or_default(), false, None);
+        }
+        FileMutationRetention::RetainDeleted if expected.is_none() || replacement.is_some() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "retention requires deletion of an existing file",
+            ));
+        }
+        FileMutationRetention::RetainReplaced if expected.is_none() || replacement.is_none() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "replacement retention requires an existing file and replacement bytes",
+            ));
+        }
+        _ => {}
+    }
+    // An absent move destination inherits source security, not the parent's
+    // broader defaults. Pin the compared source and its directory chain through
+    // publication; inability to reproduce security fails before new bytes exist.
+    let security_source = if let FileMutationRetention::CopySourceSecurity {
+        source,
+        expected: source_bytes,
+    } = &retention
+    {
+        if expected.is_some() || replacement.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "source-security copy requires an absent destination and replacement bytes",
+            ));
+        }
+        let source = source.to_abs_path()?;
+        let parents = crate::lock_directory_chain(
+            source
+                .as_path()
+                .parent()
+                .ok_or_else(|| io::Error::other("missing source parent"))?,
+        )?;
+        let file = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(source.as_path())?;
+        if !preimage_matches(&file, source_bytes)? {
+            return Ok(FileMutationOutcome::Conflict);
+        }
+        Some((source, file, parents))
+    } else {
+        None
+    };
     let mut old = match OpenOptions::new()
         .read(true)
         .access_mode(0x8000_0000 | DELETE)
@@ -242,11 +345,19 @@ pub fn mutate_file_if_matches(
     }
     let Some(replacement) = replacement else {
         if let Some(file) = &old {
+            if retention == FileMutationRetention::RetainDeleted {
+                let retained = retained_identity(file, recovery_path(parent)?)?;
+                rename_handle(file, &retained.path)?;
+                return Ok(FileMutationOutcome::CommittedRetained { file: retained });
+            }
             delete_handle(file)?;
         }
         return Ok(FileMutationOutcome::Committed);
     };
     let mut staged = NamedTempFile::new_in(parent)?;
+    if let Some((source, _, _)) = &security_source {
+        crate::atomic_write::copy_file_security(source.as_path(), staged.path())?;
+    }
     // Preserve Windows security before the replacement bytes exist.
     if let Some(expected) = preimage
         && let Err(denied) = crate::atomic_write::copy_file_security(path, staged.path())
@@ -270,8 +381,8 @@ pub fn mutate_file_if_matches(
     let (_, staged_path) = staged.keep().map_err(|error| error.error)?;
     let staged_path = tempfile::TempPath::try_from_path(staged_path)?;
     let retained = if let Some(file) = &old {
-        let retained = recovery_path(parent)?;
-        rename_handle(file, &retained)?;
+        let retained = retained_identity(file, recovery_path(parent)?)?;
+        rename_handle(file, &retained.path)?;
         Some(retained)
     } else {
         None
@@ -290,21 +401,124 @@ pub fn mutate_file_if_matches(
     if let Err(error) = published {
         return match retained {
             Some(retained_path) => Ok(FileMutationOutcome::RecoveryRequired {
-                retained_path,
+                retained_path: retained_path.path,
                 message: error.to_string(),
             }),
             None => Err(error),
         };
     }
+    if retention == FileMutationRetention::RetainReplaced
+        && let Some(file) = retained.clone()
+    {
+        return Ok(FileMutationOutcome::CommittedRetained { file });
+    }
     if let (Some(file), Some(retained_path)) = (&old, retained)
         && let Err(error) = retry_transient_denial(|| delete_handle(file))
     {
         return Ok(FileMutationOutcome::RecoveryRequired {
-            retained_path,
+            retained_path: retained_path.path,
             message: error.to_string(),
         });
     }
     Ok(FileMutationOutcome::Committed)
+}
+
+fn retained_identity(file: &File, path: PathBuf) -> io::Result<RetainedFile> {
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the owned handle stays live and the output has the native layout.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(RetainedFile {
+        path,
+        volume: information.dwVolumeSerialNumber,
+        index: (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    })
+}
+
+fn settle_retained(
+    path: &Path,
+    retained: &RetainedFile,
+    bytes: &[u8],
+    restore: bool,
+    expected: Option<&[u8]>,
+) -> io::Result<FileMutationOutcome> {
+    let mut displaced_effect = false;
+    let result = (|| {
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("missing original parent"))?;
+        if retained.path.parent() != Some(parent)
+            || !retained
+                .path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".codex-patch-recovery-"))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "retained object is outside its original recovery namespace",
+            ));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .access_mode(GENERIC_READ | DELETE)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&retained.path)?;
+        if retained_identity(&file, retained.path.clone())? != *retained
+            || !preimage_matches(&file, bytes)?
+        {
+            return Err(io::Error::other(
+                "retained object identity or bytes changed; refusing settlement",
+            ));
+        }
+        if restore {
+            let displaced = if let Some(expected) = expected {
+                let current = OpenOptions::new()
+                    .read(true)
+                    .access_mode(GENERIC_READ | DELETE)
+                    .share_mode(FILE_SHARE_READ)
+                    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                    .open(path)?;
+                if !preimage_matches(&current, expected)? {
+                    return Ok(FileMutationOutcome::Conflict);
+                }
+                let captured = recovery_path(parent)?;
+                rename_handle(&current, &captured)?;
+                displaced_effect = true;
+                Some((current, captured))
+            } else {
+                None
+            };
+            // NO replace-existing, including a nonparticipating creator after deletion.
+            if let Err(error) = retry_transient_denial(|| rename_handle(&file, path)) {
+                return Err(io::Error::other(format!(
+                    "{error}; displaced replacement retained at {:?}",
+                    displaced.as_ref().map(|(_, path)| path)
+                )));
+            }
+            if let Some((current, captured)) = displaced
+                && let Err(error) = retry_transient_denial(|| delete_handle(&current))
+            {
+                return Ok(FileMutationOutcome::RecoveryRequired {
+                    retained_path: captured,
+                    message: format!("original restored but replacement cleanup failed: {error}"),
+                });
+            }
+        } else {
+            retry_transient_denial(|| delete_handle(&file))?;
+        }
+        Ok(FileMutationOutcome::Committed)
+    })();
+    match result {
+        Ok(outcome) => Ok(outcome),
+        Err(error) if !displaced_effect => Err(error),
+        Err(error) => Ok(FileMutationOutcome::RecoveryRequired {
+            retained_path: retained.path.clone(),
+            message: error.to_string(),
+        }),
+    }
 }
 
 /// Compare through the pinned handle using fixed scratch storage. Drain the
@@ -337,7 +551,8 @@ fn preimage_matches(file: &File, expected: &[u8]) -> io::Result<bool> {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         };
-        matches &= expected.get(offset..)
+        matches &= expected
+            .get(offset..)
             .is_some_and(|remaining| remaining.starts_with(&scratch[..length]));
         offset = offset.saturating_add(length);
     }
@@ -390,7 +605,12 @@ fn rewrite_captured_original(
                 format!("{denied}; in-place rewrite needs exclusive access: {error}"),
             ));
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("opening original for in-place rewrite: {error}"),
+            ));
+        }
     };
     // The pin closed before this exclusive open: compare again under this handle.
     if !preimage_matches(&file, expected)? {
@@ -399,10 +619,19 @@ fn rewrite_captured_original(
     if link_count(&file)? != 1 {
         return Err(denied);
     }
-    let mut preimage = tempfile::Builder::new()
-        .prefix(".codex-patch-preimage-")
-        .tempfile_in(parent)?;
-    preimage.write_all(expected)?;
+    let mut preimage = crate::atomic_write::create_preimage_with_source_dacl(&file, parent)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("creating source-DACL preimage: {error}"),
+            )
+        })?;
+    preimage.write_all(expected).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("writing source-DACL preimage: {error}"),
+        )
+    })?;
     let retained = recovery_path(parent)?;
     // Capture: the name stays absent until this same object is published back.
     rename_handle(&file, &retained)?;
@@ -425,7 +654,7 @@ fn restore_captured_original(
     path: &Path,
     retained: PathBuf,
     expected: &[u8],
-    preimage: NamedTempFile,
+    preimage: crate::atomic_write::SourceDaclPreimage,
     failure: io::Error,
 ) -> io::Result<FileMutationOutcome> {
     if let Err(restore) = overwrite(file, expected) {
@@ -449,7 +678,7 @@ fn restore_captured_original(
 }
 
 /// Keeps the complete preimage copy even if clearing its temporary attribute fails.
-fn keep_preimage_copy(copy: NamedTempFile) -> PathBuf {
+fn keep_preimage_copy(copy: crate::atomic_write::SourceDaclPreimage) -> PathBuf {
     match copy.into_temp_path().keep() {
         Ok(path) => path,
         Err(error) => {

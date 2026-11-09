@@ -95,6 +95,7 @@ enum ActiveLogin {
     DeviceCode {
         cancel: CancellationToken,
         login_id: Uuid,
+        commit_admitted: bool,
     },
 }
 
@@ -720,6 +721,7 @@ impl AccountRequestProcessor {
             *guard = Some(ActiveLogin::DeviceCode {
                 cancel: cancel.clone(),
                 login_id,
+                commit_admitted: false,
             });
         }
 
@@ -743,9 +745,12 @@ impl AccountRequestProcessor {
                 };
                 // Keep the admitted writer in cancellation accounting until it
                 // settles. Logout/replacement must join it before mutating auth.
-                let guard = active_login.lock().await;
+                let mut guard = active_login.lock().await;
                 if guard.as_ref().map(ActiveLogin::login_id) != Some(login_id) {
                     return Err(IoError::new(std::io::ErrorKind::Interrupted, "Login was not completed"));
+                }
+                if let Some(ActiveLogin::DeviceCode { commit_admitted, .. }) = guard.as_mut() {
+                    *commit_admitted = true;
                 }
                 let result = pending.persist().await;
                 drop(guard);
@@ -788,6 +793,9 @@ impl AccountRequestProcessor {
     ) -> std::result::Result<(), CancelLoginError> {
         let mut guard = self.active_login.lock().await;
         if guard.as_ref().map(ActiveLogin::login_id) == Some(login_id) {
+            if matches!(guard.as_ref(), Some(ActiveLogin::DeviceCode { commit_admitted: true, .. })) {
+                return Err(CancelLoginError::NotFound);
+            }
             if let Some(ActiveLogin::Browser {
                 shutdown_handle, ..
             }) = guard.as_ref()
@@ -916,11 +924,13 @@ impl AccountRequestProcessor {
             ))
             .await;
 
-        self.outgoing
-            .send_server_notification(ServerNotification::AccountUpdated(
-                self.current_account_updated_notification(),
-            ))
-            .await;
+        self.send_current_account_updated().await;
+    }
+
+    async fn send_current_account_updated(&self) {
+        let Some(permit) = self.outgoing.reserve_server_notification().await else { return; };
+        let _guard = self.active_login.lock().await;
+        permit.send(ServerNotification::AccountUpdated(self.current_account_updated_notification()));
     }
 
     // Login completion must carry both the transport dependencies and the
@@ -945,7 +955,8 @@ impl AccountRequestProcessor {
 
         let mut guard = active_login.lock().await;
         let is_current = guard.as_ref().map(ActiveLogin::login_id) == Some(login_id);
-        let account_updated = if success && is_current {
+        let publish_account_updated = success && is_current;
+        if publish_account_updated {
             let auth_manager = thread_manager.auth_manager();
             auth_manager.reload().await;
             config_manager
@@ -963,16 +974,7 @@ impl AccountRequestProcessor {
                 auth.clone(),
             )
             .await;
-            Some(AccountUpdatedNotification {
-                auth_mode: auth
-                    .as_ref()
-                    .map(CodexAuth::api_auth_mode)
-                    .map(AuthMode::from),
-                plan_type: auth.as_ref().and_then(CodexAuth::account_plan_type),
-            })
-        } else {
-            None
-        };
+        }
         if is_current {
             guard.take();
         }
@@ -980,10 +982,15 @@ impl AccountRequestProcessor {
         outgoing
             .send_server_notification(ServerNotification::AccountLoginCompleted(payload_v2))
             .await;
-        if let Some(account_updated) = account_updated {
-            outgoing
-                .send_server_notification(ServerNotification::AccountUpdated(account_updated))
-                .await;
+        if publish_account_updated
+            && let Some(permit) = outgoing.reserve_server_notification().await
+        {
+            let _guard = active_login.lock().await;
+            let auth = thread_manager.auth_manager().auth_cached();
+            permit.send(ServerNotification::AccountUpdated(AccountUpdatedNotification {
+                auth_mode: auth.as_ref().map(CodexAuth::api_auth_mode).map(AuthMode::from),
+                plan_type: auth.as_ref().and_then(CodexAuth::account_plan_type),
+            }));
         }
     }
 
@@ -1021,23 +1028,13 @@ impl AccountRequestProcessor {
 
     async fn logout_v2(&self, request_id: ConnectionRequestId) -> Result<(), JSONRPCErrorError> {
         let result = self.logout_common().await;
-        let account_updated =
-            result
-                .as_ref()
-                .ok()
-                .cloned()
-                .map(|auth_mode| AccountUpdatedNotification {
-                    auth_mode,
-                    plan_type: None,
-                });
+        let publish_account_updated = result.is_ok();
         self.outgoing
             .send_result(request_id, result.map(|_| LogoutAccountResponse {}))
             .await;
 
-        if let Some(payload) = account_updated {
-            self.outgoing
-                .send_server_notification(ServerNotification::AccountUpdated(payload))
-                .await;
+        if publish_account_updated {
+            self.send_current_account_updated().await;
         }
         Ok(())
     }

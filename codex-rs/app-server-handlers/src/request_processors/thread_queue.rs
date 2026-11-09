@@ -943,6 +943,7 @@ impl ThreadQueueRequestProcessor {
         &self,
         params: ThreadQueueStartParams,
         origin: QueueOrigin,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<ThreadQueueStartResponse, JSONRPCErrorError> {
         let id = parse_thread_id_for_request(&params.thread_id)?;
         let processor = self.clone();
@@ -950,7 +951,7 @@ impl ThreadQueueRequestProcessor {
         self.background_tasks
             .spawn(async move {
                 processor
-                    .start_inner(id, Some(&params.queued_submission_id), Some(origin))
+                    .start_inner(id, Some(&params.queued_submission_id), Some(origin), cancellation)
                     .await?
                     .ok_or_else(|| invalid_params("queued submission not found"))
             })
@@ -963,8 +964,12 @@ impl ThreadQueueRequestProcessor {
         id: ThreadId,
         selected: Option<&str>,
         origin: Option<QueueOrigin>,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Option<ThreadQueueStartResponse>, JSONRPCErrorError> {
         let (guard, publication) = self.lock(id).await?;
+        if cancellation.as_ref().is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return Err(invalid_request("queued start was cancelled by startup interrupt"));
+        }
         let mut queue = self.load(id).await?;
         self.recover(id, &mut queue).await?;
         if queue.pending_start.is_some() {
@@ -1056,6 +1061,7 @@ impl ThreadQueueRequestProcessor {
                 origin.client_version,
                 origin.supports_openai_form_elicitation,
                 turn_id,
+                cancellation,
             )
             .await;
         match result {
@@ -1174,7 +1180,7 @@ impl ThreadQueueRequestProcessor {
             ) {
                 return;
             }
-            if let Err(error) = processor.start_inner(id, None, None).await {
+            if let Err(error) = processor.start_inner(id, None, None, None).await {
                 tracing::warn!(%id, error = %error.message, "queued follow-up was not started");
             }
         });

@@ -432,12 +432,20 @@ impl CodexThread {
         cancellation: tokio_util::sync::CancellationToken,
     ) -> CodexResult<()> {
         if cancellation.is_cancelled() {
+            self.codex.session.reject_unaccepted_start_receipt(&turn_id).await?;
             return Err(CodexErr::TurnAborted);
         }
         debug_assert!(matches!(op, Op::UserInput { .. }));
-        let guard = self.reserve_execution_guard(&op).await?;
+        let guard = match self.reserve_execution_guard(&op).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.codex.session.reject_unaccepted_start_receipt(&turn_id).await?;
+                return Err(error);
+            }
+        };
         let _residency_pin = self.residency_gate.read().await;
-        self.codex
+        let reserved_turn_id = turn_id.clone();
+        let result = self.codex
             .submit_with_start_admission(
                 Submission {
                     id: turn_id,
@@ -448,7 +456,11 @@ impl CodexThread {
                 guard,
                 cancellation,
             )
-            .await
+            .await;
+        if matches!(&result, Err(CodexErr::TurnAborted | CodexErr::InvalidRequest(_))) {
+            self.codex.session.reject_unaccepted_start_receipt(&reserved_turn_id).await?;
+        }
+        result
     }
 
     /// An acknowledged startup stop must not be overtaken by an older installer.
@@ -947,6 +959,10 @@ impl CodexThread {
 
     pub async fn config(&self) -> Arc<crate::config::Config> {
         self.codex.session.get_config().await
+    }
+
+    pub async fn config_for_project_discovery(&self) -> Arc<crate::config::Config> {
+        self.codex.session.get_config_for_project_discovery().await
     }
 
     /// Resolves the MCP runtime configuration using this thread's extension data.

@@ -2534,6 +2534,16 @@ impl Session {
             .clone()
     }
 
+    /// Fresh project discovery follows accepted cwd, not the start snapshot.
+    /// Keep the session layers and permission constraints for the caller's rebuild.
+    pub(crate) async fn get_config_for_project_discovery(&self) -> std::sync::Arc<Config> {
+        let state = self.state.lock().await;
+        let configuration = &state.session_configuration;
+        let mut config = configuration.original_config_do_not_use.as_ref().clone();
+        config.cwd = configuration.cwd().clone();
+        std::sync::Arc::new(config)
+    }
+
     pub(crate) async fn thread_config_snapshot(&self) -> ThreadConfigSnapshot {
         let state = self.state.lock().await;
         state.session_configuration.thread_config_snapshot()
@@ -3971,8 +3981,11 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         call_id: String,
-        args: RequestUserInputArgs,
+        mut args: RequestUserInputArgs,
     ) -> Option<RequestUserInputResponse> {
+        // Legacy tool calls and delegates may still supply a timeout hint.
+        // Human input waits must not advance the turn merely because time passed.
+        args.auto_resolution_ms = None;
         let _elicitation = self.services.elicitations.register();
         let sub_id = turn_context.sub_id.clone();
         let cleanup = CancellationToken::new();
@@ -4376,6 +4389,25 @@ impl Session {
                 warn!("No pending approval found for call_id: {approval_id}");
             }
         }
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "approval ownership and its originating turn are captured atomically"
+    )]
+    pub(crate) async fn take_pending_approval(
+        &self,
+        approval_id: &str,
+        expected_turn_id: Option<&str>,
+    ) -> Option<(String, tokio::sync::oneshot::Sender<ReviewDecision>)> {
+        let mut active = self.active_turn.lock().await;
+        let active = active.as_mut()?;
+        let turn_id = active.terminal.as_ref()?.turn_id().to_owned();
+        if expected_turn_id.is_some_and(|expected| expected != turn_id) {
+            return None;
+        }
+        let sender = active.turn_state.lock().await.remove_pending_approval(approval_id)?;
+        (!sender.is_closed()).then_some((turn_id, sender))
     }
 
     /// Records conversation items: append to history, persist to rollout, and
@@ -7959,7 +7991,22 @@ impl Session {
         self.emit_turn_item_started(turn_context, &turn_item).await;
         self.emit_turn_item_completed(turn_context, turn_item).await;
         if let Some((receipt, suffix)) = receipt {
-            self.complete_input_receipt(&receipt, &suffix).await?;
+            if let Err(error) = self.complete_input_receipt(&receipt, &suffix).await {
+                // Canonical append has committed. Never return this prompt to
+                // runnable recovery merely because receipt settlement failed.
+                tracing::warn!(%error, "recorded input receipt settlement remains pending");
+                let session = Arc::clone(self);
+                let custody = self.retain_tool_dispatch_commit();
+                tokio::spawn(async move {
+                    let _custody = custody;
+                    for delay in [100, 500, 1000] {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        if session.complete_input_receipt(&receipt, &suffix).await.is_ok() { return; }
+                    }
+                    // Cold recovery recognizes the deterministic recorded ID.
+                    tracing::error!("input receipt settlement deferred to durable history reconciliation");
+                });
+            }
         }
         // Keep the accepted input ordered in the rollout, then let the sampling or terminal
         // barrier materialize the complete prefix once. Materializing here would force an extra
