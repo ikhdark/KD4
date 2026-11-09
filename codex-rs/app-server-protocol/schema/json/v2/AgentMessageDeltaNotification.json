@@ -7,6 +7,17 @@
     "itemId": {
       "type": "string"
     },
+    "replayed": {
+      "description": "Active-prefix replay is not newly generated output.",
+      "type": "boolean"
+    },
+    "sourceOccurrence": {
+      "description": "Optional live-emission journal identity, not a client receipt or clock.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "threadId": {
       "type": "string"
     },

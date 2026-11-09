@@ -34,6 +34,16 @@
     },
     "ServerCapabilities": {
       "properties": {
+        "diagnostics": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ServerDiagnosticCapabilities"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "enabledFeatures": {
           "description": "Effective feature keys enabled for this app-server process.",
           "items": {
@@ -44,6 +54,33 @@
       },
       "required": [
         "enabledFeatures"
+      ],
+      "type": "object"
+    },
+    "ServerDiagnosticCapabilities": {
+      "properties": {
+        "clientOutputMethod": {
+          "type": "string"
+        },
+        "outputLineageVersion": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "runtimeJournalAvailable": {
+          "type": "boolean"
+        },
+        "schemaVersion": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "clientOutputMethod",
+        "outputLineageVersion",
+        "runtimeJournalAvailable",
+        "schemaVersion"
       ],
       "type": "object"
     },

@@ -8,13 +8,26 @@ use codex_config::McpServerTransportConfig;
 #[derive(Debug, Clone, PartialEq)]
 pub struct EffectiveMcpServer {
     config: Box<McpServerConfig>,
+    host_owned_apps: bool,
 }
 
 impl EffectiveMcpServer {
     pub fn configured(config: McpServerConfig) -> Self {
         Self {
             config: Box::new(config),
+            host_owned_apps: false,
         }
+    }
+
+    pub(crate) fn host_owned_apps(config: McpServerConfig) -> Self {
+        Self {
+            config: Box::new(config),
+            host_owned_apps: true,
+        }
+    }
+
+    pub(crate) fn is_host_owned_apps(&self) -> bool {
+        self.host_owned_apps
     }
 
     pub(crate) fn config(&self) -> &McpServerConfig {

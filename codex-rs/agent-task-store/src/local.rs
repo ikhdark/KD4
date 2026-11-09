@@ -4335,6 +4335,53 @@ async fn load_receipt_tx(
     Ok(Some((receipt, body)))
 }
 
+/// Read compatibility for an already committed capsule, never fresh dispatch
+/// authority. The legacy body and capsule keep their original identities while
+/// the relational binding carries the upgraded lineage for this same workspace.
+async fn matches_legacy_capsule_repository_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    assignment: &Assignment,
+    capsule: &TaskCapsuleV1,
+    manifest: &crate::SourceManifest,
+) -> StoreResult<bool> {
+    if assignment.workspace_id.is_empty()
+        || manifest.repository_id != assignment.workspace_id
+        || manifest.workspace_id != assignment.workspace_id
+    {
+        return Ok(false);
+    }
+    let Some(payload) = assignment.task_capsule.as_deref() else {
+        return Ok(false);
+    };
+    let body = sqlx::query_scalar::<_, String>(
+        "SELECT a.body_json FROM assignments a
+         JOIN assignment_repositories ar ON ar.assignment_id = a.assignment_id
+         JOIN workspace_repositories wr ON wr.workspace_id = ar.workspace_id
+             AND wr.repository_id = ar.repository_id AND wr.canonical_root = ar.canonical_root
+         WHERE a.assignment_id = ? AND a.root_session_id = ?
+             AND ar.repository_id = ? AND ar.workspace_id = ?",
+    )
+    .bind(assignment.assignment_id.to_string())
+    .bind(&assignment.root_session_id)
+    .bind(&assignment.repository_id)
+    .bind(&assignment.workspace_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some(body) = body else {
+        return Ok(false);
+    };
+    let original: Assignment = decode(&body)?;
+    if original.assignment_id != assignment.assignment_id
+        || original.root_session_id != assignment.root_session_id
+        || original.repository_id != manifest.repository_id
+        || original.workspace_id != manifest.workspace_id
+        || original.task_capsule.as_deref() != Some(payload)
+    {
+        return Ok(false);
+    }
+    Ok(decode::<TaskCapsuleV1>(payload)? == *capsule)
+}
+
 async fn validate_capsule_contract_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     assignment: &Assignment,
@@ -4362,7 +4409,9 @@ async fn validate_capsule_contract_tx(
     }
     if let Some(manifest) = &capsule.source_manifest {
         manifest.verify()?;
-        if manifest.repository_id != assignment.repository_id || manifest.workspace_id != assignment.workspace_id
+        let repository_matches = manifest.repository_id == assignment.repository_id
+            || matches_legacy_capsule_repository_tx(transaction, assignment, capsule, manifest).await?;
+        if !repository_matches || manifest.workspace_id != assignment.workspace_id
             || capsule.workspace_manifest_hash != manifest.sha256 || capsule.source_manifest_error.is_some()
             || (!assignment.write_scope.is_empty() && manifest.scopes != assignment.write_scope)
         {

@@ -1014,6 +1014,13 @@ pub struct AgentMessageDeltaNotification {
     pub turn_id: String,
     pub item_id: String,
     pub delta: String,
+    /// Optional live-emission journal identity, not a client receipt or clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub source_occurrence: Option<String>,
+    /// Active-prefix replay is not newly generated output.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replayed: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

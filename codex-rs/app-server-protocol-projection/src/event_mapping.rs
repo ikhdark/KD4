@@ -370,6 +370,8 @@ pub fn item_event_to_server_notification(
                 turn_id,
                 item_id,
                 delta,
+                source_occurrence: None,
+                replayed: false,
             })
         }
         EventMsg::PlanDelta(event) => ServerNotification::PlanDelta(PlanDeltaNotification {

@@ -83,6 +83,7 @@ struct OpenAiUploadCleanup {
     auth: codex_api::SharedAuthProvider,
     clients: codex_http_client::RouteAwareClientPool,
     file_ids: Vec<String>,
+    retry_on_drop: bool,
 }
 
 impl OpenAiUploadCleanup {
@@ -126,12 +127,22 @@ impl Drop for OpenAiUploadCleanup {
         if self.file_ids.is_empty() {
             return;
         }
+        if !self.retry_on_drop {
+            // A closed runtime drops newly spawned futures synchronously. The
+            // cleanup worker must never spawn another armed copy of itself.
+            tracing::warn!(
+                remaining = self.file_ids.len(),
+                "uploaded file cleanup ended before confirmation"
+            );
+            return;
+        }
         let mut owner = Self {
             tasks: self.tasks.clone(),
             base_url: self.base_url.clone(),
             auth: self.auth.clone(),
             clients: self.clients.clone(),
             file_ids: std::mem::take(&mut self.file_ids),
+            retry_on_drop: false,
         };
         self.tasks.spawn(async move {
             // Each HTTP request already has a deadline. Keep retries bounded;
@@ -210,6 +221,7 @@ pub(crate) async fn prepare_mcp_tool_arguments_for_openai_files(
         auth,
         clients: openai_file_http_client_pool(&step_context.turn.config.http_client_factory()),
         file_ids: Vec::new(),
+        retry_on_drop: true,
     };
     let mut rewritten_arguments = arguments.clone();
     let (tx, rx) = tokio::sync::oneshot::channel();

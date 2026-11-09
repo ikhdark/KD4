@@ -124,6 +124,17 @@
         "itemId": {
           "type": "string"
         },
+        "replayed": {
+          "description": "Active-prefix replay is not newly generated output.",
+          "type": "boolean"
+        },
+        "sourceOccurrence": {
+          "description": "Optional live-emission journal identity, not a client receipt or clock.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "threadId": {
           "type": "string"
         },
@@ -5502,31 +5513,26 @@
       "description": "Queue and waiter state captured at a lifecycle boundary.",
       "properties": {
         "activeToolCount": {
-          "default": 0,
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
         "parallelGateWaiterCount": {
-          "default": 0,
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
         "processOutputWaiterCount": {
-          "default": 0,
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
         "relayQueueDepth": {
-          "default": 0,
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
         "samplingGateWaiterCount": {
-          "default": 0,
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -9423,22 +9429,14 @@
               "$ref": "#/definitions/ToolLifecycleContext"
             }
           ],
-          "default": {
-            "activeToolCount": 0,
-            "parallelGateWaiterCount": 0,
-            "processOutputWaiterCount": 0,
-            "relayQueueDepth": 0,
-            "samplingGateWaiterCount": 0
-          }
+          "default": {}
         },
         "reentryCount": {
-          "default": 0,
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
         "retryCount": {
-          "default": 0,
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"

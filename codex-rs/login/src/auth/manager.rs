@@ -2086,7 +2086,7 @@ impl UnauthorizedRecovery {
                 match self
                     .manager
                     .reload_if_account_id_matches(self.expected_account_id.as_deref())
-                    .await
+                    .await?
                 {
                     ReloadOutcome::ReloadedChanged => {
                         self.step = UnauthorizedRecoveryStep::RefreshToken;
@@ -2607,27 +2607,29 @@ impl AuthManager {
     async fn reload_if_account_id_matches(
         &self,
         expected_account_id: Option<&str>,
-    ) -> ReloadOutcome {
+    ) -> std::io::Result<ReloadOutcome> {
         let expected_account_id = match expected_account_id {
             Some(account_id) => account_id,
             None => {
                 tracing::info!("Skipping auth reload because no account id is available.");
-                return ReloadOutcome::Skipped;
+                return Ok(ReloadOutcome::Skipped);
             }
         };
 
         let Some((generation, source)) = self.external_auth_snapshot() else {
-            return ReloadOutcome::Skipped;
+            return Ok(ReloadOutcome::Skipped);
         };
         let new_auth = match self.load_auth(source.as_ref()).await {
             Ok(auth) => auth,
             Err(err) => {
-                if let Err(err) = self
-                    .with_current_external_auth(&generation, || self.publish_auth_load(Err(err)))
-                {
-                    tracing::debug!("discarded stale credential-load failure: {err}");
-                }
-                return ReloadOutcome::Skipped;
+                self.with_current_external_auth(&generation, || {
+                    // Preserve the recovery identity and its revision, but keep
+                    // dispatch fail-closed until a successful credential load.
+                    if let Ok(mut error) = self.load_error.write() {
+                        *error = Some((std::time::Instant::now(), err.kind(), err.to_string()));
+                    }
+                })?;
+                return Err(err);
             }
         };
         let new_account_id = new_auth.as_ref().and_then(CodexAuth::get_account_id);
@@ -2637,7 +2639,7 @@ impl AuthManager {
             tracing::info!(
                 "Skipping auth reload due to account id mismatch (expected: {expected_account_id}, found: {found_account_id})"
             );
-            return ReloadOutcome::Skipped;
+            return Ok(ReloadOutcome::Skipped);
         }
 
         tracing::info!("Reloading auth for account {expected_account_id}");
@@ -2652,7 +2654,6 @@ impl AuthManager {
                 ReloadOutcome::ReloadedNoChange
             }
         })
-        .unwrap_or(ReloadOutcome::Skipped)
     }
 
     fn auths_equal_for_refresh(a: Option<&CodexAuth>, b: Option<&CodexAuth>) -> bool {
@@ -3167,7 +3168,7 @@ impl AuthManager {
 
         let result = match self
             .reload_if_account_id_matches(expected_account_id.as_deref())
-            .await
+            .await?
         {
             ReloadOutcome::ReloadedChanged => {
                 tracing::info!("Skipping token refresh because auth changed after guarded reload.");

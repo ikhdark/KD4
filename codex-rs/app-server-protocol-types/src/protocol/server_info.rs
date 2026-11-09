@@ -96,6 +96,18 @@ pub struct ServerPackageLayout {
 pub struct ServerCapabilities {
     /// Effective feature keys enabled for this app-server process.
     pub enabled_features: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub diagnostics: Option<ServerDiagnosticCapabilities>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerDiagnosticCapabilities {
+    pub schema_version: u32,
+    pub client_output_method: String,
+    pub output_lineage_version: u32,
+    pub runtime_journal_available: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]

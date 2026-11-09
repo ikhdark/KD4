@@ -2,6 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use sha2::{Digest, Sha256};
@@ -33,7 +34,8 @@ pub struct RawOutputArtifactTask {
 pub struct LegacyRawCapture {
     task: Option<RawOutputArtifactTask>,
     inline: Vec<u8>,
-    gap: bool,
+    inline_truncated: bool,
+    gap: Arc<AtomicBool>,
     attached: bool,
 }
 
@@ -56,17 +58,21 @@ pub fn current_legacy_capture() -> Option<SharedLegacyRawCapture> {
 }
 
 impl LegacyRawCapture {
+    pub fn output_gap_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.gap)
+    }
+
     pub fn write_chunk(&mut self, bytes: &[u8]) {
         let remaining = super::MAX_RAW_OUTPUT_ARTIFACT_BYTES.saturating_sub(self.inline.len());
         self.inline.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
-        self.gap |= bytes.len() > remaining;
+        self.inline_truncated |= bytes.len() > remaining;
         if let Some(task) = &mut self.task {
             task.write_chunk(bytes);
         }
     }
 
     pub fn mark_output_gap(&mut self) {
-        self.gap = true;
+        self.gap.store(true, Ordering::Release);
         if let Some(task) = &mut self.task {
             task.mark_output_gap();
         }
@@ -88,15 +94,30 @@ pub async fn capture_legacy_output<F: std::future::Future>(
     let capture = Arc::new(std::sync::Mutex::new(LegacyRawCapture {
         task: RawOutputArtifactTask::spawn(Some(Arc::clone(&state)), CancellationToken::new()),
         inline: Vec::new(),
-        gap: false,
+        inline_truncated: false,
+        gap: Arc::new(AtomicBool::new(false)),
         attached: false,
     }));
     let output = LEGACY_RAW_CAPTURE.scope(Arc::clone(&capture), future).await;
-    // Never hold the reader's synchronous lock while waiting for storage.
-    let (task, inline, gap, attached) = {
+    // An admitted reader can still own a disk write after its observer stops.
+    // Wait for that custody on a blocking worker, never on the async executor.
+    let captured = tokio::task::spawn_blocking(move || {
         let mut capture = capture.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        (capture.task.take(), std::mem::take(&mut capture.inline), capture.gap, capture.attached)
+        (capture.task.take(), std::mem::take(&mut capture.inline), capture.gap.load(Ordering::Acquire), capture.attached, capture.inline_truncated)
+    }).await;
+    let (mut task, inline, gap, attached, inline_truncated) = match captured {
+        Ok(captured) => captured,
+        Err(error) => return (output, CapturedShellOutput {
+            artifact: RawOutputArtifact::Failed {
+                id: None, message: format!("command output capture worker failed: {error}"),
+                owned_path: None, bytes: 0,
+            },
+            canonical: None,
+        }),
     };
+    if gap && let Some(task) = task.as_mut() {
+        task.mark_output_gap();
+    }
     if !attached {
         drop(task);
         return (output, CapturedShellOutput {
@@ -109,7 +130,7 @@ pub async fn capture_legacy_output<F: std::future::Future>(
     }
     let artifact = state.lock().await.clone();
     let mut canonical = codex_tools::CanonicalToolResult::bytes(inline);
-    canonical.complete = !gap;
+    canonical.complete = !gap && !inline_truncated;
     (
         output,
         CapturedShellOutput {
@@ -239,7 +260,14 @@ impl RawOutputArtifactTask {
         self.publish_live();
     }
 
-    pub async fn finish(mut self) {
+    pub async fn finish(self) {
+        if let Err(error) = tokio::task::spawn_blocking(move || self.finish_blocking()).await {
+            tracing::warn!(%error, "command output finalization worker failed");
+        }
+    }
+
+    /// Finalize on an existing blocking owner without nesting blocking jobs.
+    pub fn finish_blocking(mut self) {
         // Empty, complete producers need no durable recovery object. Leave the
         // pending (or previous empty) state for consumers' inline fallback.
         if self.handle.is_none() && self.failure.is_none() && !self.incomplete {
@@ -272,7 +300,7 @@ impl RawOutputArtifactTask {
         } else {
             self.failed(self.failure.clone().unwrap_or_else(|| "command log unavailable".into()))
         };
-        *self.state.lock().await = artifact;
+        *self.state.blocking_lock() = artifact;
         self.finished = true;
         self.ready.cancel();
     }

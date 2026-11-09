@@ -160,10 +160,38 @@ where
 
 impl AgentIdentityAuthRecord {
     pub(crate) fn from_agent_identity_jwt(jwt: &str) -> std::io::Result<Self> {
-        let claims = parse_unverified_agent_identity_jwt(jwt).map_err(std::io::Error::other)?;
+        let claims = parse_unverified_agent_identity_jwt(jwt).map_err(|error| {
+            if let Some(error) = error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<serde_json::Error>())
+            {
+                credential_json_error("failed to decode agent identity JWT", error)
+            } else {
+                std::io::Error::other(error)
+            }
+        })?;
 
         Ok(claims.into())
     }
+}
+
+fn credential_json_error(context: &str, error: &serde_json::Error) -> std::io::Error {
+    // Parser messages and their source chains can contain rejected credentials.
+    // Retain only the category and location, never the original error payload.
+    let kind = error.io_error_kind().unwrap_or(if error.is_eof() {
+        std::io::ErrorKind::UnexpectedEof
+    } else {
+        std::io::ErrorKind::InvalidData
+    });
+    std::io::Error::new(
+        kind,
+        format!(
+            "{context}: invalid credential JSON ({:?} at line {} column {})",
+            error.classify(),
+            error.line(),
+            error.column(),
+        ),
+    )
 }
 
 impl From<AgentIdentityJwtClaims> for AgentIdentityAuthRecord {
@@ -412,7 +440,9 @@ impl FileAuthStorage {
         let mut file = File::open(auth_file)?;
         let mut contents = String::new();
         file.read_to_string(&mut contents)?;
-        let auth_dot_json: AuthDotJson = serde_json::from_str(&contents)?;
+        let auth_dot_json: AuthDotJson = serde_json::from_str(&contents).map_err(|error| {
+            credential_json_error("failed to deserialize CLI auth from file", &error)
+        })?;
 
         Ok(auth_dot_json)
     }
@@ -484,9 +514,7 @@ impl DirectKeyringAuthStorage {
     fn load_from_keyring(&self, key: &str) -> std::io::Result<Option<AuthDotJson>> {
         match self.keyring_store.load(KEYRING_SERVICE, key) {
             Ok(Some(serialized)) => serde_json::from_str(&serialized).map(Some).map_err(|err| {
-                std::io::Error::other(format!(
-                    "failed to deserialize CLI auth from keyring: {err}"
-                ))
+                credential_json_error("failed to deserialize CLI auth from keyring", &err)
             }),
             Ok(None) => Ok(None),
             Err(error) => {
@@ -589,9 +617,10 @@ impl AuthStorageBackend for SecretsKeyringAuthStorage {
                 )
             })? {
             Some(serialized) => serde_json::from_str(&serialized).map(Some).map_err(|err| {
-                std::io::Error::other(format!(
-                    "failed to deserialize CLI auth from encrypted auth storage: {err}"
-                ))
+                credential_json_error(
+                    "failed to deserialize CLI auth from encrypted auth storage",
+                    &err,
+                )
             }),
             None => Ok(None),
         }

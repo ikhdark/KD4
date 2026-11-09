@@ -57,9 +57,9 @@ pub fn create_windows_sandbox_command_args_for_permission_profile(
     codex_home: &Path,
 ) -> Result<Vec<String>> {
     let permission_profile_json = serde_json::to_string(permission_profile)
-        .unwrap_or_else(|err| panic!("failed to serialize permission profile: {err}"));
+        .context("serialize Windows sandbox permission profile")?;
     let env_json = serde_json::to_string(env_map)
-        .unwrap_or_else(|err| panic!("failed to serialize env: {err}"));
+        .context("serialize Windows sandbox environment")?;
     let mut args = vec![
         CODEX_WINDOWS_SANDBOX_ARG1.to_string(),
         CODEX_HOME_FLAG.to_string(),
@@ -92,27 +92,27 @@ pub fn create_windows_sandbox_command_args_for_permission_profile(
         args.push(PRESERVE_PROXY_SETTINGS_FLAG.to_string());
     }
     if let Some(read_roots_override) = read_roots_override {
-        push_json_arg(&mut args, READ_ROOTS_JSON_FLAG, &read_roots_override);
+        push_json_arg(&mut args, READ_ROOTS_JSON_FLAG, &read_roots_override)?;
     }
     if read_roots_include_platform_defaults {
         args.push(READ_ROOTS_INCLUDE_PLATFORM_DEFAULTS_FLAG.to_string());
     }
     if let Some(write_roots_override) = write_roots_override {
-        push_json_arg(&mut args, WRITE_ROOTS_JSON_FLAG, &write_roots_override);
+        push_json_arg(&mut args, WRITE_ROOTS_JSON_FLAG, &write_roots_override)?;
     }
     if !deny_read_paths_override.is_empty() {
         push_json_arg(
             &mut args,
             DENY_READ_PATHS_JSON_FLAG,
             &deny_read_paths_override,
-        );
+        )?;
     }
     if !deny_write_paths_override.is_empty() {
         push_json_arg(
             &mut args,
             DENY_WRITE_PATHS_JSON_FLAG,
             &deny_write_paths_override,
-        );
+        )?;
     }
     args.push("--".to_string());
     args.extend(command);
@@ -199,12 +199,12 @@ fn decode_wrapper_args(
     serde_json::from_str(&json).context("parse Windows sandbox wrapper payload")
 }
 
-fn push_json_arg<T: serde::Serialize>(args: &mut Vec<String>, flag: &str, value: &T) {
+fn push_json_arg<T: serde::Serialize>(args: &mut Vec<String>, flag: &str, value: &T) -> Result<()> {
+    let json = serde_json::to_string(value)
+        .with_context(|| format!("serialize Windows sandbox {flag}"))?;
     args.push(flag.to_string());
-    args.push(
-        serde_json::to_string(value)
-            .unwrap_or_else(|err| panic!("failed to serialize {flag}: {err}")),
-    );
+    args.push(json);
+    Ok(())
 }
 
 pub fn run_windows_sandbox_wrapper_main() -> ! {

@@ -191,7 +191,7 @@ impl CloudConfigBundleService {
         &self,
     ) -> Result<Option<CloudConfigBundle>, CloudConfigBundleLoadError> {
         self.validate_current()?;
-        let auth = self.auth_manager.auth().await;
+        let auth = self.load_auth().await?;
         self.validate_current()?;
         let Some(auth) = auth else {
             return Ok(None);
@@ -201,6 +201,21 @@ impl CloudConfigBundleService {
         }
 
         self.fetch_remote_bundle_with_retries(auth, "startup").await
+    }
+
+    async fn load_auth(&self) -> Result<Option<CodexAuth>, CloudConfigBundleLoadError> {
+        let manager = Arc::clone(&self.auth_manager);
+        // Refresh can rotate a single-use credential. Startup's observation
+        // timeout may stop waiting, but must not discard the replacement token.
+        tokio::spawn(async move { manager.auth().await })
+            .await
+            .map_err(|error| {
+                CloudConfigBundleLoadError::new(
+                    CloudConfigBundleLoadErrorCode::Auth,
+                    None,
+                    format!("cloud config authentication task failed: {error}"),
+                )
+            })
     }
 
     async fn fetch_remote_bundle_with_retries(
@@ -370,13 +385,32 @@ impl CloudConfigBundleService {
                 max_attempts = CLOUD_CONFIG_BUNDLE_MAX_ATTEMPTS,
                 "Cloud config bundle request was unauthorized; attempting auth recovery"
             );
-            let recovery = match rejected_revision {
-                Some(revision) => auth_recovery.next_with_auth_revision(revision, Some(auth)).await,
-                None => auth_recovery.next_with_auth(auth).await,
-            };
+            let mut owned_recovery = std::mem::replace(
+                auth_recovery,
+                self.auth_manager.unauthorized_recovery(),
+            );
+            let rejected_auth = auth.clone();
+            let (completed_recovery, recovery) = tokio::spawn(async move {
+                let result = match rejected_revision {
+                    Some(revision) => owned_recovery
+                        .next_with_auth_revision(revision, Some(&rejected_auth))
+                        .await,
+                    None => owned_recovery.next_with_auth(&rejected_auth).await,
+                };
+                (owned_recovery, result)
+            })
+            .await
+            .map_err(|error| {
+                CloudConfigBundleLoadError::new(
+                    CloudConfigBundleLoadErrorCode::Auth,
+                    status_code,
+                    format!("cloud config auth recovery task failed: {error}"),
+                )
+            })?;
+            *auth_recovery = completed_recovery;
             match recovery {
                 Ok(_) => {
-                    let Some(refreshed_auth) = self.auth_manager.auth().await else {
+                    let Some(refreshed_auth) = self.load_auth().await? else {
                         tracing::error!(
                             "Auth recovery succeeded but no auth is available for cloud config bundle"
                         );

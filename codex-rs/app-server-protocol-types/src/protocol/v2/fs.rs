@@ -22,6 +22,35 @@ pub struct FsReadFileResponse {
     pub data_base64: String,
 }
 
+/// Read a bounded byte range without transferring the rest of a file.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct FsReadFileRangeParams {
+    /// Absolute path to read.
+    pub path: AbsolutePathBuf,
+    /// Zero-based starting byte offset.
+    #[ts(type = "number")]
+    pub start: u64,
+    /// Maximum bytes to return; must not exceed 64 KiB.
+    pub len: usize,
+    /// Refuse a file revision different from a preceding range response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub expected_revision: Option<String>,
+}
+
+/// Bounded contents and the opened file's size and revision.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct FsReadFileRangeResponse {
+    pub data_base64: String,
+    #[ts(type = "number")]
+    pub file_bytes: u64,
+    pub revision: String,
+}
+
 /// Write a file on the host filesystem.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]

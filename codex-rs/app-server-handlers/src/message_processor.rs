@@ -1269,6 +1269,11 @@ impl MessageProcessor {
                         .read_file(params)
                         .await
                         .map(|response| Some(response.into())),
+                    ClientRequest::FsReadFileRange { params, .. } => self
+                        .fs_processor
+                        .read_file_range(params)
+                        .await
+                        .map(|response| Some(response.into())),
                     ClientRequest::FsWriteFile { params, .. } => self
                         .fs_processor
                         .write_file(params)

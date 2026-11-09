@@ -126,7 +126,11 @@ impl HttpClient for ReqwestHttpClient {
                     ..params
                 })
                 .await
-                .map_err(|error| ExecServerError::HttpRequest(error.message))?;
+                .map_err(|error| ExecServerError::Server {
+                    code: error.code,
+                    message: error.message,
+                    data: error.data,
+                })?;
             Ok(response)
         }
         .boxed()
@@ -144,7 +148,11 @@ impl HttpClient for ReqwestHttpClient {
                     ..params
                 })
                 .await
-                .map_err(|error| ExecServerError::HttpRequest(error.message))?;
+                .map_err(|error| ExecServerError::Server {
+                    code: error.code,
+                    message: error.message,
+                    data: error.data,
+                })?;
             let pending_stream = pending_stream.ok_or_else(|| {
                 ExecServerError::Protocol(
                     "http request stream did not return a response body stream".to_string(),

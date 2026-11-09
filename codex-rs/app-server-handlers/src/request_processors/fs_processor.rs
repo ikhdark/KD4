@@ -15,6 +15,8 @@ use codex_app_server_protocol_types::FsReadDirectoryEntry;
 use codex_app_server_protocol_types::FsReadDirectoryParams;
 use codex_app_server_protocol_types::FsReadDirectoryResponse;
 use codex_app_server_protocol_types::FsReadFileParams;
+use codex_app_server_protocol_types::FsReadFileRangeParams;
+use codex_app_server_protocol_types::FsReadFileRangeResponse;
 use codex_app_server_protocol_types::FsReadFileResponse;
 use codex_app_server_protocol_types::FsRemoveParams;
 use codex_app_server_protocol_types::FsRemoveResponse;
@@ -88,6 +90,35 @@ impl FsRequestProcessor {
             })?;
         Ok(FsReadFileResponse {
             data_base64: STANDARD.encode(bytes),
+        })
+    }
+
+    pub(crate) async fn read_file_range(
+        &self,
+        params: FsReadFileRangeParams,
+    ) -> Result<FsReadFileRangeResponse, JSONRPCErrorError> {
+        let max_bytes = codex_file_system::FILE_RANGE_MAX_BYTES;
+        if params.len > max_bytes {
+            return Err(invalid_request(format!(
+                "fs/readFileRange len exceeds maximum of {max_bytes} bytes"
+            )));
+        }
+        let path = PathUri::from_abs_path(&params.path);
+        let read = self
+            .file_system()?
+            .read_file_range(
+                &path,
+                params.start,
+                params.len,
+                params.expected_revision.as_deref(),
+                /*sandbox*/ None,
+            )
+            .await
+            .map_err(map_fs_error)?;
+        Ok(FsReadFileRangeResponse {
+            data_base64: STANDARD.encode(read.bytes),
+            file_bytes: read.file_bytes,
+            revision: read.revision,
         })
     }
 

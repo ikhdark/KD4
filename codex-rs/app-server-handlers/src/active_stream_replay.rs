@@ -149,7 +149,13 @@ impl ActiveStreamReplay {
         let mut notifications = self
             .entries
             .iter()
-            .map(|entry| entry.notification.clone())
+            .map(|entry| {
+                let mut notification = entry.notification.clone();
+                if let ServerNotification::AgentMessageDelta(delta) = &mut notification {
+                    delta.replayed = true;
+                }
+                notification
+            })
             .collect::<Vec<_>>();
         if self.untracked_incomplete || !self.incomplete_items.is_empty() {
             notifications.push(ServerNotification::ConfigWarning(codex_app_server_protocol_types::ConfigWarningNotification {

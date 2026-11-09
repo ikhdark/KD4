@@ -1,7 +1,7 @@
 //! Overflow event journal backed by the existing bounded-memory raw artifact sink.
 //! Writers apply disk backpressure outside the turn-state lock. Sequence numbers
 //! assigned under that lock preserve causality even when concurrent writes arrive
-//! out of order; no queue, worker thread, or admission policy is added.
+//! out of order; no unbounded write queue or new admission policy is added.
 use std::sync::{Arc, Mutex};
 use codex_tool_artifacts::RawOutputArtifact;
 use codex_tool_artifacts::capture::RawOutputArtifactTask;
@@ -114,33 +114,45 @@ impl TurnTimingState {
             (state.detail_archive.clone(), state.archive_sequence)
         };
         let Some(capture) = capture else { return; };
-        let start = {
-            let mut state = capture.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.finishing { false } else { state.finishing = true; true }
-        };
-        if start {
-            // Creation/finalization ownership survives a cancelled terminal waiter.
-            let owned = capture.clone();
-            let finish = tokio::spawn(async move {
-                let notify = owned.lock().unwrap_or_else(std::sync::PoisonError::into_inner).notify.clone();
-                let drained = tokio::time::timeout(std::time::Duration::from_millis(100), async {
-                    loop {
-                        let changed = notify.notified();
-                        tokio::pin!(changed);
-                        changed.as_mut().enable();
-                        if owned.lock().unwrap_or_else(std::sync::PoisonError::into_inner).received >= expected { break; }
-                        changed.await;
-                    }
-                }).await.is_ok();
-                let task = owned.lock().unwrap_or_else(std::sync::PoisonError::into_inner).task.take();
+        let runtime = tokio::runtime::Handle::current();
+        // Writers hold this mutex across filesystem I/O. Even acquiring it to
+        // start finalization or read a receipt must stay off the async worker.
+        // The blocking owner survives expiry of the terminal observer below.
+        let finish = tokio::task::spawn_blocking(move || {
+            let start = {
+                let mut state = capture.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.finishing { false } else { state.finishing = true; true }
+            };
+            if start {
+                let notify = capture.lock().unwrap_or_else(std::sync::PoisonError::into_inner).notify.clone();
+                let drained = runtime.block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_millis(100), async {
+                        loop {
+                            let changed = notify.notified();
+                            tokio::pin!(changed);
+                            changed.as_mut().enable();
+                            if capture.lock().unwrap_or_else(std::sync::PoisonError::into_inner).received >= expected { break; }
+                            changed.await;
+                        }
+                    }).await.is_ok()
+                });
+                let task = capture.lock().unwrap_or_else(std::sync::PoisonError::into_inner).task.take();
                 if let Some(mut task) = task {
                     if !drained { task.mark_output_gap(); }
-                    task.finish().await;
+                    task.finish_blocking();
                 }
-            });
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(100), finish).await;
-        }
-        let receipt = capture.lock().unwrap_or_else(std::sync::PoisonError::into_inner).receipt(expected);
+            }
+            capture.lock().unwrap_or_else(std::sync::PoisonError::into_inner).receipt(expected)
+        });
+        let receipt = match tokio::time::timeout(std::time::Duration::from_millis(100), finish).await {
+            Ok(Ok(receipt)) => receipt,
+            result => json!({
+                "schema_version": 1, "format": "turn-timing-overflow-jsonl-v1",
+                "complete": false, "capture_bound": true, "ephemeral": ephemeral,
+                "expected_records": expected,
+                "reason": if result.is_err() { "archive observation timed out" } else { "archive finalization worker failed" },
+            }),
+        };
         let evidence = timing.measurement_evidence.get_or_insert_with(|| json!({}));
         evidence["toolTimingOverflow"] = receipt;
     }

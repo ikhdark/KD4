@@ -337,6 +337,12 @@ impl ResolvedMcpServer {
     pub fn config(&self) -> &McpServerConfig {
         &self.config
     }
+
+    pub(crate) fn is_host_owned_apps(&self, name: &str) -> bool {
+        name == crate::mcp::CODEX_APPS_MCP_SERVER_NAME
+            && self.config.is_local_environment()
+            && matches!(self.source, McpServerSource::Compatibility { .. })
+    }
 }
 
 /// Immutable result of MCP registration resolution.

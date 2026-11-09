@@ -216,6 +216,12 @@ impl InitializeRequestProcessor {
             runtime_info: Some(crate::runtime_provenance::current()),
             server_capabilities: Some(codex_app_server_protocol_types::ServerCapabilities {
                 enabled_features: enabled_features.clone(),
+                diagnostics: Some(codex_app_server_protocol_types::ServerDiagnosticCapabilities {
+                    schema_version: 1,
+                    client_output_method: "diagnostics/clientOutput".into(),
+                    output_lineage_version: 1,
+                    runtime_journal_available: codex_protocol::timing::observations::enabled(),
+                }),
             }),
             local_watermark: Some(ServerLocalWatermark {
                 version: LOCAL_WATERMARK_VERSION.to_string(),

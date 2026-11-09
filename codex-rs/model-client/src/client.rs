@@ -1516,6 +1516,10 @@ struct ModelAttemptOffsets {
     connection_setup_us: u64,
     dispatch_ready_us: Option<u64>,
     stream_established_us: Option<u64>,
+    // Application socket-send duration and first delivered WebSocket message;
+    // neither is a kernel upload/ACK or provider-processing measurement.
+    websocket_send_duration_us: Option<u64>,
+    websocket_first_message_us: Option<u64>,
     first_provider_event_us: Option<u64>,
     first_model_output_us: Option<u64>,
     first_actionable_output_us: Option<u64>,
@@ -1530,6 +1534,7 @@ struct ModelAttemptClock {
     started: Instant,
     started_at_us: u64,
     provider_event_at_transport: bool,
+    websocket_first_message_seen: Arc<AtomicBool>,
     offsets: Arc<StdMutex<ModelAttemptOffsets>>,
 }
 
@@ -1706,6 +1711,7 @@ impl ModelAttemptClock {
             started_at_us: u64::try_from(codex_protocol::timing::process_monotonic_ns() / 1_000)
                 .unwrap_or(u64::MAX),
             provider_event_at_transport: false,
+            websocket_first_message_seen: Arc::new(AtomicBool::new(false)),
             started: Instant::now(),
             offsets: Arc::new(StdMutex::new(ModelAttemptOffsets::default())),
         }
@@ -1728,6 +1734,7 @@ impl ModelAttemptClock {
     /// A later safe pre-dispatch transport try of the same attempt.
     fn mark_redispatch_ready(&self, transport_attempt: u64) {
         let now_us = self.elapsed_us();
+        self.websocket_first_message_seen.store(false, Ordering::Relaxed);
         let mut offsets = self
             .offsets
             .lock()
@@ -1799,6 +1806,25 @@ impl ModelAttemptClock {
             }
             offsets.completed_us = Some(now_us);
         }
+    }
+
+    fn record_websocket_send(&self, duration: Duration) {
+        self.offsets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .websocket_send_duration_us = Some(u64::try_from(duration.as_micros()).unwrap_or(u64::MAX));
+    }
+
+    fn mark_websocket_first_message(&self) {
+        if self.websocket_first_message_seen.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let now_us = self.elapsed_us();
+        self.offsets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .websocket_first_message_us
+            .get_or_insert(now_us);
     }
 
     fn mark_first_provider_event(&self) {
@@ -1971,6 +1997,10 @@ struct ModelStreamDelivery {
     dispatch_ready_us: Option<u64>,
     completed_us: u64,
     connection_setup_us: u64,
+    stream_established_us: Option<u64>,
+    websocket_send_duration_us: Option<u64>,
+    websocket_first_message_us: Option<u64>,
+    first_provider_event_us: Option<u64>,
     request_send_started_ns: Option<u64>,
     response_headers_received_ns: Option<u64>,
     first_response_body_byte_ns: Option<u64>,
@@ -2083,6 +2113,10 @@ impl ModelStreamDeliveryObserver {
         self.summary.dispatch_ready_us = offsets.dispatch_ready_us;
         self.summary.completed_us = offsets.completed_us.unwrap_or_else(|| clock.elapsed_us());
         self.summary.connection_setup_us = offsets.connection_setup_us;
+        self.summary.stream_established_us = offsets.stream_established_us;
+        self.summary.websocket_send_duration_us = offsets.websocket_send_duration_us;
+        self.summary.websocket_first_message_us = offsets.websocket_first_message_us;
+        self.summary.first_provider_event_us = offsets.first_provider_event_us;
         self.summary.request_send_started_ns = offsets.request_send_started_ns;
         self.summary.response_headers_received_ns = offsets.response_headers_received_ns;
         self.summary.first_response_body_byte_ns = offsets.first_response_body_byte_ns;
@@ -2556,6 +2590,10 @@ fn redispatch_offsets(offsets: &mut ModelAttemptOffsets, now_us: u64) {
     offsets.response_headers_received_ns = None;
     offsets.first_response_body_byte_ns = None;
     offsets.provider_processing_us = None;
+    offsets.stream_established_us = None;
+    offsets.websocket_send_duration_us = None;
+    offsets.websocket_first_message_us = None;
+    offsets.first_provider_event_us = None;
     finish_queue_span(offsets, now_us);
     if let Some(previous_us) = offsets.dispatch_ready_us.replace(now_us) {
         offsets.connection_setup_us = offsets
@@ -8336,6 +8374,9 @@ impl WebsocketTelemetry for ApiTelemetry {
     }
 
     fn on_ws_request(&self, duration: Duration, error: Option<&ApiError>, connection_reused: bool) {
+        if let Some((_, clock)) = &self.websocket_response {
+            clock.record_websocket_send(duration);
+        }
         self.session_telemetry.record_model_transport_identity(
             &self.logical_request_id,
             self.websocket_response
@@ -8357,6 +8398,7 @@ impl WebsocketTelemetry for ApiTelemetry {
             sampling_request_id = self.websocket_response.as_ref().map(|(identity, _)| identity.sampling_request_id.as_str()),
             physical_attempt_id = self.websocket_response.as_ref().map(|(identity, _)| identity.physical_attempt_id.as_str()),
             connection_reused,
+            duration_us = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX),
             failed = error.is_some() },
             "websocket request observation"
         );
@@ -8404,6 +8446,13 @@ impl WebsocketTelemetry for ApiTelemetry {
         result: &std::result::Result<Option<std::result::Result<Message, Error>>, ApiError>,
         duration: Duration,
     ) {
+        if matches!(result, Ok(Some(Ok(Message::Text(text)))) if !text.is_empty())
+            || matches!(result, Ok(Some(Ok(Message::Binary(bytes)))) if !bytes.is_empty())
+        {
+            if let Some((_, clock)) = &self.websocket_response {
+                clock.mark_websocket_first_message();
+            }
+        }
         if let Some((identity, _)) = &self.websocket_response {
             self.session_telemetry.record_model_transport_identity(
                 &self.logical_request_id,

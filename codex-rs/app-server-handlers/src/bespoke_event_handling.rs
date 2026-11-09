@@ -710,11 +710,20 @@ pub(crate) async fn apply_bespoke_event_handling(
         | EventMsg::ReasoningContentDelta(_)
         | EventMsg::ReasoningRawContentDelta(_)
         | EventMsg::AgentReasoningSectionBreak(_)) => {
-            let notification = item_event_to_server_notification(
+            let mut notification = item_event_to_server_notification(
                 msg,
                 &conversation_id.to_string(),
                 &event_turn_id,
             );
+            if let ServerNotification::AgentMessageDelta(delta) = &mut notification
+                && codex_protocol::timing::observations::enabled()
+            {
+                delta.source_occurrence = codex_protocol::timing::observations::record(
+                    "output_emitted", &delta.thread_id, &delta.turn_id, &delta.item_id,
+                    serde_json::json!({"method":"item/agentMessage/delta",
+                        "utf16_units":delta.delta.encode_utf16().count()}),
+                ).map(|receipt| receipt.id);
+            }
             outgoing.send_server_notification(notification).await;
         }
         EventMsg::ContextCompacted(..) => {

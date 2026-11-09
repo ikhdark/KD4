@@ -844,6 +844,11 @@ client_request_definitions! {
         serialization: None,
         response: v2::FsReadFileResponse,
     },
+    FsReadFileRange => "fs/readFileRange" {
+        params: v2::FsReadFileRangeParams,
+        serialization: None,
+        response: v2::FsReadFileRangeResponse,
+    },
     FsWriteFile => "fs/writeFile" {
         params: v2::FsWriteFileParams,
         serialization: None,

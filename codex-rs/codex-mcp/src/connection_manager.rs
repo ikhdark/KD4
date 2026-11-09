@@ -1100,7 +1100,11 @@ impl McpConnectionManager {
     }
 
     pub fn is_host_owned_codex_apps_server(&self, server_name: &str) -> bool {
-        server_name == CODEX_APPS_MCP_SERVER_NAME && self.server_metadata.contains_key(server_name)
+        server_name == CODEX_APPS_MCP_SERVER_NAME
+            && self
+                .server_definitions
+                .get(server_name)
+                .is_some_and(EffectiveMcpServer::is_host_owned_apps)
     }
 
     pub fn set_approval_policy(&self, approval_policy: &Constrained<AskForApproval>) {
@@ -1571,7 +1575,9 @@ impl McpConnectionManager {
 
         for (server_name, async_managed_client) in clients_snapshot
             .iter()
-            .filter(|(server_name, _)| include_server(server_name))
+            .filter(|(server_name, _)| {
+                include_server(server_name) && !self.is_host_owned_codex_apps_server(server_name)
+            })
         {
             let server_name = server_name.clone();
             let async_managed_client = async_managed_client.clone();
@@ -1683,7 +1689,9 @@ impl McpConnectionManager {
         for (server_name, async_managed_client) in self
             .clients
             .iter()
-            .filter(|(server_name, _)| include_server(server_name))
+            .filter(|(server_name, _)| {
+                include_server(server_name) && !self.is_host_owned_codex_apps_server(server_name)
+            })
         {
             let server_name = server_name.clone();
             let async_managed_client = async_managed_client.clone();
@@ -1827,6 +1835,11 @@ impl McpConnectionManager {
         server: &str,
         params: Option<PaginatedRequestParams>,
     ) -> Result<ListResourceTemplatesResult> {
+        // Hosted Apps has no templates. Same-name extension/config registrations
+        // retain discovery because their effective registration is not host-owned.
+        if self.is_host_owned_codex_apps_server(server) {
+            return Ok(ListResourceTemplatesResult::with_all_items(Vec::new()));
+        }
         let managed = self.client_by_name(server).await?;
         let client = managed.client.clone();
         let timeout = Some(managed.tool_timeout);

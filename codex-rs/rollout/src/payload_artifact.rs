@@ -749,9 +749,18 @@ fn hydrate_line_with_limit(
             "rollout payload exceeds the remaining {max_bytes}-byte export budget"
         )));
     }
-    let mut item: serde_json::Value =
-        serde_json::from_slice(&read_payload(&root(path), sha256, bytes)?)?;
-    if item["type"] != reference["payload"]["item_type"] || item["type"] == KIND {
+    // Keep large nested bodies as borrowed JSON. Materializing a diagnostic
+    // snapshot here only to serialize it for the canonical decoder duplicates
+    // its entire object tree on every history read and cold resume.
+    let payload = read_payload(&root(path), sha256, bytes)?;
+    let mut item: std::collections::BTreeMap<String, &serde_json::value::RawValue> =
+        serde_json::from_slice(&payload)?;
+    let item_type: serde_json::Value = item
+        .get("type")
+        .map(|value| serde_json::from_str(value.get()))
+        .transpose()?
+        .unwrap_or(serde_json::Value::Null);
+    if item_type != reference["payload"]["item_type"] || item_type == KIND {
         return Err(io::Error::other("rollout payload type mismatch"));
     }
     if enroll {
@@ -770,8 +779,10 @@ fn hydrate_line_with_limit(
             sequence,
         );
     }
-    item["timestamp"] = reference["timestamp"].clone();
-    item["format_version"] = reference["format_version"].clone();
+    let timestamp = serde_json::value::to_raw_value(&reference["timestamp"])?;
+    let format_version = serde_json::value::to_raw_value(&reference["format_version"])?;
+    item.insert("timestamp".to_owned(), &timestamp);
+    item.insert("format_version".to_owned(), &format_version);
     serde_json::to_string(&item).map_err(io::Error::other)
 }
 

@@ -302,6 +302,17 @@
         "itemId": {
           "type": "string"
         },
+        "replayed": {
+          "description": "Active-prefix replay is not newly generated output.",
+          "type": "boolean"
+        },
+        "sourceOccurrence": {
+          "description": "Optional live-emission journal identity, not a client receipt or clock.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "threadId": {
           "type": "string"
         },
@@ -1341,6 +1352,91 @@
         "name",
         "version"
       ],
+      "type": "object"
+    },
+    "ClientOutputObservation": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "description": "One frontend-owned output occurrence, measured entirely on its own clock. Revision is a content-free revision ID or digest, never output text. An acknowledgement for a coalesced-away revision must not be reported as paint.",
+      "properties": {
+        "activeSessions": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "clientClockId": {
+          "type": "string"
+        },
+        "dequeuedAtNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "displayedThreadId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "observationId": {
+          "type": "string"
+        },
+        "outputId": {
+          "type": "string"
+        },
+        "paintedAtNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "receivedAtNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "revision": {
+          "type": "string"
+        },
+        "scheduledAtNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        },
+        "uiId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "clientClockId",
+        "observationId",
+        "outputId",
+        "receivedAtNs",
+        "revision",
+        "threadId",
+        "turnId"
+      ],
+      "title": "ClientOutputObservation",
       "type": "object"
     },
     "ClientRequest": {
@@ -5277,6 +5373,17 @@
         "version"
       ],
       "title": "ConfigWriteResponse",
+      "type": "object"
+    },
+    "ConfigurationReasoning": {
+      "properties": {
+        "effort": {
+          "$ref": "#/definitions/ReasoningEffort"
+        }
+      },
+      "required": [
+        "effort"
+      ],
       "type": "object"
     },
     "ConfiguredHookHandler": {
@@ -13190,6 +13297,27 @@
           "type": "object"
         },
         {
+          "description": "A positional input control, authored by the harness after accepted input.",
+          "properties": {
+            "reasoning": {
+              "$ref": "#/definitions/ConfigurationReasoning"
+            },
+            "type": {
+              "enum": [
+                "configuration_update"
+              ],
+              "title": "ConfigurationUpdateResponseItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "reasoning",
+            "type"
+          ],
+          "title": "ConfigurationUpdateResponseItem",
+          "type": "object"
+        },
+        {
           "properties": {
             "type": {
               "enum": [
@@ -18529,31 +18657,26 @@
       "description": "Queue and waiter state captured at a lifecycle boundary.",
       "properties": {
         "activeToolCount": {
-          "default": 0,
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
         "parallelGateWaiterCount": {
-          "default": 0,
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
         "processOutputWaiterCount": {
-          "default": 0,
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
         "relayQueueDepth": {
-          "default": 0,
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
         "samplingGateWaiterCount": {
-          "default": 0,
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -22688,22 +22811,14 @@
               "$ref": "#/definitions/ToolLifecycleContext"
             }
           ],
-          "default": {
-            "activeToolCount": 0,
-            "parallelGateWaiterCount": 0,
-            "processOutputWaiterCount": 0,
-            "relayQueueDepth": 0,
-            "samplingGateWaiterCount": 0
-          }
+          "default": {}
         },
         "reentryCount": {
-          "default": 0,
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
         "retryCount": {
-          "default": 0,
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -23442,91 +23557,6 @@
         "okOverridden"
       ],
       "type": "string"
-    },
-    "ClientOutputObservation": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "additionalProperties": false,
-      "description": "One frontend-owned output occurrence, measured entirely on its own clock. Revision is a content-free revision ID or digest, never output text. An acknowledgement for a coalesced-away revision must not be reported as paint.",
-      "properties": {
-        "activeSessions": {
-          "format": "uint32",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "clientClockId": {
-          "type": "string"
-        },
-        "dequeuedAtNs": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "displayedThreadId": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "observationId": {
-          "type": "string"
-        },
-        "outputId": {
-          "type": "string"
-        },
-        "paintedAtNs": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "receivedAtNs": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "revision": {
-          "type": "string"
-        },
-        "scheduledAtNs": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "threadId": {
-          "type": "string"
-        },
-        "turnId": {
-          "type": "string"
-        },
-        "uiId": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "clientClockId",
-        "observationId",
-        "outputId",
-        "receivedAtNs",
-        "revision",
-        "threadId",
-        "turnId"
-      ],
-      "title": "ClientOutputObservation",
-      "type": "object"
     }
   },
   "title": "CodexAppServerProtocolV2",

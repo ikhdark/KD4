@@ -57,6 +57,15 @@ semantics; its frame-write and ingress boundaries are not mislabeled as HTTP
 header/body timings. The native UI is outside this checkout: server publication
 does not establish when content became visible in the interface.
 
+WebSocket summaries additionally retain `websocket_send_duration_us` (the
+application socket-send future, including local queueing), `stream_established_us`
+(successful send completion), `websocket_first_message_us` (first nonempty
+text/binary frame delivered by the application ingress), and
+`first_provider_event_us` (first freshly decoded provider event). Offset fields
+use the summary's attempt clock; they are not kernel/peer-ACK timestamps or
+provider inference measurements. Unobserved boundaries remain null; transport
+redispatch clears them rather than reusing evidence from the prior attempt.
+
 Use existing local/OTEL telemetry collection and filters to retain the phase
 records; no new logger or background collector is installed. The
 `codex.model_stream_delivery` event also carries a content-free JSON summary.

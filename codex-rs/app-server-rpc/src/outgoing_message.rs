@@ -1767,10 +1767,16 @@ impl OutgoingMessageSender {
                 targeted_connections = connection_ids.len(),
                 "app-server event: {notification}"
             );
+            let (thread, turn, output, source) = match &notification {
+                ServerNotification::AgentMessageDelta(delta) => (
+                    delta.thread_id.as_str(), delta.turn_id.as_str(), delta.item_id.as_str(),
+                    delta.source_occurrence.as_deref()),
+                _ => ("", "", "", None),
+            };
             let observation = codex_protocol::timing::observations::Span::start(
-                "notification_route", "", "", "",
+                "notification_route", thread, turn, output,
                 serde_json::json!({"target_connections":connection_ids.iter().map(|id| id.0).collect::<Vec<_>>(),
-                    "broadcast":connection_ids.is_empty()}));
+                    "broadcast":connection_ids.is_empty(), "source_occurrence":source}));
             let outgoing_message = OutgoingMessage::AppServerNotification(notification);
             let delivery_deadline = tokio::time::Instant::now() + RESOURCE_DELIVERY_TIMEOUT;
             if connection_ids.is_empty() {

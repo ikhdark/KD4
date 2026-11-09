@@ -286,6 +286,12 @@ pub fn effective_mcp_servers_from_configured(
     let mut servers = configured_servers
         .into_iter()
         .map(|(name, mut server)| {
+            let host_owned_apps = config
+                .mcp_server_catalog
+                .server(&name)
+                .is_some_and(|registration| {
+                    registration.is_host_owned_apps(&name) && registration.config() == &server
+                });
             match server.auth.clone() {
                 McpServerAuth::ChatGpt => {
                     let server_origin = match &server.transport {
@@ -303,11 +309,16 @@ pub fn effective_mcp_servers_from_configured(
                 }
                 McpServerAuth::OAuth => {}
             }
-            (name, EffectiveMcpServer::configured(server))
+            let server = if host_owned_apps {
+                EffectiveMcpServer::host_owned_apps(server)
+            } else {
+                EffectiveMcpServer::configured(server)
+            };
+            (name, server)
         })
         .collect::<HashMap<_, _>>();
     if !host_owned_codex_apps_enabled(config, auth) {
-        servers.remove(CODEX_APPS_MCP_SERVER_NAME);
+        servers.retain(|_, server| !server.is_host_owned_apps());
     }
     servers
 }

@@ -19,6 +19,7 @@ Keep command syntax, inventories and storage maps in those guides, not duplicate
 
 ## Working rules
 
+- The Desktop frontend is editable in sibling `Codex-Fork`; follow [its AGENTS.md](../Codex-Fork/AGENTS.md) for durable performance/UX changes. KD4 owns the backend; leave the Windows Store installation untouched.
 - Do not start background monitoring or perform cleanup/migration without a request.
 - Repair harness-controlled causes, not unrelated captured tasks. Integrate genuinely reusable analysis/capture/replay logic into existing KDR owners rather than task-local parallel runners.
 - Avoid duplicate hashing while verified input/analyzer identities remain valid.

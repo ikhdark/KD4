@@ -156,6 +156,18 @@ ordering; it grants no thread access and never changes runtime execution.
 claims separate from server-verified delivery and in-process native paint tokens.
 Real frontend integration is required; transport flush is not paint.
 
+The editable sibling Codex-Fork now supplies opt-in transcript receipt/application
+observations through the existing privileged host connection. Initialization
+advertises diagnostics schema/journal availability. Journaled live assistant-text
+deltas optionally carry `sourceOccurrence`; their UTF-16 subranges survive host
+coalescing and splitting. Active-prefix recovery carries `replayed: true` and no
+live occurrence identity. Route journals retain thread/turn/item/source identity.
+These are distinct source, delivery, application and visibility boundaries;
+neither client reports nor the existing visibility proxy prove compositor paint.
+See [the frontend owner](../../../Codex-Fork/frontend/README.md) for explicit
+capture, privacy, installation and legacy/other-output limitations. Backend
+journaling remains launch-time opt-in and can add per-emission I/O overhead.
+
 Independent owner journals now include terminal emission/writer outcome spans,
 cancel claim and startup fences, replay candidate inventories, command approval
 submission and bounded shutdown inventories/dispositions. Timeouts do not imply

@@ -764,6 +764,11 @@ async fn exec_windows_sandbox(
     let retained_bytes_cap = capture_policy.retained_bytes_cap();
     let aggregate_capture = Arc::new(Mutex::new(OutputCapture::aggregate(retained_bytes_cap)));
     let aggregate_capture_for_sink = Arc::clone(&aggregate_capture);
+    let raw_capture_for_sink = aggregate_capture
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .raw
+        .clone();
     let limiter = Arc::new(OutputDeltaLimiter::default());
     // Recovery has a separate bounded suffix for each pipe. Exhausting one
     // pipe must not prevent the other from reaching its recovery owner.
@@ -771,10 +776,21 @@ async fn exec_windows_sandbox(
     let live_output_enabled_for_sink = Arc::clone(&live_output_enabled);
     let output_sink = Some(
         Arc::new(move |capture_stream: CaptureOutputStream, chunk: &[u8]| {
+            // The sandbox invokes this sink on blocking capture threads. Keep
+            // raw and aggregate ordering identical without holding the display
+            // state lock during filesystem I/O.
+            let mut raw = raw_capture_for_sink.as_ref().map(|raw| {
+                raw.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            });
+            if let Some(raw) = raw.as_mut() {
+                raw.write_chunk(chunk);
+            }
             aggregate_capture_for_sink
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .append_process_bytes(chunk);
+                .append(chunk);
+            drop(raw);
             let Some(stream) = stdout_stream.as_ref() else {
                 return;
             };
@@ -959,6 +975,7 @@ struct OutputCapture {
     omitted_bytes: usize,
     drain_timed_out: bool,
     raw: Option<crate::tools::command_output_artifact::capture::SharedLegacyRawCapture>,
+    raw_gap: Option<Arc<AtomicBool>>,
 }
 
 impl OutputCapture {
@@ -975,29 +992,24 @@ impl OutputCapture {
             omitted_bytes: 0,
             drain_timed_out: false,
             raw: None,
+            raw_gap: None,
         }
     }
 
     fn aggregate(max_bytes: Option<usize>) -> Self {
         let mut capture = Self::new(max_bytes);
         capture.raw = crate::tools::command_output_artifact::capture::current_legacy_capture();
+        capture.raw_gap = capture.raw.as_ref().map(|raw| {
+            raw.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .output_gap_flag()
+        });
         capture
     }
 
-    fn append_process_bytes(&mut self, bytes: &[u8]) {
-        if let Some(raw) = &self.raw {
-            raw.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .write_chunk(bytes);
-        }
-        self.append(bytes);
-    }
-
     fn mark_raw_gap(&self) {
-        if let Some(raw) = &self.raw {
-            raw.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .mark_output_gap();
+        if let Some(gap) = &self.raw_gap {
+            gap.store(true, Ordering::Release);
         }
     }
 
@@ -1362,6 +1374,11 @@ async fn read_output_into_capture<R: AsyncRead + Unpin + Send + 'static>(
     let mut tmp = [0u8; READ_CHUNK_SIZE];
     let mut live_output_enabled = true;
     let mut pending_delta = Vec::with_capacity(READ_CHUNK_SIZE);
+    let raw = aggregate_capture
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .raw
+        .clone();
 
     loop {
         let n = reader.read(&mut tmp).await?;
@@ -1373,14 +1390,53 @@ async fn read_output_into_capture<R: AsyncRead + Unpin + Send + 'static>(
             progress.record_output();
         }
 
-        aggregate_capture
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .append_process_bytes(&tmp[..n]);
-        capture
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .append(&tmp[..n]);
+        if let Some(raw) = &raw {
+            let raw = Arc::clone(raw);
+            let aggregate = Arc::clone(&aggregate_capture);
+            let retained = Arc::clone(&capture);
+            let bytes = tmp[..n].to_vec();
+            // One awaited chunk per reader preserves disk backpressure. The raw
+            // owner serializes stdout/stderr and their aggregate in the same
+            // order, without holding a display-state lock during disk I/O.
+            tokio::task::spawn_blocking(move || {
+                let mut raw = raw
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if aggregate
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .drain_timed_out
+                {
+                    raw.mark_output_gap();
+                    return;
+                }
+                raw.write_chunk(&bytes);
+                let mut aggregate = aggregate
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !aggregate.drain_timed_out {
+                    aggregate.append(&bytes);
+                }
+                drop(aggregate);
+                let mut retained = retained
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !retained.drain_timed_out {
+                    retained.append(&bytes);
+                }
+            })
+            .await
+            .map_err(|error| io::Error::other(format!("output capture worker failed: {error}")))?;
+        } else {
+            aggregate_capture
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .append(&tmp[..n]);
+            capture
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .append(&tmp[..n]);
+        }
 
         if let Some(stream) = &stream
             && live_output_enabled
