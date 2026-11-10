@@ -1656,6 +1656,7 @@ impl ThreadRequestProcessor {
 
         let notif = thread_started_notification(&mut thread);
         let response = ThreadStartResponse {
+            subagent_settings: config_snapshot.subagent_settings,
             thread,
             model: config_snapshot.model,
             model_provider: config_snapshot.model_provider_id,
@@ -3871,6 +3872,7 @@ impl ThreadRequestProcessor {
                 };
                 let thread_originator = config_snapshot.originator.clone();
                 let response = ThreadResumeResponse {
+                    subagent_settings: config_snapshot.subagent_settings,
                     thread,
                     model: session_configured.model,
                     model_provider: session_configured.model_provider_id,

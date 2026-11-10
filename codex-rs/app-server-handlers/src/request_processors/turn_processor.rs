@@ -1536,6 +1536,7 @@ impl TurnRequestProcessor {
         }
 
         Ok(codex_protocol::protocol::ThreadSettingsOverrides {
+            subagent_settings: None,
             environments,
             workspace_roots: runtime_workspace_roots,
             profile_workspace_roots,
@@ -1563,7 +1564,7 @@ impl TurnRequestProcessor {
         let environments = self
             .build_environment_override(thread.as_ref(), cwd, /*environment_selections*/ None)
             .await;
-        let thread_settings = self
+        let mut thread_settings = self
             .build_thread_settings_overrides(
                 thread.as_ref(),
                 ThreadSettingsBuildParams {
@@ -1584,6 +1585,11 @@ impl TurnRequestProcessor {
             )
             .await?;
 
+        if let Some(settings) = params.subagent_settings.as_ref() {
+            thread.validate_subagent_settings(settings).await
+                .map_err(|error| invalid_request(error.to_string()))?;
+        }
+        thread_settings.subagent_settings = params.subagent_settings;
         if thread_settings != codex_protocol::protocol::ThreadSettingsOverrides::default() {
             self.submit_core_op(
                 request_id,

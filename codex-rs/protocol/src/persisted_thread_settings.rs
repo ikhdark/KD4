@@ -30,6 +30,7 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 /// supply reasoning effort at all.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PersistedThreadSettings {
+    pub subagent_settings: Option<crate::openai_models::SubagentModelSettings>,
     pub model: Option<String>,
     pub model_provider_id: Option<String>,
     pub service_tier: Option<Option<String>>,
@@ -220,6 +221,9 @@ impl PersistedThreadSettingsReducer {
     }
 
     fn apply_snapshot(&mut self, snapshot: &ThreadSettingsSnapshot) {
+        if let Some(settings) = snapshot.subagent_settings.as_ref() {
+            self.settings.subagent_settings = Some(settings.clone());
+        }
         self.settings.model = Some(snapshot.model.clone());
         self.settings.model_provider_id = Some(snapshot.model_provider_id.clone());
         if let Some(service_tier) = snapshot.service_tier.as_ref() {

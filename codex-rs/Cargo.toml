@@ -509,6 +509,12 @@ strip = "symbols"
 codegen-units = 1
 incremental = false
 
+# Regular rebuilds retain release settings except for LTO and codegen parallelism.
+[profile.rebuild]
+inherits = "release"
+lto = "off"
+codegen-units = 16
+
 # Both PGO passes use this same Cargo profile, in separate target directories.
 [profile.pgo]
 inherits = "release"

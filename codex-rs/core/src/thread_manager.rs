@@ -2206,12 +2206,15 @@ impl ThreadManagerState {
                 /*developer_instructions*/ None,
             )
         });
-        if collaboration_mode.is_some() || settings.windows_sandbox_level.is_some() {
+        if collaboration_mode.is_some() || settings.windows_sandbox_level.is_some()
+            || settings.subagent_settings.is_some()
+        {
             new_thread
                 .thread
                 .codex
                 .session
                 .update_settings(SessionSettingsUpdate {
+                    subagent_settings: settings.subagent_settings.clone(),
                     collaboration_mode,
                     windows_sandbox_level: settings.windows_sandbox_level,
                     ..Default::default()

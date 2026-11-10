@@ -400,6 +400,7 @@ export type { SkillsListResponse } from "./SkillsListResponse";
 export type { SortDirection } from "./SortDirection";
 export type { SpendControlLimitSnapshot } from "./SpendControlLimitSnapshot";
 export type { SubAgentActivityKind } from "./SubAgentActivityKind";
+export type { SubagentDefaults } from "./SubagentDefaults";
 export type { SubagentMigration } from "./SubagentMigration";
 export type { SurfacedToolResult } from "./SurfacedToolResult";
 export type { TerminalInteractionNotification } from "./TerminalInteractionNotification";

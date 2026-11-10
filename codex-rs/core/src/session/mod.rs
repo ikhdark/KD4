@@ -822,6 +822,7 @@ impl Codex {
             });
         let inherited_validation = agent_control.inherited_validation_context.as_ref();
         let session_configuration = SessionConfiguration {
+            subagent_settings: None,
             provider: config.model_provider.clone(),
             collaboration_mode,
             model_reasoning_summary: config.model_reasoning_summary,
@@ -1865,6 +1866,7 @@ impl Session {
         let sandbox_policy = snapshot.sandbox_policy();
         EventMsg::ThreadSettingsApplied(ThreadSettingsAppliedEvent {
             thread_settings: ThreadSettingsSnapshot {
+                subagent_settings: snapshot.subagent_settings,
                 model: snapshot.model,
                 model_provider_id: snapshot.model_provider_id,
                 service_tier: Some(snapshot.service_tier),
@@ -2407,6 +2409,30 @@ impl Session {
         ))
     }
 
+    pub(crate) async fn validate_subagent_settings(
+        &self,
+        settings: &codex_protocol::openai_models::SubagentModelSettings,
+    ) -> codex_config::ConstraintResult<()> {
+        let config = {
+            let state = self.state.lock().await;
+            Arc::clone(&state.session_configuration.original_config_do_not_use)
+        };
+        let invalid = |reason: String| codex_config::ConstraintError::UpdateRejected { reason };
+        let models = self.services.models_manager
+            .list_models_shared(RefreshStrategy::Offline, config.http_client_factory())
+            .await
+            .map_err(|error| invalid(format!("could not read subagent model catalog: {error}")))?;
+        let model = models.iter().find(|model| model.model == settings.model)
+            .ok_or_else(|| invalid(format!("Unknown subagent model `{}`", settings.model)))?;
+        if !model.supported_reasoning_efforts.iter()
+            .any(|preset| preset.effort == settings.reasoning_effort)
+        {
+            return Err(invalid(format!("Reasoning effort `{}` is not supported for subagent model `{}`",
+                settings.reasoning_effort, settings.model)));
+        }
+        Ok(())
+    }
+
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "Serialize settings projection, persistence and commit against concurrent accepted updates"
@@ -2432,6 +2458,9 @@ impl Session {
             None
         };
         let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
+        if let Some(settings) = updates.subagent_settings.as_ref() {
+            self.validate_subagent_settings(settings).await?;
+        }
         let (previous_config, new_config, updated) = {
             let mut state = self.state.lock().await;
             let updated = match state.session_configuration.apply_async(updates).await {

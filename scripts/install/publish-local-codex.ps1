@@ -8,7 +8,7 @@ param(
     [switch]$NoSccache,
     [switch]$BuildOnly,
 
-    [ValidateSet("dev", "release", "pgo")]
+    [ValidateSet("dev", "rebuild", "release", "pgo")]
     [string]$Profile = "release",
     [string]$PgoGenerateDirectory,
     [string]$PgoProfileData,
@@ -485,6 +485,9 @@ function Get-LocalPublishCommand {
 
     if ($Profile -eq "release" -and $PublishForkFrontend) {
         return "just publish-local-codex-final -ForkRoot `"$ForkRoot`""
+    }
+    if ($Profile -eq "rebuild" -and $PublishForkFrontend) {
+        return "just publish-local-codex-rebuild -ForkRoot `"$ForkRoot`""
     }
 
     $publisherPath = Join-Path $PSScriptRoot "publish-local-codex.ps1"
@@ -3098,7 +3101,7 @@ function Get-LocalPublishCargoConfigLines {
         $lines.Add("rustc-wrapper = `"`"")
         $lines.Add("rustc-workspace-wrapper = `"`"")
     }
-    if ($Profile -in @("release", "pgo")) {
+    if ($Profile -in @("rebuild", "release", "pgo")) {
         # Cargo appends these to the shared stack/static-CRT/native-CPU flags.
         # Scope MSVC linker syntax to Windows MSVC, not GNU or other platforms.
         $lines.Add("[target.'cfg(all(windows, target_env = `"msvc`"))']")
@@ -3138,7 +3141,10 @@ function Invoke-CodexBuild {
     if ($Profile -eq "release") {
         Write-ProofLine "releaseProfile" "release: opt-level=3, debug=0, thin LTO, codegen-units=1, runtime-dependency-codegen-units=1, build-dependencies=Cargo defaults, incremental=false"
     }
-    if ($Profile -in @("release", "pgo")) {
+    if ($Profile -eq "rebuild") {
+        Write-ProofLine "rebuildProfile" "rebuild: inherits release, LTO off, codegen-units=16"
+    }
+    if ($Profile -in @("rebuild", "release", "pgo")) {
         Write-ProofLine "linkerOptimization" "Windows MSVC: /OPT:REF, /OPT:ICF"
     }
     try {

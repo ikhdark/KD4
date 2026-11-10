@@ -7180,6 +7180,22 @@
           "type": "object"
         }
       ]
+    },
+    "SubagentModelSettings": {
+      "description": "Thread-local preferences for future generic workers, not model/effort locks.",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "reasoningEffort": {
+          "$ref": "#/definitions/ReasoningEffort"
+        }
+      },
+      "required": [
+        "model",
+        "reasoningEffort"
+      ],
+      "type": "object"
     }
   },
   "properties": {
@@ -7238,6 +7254,16 @@
     },
     "thread": {
       "$ref": "#/definitions/Thread"
+    },
+    "subagentSettings": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SubagentModelSettings"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "required": [

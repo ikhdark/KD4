@@ -9848,6 +9848,22 @@
             "string",
             "null"
           ]
+        },
+        "subagentDefaults": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SubagentDefaults"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Generic worker preferences, independent of the parent model/effort. Older servers omit this metadata; it is not the settings of every child."
+        },
+        "subagentSettingsSupported": {
+          "default": false,
+          "description": "Whether thread/settings/update accepts and persists subagentSettings.",
+          "type": "boolean"
         }
       },
       "required": [
@@ -17781,6 +17797,16 @@
         },
         "thread": {
           "$ref": "#/definitions/Thread"
+        },
+        "subagentSettings": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SubagentModelSettings"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -17970,6 +17996,17 @@
               "type": "null"
             }
           ]
+        },
+        "subagentSettings": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SubagentModelSettings"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Omitted on older servers; no selection means the SOL/high built-in default."
         }
       },
       "required": [
@@ -18219,6 +18256,16 @@
         },
         "thread": {
           "$ref": "#/definitions/Thread"
+        },
+        "subagentSettings": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SubagentModelSettings"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -23557,6 +23604,43 @@
         "okOverridden"
       ],
       "type": "string"
+    },
+    "SubagentDefaults": {
+      "properties": {
+        "model": {
+          "description": "Preferred model before provider-catalog fallback or a per-spawn override.",
+          "type": "string"
+        },
+        "reasoningEffort": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ReasoningEffort"
+            }
+          ],
+          "description": "Preferred effort before model-capability fallback or a per-spawn override."
+        }
+      },
+      "required": [
+        "model",
+        "reasoningEffort"
+      ],
+      "type": "object"
+    },
+    "SubagentModelSettings": {
+      "description": "Thread-local preferences for future generic workers, not model/effort locks.",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "reasoningEffort": {
+          "$ref": "#/definitions/ReasoningEffort"
+        }
+      },
+      "required": [
+        "model",
+        "reasoningEffort"
+      ],
+      "type": "object"
     }
   },
   "title": "CodexAppServerProtocolV2",

@@ -58,6 +58,7 @@ use codex_rollout::state_integration::StateDbHandle;
 
 #[derive(Clone, Debug)]
 pub struct ThreadConfigSnapshot {
+    pub subagent_settings: Option<codex_protocol::openai_models::SubagentModelSettings>,
     pub model: String,
     pub model_provider_id: String,
     pub service_tier: Option<String>,
@@ -561,6 +562,14 @@ impl CodexThread {
             .session
             .set_openai_form_elicitation_support(supported)
             .await
+    }
+
+    /// Validate model and effort against this thread's provider catalog before admission.
+    pub async fn validate_subagent_settings(
+        &self,
+        settings: &codex_protocol::openai_models::SubagentModelSettings,
+    ) -> ConstraintResult<()> {
+        self.codex.session.validate_subagent_settings(settings).await
     }
 
     /// Preview persistent thread settings overrides without committing them.

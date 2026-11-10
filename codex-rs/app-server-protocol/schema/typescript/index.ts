@@ -100,6 +100,7 @@ export type { ServerRuntimeWarning } from "./ServerRuntimeWarning";
 export type { SessionSource } from "./SessionSource";
 export type { Settings } from "./Settings";
 export type { SubAgentSource } from "./SubAgentSource";
+export type { SubagentModelSettings } from "./SubagentModelSettings";
 export type { ThreadId } from "./ThreadId";
 export type { TokenUsageCoverage } from "./TokenUsageCoverage";
 export type { Tool } from "./Tool";

@@ -806,6 +806,7 @@ pub(crate) struct TaskStartState {
 
 #[derive(Clone)]
 pub(crate) struct SessionConfiguration {
+    pub(super) subagent_settings: Option<codex_protocol::openai_models::SubagentModelSettings>,
     /// Provider identifier ("openai", "openrouter", ...).
     pub(super) provider: ModelProviderInfo,
 
@@ -927,6 +928,7 @@ impl SessionConfiguration {
 
     pub(super) fn thread_config_snapshot(&self) -> ThreadConfigSnapshot {
         ThreadConfigSnapshot {
+            subagent_settings: self.subagent_settings.clone(),
             model: self.collaboration_mode.model().to_string(),
             model_provider_id: self.original_config_do_not_use.model_provider_id.clone(),
             service_tier: self.service_tier.clone(),
@@ -967,6 +969,9 @@ impl SessionConfiguration {
 
     pub(crate) fn apply(&self, updates: &SessionSettingsUpdate) -> ConstraintResult<Self> {
         let mut next_configuration = self.clone();
+        if let Some(settings) = updates.subagent_settings.as_ref() {
+            next_configuration.subagent_settings = Some(settings.clone());
+        }
         let current_sandbox_policy = self.sandbox_policy();
         let current_file_system_sandbox_policy = self.file_system_sandbox_policy();
         let current_network_sandbox_policy = self.network_sandbox_policy();
@@ -1174,6 +1179,7 @@ impl SessionConfiguration {
 
 #[derive(Default, Clone)]
 pub(crate) struct SessionSettingsUpdate {
+    pub(crate) subagent_settings: Option<codex_protocol::openai_models::SubagentModelSettings>,
     pub(crate) environments: Option<TurnEnvironmentSelections>,
     pub(crate) workspace_roots: Option<Vec<AbsolutePathBuf>>,
     pub(crate) profile_workspace_roots: Option<Vec<AbsolutePathBuf>>,
@@ -1193,7 +1199,8 @@ pub(crate) struct SessionSettingsUpdate {
 
 impl SessionSettingsUpdate {
     pub(crate) fn is_empty(&self) -> bool {
-        self.environments.is_none()
+        self.subagent_settings.is_none()
+            && self.environments.is_none()
             && self.workspace_roots.is_none()
             && self.profile_workspace_roots.is_none()
             && self.approval_policy.is_none()

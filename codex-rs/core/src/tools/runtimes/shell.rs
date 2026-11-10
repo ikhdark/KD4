@@ -220,10 +220,6 @@ impl Approvable<ShellRequest> for ShellRuntime {
 }
 
 impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
-    fn read_only_in_subagents(&self) -> bool {
-        true
-    }
-
     async fn run(
         &mut self,
         req: &ShellRequest,

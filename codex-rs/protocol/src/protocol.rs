@@ -209,6 +209,7 @@ pub struct McpServerRefreshConfig {
 /// on their own.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ThreadSettingsOverrides {
+    pub subagent_settings: Option<crate::openai_models::SubagentModelSettings>,
     /// Updated fallback `cwd` and environments supplied together as a complete pair.
     pub environments: Option<TurnEnvironmentSelections>,
 
@@ -3633,6 +3634,9 @@ pub struct ThreadSettingsAppliedEvent {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ThreadSettingsSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub subagent_settings: Option<crate::openai_models::SubagentModelSettings>,
     pub model: String,
     pub model_provider_id: String,
     /// Outer `None` means an older snapshot did not supply this field; an

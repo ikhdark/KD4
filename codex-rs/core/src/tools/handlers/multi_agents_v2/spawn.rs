@@ -866,11 +866,6 @@ impl SpawnAgentArgs {
                 "spawn_agent: specialized roles are no longer supported; use an explicit typed assignment for writable work or message for read-only work".to_string(),
             ));
         }
-        if self.model.is_some() || self.reasoning_effort.is_some() {
-            return Err(FunctionCallError::RespondToModel(format!(
-                "spawn_agent: model and reasoning overrides are not supported; subagents use {DEFAULT_SPAWN_AGENT_MODEL} with {DEFAULT_SPAWN_AGENT_REASONING_EFFORT} reasoning"
-            )));
-        }
         Ok(())
     }
 

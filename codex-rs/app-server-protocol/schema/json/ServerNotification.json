@@ -5176,6 +5176,17 @@
               "type": "null"
             }
           ]
+        },
+        "subagentSettings": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SubagentModelSettings"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Omitted on older servers; no selection means the SOL/high built-in default."
         }
       },
       "required": [
@@ -9876,6 +9887,22 @@
         "extraCount",
         "failedScan",
         "samplePaths"
+      ],
+      "type": "object"
+    },
+    "SubagentModelSettings": {
+      "description": "Thread-local preferences for future generic workers, not model/effort locks.",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "reasoningEffort": {
+          "$ref": "#/definitions/ReasoningEffort"
+        }
+      },
+      "required": [
+        "model",
+        "reasoningEffort"
       ],
       "type": "object"
     }

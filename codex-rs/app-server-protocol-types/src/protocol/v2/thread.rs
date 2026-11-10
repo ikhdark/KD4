@@ -192,6 +192,9 @@ pub struct MockExperimentalMethodResponse {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadStartResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub subagent_settings: Option<codex_protocol::openai_models::SubagentModelSettings>,
     pub thread: Thread,
     pub model: String,
     pub model_provider: String,
@@ -247,6 +250,11 @@ impl ThreadStartResponse {
 #[ts(export_to = "v2/")]
 pub struct ThreadSettingsUpdateParams {
     pub thread_id: String,
+    /// Preferences for future subagents in this chat, independent of parent settings.
+    /// Explicit per-spawn overrides remain supported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub subagent_settings: Option<codex_protocol::openai_models::SubagentModelSettings>,
     /// Override the working directory for subsequent turns.
     #[ts(optional = nullable)]
     pub cwd: Option<PathBuf>,
@@ -309,6 +317,10 @@ pub struct ThreadSettingsUpdateResponse {}
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadSettings {
+    /// Omitted on older servers; no selection means the SOL/high built-in default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub subagent_settings: Option<codex_protocol::openai_models::SubagentModelSettings>,
     pub cwd: AbsolutePathBuf,
     /// Ordered applied selection; first is primary, empty disables environment access.
     /// Absent only when restoring legacy settings without selection information.
@@ -457,6 +469,9 @@ pub struct ThreadResumeParams {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadResumeResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub subagent_settings: Option<codex_protocol::openai_models::SubagentModelSettings>,
     pub thread: Thread,
     pub model: String,
     pub model_provider: String,

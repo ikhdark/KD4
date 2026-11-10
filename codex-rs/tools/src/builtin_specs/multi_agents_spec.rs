@@ -28,7 +28,7 @@ pub struct SpawnAgentToolOptions {
 
 fn spawn_agent_default_guidance() -> String {
     format!(
-        "All subagents are generic and use `{DEFAULT_SPAWN_AGENT_MODEL}` with `{DEFAULT_SPAWN_AGENT_REASONING_EFFORT}` reasoning. Use `message` for read-only tasks or `assignment` for writable workers; there are no role, model, or reasoning overrides. If the built-in model is unavailable, the effective model or provider default is used with a supported reasoning effort."
+        "All subagents are generic and use this chat's selected subagent preferences, or `{DEFAULT_SPAWN_AGENT_MODEL}` with `{DEFAULT_SPAWN_AGENT_REASONING_EFFORT}` reasoning when none are selected. Optional `model` and `reasoning_effort` override those defaults independently. Use `message` for read-only tasks or `assignment` for writable workers; there are no role overrides. If the built-in model is unavailable, the effective model or provider default is used with a supported reasoning effort."
     )
 }
 
@@ -585,6 +585,18 @@ fn spawn_agent_common_properties_v2() -> BTreeMap<String, JsonSchema> {
     BTreeMap::from([
         ("assignment".into(), writable_assignment_schema()),
         (
+            "model".into(),
+            JsonSchema::string(Some(format!(
+                "Optional exact model name from the effective provider catalog. Omit to use this chat's selected subagent model, otherwise `{DEFAULT_SPAWN_AGENT_MODEL}` when available; this override is local to the new worker."
+            ))),
+        ),
+        (
+            "reasoning_effort".into(),
+            JsonSchema::string(Some(format!(
+                "Optional reasoning effort supported by the selected model (for example `low`, `medium`, `high`, or `xhigh`). Omit to use this chat's selected subagent effort when supported, otherwise prefer `{DEFAULT_SPAWN_AGENT_REASONING_EFFORT}` with a supported fallback; independent of the model override."
+            ))),
+        ),
+        (
             "cwd".into(),
             JsonSchema::string(Some("Optional absolute local repository directory for this child. Use it when the parent is projectless or targets another already-authorized repository. Assignment scopes remain repository-relative. Omit to inherit the selected environment's cwd. This does not add workspace roots or broaden inherited permissions.".into())),
         ),
@@ -695,11 +707,11 @@ The spawned agent receives a durable task binding.
 Only call this tool for a concrete, bounded subtask that can run independently alongside useful local work; otherwise continue locally.
 Apply the base instructions for audit/review scope, verification, validation, and completion, and applicable assignment restrictions.
 Fit assignments to actual worker context, reserving reasoning/evidence/reporting space; partition by cohesive subsystems and execution paths, not just file size.
-The read-only `message` must include task type, scope, exclusions, detection criteria, user restrictions, evidence and stop condition. Writable work requires `assignment` with explicit write scopes, typed prohibitions and criterion-specific source evidence policies. Never infer write authority from natural-language messages. Native source acquisition is not semantic acceptance; workers can independently verify with read-only sandboxed commands, while root owns write-requiring execution and integration.
+The read-only `message` must include task type, scope, exclusions, detection criteria, user restrictions, evidence and stop condition. Writable work requires `assignment` with explicit write scopes, typed prohibitions and criterion-specific source evidence policies. Never infer write authority from natural-language messages. Native source acquisition is not semantic acceptance; workers can independently verify with permitted commands, while root owns integration.
 Launch authorized independent assignments in the same batch, not a serial spawn loop. In exec, use bounded Promise.allSettled and retain every success and failure; failed siblings do not justify respawning successes.
 Sequence only real dependencies or shared-resource conflicts. Integrate completions with the next substantive step/final, not an acknowledgment-only model round.
 It can message its children and peers, but cannot message ancestors. Its final answer and terminal outcome are delivered to its parent automatically when it finishes.
-Supply exactly one of read-only `message` (or its aliases) or writable `assignment`. Invalid writable contracts are rejected before execution. Message-only workers have native read/search, communication and commands in an enforced read-only filesystem/restricted-network sandbox, never source writes or sandbox bypass. Writable workers use the scope-checked patch owner, submit native assignment-specific evidence and an exact scoped change declaration; their commands remain read-only and root independently reviews acceptance. Spawn returns durable assignment/attempt identities and advisory overlap warnings, never redundancy or completion proof.
+Supply exactly one of read-only `message` (or its aliases) or writable `assignment`. Invalid writable contracts are rejected before execution. Worker commands inherit the parent's filesystem, network and Windows sandbox settings; normal approval and managed-policy checks remain. Without an inherited sandbox, commands are not OS-confined to assignment write scopes. Message-only workers must remain read-only. Writable workers use the scope-checked patch owner, submit native assignment-specific evidence and an exact scoped change declaration; root independently reviews acceptance. Spawn returns durable assignment/attempt identities and advisory overlap warnings, never redundancy or completion proof.
 
 Omitted `fork_turns` and `fork_turns="none"` create a lineage-preserving TaskCapsule fork: the capsule is the sole structured bootstrap and no parent conversation or conversation-derived capability selection is inherited. Integers from 1 through 5 retain bounded history. `fork_turns="all"` is disabled by default and is only available with the configuration escape hatch."#
     );

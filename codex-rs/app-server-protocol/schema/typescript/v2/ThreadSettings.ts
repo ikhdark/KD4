@@ -6,13 +6,17 @@ import type { CollaborationMode } from "../CollaborationMode";
 import type { Personality } from "../Personality";
 import type { ReasoningEffort } from "../ReasoningEffort";
 import type { ReasoningSummary } from "../ReasoningSummary";
+import type { SubagentModelSettings } from "../SubagentModelSettings";
 import type { ActivePermissionProfile } from "./ActivePermissionProfile";
 import type { ApprovalsReviewer } from "./ApprovalsReviewer";
 import type { AskForApproval } from "./AskForApproval";
 import type { SandboxPolicy } from "./SandboxPolicy";
 import type { ThreadSelectedEnvironment } from "./ThreadSelectedEnvironment";
 
-export type ThreadSettings = {cwd: AbsolutePathBuf, /**
+export type ThreadSettings = {/**
+ * Omitted on older servers; no selection means the SOL/high built-in default.
+ */
+subagentSettings?: SubagentModelSettings, cwd: AbsolutePathBuf, /**
  * Ordered applied selection; first is primary, empty disables environment access.
  * Absent only when restoring legacy settings without selection information.
  */

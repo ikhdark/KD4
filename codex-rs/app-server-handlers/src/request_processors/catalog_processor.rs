@@ -457,7 +457,12 @@ impl CatalogRequestProcessor {
         };
         Ok(ModelListResponse {
             data: items,
+            subagent_settings_supported: true,
             next_cursor,
+            subagent_defaults: Some(codex_app_server_protocol_types::SubagentDefaults {
+                model: codex_tools::DEFAULT_SPAWN_AGENT_MODEL.to_string(),
+                reasoning_effort: codex_tools::DEFAULT_SPAWN_AGENT_REASONING_EFFORT,
+            }),
         })
     }
 

@@ -127,11 +127,29 @@ pub struct ReasoningEffortOption {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
+pub struct SubagentDefaults {
+    /// Preferred model before provider-catalog fallback or a per-spawn override.
+    pub model: String,
+    /// Preferred effort before model-capability fallback or a per-spawn override.
+    pub reasoning_effort: ReasoningEffort,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
 pub struct ModelListResponse {
     pub data: Vec<Model>,
+    /// Whether thread/settings/update accepts and persists subagentSettings.
+    #[serde(default)]
+    pub subagent_settings_supported: bool,
     /// Opaque cursor to pass to the next call to continue after the last item.
     /// If None, there are no more items to return.
     pub next_cursor: Option<String>,
+    /// Generic worker preferences, independent of the parent model/effort.
+    /// Older servers omit this metadata; it is not the settings of every child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub subagent_defaults: Option<SubagentDefaults>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]

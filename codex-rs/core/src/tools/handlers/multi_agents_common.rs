@@ -310,6 +310,9 @@ pub(crate) async fn apply_spawn_agent_model_defaults_and_overrides(
     requested_reasoning_effort: Option<ReasoningEffort>,
 ) -> Result<(), FunctionCallError> {
     let models_manager = models_manager_for_spawn_config(session, turn, config);
+    let preferences = session.thread_config_snapshot().await.subagent_settings;
+    let requested_model = requested_model.or_else(|| preferences.as_ref().map(|s| s.model.as_str()));
+    let preferred_effort = preferences.as_ref().map(|s| s.reasoning_effort.clone());
     let available_models = models_manager
         .list_models_shared(RefreshStrategy::Offline, config.http_client_factory())
         .await
@@ -334,6 +337,9 @@ pub(crate) async fn apply_spawn_agent_model_defaults_and_overrides(
     // Resolved catalog limits are not configuration overrides. Bounded forks
     // resolve their admission budget from the selected model at admission.
     let reasoning_effort = requested_reasoning_effort.or_else(|| {
+        preferred_effort.filter(|effort| selected_model_info.supported_reasoning_levels.iter()
+            .any(|preset| &preset.effort == effort))
+    }).or_else(|| {
         default_spawn_reasoning_effort(
             &selected_model_info.supported_reasoning_levels,
             selected_model_info.default_reasoning_level.clone(),

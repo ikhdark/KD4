@@ -5074,6 +5074,22 @@
         "mode"
       ],
       "type": "object"
+    },
+    "SubagentModelSettings": {
+      "description": "Thread-local preferences for future generic workers, not model/effort locks.",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "reasoningEffort": {
+          "$ref": "#/definitions/ReasoningEffort"
+        }
+      },
+      "required": [
+        "model",
+        "reasoningEffort"
+      ],
+      "type": "object"
     }
   },
   "description": "Request from the client to the server.",

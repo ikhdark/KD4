@@ -28,7 +28,16 @@ platform npm archive layout is not probed or installed.
 ## Build profiles
 
 The configured Cargo profiles and publisher `-Profile` values are `dev`,
-`release` (final), and `pgo`. The publisher defaults to `release`.
+`rebuild`, `release` (final), and `pgo`. The publisher defaults to `release`.
+
+## Regular local rebuilds
+
+Use `just publish-local-codex-rebuild` for regular local rebuilds and publishing.
+It uses the `rebuild` profile, inheriting every `release` setting except
+`lto = "off"` and `codegen-units = 16`, with a separate
+`codex-rs/target/publish-rebuild` build directory. It retains the final recipe's
+frontend publishing, Desktop routing/restart options, freshness checks, and
+rollback safeguards. The existing final and PGO commands are unchanged.
 
 ## Final builds
 
@@ -40,9 +49,9 @@ Windows builds retain native CPU tuning,
 the 8 MiB stack, and static CRT from the shared Cargo configuration.
 
 The local publisher explicitly enables `/OPT:REF` (unused-code removal) and
-`/OPT:ICF` (identical COMDAT folding) for Windows MSVC `release` builds and
-both PGO passes. These flags join the shared target flags; dev publishes are
-unchanged. Direct Cargo builds do not use this publisher overlay.
+`/OPT:ICF` (identical COMDAT folding) for Windows MSVC `rebuild` and `release`
+builds and both PGO passes. These flags join the shared target flags; dev
+publishes are unchanged. Direct Cargo builds do not use this publisher overlay.
 
 `just publish-local-codex-final` remains the normal local publish command. It uses
 the `release` profile and `codex-rs/target/publish-release` build directory; `cargo build --release`

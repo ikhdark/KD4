@@ -3557,9 +3557,10 @@ pub enum StartupPrewarmClaim {
     Rejected,
 }
 
-// Input is compared through the normalized prefix chain. Delivery-only stream
-// options, diagnostic comparisons and client metadata do not affect previous_response_id reuse. Keep
-// this destructuring exhaustive so new fields require an explicit reuse decision.
+// Input is compared through the normalized prefix chain. Per-request service tier,
+// delivery-only stream options, diagnostic comparisons and client metadata do not
+// affect previous_response_id reuse. Keep this destructuring exhaustive so new
+// fields require an explicit reuse decision.
 // Both equality and fingerprinting use this same ordered projection.
 fn responses_request_reuse_properties(
     request: &ResponsesApiRequest,
@@ -3576,7 +3577,7 @@ fn responses_request_reuse_properties(
         stream,
         stream_options: _,
         include,
-        service_tier,
+        service_tier: _,
         prompt_cache_key,
         prompt_cache_options: _,
         text,
@@ -3592,7 +3593,6 @@ fn responses_request_reuse_properties(
         store,
         stream,
         include,
-        service_tier,
         prompt_cache_key,
         text,
     )
@@ -5624,9 +5624,10 @@ impl ModelClientSession {
             Some(conn) => {
                 setup_fingerprint.is_none()
                     || self.websocket_session.setup_fingerprint != setup_fingerprint
-                    // The handshake routing hint is immutable for a socket. A
-                    // model/tier transition must not keep the previous pool's route.
-                    || self.websocket_session.routing_hint != routing_hint
+                    // Preserve model routing, but service_tier is selected on each
+                    // response.create, not inherited from the handshake hint.
+                    || self.websocket_session.routing_hint.as_ref().map(routing_hint_model)
+                        != routing_hint.as_ref().map(routing_hint_model)
                     || websocket_connection_expiring(
                         self.websocket_session.connected_at,
                         Instant::now(),
@@ -7742,6 +7743,14 @@ struct WebsocketConnectParams<'a> {
     auth_context: AuthRequestTelemetryContext,
     request_route_telemetry: RequestRouteTelemetry,
     routing_hint: Option<HeaderValue>,
+}
+
+// Hints are constructed below as model=... with an optional ;tier=... suffix.
+fn routing_hint_model(hint: &HeaderValue) -> &[u8] {
+    hint.as_bytes()
+        .split(|byte| *byte == b';')
+        .next()
+        .unwrap_or_default()
 }
 
 fn build_routing_hint_header(

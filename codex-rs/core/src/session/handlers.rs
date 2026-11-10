@@ -104,6 +104,7 @@ async fn thread_settings_update(
     thread_settings: ThreadSettingsOverrides,
 ) -> SessionSettingsUpdate {
     let ThreadSettingsOverrides {
+        subagent_settings,
         environments,
         workspace_roots,
         profile_workspace_roots,
@@ -132,6 +133,7 @@ async fn thread_settings_update(
         }
     };
     SessionSettingsUpdate {
+        subagent_settings,
         environments,
         workspace_roots,
         profile_workspace_roots,

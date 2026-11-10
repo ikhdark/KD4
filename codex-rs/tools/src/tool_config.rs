@@ -7,7 +7,7 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort;
 
 pub const DEFAULT_SPAWN_AGENT_MODEL: &str = "gpt-6.1-sol";
-pub const DEFAULT_SPAWN_AGENT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::XHigh;
+pub const DEFAULT_SPAWN_AGENT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum UnifiedExecFeatureMode {

@@ -56,6 +56,7 @@ pub(crate) fn thread_settings_from_config_snapshot(
     config_snapshot: &ThreadConfigSnapshot,
 ) -> ThreadSettings {
     ThreadSettings {
+        subagent_settings: config_snapshot.subagent_settings.clone(),
         cwd: config_snapshot.cwd().clone(),
         environments: Some(
             config_snapshot
@@ -94,6 +95,7 @@ pub(crate) fn thread_settings_from_core_snapshot(
     snapshot: codex_protocol::protocol::ThreadSettingsSnapshot,
 ) -> ThreadSettings {
     let codex_protocol::protocol::ThreadSettingsSnapshot {
+        subagent_settings,
         model,
         model_provider_id,
         service_tier,
@@ -110,6 +112,7 @@ pub(crate) fn thread_settings_from_core_snapshot(
     } = snapshot;
     let sandbox_policy = thread_response_sandbox_policy(&permission_profile, cwd.as_path());
     ThreadSettings {
+        subagent_settings,
         environments: environments.map(|selection| {
             selection
                 .environments

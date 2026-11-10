@@ -203,6 +203,27 @@
         "reasoningEffort"
       ],
       "type": "object"
+    },
+    "SubagentDefaults": {
+      "properties": {
+        "model": {
+          "description": "Preferred model before provider-catalog fallback or a per-spawn override.",
+          "type": "string"
+        },
+        "reasoningEffort": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ReasoningEffort"
+            }
+          ],
+          "description": "Preferred effort before model-capability fallback or a per-spawn override."
+        }
+      },
+      "required": [
+        "model",
+        "reasoningEffort"
+      ],
+      "type": "object"
     }
   },
   "properties": {
@@ -218,6 +239,22 @@
         "string",
         "null"
       ]
+    },
+    "subagentDefaults": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SubagentDefaults"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Generic worker preferences, independent of the parent model/effort. Older servers omit this metadata; it is not the settings of every child."
+    },
+    "subagentSettingsSupported": {
+      "default": false,
+      "description": "Whether thread/settings/update accepts and persists subagentSettings.",
+      "type": "boolean"
     }
   },
   "required": [

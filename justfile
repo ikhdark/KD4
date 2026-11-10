@@ -139,6 +139,12 @@ install:
 publish-local-codex-final *args:
     @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\install\publish-local-codex.ps1" -Concise -AutoSkipBuild -Profile release -CloseRunningTargetTimeoutSeconds 30 -ConfigureDesktopLocalCli -DesktopCliEnvironmentTarget User -PublishForkFrontend -RestartDesktopIfNeeded {args}
 
+# Regular local rebuild/publish with release settings, no LTO and 16 codegen units.
+[no-cd]
+[windows]
+publish-local-codex-rebuild *args:
+    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\install\publish-local-codex.ps1" -Concise -AutoSkipBuild -Profile rebuild -CloseRunningTargetTimeoutSeconds 30 -ConfigureDesktopLocalCli -DesktopCliEnvironmentTarget User -PublishForkFrontend -RestartDesktopIfNeeded {args}
+
 [no-cd]
 [windows]
 publish-local-codex-pgo *args:
