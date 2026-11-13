@@ -1627,6 +1627,7 @@ dependencies = [
  "codex-arg0",
  "codex-config",
  "codex-core",
+ "codex-core-plugins",
  "codex-exec-server",
  "codex-feedback",
  "codex-http-client",

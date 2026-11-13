@@ -1923,6 +1923,7 @@ impl ToolCallRuntime {
                     let failure_detail = response.result.model_delivery_unavailable().then(|| {
                         crate::tools::registry::model_delivery_unavailable_receipt(&error_call.call_id)
                     });
+                    response.reconcile_settled_history_candidate(&self.session).await;
                     let response = response.into_response();
                     evidence_timing.record_output_projection(projection_started.elapsed());
                     // Code-mode carriers capture their baseline after the handler.

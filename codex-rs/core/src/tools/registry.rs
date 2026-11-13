@@ -8,6 +8,7 @@ use crate::hook_runtime::run_post_tool_use_hooks;
 use crate::hook_runtime::run_pre_tool_use_hooks;
 use crate::sandbox_tags::permission_profile_policy_tag;
 use crate::sandbox_tags::permission_profile_sandbox_tag;
+use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_execution::PendingOwnerDrainedContinuation;
 use crate::tools::command_output_artifact::ToolOutputSelector;
@@ -590,6 +591,62 @@ impl AnyToolResult {
         let notice = self.operation_history.as_ref()
             .map(|history| serde_json::json!({"operation_history": history}).to_string());
         with_operation_history_notice(response, notice.as_deref())
+    }
+
+    /// Register the final text only after both it and the producer's original
+    /// canonical artifact have protected, independently recoverable identities.
+    pub(crate) async fn reconcile_settled_history_candidate(&mut self, session: &Session) {
+        if self.operation_history.is_none() || self.outcome_for_logging() != ToolOutputOutcome::Success {
+            return;
+        }
+        let Some(mut candidate) = self.model_projection.as_ref().and_then(|p| p.candidate.clone()) else {
+            return;
+        };
+        if !candidate.successful || !candidate.complete || !candidate.projection_eligible {
+            return;
+        }
+        let response = self.response();
+        if !matches!(&response, ResponseInputItem::FunctionCallOutput { .. } | ResponseInputItem::CustomToolCallOutput { .. })
+            || !preserved_non_text_content(&response).is_empty()
+        {
+            return;
+        }
+        let delivered = history_output_text(&response)
+            .unwrap_or_else(|| consolidated_history_output_text(&response));
+        if delivered == candidate.bounded_model_output {
+            return;
+        }
+        if session.try_register_tool_artifact_origin(
+            candidate.artifact_id.clone(), candidate.call_id.clone(),
+            candidate.artifact_bytes, candidate.artifact_sha256.clone(),
+        ).await.is_err() {
+            return;
+        }
+        // The visible projection can already refer to the producer artifact.
+        // Keep its selector space and source identity intact; the new archive
+        // adds the final settlement and links to that protected original.
+        let archive = CanonicalToolResult::json(serde_json::json!({
+            "kind": "settled_tool_output",
+            "delivered_output": delivered,
+            "producer_artifact": {
+                "artifact_id": candidate.artifact_id,
+                "bytes": candidate.artifact_bytes,
+                "sha256": candidate.artifact_sha256,
+            },
+        }));
+        let artifact = crate::tools::command_output_artifact::create_tool_history_output_artifact(
+            session.codex_home().await.as_path(), &session.thread_id.to_string(), &archive,
+        ).await;
+        let Some(artifact_id) = artifact.artifact_id() else { return; };
+        if !artifact.complete || artifact.retained_bytes != archive.exact_bytes
+            || !artifact.unavailable_ranges.is_empty() {
+            return;
+        }
+        candidate.artifact_id = artifact_id;
+        candidate.artifact_bytes = archive.exact_bytes;
+        candidate.artifact_sha256 = archive.sha256;
+        candidate.bounded_model_output = delivered;
+        session.register_tool_history_candidate(candidate).await;
     }
 
     pub(crate) fn success_for_logging(&self) -> bool {

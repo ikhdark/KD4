@@ -7645,7 +7645,13 @@ impl Session {
             estimated_context_tokens: None,
             model_context_window: turn_context.model_context_window(),
         });
-        for usage in receipts {
+        let mut published_receipt = state.published_token_info()
+            .filter(|published| published.last_token_usage != info.last_token_usage)
+            .map(|published| published.last_token_usage);
+        for (usage, is_latest) in receipts {
+            if is_latest {
+                published_receipt = Some(usage.clone());
+            }
             turn_context.record_current_turn_usage(&usage);
             info.total_token_usage.add_assign(&usage);
             self.services.agent_control.task_coordinator().record_task_usage_for_source(
@@ -7653,14 +7659,17 @@ impl Session {
                 crate::agent::task_metrics::TokenClassTotals::from_usage(&usage), 1,
             );
         }
-        // Billable abandoned/compactor usage cannot replace active context.
+        // A recovered latest receipt is published without replacing active context.
         // There is no await between claiming receipts and committing totals.
         state.set_token_info(Some(info));
+        if let Some(usage) = published_receipt {
+            state.record_compaction_receipt(&usage);
+        }
         turn_context.turn_timing_state.mark_model_responses_accounted(count);
         count
     }
 
-    pub(crate) async fn record_missing_model_usage(&self, turn_context: &TurnContext, count: u64) {
+    pub(crate) async fn record_missing_model_usage(&self, turn_context: &TurnContext, count: u64, replace_last: bool) {
         if count == 0 {
             return;
         }
@@ -7679,12 +7688,21 @@ impl Session {
                 estimated_context_tokens: None,
                 model_context_window: turn_context.model_context_window(),
             });
+            let published_compaction = (!replace_last).then(|| state.published_token_info())
+                .flatten()
+                .filter(|published| published.last_token_usage != info.last_token_usage)
+                .map(|published| published.last_token_usage);
             info.total_token_usage.add_assign(&missing);
-            // Preserve the context estimate independently, but do not present an
-            // earlier receipt as the latest attempt's observed consumption.
-            info.estimated_context_tokens = Some(info.context_tokens());
-            info.last_token_usage = missing.clone();
+            if replace_last {
+                // Preserve the context estimate independently, but do not present an
+                // earlier receipt as the latest attempt's observed consumption.
+                info.estimated_context_tokens = Some(info.context_tokens());
+                info.last_token_usage = missing.clone();
+            }
             state.set_token_info(Some(info));
+            if let Some(usage) = published_compaction {
+                state.record_compaction_receipt(&usage);
+            }
         }
         self.services
             .agent_control
@@ -7810,7 +7828,7 @@ impl Session {
                 }
             }
         } else {
-            self.record_missing_model_usage(turn_context, 1).await;
+            self.record_missing_model_usage(turn_context, 1, true).await;
             if update_context {
                 // Successful generation can lack usable provider accounting. Keep
                 // budget protection using the existing prepared-history estimate.

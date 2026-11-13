@@ -1328,7 +1328,8 @@ impl Session {
             .turn_timing_state
             .unaccounted_model_request_count();
         if unaccounted != 0 {
-            self.record_missing_model_usage(turn_context.as_ref(), unaccounted)
+            let replace_last = !turn_context.turn_timing_state.latest_dispatched_model_usage_observed();
+            self.record_missing_model_usage(turn_context.as_ref(), unaccounted, replace_last)
                 .await;
         }
         if requires_abort_cleanup {

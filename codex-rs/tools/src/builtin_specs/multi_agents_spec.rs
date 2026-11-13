@@ -225,7 +225,7 @@ pub fn create_followup_task_tool() -> ToolSpec {
 pub fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "wait_agent".to_string(),
-        description: "Wait in-turn. Supply nonempty targets (child task names or thread IDs) for selected-child completion subscriptions; completion_mode is any (default) or all. Pins current producer attempts, returns durable terminal outcomes and exact result_recovery references, not deliverable acceptance. No status polling, mailbox consumption, cursor advancement or worker cancellation; cancellation/deadline returns partial outcomes and pending obligations. Independent of unrelated mail; omit targets for the existing progress/input wait. mailbox_only:true waits for mailbox, deferred-result or new user input even when descendants settled. Default progress mode returns at the first event, not necessarily completion, or immediately when owned assignments settled. On input wake return from the exec cell and process input. Empty typed_deltas alone is not a reason to wait again. Default-mode admission bookkeeping and delivered completion events are folded internally. Omit cursor to retain position; supply one only to replay. Message content arrives on your next request."
+        description: "Wait in-turn. Supply nonempty targets (child task names or thread IDs) for selected-child completion subscriptions; completion_mode is any (default) or all. Pins current producer attempts, returns durable terminal outcomes and exact result_recovery references, not deliverable acceptance. For repeated any waits, remove returned terminal attempts from the next target set; pending means not returned by this call, not necessarily still running. Repeating an already-terminal target may return immediately again; include it again only for a newly admitted follow-up attempt or intentional recovery. No status polling, mailbox consumption, cursor advancement or worker cancellation; cancellation/deadline returns partial outcomes and pending obligations. Independent of unrelated mail; omit targets for the existing progress/input wait. mailbox_only:true waits for mailbox, deferred-result or new user input even when descendants settled. Default progress mode returns at the first event, not necessarily completion, or immediately when owned assignments settled. On input wake return from the exec cell and process input. Empty typed_deltas alone is not a reason to wait again. Default-mode admission bookkeeping and delivered completion events are folded internally. Omit cursor to retain position; supply one only to replay. Message content arrives on your next request."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -654,7 +654,9 @@ fn writable_assignment_schema() -> JsonSchema {
     ]), Some(vec!["path".into(), "recursive".into()]), Some(false.into()));
     let scopes = JsonSchema::array(scope, None);
     let mut policy = criterion_evidence_policy_schema();
-    policy.required = Some(vec!["kind".into(), "required_evidence".into(), "freshness".into()]);
+    // Omission keeps the typed owner's Current default; the policy and its
+    // exact evidence binding remain mandatory for every writable criterion.
+    policy.required = Some(vec!["kind".into(), "required_evidence".into()]);
     if let Some(properties) = &mut policy.properties {
         properties.insert("kind".into(), JsonSchema::string_enum(vec![json!("source_inspection")],
             Some("Writable workers require owned source evidence; root owns execution/integration checks.".into())));

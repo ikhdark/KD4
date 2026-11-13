@@ -7516,6 +7516,36 @@ where
                                 true,
                             );
                         }
+                        // Explicit, bounded KDR rendezvous: observe producer truth
+                        // before cancellation can prevent terminal relay delivery.
+                        if response_id == "usage-1"
+                            && let (Some(ready), Some(release)) = (
+                                std::env::var_os("CODEX_KDR_TERMINAL_USAGE_READY"),
+                                std::env::var_os("CODEX_KDR_TERMINAL_USAGE_RELEASE"),
+                            )
+                        {
+                            let ready = std::path::PathBuf::from(ready);
+                            let release = std::path::PathBuf::from(release);
+                            let observe = async {
+                                if ready == release || ready.parent() != release.parent()
+                                    || ready.exists() || release.exists()
+                                {
+                                    return Err(std::io::Error::other("invalid KDR usage rendezvous paths"));
+                                }
+                                let pending = ready.with_extension("pending");
+                                let marker = br#"{"phase":"terminal_usage_recorded_before_relay","response_id":"usage-1"}"#;
+                                tokio::fs::write(&pending, marker).await?;
+                                tokio::fs::rename(&pending, &ready).await?;
+                                while !release.exists() {
+                                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                }
+                                Ok::<(), std::io::Error>(())
+                            };
+                            if !matches!(tokio::time::timeout(std::time::Duration::from_secs(90), observe).await, Ok(Ok(()))) {
+                                tracing::error!("KDR terminal usage rendezvous failed or timed out");
+                                return;
+                            }
+                        }
                         // History and diagnostics share immutable completed output;
                         // converting the collection does not clone its payloads.
                         let items_added: Arc<[ResponseItem]> = items_added.into();

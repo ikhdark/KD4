@@ -1,0 +1,49 @@
+{
+  "outcome": "Source repair implemented; behavioral closure remains open for root-owned builds and KDR verification.",
+  "next_action": "Root: build matched baseline and candidate and extend the existing KDR native plugin workload to capture the real remote plugin install path; execute the matched acceptance controls below and independently challenge privacy and regression assumptions.",
+  "verified_findings": [
+    {
+      "id": "D11/P1",
+      "title": "Signed remote plugin bundle URL exposed in diagnostics",
+      "severity": "medium",
+      "location": "codex-rs/core-plugins/src/remote_bundle.rs:35",
+      "summary": "Baseline derived Debug, invalid input, request, response, size and redirect errors retained URL bytes; transport error chains and arbitrary echoed response bodies also exposed them. Candidate retains only parsed scheme and host, maps route errors to existing bounded safe_category, drops body error chains, omits untrusted response bodies, and redacts app_manifest in bundle Debug. Original request URL and policy/control flow remain intact.",
+      "trigger": "A signed URL with credentials, path, query or fragment enters bundle validation or a failed real download; the error is formatted as Debug/Display or converted to JSON-RPC/analytics.",
+      "evidence_refs": [
+        "baseline raw SHA-256 aa22b26b05309e8c0e58bd4d7ca02e8a97e98bf3fc78e425352825f29e1ca90a (assignment manifest)",
+        "candidate source SHA-256 fc69a0890a048c0819cf15e0f36c457a04cdb5f7129869bb25745737410a2343",
+        "KDR/audits/open-cases/upstream-month-review-20261105/review.txt:137",
+        "KDR/audits/open-cases/codex-0.167.0-port-review-20261108.txt:13",
+        "codex-rs/app-server-handlers/src/request_processors/plugins.rs:1900",
+        "codex-rs/http-client/src/route_aware_client_pool.rs:127"
+      ]
+    }
+  ],
+  "verification_requests": [
+    {
+      "id": "native-comparison",
+      "title": "Matched real trigger and safety controls",
+      "severity": "medium",
+      "location": "KDR/tools/app_server_verified_plugins.py",
+      "summary": "Existing PluginWorkload explicitly disables remote_plugin and _install uses marketplacePath. Add a bounded private remote plugin fixture using its owned peer/home and real plugin/install remoteMarketplaceName branch. Supply private authenticated workspace-enabled remote detail with release.bundle_download_url, capture owned app-server JSON-RPC error and telemetry/log surfaces plus peer request target; bind both binary builds and source bytes. Use debug-assertions loopback opt-in only in the isolated process, never real profile. Add native non-test diagnostic observation for ValidatedRemotePluginBundle Debug, Display, Debug and source-chain traversal where JSON-RPC cannot expose them.",
+      "reproduction": "Matched baseline/candidate same synthetic URL with distinct userinfo, path, query and fragment canaries: malformed URL; connection failure; 4xx echo body; truncated body; oversized Content-Length and streamed overflow; redirect to signed second URL then failure or unsupported scheme; interrupted successful body. Require baseline leakage and candidate absence in every accessible diagnostic and chain; require safe scheme/host, category/status/cap and no server body. Verify peer receives exact signed path/query per hop, per-hop route enforcement, successful signed archive installation to private home, 100 MiB download/512 MiB extract caps, cancellation and cache-mutation/install lease behavior. Record unreachable branch separately rather than asserting coverage.",
+      "blocker": "Worker assignment delegates builds and native observation to root; no tests or test scaffolding permitted."
+    }
+  ],
+  "blockers": [],
+  "coverage": {
+    "examined": [
+      "remote_bundle.rs complete current implementation and baseline",
+      "app-server remote install mapping, analytics and JSON-RPC consumers; share checkout and installed sync call sites",
+      "route-aware error safe_category and without_url; KDR plugin workload configuration, peer and install entrypoints",
+      "prior D11/P1 audit and history advisory machinery-value-plugins-skills-2026-11-01 (no recorded behavioral constraints); historical deletion advisory commit 620b947b85aae9c086c85f2818fb89531d8c531c"
+    ],
+    "remaining": [
+      "No compilation or behavioral execution in worker; root owns both.",
+      "Public DownloadRequest and DownloadBody field shapes change; source consumers searched use wildcard variants, but external consumers may require adaptation.",
+      "Body content is intentionally omitted even when harmless; transport error detail reduced to bounded category, and app_manifest Debug omitted. Independent review should assess diagnostic tradeoff and whether hostnames are acceptable to expose.",
+      "Baseline exact file identity was supplied in assignment manifest; preserve baseline bytes or use a matching frozen build, not an assumed HEAD.",
+      "No universal secret scrubber: plugin IDs and non-bundle components are separate boundaries."
+    ]
+  }
+}

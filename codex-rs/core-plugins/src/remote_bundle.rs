@@ -6,7 +6,6 @@ use crate::store::PluginStore;
 use crate::store::PluginStoreError;
 use crate::store::error_context_sub_error_type;
 use crate::store::validate_plugin_version_segment;
-use codex_http_client::HttpError;
 use codex_http_client::HttpResponse;
 use codex_http_client::RouteAwareClientPool;
 use codex_plugin::PluginId;
@@ -15,6 +14,7 @@ use codex_plugin::find_plugin_manifest_path;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use http::StatusCode;
 use serde_json::Value as JsonValue;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -32,13 +32,39 @@ const REMOTE_PLUGIN_INSTALL_STAGING_DIR: &str = "plugins/.remote-plugin-install-
 const TEST_ALLOW_LOOPBACK_HTTP_REMOTE_PLUGIN_BUNDLES_ENV: &str =
     "CODEX_TEST_ALLOW_HTTP_REMOTE_PLUGIN_BUNDLE_DOWNLOADS";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ValidatedRemotePluginBundle {
     pub plugin_id: PluginId,
     pub plugin_version: String,
     remote_plugin_id: String,
     app_manifest: Option<JsonValue>,
     bundle_download_url: String,
+}
+
+impl fmt::Debug for ValidatedRemotePluginBundle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ValidatedRemotePluginBundle")
+            .field("plugin_id", &self.plugin_id)
+            .field("plugin_version", &self.plugin_version)
+            .field("remote_plugin_id", &self.remote_plugin_id)
+            .field("app_manifest", &"[omitted]")
+            .field(
+                "bundle_download_url",
+                &safe_bundle_url(&self.bundle_download_url),
+            )
+            .finish()
+    }
+}
+
+// Never retain URL userinfo, path, query or fragment in diagnostics.
+fn safe_bundle_url(url: &str) -> String {
+    match Url::parse(url) {
+        Ok(url) => match url.host() {
+            Some(host) => format!("{}://{}", url.scheme(), host),
+            None => format!("{}:", url.scheme()),
+        },
+        Err(_) => "[invalid URL]".to_string(),
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -87,11 +113,10 @@ pub enum RemotePluginBundleInstallError {
         source: PluginIdError,
     },
 
-    #[error("failed to send remote plugin bundle download request to {url}: {source}")]
+    #[error("failed to send remote plugin bundle download request to {url}: {category}")]
     DownloadRequest {
         url: String,
-        #[source]
-        source: codex_http_client::RouteAwareRequestError,
+        category: &'static str,
     },
 
     #[error("remote plugin bundle download from {url} failed with status {status}: {body}")]
@@ -101,12 +126,8 @@ pub enum RemotePluginBundleInstallError {
         body: String,
     },
 
-    #[error("failed to read remote plugin bundle download response from {url}: {source}")]
-    DownloadBody {
-        url: String,
-        #[source]
-        source: HttpError,
-    },
+    #[error("failed to read remote plugin bundle download response from {url}")]
+    DownloadBody { url: String },
 
     #[error("remote plugin bundle download from {url} exceeded maximum size of {max_bytes} bytes")]
     DownloadTooLarge { url: String, max_bytes: u64 },
@@ -198,7 +219,7 @@ pub fn validate_remote_plugin_bundle(
     let parsed_bundle_url = Url::parse(&bundle_download_url).map_err(|source| {
         RemotePluginBundleInstallError::InvalidBundleDownloadUrl {
             remote_plugin_id: remote_plugin_id.to_string(),
-            url: bundle_download_url.clone(),
+            url: "[invalid URL]".to_string(),
             source,
         }
     })?;
@@ -335,8 +356,8 @@ async fn download_remote_plugin_bundle_with_limit(
         .send()
         .await
         .map_err(|source| RemotePluginBundleInstallError::DownloadRequest {
-            url: bundle_download_url.to_string(),
-            source,
+            url: safe_bundle_url(bundle_download_url),
+            category: source.safe_category(),
         })?;
 
     let final_url = response.url().clone();
@@ -345,25 +366,25 @@ async fn download_remote_plugin_bundle_with_limit(
     if !is_allowed_bundle_download_url(&final_url, allow_test_loopback_http_bundle_downloads()) {
         return Err(
             RemotePluginBundleInstallError::UnsupportedBundleDownloadFinalUrl {
-                url: bundle_download_url.to_string(),
-                final_url: final_url.to_string(),
+                url: safe_bundle_url(bundle_download_url),
+                final_url: safe_bundle_url(final_url.as_str()),
             },
         );
     }
 
-    let url = final_url.to_string();
+    let url = safe_bundle_url(final_url.as_str());
     let status = response.status();
     if !status.is_success() {
         let mut response = response;
         let mut body = Vec::new();
         let mut body_truncated = false;
-        let mut body_read_error = None;
+        let mut body_read_failed = false;
         loop {
             let chunk = match response.chunk().await {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break,
-                Err(source) => {
-                    body_read_error = Some(source);
+                Err(_) => {
+                    body_read_failed = true;
                     break;
                 }
             };
@@ -376,15 +397,15 @@ async fn download_remote_plugin_bundle_with_limit(
             body.extend_from_slice(&chunk);
         }
 
-        let mut body = String::from_utf8_lossy(&body).into_owned();
-        if body_truncated {
-            body.push_str(&format!(
-                "\n[response body truncated after {REMOTE_PLUGIN_BUNDLE_ERROR_BODY_MAX_BYTES} bytes]"
-            ));
+        // A server can echo the signed URL or its credentials in arbitrary body text.
+        let body = if body_read_failed {
+            "[response body omitted; read failed]"
+        } else if body_truncated {
+            "[response body omitted; truncated]"
+        } else {
+            "[response body omitted]"
         }
-        if let Some(source) = body_read_error {
-            body.push_str(&format!("\n[failed to read response body: {source}]"));
-        }
+        .to_string();
         return Err(RemotePluginBundleInstallError::DownloadStatus { url, status, body });
     }
 
@@ -405,9 +426,8 @@ async fn read_response_body_with_limit(
         response
             .chunk()
             .await
-            .map_err(|source| RemotePluginBundleInstallError::DownloadBody {
+            .map_err(|_| RemotePluginBundleInstallError::DownloadBody {
                 url: url.to_string(),
-                source,
             })?
     {
         let next_len = body.len() as u64 + chunk.len() as u64;

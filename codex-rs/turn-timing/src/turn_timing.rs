@@ -1347,6 +1347,8 @@ struct TurnTimingStateInner {
     model_requests: Vec<ModelRequestTiming>,
     model_request_history_truncated: bool,
     accounted_model_responses: u64,
+    // Accounting chronology must survive eviction of optional request details.
+    latest_dispatched_usage_identity: Option<(String, String)>,
     tool_calls: Vec<TurnTimingToolCall>,
     tool_call_timing_overflow: u32,
     detail_archive: Option<Arc<StdMutex<detail_archive::Capture>>>,
@@ -1489,6 +1491,7 @@ impl TurnTimingStateInner {
             model_requests: self.model_requests.clone(),
             model_request_history_truncated: self.model_request_history_truncated,
             accounted_model_responses: self.accounted_model_responses,
+            latest_dispatched_usage_identity: self.latest_dispatched_usage_identity.clone(),
             tool_calls: Vec::new(),
             tool_call_timing_overflow: self.tool_call_timing_overflow,
             detail_archive: None,
@@ -3559,12 +3562,15 @@ impl TurnTimingState {
     }
 
     /// Caller holds the session accounting lock through the synchronous commit.
-    pub fn claim_unsettled_model_usage(&self) -> Vec<TokenUsage> {
+    /// Mark the latest dispatch independently of bounded diagnostic detail.
+    pub fn claim_unsettled_model_usage(&self) -> Vec<(TokenUsage, bool)> {
+        let state = self.state();
+        let latest = state.latest_dispatched_usage_identity.as_ref();
         self.model_usage_receipts.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values_mut().filter_map(|(usage, settled)| {
+            .iter_mut().filter_map(|(identity, (usage, settled))| {
                 if *settled { return None; }
                 *settled = true;
-                Some(usage.clone())
+                Some((usage.clone(), latest == Some(identity)))
             }).collect()
     }
 
@@ -4575,6 +4581,18 @@ impl TurnTimingState {
             .saturating_sub(state.accounted_model_responses)
     }
 
+    /// Whether the most recently dispatched physical attempt has reported usage.
+    pub fn latest_dispatched_model_usage_observed(&self) -> bool {
+        let state = self.state();
+        let Some(identity) = state.latest_dispatched_usage_identity.as_ref() else {
+            return false;
+        };
+        self.model_usage_receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(identity)
+    }
+
     /// Last physical entry reported by the transport dispatch owner, not stream creation.
     pub fn latest_model_dispatch_identity(
         &self,
@@ -4629,6 +4647,10 @@ impl TurnTimingState {
         let first_dispatch = request.dispatch_ns.is_none();
         let generation_index = request.generation_index;
         let resumed_generation_id = format!("generation-{}", request.generation_index);
+        state.latest_dispatched_usage_identity = Some((
+            sampling_request_id.to_owned(),
+            physical_attempt_id.to_owned(),
+        ));
         // The sampling owner advances generations only after the preceding
         // request closes. Retain that control edge, including continuations
         // without a tool result; physical retries do not add it again.

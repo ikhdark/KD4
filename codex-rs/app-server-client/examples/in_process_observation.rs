@@ -30,6 +30,44 @@ use tokio::task::JoinSet;
 
 type Failure = Box<dyn Error + Send + Sync>;
 
+fn error_observation(error: &(dyn Error + 'static)) -> Value {
+    let mut sources = Vec::new();
+    let mut next = error.source();
+    while let Some(source) = next {
+        sources.push(json!({"display": source.to_string(), "debug": format!("{source:?}")}));
+        next = source.source();
+    }
+    json!({"display": error.to_string(), "debug": format!("{error:?}"), "sources": sources})
+}
+
+async fn remote_bundle_observation(params: Value, overrides: Vec<(String, toml::Value)>) -> Result<Value, Failure> {
+    use codex_core_plugins::remote::RemotePluginServiceConfig;
+    use codex_core_plugins::remote_bundle::{validate_remote_plugin_bundle, download_and_install_remote_plugin_bundle};
+    let home = PathBuf::from(std::env::var_os("CODEX_HOME").ok_or("explicit private CODEX_HOME required")?).canonicalize()?;
+    let url = params.get("url").and_then(Value::as_str).ok_or("url required")?;
+    let bundle = match validate_remote_plugin_bundle("kdr-remote-id", "kdr", "kdr-plugin", Some("1.0.0"), Some(url), params.get("appManifest").cloned()) {
+        Ok(bundle) => bundle,
+        Err(error) => return Ok(json!({"validationError": error_observation(&error)})),
+    };
+    let debug = format!("{bundle:?}");
+    let config = ConfigBuilder::default().codex_home(home.clone())
+        .loader_overrides(observation_loader(&home)?)
+        .cli_overrides(overrides).build().await?;
+    let service = RemotePluginServiceConfig::new(config.chatgpt_base_url.clone(), config.http_client_factory());
+    let operation = download_and_install_remote_plugin_bundle(home, bundle, service.http_clients());
+    let result = if let Some(ms) = params.get("cancelAfterMs").and_then(Value::as_u64) {
+        match tokio::time::timeout(std::time::Duration::from_millis(ms.min(60_000)), operation).await {
+            Ok(result) => Some(result),
+            Err(_) => None,
+        }
+    } else { Some(operation.await) };
+    Ok(match result {
+        None => json!({"bundleDebug": debug, "cancelled": true}),
+        Some(Err(error)) => json!({"bundleDebug": debug, "cancelled": false, "installError": error_observation(&error)}),
+        Some(Ok(result)) => json!({"bundleDebug": debug, "cancelled": false, "installedPath": result.installed_path.display().to_string(), "installDebug": format!("{result:?}")}),
+    })
+}
+
 fn emit(output: &std::sync::mpsc::SyncSender<Value>, value: Value) -> Result<(), Failure> {
     output.try_send(value).map_err(|error| std::io::Error::new(
         std::io::ErrorKind::WouldBlock, format!("bounded observation stdout unavailable: {error}"),
@@ -193,6 +231,18 @@ async fn run() -> Result<(), Failure> {
                             }
                         },
                         Some("initialized") => {}, // public start already performed this handshake
+                        Some("kdr/remotePluginBundle") => {
+                            if requests.len() >= 64 { return Err("observation request capacity reached".into()); }
+                            let params = value.get("params").cloned().unwrap_or(Value::Null);
+                            let overrides = overrides.clone();
+                            requests.spawn(async move {
+                                let response = match remote_bundle_observation(params, overrides).await {
+                                    Ok(result) => json!({"id": id, "result": result}),
+                                    Err(error) => json!({"id": id, "error": {"code": -32000, "message": error.to_string()}}),
+                                };
+                                (response, false)
+                            });
+                        },
                         Some("kdr/reconnect") => {
                             if !requests.is_empty() { return Err("reconnect requires settled requests".into()); }
                             let retiring = client.take().ok_or("client retired")?;

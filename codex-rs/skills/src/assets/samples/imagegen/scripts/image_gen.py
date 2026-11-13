@@ -418,7 +418,7 @@ def _create_client():
         _die(
             f"openai SDK not installed in the active environment. {_dependency_hint('openai')}"
         )
-    return OpenAI()
+    return OpenAI(max_retries=0)
 
 
 def _create_async_client():
@@ -435,7 +435,7 @@ def _create_async_client():
             "AsyncOpenAI not available in this openai SDK version. "
             f"{_dependency_hint('openai', upgrade=True)}"
         )
-    return AsyncOpenAI()
+    return AsyncOpenAI(max_retries=0)
 
 
 def _slugify(value: str) -> str:
@@ -524,6 +524,14 @@ def _job_output_paths(
 
 def _extract_retry_after_seconds(exc: Exception) -> Optional[float]:
     # Best-effort: openai SDK errors vary by version. Prefer a conservative fallback.
+    response = getattr(exc, "response", None)
+    if response is not None:
+        try:
+            value = float(response.headers.get("retry-after", ""))
+            if 0 <= value < float("inf"):
+                return value
+        except (TypeError, ValueError):
+            pass
     for attr in ("retry_after", "retry_after_seconds"):
         val = getattr(exc, attr, None)
         if isinstance(val, (int, float)) and val >= 0:
@@ -538,22 +546,58 @@ def _extract_retry_after_seconds(exc: Exception) -> Optional[float]:
     return None
 
 
-def _is_rate_limit_error(exc: Exception) -> bool:
-    name = exc.__class__.__name__.lower()
-    if "ratelimit" in name or "rate_limit" in name:
-        return True
-    msg = str(exc).lower()
-    return "429" in msg or "rate limit" in msg or "too many requests" in msg
+def _is_safe_retry_error(exc: Exception) -> bool:
+    from openai import APIConnectionError, RateLimitError
+
+    if isinstance(exc, RateLimitError):
+        response = exc.response
+        return response.status_code == 429 and response.headers.get("x-should-retry") != "false"
+    if not isinstance(exc, APIConnectionError):
+        return False
+    # The SDK preserves the underlying transport exception as its cause.
+    # Only connect failures establish that this HTTP request was not sent.
+    cause = exc.__cause__
+    for module_name in ("httpx", "httpx2"):
+        module = sys.modules.get(module_name)
+        if module is not None:
+            types = tuple(
+                cls for cls in (getattr(module, "ConnectError", None),
+                                getattr(module, "ConnectTimeout", None))
+                if isinstance(cls, type)
+            )
+            if isinstance(cause, types):
+                return True
+    return False
 
 
-def _is_transient_error(exc: Exception) -> bool:
-    if _is_rate_limit_error(exc):
-        return True
-    name = exc.__class__.__name__.lower()
-    if "timeout" in name or "timedout" in name or "tempor" in name:
-        return True
-    msg = str(exc).lower()
-    return "timeout" in msg or "timed out" in msg or "connection reset" in msg
+def _retry_delay(exc: Exception, attempt: int, attempts: int, job_label: str) -> float:
+    sleep_s = _extract_retry_after_seconds(exc)
+    if sleep_s is None:
+        sleep_s = min(60.0, 2.0**attempt)
+    print(
+        f"{job_label} attempt {attempt}/{attempts} failed ({exc.__class__.__name__}); retrying in {sleep_s:.1f}s",
+        file=sys.stderr,
+    )
+    return sleep_s
+
+
+def _warn_unknown_outcome(exc: Exception) -> None:
+    from openai import APIConnectionError
+
+    if isinstance(exc, APIConnectionError) and not _is_safe_retry_error(exc):
+        _warn("Image request outcome is unknown after a connection failure; automatic retry stopped.")
+
+
+def _call_with_retries(call: Any, *, attempts: int, job_label: str) -> Any:
+    for attempt in range(1, attempts + 1):
+        try:
+            return call()
+        except Exception as exc:
+            if not _is_safe_retry_error(exc) or attempt == attempts:
+                _warn_unknown_outcome(exc)
+                raise
+            time.sleep(_retry_delay(exc, attempt, attempts, job_label))
+    raise RuntimeError("no attempts configured")
 
 
 async def _generate_one_with_retries(
@@ -569,18 +613,10 @@ async def _generate_one_with_retries(
             return await client.images.generate(**payload)
         except Exception as exc:
             last_exc = exc
-            if not _is_transient_error(exc):
+            if not _is_safe_retry_error(exc) or attempt == attempts:
+                _warn_unknown_outcome(exc)
                 raise
-            if attempt == attempts:
-                raise
-            sleep_s = _extract_retry_after_seconds(exc)
-            if sleep_s is None:
-                sleep_s = min(60.0, 2.0**attempt)
-            print(
-                f"{job_label} attempt {attempt}/{attempts} failed ({exc.__class__.__name__}); retrying in {sleep_s:.1f}s",
-                file=sys.stderr,
-            )
-            await asyncio.sleep(sleep_s)
+            await asyncio.sleep(_retry_delay(exc, attempt, attempts, job_label))
     raise last_exc or RuntimeError("unknown error")
 
 
@@ -798,7 +834,9 @@ def _generate(args: argparse.Namespace) -> None:
     )
     started = time.time()
     client = _create_client()
-    result = client.images.generate(**payload)
+    result = _call_with_retries(
+        lambda: client.images.generate(**payload), attempts=3, job_label="Generation"
+    )
     elapsed = time.time() - started
     print(f"Generation completed in {elapsed:.1f}s.", file=sys.stderr)
 
@@ -875,12 +913,15 @@ def _edit(args: argparse.Namespace) -> None:
     started = time.time()
     client = _create_client()
 
-    with _open_files(image_paths) as image_files, _open_mask(mask_path) as mask_file:
-        request = dict(payload)
-        request["image"] = image_files if len(image_files) > 1 else image_files[0]
-        if mask_file is not None:
-            request["mask"] = mask_file
-        result = client.images.edit(**request)
+    def call_edit():
+        with _open_files(image_paths) as image_files, _open_mask(mask_path) as mask_file:
+            request = dict(payload)
+            request["image"] = image_files if len(image_files) > 1 else image_files[0]
+            if mask_file is not None:
+                request["mask"] = mask_file
+            return client.images.edit(**request)
+
+    result = _call_with_retries(call_edit, attempts=3, job_label="Edit")
 
     elapsed = time.time() - started
     print(f"Edit completed in {elapsed:.1f}s.", file=sys.stderr)
