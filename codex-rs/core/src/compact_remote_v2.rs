@@ -652,6 +652,7 @@ async fn prepare_v2_retained_input_source(
     prompt_input: &[ResponseItem],
 ) -> CodexResult<crate::compact::TaskInputCheckpoint> {
     let mut retained = crate::compact::build_task_input_checkpoint_with_details(prompt_input);
+    crate::compact::bound_compaction_tool_outputs(sess, &mut retained.items).await?;
     let omission_receipt_ids =
         crate::compact::new_omission_receipt_ids(&retained.items, prompt_input);
     if let Some(text) = crate::compact::persist_task_compaction_text_recovery(

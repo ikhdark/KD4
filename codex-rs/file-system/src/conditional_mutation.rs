@@ -207,6 +207,11 @@ pub fn try_acquire_patch_capture(path: &Path) -> io::Result<File> {
 /// race. Temp storage failures fail closed; contention is WouldBlock, not absence.
 pub fn guard_patch_read(path: &Path) -> io::Result<Option<File>> {
     let resolved = crate::atomic_write::resolve_symlink_write_paths(path)?;
+    // Volume/share roots have no replaceable directory entry. Metadata discovery
+    // still needs to inspect them, but there is no parent/name capture to guard.
+    if resolved.write_path.is_absolute() && resolved.write_path.parent().is_none() {
+        return Ok(None);
+    }
     let file = match open_patch_capture_file(&resolved.write_path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),

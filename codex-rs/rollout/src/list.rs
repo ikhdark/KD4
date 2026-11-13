@@ -1474,9 +1474,14 @@ async fn read_head_summary(
         crate::metadata::extraction_cache_guard(path, default_provider).await;
 
     let (thread_id, parse_errors, _, unresolved_payloads, payload_versions) =
-        crate::recorder::RolloutRecorder::for_each_rollout_item_with_versions(
+        crate::recorder::RolloutRecorder::for_each_rollout_item_with_versions_inner(
             path,
             false,
+            true,
+            // Diagnostic replay bodies do not contribute settings, recency or
+            // previews. Use the same exclusion as operational resume: missing
+            // diagnostic artifacts must not poison or repeatedly invalidate a
+            // sidebar summary, and large captures need not be hydrated here.
             true,
             |item, record_number| {
                 settings_reducer.apply_item(&item);

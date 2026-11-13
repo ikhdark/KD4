@@ -2440,8 +2440,6 @@ pub(crate) struct TurnExecutionControl {
     plan: Option<crate::plan_store::PlanExecutionSnapshot>,
     /// An inherited completed checklist is not a final-answer hint for new input.
     plan_updated_since_input: bool,
-    /// Unlike answer hints, task debt survives delivered child reports.
-    plan_work_since_user_input: bool,
     completion_reconciliation_issued: bool,
     plan_revision: u64,
     input_revision: u64,
@@ -2490,7 +2488,6 @@ impl TurnExecutionControl {
             delivered_agent_events: BTreeSet::new(),
             plan: None,
             plan_updated_since_input: false,
-            plan_work_since_user_input: false,
             completion_reconciliation_issued: false,
             plan_revision: 0,
             input_revision: 0,
@@ -2521,7 +2518,6 @@ impl TurnExecutionControl {
     ) -> Self {
         self.refresh_plan(plan);
         self.plan_updated_since_input = false;
-        self.plan_work_since_user_input = false;
         self
     }
 
@@ -2531,7 +2527,6 @@ impl TurnExecutionControl {
         if self.plan != plan {
             self.plan_revision = self.plan_revision.saturating_add(1);
             self.plan_updated_since_input = plan.is_some();
-            self.plan_work_since_user_input |= plan.is_some();
         }
         self.plan = plan;
     }
@@ -2586,9 +2581,8 @@ impl TurnExecutionControl {
     }
 
     fn unresolved_current_plan(&self) -> Option<&crate::plan_store::PlanExecutionSnapshot> {
-        if !self.plan_work_since_user_input {
-            return None;
-        }
+        // Task debt survives resume and user steering even without a plan edit.
+        // Only completed-plan answer hints depend on work since the latest input.
         self.plan.as_ref().filter(|plan| !plan.obligations.unresolved.is_empty())
     }
 
@@ -2904,7 +2898,6 @@ impl TurnExecutionControl {
         // instructions re-arm the one-shot
         // intervention or reset passive cycle identity.
         if instructions_changed {
-            self.plan_work_since_user_input = false;
             self.completion_reconciliation_issued = false;
             self.instruction_revision = self.instruction_revision.saturating_add(1);
 

@@ -2430,6 +2430,14 @@ impl Session {
             return Err(invalid(format!("Reasoning effort `{}` is not supported for subagent model `{}`",
                 settings.reasoning_effort, settings.model)));
         }
+        if let Some(tier) = settings.service_tier.as_deref() {
+            let model_info = self.services.models_manager
+                .get_model_info(&settings.model, &config.to_models_manager_config()).await;
+            if !model_info.accepts_configured_service_tier(tier) {
+                return Err(invalid(format!("Service tier `{tier}` is not supported for subagent model `{}`",
+                    settings.model)));
+            }
+        }
         Ok(())
     }
 

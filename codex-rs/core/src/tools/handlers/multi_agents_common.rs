@@ -155,8 +155,8 @@ pub(crate) fn build_agent_spawn_config(turn: &TurnContext) -> Result<Config, Fun
     config.base_instructions = (!turn.model_info.uses_default_base_instructions)
         .then(|| turn.base_instructions.text.clone());
     // Do not freeze an inherited preference into a local override. None is
-    // persisted as such, so reloaded workers still follow the root. Explicit
-    // per-spawn tiers are applied below after the model has been resolved.
+    // persisted as such, so reloaded workers still follow the root. Chat-local
+    // preferences and per-spawn tiers are applied after the model is resolved.
     config.service_tier = None;
     Ok(config)
 }
@@ -377,9 +377,11 @@ pub(crate) async fn apply_spawn_agent_service_tier(
     config: &mut Config,
     requested_service_tier: Option<&str>,
 ) -> Result<(), FunctionCallError> {
+    let preferences = session.thread_config_snapshot().await.subagent_settings;
     let candidate_service_tiers = [
-        config.service_tier.clone(),
         requested_service_tier.map(str::to_string),
+        config.service_tier.clone(),
+        preferences.and_then(|settings| settings.service_tier),
     ];
     if candidate_service_tiers.iter().all(Option::is_none) {
         config.service_tier = None;

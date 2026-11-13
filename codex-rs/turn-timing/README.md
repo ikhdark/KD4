@@ -169,6 +169,12 @@ acknowledgements. A response owner returning does not establish delivery. KDR's
 `tools diagnose native-observations --capture PATH` exposes these under `mobile`;
 legacy journals remain unavailable for that coverage. Missing requests alone
 cannot establish that the phone ignored a tap.
+Remote-control virtual-client retirement also emits `mobile_connection_retired`
+with the server connection ID and a static reason (peer close, reinitialize,
+idle expiry, outbound stop, transport retirement, or initialize-forward failure).
+KDR exposes these under `mobile.owner_events`. This journal boundary survives
+missing terminal SQLite log rows; it records the server's retirement decision,
+not the initiating phone/network cause or successful close-event forwarding.
 
 The editable sibling Codex-Fork now supplies opt-in transcript receipt/application
 observations through the existing privileged host connection. Initialization

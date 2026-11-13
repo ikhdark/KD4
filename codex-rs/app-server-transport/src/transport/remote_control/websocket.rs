@@ -98,12 +98,14 @@ struct BufferedServerEnvelope {
     payload: tungstenite::Utf8Bytes,
     delivery_failure: Option<CancellationToken>,
     replay_credit: Arc<super::ReplayCredit>,
+    observation: Option<super::protocol::DeliveryObservation>,
 }
 
 impl BufferedServerEnvelope {
 
 
     fn from_payload(encoded: EncodedServerPayload, delivery_failure: Option<CancellationToken>, replay_credit: Arc<super::ReplayCredit>) -> Self {
+        let observation = super::protocol::DeliveryObservation::new(&encoded.client_id, &encoded.stream_id, encoded.seq_id, encoded.segment_id);
         Self {
             client_id: encoded.client_id,
             stream_id: encoded.stream_id,
@@ -112,6 +114,7 @@ impl BufferedServerEnvelope {
             payload: encoded.payload.into(),
             delivery_failure,
             replay_credit,
+            observation,
         }
     }
 }
@@ -122,6 +125,7 @@ struct ScheduledServerFrame {
     completion: Option<oneshot::Sender<std::time::Instant>>,
     delivery_failure: Option<CancellationToken>,
     _replay_credit: Arc<super::ReplayCredit>,
+    observation: Option<super::protocol::DeliveryObservation>,
 }
 
 // Custody survives a socket worker's cancellation. At most one envelope is
@@ -157,10 +161,11 @@ impl ServerWriterQueue {
     fn is_empty(&self) -> bool { self.ready.is_empty() }
 
     fn push(&mut self, key: (ClientId, StreamId), payload: tungstenite::Utf8Bytes,
-        completion: Option<oneshot::Sender<std::time::Instant>>, delivery_failure: Option<CancellationToken>, replay_credit: Arc<super::ReplayCredit>) {
+        completion: Option<oneshot::Sender<std::time::Instant>>, delivery_failure: Option<CancellationToken>, replay_credit: Arc<super::ReplayCredit>,
+        observation: Option<super::protocol::DeliveryObservation>) {
         let stream = self.streams.entry(key.clone()).or_default();
         if stream.is_empty() { self.ready.push_back(key); }
-        stream.push_back(ScheduledServerFrame { payload, completion, delivery_failure, _replay_credit: replay_credit });
+        stream.push_back(ScheduledServerFrame { payload, completion, delivery_failure, _replay_credit: replay_credit, observation });
     }
 
     fn pop(&mut self) -> Option<ScheduledServerFrame> {
@@ -200,6 +205,13 @@ impl ServerWriterQueue {
             let envelope = ServerEnvelope {
                 event: queued.event, client_id: queued.client_id, stream_id: queued.stream_id, seq_id,
             };
+            if let Some(observation) = super::protocol::DeliveryObservation::new(&envelope.client_id, &envelope.stream_id, seq_id, None) {
+                let facts = match &envelope.event {
+                    super::protocol::ServerEvent::ServerMessage { message } => super::protocol::response_observation(message),
+                    _ => serde_json::json!({"message_kind":"other"}),
+                };
+                observation.record("mobile_transport_encoding", facts);
+            }
             receiver.encoding = Some(PendingServerEncoding {
                 key, seq_id, completion: queued.write_complete_tx,
                 delivery_failure: queued.delivery_failure,
@@ -248,8 +260,11 @@ impl ServerWriterQueue {
         let count = encoded.len();
         for (index, encoded) in encoded.into_iter().enumerate() {
             let buffered = BufferedServerEnvelope::from_payload(encoded, encoding.delivery_failure.clone(), Arc::clone(&encoding.replay_credit));
+            if let Some(observation) = &buffered.observation {
+                observation.record("mobile_transport_buffered", serde_json::json!({"frame_count":count}));
+            }
             self.push(key.clone(), buffered.payload.clone(),
-                if index + 1 == count { encoding.completion.take() } else { None }, buffered.delivery_failure.clone(), Arc::clone(&buffered.replay_credit));
+                if index + 1 == count { encoding.completion.take() } else { None }, buffered.delivery_failure.clone(), Arc::clone(&buffered.replay_credit), buffered.observation.clone());
             state.outbound_buffer.insert_encoded(buffered);
         }
         state.next_seq_id_by_stream.insert(key.clone(), seq_id.saturating_add(1));
@@ -331,7 +346,10 @@ impl BoundedOutboundBuffer {
         while buffer.front().is_some_and(|envelope| {
             (envelope.seq_id, envelope.segment_id.unwrap_or_default()) <= acked_cursor
         }) {
-            buffer.pop_front();
+            if let Some(envelope) = buffer.pop_front()
+                && let Some(observation) = envelope.observation {
+                observation.record("mobile_transport_acknowledged", serde_json::json!({"boundary":"relay_ack_not_phone_rendering"}));
+            }
             removed += 1;
         }
         if removed != 0 {
@@ -414,7 +432,7 @@ async fn run_client_ingress(
                         state.client_segment_reassembler.invalidate_stream(&client, &stream);
                         state.invalidate_client_message_stream(&client, &stream);
                     }
-                    if tracker.close_client(&(client.clone(), stream.clone())).await.is_err() { return; }
+                    if tracker.close_client(&(client.clone(), stream.clone()), "outbound_stopped").await.is_err() { return; }
                 }
                 continue;
             }
@@ -437,7 +455,7 @@ async fn run_client_ingress(
                     keys
                 };
                 for key in keys {
-                    if tracker.close_client(&key).await.is_err() { return; }
+                    if tracker.close_client(&key, "idle_expired").await.is_err() { return; }
                 }
                 continue;
             }
@@ -1421,7 +1439,7 @@ impl RemoteControlWebsocket {
         )
         .await;
         if let Err(err) = result {
-            warn!("remote control websocket writer disconnected, err: {err}");
+            warn!(io_error_kind = ?err.kind(), "remote control websocket writer disconnected, err: {err}");
         } else {
             warn!("remote control websocket writer was stopped");
         }
@@ -1451,6 +1469,7 @@ impl RemoteControlWebsocket {
                         None,
                         envelope.delivery_failure.clone(),
                         Arc::clone(&envelope.replay_credit),
+                        envelope.observation.clone(),
                     );
                 }
             }
@@ -1511,6 +1530,7 @@ impl RemoteControlWebsocket {
             let mut batch_messages = 0;
             let mut batch_bytes = 0;
             let mut completions = Vec::new();
+            let mut flushed_observations = Vec::new();
             let mut heartbeat_due = false;
             while batch_messages < REMOTE_CONTROL_REPLAY_BATCH_MESSAGES
                 && batch_bytes < REMOTE_CONTROL_REPLAY_BATCH_TARGET_BYTES
@@ -1529,12 +1549,18 @@ impl RemoteControlWebsocket {
                 batch_bytes += frame.payload.len();
                 writer_operation(&shutdown_token, websocket_writer.feed(tungstenite::Message::Text(frame.payload))).await?;
                 if shutdown_token.is_cancelled() { return Ok(()); }
+                if let Some(observation) = frame.observation {
+                    flushed_observations.push(observation);
+                }
                 if let Some(completion) = frame.completion {
                     completions.push((completion, frame.delivery_failure));
                 }
             }
             writer_operation(&shutdown_token, websocket_writer.flush()).await?;
             if shutdown_token.is_cancelled() { return Ok(()); }
+            for observation in flushed_observations {
+                observation.record("mobile_transport_flushed", serde_json::json!({"boundary":"relay_socket_flush_not_phone_receipt"}));
+            }
             for (completion, failure) in completions {
                 if !failure.as_ref().is_some_and(CancellationToken::is_cancelled) {
                     let _ = completion.send(std::time::Instant::now());
@@ -1562,7 +1588,7 @@ impl RemoteControlWebsocket {
         )
         .await;
         if let Err(err) = result {
-            warn!("remote control websocket reader disconnected, err: {err}");
+            warn!(io_error_kind = ?err.kind(), "remote control websocket reader disconnected, err: {err}");
         } else {
             warn!("remote control websocket reader was stopped");
         }

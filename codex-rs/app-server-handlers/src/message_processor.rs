@@ -1,5 +1,6 @@
 use crate::connection_rpc_gate::ConnectionRpcGate;
 use std::future::Future;
+use sha2::Digest;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -566,7 +567,7 @@ impl MessageProcessor {
             let operation = uuid::Uuid::now_v7().to_string();
             let method = match request_method {
                 "initialize" | "fs/readFile" | "fs/readFileRange" | "fs/getMetadata"
-                | "fs/readDirectory" | "fs/writeFile" | "thread/read" | "thread/resume"
+                | "fs/readDirectory" | "fs/writeFile" | "thread/list" | "thread/read" | "thread/resume"
                 | "thread/turns/list" | "turn/start" | "turn/interrupt" => request_method,
                 _ => "other",
             };
@@ -574,6 +575,20 @@ impl MessageProcessor {
                 "mobile_rpc_received", "", "", &operation,
                 serde_json::json!({"schema_version":1, "connection_id":connection_id.0,
                     "method":method, "boundary":"remote_control_server_ingress_not_phone_tap",
+                    "request_key_sha256":serde_json::to_vec(&request.id).ok()
+                        .map(|bytes| sha2::Sha256::digest(bytes).iter()
+                            .map(|byte| format!("{byte:02x}")).collect::<String>()),
+                    "file_path_facts":(request_method == "fs/readFile").then(|| {
+                        let params = request.params.as_ref();
+                        let path = params.and_then(|params| params.get("path"));
+                        let mut facts = FsRequestProcessor::directory_path_facts(
+                            path.and_then(serde_json::Value::as_str));
+                        facts["params_is_object"] = serde_json::json!(params.is_some_and(serde_json::Value::is_object));
+                        facts["path_present"] = serde_json::json!(path.is_some());
+                        facts["path_is_absolute"] = serde_json::json!(path.and_then(serde_json::Value::as_str)
+                            .map(|path| std::path::Path::new(path).is_absolute()));
+                        facts
+                    }),
                     "directory_path_facts":(request_method == "fs/readDirectory").then(|| {
                         FsRequestProcessor::directory_path_facts(request.params.as_ref()
                             .and_then(|params| params.get("path"))

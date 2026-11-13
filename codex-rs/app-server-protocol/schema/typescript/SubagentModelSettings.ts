@@ -4,6 +4,10 @@
 import type { ReasoningEffort } from "./ReasoningEffort";
 
 /**
- * Thread-local preferences for future generic workers, not model/effort locks.
+ * Thread-local preferences for future generic workers, not per-spawn locks.
  */
-export type SubagentModelSettings = { model: string, reasoningEffort: ReasoningEffort, };
+export type SubagentModelSettings = { model: string, reasoningEffort: ReasoningEffort,
+/**
+ * Omit to follow the root's live tier; `default` pins Standard independently.
+ */
+serviceTier?: string, };

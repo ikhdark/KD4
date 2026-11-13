@@ -1325,7 +1325,7 @@ impl RolloutRecorder {
         ).await
     }
 
-    async fn for_each_rollout_item_with_versions_inner<F>(
+    pub(crate) async fn for_each_rollout_item_with_versions_inner<F>(
         path: &Path,
         enroll_dependencies: bool,
         capture_payload_versions: bool,

@@ -29,6 +29,8 @@ Follow the active mode, task scope and permissions:
 - Full .5 (default; `full.5`, legacy `benchmark`): compilation/type checks, builds, formatting/editing, benchmarks, explicitly permitted repository workflows and task-relevant operations. No tests or other non-compilation checks outside those workflow exceptions.
 - FULL: only with explicit authorization; run authorized existing tests and requested checks.
 
+In Full .5 or FULL, an existing XCTest-based iOS automation runner may execute solely as the device-control transport for task-authorized app interaction, screenshots, accessibility capture or gesture replay. This narrow exception does not authorize application tests, test discovery/suites, test creation/scaffolding, provisioning, or bypassing device security, permissions or other safeguards; OFF and COMPILE remain unchanged.
+
 Never create tests or test scaffolding in any mode. Inspect delegated workflow workloads; names, paths and wrappers do not grant exceptions or bypass restrictions. Never weaken checks, suppress diagnostics or change tests for a pass.
 Finish related edits before checking; do not edit running-check inputs. Use the smallest authorized check and recompile only after relevant inputs change, without an attempt-count cap. Prompt/documentation-only edits need no Rust rebuild. Report evidence gaps honestly rather than inventing passes or blockers.
 

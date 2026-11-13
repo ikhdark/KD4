@@ -630,6 +630,7 @@ async fn run_compact_task_inner_impl(
         omitted_user_text,
         omitted_text,
     ) = build_bounded_input_history(&task_items, false);
+    bound_compaction_tool_outputs(sess.as_ref(), &mut retained_history).await?;
     let omission_receipt_ids = new_omission_receipt_ids(&retained_history, history.raw_items());
     analytics_details.retained_image_count = Some(retained_image_count);
     let summary_items = compaction_summary_items(history.raw_items());
@@ -1749,6 +1750,88 @@ Later update_plan results replace it. Original remaining requirements and pinned
     );
     crate::stable_context::mark_trusted_stable_context_item(&mut item);
     Ok(Some(item))
+}
+
+/// Unread outputs must survive compaction, but need not remain inline at an
+/// unbounded size. Unlike consumed-output retirement, this never asserts that
+/// the model observed the result or that uncertain effects were resolved.
+/// Archive the exact item before changing its body, keeping its call identity
+/// and success metadata. Both local and remote replacement paths use this.
+pub(crate) async fn bound_compaction_tool_outputs(
+    sess: &Session,
+    items: &mut [ResponseItem],
+) -> CodexResult<()> {
+    use codex_protocol::models::FunctionCallOutputBody;
+    use codex_protocol::models::FunctionCallOutputContentItem;
+
+    const INLINE_OUTPUT_TOKENS: usize = 8_000;
+    let mut outputs = items.iter().enumerate().filter_map(|(index, item)| {
+        let output = match item {
+            ResponseItem::FunctionCallOutput { output, .. }
+            | ResponseItem::CustomToolCallOutput { output, .. } => output,
+            _ => return None,
+        };
+        let tokens = match &output.body {
+            FunctionCallOutputBody::Text(text) => approx_token_count(text),
+            FunctionCallOutputBody::ContentItems(parts) => {
+                parts.iter().filter_map(|part| match part {
+                    FunctionCallOutputContentItem::InputText { text } => Some(approx_token_count(text)),
+                    _ => None,
+                }).fold(0usize, usize::saturating_add)
+            }
+        };
+        Some((tokens, index))
+    }).collect::<Vec<_>>();
+    let mut total = outputs.iter().fold(0usize, |sum, (tokens, _)| sum.saturating_add(*tokens));
+    outputs.sort_unstable_by(|left, right| right.cmp(left));
+    for (tokens, index) in outputs {
+        if total <= INLINE_OUTPUT_TOKENS {
+            break;
+        }
+        // Tiny results are not worth replacing with a larger envelope.
+        if tokens <= 1_024 {
+            continue;
+        }
+        let recovery = persist_compaction_recovery(sess, CanonicalToolResult::json(
+            serde_json::json!({"items": [&items[index]]}),
+        )).await?;
+        let pin = serde_json::json!({
+            "kind": "compaction_unread_tool_output",
+            "unresolved": true,
+            "effects_state": "unknown",
+            "retry_safe": false,
+            "instruction": "Unread tool result, NOT a summary or proof of success. Recover the exact original response item at /items/0 before relying on its outcome or retrying any work. Cancellation is not rollback; preserve live-operation and effect uncertainty from the original result. Do not rerun its producer.",
+            "recovery": serde_json::from_str::<serde_json::Value>(&recovery)
+                .map_err(|error| CodexErr::Fatal(format!("invalid compaction recovery reference: {error}")))?,
+        }).to_string();
+        total = total.saturating_sub(tokens).saturating_add(approx_token_count(&pin));
+        match &mut items[index] {
+            ResponseItem::FunctionCallOutput { output, .. }
+            | ResponseItem::CustomToolCallOutput { output, .. } => {
+                match &mut output.body {
+                    FunctionCallOutputBody::Text(text) => *text = pin,
+                    FunctionCallOutputBody::ContentItems(parts) => {
+                        // Archive all parts, but replace only text. Images and
+                        // opaque content retain their original order and bytes.
+                        let mut pin = Some(pin);
+                        parts.retain_mut(|part| match part {
+                            FunctionCallOutputContentItem::InputText { text } => {
+                                if let Some(pin) = pin.take() {
+                                    *text = pin;
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            _ => true,
+                        });
+                    }
+                }
+            }
+            _ => unreachable!("selected a textual tool output"),
+        }
+    }
+    Ok(())
 }
 
 async fn persist_compaction_recovery(

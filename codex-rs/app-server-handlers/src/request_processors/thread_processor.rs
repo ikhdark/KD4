@@ -4237,10 +4237,27 @@ impl ThreadRequestProcessor {
             Err(ThreadStoreError::ThreadNotFound { thread_id })
                 if self.thread_manager.get_thread(thread_id).await.is_ok() =>
             {
-                Err(ThreadStoreError::RolloutNotMaterialized {
-                    path: PathBuf::from(thread_id.to_string()),
-                    reason: "known live thread has not materialized its rollout".to_string(),
-                })
+                if self.thread_store.as_any().is::<codex_thread_store::LocalThreadStore>()
+                    && let Ok(live_thread) = self.thread_manager.get_thread(thread_id).await
+                    && !live_thread.config_snapshot().await.ephemeral
+                {
+                    // Explicit reattachment needs an authoritative history snapshot even
+                    // before the first turn. Settle the existing writer, never create a
+                    // replacement runtime or synthesize empty history on a failed read.
+                    // The recorder refuses to recreate a vanished materialized file.
+                    self.thread_store.persist_thread(thread_id).await
+                        .map_err(thread_store_resume_read_error)?;
+                    self.thread_store.read_thread(StoreReadThreadParams {
+                        thread_id,
+                        include_archived: true,
+                        include_history,
+                    }).await
+                } else {
+                    Err(ThreadStoreError::RolloutNotMaterialized {
+                        path: PathBuf::from(thread_id.to_string()),
+                        reason: "known live thread has not materialized its rollout".to_string(),
+                    })
+                }
             }
             other => other,
         };

@@ -142,6 +142,9 @@ pub struct ModelListResponse {
     /// Whether thread/settings/update accepts and persists subagentSettings.
     #[serde(default)]
     pub subagent_settings_supported: bool,
+    /// Whether subagentSettings.serviceTier is independently persisted and applied.
+    #[serde(default)]
+    pub subagent_service_tier_supported: bool,
     /// Opaque cursor to pass to the next call to continue after the last item.
     /// If None, there are no more items to return.
     pub next_cursor: Option<String>,

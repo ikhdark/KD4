@@ -196,6 +196,9 @@ struct StdioDelivery {
 
 const STDIO_DELIVERY_BYTES: usize = 16 * 1024 * 1024;
 const STDIO_COALESCED_TEXT_BYTES: usize = 64 * 1024;
+// Account for each handoff node as well as its payload. A small-message burst
+// must not retire the entire stdio session at 128 frames while bytes are free.
+const STDIO_STAGED_MESSAGE_BYTES: usize = 1024;
 
 impl StdioDelivery {
     fn try_send(&mut self, message: QueuedOutgoingMessage) -> bool {
@@ -211,7 +214,7 @@ impl StdioDelivery {
         } else {
             Arc::clone(&self.bytes).try_acquire_many_owned(size.max(1) as u32)
         };
-        let Ok(credit) = credit else { return false; };
+        let Ok(mut credit) = credit else { return false; };
         // mpsc does not expose a mutable queued tail. The handoff node permits
         // adjacent text to append only until the existing consumer takes it.
         // No lock survives encoding, a capacity wait or a physical write.
@@ -224,6 +227,14 @@ impl StdioDelivery {
                 queued.credit.merge(credit);
                 return true;
             }
+        }
+        // Coalesced fragments share their existing node; charge this minimum
+        // only for a new node, retaining the physical-flush credit lifetime.
+        if !oversized && size < STDIO_STAGED_MESSAGE_BYTES {
+            let Ok(overhead) = Arc::clone(&self.bytes).try_acquire_many_owned(
+                (STDIO_STAGED_MESSAGE_BYTES - size.max(1)) as u32,
+            ) else { return false; };
+            credit.merge(overhead);
         }
         let queued = Arc::new(Mutex::new(Some(StdioStagedMessage { message, credit, oversized })));
         if self.sender.try_send(Arc::clone(&queued)).is_err() {
@@ -423,7 +434,9 @@ async fn send_message_to_connection(
         }
         let delivery = connection_state.stdio_delivery.get_or_insert_with(|| {
             let (sender, mut receiver) =
-                mpsc::channel::<Arc<Mutex<Option<StdioStagedMessage>>>>(128);
+                mpsc::channel::<Arc<Mutex<Option<StdioStagedMessage>>>>(
+                    STDIO_DELIVERY_BYTES / STDIO_STAGED_MESSAGE_BYTES + 1,
+                );
             let bytes = Arc::new(tokio::sync::Semaphore::new(STDIO_DELIVERY_BYTES));
             let oversized_frames = Arc::new(tokio::sync::Semaphore::new(1));
             let drained_bytes = Arc::clone(&bytes);

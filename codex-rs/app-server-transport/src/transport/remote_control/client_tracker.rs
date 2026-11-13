@@ -115,6 +115,7 @@ impl ClientTracker {
         let clients = std::mem::take(&mut self.clients);
         self.legacy_stream_ids.clear();
         for client in clients.into_values() {
+            observe_retirement(client.connection_id, "transport_retired");
             client.disconnect_token.cancel();
             let cleanup = self.spawn_connection_closed(client.connection_id);
             self.cleanup.push(cleanup);
@@ -232,7 +233,7 @@ impl ClientTracker {
                 let mut admitted_initializes = Vec::new();
                 if is_initialize && let Some(client) = self.clients.get_mut(&client_key) {
                     admitted_initializes = std::mem::take(&mut client.admitted_initializes);
-                    self.close_client(&client_key).await?;
+                    self.close_client(&client_key, "reinitialized").await?;
                 }
 
                 if let Some((connection_id, writer)) = self.clients.get_mut(&client_key).map(|client| {
@@ -288,6 +289,7 @@ impl ClientTracker {
                         status_tx,
                     },
                 );
+                info!(?connection_id, "remote control client opened");
                 if is_legacy_stream_id {
                     self.legacy_stream_ids.insert(client_id.clone(), stream_id);
                 }
@@ -298,6 +300,7 @@ impl ClientTracker {
                     .await
                 {
                     if let Some(client) = self.remove_client(&client_key) {
+                        observe_retirement(client.connection_id, "initialize_forward_failed");
                         client.disconnect_token.cancel();
                         // The initialize send already timed out on this queue; preserve close
                         // delivery without blocking reconnect on the same backpressure.
@@ -342,7 +345,7 @@ impl ClientTracker {
                 });
                 Ok(())
             }
-            ClientEvent::ClientClosed => self.close_client(&client_key).await,
+            ClientEvent::ClientClosed => self.close_client(&client_key, "peer_closed").await,
         }
     }
 
@@ -357,20 +360,21 @@ impl ClientTracker {
         mut status_rx: watch::Receiver<PongStatus>,
         disconnect_token: CancellationToken,
     ) -> (ClientId, StreamId, ConnectionId) {
-        // One unacknowledged logical envelope per stream. A stalled client
-        // waits here, never at the common encoder ahead of another client.
+        // Preserve REL-02's one unacknowledged data envelope per stream, but
+        // let liveness replies progress while that data awaits its ACK. Status
+        // has its own one-envelope cap and still consumes global/byte credits.
         let stream_slot = Arc::new(tokio::sync::Semaphore::new(1));
+        let status_slot = Arc::new(tokio::sync::Semaphore::new(1));
         loop {
-            let stream_credit = tokio::select! {
-                _ = disconnect_token.cancelled() => break,
-                permit = Arc::clone(&stream_slot).acquire_owned() => match permit { Ok(permit) => permit, Err(_) => break },
-            };
-            let (event, write_complete_tx, message_bytes) = tokio::select! {
+            let (event, write_complete_tx, message_bytes, stream_credit) = tokio::select! {
                 _ = disconnect_token.cancelled() => {
                     break;
                 }
-                queued_message = writer_rx.recv() => {
-                    let Some(mut queued_message) = queued_message else {
+                queued_message = async {
+                    let permit = Arc::clone(&stream_slot).acquire_owned().await.ok()?;
+                    writer_rx.recv().await.map(|message| (permit, message))
+                } => {
+                    let Some((permit, mut queued_message)) = queued_message else {
                         break;
                     };
                      // This is the Remote connection's owned copy, after fanout.
@@ -383,17 +387,26 @@ impl ClientTracker {
                         Some(encoded) => encoded.streamed_len.unwrap_or(encoded.bytes.len()),
                         None => match queued_message.prepare_stdio_json(0) { Ok(bytes) => bytes, Err(_) => break },
                     };
+                    if let Some(observation) = super::protocol::DeliveryObservation::new(&client_id, &stream_id, 0, None) {
+                        let mut facts = super::protocol::response_observation(&queued_message.message);
+                        facts["connection_id"] = connection_id.0.into();
+                        observation.record("mobile_response_dequeued", facts);
+                    }
                     let event = ServerEvent::ServerMessage {
                         message: Box::new(queued_message.message),
                     };
-                    (event, queued_message.write_complete_tx, bytes)
+                    (event, queued_message.write_complete_tx, bytes, permit)
                 }
-                changed = status_rx.changed() => {
-                    if changed.is_err() {
+                status = async {
+                    let permit = Arc::clone(&status_slot).acquire_owned().await.ok()?;
+                    status_rx.changed().await.ok()?;
+                    Some((permit, status_rx.borrow_and_update().clone()))
+                } => {
+                    let Some((permit, status)) = status else {
                         break;
-                    }
-                    let event = ServerEvent::Pong { status: status_rx.borrow().clone() };
-                    (event, None, 256)
+                    };
+                    let event = ServerEvent::Pong { status };
+                    (event, None, 256, permit)
                 }
             };
             let Some(cost) = super::replay_byte_cost(message_bytes, &client_id, &stream_id) else {
@@ -452,10 +465,12 @@ impl ClientTracker {
     pub(super) async fn close_client(
         &mut self,
         client_key: &(ClientId, StreamId),
+        retirement_reason: &'static str,
     ) -> Result<(), Stopped> {
         let Some(client) = self.remove_client(client_key) else {
             return Ok(());
         };
+        observe_retirement(client.connection_id, retirement_reason);
         client.disconnect_token.cancel();
         let cleanup = self.spawn_connection_closed(client.connection_id);
         self.cleanup.push(cleanup);
@@ -560,6 +575,17 @@ impl ClientTracker {
                 Stopped
             })
         })
+    }
+}
+
+fn observe_retirement(connection_id: ConnectionId, retirement_reason: &'static str) {
+    info!(?connection_id, retirement_reason, "retiring remote control client");
+    if codex_protocol::timing::observations::enabled() {
+        let _ = codex_protocol::timing::observations::record(
+            "mobile_connection_retired", "", "", &format!("connection-{}", connection_id.0),
+            serde_json::json!({"schema_version":1, "connection_id":connection_id.0,
+                "reason":retirement_reason, "boundary":"server_retirement_not_phone_cause"}),
+        );
     }
 }
 

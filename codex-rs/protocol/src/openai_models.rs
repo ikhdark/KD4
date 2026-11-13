@@ -34,12 +34,16 @@ use crate::protocol::MultiAgentVersion;
 const PERSONALITY_PLACEHOLDER: &str = "{{ personality }}";
 pub const SPEED_TIER_FAST: &str = "fast";
 
-/// Thread-local preferences for future generic workers, not model/effort locks.
+/// Thread-local preferences for future generic workers, not per-spawn locks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct SubagentModelSettings {
     pub model: String,
     pub reasoning_effort: ReasoningEffort,
+    /// Omit to follow the root's live tier; `default` pins Standard independently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub service_tier: Option<String>,
 }
 
 /// See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning

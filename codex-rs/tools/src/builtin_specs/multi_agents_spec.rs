@@ -13,7 +13,7 @@ use crate::DEFAULT_SPAWN_AGENT_REASONING_EFFORT;
 
 
 const SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION: &str =
-    "Optional worker service tier: omit to inherit the root's live tier, `default` selects Standard, `priority` selects Fast. Set only when requested; an explicit override remains local to this worker.";
+    "Optional worker service tier: omit to use this chat's subagent tier when supported, otherwise inherit the root's live tier. `default` selects Standard, `priority` selects Fast. Set only when requested; an explicit override remains local to this worker and takes precedence over the chat preference.";
 const SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE: &str = "Full-history forks (`fork_turns=\"all\"`) are disabled by default; prefer `none` or an integer from 1 through 5.";
 /// `message` and the aliases the V2 handler accepts for the same task text.
 /// Keep these plaintext: durable objectives are rendered inside ordinary capsule

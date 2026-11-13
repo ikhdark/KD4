@@ -13978,6 +13978,11 @@
             "default": false,
             "description": "Whether thread/settings/update accepts and persists subagentSettings.",
             "type": "boolean"
+          },
+          "subagentServiceTierSupported": {
+            "default": false,
+            "description": "Whether subagentSettings.serviceTier is independently persisted and applied.",
+            "type": "boolean"
           }
         },
         "required": [
@@ -26559,13 +26564,20 @@
         "type": "object"
       },
       "SubagentModelSettings": {
-        "description": "Thread-local preferences for future generic workers, not model/effort locks.",
+        "description": "Thread-local preferences for future generic workers, not per-spawn locks.",
         "properties": {
           "model": {
             "type": "string"
           },
           "reasoningEffort": {
             "$ref": "#/definitions/v2/ReasoningEffort"
+          },
+          "serviceTier": {
+            "description": "Omit to follow the root's live tier; `default` pins Standard independently.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [

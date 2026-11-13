@@ -10,6 +10,10 @@ export type ModelListResponse = { data: Array<Model>,
  */
 subagentSettingsSupported: boolean,
 /**
+ * Whether subagentSettings.serviceTier is independently persisted and applied.
+ */
+subagentServiceTierSupported: boolean,
+/**
  * Opaque cursor to pass to the next call to continue after the last item.
  * If None, there are no more items to return.
  */

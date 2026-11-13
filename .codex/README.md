@@ -10,10 +10,10 @@ The [root README](../README.md) indexes the active product and development guide
 | --- | --- |
 | [config.toml](config.toml) | Repository-local Codex configuration; kept at its runtime path. |
 | [test-runners.json](test-runners.json) | Validation runner registration; kept at its runtime path. |
-| [audits/](audits/README.md) | Retained historical reports/captures; new investigation reports use [KDR/audits](../../KDR/audits/README.md). |
+| [audits/](audits/README.md) | Retained historical reports/captures; new investigation reports use KDR's `audits/open-cases/`; see [case status](../../KDR/audits/README.md). |
 | [fix-evidence/](fix-evidence/index.json) | Existing KD4 fix-to-receipt bindings; moved KDR evidence and shared benchmark learning are linked without copies. |
 | `gitdiff/` (when present) | Runtime output path for named patch receipts from the diff-saving tool. |
-| `benchmark-runs/` (when present) | Historical benchmark captures; new output uses KDR's `benchmarks/`. |
+| `benchmark-runs/` (when present) | Historical benchmark captures; new case output uses KDR's `benchmarks/open-cases/`; see [benchmark cases](../../KDR/benchmarks/README.md). |
 | [locks/](locks/) | Tool-managed coordination files; not disposable audit clutter. |
 
 New investigation evidence, proposals and benchmark learning use

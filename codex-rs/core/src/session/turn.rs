@@ -1548,7 +1548,6 @@ pub(crate) fn run_turn(
                                     changed: Vec::new(),
                                     incomplete: analysis_paths,
                                 });
-                                changed_tests.incomplete.extend(uncertain_contents);
                                 changed_tests.incomplete.sort();
                                 changed_tests.incomplete.dedup();
                                 let mut assessment = turn_execution.completion_assessment(settled_state.mutation_revision);
@@ -1556,6 +1555,9 @@ pub(crate) fn run_turn(
                                     assessment.advisories.push(advisory);
                                 }
                                 if let Some(advisory) = incomplete_test_evidence_advisory(&changed_tests.incomplete) {
+                                    assessment.advisories.push(advisory);
+                                }
+                                if let Some(advisory) = uncertain_content_advisory(&uncertain_contents) {
                                     assessment.advisories.push(advisory);
                                 }
                                 if finalized_mutation_revision.is_some_and(|revision| {
@@ -2134,6 +2136,23 @@ fn incomplete_test_evidence_advisory(paths: &[String]) -> Option<String> {
     (!paths.is_empty()).then(|| format!(
         "Existing-test evidence could not be fully assessed (incomplete analysis or uncertain before/after attribution): {}. Do not treat this as proof that tests were unchanged or attribute uncertain edits to this turn.",
         serde_json::to_string(paths).expect("path inventory is JSON serializable")
+    ))
+}
+
+/// Attribution uncertainty applies to all content, not just existing tests.
+fn uncertain_content_advisory(paths: &[String]) -> Option<String> {
+    let paths = paths.iter().fold(std::collections::BTreeMap::new(), |mut unique, path| {
+        let key = if cfg!(windows) {
+            path.replace('\\', "/").to_ascii_lowercase()
+        } else {
+            path.clone()
+        };
+        unique.entry(key).or_insert_with(|| path.clone());
+        unique
+    }).into_values().collect::<Vec<_>>();
+    (!paths.is_empty()).then(|| format!(
+        "File-content before/after attribution is uncertain: {}. Do not attribute uncertain edits to this turn or treat this as proof that these files were unchanged.",
+        serde_json::to_string(&paths).expect("path inventory is JSON serializable")
     ))
 }
 

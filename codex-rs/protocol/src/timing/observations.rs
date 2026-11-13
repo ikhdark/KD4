@@ -12,6 +12,11 @@ const MAX_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ROW_BYTES: usize = 1024 * 1024;
 
 struct Journal {
+    lanes: [Option<Lane>; 3],
+    sequence: u64,
+}
+
+struct Lane {
     file: File,
     sequence: u64,
     bytes: usize,
@@ -29,20 +34,22 @@ fn journal() -> Option<&'static Mutex<Journal>> {
             if !directory.is_absolute() || !directory.is_dir() {
                 return None;
             }
-            let file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(directory.join(format!(
-                    "runtime-{}-{}.jsonl",
-                    std::process::id(),
-                    super::process_clock_domain_id()
-                )))
-                .ok()?;
+            let open = |suffix: &str| {
+                let file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(directory.join(format!(
+                        "runtime-{}-{}{}.jsonl",
+                        std::process::id(),
+                        super::process_clock_domain_id(),
+                        suffix
+                    )))
+                    .ok()?;
+                Some(Lane { file, sequence: 0, bytes: 0, stopped: false })
+            };
             Some(Mutex::new(Journal {
-                file,
+                lanes: [Some(open("")?), open("-mobile"), open("-lifecycle")],
                 sequence: 0,
-                bytes: 0,
-                stopped: false,
             }))
         })
         .as_ref()
@@ -70,31 +77,56 @@ pub fn record(
 ) -> Option<Receipt> {
     let journal = journal()?;
     let mut journal = journal.lock().ok()?;
-    if journal.stopped {
+    // Ordinary tool traffic must not exhaust connection evidence. Keep the
+    // existing runtime cap and a separately bounded mobile lane, with a small
+    // retirement reserve even when response telemetry itself is saturated.
+    let (requested_lane, _, _) = if kind == "mobile_connection_retired" {
+        (2, "lifecycle", 64 * 1024)
+    } else if kind.starts_with("mobile_") {
+        (1, "mobile", MAX_BYTES)
+    } else {
+        (0, "runtime", MAX_BYTES)
+    };
+    // A secondary file failure must not disable ordinary observations. Fall
+    // back to the original shared budget and explicitly report lost isolation.
+    let lane_index = if journal.lanes[requested_lane].is_some() { requested_lane } else { 0 };
+    let lane_name = ["runtime", "mobile", "lifecycle"][lane_index];
+    let limit = if lane_index == 2 { 64 * 1024 } else { MAX_BYTES };
+    let unavailable_lanes: Vec<_> = ["runtime", "mobile", "lifecycle"].into_iter()
+        .enumerate().filter_map(|(index, name)| journal.lanes[index].is_none().then_some(name)).collect();
+    if journal.lanes[lane_index].as_ref()?.stopped {
         return None;
     }
     let sequence = journal.sequence.checked_add(1)?;
+    let lane = journal.lanes[lane_index].as_mut()?;
+    let lane_sequence = lane.sequence.checked_add(1)?;
     let at_ns = u64::try_from(super::process_monotonic_ns()).ok()?;
     let id = format!("{}:{sequence}", super::process_clock_domain_id());
     let mut row = json!({"version":1, "pid":std::process::id(),
         "clock_id":super::process_clock_domain_id(), "seq":sequence, "id":id,
+        "journal_lane":lane_name, "lane_seq":lane_sequence,
         "at_ns":at_ns, "kind":kind, "thread_id":thread, "turn_id":turn,
         "operation_id":operation, "data":data});
+    if !unavailable_lanes.is_empty() {
+        row["unavailable_journal_lanes"] = json!(unavailable_lanes);
+    }
     let mut bytes = serde_json::to_vec(&row).ok()?;
-    if bytes.len() > MAX_ROW_BYTES || journal.bytes + bytes.len() + 1024 > MAX_BYTES {
+    if bytes.len() > MAX_ROW_BYTES || lane.bytes + bytes.len() + 1024 > limit {
         row["kind"] = json!("capture_overflow");
-        row["data"] = json!({"row_bytes":bytes.len(), "retained_bytes":journal.bytes});
+        row["data"] = json!({"row_bytes":bytes.len(), "retained_bytes":lane.bytes});
         bytes = serde_json::to_vec(&row).ok()?;
-        journal.stopped = true;
+        lane.stopped = true;
     }
     bytes.push(b'\n');
-    if journal.file.write_all(&bytes).is_err() {
-        journal.stopped = true;
+    if lane.file.write_all(&bytes).is_err() {
+        lane.stopped = true;
         return None;
     }
+    lane.sequence = lane_sequence;
+    lane.bytes += bytes.len();
+    let stopped = lane.stopped;
     journal.sequence = sequence;
-    journal.bytes += bytes.len();
-    if journal.stopped {
+    if stopped {
         None
     } else {
         Some(Receipt { id, at_ns })

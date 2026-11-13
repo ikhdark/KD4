@@ -9891,13 +9891,20 @@
       "type": "object"
     },
     "SubagentModelSettings": {
-      "description": "Thread-local preferences for future generic workers, not model/effort locks.",
+      "description": "Thread-local preferences for future generic workers, not per-spawn locks.",
       "properties": {
         "model": {
           "type": "string"
         },
         "reasoningEffort": {
           "$ref": "#/definitions/ReasoningEffort"
+        },
+        "serviceTier": {
+          "description": "Omit to follow the root's live tier; `default` pins Standard independently.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

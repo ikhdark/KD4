@@ -2,15 +2,17 @@ use crate::outgoing_message::OutgoingMessage;
 use codex_app_server_protocol_types::JSONRPCMessage;
 use serde::Deserialize;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::io;
 use std::io::ErrorKind;
 use url::Host;
 use url::Url;
 
 // Desktop rejects the workspace's 0.0.0 development marker for remote control.
-// This transport implements the protocol-v3 contract from rust-v0.146.0-alpha.7.
-// Advertise that compatibility only here; do not relabel the binary or model traffic.
-const DEVELOPMENT_COMPATIBILITY_VERSION: &str = "0.146.0-alpha.7+kd4.remote-control-v3";
+// Remote clients also gate project discovery on 0.148.0-alpha.21. The project
+// APIs are implemented here; advertising the older v3 floor hides them. Keep
+// this below the paginated-history floor and do not relabel local/model traffic.
+const DEVELOPMENT_COMPATIBILITY_VERSION: &str = "0.148.0-alpha.21+kd4.remote-control-v3";
 
 pub(super) fn remote_control_app_server_version() -> &'static str {
     match codex_utils_build_info::CODEX_VERSION {
@@ -108,6 +110,41 @@ pub struct ClientId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct StreamId(pub String);
+
+/// Opt-in, content-free custody observations. A relay ACK is not phone UI proof.
+#[derive(Clone)]
+pub(super) struct DeliveryObservation {
+    stream_key: String,
+    seq_id: u64,
+    segment_id: Option<usize>,
+}
+
+impl DeliveryObservation {
+    pub(super) fn new(client: &ClientId, stream: &StreamId, seq_id: u64, segment_id: Option<usize>) -> Option<Self> {
+        if !codex_protocol::timing::observations::enabled() { return None; }
+        let bytes = serde_json::to_vec(&(client, stream)).ok()?;
+        Some(Self { stream_key: Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect(), seq_id, segment_id })
+    }
+
+    pub(super) fn record(&self, kind: &str, mut facts: serde_json::Value) {
+        let Some(data) = facts.as_object_mut() else { return; };
+        data.insert("stream_key_sha256".into(), self.stream_key.clone().into());
+        data.insert("seq_id".into(), self.seq_id.into());
+        data.insert("segment_id".into(), self.segment_id.into());
+        let _ = codex_protocol::timing::observations::record(kind, "", "", "", facts);
+    }
+}
+
+pub(super) fn response_observation(message: &OutgoingMessage) -> serde_json::Value {
+    let (id, error_code) = match message {
+        OutgoingMessage::Response(response) => (&response.id, None),
+        OutgoingMessage::Error(error) => (&error.id, Some(error.error.code)),
+        _ => return serde_json::json!({"message_kind":"other"}),
+    };
+    let key = serde_json::to_vec(id).ok().map(|bytes| Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+    serde_json::json!({"message_kind":if error_code.is_some() { "error" } else { "response" },
+        "request_key_sha256":key, "error_code":error_code})
+}
 
 impl StreamId {
     pub fn new_random() -> Self {
