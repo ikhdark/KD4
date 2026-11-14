@@ -44,7 +44,7 @@ pub(super) type SharedLocalThreadProjection = Arc<LocalThreadProjectionEntry>;
 const MAX_UNLOADED_PROJECTIONS: usize = 4;
 
 pub(super) struct LocalThreadProjectionEntry {
-    state: Mutex<LocalThreadProjection>,
+    state: Arc<Mutex<LocalThreadProjection>>,
     operation_gate: Arc<Semaphore>,
     source_version: Mutex<Option<(PathBuf, u64, Option<SystemTime>)>>,
     payload_versions: Mutex<Vec<codex_rollout::PayloadDependencyVersion>>,
@@ -108,11 +108,13 @@ impl Default for LocalThreadProjection {
 
 impl LocalThreadProjection {
     fn initialize(&mut self, items: &[RolloutItem]) -> ThreadStoreResult<()> {
-        *self = Self::default();
-        self.initialized = true;
-        self.source_partial = codex_rollout::ensure_rollout_source_integrity(items).is_err();
+        let mut replacement = Self::default();
+        replacement.source_partial = codex_rollout::ensure_rollout_source_integrity(items).is_err();
         let persisted_items = persisted_rollout_items(items, ThreadHistoryMode::Legacy);
-        self.apply_persisted_items(persisted_items.as_slice())
+        replacement.apply_persisted_items(persisted_items.as_slice())?;
+        replacement.initialized = true;
+        *self = replacement;
+        Ok(())
     }
 
     fn apply_persisted_items(&mut self, items: &[RolloutItem]) -> ThreadStoreResult<()> {
@@ -480,7 +482,11 @@ impl LocalThreadProjection {
             started_at: metadata.and_then(|metadata| metadata.started_at),
             completed_at: metadata.and_then(|metadata| metadata.completed_at),
             duration_ms: metadata.and_then(|metadata| metadata.duration_ms),
-            timing: metadata.and_then(|metadata| metadata.timing.clone()),
+            timing: if matches!(items_view, StoredTurnItemsView::Full) {
+                metadata.and_then(|metadata| metadata.timing.clone())
+            } else {
+                None
+            },
             surfaced_result: metadata.and_then(|metadata| metadata.surfaced_result.clone()),
         };
 
@@ -506,7 +512,7 @@ impl LocalThreadProjection {
 impl LocalThreadProjectionEntry {
     fn new() -> Self {
         Self {
-            state: Mutex::new(LocalThreadProjection::default()),
+            state: Arc::new(Mutex::new(LocalThreadProjection::default())),
             operation_gate: Arc::new(Semaphore::new(1)),
             source_version: Mutex::new(None),
             payload_versions: Mutex::new(Vec::new()),
@@ -543,8 +549,16 @@ impl LocalThreadProjectionEntry {
         self.state.lock().await.initialized
     }
 
-    async fn initialize(&self, items: &[RolloutItem]) -> ThreadStoreResult<()> {
-        self.state.lock().await.initialize(items)
+    async fn initialize(&self, items: Vec<RolloutItem>) -> ThreadStoreResult<()> {
+        let mut state = Arc::clone(&self.state).lock_owned().await;
+        // Replaying a large rollout is CPU-bound. Retain the state guard in the
+        // worker so cancellation cannot publish a half-built index or let a
+        // following operation mutate it before reconstruction finishes.
+        tokio::task::spawn_blocking(move || state.initialize(&items))
+            .await
+            .map_err(|error| ThreadStoreError::Internal {
+                message: format!("local thread projection initialization failed: {error}"),
+            })?
     }
 
     pub(super) async fn append_pending(&self, items: Vec<RolloutItem>) {
@@ -552,15 +566,44 @@ impl LocalThreadProjectionEntry {
     }
 
     pub(super) async fn commit_pending(&self) -> ThreadStoreResult<()> {
-        self.state.lock().await.commit_pending()
+        let mut state = Arc::clone(&self.state).lock_owned().await;
+        tokio::task::spawn_blocking(move || state.commit_pending())
+            .await
+            .map_err(|error| ThreadStoreError::Internal {
+                message: format!("local thread projection commit failed: {error}"),
+            })?
     }
 
-    async fn list_turns(&self, params: &ListTurnsParams) -> ThreadStoreResult<TurnPage> {
-        self.state.lock().await.list_turns(params)
+    async fn list_turns(
+        &self,
+        params: ListTurnsParams,
+        operation: OwnedSemaphorePermit,
+    ) -> ThreadStoreResult<TurnPage> {
+        let state = Arc::clone(&self.state).lock_owned().await;
+        tokio::task::spawn_blocking(move || {
+            let _operation = operation;
+            state.list_turns(&params)
+        })
+            .await
+            .map_err(|error| ThreadStoreError::Internal {
+                message: format!("local thread projection turn listing failed: {error}"),
+            })?
     }
 
-    async fn list_items(&self, params: &ListItemsParams) -> ThreadStoreResult<ItemPage> {
-        self.state.lock().await.list_items(params)
+    async fn list_items(
+        &self,
+        params: ListItemsParams,
+        operation: OwnedSemaphorePermit,
+    ) -> ThreadStoreResult<ItemPage> {
+        let state = Arc::clone(&self.state).lock_owned().await;
+        tokio::task::spawn_blocking(move || {
+            let _operation = operation;
+            state.list_items(&params)
+        })
+            .await
+            .map_err(|error| ThreadStoreError::Internal {
+                message: format!("local thread projection item listing failed: {error}"),
+            })?
     }
 }
 
@@ -626,6 +669,10 @@ pub(super) async fn initialize_from_store(
             || projection.gap_retry_after.lock().await.is_some_and(|deadline| Instant::now() >= deadline)
             || !codex_rollout::payload_versions_match(&dependencies).await;
         if source_changed {
+            // An interrupted reload may finish in its blocking worker after the
+            // caller drops the operation permit. Never associate that state with
+            // the old source stamp, even if the source later returns to it.
+            *projection.source_version.lock().await = None;
             // The canonical reader stamps each named dependency before hydration.
             // A repair/replacement during replay still invalidates the next page.
             let mut dependencies = None;
@@ -638,7 +685,6 @@ pub(super) async fn initialize_from_store(
                     Some(&mut dependencies),
                 )
                 .await?;
-            projection.initialize(history.items.as_slice()).await?;
             let degraded = history.items.iter().any(|item| match item {
                 RolloutItem::ResponseItem(item) => {
                     codex_rollout::is_rollout_reconstruction_notice(item)
@@ -652,6 +698,7 @@ pub(super) async fn initialize_from_store(
                 }
                 _ => false,
             });
+            projection.initialize(history.items).await?;
             // Metadata stamps cannot prove content readability. Even confirmed
             // gaps must retry periodically after transient sharing/I/O failures.
             *projection.gap_retry_after.lock().await = degraded.then(||
@@ -718,17 +765,28 @@ async fn initialize_entry_from_store(
         return Ok(());
     }
     {
-        let mut state = projection.state.lock().await;
-        if let Some(seed) = state.deferred_seed.take() {
+        let mut state = Arc::clone(&projection.state).lock_owned().await;
+        if state.deferred_seed.is_some() {
             // Share the resume snapshot until pagination actually needs the
             // reducer/index. Keep pending versus committed visibility identical
             // to the eager path, without forcing a recorder persistence barrier.
-            let committed = std::mem::take(&mut state.deferred_committed);
-            let pending = std::mem::take(&mut state.pending_items);
-            state.initialize(&seed)?;
-            state.apply_persisted_items(&committed)?;
-            state.pending_items = pending;
-            return Ok(());
+            return tokio::task::spawn_blocking(move || {
+                let seed = state.deferred_seed.as_ref().ok_or_else(|| {
+                    projection_invariant_error("deferred projection seed disappeared")
+                })?;
+                // Retain the original seed and queues until reconstruction
+                // succeeds, then publish the complete replacement atomically.
+                let mut replacement = LocalThreadProjection::default();
+                replacement.initialize(seed)?;
+                replacement.apply_persisted_items(&state.deferred_committed)?;
+                replacement.pending_items = std::mem::take(&mut state.pending_items);
+                *state = replacement;
+                Ok(())
+            })
+            .await
+            .map_err(|error| ThreadStoreError::Internal {
+                message: format!("deferred thread projection initialization failed: {error}"),
+            })?;
         }
     }
     let history = store
@@ -737,7 +795,7 @@ async fn initialize_entry_from_store(
             include_archived,
         })
         .await?;
-    projection.initialize(history.items.as_slice()).await
+    projection.initialize(history.items).await
 }
 
 pub(super) async fn initialized_entry_for_append(
@@ -786,14 +844,14 @@ pub(super) async fn list_turns(
     require_positive_page_size(params.page_size)?;
     let rollout_path =
         validate_thread_visibility(store, params.thread_id, params.include_archived).await?;
-    let (projection, _operation) = initialize_from_store(
+    let (projection, operation) = initialize_from_store(
         store,
         params.thread_id,
         params.include_archived,
         rollout_path,
     )
     .await?;
-    projection.list_turns(&params).await
+    projection.list_turns(params, operation).await
 }
 
 pub(super) async fn list_items(
@@ -803,14 +861,14 @@ pub(super) async fn list_items(
     require_positive_page_size(params.page_size)?;
     let rollout_path =
         validate_thread_visibility(store, params.thread_id, params.include_archived).await?;
-    let (projection, _operation) = initialize_from_store(
+    let (projection, operation) = initialize_from_store(
         store,
         params.thread_id,
         params.include_archived,
         rollout_path,
     )
     .await?;
-    projection.list_items(&params).await
+    projection.list_items(params, operation).await
 }
 
 async fn validate_thread_visibility(

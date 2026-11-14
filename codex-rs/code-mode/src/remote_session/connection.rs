@@ -181,6 +181,9 @@ impl Connection {
             ));
         }
 
+        let host_process_id = child.id();
+        tracing::debug!(?host_process_id, host_program = %host_program.display(),
+            stage = "spawned", "code-mode host lifecycle");
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
@@ -188,6 +191,7 @@ impl Connection {
                     match lines.next_line().await {
                         Ok(Some(line)) => tracing::info!(
                             event.name = "codex.code_mode_host.observation",
+                            ?host_process_id,
                             host_event = %line,
                             "code-mode host stderr observation"
                         ),
@@ -289,6 +293,8 @@ impl Connection {
                 }
             };
 
+        tracing::debug!(?host_process_id, stage = "handshake_ready",
+            "code-mode host lifecycle");
         let (command_tx, command_rx) = mpsc::channel(IPC_CHANNEL_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel(IPC_CHANNEL_CAPACITY);
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<EncodedFrame>(OUTGOING_FRAME_CAPACITY);

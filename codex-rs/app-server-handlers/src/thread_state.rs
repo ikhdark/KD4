@@ -577,7 +577,11 @@ pub(crate) fn clone_turn_with_items_view(turn: &Turn, items_view: TurnItemsView)
         started_at: turn.started_at,
         completed_at: turn.completed_at,
         duration_ms: turn.duration_ms,
-        timing: turn.timing.clone(),
+        timing: if items_view == TurnItemsView::Full {
+            turn.timing.clone()
+        } else {
+            None
+        },
         surfaced_result: turn.surfaced_result.clone(),
     }
 }
@@ -811,7 +815,7 @@ impl ThreadState {
         items_view: TurnItemsView,
     ) -> Result<Option<IndexedTurnPage>, ()> {
         if self.turn_index_source_partial {
-            return Err(());
+            return Ok(None);
         }
         self.turn_index
             .page(anchor, page_size, sort_direction, items_view)
@@ -825,7 +829,7 @@ impl ThreadState {
         sort_direction: SortDirection,
     ) -> Result<Option<IndexedItemPage>, ()> {
         if self.turn_index_source_partial {
-            return Err(());
+            return Ok(None);
         }
         self.turn_index
             .items_page(turn_id_filter, anchor, page_size, sort_direction)
@@ -1137,6 +1141,9 @@ impl ThreadState {
         if self.listener_generation != listener_generation || self.listener_command_tx.is_none() {
             return false;
         }
+        if codex_rollout::ensure_rollout_source_integrity(items).is_err() {
+            return false;
+        }
         if !self.turn_index.initialized || self.turn_index_source_partial {
             if self.turn_index_rollback_generation != history_generation {
                 return false;
@@ -1170,6 +1177,9 @@ impl ThreadState {
         direction: SortDirection,
         items_view: TurnItemsView,
     ) -> Option<IndexedTurnPage> {
+        if self.turn_index_source_partial {
+            return None;
+        }
         self.turn_index.page(None, limit, direction, items_view).ok().flatten()
     }
 

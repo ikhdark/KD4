@@ -561,24 +561,31 @@ impl MessageProcessor {
         let request_method = request.method.as_str();
         // Only the transport owner can establish a remote-control connection.
         // Never infer phone provenance from a self-reported client name.
-        let mobile_observation_id = if codex_protocol::timing::observations::enabled()
-            && self.outgoing.connection_is_remote_control(connection_id).await
-        {
-            let operation = uuid::Uuid::now_v7().to_string();
+        let remote_observation = codex_protocol::timing::observations::enabled()
+            && self.outgoing.connection_is_remote_control(connection_id).await;
+        let local_observation = codex_protocol::timing::observations::enabled()
+            && matches!(transport, AppServerTransport::Stdio)
+            && matches!(request_method, "thread/list" | "config/read" | "fs/getMetadata");
+        let mobile_observation_id = if remote_observation || local_observation {
+            let operation = if remote_observation {
+                uuid::Uuid::now_v7().to_string()
+            } else {
+                format!("local:{}", uuid::Uuid::now_v7())
+            };
             let method = match request_method {
-                "initialize" | "fs/readFile" | "fs/readFileRange" | "fs/getMetadata"
+                "initialize" | "config/read" | "fs/readFile" | "fs/readFileRange" | "fs/getMetadata"
                 | "fs/readDirectory" | "fs/writeFile" | "thread/list" | "thread/read" | "thread/resume"
                 | "thread/turns/list" | "turn/start" | "turn/interrupt" => request_method,
                 _ => "other",
             };
             let _ = codex_protocol::timing::observations::record(
-                "mobile_rpc_received", "", "", &operation,
+                if remote_observation { "mobile_rpc_received" } else { "local_rpc_received" }, "", "", &operation,
                 serde_json::json!({"schema_version":1, "connection_id":connection_id.0,
-                    "method":method, "boundary":"remote_control_server_ingress_not_phone_tap",
+                    "method":method, "boundary":if remote_observation { "remote_control_server_ingress_not_phone_tap" } else { "local_server_ingress" },
                     "request_key_sha256":serde_json::to_vec(&request.id).ok()
                         .map(|bytes| sha2::Sha256::digest(bytes).iter()
                             .map(|byte| format!("{byte:02x}")).collect::<String>()),
-                    "file_path_facts":(request_method == "fs/readFile").then(|| {
+                    "file_path_facts":(remote_observation && request_method == "fs/readFile").then(|| {
                         let params = request.params.as_ref();
                         let path = params.and_then(|params| params.get("path"));
                         let mut facts = FsRequestProcessor::directory_path_facts(
@@ -589,7 +596,7 @@ impl MessageProcessor {
                             .map(|path| std::path::Path::new(path).is_absolute()));
                         facts
                     }),
-                    "directory_path_facts":(request_method == "fs/readDirectory").then(|| {
+                    "directory_path_facts":(remote_observation && request_method == "fs/readDirectory").then(|| {
                         FsRequestProcessor::directory_path_facts(request.params.as_ref()
                             .and_then(|params| params.get("path"))
                             .and_then(serde_json::Value::as_str))
@@ -612,7 +619,7 @@ impl MessageProcessor {
         {
             if let Some(operation) = mobile_observation_id.as_deref() {
                 let _ = codex_protocol::timing::observations::record(
-                    "mobile_rpc_rejected", "", "", operation,
+                    if operation.starts_with("local:") { "local_rpc_rejected" } else { "mobile_rpc_rejected" }, "", "", operation,
                     serde_json::json!({"reason":"control_envelope_too_large"}),
                 );
             }
@@ -648,7 +655,7 @@ impl MessageProcessor {
             async {
                 let observation = request_context.mobile_observation_id().map(|operation| {
                     codex_protocol::timing::observations::Span::start(
-                        "mobile_rpc_admission", "", "", operation,
+                        if operation.starts_with("local:") { "local_rpc_admission" } else { "mobile_rpc_admission" }, "", "", operation,
                         serde_json::json!({"boundary":"decode_and_dispatch_not_handler_completion"}),
                     )
                 });
@@ -1062,12 +1069,19 @@ impl MessageProcessor {
             | ClientRequest::ThreadResume { .. } | ClientRequest::ThreadInjectItems { .. });
         let processor = Arc::clone(self);
         let span = request_context.span();
+        let queue_observation = request_context.mobile_observation_id().map(|operation| {
+            codex_protocol::timing::observations::Span::start(
+                "rpc_queued", "", "", operation, serde_json::Value::Null)
+        });
         let request = QueuedInitializedRequest::new_with_estimated_bytes(
             rpc_gate,
             estimated_request_bytes,
             async move {
-                let processor_for_request = Arc::clone(&processor);
                 if rpc_cancellation.is_cancelled() { return; }
+                if let Some(observation) = queue_observation {
+                    observation.finish("started", serde_json::Value::Null);
+                }
+                let processor_for_request = Arc::clone(&processor);
                 tokio::select! {
                     biased;
                     _ = rpc_cancellation.cancelled(), if !retain_settlement => {}
@@ -1250,7 +1264,7 @@ impl MessageProcessor {
             };
             let observation = mobile_observation_id.as_deref().map(|operation| {
                 codex_protocol::timing::observations::Span::start(
-                    "mobile_rpc_handler", "", "", operation,
+                    if operation.starts_with("local:") { "local_rpc_handler" } else { "mobile_rpc_handler" }, "", "", operation,
                     serde_json::json!({"method":codex_request.method_name(),
                         "connection_id":connection_id.0, "boundary":"initialized_handler"}),
                 )
@@ -1562,7 +1576,7 @@ impl MessageProcessor {
                         .map(|response| Some(response.into())),
                     ClientRequest::ThreadList { params, .. } => self
                         .thread_processor
-                        .thread_list(params)
+                        .thread_list(params, mobile_observation_id.as_deref())
                         .await
                         .map(|response| Some(response.into())),
                     ClientRequest::ProjectList { params, .. } => {
@@ -1877,7 +1891,7 @@ impl MessageProcessor {
             let response_observation = mobile_observation_id.as_deref()
                 .filter(|_| !matches!(&result, Ok(None)))
                 .map(|operation| codex_protocol::timing::observations::Span::start(
-                    "mobile_rpc_response", "", "", operation,
+                    if operation.starts_with("local:") { "local_rpc_response" } else { "mobile_rpc_response" }, "", "", operation,
                     serde_json::json!({"boundary":"response_owner_not_peer_receipt"})));
             match result {
                 Ok(Some(response)) => {

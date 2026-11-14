@@ -649,10 +649,15 @@ pub fn criterion_evidence_policy_schema() -> JsonSchema {
 
 fn writable_assignment_schema() -> JsonSchema {
     let scope = JsonSchema::object(BTreeMap::from([
-        ("path".into(), JsonSchema::string(None)),
-        ("recursive".into(), JsonSchema::boolean(None)),
+        ("path".into(), JsonSchema::string(Some("Path relative to cwd's repository root, using forward slashes; no absolute paths, parent traversal, or dot components. Select another repository with cwd, never ../ scopes.".into()))),
+        ("recursive".into(), JsonSchema::boolean(Some("False for one file; true includes a directory's descendants.".into()))),
     ]), Some(vec!["path".into(), "recursive".into()]), Some(false.into()));
     let scopes = JsonSchema::array(scope, None);
+    let inspection = JsonSchema {
+        pattern: Some(r"^inspect:[^\\]+$".into()),
+        min_length: Some(8),
+        ..JsonSchema::string(Some("Exact owned-source obligation: inspect:<normalized repository-relative file>, for example inspect:src/lib.rs. Use the identical string in assignment.required_evidence and the criterion's evidence_policy.required_evidence; not prose, an absolute path, a directory, or a glob.".into()))
+    };
     let mut policy = criterion_evidence_policy_schema();
     // Omission keeps the typed owner's Current default; the policy and its
     // exact evidence binding remain mandatory for every writable criterion.
@@ -660,6 +665,7 @@ fn writable_assignment_schema() -> JsonSchema {
     if let Some(properties) = &mut policy.properties {
         properties.insert("kind".into(), JsonSchema::string_enum(vec![json!("source_inspection")],
             Some("Writable workers require owned source evidence; root owns execution/integration checks.".into())));
+        properties.insert("required_evidence".into(), inspection.clone());
     }
     let criterion = JsonSchema::object(BTreeMap::from([
         ("id".into(), JsonSchema::string(None)),
@@ -682,8 +688,8 @@ fn writable_assignment_schema() -> JsonSchema {
             ("read_scope".into(), scopes.clone()),
             ("write_scope".into(), scopes),
             ("stop_condition".into(), JsonSchema::string(None)),
-            ("required_evidence".into(), strings.clone()),
-            ("prohibited_changes".into(), JsonSchema::array(JsonSchema::one_of(vec![paths, operations], None), None)),
+            ("required_evidence".into(), JsonSchema::array(inspection, Some("Every entry must have a matching criterion with an owned source-inspection policy; root owns execution/integration evidence.".into()))),
+            ("prohibited_changes".into(), JsonSchema::array(JsonSchema::one_of(vec![paths, operations], None), Some("Typed prohibitions only, e.g. [{\"kind\":\"delete\"},{\"kind\":\"move\"}]; use [] when no extra prohibition is needed. Free-text strings are not valid write contracts.".into()))),
             ("risk_hints".into(), strings.clone()),
             ("contract_claims".into(), strings.clone()),
             ("dependencies".into(), strings),

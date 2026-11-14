@@ -37,7 +37,6 @@ use super::ThreadStatus;
 use super::ThreadWatchManager;
 use super::Turn;
 use super::TurnItemsView;
-use super::TurnStatus;
 use super::apply_bespoke_event_handling;
 use super::build_legacy_api_turns_from_rollout_items;
 use super::info;
@@ -1218,7 +1217,18 @@ pub(super) async fn handle_pending_thread_resume_request(
         {
             Err(resume_listener_changed_error(conversation_id))
         } else if let Some(history_items) = pending.history_items.as_deref() {
-            if !state.seed_resume_history_for_listener(
+            if let Err(error) = codex_rollout::ensure_rollout_source_integrity(history_items) {
+                if pending.include_turns || pending.initial_turns_page.is_some() {
+                    Err(internal_error(error.to_string()))
+                } else {
+                    // Metadata-only admission returns no persisted history. Do
+                    // not seed or mark a partial index complete for later pages.
+                    if needs_stream_prefix {
+                        stream_prefix = state.active_stream_replay();
+                    }
+                    Ok(state.active_turn_snapshot())
+                }
+            } else if !state.seed_resume_history_for_listener(
                 history_items,
                 pending.listener_generation,
                 pending.history_generation,
@@ -1248,7 +1258,7 @@ pub(super) async fn handle_pending_thread_resume_request(
             return;
         }
     };
-    let history_items = pending.history_items.as_deref().unwrap_or(&[]);
+    let history_items = pending.history_items.unwrap_or_default();
     let listener_has_live_in_progress_turn;
     {
         // No listener event can interleave this capture and subscription commit.
@@ -1266,6 +1276,12 @@ pub(super) async fn handle_pending_thread_resume_request(
             );
         }
     }
+    if (pending.include_turns && resume_turns.is_none())
+        || (pending.initial_turns_page.is_some() && !pending.include_turns && indexed_initial_page.is_none())
+    {
+        outgoing.send_error(pending.request_id, internal_error("thread resume history index is unavailable or has partial source integrity".to_string())).await;
+        return;
+    }
     tracing::debug!(
         thread_id = %conversation_id,
         request_id = ?pending.request_id,
@@ -1281,6 +1297,9 @@ pub(super) async fn handle_pending_thread_resume_request(
     let core_turn_id = conversation.active_turn_id().await;
     let has_live_in_progress_turn = listener_has_live_in_progress_turn
         || core_running && core_turn_id.as_deref() == active_turn.as_ref().map(|turn| turn.id.as_str());
+    let live_turn_id = has_live_in_progress_turn
+        .then(|| active_turn.as_ref().map(|turn| turn.id.clone()))
+        .flatten();
     // Prefixes contain only events consumed by this listener generation and
     // are reset when its producer changes. Core may already be finished while
     // its terminal event is still queued: retain the listener-consistent prefix
@@ -1288,19 +1307,38 @@ pub(super) async fn handle_pending_thread_resume_request(
 
     let request_id = pending.request_id;
     let connection_id = request_id.connection_id;
-    let mut thread = pending.thread_summary;
-    let token_usage_snapshot = if pending.include_turns {
-        let usage = populate_thread_turns_from_history_with_token_usage(
-            &mut thread,
-            history_items,
-            active_turn.as_ref(),
-        );
-        if let Some(turns) = resume_turns {
-            thread.turns = turns;
+    let thread = pending.thread_summary;
+    let (mut thread, token_usage_snapshot, history_items, active_turn) = if pending.include_turns {
+        // Attribution needs the reconstructed history, not just the live index.
+        // Keep that CPU work (and disposal of its replaced turns) off Tokio's
+        // async workers without changing this listener command's event boundary.
+        match tokio::task::spawn_blocking(move || {
+            let mut thread = thread;
+            let usage = populate_thread_turns_from_history_with_token_usage(
+                &mut thread,
+                &history_items,
+                active_turn.as_ref(),
+            );
+            if let Some(turns) = resume_turns {
+                thread.turns = turns;
+            }
+            (thread, usage, history_items, active_turn)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                outgoing
+                    .send_error(
+                        request_id,
+                        internal_error(format!("thread resume history task failed: {error}")),
+                    )
+                    .await;
+                return;
+            }
         }
-        usage
     } else {
-        None
+        (thread, None, history_items, active_turn)
     };
 
     let thread_status = thread_watch_manager
@@ -1310,10 +1348,10 @@ pub(super) async fn handle_pending_thread_resume_request(
     set_thread_status_and_interrupt_stale_turns(
         &mut thread,
         thread_status,
-        has_live_in_progress_turn,
+        live_turn_id.as_deref(),
     );
     let initial_turns_page = if let Some(mut page) = indexed_initial_page {
-        super::thread_processor::normalize_thread_turns_status(&mut page.turns, thread.status.clone(), has_live_in_progress_turn);
+        super::thread_processor::normalize_thread_turns_status(&mut page.turns, live_turn_id.as_deref());
         let cursors = (|| {
             let backwards_cursor = page.turns.first()
                 .map(|turn| super::thread_processor::serialize_thread_turns_cursor(&turn.id, true))
@@ -1335,9 +1373,8 @@ pub(super) async fn handle_pending_thread_resume_request(
             super::thread_processor::build_thread_resume_initial_turns_page(&thread.turns, params)
         } else {
             super::thread_processor::build_thread_resume_initial_turns_page_from_history(
-                history_items,
-                thread.status.clone(),
-                has_live_in_progress_turn,
+                &history_items,
+                live_turn_id.as_deref(),
                 active_turn,
                 params,
             )
@@ -1391,7 +1428,7 @@ pub(super) async fn handle_pending_thread_resume_request(
         permission_profile: Some(permission_profile),
         active_permission_profile,
         reasoning_effort,
-        initial_turns_page,
+        initial_turns_page: initial_turns_page.map(super::thread_processor::omit_initial_turn_timing),
     };
     let committed = outgoing
         .send_resume_response_with_commit(request_id, response, originator, async {
@@ -1536,8 +1573,9 @@ pub(super) fn merge_turn_history_with_active_turn(turns: &mut Vec<Turn>, active_
 pub(super) fn set_thread_status_and_interrupt_stale_turns(
     thread: &mut Thread,
     loaded_status: ThreadStatus,
-    has_live_in_progress_turn: bool,
+    live_turn_id: Option<&str>,
 ) {
+    let has_live_in_progress_turn = live_turn_id.is_some();
     let loaded_status = match loaded_status {
         ThreadStatus::Active { active_flags, .. }
             if !has_live_in_progress_turn && active_flags.is_empty() =>
@@ -1547,13 +1585,7 @@ pub(super) fn set_thread_status_and_interrupt_stale_turns(
         status => status,
     };
     let status = resolve_thread_status(loaded_status, has_live_in_progress_turn);
-    if !matches!(status, ThreadStatus::Active { .. }) {
-        for turn in &mut thread.turns {
-            if matches!(turn.status, TurnStatus::InProgress) {
-                turn.status = TurnStatus::Interrupted;
-            }
-        }
-    }
+    super::thread_processor::normalize_thread_turns_status(&mut thread.turns, live_turn_id);
     thread.status = status;
 }
 

@@ -97,6 +97,8 @@ impl ConnectionDriver {
                 response_tx,
             } => match result {
                 Ok(HostResponse::SessionReady { session_id }) if session_id == session.id => {
+                    tracing::debug!(request_id = ?id, ?session_id, stage = "open_acknowledged",
+                        "code-mode host lifecycle");
                     let abandoned = cancellation.is_cancelled() || response_tx.is_closed();
                     self.sessions
                         .insert_ready(session.clone(), delegate, cleanup);

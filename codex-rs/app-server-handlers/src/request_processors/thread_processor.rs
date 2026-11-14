@@ -567,6 +567,10 @@ fn prepare_resume_response_history(
     ),
     JSONRPCErrorError,
 > {
+    if include_turns || initial_turns_page.is_some() {
+        codex_rollout::ensure_rollout_source_integrity(thread_history.get_rollout_items())
+            .map_err(|error| internal_error(error.to_string()))?;
+    }
     match thread_history {
         InitialHistory::Forked(items) => {
             let preview = preview_from_rollout_items(&items);
@@ -584,8 +588,7 @@ fn prepare_resume_response_history(
                 } else {
                     build_thread_resume_initial_turns_page_from_history(
                         &items,
-                        ThreadStatus::Idle,
-                        /*has_live_running_thread*/ false,
+                        /*live_turn_id*/ None,
                         /*active_turn*/ None,
                         params,
                     )?
@@ -2298,6 +2301,7 @@ impl ThreadRequestProcessor {
     pub(crate) async fn thread_list(
         &self,
         params: ThreadListParams,
+        diagnostic_operation: Option<&str>,
     ) -> Result<ThreadListResponse, JSONRPCErrorError> {
         let ThreadListParams {
             cursor,
@@ -2380,6 +2384,7 @@ impl ThreadRequestProcessor {
                     use_state_db_only,
                     relation_filter,
                 },
+                diagnostic_operation,
             )
             .await?;
         let mut threads = Vec::with_capacity(stored_threads.len());
@@ -2393,7 +2398,11 @@ impl ThreadRequestProcessor {
             );
             threads.push(thread);
         }
+        let status_observation = list_observation(diagnostic_operation, "thread_list_status_hydration");
         self.refresh_loaded_thread_statuses(&mut threads).await;
+        if let Some(observation) = status_observation {
+            observation.finish("completed", serde_json::Value::Null);
+        }
         Ok(ThreadListResponse {
             data: threads,
             next_cursor,
@@ -2647,10 +2656,18 @@ impl ThreadRequestProcessor {
             });
         };
 
-        let has_live_in_progress_turn = if let Some(loaded_thread) = loaded_thread.as_ref() {
-            matches!(loaded_thread.agent_status().await, AgentStatus::Running)
+        let listener_live_turn_id = if let Some(state) = self.thread_state_manager.existing_thread_state(thread_id).await {
+            let state = state.lock().await;
+            state.has_live_in_progress_turn().then(|| state.in_progress_turn_id().map(str::to_owned)).flatten()
         } else {
-            false
+            None
+        };
+        let core_live_turn_id = if let Some(loaded_thread) = loaded_thread.as_ref() {
+            if matches!(loaded_thread.agent_status().await, AgentStatus::Running) {
+                loaded_thread.active_turn_id().await
+            } else { None }
+        } else {
+            None
         };
 
         let thread_status = self
@@ -2661,7 +2678,7 @@ impl ThreadRequestProcessor {
         set_thread_status_and_interrupt_stale_turns(
             &mut thread,
             thread_status,
-            has_live_in_progress_turn,
+            listener_live_turn_id.as_deref().or(core_live_turn_id.as_deref()),
         );
         Ok(thread)
     }
@@ -2871,18 +2888,13 @@ impl ThreadRequestProcessor {
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     let loaded_thread = self.thread_manager.get_thread(thread_uuid).await.ok();
-                    let has_live_running_thread = match loaded_thread.as_ref() {
-                        Some(thread) => matches!(thread.agent_status().await, AgentStatus::Running),
-                        None => false,
+                    let live_turn_id = match loaded_thread.as_ref() {
+                        Some(thread) if matches!(thread.agent_status().await, AgentStatus::Running) => thread.active_turn_id().await,
+                        _ => None,
                     };
-                    let loaded_status = self
-                        .thread_watch_manager
-                        .loaded_status_for_thread(&thread_uuid.to_string())
-                        .await;
                     normalize_thread_turns_status(
                         &mut turns,
-                        loaded_status,
-                        has_live_running_thread,
+                        live_turn_id.as_deref(),
                     );
                     apply_thread_turns_items_view(&mut turns, items_view);
                     return Ok(ThreadTurnsListResponse {
@@ -2919,7 +2931,7 @@ impl ThreadRequestProcessor {
                     sort_direction,
                     items_view,
                 ),
-                state.in_progress_turn_id().is_some(),
+                state.has_live_in_progress_turn().then(|| state.in_progress_turn_id().map(str::to_owned)).flatten(),
                 state.turn_index_history_generation(),
             )
         };
@@ -2951,7 +2963,7 @@ impl ThreadRequestProcessor {
                         invalid_request("invalid cursor: anchor turn is no longer present")
                     })?
                     .ok_or_else(|| internal_error("seeded turn index was not initialized"))?;
-                (page, state.in_progress_turn_id().is_some())
+                (page, state.has_live_in_progress_turn().then(|| state.in_progress_turn_id().map(str::to_owned)).flatten())
             }
             Err(()) => {
                 return Err(invalid_request(
@@ -2961,16 +2973,12 @@ impl ThreadRequestProcessor {
         };
 
         let loaded_thread = self.thread_manager.get_thread(thread_uuid).await.ok();
-        let has_live_running_thread = match loaded_thread.as_ref() {
-            Some(thread) => matches!(thread.agent_status().await, AgentStatus::Running),
-            None => false,
+        let core_live_turn_id = match loaded_thread.as_ref() {
+            Some(thread) if matches!(thread.agent_status().await, AgentStatus::Running) => thread.active_turn_id().await,
+            _ => None,
         };
-        let loaded_status = self
-            .thread_watch_manager
-            .loaded_status_for_thread(&thread_uuid.to_string())
-            .await;
-        let has_live_in_progress_turn = has_live_running_thread || indexed_live_in_progress;
-        normalize_thread_turns_status(&mut page.turns, loaded_status, has_live_in_progress_turn);
+        let live_turn_id = indexed_live_in_progress.as_deref().or(core_live_turn_id.as_deref());
+        normalize_thread_turns_status(&mut page.turns, live_turn_id);
         let backwards_cursor = page
             .turns
             .first()
@@ -3820,7 +3828,7 @@ impl ThreadRequestProcessor {
                 set_thread_status_and_interrupt_stale_turns(
                     &mut thread,
                     ThreadStatus::Idle,
-                    /*has_live_in_progress_turn*/ false,
+                    /*live_turn_id*/ None,
                 );
                 self.thread_watch_manager.upsert_thread(&thread).await;
                 let config_snapshot = codex_thread.config_snapshot().await;
@@ -3833,7 +3841,8 @@ impl ThreadRequestProcessor {
                     config_snapshot.active_permission_profile,
                 );
                 let permission_profile = config_snapshot.permission_profile.clone();
-                let initial_turns_page = if let Some(page) = prepared_initial_turns_page {
+                let initial_turns_page = if let Some(mut page) = prepared_initial_turns_page {
+                    normalize_thread_turns_status(&mut page.data, None);
                     Some(page)
                 } else if let Some(params) = initial_turns_page.as_ref() {
                     let page = if include_turns {
@@ -3843,8 +3852,7 @@ impl ThreadRequestProcessor {
                             ResumeResponseHistory::Resumed(history) => {
                                 build_thread_resume_initial_turns_page_from_history(
                                     history.get_rollout_items(),
-                                    thread.status.clone(),
-                                    /*has_live_running_thread*/ false,
+                                    /*live_turn_id*/ None,
                                     /*active_turn*/ None,
                                     params,
                                 )
@@ -3887,7 +3895,7 @@ impl ThreadRequestProcessor {
                     permission_profile: Some(permission_profile),
                     active_permission_profile,
                     reasoning_effort: session_configured.reasoning_effort,
-                    initial_turns_page,
+                    initial_turns_page: initial_turns_page.map(omit_initial_turn_timing),
                 };
 
                 let connection_id = request_id.connection_id;
@@ -4446,11 +4454,22 @@ impl ThreadRequestProcessor {
         thread.path = rollout_path.map(Path::to_path_buf);
         let token_usage_snapshot = match (include_turns, &mut *response_history) {
             (true, ResumeResponseHistory::Resumed(history)) => {
-                super::thread_lifecycle::populate_thread_turns_from_history_with_token_usage(
-                    &mut thread,
-                    history.get_rollout_items(),
-                    /*active_turn*/ None,
-                )
+                // Resumed history shares its rollout Vec through Arc. Preserve
+                // token replay semantics without reducing it on an async worker.
+                let history = history.clone();
+                let (prepared_thread, snapshot) = tokio::task::spawn_blocking(move || {
+                    let mut thread = thread;
+                    let snapshot = super::thread_lifecycle::populate_thread_turns_from_history_with_token_usage(
+                        &mut thread,
+                        history.get_rollout_items(),
+                        /*active_turn*/ None,
+                    );
+                    (thread, snapshot)
+                })
+                .await
+                .map_err(|error| format!("thread resume history task failed: {error}"))?;
+                thread = prepared_thread;
+                snapshot
             }
             (
                 true,
@@ -4920,6 +4939,7 @@ impl ThreadRequestProcessor {
         sort_key: StoreThreadSortKey,
         sort_direction: SortDirection,
         filters: ThreadListFilters,
+        diagnostic_operation: Option<&str>,
     ) -> Result<(Vec<StoredThread>, Option<String>, Option<String>), JSONRPCErrorError> {
         let ThreadListFilters {
             project_id,
@@ -4947,13 +4967,14 @@ impl ThreadRequestProcessor {
                 }
             }
             None if relation_filter.is_some() => None,
-            None => Some(vec![
-                self.config_manager
-                    .load_latest_config(None)
-                    .await
-                    .map_config_load_error()?
-                    .model_provider_id,
-            ]),
+            None => {
+                let observation = list_observation(diagnostic_operation, "thread_list_config_resolution");
+                let result = self.config_manager.load_latest_config(None).await.map_config_load_error();
+                if let Some(observation) = observation {
+                    observation.finish(if result.is_ok() { "completed" } else { "error" }, serde_json::Value::Null);
+                }
+                Some(vec![result?.model_provider_id])
+            }
         };
         let (allowed_sources_vec, source_kind_filter) =
             if relation_filter.is_some() && source_kinds.is_none() {
@@ -4966,6 +4987,16 @@ impl ThreadRequestProcessor {
 
         while remaining > 0 {
             let page_size = remaining.min(THREAD_PAGE_MAX_LIMIT);
+            if let Some(operation) = diagnostic_operation {
+                let _ = codex_protocol::timing::observations::record(
+                    "thread_list_storage_selection", "", "", operation,
+                    serde_json::json!({"page_size":page_size, "has_cursor":cursor_obj.is_some(),
+                        "storage_mode":match use_state_db_only {
+                            None => "prefer_state_db", Some(true) => "state_db_only", Some(false) => "scan_and_repair"
+                        }}),
+                );
+            }
+            let observation = list_observation(diagnostic_operation, "thread_list_store_page");
             let page = self
                 .thread_store
                 .list_threads(StoreListThreadsParams {
@@ -4987,7 +5018,11 @@ impl ThreadRequestProcessor {
                     relation_filter,
                 })
                 .await
-                .map_err(thread_store_list_error)?;
+                .map_err(thread_store_list_error);
+            if let Some(observation) = observation {
+                observation.finish(if page.is_ok() { "completed" } else { "error" }, serde_json::Value::Null);
+            }
+            let page = page?;
 
             let mut filtered = Vec::with_capacity(page.items.len());
             for it in page.items {
@@ -5035,6 +5070,11 @@ impl ThreadRequestProcessor {
 
         Ok((items, next_cursor, backwards_cursor))
     }
+}
+
+fn list_observation(operation: Option<&str>, phase: &str) -> Option<codex_protocol::timing::observations::Span> {
+    operation.map(|operation| codex_protocol::timing::observations::Span::start(
+        phase, "", "", operation, serde_json::Value::Null))
 }
 
 const MCP_ELICITATIONS_AUTO_DENY: bool = false;
@@ -5190,23 +5230,20 @@ struct ThreadTurnsPageOptions<'a> {
 
 fn build_thread_turns_page_response(
     items: &[RolloutItem],
-    loaded_status: ThreadStatus,
-    has_live_running_thread: bool,
+    live_turn_id: Option<&str>,
     active_turn: Option<Turn>,
     options: ThreadTurnsPageOptions<'_>,
 ) -> Result<ThreadTurnsListResponse, JSONRPCErrorError> {
-    let has_live_in_progress_turn = has_live_running_thread
-        || active_turn.as_ref().is_some_and(|turn| matches!(turn.status, TurnStatus::InProgress));
     let mut turns = codex_app_server_protocol_projection::build_turns_from_rollout_items_with_items_view(
         items.iter().filter(|item| codex_rollout::is_persisted_rollout_item(
             item, codex_protocol::protocol::ThreadHistoryMode::Legacy,
         )),
         options.items_view,
     );
-    normalize_thread_turns_status(&mut turns, loaded_status, has_live_in_progress_turn);
     if let Some(active_turn) = active_turn {
         merge_turn_history_with_active_turn(&mut turns, active_turn);
     }
+    normalize_thread_turns_status(&mut turns, live_turn_id);
     let mut page =
         paginate_thread_turns(turns, options.cursor, options.limit, options.sort_direction)?;
     apply_thread_turns_items_view(&mut page.turns, options.items_view);
@@ -5215,6 +5252,17 @@ fn build_thread_turns_page_response(
         next_cursor: page.next_cursor,
         backwards_cursor: page.backwards_cursor,
     })
+}
+
+pub(super) fn omit_initial_turn_timing(
+    mut page: codex_app_server_protocol_types::TurnsPage,
+) -> codex_app_server_protocol_types::TurnsPage {
+    // The resume preview is for opening history, not transferring potentially
+    // multi-megabyte diagnostic evidence. Explicit full turn reads retain it.
+    for turn in &mut page.data {
+        turn.timing = None;
+    }
+    page
 }
 
 pub(super) fn build_thread_resume_initial_turns_page(
@@ -5259,15 +5307,13 @@ pub(super) fn build_thread_resume_initial_turns_page(
 
 pub(super) fn build_thread_resume_initial_turns_page_from_history(
     items: &[RolloutItem],
-    loaded_status: ThreadStatus,
-    has_live_running_thread: bool,
+    live_turn_id: Option<&str>,
     active_turn: Option<Turn>,
     params: &ThreadResumeInitialTurnsPageParams,
 ) -> Result<codex_app_server_protocol_types::TurnsPage, JSONRPCErrorError> {
     build_thread_turns_page_response(
         items,
-        loaded_status,
-        has_live_running_thread,
+        live_turn_id,
         active_turn,
         ThreadTurnsPageOptions {
             cursor: None,
@@ -5281,6 +5327,9 @@ pub(super) fn build_thread_resume_initial_turns_page_from_history(
 
 fn apply_thread_turns_items_view(turns: &mut [Turn], items_view: TurnItemsView) {
     for turn in turns {
+        if items_view != TurnItemsView::Full {
+            turn.timing = None;
+        }
         match items_view {
             TurnItemsView::NotLoaded => {
                 turn.items.clear();
@@ -5309,15 +5358,10 @@ fn apply_thread_turns_items_view(turns: &mut [Turn], items_view: TurnItemsView) 
 
 pub(super) fn normalize_thread_turns_status(
     turns: &mut [Turn],
-    loaded_status: ThreadStatus,
-    has_live_in_progress_turn: bool,
+    live_turn_id: Option<&str>,
 ) {
-    let status = resolve_thread_status(loaded_status, has_live_in_progress_turn);
-    if matches!(status, ThreadStatus::Active { .. }) {
-        return;
-    }
     for turn in turns {
-        if matches!(turn.status, TurnStatus::InProgress) {
+        if matches!(turn.status, TurnStatus::InProgress) && Some(turn.id.as_str()) != live_turn_id {
             turn.status = TurnStatus::Interrupted;
         }
     }

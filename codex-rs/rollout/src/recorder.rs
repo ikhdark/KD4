@@ -1362,7 +1362,25 @@ impl RolloutRecorder {
                 decoder.note_undecoded_record();
                 continue;
             }
-            if let Some(item) = decoder.decode(&line, reader.last_line_terminated())? {
+            // Keep small records on the fast path, but avoid monopolizing an
+            // async worker while parsing a large hydrated payload. Decode in
+            // sequence and move the decoder/string rather than cloning them.
+            const BLOCKING_DECODE_THRESHOLD_BYTES: usize = 256 * 1024;
+            let terminated = reader.last_line_terminated();
+            let decoded = if line.len() >= BLOCKING_DECODE_THRESHOLD_BYTES {
+                let (returned_decoder, result) = tokio::task::spawn_blocking(move || {
+                    let mut decoder = decoder;
+                    let result = decoder.decode(&line, terminated);
+                    (decoder, result)
+                })
+                .await
+                .map_err(|error| IoError::other(format!("rollout decode task failed: {error}")))?;
+                decoder = returned_decoder;
+                result
+            } else {
+                decoder.decode(&line, terminated)
+            };
+            if let Some(item) = decoded? {
                 visit(item, decoder.record_number);
             }
         }

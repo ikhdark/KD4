@@ -866,9 +866,8 @@ impl ThreadManager {
         &self,
         thread_id: ThreadId,
     ) -> CodexResult<Vec<ThreadId>> {
-        // Archive and delete act on the known subtree. Waiting for global backfill
-        // certification would block them indefinitely when historical payload gaps
-        // keep it withdrawn.
+        // Read-only callers can traverse known edges while global certification
+        // is withdrawn. Destructive callers enforce coverage at removal admission.
         self.state
             .reconciled_agent_subtree(thread_id, Vec::new())
             .await

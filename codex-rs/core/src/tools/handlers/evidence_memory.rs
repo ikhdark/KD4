@@ -277,8 +277,14 @@ fn constraints(fix: &Value, relative: &str, symbol: Option<&str>, change: Option
             constraint["verification"].as_array().into_iter().flatten().filter(|v|
                 v["receipt_sha256"].as_str().is_some_and(|hash| fix["receipts"].as_array()
                     .is_some_and(|refs| refs.iter().any(|r| r["sha256"] == hash))))
-                .take(2).map(|v| json!({"kind":bounded(&v["kind"],32),
-                    "receipt_sha256":v["receipt_sha256"], "selector":bounded(&v["selector"],240)})).collect()
+                .take(2).map(|v| {
+                    let mut target = json!({"kind":bounded(&v["kind"],32),
+                        "receipt_sha256":v["receipt_sha256"], "selector":bounded(&v["selector"],240)});
+                    if !v["recorded_proof_valid"].is_null() {
+                        target["recorded_proof_valid"] = v["recorded_proof_valid"].clone();
+                    }
+                    target
+                }).collect()
         } else { Vec::new() };
         Some(json!({"id":bounded(&constraint["id"],120),
             "broken_behavior":bounded(&constraint["broken_behavior"],240),
@@ -345,14 +351,29 @@ async fn lookup(
             && let Some((index, hash)) = loaded.as_mut()
         {
             for fix in view["fixes"].as_array().into_iter().flatten() {
-                let rows: Vec<Value> = fix["contract"].as_array().into_iter().flatten().map(|condition|
+                let mut receipts = Vec::new();
+                let rows: Vec<Value> = fix["contract"].as_array().into_iter().flatten().map(|condition| {
+                    let verification: Vec<Value> = condition["id"].as_str().filter(|id| !id.is_empty() && id.len() <= 120)
+                        .into_iter().flat_map(|id| fix["proofs"].as_array().into_iter().flatten().filter_map(move |proof| {
+                            if proof["condition_id"].as_str() != Some(id) { return None; }
+                            let valid = match proof["valid"].as_i64()? { 0 => false, 1 => true, _ => return None };
+                            let reference = &proof["receipt"];
+                            let hash = reference["sha256"].as_str().filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))?;
+                            let path = reference["receipt"].as_str().filter(|s| !s.is_empty() && s.len() <= 240)?;
+                            let selector = reference["selector"].as_str().filter(|s| s.len() <= 240 && *s == format!("/checks/{id}"))?;
+                            Some((json!({"kind":"ledger_proof", "path":path, "sha256":hash}),
+                                json!({"kind":"ledger_proof", "receipt_sha256":hash, "selector":selector,
+                                    "recorded_proof_valid":valid})))
+                        })).take(2).map(|(receipt, target)| { receipts.push(receipt); target }).collect();
                     json!({"id":condition["id"],"broken_behavior":condition["behavior"],
                         "correction":"Recorded KDR behavioral verification; preserve the declared contract.",
-                        "must_remain_true":condition["behavior"],"scopes":condition["scopes"]})).collect();
+                        "must_remain_true":condition["behavior"],"scopes":condition["scopes"],
+                        "verification":verification})
+                }).collect();
                 let paths: Vec<Value> = fix["contract"].as_array().into_iter().flatten()
                     .flat_map(|c| c["scopes"].as_array().into_iter().flatten().map(|s|s["path"].clone())).collect();
                 if let Some(fixes) = index["fixes"].as_array_mut() {
-                    fixes.push(json!({"id":fix["id"],"paths":paths,"receipts":[],
+                    fixes.push(json!({"id":fix["id"],"paths":paths,"receipts":receipts,
                         "behavioral_constraints":rows,"ledger_status":fix["status"],"ledger_revision":view["revision"]}));
                 }
             }

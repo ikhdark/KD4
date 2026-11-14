@@ -66,6 +66,9 @@ pub fn build_turns_from_rollout_items_with_items_view<'a>(
     }
     let mut turns = builder.finish();
     for turn in &mut turns {
+        if items_view != TurnItemsView::Full {
+            turn.timing = None;
+        }
         match items_view {
             TurnItemsView::Full => {}
             TurnItemsView::NotLoaded => turn.items = Vec::new(),

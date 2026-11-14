@@ -362,8 +362,18 @@ impl LocalThreadStore {
     ) -> ThreadStoreResult<()> {
         if let Some(projection) = projection::existing_entry(self, thread_id).await {
             let _operation = projection.acquire_operation().await?;
-            live_writer::flush_thread(self, thread_id, durable).await?;
-            projection.commit_pending().await?;
+            let store = self.clone();
+            // Once writer work is admitted, retain its projection settlement
+            // and operation order even if the requesting future is cancelled.
+            tokio::spawn(async move {
+                let _operation = _operation;
+                live_writer::flush_thread(&store, thread_id, durable).await?;
+                projection.commit_pending().await
+            })
+            .await
+            .map_err(|error| ThreadStoreError::Internal {
+                message: format!("flush projection handoff failed: {error}"),
+            })??;
         } else {
             live_writer::flush_thread(self, thread_id, durable).await?;
         }
@@ -429,10 +439,18 @@ impl ThreadStore for LocalThreadStore {
             if persisted_items.is_empty() {
                 return Ok(());
             }
-            live_writer::append_persisted_items_ordered(self, thread_id, &persisted_items).await?;
-            projection.append_pending(persisted_items).await;
-            live_writer::flush_thread(self, thread_id, false).await?;
-            projection.commit_pending().await
+            let store = self.clone();
+            tokio::spawn(async move {
+                let _operation = _operation;
+                live_writer::append_persisted_items_ordered(&store, thread_id, &persisted_items).await?;
+                projection.append_pending(persisted_items).await;
+                live_writer::flush_thread(&store, thread_id, false).await?;
+                projection.commit_pending().await
+            })
+            .await
+            .map_err(|error| ThreadStoreError::Internal {
+                message: format!("append projection handoff failed: {error}"),
+            })?
         })
     }
 
@@ -445,11 +463,19 @@ impl ThreadStore for LocalThreadStore {
             );
             let (projection, _operation) =
                 projection::initialized_entry_for_append(self, thread_id).await?;
-            live_writer::append_persisted_items_ordered(self, thread_id, &persisted_items).await?;
-            if !persisted_items.is_empty() {
-                projection.append_pending(persisted_items).await;
-            }
-            Ok(())
+            let store = self.clone();
+            tokio::spawn(async move {
+                let _operation = _operation;
+                live_writer::append_persisted_items_ordered(&store, thread_id, &persisted_items).await?;
+                if !persisted_items.is_empty() {
+                    projection.append_pending(persisted_items).await;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|error| ThreadStoreError::Internal {
+                message: format!("ordered append projection handoff failed: {error}"),
+            })?
         })
     }
 
@@ -464,10 +490,19 @@ impl ThreadStore for LocalThreadStore {
             }
             let (projection, _operation) =
                 projection::initialized_entry_for_append(self, thread_id).await?;
-            live_writer::append_persisted_items_ordered(self, thread_id, items).await?;
-            projection.append_pending(items.to_vec()).await;
-            live_writer::flush_thread(self, thread_id, false).await?;
-            projection.commit_pending().await
+            let store = self.clone();
+            let items = items.to_vec();
+            tokio::spawn(async move {
+                let _operation = _operation;
+                live_writer::append_persisted_items_ordered(&store, thread_id, &items).await?;
+                projection.append_pending(items).await;
+                live_writer::flush_thread(&store, thread_id, false).await?;
+                projection.commit_pending().await
+            })
+            .await
+            .map_err(|error| ThreadStoreError::Internal {
+                message: format!("persisted append projection handoff failed: {error}"),
+            })?
         })
     }
 
@@ -503,8 +538,16 @@ impl ThreadStore for LocalThreadStore {
         Box::pin(async move {
             if let Some(projection) = projection::existing_entry(self, thread_id).await {
                 let _operation = projection.acquire_operation().await?;
-                live_writer::persist_thread(self, thread_id).await?;
-                projection.commit_pending().await?;
+                let store = self.clone();
+                tokio::spawn(async move {
+                    let _operation = _operation;
+                    live_writer::persist_thread(&store, thread_id).await?;
+                    projection.commit_pending().await
+                })
+                .await
+                .map_err(|error| ThreadStoreError::Internal {
+                    message: format!("persist projection handoff failed: {error}"),
+                })??;
             } else {
                 live_writer::persist_thread(self, thread_id).await?;
             }
@@ -524,9 +567,18 @@ impl ThreadStore for LocalThreadStore {
         Box::pin(async move {
             if let Some(projection) = projection::existing_entry(self, thread_id).await {
                 let _operation = projection.acquire_operation().await?;
-                live_writer::shutdown_thread(self, thread_id).await?;
-                projection.commit_pending().await?;
-                projection::remove_if_current(self, thread_id, &projection).await;
+                let store = self.clone();
+                tokio::spawn(async move {
+                    let _operation = _operation;
+                    live_writer::shutdown_thread(&store, thread_id).await?;
+                    projection.commit_pending().await?;
+                    projection::remove_if_current(&store, thread_id, &projection).await;
+                    Ok::<_, ThreadStoreError>(())
+                })
+                .await
+                .map_err(|error| ThreadStoreError::Internal {
+                    message: format!("shutdown projection handoff failed: {error}"),
+                })??;
             } else {
                 live_writer::shutdown_thread(self, thread_id).await?;
             }

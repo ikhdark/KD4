@@ -49,4 +49,4 @@ Give one brief initial update for multi-step work, then only material findings o
 ## Task-specific work
 
 For performance claims, use representative matched baseline/candidate measurements and retain workload, configuration, identities, repetitions and raw results; microbenchmarks do not prove end-to-end gains.
-For audits/reviews, cover the full requested scope and every assigned entry or recommendation. Separate verified actionable defects from candidates and coverage gaps, and follow the requested reporting format. Project-specific workflows belong in project guidance.
+For audits/reviews, cover the full requested scope and every assigned entry or recommendation. Separate verified actionable defects from candidates and coverage gaps, and follow the requested reporting format. Judge review completion against its own acceptance criteria: separately owned historical gaps or defers do not keep a completed review open unless resolving them is in scope, and closing the review does not close those findings. Project-specific workflows belong in project guidance.

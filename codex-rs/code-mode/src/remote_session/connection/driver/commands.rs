@@ -112,6 +112,8 @@ impl ConnectionDriver {
             }
         };
         let cancellation = CancellableRequest::new(caller_cancellation);
+        tracing::debug!(?request_id, session_id = ?session.id, stage = "open_queued",
+            "code-mode host lifecycle");
         self.requests.insert_pending(
             request_id,
             PendingRequest::OpenSession {

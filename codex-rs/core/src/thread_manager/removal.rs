@@ -75,6 +75,24 @@ impl ThreadManager {
         &self,
         root: ThreadId,
     ) -> CodexResult<(ThreadRemovalGuard, Vec<ThreadId>)> {
+        // Read-only restoration can use known edges, but destructive operations
+        // must not orphan descendants missing from an incomplete index.
+        let store = self.state.agent_graph_store().ok_or_else(|| {
+            CodexErr::InvalidRequest(
+                "descendant coverage is unavailable; archive or delete requires a durable index"
+                    .to_string(),
+            )
+        })?;
+        if !store
+            .await_edge_coverage()
+            .await
+            .map_err(|err| CodexErr::Fatal(err.to_string()))?
+        {
+            return Err(CodexErr::InvalidRequest(
+                "thread index is incomplete; archive or delete requires complete descendant coverage"
+                    .to_string(),
+            ));
+        }
         let mut guard = ThreadRemovalGuard {
             state: Arc::clone(&self.state),
             ids: HashSet::new(),

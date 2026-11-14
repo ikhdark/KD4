@@ -189,11 +189,16 @@ impl FsRequestProcessor {
         let path = PathUri::from_abs_path(&params.path);
         let metadata = self
             .file_system()
-            .inspect_err(|_| finish_fs_observation(&mut observation, "filesystem_unavailable", || serde_json::Value::Null))?
+            .inspect_err(|_| finish_fs_observation(&mut observation, "filesystem_unavailable", || serde_json::Value::Null))
+            .map_err(|error| with_metadata_error_data(error, "filesystem_unavailable", None))?
             .get_metadata(&path, /*sandbox*/ None)
             .await
             .inspect_err(|error| observe_fs_error(&mut observation, error))
-            .map_err(map_fs_error)?;
+            .map_err(|error| {
+                let kind = metadata_error_kind(error.kind());
+                let os_error_code = error.raw_os_error();
+                with_metadata_error_data(map_fs_error(error), kind, os_error_code)
+            })?;
         finish_fs_observation(&mut observation, "metadata_read", || serde_json::json!({
             "file_bytes":metadata.size, "is_file":metadata.is_file,
             "is_directory":metadata.is_directory, "is_symlink":metadata.is_symlink}));
@@ -348,7 +353,8 @@ impl FsRequestProcessor {
 // file contents or io::Error messages (which may contain all of those).
 fn fs_observation(operation: Option<&str>, method: &str) -> Option<codex_protocol::timing::observations::Span> {
     operation.map(|operation| codex_protocol::timing::observations::Span::start(
-        "mobile_file_read", "", "", operation, serde_json::json!({"method":method})))
+        if operation.starts_with("local:") { "local_file_read" } else { "mobile_file_read" },
+        "", "", operation, serde_json::json!({"method":method})))
 }
 
 fn finish_fs_observation(
@@ -364,6 +370,35 @@ fn finish_fs_observation(
 fn observe_fs_error(observation: &mut Option<codex_protocol::timing::observations::Span>, error: &io::Error) {
     finish_fs_observation(observation, "io_error", || serde_json::json!({
         "io_error_kind":format!("{:?}", error.kind()), "os_error_code":error.raw_os_error()}));
+}
+
+fn metadata_error_kind(kind: io::ErrorKind) -> &'static str {
+    match kind {
+        io::ErrorKind::NotFound => "not_found",
+        io::ErrorKind::PermissionDenied => "permission_denied",
+        io::ErrorKind::InvalidInput => "invalid_input",
+        io::ErrorKind::AlreadyExists => "already_exists",
+        io::ErrorKind::NotADirectory => "not_directory",
+        io::ErrorKind::IsADirectory => "is_directory",
+        io::ErrorKind::Unsupported => "unsupported",
+        io::ErrorKind::Interrupted => "interrupted",
+        io::ErrorKind::TimedOut => "timed_out",
+        _ => "other",
+    }
+}
+
+fn with_metadata_error_data(
+    mut error: JSONRPCErrorError,
+    kind: &'static str,
+    os_error_code: Option<i32>,
+) -> JSONRPCErrorError {
+    let data = error.data.get_or_insert_with(|| serde_json::json!({}));
+    if let Some(data) = data.as_object_mut() {
+        data.insert("kdrFs".to_owned(), serde_json::json!({
+            "version": 1, "errorKind": kind, "osErrorCode": os_error_code
+        }));
+    }
+    error
 }
 
 fn write_file_size_error() -> JSONRPCErrorError {

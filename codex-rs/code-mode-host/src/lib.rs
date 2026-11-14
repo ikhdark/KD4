@@ -417,9 +417,13 @@ impl HostState {
         }
         match request {
             HostRequest::OpenSession { session_id } => {
+                tracing::info!(?request_id, ?session_id, stage = "open_received",
+                    "code-mode host lifecycle");
                 let result = self
                     .open_session(session_id.clone())
                     .map(|()| HostResponse::SessionReady { session_id });
+                tracing::info!(?request_id, ready = result.is_ok(), stage = "open_initialized",
+                    "code-mode host lifecycle");
                 self.respond(request_id, result);
             }
             HostRequest::Execute {
