@@ -421,10 +421,13 @@ pub(crate) async fn run_workspace_hook_with_receipt<T: Send + 'static>(
             let mut tracker = tracker.lock().await;
             let before_revision = tracker.current_mutation_revision();
             tracker.record_unknown_mutation();
-            Some(WorkspaceHookMutationReceipt {
+            let receipt = Some(WorkspaceHookMutationReceipt {
                 before_revision,
                 after_revision: tracker.current_mutation_revision(),
-            })
+            });
+            drop(tracker);
+            session.invalidate_tool_history_sources(None, None).await;
+            receipt
         } else {
             None
         };
@@ -682,12 +685,14 @@ struct ToolCallWorkspaceEvidenceContext {
         Option<std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>>,
     workspace_admission_hint: Option<(crate::tool_history::WorkspaceCallClassification, bool)>,
     baseline_slot: Option<WorkspaceEvidenceBaselineSlot>,
+    history_gate_slot: Option<Arc<Mutex<Option<WorkspaceGateGuard>>>>,
     admitted_revision: Option<Arc<Mutex<Option<u64>>>>,
     dispatch_state: Option<Arc<ToolDispatchState>>,
 }
 
 struct WorkspaceEvidenceAfterCall<'a> {
     response: &'a ResponseInputItem,
+    captured_current: bool,
     baseline: Option<WorkspaceEvidenceBaseline>,
     source_dependencies_override:
         Option<std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>>,
@@ -1327,6 +1332,8 @@ impl ToolCallRuntime {
         response: &ResponseInputItem,
         baseline: Option<WorkspaceEvidenceBaseline>,
         mutation_advanced: bool,
+        captured_current: bool,
+        history_gate: Option<WorkspaceGateGuard>,
         source_dependencies_override: Option<
             std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
         >,
@@ -1337,7 +1344,9 @@ impl ToolCallRuntime {
         }
         // Preserve admission ordering without a compatible baseline or after
         // an instrumented mutation.
-        let gate_guard = if baseline.is_none() || mutation_advanced {
+        let gate_guard = if history_gate.is_some() {
+            history_gate
+        } else if baseline.is_none() || mutation_advanced {
             Some(
                 WorkspaceGateGuard::Shared {
                     _guard: Arc::clone(&self.parallel_execution).read_owned().await,
@@ -1352,6 +1361,7 @@ impl ToolCallRuntime {
             self.step_context.turn.as_ref(),
             WorkspaceEvidenceAfterCall {
                 response,
+                captured_current,
                 baseline,
                 source_dependencies_override,
                 classification,
@@ -1368,6 +1378,7 @@ impl ToolCallRuntime {
     ) -> bool {
         let WorkspaceEvidenceAfterCall {
             response,
+            captured_current,
             baseline,
             source_dependencies_override,
             classification,
@@ -1383,18 +1394,15 @@ impl ToolCallRuntime {
         );
         let workspace_gate_guard =
             workspace_gate_guard.map(WorkspaceGateGuard::downgrade_for_observation);
-        // History projection and persistence do not need the workspace lease,
-        // even when they wait for session state.
-        drop(workspace_gate_guard);
         Self::register_workspace_evidence_observation(
             session,
             turn,
             WorkspaceEvidenceObservation {
                 response,
-                captured_current: true,
+                captured_current,
                 source_scope_complete: classification.source_scope_complete,
                 source_dependencies,
-                workspace_gate_guard: None,
+                workspace_gate_guard,
             },
         )
         .await;
@@ -1406,7 +1414,6 @@ impl ToolCallRuntime {
         turn: &TurnContext,
         input: WorkspaceEvidenceObservation<'_>,
     ) {
-        drop(input.workspace_gate_guard);
         // Record only already-acquired, scoped source output. Do not revive
         // command freshness tracking or perform another source read.
         if input.source_dependencies.is_empty() {
@@ -1421,7 +1428,7 @@ impl ToolCallRuntime {
         ) {
             session.register_workspace_evidence(
                 observation.with_source_scope_complete(input.source_scope_complete),
-                (),
+                input.workspace_gate_guard,
             ).await;
         }
     }
@@ -1795,6 +1802,8 @@ impl ToolCallRuntime {
             let workspace_evidence_baseline_slot = (observes_workspace || pre_tool_use_hook_may_run).then(|| {
                 Arc::new(Mutex::new(None))
             });
+            let history_gate_slot = (observes_workspace && !passive_poll)
+                .then(|| Arc::new(Mutex::new(None)));
             let mutation_tracker = Arc::clone(&self.tracker);
             let error_call = call.clone();
             let owner_tool_name = call.tool_name.clone();
@@ -1813,11 +1822,15 @@ impl ToolCallRuntime {
                     ),
                     workspace_admission_hint: Some((workspace_call_classification.clone(), read_only)),
                     baseline_slot: workspace_evidence_baseline_slot.clone(),
+                    history_gate_slot: history_gate_slot.clone(),
                     admitted_revision: None,
                     dispatch_state: Some(Arc::clone(&dispatch_state)),
                 },
             );
             let result = future.await;
+            let mut history_gate = history_gate_slot.and_then(|slot| {
+                slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+            });
             let captured_workspace_baseline = workspace_evidence_baseline_slot.and_then(|slot| {
                 let mut slot = slot
                     .lock()
@@ -1830,6 +1843,7 @@ impl ToolCallRuntime {
             evidence_timing.mark_output_collected();
             match result {
                 Ok(mut response) => {
+                    let captured_current = !response.workspace_source_invalidated;
                     let mutation_advanced = if let Some(before) = mutation_revision_before {
                         mutation_tracker.lock().await.current_mutation_revision() > before
                     } else {
@@ -1983,6 +1997,8 @@ impl ToolCallRuntime {
                         &response,
                         workspace_revision_before,
                         mutation_advanced,
+                        captured_current,
+                        history_gate.take(),
                         source_dependencies_override,
                         &evidence_classification,
                     )
@@ -2053,6 +2069,8 @@ impl ToolCallRuntime {
                         &response,
                         workspace_revision_before,
                         mutation_advanced,
+                        false,
+                        history_gate.take(),
                         None,
                         &workspace_call_classification,
                     )
@@ -2179,6 +2197,7 @@ impl ToolCallRuntime {
             projection_source_dependencies,
             workspace_admission_hint,
             baseline_slot: workspace_evidence_baseline_slot,
+            history_gate_slot,
             admitted_revision,
             dispatch_state,
         } = workspace_evidence;
@@ -2535,6 +2554,7 @@ impl ToolCallRuntime {
                                 }
                                 admission_dispatch_state.try_complete();
                                 return Ok(AnyToolResult {
+                                    workspace_source_invalidated: false,
                                     call_id: dispatch_call.call_id,
                                     payload: dispatch_call.payload,
                                     operation_history: None,
@@ -2748,6 +2768,7 @@ impl ToolCallRuntime {
                     .as_ref()
                     .ok()
                     .and_then(|result| result.projected_source_dependencies().cloned());
+                let captured_current = result.as_ref().is_ok_and(|result| !result.workspace_source_invalidated);
                 let evidence_revision_before = evidence_revision_before.filter(|_| {
                     workspace_call_classification
                         .as_ref()
@@ -2791,6 +2812,7 @@ impl ToolCallRuntime {
                             turn.as_ref(),
                             WorkspaceEvidenceAfterCall {
                                 response,
+                                captured_current,
                                 baseline: evidence_revision_before,
                                 source_dependencies_override,
                                 classification,
@@ -2803,7 +2825,11 @@ impl ToolCallRuntime {
                         timing.record_workspace_evidence_after(evidence_capture_started.elapsed());
                     }
                 } else {
-                    drop(gate_guard);
+                    if let Some(slot) = history_gate_slot {
+                        *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = gate_guard;
+                    } else {
+                        drop(gate_guard);
+                    }
                 }
                 result
             }))));
@@ -3268,6 +3294,7 @@ impl ToolCallRuntime {
 
     fn aborted_response(call: &ToolCall, secs: f32, invocation: &ToolInvocation) -> AnyToolResult {
         AnyToolResult {
+            workspace_source_invalidated: false,
             call_id: call.call_id.clone(),
             payload: call.payload.clone(),
             operation_history: None,

@@ -20,7 +20,7 @@ use sha2::Sha256;
 
 const REMOTE_COMPACTION_TOOL_RECEIPT_MAX_TOKENS: usize = 2_000;
 const REMOTE_COMPACTION_TOOL_RECEIPT_MAX_ITEMS: usize = 32;
-const REMOTE_COMPACTION_TRANSPORT_RESERVE_TOKENS: i64 = 512;
+pub(crate) const REMOTE_COMPACTION_TRANSPORT_RESERVE_TOKENS: i64 = 512;
 const TOOL_SEARCH_RECEIPT_KIND: &str = "tool_search_receipt";
 const TOOL_SEARCH_RECEIPT_MAX_TOKENS: usize = 256;
 const TOOL_SEARCH_ARGUMENT_VALUE_MAX_TOKENS: usize = 64;
@@ -424,6 +424,7 @@ pub(crate) fn trim_function_call_history_to_fit_context_window_for_prompt(
     base_instructions: &BaseInstructions,
     prepared_items: Option<&[ResponseItem]>,
     request_overhead_tokens: i64,
+    observation_id: Option<u64>,
 ) -> (usize, i64) {
     let Some(context_window) = turn_context.model_context_window() else {
         return (0, 0);
@@ -438,6 +439,15 @@ pub(crate) fn trim_function_call_history_to_fit_context_window_for_prompt(
     let estimated_tokens_before = estimated_tokens;
     let context_window =
         i128::from(context_window.saturating_sub(REMOTE_COMPACTION_TRANSPORT_RESERVE_TOKENS));
+    if let Some(id) = observation_id {
+        use std::io::Write;
+        let value = serde_json::json!({
+            "phase": "trim_budget", "id": id,
+            "local_trim_tokens": estimated_tokens.to_string(),
+            "effective_window": context_window.to_string(),
+        });
+        let _ = writeln!(std::io::stderr().lock(), "kdr_compaction_budget {value}");
+    }
     if estimated_tokens <= context_window {
         return (0, 0);
     }
@@ -507,6 +517,15 @@ pub(crate) fn trim_function_call_history_to_fit_context_window_for_prompt(
     }
 
     let rewritten_outputs = replacements.len();
+    if let Some(id) = observation_id {
+        use std::io::Write;
+        let indices = replacements
+            .iter()
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>();
+        let value = serde_json::json!({"phase": "rewrites", "id": id, "indices": indices});
+        let _ = writeln!(std::io::stderr().lock(), "kdr_compaction_budget {value}");
+    }
     if rewritten_outputs > 0 {
         let mut items = history.raw_items().to_vec();
         for (index, rewritten_item) in replacements {

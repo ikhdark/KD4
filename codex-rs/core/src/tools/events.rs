@@ -773,11 +773,15 @@ async fn emit_exec_end(
     // without parsing commands, taking workspace baselines, or changing patch diffs.
     if exec_result.status != ExecCommandStatus::Declined {
         if let Some(tracker) = ctx.turn_diff_tracker {
-            let revision = {
+            let (revision, may_have_mutated) = {
                 let mut tracker = tracker.lock().await;
+                let before = tracker.unproven_command_revision();
                 tracker.record_command_execution(ctx.call_id);
-                tracker.current_mutation_revision()
+                (tracker.current_mutation_revision(), tracker.unproven_command_revision() != before)
             };
+            if may_have_mutated {
+                ctx.session.invalidate_tool_history_sources(None, Some(ctx.call_id)).await;
+            }
             ctx.session.services.command_execution
                 .invalidate_repository_revision(&ctx.turn.sub_id, revision).await;
         }
@@ -860,9 +864,15 @@ async fn emit_patch_end(
     tracker_update: TurnDiffTrackerUpdate<'_>,
 ) -> CodexResult<()> {
     let effects = patch_effects(&tracker_update);
+    let changed_paths = effects.changes.iter().filter(|change| change.before != change.after)
+        .map(|change| change.path.to_path_buf()).collect::<std::collections::BTreeSet<_>>();
+    if !effects.exact || !changed_paths.is_empty() {
+        ctx.session.invalidate_tool_history_sources(
+            effects.exact.then_some(changed_paths.clone()), Some(ctx.call_id),
+        ).await;
+    }
     if effects.exact {
-        let changed_paths = effects.changes.iter().filter(|change| change.before != change.after)
-            .map(|change| change.path.to_path_buf()).collect::<Vec<_>>();
+        let changed_paths = changed_paths.into_iter().collect::<Vec<_>>();
         let environment = match &tracker_update {
             TurnDiffTrackerUpdate::Track { environment_id, .. } => environment_id.as_deref(),
             _ => None,

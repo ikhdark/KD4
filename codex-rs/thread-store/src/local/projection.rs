@@ -242,7 +242,14 @@ impl LocalThreadProjection {
     }
 
     pub(super) fn append_pending(&mut self, items: Vec<RolloutItem>) {
-        self.pending_items.extend(items);
+        // Replay captures are persisted by the writer, but the history builder
+        // ignores them. A lazy projection must not retain every full request
+        // snapshot until its first pagination read.
+        self.pending_items.extend(
+            items
+                .into_iter()
+                .filter(|item| !matches!(item, RolloutItem::ContextReplay { .. })),
+        );
     }
 
     fn commit_pending(&mut self) -> ThreadStoreResult<()> {
@@ -564,6 +571,22 @@ pub(super) async fn initialize_deferred(
 ) -> ThreadStoreResult<()> {
     let projection = projection_entry(store, thread_id).await;
     let _operation = projection.acquire_operation().await?;
+    let history = history.map(|history| {
+        if history
+            .iter()
+            .any(|item| matches!(item, RolloutItem::ContextReplay { .. }))
+        {
+            Arc::new(
+                history
+                    .iter()
+                    .filter(|item| !matches!(item, RolloutItem::ContextReplay { .. }))
+                    .cloned()
+                    .collect(),
+            )
+        } else {
+            history
+        }
+    });
     *projection.state.lock().await = LocalThreadProjection {
         deferred_seed: Some(history.unwrap_or_else(|| Arc::new(Vec::new()))),
         ..Default::default()

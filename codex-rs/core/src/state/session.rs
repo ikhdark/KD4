@@ -82,6 +82,16 @@ impl PromptTokenCalibration {
         model: &str,
         prompt: &crate::client_common::PromptCalibrationBasis,
     ) -> i64 {
+        if std::env::var_os("CODEX_KDR_COMPACTION_BUDGET_OBSERVE").as_deref() == Some(std::ffi::OsStr::new("1")) {
+            eprintln!("kdr_compaction_budget {}", serde_json::json!({
+                "phase": "calibration_basis", "samples": self.samples.len(),
+                "covered": self.covered_prompt.is_some(),
+                "extends": self.covered_prompt.as_ref().is_some_and(|previous| prompt.extends(previous)),
+                "provider_model_match": self.basis.as_ref().is_some_and(|(p,m)| p == provider && m == model),
+                "observed_input": self.observed_input_tokens,
+                "local_tokens": prompt.local_tokens,
+            }));
+        }
         let Some(previous) = self
             .covered_prompt
             .as_ref()

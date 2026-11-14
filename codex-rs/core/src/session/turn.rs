@@ -1465,6 +1465,10 @@ pub(crate) fn run_turn(
                                 tracker.record_unknown_mutation();
                                 finalized_mutation_revision =
                                     Some(tracker.current_mutation_revision());
+                                drop(tracker);
+                                if sess.hooks().has_legacy_after_agent_hooks() {
+                                    sess.invalidate_tool_history_sources(None, None).await;
+                                }
                                 after_agent_outcome.aborted
                             } else {
                                 false
@@ -1677,14 +1681,17 @@ pub(crate) fn run_turn(
                             turn_context.config.after_agent_policy,
                             AfterAgentPolicy::Legacy
                         ) {
-                            run_legacy_after_agent_hook(
+                            let outcome = run_legacy_after_agent_hook(
                                 &sess,
                                 &turn_context,
                                 &sampling_request_input,
                                 last_agent_message.clone(),
                             )
-                            .await
-                            .aborted
+                            .await;
+                            if sess.hooks().has_legacy_after_agent_hooks() {
+                                sess.invalidate_tool_history_sources(None, None).await;
+                            }
+                            outcome.aborted
                         } else {
                             false
                         };
@@ -5988,7 +5995,7 @@ pub(crate) async fn prompt_token_estimates(
         {
             continue;
         }
-        bases.push(prompt.calibration_basis(Arc::clone(input)));
+        bases.push(prompt.calibration_basis_for_provider(Arc::clone(input), 0, turn.provider.info().is_openai()));
     }
     let local_tokens = bases
         .iter()
@@ -6970,7 +6977,7 @@ fn try_run_sampling_request<'a>(
                         .unwrap_or_else(|| (Arc::clone(&prompt.input), 0));
                     turn_context
                         .extension_data
-                        .insert(prompt.calibration_basis_with_prefix(effective_input, prefix));
+                        .insert(prompt.calibration_basis_for_provider(effective_input, prefix, turn_context.provider.info().is_openai()));
                     let budget_result = sess
                         .record_token_usage_info(&turn_context, token_usage.as_ref())
                         .await;

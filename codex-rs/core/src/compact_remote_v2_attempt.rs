@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use super::RemoteCompactionV2Output;
 use super::prepare_v2_retained_input_source;
@@ -21,6 +23,13 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TokenUsage;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
+
+static COMPACTION_BUDGET_OBSERVATION_ID: AtomicU64 = AtomicU64::new(0);
+
+fn budget_observation(value: serde_json::Value) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "kdr_compaction_budget {value}");
+}
 
 pub(super) struct RemoteCompactV2Attempt {
     pub(super) retained_input: crate::compact::TaskInputCheckpoint,
@@ -75,14 +84,58 @@ pub(super) async fn run_remote_compact_v2_attempt(
         let measured_input = largest_compaction_request_input(&prompt);
         let tool_tokens =
             i64::try_from(prompt.tools.serialized().len().div_ceil(4)).unwrap_or(i64::MAX);
-        let (rewritten_outputs, estimated_deleted_tokens) =
+        let observation_id = (std::env::var_os("CODEX_KDR_COMPACTION_BUDGET_OBSERVE")
+            .as_deref() == Some(std::ffi::OsStr::new("1")))
+        .then(|| COMPACTION_BUDGET_OBSERVATION_ID.fetch_add(1, Ordering::Relaxed));
+        let mut occurrence_ids = std::collections::HashMap::new();
+        let mut next_occurrence_id = 0_usize;
+        let mut occurrences = |items: &[ResponseItem]| {
+            items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| {
+                    let (kind, is_call, id) = crate::tool_occurrence::identity(item)?;
+                    let ordinal = *occurrence_ids.entry((kind, id.to_owned())).or_insert_with(|| {
+                        let ordinal = next_occurrence_id;
+                        next_occurrence_id += 1;
+                        ordinal
+                    });
+                    Some(serde_json::json!([index, kind, is_call, ordinal]))
+                })
+                .collect::<Vec<_>>()
+        };
+        let estimates = prompt_token_estimates(sess, turn_context, &prompt).await;
+        let calibrated_fits = turn_context.model_context_window().is_some_and(|window| {
+            estimates.calibrated_tokens < window.saturating_sub(crate::compact_remote::REMOTE_COMPACTION_TRANSPORT_RESERVE_TOKENS)
+        });
+        if let Some(id) = observation_id {
+            budget_observation(serde_json::json!({
+                "phase": "pretrim", "id": id,
+                "model_window": turn_context.model_context_window(),
+                "calibrated_tokens": estimates.calibrated_tokens,
+                "admission_local_tokens": estimates.local_tokens,
+                "occurrences": occurrences(history.raw_items()),
+            }));
+        }
+        let (rewritten_outputs, estimated_deleted_tokens) = if calibrated_fits {
+            (0, 0)
+        } else {
             trim_function_call_history_to_fit_context_window_for_prompt(
                 &mut history,
                 turn_context.as_ref(),
                 &base_instructions,
                 Some(&measured_input),
                 tool_tokens,
-            );
+                observation_id,
+            )
+        };
+        if let Some(id) = observation_id {
+            budget_observation(serde_json::json!({
+                "phase": "posttrim", "id": id, "rewritten_outputs": rewritten_outputs,
+                "estimated_deleted_tokens": estimated_deleted_tokens,
+                "occurrences": occurrences(history.raw_items()),
+            }));
+        }
         if rewritten_outputs > 0 {
             info!(
                 turn_id = %turn_context.sub_id,

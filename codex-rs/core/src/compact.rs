@@ -1800,7 +1800,7 @@ pub(crate) async fn bound_compaction_tool_outputs(
             "unresolved": true,
             "effects_state": "unknown",
             "retry_safe": false,
-            "instruction": "Unread tool result, NOT a summary or proof of success. Recover the exact original response item at /items/0 before relying on its outcome or retrying any work. Cancellation is not rollback; preserve live-operation and effect uncertainty from the original result. Do not rerun its producer.",
+            "instruction": "Unread tool result, NOT a summary or proof of success. The exact original response item is at /items/0. Recover only decision-relevant fields or text ranges before relying on an outcome or considering a retry; do not retrieve the whole item unless needed. Recovery success is not producer success. Cancellation is not rollback; preserve live-operation and effect uncertainty from the original result. Do not rerun its producer.",
             "recovery": serde_json::from_str::<serde_json::Value>(&recovery)
                 .map_err(|error| CodexErr::Fatal(format!("invalid compaction recovery reference: {error}")))?,
         }).to_string();
@@ -1838,6 +1838,28 @@ async fn persist_compaction_recovery(
     sess: &Session,
     canonical: CanonicalToolResult,
 ) -> CodexResult<String> {
+    // Content-specific origins avoid both duplicate retry archives and keeping
+    // unrelated archives alive through a shared synthetic call identity.
+    let origin = format!("compaction-recovery:{}", canonical.sha256);
+    if let Some(id) = sess
+        .reusable_protected_tool_artifact(&origin, canonical.exact_bytes, &canonical.sha256)
+        .await
+    {
+        let artifact = CanonicalOutputArtifact {
+            id: Some(id.parse().map_err(|error| {
+                CodexErr::Fatal(format!("invalid compaction recovery artifact identity: {error}"))
+            })?),
+            retained_bytes: canonical.exact_bytes,
+            complete: true,
+            unavailable_ranges: Vec::new(),
+            error: None,
+        };
+        // A prior attempt can have registered this origin before its checkpoint.
+        sess.flush_tool_history_persistence().await?;
+        return compaction_text_recovery_sidecar(&canonical, &artifact).ok_or_else(|| {
+            CodexErr::Fatal("Compaction recovery artifact has no identity".to_string())
+        });
+    }
     let codex_home = sess.codex_home().await;
     let artifact = create_canonical_output_artifact(
         codex_home.as_path(),
@@ -1862,7 +1884,7 @@ async fn persist_compaction_recovery(
     })?;
     sess.try_register_tool_artifact_origin(
         artifact_id.clone(),
-        format!("compaction-recovery:{artifact_id}"),
+        origin,
         canonical.exact_bytes,
         canonical.sha256.clone(),
     )

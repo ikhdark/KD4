@@ -454,6 +454,7 @@ pub(crate) struct AnyToolResult {
         Option<std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>>,
     pub(crate) code_mode_feedback: Vec<FunctionCallOutputContentItem>,
     pub(crate) operation_history: Option<Value>,
+    pub(crate) workspace_source_invalidated: bool,
 }
 
 pub(crate) fn record_tool_result_measurement(
@@ -2365,11 +2366,11 @@ impl ToolRegistry {
         } else {
             None
         };
-        let post_tool_use_outcome =
+        let (post_tool_use_outcome, post_tool_workspace_mutated) =
             if let Some((plan, post_tool_use_payload)) = post_tool_use_payload {
                 let phase_started = Instant::now();
                 let hook_invocation = invocation.clone();
-                let outcome = crate::tools::parallel::run_workspace_hook(
+                let (outcome, workspace_mutated) = crate::tools::parallel::run_workspace_hook_with_receipt(
                     Arc::clone(&invocation.session),
                     Arc::clone(&invocation.step_context.turn),
                     Arc::clone(&invocation.tracker),
@@ -2388,17 +2389,18 @@ impl ToolRegistry {
                     },
                 )
                 .await
-                .unwrap_or_else(|error| PostToolUseOutcome {
+                .map(|(outcome, receipt)| (outcome, receipt.is_some()))
+                .unwrap_or_else(|error| (PostToolUseOutcome {
                     hook_events: Vec::new(),
                     should_block: true,
                     stop_reason: None,
                     additional_contexts: Vec::new(),
                     feedback_message: Some(format!("PostToolUse could not finish: {error}")),
-                });
+                }, true));
                 record_lifecycle_phase(&invocation, "post_hooks", phase_started);
-                Some(outcome)
+                (Some(outcome), workspace_mutated)
             } else {
-                None
+                (None, false)
             };
         if let (Ok(result), Some(outcome)) = (&mut result, post_tool_use_outcome) {
             let phase_started = Instant::now();
@@ -2471,6 +2473,7 @@ impl ToolRegistry {
         };
         match result {
             Ok(mut result) => {
+                result.workspace_source_invalidated |= post_tool_workspace_mutated;
                 let force_inline_carrier = result
                     .deterministic_continuation_owner_key()
                     .is_some_and(|owner_key| {
@@ -2508,10 +2511,21 @@ impl ToolRegistry {
                 .await;
                 let admission_tracking_required =
                     projection_admission_required && projection_input.is_some();
-                let model_projection = match projection_input {
+                let mut model_projection = match projection_input {
                     Some(input) => project_model_output(input).await,
                     None => None,
                 };
+                // The output predates PostToolUse. A hook's unknown write has
+                // already invalidated registered reads; do not register this
+                // delayed candidate as fresh after that invalidation.
+                if post_tool_workspace_mutated
+                    && let Some(candidate) = model_projection.as_mut()
+                        .and_then(|projection| projection.candidate.as_mut())
+                    && (!candidate.source_dependencies.is_empty()
+                        || crate::tool_history::tool_observes_workspace(&candidate.tool_identity))
+                {
+                    candidate.source_dependencies_current = false;
+                }
                 record_lifecycle_phase(&invocation, "projection", phase_started);
                 if (canonical_artifact_required || admission_tracking_required)
                     && model_projection.is_none()
@@ -2786,6 +2800,7 @@ async fn handle_any_tool(
         source_dependencies: None,
         code_mode_feedback: Vec::new(),
         operation_history: None,
+        workspace_source_invalidated: false,
     };
     Ok(result)
 }

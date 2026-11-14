@@ -115,9 +115,13 @@ const __codex_paginate_search = (search) => {
     return sources;
   };
   const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const present = (result, pattern, contextLines) => {
+    if (Array.isArray(pattern) || result.pagination) registerSearchProjection(result, contextLines);
+    return result;
+  };
   return async function search_files(pattern, options = {}) {
     if (options.page_size === undefined && options.cursor === undefined)
-      return search(pattern, options);
+      return present(await search(pattern, options), pattern);
     if (!Number.isInteger(options.page_size) || options.page_size < 1 || options.page_size > 1000)
       throw new TypeError("paged search requires page_size from 1 through 1000 on every call");
     if (options.count_only) throw new TypeError("count_only cannot paginate results");
@@ -180,9 +184,9 @@ const __codex_paginate_search = (search) => {
       if (state && !same(scope, await inventory(opts))) return incomplete(pattern, "search_scope_changed");
       if (!state) {
         const result = await search(request.pattern, opts, true);
-        if (!result.search_complete) return { ...result, continuation: null,
+        if (!result.search_complete) return present({ ...result, continuation: null,
           coverage: { ...result.coverage, scope: currentScope },
-          pagination: { consistent: false, reason: "search_incomplete" } };
+          pagination: { consistent: false, reason: "search_incomplete" } }, request.pattern);
         const after = await inventory(opts);
         if (!same(scope, after)) return incomplete(pattern, "search_scope_changed");
         if (!same(sources, await identities(after))) return incomplete(pattern, "source_changed");
@@ -216,7 +220,7 @@ const __codex_paginate_search = (search) => {
         matching_lines: files.reduce((sum, file) => sum + file.pattern_counts.find(p => p.id === item.id).matching_lines, 0),
         matching_files: files.filter(file => file.pattern_counts.some(p => p.id === item.id && p.matching_lines > 0)).length,
         complete: !more, lower_bound: more }));
-      return { ...state.result, files, file_count: files.length, match_count: end - start,
+      return present({ ...state.result, files, file_count: files.length, match_count: end - start,
         pattern_counts, counts: { occurrences: pattern_counts.reduce((sum, p) => sum + p.occurrences, 0),
           matching_lines: end - start, matching_files: files.length, complete: !more, lower_bound: more },
         complete: !more && state.result.complete, search_complete: !more,
@@ -225,7 +229,7 @@ const __codex_paginate_search = (search) => {
         continuation: more ? state.cursors[index + 1] : null,
         pagination: { consistent: true, start, end, total_matching_lines: state.result.match_count,
           expires_at: state.expires_at, source_count: state.sources.length,
-          consistency: "guarded_observations_not_atomic_snapshot" } };
+          consistency: "guarded_observations_not_atomic_snapshot" } }, request.pattern, opts.context_lines);
     } catch (cause) {
       // Preserve owner-issued live handles and exact-capture recovery on failure.
       if (cause?.evidence?.scope) currentScope = { ...cause.evidence.scope,

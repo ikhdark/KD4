@@ -225,6 +225,31 @@ impl Prompt {
         self.calibration_basis_with_prefix(input, 0)
     }
 
+    /// Match request preparation's item-identity policy without changing content.
+    pub fn calibration_basis_for_provider(
+        &self,
+        mut input: Arc<[ResponseItem]>,
+        input_start: usize,
+        is_openai: bool,
+    ) -> PromptCalibrationBasis {
+        let strip_id = |item: &ResponseItem| item.id().is_some_and(|id| {
+            !is_openai || !id.is_prefixed() || (id.len() > 64 && id.chars().take(65).count() > 64)
+        });
+        if input.iter().any(|item| strip_id(item)
+            || (!is_openai && item.internal_chat_message_metadata_passthrough().is_some()))
+        {
+            for item in Arc::make_mut(&mut input) {
+                if strip_id(item) {
+                    item.set_id(None);
+                }
+                if !is_openai {
+                    item.clear_internal_chat_message_metadata_passthrough();
+                }
+            }
+        }
+        self.calibration_basis_with_prefix(input, input_start)
+    }
+
     pub fn calibration_basis_with_prefix(
         &self,
         input: Arc<[ResponseItem]>,
@@ -381,6 +406,16 @@ pub struct PromptCalibrationBasis {
 
 impl PromptCalibrationBasis {
     pub fn extends(&self, previous: &Self) -> bool {
+        if std::env::var_os("CODEX_KDR_COMPACTION_BUDGET_OBSERVE").as_deref() == Some(std::ffi::OsStr::new("1")) {
+            eprintln!("kdr_compaction_budget {}", serde_json::json!({
+                "phase": "calibration_extension", "tools": self.tools == previous.tools,
+                "instructions": self.base_instructions == previous.base_instructions,
+                "schema": self.output_schema == previous.output_schema, "strict": self.strict == previous.strict,
+                "prefix": self.input[self.input_start..].starts_with(&previous.input[previous.input_start..]),
+                "input_items": self.input.len() - self.input_start,
+                "previous_items": previous.input.len() - previous.input_start,
+            }));
+        }
         self.tools == previous.tools
             && self.base_instructions == previous.base_instructions
             && self.output_schema == previous.output_schema

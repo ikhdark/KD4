@@ -602,10 +602,16 @@ pub(super) async fn source_read(invocation: &ToolInvocation, packet: &Value) -> 
     // Consult accepted current history, not a permanent per-thread seen set:
     // compaction/removal must allow a later turn to deliver the evidence again.
     let history = invocation.session.clone_history().await;
-    if history.raw_items().iter().any(|item| matches!(item,
-        ResponseItem::Message { role, content, .. } if role == "developer"
-            && matches!(content.as_slice(), [ContentItem::InputText { text: present }] if present == &text)
-    )) {
+    let latest = history.raw_items().iter().rev().find_map(|item| {
+        let ResponseItem::Message { role, content, .. } = item else { return None; };
+        if role != "developer" { return None; }
+        let [ContentItem::InputText { text: present }] = content.as_slice() else { return None; };
+        if !present.starts_with("<evidence_memory_advisory ") { return None; }
+        let previous: Value = serde_json::from_str(present.lines().nth(2)?).ok()?;
+        (previous["phase"] == "source_read" && previous["index"] == payload["index"]
+            && previous["source_path"] == payload["source_path"]).then_some(present)
+    });
+    if latest == Some(&text) {
         // The notice is already available; keep this turn's reservations but
         // don't spend its injection allowance on a body we did not inject.
         let mut state = ledger.0.lock().await;

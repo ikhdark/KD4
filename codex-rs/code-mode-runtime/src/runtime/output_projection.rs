@@ -1289,6 +1289,75 @@ pub(super) fn tool_result_to_v8<'s>(
     Ok(value)
 }
 
+// Invoked only by the private, owned search helper after it constructs a
+// search result. Never attach native extraction provenance.
+pub(super) fn register_search_projection_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    _retval: v8::ReturnValue<v8::Value>,
+) {
+    let value = args.get(0);
+    let Ok(Some(raw)) = super::value::v8_value_to_json(scope, value) else { return };
+    // Extend the existing display, including nested source recipes. Building
+    // from raw bytes would discard their already-verified compaction benefits.
+    let Some(display) = stringify(scope, value) else { return };
+    let Ok(mut projected) = serde_json::from_str::<Value>(&display.to_rust_string_lossy(scope)) else { return };
+    let Some(files) = projected.get_mut("files").and_then(Value::as_array_mut) else { return };
+    let context_lines = args.get(1).uint32_value(scope).map(u64::from);
+    let paged = raw.get("pagination").is_some();
+    let multipattern = raw.get("pattern").is_some_and(Value::is_array);
+    let mut changed = false;
+    for (index, file) in files.iter_mut().enumerate() {
+        let complete_source = raw.pointer(&format!("/files/{index}")).is_some_and(|original| {
+            original.get("path") == file.get("path")
+                && original.pointer("/hydration/complete") == Some(&Value::Bool(true))
+                && original.pointer("/source/complete") == Some(&Value::Bool(true))
+                && original.pointer("/source/delivered_selection_complete") == Some(&Value::Bool(true))
+        });
+        if paged && complete_source && let Some(context) = context_lines {
+            changed |= project_page_source(file, context);
+        }
+        if multipattern && let Some(counts) = file.get_mut("pattern_counts").and_then(Value::as_array_mut) {
+            for count in counts {
+                if let Some(fields) = count.as_object_mut() {
+                    changed |= fields.remove("pattern").is_some();
+                }
+            }
+        }
+    }
+    if changed {
+        let _ = register(scope, value, &raw, &projected, false);
+    }
+}
+
+fn project_page_source(file: &mut Value, context: u64) -> bool {
+    let Some(lines) = file.get("lines").and_then(Value::as_array) else { return false };
+    let hits: Option<Vec<u64>> = lines.iter().map(|line| line.get("line").and_then(Value::as_u64)).collect();
+    let Some(hits) = hits.filter(|hits| !hits.is_empty()) else { return false };
+    let Some(source) = file.get_mut("source") else { return false };
+    let Some(rows) = source.get("results").and_then(Value::as_array) else { return false };
+    // Unknown/error/shared/framed selections retain the full existing display.
+    // Never infer membership from row position or sever a body dependency.
+    let bounds: Option<Vec<(u64,u64)>> = rows.iter().map(|row| {
+        if row.get("shared").is_some() || row.get("text").and_then(Value::as_str).is_none()
+            || row.get("status").is_some_and(|status| status != "ok")
+            || row.get("complete").is_some_and(|complete| complete != true)
+            || row.pointer("/selector/kind")?.as_str()? != "lines" { return None; }
+        Some((row.pointer("/selector/start")?.as_u64()?, row.pointer("/selector/end")?.as_u64()?))
+    }).collect();
+    let Some(bounds) = bounds else { return false };
+    if hits.iter().any(|hit| !bounds.iter().any(|(start,end)| start <= hit && hit <= end)) { return false; }
+    let selected: Vec<Value> = rows.iter().zip(&bounds).filter_map(|(row,(start,end))| {
+        hits.iter().any(|hit| *start <= hit.saturating_add(context) && *end >= hit.saturating_sub(context))
+            .then(|| row.clone())
+    }).collect();
+    if selected.len() == rows.len() { return false; }
+    let omitted = rows.len() - selected.len();
+    source["results"] = Value::Array(selected);
+    source["display_omitted_search_context_rows"] = serde_json::json!(omitted);
+    true
+}
+
 pub(super) fn register(
     scope: &mut v8::PinScope<'_, '_>,
     value: v8::Local<'_, v8::Value>,

@@ -7011,6 +7011,28 @@ impl Session {
         self.state.lock().await.tool_history_state_ref().source_snapshot_backing(bytes, sha256)
     }
 
+    /// Reuse only a still-authenticated, protected artifact. A stale ledger
+    /// entry must not prevent retaining the exact source again under a new ID.
+    pub(crate) async fn reusable_protected_tool_artifact(
+        &self,
+        call_id: &str,
+        bytes: u64,
+        sha256: &str,
+    ) -> Option<String> {
+        let _permit = self.tool_history_reconciliation_gate.acquire().await.ok()?;
+        let id = self.reusable_tool_artifact(call_id, bytes, sha256).await?;
+        crate::tools::command_output_artifact::protect_active_tool_history_artifact(
+            self.codex_home().await.as_path(),
+            &self.thread_id.to_string(),
+            &id,
+            bytes,
+            sha256,
+        )
+        .await
+        .ok()?;
+        Some(id)
+    }
+
     pub(crate) async fn bind_source_inspection_origin(
         &self,
         artifact_id: String,
@@ -7097,6 +7119,28 @@ impl Session {
         advisory
     }
 
+    pub(crate) async fn invalidate_tool_history_sources(
+        &self,
+        affected_paths: Option<std::collections::BTreeSet<PathBuf>>,
+        call_id: Option<&str>,
+    ) {
+        let Ok(_permit) = self.tool_history_reconciliation_gate.acquire().await else {
+            unreachable!("session-owned tool-history reconciliation semaphore is never closed");
+        };
+        let mutation = crate::tool_history::ToolHistoryMutation::InvalidateSourceDependencies {
+            affected_paths,
+            current_workspace_identity: None,
+            excluded_call_ids: call_id.into_iter().map(str::to_owned).collect(),
+        };
+        let mut writer = self.tool_history_persistence.writer().await;
+        let mut state = self.state.lock().await;
+        if state.apply_tool_history_mutation(&mutation) {
+            if let Err(err) = writer.enqueue_mutation(mutation, "workspace source invalidation") {
+                tracing::warn!("failed to enqueue workspace source invalidation: {err}");
+            }
+        }
+    }
+
     pub(crate) async fn register_tool_history_candidate(
         &self,
         candidate: crate::tool_history::ToolHistoryCandidate,
@@ -7157,8 +7201,8 @@ impl Session {
         observation: crate::tool_history::WorkspaceEvidenceObservation,
         workspace_gate_guard: WorkspaceGateGuard,
     ) {
-        drop(workspace_gate_guard);
         self.register_workspace_evidence_batch(vec![observation]).await;
+        drop(workspace_gate_guard);
     }
 
     pub(crate) async fn register_workspace_evidence_batch(

@@ -1202,6 +1202,13 @@ impl ToolHistoryMutation {
                         output: output.clone(),
                     },
                 );
+                // A delayed nested read can already be stale when its carrier
+                // was registered. Never let the carrier re-certify those bytes.
+                if !observation.source_dependencies_current
+                    && let Some(parent) = state.workspace_evidence.get_mut(parent_call_id)
+                {
+                    parent.source_dependencies_current = false;
+                }
                 true
             }
             Self::InvalidateSourceDependencies {
@@ -2018,6 +2025,13 @@ impl ToolHistoryState {
     }
 
     fn register_candidate(&mut self, mut candidate: ToolHistoryCandidate, derive: bool) {
+        // A settled archive can replace the original candidate after a writer
+        // invalidated it. Changing its representation cannot refresh its source.
+        if self.candidates.get(&candidate.call_id)
+            .is_some_and(|previous| !previous.source_dependencies_current)
+        {
+            candidate.source_dependencies_current = false;
+        }
         if !self.candidates.contains_key(&candidate.call_id)
             && !self.workspace_evidence.contains_key(&candidate.call_id)
         {
@@ -2173,8 +2187,16 @@ impl ToolHistoryState {
 
     pub fn register_workspace_evidence(
         &mut self,
-        observation: WorkspaceEvidenceObservation,
+        mut observation: WorkspaceEvidenceObservation,
     ) {
+        if self.code_mode_nested_evidence.get(&observation.call_id).is_some_and(|children| {
+            children.values().any(|child| {
+                !self.workspace_evidence.get(&child.observation.call_id)
+                    .unwrap_or(&child.observation).source_dependencies_current
+            })
+        }) {
+            observation.source_dependencies_current = false;
+        }
         if !self.candidates.contains_key(&observation.call_id)
             && !self.workspace_evidence.contains_key(&observation.call_id)
         {
@@ -2182,6 +2204,10 @@ impl ToolHistoryState {
         }
         self.workspace_evidence
             .entry(observation.call_id.clone())
+            .and_modify(|existing| {
+                // Re-registering the same acquired output is not a new read.
+                existing.source_dependencies_current &= observation.source_dependencies_current;
+            })
             .or_insert(observation);
     }
 

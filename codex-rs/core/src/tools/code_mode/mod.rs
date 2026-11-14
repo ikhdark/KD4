@@ -2399,6 +2399,40 @@ fn compact_emitted_packet_recovery(mut entry: JsonValue, emitted: &str) -> JsonV
             "canonical_bytes": serialized.len(),
             "notice": "Exact result appears earlier in this cell output and its canonical artifact; do not replay the call.",
         });
+    } else if entry["tool_name"] == "exec_command"
+        && result["process_exited"] == true
+        && result["exit_code"] == 0
+        && result.get("session_id").is_none_or(JsonValue::is_null)
+    {
+        // Presentation only: keep the unique suffix and every process/recovery
+        // field. Offsets address the exact earlier UTF-8 cell text, not escaped JSON.
+        let mut presentation = result.clone();
+        for field in ["stdout", "stderr", "output"] {
+            let Some(body) = presentation[field].as_str() else { continue; };
+            if body.len() < 512 { continue; }
+            let mut probe_end = 256;
+            while !body.is_char_boundary(probe_end) { probe_end += 1; }
+            let Some(start) = emitted.find(&body[..probe_end]) else { continue; };
+            let available = &emitted[start..];
+            let mut length = body.bytes().zip(available.bytes())
+                .take_while(|(left, right)| left == right).count();
+            while !body.is_char_boundary(length) { length -= 1; }
+            let prefix = &body[..length];
+            let projected = serde_json::json!({
+                "emitted_prefix": {
+                    "source": "earlier_cell_output_utf8",
+                    "source_definition": "UTF-8 input_text cell content items joined with LF; omit non-text items, Script failed wrapper header, and this recovery directory. Slice start_byte..start_byte+canonical_bytes, verify SHA-256, then append suffix.",
+                    "start_byte": start,
+                    "canonical_bytes": length,
+                    "canonical_sha256": hex::encode(Sha256::digest(prefix.as_bytes())),
+                },
+                "suffix": &body[length..],
+            });
+            if projected.to_string().len() < serde_json::to_string(body).map_or(0, |s| s.len()) {
+                presentation[field] = projected;
+            }
+        }
+        entry["outcome"]["result"] = presentation;
     }
     entry
 }

@@ -3580,6 +3580,16 @@ impl TurnTimingState {
         let state = self.state();
         let request = state.model_requests.last()?;
         let input = usage.known_input()?;
+        if std::env::var_os("CODEX_KDR_COMPACTION_BUDGET_OBSERVE").as_deref() == Some(std::ffi::OsStr::new("1")) {
+            eprintln!("kdr_compaction_budget {}", serde_json::json!({
+                "phase": "calibration_gate", "completed": request.completed_ns.is_some(),
+                "primary": request.attempt_kind == TurnTimingAttemptKind::Primary,
+                "single_attempt": request.physical_attempt_ids.len() == 1,
+                "estimator_matches": request.estimator_model.as_deref() == Some(model),
+                "usage_matches": request.token_usage.as_ref().is_some_and(|usage| usage.input_tokens == input as u64),
+                "local_tokens": local, "measured_input": input,
+            }));
+        }
         if request.completed_ns.is_none()
             || request.attempt_kind != TurnTimingAttemptKind::Primary
             || request.physical_attempt_ids.len() != 1

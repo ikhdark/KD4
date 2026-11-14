@@ -400,6 +400,15 @@ pub fn printed_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> {
         {
             object.remove("delivered_selection_complete");
         }
+        if tool.name == "read_file"
+            && let Some(recovery) = object.get_mut("recovery").and_then(Value::as_object_mut)
+            && recovery.get("remaining_selectors").is_some_and(Value::is_array)
+            && recovery.get("remaining_selectors") == recovery.get("arguments").and_then(|args| args.get("selectors"))
+        {
+            recovery.insert("remaining_selectors".into(), serde_json::json!({
+                "same_as": "recovery.arguments.selectors"
+            }));
+        }
     }
     Some(projected)
 }
