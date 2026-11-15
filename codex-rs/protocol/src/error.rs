@@ -209,6 +209,14 @@ impl CodexErr {
         }
     }
 
+    /// A peer size rejection before any text can only recover on HTTP, not another socket.
+    pub fn requires_http_fallback(&self) -> bool {
+        matches!(self, Self::WebsocketRejected {
+            reason: WebsocketRecoveryReason::MessageTooLarge,
+            ..
+        })
+    }
+
     pub fn retry_after(&self) -> Option<RetryAfter> {
         match self {
             Self::TerminalResponse { source, .. } => source.retry_after(),
@@ -404,6 +412,8 @@ pub enum WebsocketRecoveryReason {
     PreviousResponseNotFound,
     ConnectionLimitReached,
     ConnectionClosedBeforeDispatch,
+    /// Close 1009 before any text proves a transport-size rejection, not accepted sampling.
+    MessageTooLarge,
 }
 
 #[derive(Debug, Default)]

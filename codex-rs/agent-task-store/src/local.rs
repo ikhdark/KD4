@@ -1032,6 +1032,9 @@ impl LocalAgentTaskStore {
             r#"
 SELECT
     assignments.body_json AS assignment_body_json,
+    assignments.root_session_id AS assignment_root_session_id,
+    assignment_repositories.repository_id,
+    assignment_repositories.workspace_id,
     assignment_repositories.canonical_root AS repo_root,
     attempts.attempt_id,
     attempts.assignment_id,
@@ -1053,6 +1056,13 @@ LIMIT 1
         .await?
         .ok_or(StoreError::AssignmentNotFound(assignment_id))?;
         let assignment: Assignment = decode(row.get::<String, _>("assignment_body_json").as_str())?;
+        let assignment = reconcile_assignment_binding(
+            assignment,
+            assignment_id,
+            row.get::<String, _>("assignment_root_session_id").as_str(),
+            row.get("repository_id"),
+            row.get("workspace_id"),
+        )?;
         let attempt_id = AttemptId::parse(row.get::<String, _>("attempt_id").as_str())?;
 
         Ok(AgentTaskAuthorization {
@@ -4024,19 +4034,33 @@ async fn load_assignment_tx(
         .fetch_optional(&mut **transaction)
         .await?
         .ok_or(StoreError::AssignmentNotFound(assignment_id))?;
-    let mut assignment: Assignment = decode(row.get::<String, _>("body_json").as_str())?;
+    let assignment: Assignment = decode(row.get::<String, _>("body_json").as_str())?;
+    reconcile_assignment_binding(
+        assignment,
+        assignment_id,
+        row.get::<String, _>("root_session_id").as_str(),
+        row.get("repository_id"),
+        row.get("workspace_id"),
+    )
+}
+
+fn reconcile_assignment_binding(
+    mut assignment: Assignment,
+    assignment_id: AssignmentId,
+    root_session_id: &str,
+    bound_repository_id: Option<String>,
+    bound_workspace_id: Option<String>,
+) -> StoreResult<Assignment> {
     if assignment.assignment_id != assignment_id {
         return Err(StoreError::CorruptData(format!(
             "assignment body identity does not match {assignment_id}"
         )));
     }
-    if assignment.root_session_id != row.get::<String, _>("root_session_id") {
+    if assignment.root_session_id != root_session_id {
         return Err(StoreError::CorruptData(format!(
             "assignment root session does not match {assignment_id}"
         )));
     }
-    let bound_repository_id = row.get::<Option<String>, _>("repository_id");
-    let bound_workspace_id = row.get::<Option<String>, _>("workspace_id");
     if let Some(bound_repository_id) = bound_repository_id {
         let legacy_body_identity = bound_workspace_id
             .as_deref()

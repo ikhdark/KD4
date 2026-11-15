@@ -203,16 +203,29 @@ pub(crate) async fn handle_retryable_response_stream_error(
     )?;
 
     if matches!(&err, CodexErr::WebsocketRejected { .. }) {
-        if retry_state.repaired_explicit_rejection {
-            return Err(err);
+        if err.requires_http_fallback() {
+            if !client_session.try_switch_fallback_transport(&turn_context.session_telemetry) {
+                return Err(err);
+            }
+            // This explicit refusal accepted no sampling. Preserve all replay/repair
+            // counters; HTTP failures still spend the existing bounded replay budget.
+            record_retry_decision(turn_context, &err, RetryAction::FallbackHttp,
+                Some(retry_after.map_or(Duration::ZERO, |advice| advice.remaining_delay())));
+            turn_context.turn_timing_state.record_model_fallback();
+            sess.send_event(turn_context, EventMsg::Warning(WarningEvent {
+                message: "Falling back from WebSockets to HTTPS transport after an early message-size rejection.".into(),
+            })).await;
+        } else {
+            if retry_state.repaired_explicit_rejection {
+                return Err(err);
+            }
+            retry_state.repaired_explicit_rejection = true;
+            record_retry_decision(turn_context, &err, RetryAction::WebsocketRepair,
+                Some(retry_after.map_or(Duration::ZERO, |advice| advice.remaining_delay())));
+            // Retire the chain/socket so the next request carries full authoritative input.
+            client_session.replace_websocket_for_recovery();
         }
-        retry_state.repaired_explicit_rejection = true;
         retry_state.emit_budget(turn_context, request);
-        record_retry_decision(turn_context, &err, RetryAction::WebsocketRepair,
-            Some(retry_after.map_or(Duration::ZERO, |advice| advice.remaining_delay())));
-        // Each typed refusal proves no sampling was accepted. Retire the
-        // chain/socket so the next request carries full authoritative input.
-        client_session.replace_websocket_for_recovery();
         if let Some(advice) = retry_after {
             wait_for_response_retry_deadline(
                 advice.deadline(),

@@ -1204,6 +1204,7 @@ async fn run_websocket_response_stream(
     let mut interpreter =
         ResponsesEventInterpreter::new(&metadata, turn_state).with_connection_history(history);
     let mut progress_deadline = tokio::time::Instant::now() + idle_timeout;
+    let mut received_text = false;
     loop {
         if tokio::time::Instant::now() >= progress_deadline {
             return Err(ApiError::Stream(
@@ -1242,6 +1243,7 @@ async fn run_websocket_response_stream(
 
         match message {
             Message::Text(text) => {
+                received_text = true;
                 let events = match interpreter.process_payload_with_error_mapper(&text, || {
                     let wrapped_error = parse_wrapped_websocket_error_event(&text)?;
                     map_wrapped_websocket_error_event(wrapped_error, text.to_string())
@@ -1310,6 +1312,13 @@ async fn run_websocket_response_stream(
                         frame.code,
                         frame.reason.as_str()
                     ));
+                }
+                if code == Some(1009) && !received_text {
+                    return Err(ApiError::WebsocketRejected {
+                        reason: codex_protocol::error::WebsocketRecoveryReason::MessageTooLarge,
+                        message,
+                        delay: None,
+                    });
                 }
                 return Err(ApiError::WebsocketClosed { code, message });
             }
