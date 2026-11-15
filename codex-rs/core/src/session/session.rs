@@ -2163,7 +2163,7 @@ impl Session {
             sess.input_queue.seed_mailbox_progress(std::mem::take(
                 &mut startup_rollout_facts.mailbox_progress,
             )).await;
-            let events = std::iter::once(Event {
+            let session_configured = Event {
                 id: INITIAL_SUBMIT_ID.to_owned(),
                 msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                     session_id,
@@ -2183,14 +2183,17 @@ impl Session {
                     initial_messages,
                     rollout_path,
                 }),
-            })
-            .chain(post_session_configured_events.into_iter());
-            for event in events {
-                // Startup metadata must be visible immediately without turning an otherwise
-                // empty thread into a persisted rollout. Resumed/forked rollouts already exist,
-                // so this helper continues to persist their startup events in place.
-                sess.send_event_raw_without_materializing_rollout(event)
-                    .await;
+            };
+            // Startup metadata must be visible immediately without turning an otherwise
+            // empty thread into a persisted rollout.
+            sess.send_event_raw_without_materializing_rollout(session_configured)
+                .await;
+            // Startup, unknown-feature and unstable-feature warnings describe this process's
+            // configuration, not the thread. Deliver them live only: persisting them into a
+            // resumed rollout rewrote idle completed threads (new last event and mtime) on
+            // every reload, while new threads never persisted them.
+            for event in post_session_configured_events {
+                sess.deliver_event_raw(event).await;
             }
 
             let mcp_startup_cancellation_token = {

@@ -428,11 +428,20 @@ impl ThreadQueueRequestProcessor {
         if metadata.is_none() {
             loaded = self.thread_manager.get_thread(id).await.ok();
             // An unloaded thread may only be missing from an index still being built.
+            // Wait for its row or for certified coverage: a home with a permanent
+            // payload gap never certifies, yet its readable rows are still indexed.
             if loaded.is_none() {
-                if !db.await_thread_index().await {
-                    return Err(internal_error("thread index is still being built; retry shortly"));
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    metadata = db.get_thread(id).await.map_err(queue_error)?;
+                    if metadata.is_some() || db.thread_index_certified().await {
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(internal_error("thread index is still being built; retry shortly"));
+                    }
                 }
-                metadata = db.get_thread(id).await.map_err(queue_error)?;
             }
         }
         if metadata

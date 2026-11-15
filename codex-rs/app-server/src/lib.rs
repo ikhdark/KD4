@@ -1003,6 +1003,7 @@ async fn run_main_owned(
 
     let processor_handle = tokio::spawn({
         let shutdown_timed_out = Arc::clone(&shutdown_timed_out);
+        let backfill_state_db = state_db.clone();
         let auth_manager = Arc::clone(&auth_manager);
         let analytics_events_client =
             analytics_events_client_from_config(Arc::clone(&auth_manager), &config);
@@ -1366,6 +1367,11 @@ async fn run_main_owned(
                         processor.drain_background_tasks().await;
                         processor.shutdown_threads().await;
                         processor.wait_for_background_tasks().await;
+                        // Hand back an active rollout-index claim so the next process resumes
+                        // from its checkpoint instead of waiting out the lease, as exec does.
+                        if let Some(state_db) = backfill_state_db.as_ref() {
+                            state_db.stop_backfill_worker().await;
+                        }
                         processor.finish_shutdown_delivery().await;
                         if disconnect_all {
                             let _ = outbound_control_tx

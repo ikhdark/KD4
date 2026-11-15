@@ -311,6 +311,8 @@ pub struct AppliedPatchDelta {
     changes: Vec<AppliedPatchChange>,
     exact: bool,
     // Captured before mutation, including deletes; never reconstructed later.
+    // Continuity identities: prospective segments keep their requested spelling
+    // (see `invocation::mutation_continuity_identity`), not the guard's fold.
     endpoint_identities: HashMap<PathBuf, String>,
     preimage_modes: HashMap<PathBuf, String>,
     manifest: manifest::PatchManifest,
@@ -1028,7 +1030,7 @@ async fn apply_hunks_to_files(
         if let Some(mode) = preimage_mode(&path_uri, fs).await {
             delta.preimage_modes.entry(path_uri.to_path_buf()).or_insert(mode);
         }
-        let identity = invocation::mutation_endpoint_identity(fs, &path_uri, sandbox).await?;
+        let identity = invocation::mutation_continuity_identity(fs, &path_uri, sandbox).await?;
         let previous = delta.endpoint_identities.insert(path_uri.to_path_buf(), identity);
         if previous.as_ref().is_some_and(|previous| delta.endpoint_identities.get(&path_uri.to_path_buf()) != Some(previous)) {
             delta.exact = false;
@@ -1152,7 +1154,7 @@ async fn apply_hunks_to_files(
                     if let Some(mode) = preimage_mode(&dest_uri, fs).await {
                         delta.preimage_modes.entry(dest_uri.to_path_buf()).or_insert(mode);
                     }
-                    let destination_identity = invocation::mutation_endpoint_identity(fs, &dest_uri, sandbox).await?;
+                    let destination_identity = invocation::mutation_continuity_identity(fs, &dest_uri, sandbox).await?;
                     delta.endpoint_identities.insert(dest_uri.to_path_buf(), destination_identity);
                     let source_identity =
                         invocation::mutation_endpoint_identity(fs, &path_uri, sandbox).await?;

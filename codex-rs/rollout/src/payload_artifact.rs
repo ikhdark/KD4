@@ -519,7 +519,7 @@ pub(crate) fn is_artifact_candidate(item: &RolloutItem) -> bool {
 
 
 /// Artifacts are content-addressed and atomically published before the referencing line.
-/// Per-record fsync is deferred to the durable rollout barrier.
+/// Each new body is synced before its rename; the durable rollout barrier syncs names.
 /// Failures and oversized bodies fall back to the original inline record at the writer boundary.
 /// The caller selects eligible items and checks the complete JSONL byte threshold.
 pub(crate) fn store_value(
@@ -662,6 +662,16 @@ fn publish_payload(
     let directory = root(path);
     std::fs::create_dir_all(&directory)?;
     let destination = directory.join(format!("{sha256}.json"));
+    // The caller writes the referencing rollout line as soon as this returns,
+    // and the OS may persist that line before the next durable barrier. Sync
+    // the staged body before its atomic rename so a content address never
+    // names bytes a crash can lose (a referenced body read back with a NUL
+    // tail after power loss). The barrier still syncs names and reused objects.
+    let stage = || {
+        let staged = stage()?;
+        staged.as_file().sync_all()?;
+        Ok::<_, io::Error>(staged)
+    };
     if destination.exists() {
         if read_payload(&directory, sha256, bytes).is_err() {
             stage()?.persist(&destination).map_err(|error| error.error)?;

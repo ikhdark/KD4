@@ -2460,6 +2460,8 @@ fn collect_rollout_stats_inner(
 }
 
 fn is_rollout_file(path: &Path) -> bool {
+    // Count compressed `.jsonl.zst` rollouts too; temporaries keep other extensions.
+    let path = codex_rollout::plain_rollout_path(path);
     path.extension() == Some(OsStr::new("jsonl"))
         && path
             .file_name()

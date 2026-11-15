@@ -2366,6 +2366,82 @@ function Assert-CodexProcessesMayBeStopped {
     }
 }
 
+function Start-ProcessWithoutInheritedHandles {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [Parameter(Mandatory)][string]$WorkingDirectory,
+        [Parameter(Mandatory)][System.Collections.Generic.Dictionary[string, string]]$Environment
+    )
+
+    if (-not ("CodexPublish.DetachedProcess" -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace CodexPublish {
+    public static class DetachedProcess {
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct StartupInfo {
+            public int cb; public string lpReserved; public string lpDesktop; public string lpTitle;
+            public int dwX; public int dwY; public int dwXSize; public int dwYSize;
+            public int dwXCountChars; public int dwYCountChars; public int dwFillAttribute; public int dwFlags;
+            public short wShowWindow; public short cbReserved2; public IntPtr lpReserved2;
+            public IntPtr hStdInput; public IntPtr hStdOutput; public IntPtr hStdError;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ProcessInformation {
+            public IntPtr hProcess; public IntPtr hThread; public int dwProcessId; public int dwThreadId;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool CreateProcessW(string lpApplicationName, StringBuilder lpCommandLine,
+            IntPtr lpProcessAttributes, IntPtr lpThreadAttributes, bool bInheritHandles, uint dwCreationFlags,
+            IntPtr lpEnvironment, string lpCurrentDirectory, ref StartupInfo lpStartupInfo,
+            out ProcessInformation lpProcessInformation);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr hObject);
+
+        // Starts a process that inherits no handles and receives exactly this environment.
+        public static int Start(string path, string workingDirectory, IDictionary<string, string> environment) {
+            var names = new List<string>(environment.Keys);
+            names.Sort(StringComparer.OrdinalIgnoreCase);
+            var block = new StringBuilder();
+            foreach (var name in names) {
+                block.Append(name).Append('=').Append(environment[name]).Append('\0');
+            }
+            block.Append('\0');
+            var startup = new StartupInfo();
+            startup.cb = Marshal.SizeOf(typeof(StartupInfo));
+            ProcessInformation info;
+            const uint CreateUnicodeEnvironment = 0x00000400;
+            const uint CreateNoWindow = 0x08000000;
+            IntPtr environmentBlock = Marshal.StringToHGlobalUni(block.ToString());
+            try {
+                if (!CreateProcessW(path, new StringBuilder("\"" + path + "\""), IntPtr.Zero, IntPtr.Zero, false,
+                        CreateUnicodeEnvironment | CreateNoWindow, environmentBlock, workingDirectory,
+                        ref startup, out info)) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+            }
+            finally {
+                Marshal.FreeHGlobal(environmentBlock);
+            }
+            CloseHandle(info.hThread);
+            CloseHandle(info.hProcess);
+            return info.dwProcessId;
+        }
+    }
+}
+"@
+    }
+
+    [CodexPublish.DetachedProcess]::Start($FilePath, $WorkingDirectory, $Environment)
+}
 function Start-CodexDesktopProcess {
     param(
         [string]$DesktopPath,
@@ -2374,28 +2450,28 @@ function Start-CodexDesktopProcess {
         [string]$LocalCodexSqliteHome
     )
 
-    $process = [Diagnostics.Process]::new()
-    try {
-        # Explorer activation delegates to the existing shell, whose environment
-        # can predate this publish. Start the manifest executable with explicit
-        # child routing so Desktop receives the selected binary and fork home.
-        $process.StartInfo.FileName = $DesktopPath
-        $process.StartInfo.WorkingDirectory = Split-Path -Parent $DesktopPath
-        $process.StartInfo.UseShellExecute = $false
-        $process.StartInfo.CreateNoWindow = $true
-        $process.StartInfo.EnvironmentVariables["CODEX_CLI_PATH"] = $LocalCliPath
-        $process.StartInfo.EnvironmentVariables["CODEX_HOME"] = $LocalCodexHome
-        $process.StartInfo.EnvironmentVariables["CODEX_SQLITE_HOME"] = $LocalCodexSqliteHome
-        # IDE extension tools may run under Electron's Node mode. Desktop must
-        # initialize its GUI and identify its own app-server client.
-        $process.StartInfo.EnvironmentVariables.Remove("ELECTRON_RUN_AS_NODE")
-        $process.StartInfo.EnvironmentVariables.Remove("CODEX_INTERNAL_ORIGINATOR_OVERRIDE")
-        if (-not $process.Start()) {
-            throw "Could not start Codex Desktop: $DesktopPath"
-        }
+    # Explorer activation delegates to the existing shell, whose environment
+    # can predate this publish. Start the manifest executable with explicit
+    # child routing so Desktop receives the selected binary and fork home.
+    $environment = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
+        $environment[[string]$entry.Key] = [string]$entry.Value
     }
-    finally {
-        $process.Dispose()
+    $environment["CODEX_CLI_PATH"] = $LocalCliPath
+    $environment["CODEX_HOME"] = $LocalCodexHome
+    $environment["CODEX_SQLITE_HOME"] = $LocalCodexSqliteHome
+    # IDE extension tools may run under Electron's Node mode. Desktop must
+    # initialize its GUI and identify its own app-server client.
+    [void]$environment.Remove("ELECTRON_RUN_AS_NODE")
+    [void]$environment.Remove("CODEX_INTERNAL_ORIGINATOR_OVERRIDE")
+    # Desktop outlives this publish. A handle-inheriting start would also hand it the
+    # caller's stdout pipe, so a piped publish would not finish until Desktop closed.
+    try {
+        [void](Start-ProcessWithoutInheritedHandles -FilePath $DesktopPath `
+            -WorkingDirectory (Split-Path -Parent $DesktopPath) -Environment $environment)
+    }
+    catch {
+        throw "Could not start Codex Desktop: $DesktopPath ($($_.Exception.Message))"
     }
 }
 

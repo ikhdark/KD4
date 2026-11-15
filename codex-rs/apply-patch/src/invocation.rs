@@ -391,6 +391,29 @@ pub(crate) async fn mutation_endpoint_identity(
     path: &PathUri,
     sandbox: Option<&codex_exec_server::FileSystemSandboxContext>,
 ) -> Result<String, ApplyPatchError> {
+    resolve_endpoint_identity(fs, path, sandbox, /*fold_prospective*/ true).await
+}
+
+/// Continuity identity a committed delta records for later operations, captured
+/// before mutation like the guard identity. A prospective (missing) segment keeps
+/// its requested spelling instead of the guard's conservative fold: creating it
+/// publishes exactly that spelling (a case variant would have resolved), which is
+/// the canonical spelling later operations on the created path resolve. The
+/// one-mutation-per-endpoint guard and leases keep `mutation_endpoint_identity`.
+pub(crate) async fn mutation_continuity_identity(
+    fs: &dyn ExecutorFileSystem,
+    path: &PathUri,
+    sandbox: Option<&codex_exec_server::FileSystemSandboxContext>,
+) -> Result<String, ApplyPatchError> {
+    resolve_endpoint_identity(fs, path, sandbox, /*fold_prospective*/ false).await
+}
+
+async fn resolve_endpoint_identity(
+    fs: &dyn ExecutorFileSystem,
+    path: &PathUri,
+    sandbox: Option<&codex_exec_server::FileSystemSandboxContext>,
+    fold_prospective: bool,
+) -> Result<String, ApplyPatchError> {
     let mut candidate = path.clone();
     let mut missing_segments = Vec::new();
     let mut resolved = loop {
@@ -459,7 +482,8 @@ pub(crate) async fn mutation_endpoint_identity(
         }
     };
 
-    let windows = resolved.infer_path_convention() == Some(PathConvention::Windows);
+    let windows = fold_prospective
+        && resolved.infer_path_convention() == Some(PathConvention::Windows);
     let sensitive = if windows && !missing_segments.is_empty() {
         fs.directory_case_sensitive(&resolved, sandbox)
             .await

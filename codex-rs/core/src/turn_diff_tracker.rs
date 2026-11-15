@@ -91,6 +91,9 @@ struct OwnedPatchOperation {
 pub struct TurnDiffTracker {
     valid: bool,
     invalidation_reported: bool,
+    /// The latest reported invalidation warning, held for the next model request:
+    /// the warning addresses the model, not only the UI event stream.
+    pending_model_warning: Option<String>,
     first_invalidation_cause: Option<serde_json::Value>,
     invalidation_causes: Vec<serde_json::Value>,
     owned_operations: VecDeque<OwnedPatchOperation>,
@@ -133,6 +136,7 @@ impl Default for TurnDiffTracker {
         Self {
             valid: true,
             invalidation_reported: false,
+            pending_model_warning: None,
             first_invalidation_cause: None,
             invalidation_causes: Vec::new(),
             owned_operations: VecDeque::new(),
@@ -699,13 +703,20 @@ impl TurnDiffTracker {
         }
         self.invalidation_reported = true;
         let status = if self.valid { "partial" } else { "unavailable" };
-        Some(format!(
+        let message = format!(
             "The turn diff is {status} because command effects or workspace changes could not be tracked exactly. First cause: {}. Recent causes (bounded): {}. Do not claim that no files changed without fresh workspace verification.",
             self.first_invalidation_cause
                 .as_ref()
                 .unwrap_or(&serde_json::Value::Null),
             serde_json::Value::Array(self.invalidation_causes.clone()),
-        ))
+        );
+        self.pending_model_warning = Some(message.clone());
+        Some(message)
+    }
+
+    /// The reported warning not yet delivered to the model, taken once.
+    pub(crate) fn take_pending_model_warning(&mut self) -> Option<String> {
+        self.pending_model_warning.take()
     }
 
     fn record_mutation(&mut self) {

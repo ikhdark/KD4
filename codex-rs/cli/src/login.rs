@@ -40,6 +40,7 @@ const API_KEY_LOGIN_DISABLED_MESSAGE: &str =
 const ACCESS_TOKEN_LOGIN_DISABLED_MESSAGE: &str =
     "Access token login is disabled. Use API key login instead.";
 const LOGIN_SUCCESS_MESSAGE: &str = "Successfully logged in";
+const API_KEY_AUTHENTICATION_NOTICE: &str = "Authentication is checked when you send a request.";
 
 /// Installs a small file-backed tracing layer for direct `codex login` flows.
 ///
@@ -186,7 +187,8 @@ pub async fn run_login_with_api_key(
         config.auth_keyring_backend_kind(),
     ) {
         Ok(_) => {
-            eprintln!("{LOGIN_SUCCESS_MESSAGE}");
+            // The key is stored, not checked; authentication happens on first use.
+            eprintln!("API key saved. {API_KEY_AUTHENTICATION_NOTICE}");
             drop(login_log_guard);
             std::process::exit(0);
         }
@@ -355,7 +357,8 @@ pub async fn run_login_status(cli_config_overrides: CliConfigOverrides) -> ! {
         Ok(Some(auth)) => match auth.auth_mode() {
             AuthMode::ApiKey => match auth.get_token() {
                 Ok(api_key) => {
-                    eprintln!("Logged in using an API key - {}", safe_format_key(&api_key));
+                    eprintln!("API key configured - {}", safe_format_key(&api_key));
+                    eprintln!("{API_KEY_AUTHENTICATION_NOTICE}");
                     std::process::exit(0);
                 }
                 Err(e) => {

@@ -1398,7 +1398,13 @@ async fn dispatch_submission(
         .services
         .agent_control
         .execution_permit_cleanup(sess.thread_id, &sub.id);
-    debug!(?sub, "Submission");
+    // Op payloads carry user input, commands and tool results; log metadata only.
+    debug!(
+        submission.id = sub.id.as_str(),
+        codex.op = sub.op.kind(),
+        client_user_message_id = ?sub.client_user_message_id,
+        "Submission"
+    );
     let dispatch_span = submission_dispatch_span(&sub);
     async {
         if matches!(&sub.op, Op::UserInput { .. } | Op::Review { .. }) {

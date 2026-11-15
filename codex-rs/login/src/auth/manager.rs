@@ -2469,7 +2469,7 @@ impl AuthManager {
                 }
             });
             if admitted {
-                self.reload().await;
+                self.retry_failed_auth_load().await;
             }
         }
         let auth = self.auth_cached()?;
@@ -2564,6 +2564,28 @@ impl AuthManager {
         let new_auth = self.load_auth(source.as_ref()).await;
         self.with_current_external_auth(&generation, || self.publish_auth_load(new_auth))
             .unwrap_or(false)
+    }
+
+    /// Retries a failed credential load. A repeated read or parse failure is not
+    /// a logout: like the guarded reload, keep the identity anchor and record the
+    /// failure so dispatch stays fail-closed until a load succeeds.
+    async fn retry_failed_auth_load(&self) {
+        tracing::info!("Retrying failed auth load");
+        let Some((generation, source)) = self.external_auth_snapshot() else {
+            return;
+        };
+        let new_auth = self.load_auth(source.as_ref()).await;
+        let _ = self.with_current_external_auth(&generation, || match new_auth {
+            Ok(auth) => {
+                let changed = self.publish_auth_load(Ok(auth));
+                tracing::info!("Reloaded auth after failed load, changed: {changed}");
+            }
+            Err(err) => {
+                if let Ok(mut error) = self.load_error.write() {
+                    *error = Some((std::time::Instant::now(), err.kind(), err.to_string()));
+                }
+            }
+        });
     }
 
     /// Distinguishes missing credentials from an unavailable or malformed store.

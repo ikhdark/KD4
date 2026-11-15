@@ -221,22 +221,62 @@ pub async fn run_plugin_list(
                 .is_none_or(|name| marketplace.name == *name)
         })
         .collect::<Vec<_>>();
+    let marketplace_sources = if args.json {
+        configured_marketplace_sources(&plugins_input, codex_home.as_path())
+    } else {
+        HashMap::new()
+    };
+    write_plugin_list(
+        &mut std::io::stdout().lock(),
+        marketplaces,
+        args,
+        &marketplace_sources,
+    )
+}
+
+/// A consumer such as `head` may close the pipe before the whole list is written;
+/// that is not a failure. Other write errors still propagate.
+fn write_plugin_list(
+    out: &mut impl std::io::Write,
+    marketplaces: Vec<ConfiguredMarketplace>,
+    args: ListPluginsArgs,
+    marketplace_sources: &HashMap<String, JsonMarketplaceSource>,
+) -> Result<()> {
+    let result = render_plugin_list(out, marketplaces, args, marketplace_sources)
+        .and_then(|()| out.flush().map_err(Into::into));
+    match result {
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe) =>
+        {
+            Ok(())
+        }
+        result => result,
+    }
+}
+
+fn render_plugin_list(
+    out: &mut impl std::io::Write,
+    marketplaces: Vec<ConfiguredMarketplace>,
+    args: ListPluginsArgs,
+    marketplace_sources: &HashMap<String, JsonMarketplaceSource>,
+) -> Result<()> {
     if args.json {
-        let marketplace_sources = configured_marketplace_sources(&plugins_input, codex_home.as_path());
         let output = JsonPluginListOutput::from_marketplaces(
             marketplaces,
             args.available,
-            &marketplace_sources,
+            marketplace_sources,
         );
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        writeln!(out, "{}", serde_json::to_string_pretty(&output)?)?;
         return Ok(());
     }
 
     if marketplaces.is_empty() {
         if let Some(marketplace_name) = args.marketplace_name {
-            println!("No plugins found in marketplace `{marketplace_name}`.");
+            writeln!(out, "No plugins found in marketplace `{marketplace_name}`.")?;
         } else {
-            println!("No marketplace plugins found.");
+            writeln!(out, "No marketplace plugins found.")?;
         }
     } else {
         for (index, marketplace) in marketplaces.into_iter().enumerate() {
@@ -300,19 +340,21 @@ pub async fn run_plugin_list(
             }
 
             if index > 0 {
-                println!();
+                writeln!(out)?;
             }
-            println!("Marketplace `{}`", marketplace.name);
-            println!("{}", marketplace.path.as_path().display());
-            println!();
-            println!(
+            writeln!(out, "Marketplace `{}`", marketplace.name)?;
+            writeln!(out, "{}", marketplace.path.as_path().display())?;
+            writeln!(out)?;
+            writeln!(
+                out,
                 "{:<plugin_width$}  {:<status_width$}  {:<installed_version_width$}  {:<path_width$}",
                 "PLUGIN", "STATUS", "VERSION", "PATH"
-            );
+            )?;
             for (plugin, status, installed_version, path) in rows {
-                println!(
+                writeln!(
+                    out,
                     "{plugin:<plugin_width$}  {status:<status_width$}  {installed_version:<installed_version_width$}  {path:<path_width$}"
-                );
+                )?;
             }
         }
     }

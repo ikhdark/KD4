@@ -144,7 +144,7 @@ impl ConfigManager {
         let config: ApiConfig = serde_json::from_value(json_value)
             .map_err(|err| ConfigManagerError::json("failed to deserialize configuration", err))?;
 
-        let response = ConfigReadResponse {
+        let mut response = ConfigReadResponse {
             config,
             origins: layers
                 .origins()
@@ -162,6 +162,17 @@ impl ConfigManager {
                     .collect()
             }),
         };
+
+        // Exporter credentials stay in runtime config; the public projection of
+        // both the effective config and every included layer never returns them.
+        if let Some(otel) = response.config.additional.get_mut("otel") {
+            redact_otel_exporter_headers(otel);
+        }
+        for layer in response.layers.iter_mut().flatten() {
+            if let Some(otel) = layer.config.get_mut("otel") {
+                redact_otel_exporter_headers(otel);
+            }
+        }
 
         Ok((response, features))
     }
@@ -806,13 +817,48 @@ fn compute_override_metadata(
     let overriding_layer = find_effective_layer(layers, segments)?;
     let message = override_message(&overriding_layer.name);
 
+    // Redact the whole OTEL table before selecting the path, which may name an
+    // entire exporter or a single credential header.
+    let effective_value = if segments.first().is_some_and(|segment| segment == "otel") {
+        effective
+            .get("otel")
+            .and_then(|otel| serde_json::to_value(otel).ok())
+            .and_then(|mut otel| {
+                redact_otel_exporter_headers(&mut otel);
+                segments[1..]
+                    .iter()
+                    .try_fold(&otel, |value, segment| value.get(segment.as_str()))
+                    .cloned()
+            })
+    } else {
+        effective_value.and_then(|value| serde_json::to_value(value).ok())
+    }
+    .unwrap_or(JsonValue::Null);
+
     Some(OverriddenMetadata {
         message,
         overriding_layer: config_layer_metadata_to_api(overriding_layer),
-        effective_value: effective_value
-            .and_then(|value| serde_json::to_value(value).ok())
-            .unwrap_or(JsonValue::Null),
+        effective_value,
     })
+}
+
+/// Replaces OTEL exporter header values (for example `Authorization`) in a public
+/// config projection; names, endpoints, protocol and TLS fields are kept.
+fn redact_otel_exporter_headers(otel: &mut JsonValue) {
+    for field in ["exporter", "trace_exporter", "metrics_exporter"] {
+        let Some(exporter) = otel.get_mut(field).and_then(JsonValue::as_object_mut) else {
+            continue;
+        };
+        for settings in exporter.values_mut() {
+            let Some(headers) = settings.get_mut("headers").and_then(JsonValue::as_object_mut)
+            else {
+                continue;
+            };
+            for value in headers.values_mut() {
+                *value = JsonValue::String("[REDACTED]".to_string());
+            }
+        }
+    }
 }
 
 fn first_overridden_edit(

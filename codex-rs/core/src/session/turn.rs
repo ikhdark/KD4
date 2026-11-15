@@ -781,6 +781,16 @@ pub(crate) fn run_turn(
             };
             logical_generation_ordinal = logical_generation_ordinal.saturating_add(1);
             let sampling_request_result: CodexResult<_> = async {
+                // The partial/unavailable turn-diff warning tells the model not to claim
+                // unchanged files; deliver it once, at this request boundary, not only to the UI.
+                let diff_warning = turn_diff_tracker.lock().await.take_pending_model_warning();
+                if let Some(message) = diff_warning {
+                    let item = ContextualUserFragment::into(RenderedContextFragment::new(
+                        "developer", message,
+                    ));
+                    sess.record_conversation_items(turn_context.as_ref(), std::slice::from_ref(&item))
+                        .await?;
+                }
                 super::workflow_checkpoint::maybe_record_workflow_checkpoint(
                     sess.as_ref(),
                     turn_context.as_ref(),
