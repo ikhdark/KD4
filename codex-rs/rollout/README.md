@@ -1,15 +1,17 @@
 # Rollout activity capture
 
-Enable optional intermediate activity records in the fork configuration:
+Control intermediate activity records in the fork configuration:
 
 ```toml
 [features]
 rollout_activity = true
 ```
 
-The feature is off by default and requires a binary built with this feature.
-It affects new events in sessions using that configuration, including resumed
-sessions; it cannot recover events omitted by older runs.
+The current [feature registry](../features/src/lib.rs) enables `rollout_activity`
+by default; set it to `false` to disable capture. This is a runtime configuration
+flag, not a Cargo build feature. Older binaries without the implementation cannot
+enable it. It affects new events in sessions using that configuration, including
+resumed sessions; it cannot recover events omitted by older runs.
 
 Captured events use the existing JSONL `event_msg` representation:
 

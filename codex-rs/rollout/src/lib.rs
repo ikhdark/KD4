@@ -83,6 +83,7 @@ pub use list::rollout_created_at_key;
 pub use list::rollout_date_parts;
 pub use list::verified_rollout_thread_id;
 pub use metadata::builder_from_items;
+pub use metadata::has_unavailable_session_meta;
 pub use persistence_metrics::RolloutPersistenceBatchMeasurement;
 pub use persistence_metrics::RolloutPersistenceTelemetry;
 pub use persistence_metrics::measure_and_filter_rollout_items;

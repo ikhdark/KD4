@@ -169,4 +169,9 @@ Formatting remains opt-in: `just fmt` selects Just and Rust;
 explicit formatter group. The `pnpm format` family checks formatting;
 `pnpm format:fix` writes it. Check recipes remain subject to validation policy.
 The `scripts/` Python project retains only formatting and archive dependencies.
+`just sdk-python-check` first synchronizes development dependencies into
+`.cache/sdk-python-check` (excluding the pinned CLI runtime), then runs Ruff.
+The Python formatter groups also use `uv run`, which can synchronize their
+environments. A check or formatting recipe is not an offline/no-install guarantee;
+inspect its workload and follow setup permissions before running it.
 Saved-session analysis belongs in KDR, not compatibility shims in this tree.

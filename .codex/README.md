@@ -10,10 +10,10 @@ The [root README](../README.md) indexes the active product and development guide
 | --- | --- |
 | [config.toml](config.toml) | Repository-local Codex configuration; kept at its runtime path. |
 | [test-runners.json](test-runners.json) | Validation runner registration; kept at its runtime path. |
-| [audits/](audits/README.md) | Retained historical reports/captures; new investigation reports use KDR's `audits/open-cases/`; see [case status](../../KDR/audits/README.md). |
-| [fix-evidence/](fix-evidence/index.json) | Existing KD4 fix-to-receipt bindings; moved KDR evidence and shared benchmark learning are linked without copies. |
+| [audits/](audits/README.md) | Retained historical reports/captures; new investigation reports use KDR's `audits/active-cases/<frontend|backend>/<task>/`; see [case status](../../KDR/audits/README.md). |
+| [fix-evidence/](fix-evidence/index.json) | Existing KD4 fix-to-receipt bindings; see the [registry guide](fix-evidence/README.md). Moved KDR evidence and shared benchmark learning are linked without copies. |
 | `gitdiff/` (when present) | Runtime output path for named patch receipts from the diff-saving tool. |
-| `benchmark-runs/` (when present) | Historical benchmark captures; new case output uses KDR's `benchmarks/open-cases/`; see [benchmark cases](../../KDR/benchmarks/README.md). |
+| `benchmark-runs/` (when present) | Historical benchmark captures; new case output uses KDR's `benchmarks/active-cases/<frontend|backend>/<task>/`; see [benchmark cases](../../KDR/benchmarks/README.md). |
 | [locks/](locks/) | Tool-managed coordination files; not disposable audit clutter. |
 
 New investigation evidence, proposals and benchmark learning use
@@ -26,28 +26,28 @@ for selective behavioral constraints and warning-only advisories, not work-refus
 
 ## Current repository state
 
-Repository-owned test-only files and dedicated test commands have been removed
-across all languages. Build/lint checks, production examples/generators, and
+First-party test-only files and dedicated test commands have been removed
+from the maintained source. This does not describe vendored dependencies, installed
+environments, or frozen evidence/source snapshots. Build/lint checks, production examples/generators, and
 mixed-purpose validation-runner registrations remain. SDK check recipes perform
-lint/type checks, not tests. See [AGENTS.md](../AGENTS.md) for guidance.
+lint/type checks, not tests; the Python recipe also synchronizes dependencies.
+See [the script workflow](../scripts/README.md#other-workflows) and
+[AGENTS.md](../AGENTS.md) for guidance.
 Runner registration is not execution permission: the active validation mode
-still applies, and retained benchmark workloads may generate and run tests.
+still applies. Inspect a retained workload before running it; one that creates
+or runs tests remains forbidden under Full .5.
 
 ## Retained history
 
-- The [audit library](audits/README.md) groups reports and raw captures by task.
-  At the 2026-10-26 organization, all 105 retained tasks had matching copies here
-  and in `C:\Users\kuh\Desktop\KDR\audits` (see the library's organization
-  report); later task folders are not guaranteed to be mirrored.
+- The [audit library](audits/README.md) retains October 2026 KD4 reports and raw
+  captures by task. It is not mirrored in KDR's audit library; new reports go to
+  KDR.
 - Historical reports and benchmark captures may refer to removed tests,
   support crates, and paths; preserve those records rather than treating them as
   current runnable instructions.
 - Related evidence bundles are collected inside their task folder. Their source
   snapshots, including any nested `.codex` directories, are historical evidence,
   not active workspace configuration.
-- Files older than seven days were removed on 2026-10-26 by last-modified time.
-  Newer reports and captures are retained. Historical commands may name old
-  paths; see the [relocation guide](audits/README.md#relocated-files).
-- Audit evidence, patch receipts, benchmark output, and locks are Git-ignored
-  by repository rules. The formerly tracked loose closeout is included in the
-  `remaining-fixes-2026-10-22` task folder; local organization publishes nothing.
+- Age-based pruning left some retained bundles incomplete. Historical commands
+  may name old paths; see the [relocation guide](audits/README.md#relocated-files).
+- Audit evidence, patch receipts, benchmark output and locks are Git-ignored.

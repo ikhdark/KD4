@@ -17,6 +17,10 @@ python .\scripts\codex_package\stage_npm_packages.py `
 
 `--package codex` expands to the launcher plus Windows x64 and ARM64 native
 packages. `codex-sdk` stages the TypeScript SDK with a matching CLI dependency.
+Staging `codex-sdk` also runs `pnpm install --frozen-lockfile` (including dependency
+lifecycle scripts) and builds the SDK, even with local `--vendor-src`. It may
+download dependencies; local staging is not an offline/no-install check. Inspect
+the selected workload and obtain any required setup authorization first.
 The helper writes tarballs to `dist/npm/` by default; `--output-dir` overrides it.
 Native tarballs contain the canonical runtime tree under `vendor/<target>/`;
 the launcher and SDK do not embed native payloads.

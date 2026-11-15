@@ -102,6 +102,9 @@ $env:CARGO_INCREMENTAL = "1"
 python tools/argument-comment-lint/run.py -p codex-core
 ```
 
+An intentionally relaxed run is exploratory, not evidence that the repository
+lint rules pass. Do not use these overrides to obtain a passing validation result.
+
 To override an explicitly narrow target selection, or to be explicit in scripts:
 
 ```powershell

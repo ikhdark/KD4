@@ -8,8 +8,10 @@ inherited from upstream and do not identify a published KD4 SDK.
 
 ## Local setup
 
-Requires Windows and Node.js 18+. In an already configured checkout, build the SDK
-from the repository root:
+The packaged SDK requires Windows and Node.js 18+. Checkout development uses the
+newer Node.js and pnpm versions declared in the root
+[`package.json`](../../package.json). With those tools and dependencies already
+configured, build the SDK from the repository root:
 
 ```powershell
 pnpm --filter @openai/codex-sdk build

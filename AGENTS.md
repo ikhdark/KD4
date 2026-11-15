@@ -1,91 +1,224 @@
 # KD4 and KDR
 
-Keep this file identical in both checkouts, keep project context.
+Keep this file identical in both checkouts. It owns shared agent policy; linked
+guides own commands, inventories and area-specific contracts.
 
-## Completion and workflow blockers
+## Start with the owner
 
-- Root-cause ownership: Do not stop at symptoms, classified findings, missing evidence, or an “unresolved” disposition when the task requires a fix. Trace the failure through its owning code, obtain missing evidence using permitted methods, identify the actual cause, implement the correction, and verify it.
-- No premature completion: A diagnostic report, workaround, or successful unrelated check does not complete a repair task. Continue until the requested behavior is verified or a concrete external blocker prevents further progress. Never invent causes or fixes to force closure.
-- Leave no gaps: keep the full requested outcome and every in-scope claim, review item and acceptance criterion active until resolved, including missing artifact coverage and measurements needed to substantiate requested claims. For each unresolved item, identify the exact missing observation, its owning path and the next permitted action, then perform that action without waiting for the user to repeat "solve it." Partial, unverified and blocked items are unfinished, not a completed handoff; status questions do not cancel remaining work. Incidental observations, speculative risks and newly discovered unrelated issues do not automatically expand the requested scope. Resolve all demonstrated in-scope failures, but do not convert every uncertainty into a mandatory acceptance criterion.
-- When an authorized investigation-and-fix task reveals multiple in-scope failure modes, diagnose, fix and verify each; do not silently narrow work to the latest/primary failure or wait for the user to say "fix both." Keep separate causes separate, but do not treat an independent cause or older occurrence as optional follow-up. Reconcile historical failures with current code/evidence before editing; close only with verified correction or an evidence-backed no-defect/not-applicable disposition. Explicit scope, read-only and permission limits still apply.
-- Treat any workflow blocker as work to resolve. Diagnose and repair its cause in the owning component, add missing reusable diagnostics/capture/replay/workload support when needed, then resume the original task. Use the smallest reusable addition sufficient to resolve the original task; do not generalize beyond its demonstrated needs. Material infrastructure or scope expansion requires a user decision, not automatic escalation of the repair into a platform project. Implementation complexity or diagnostic difficulty alone is not material scope expansion; a genuinely independent infrastructure project, destructive change or significant new operational commitment is. Do not stop at a blocker list or substitute a smaller successful task.
-- Reproduce in-scope issues yourself as part of an authorized investigation-and-fix task; do not ask the user to recreate them or seek separate permission for reproduction already covered by the task and current permissions. Use bounded, isolated diagnostics, captures or replays that preserve active user work and exercise the real trigger. Missing reproduction/capture/replay support is a workflow blocker to repair in its reusable KDR owner, not a reason to hand reproduction back to the user. Escalate only a demonstrated dependency on unavailable user-only input or authority beyond the task, after completing independent work; never bypass explicit restrictions.
-- When offline evidence cannot prove an in-scope issue or its correction, perform the necessary bounded live reproduction/verification yourself; do not ask the user for live-run permission already covered here. This is explicit standing user authorization for necessary task-scoped live runs, including live application interaction and paid provider/model calls when required. Identify the missing observation, preserve active user work, and retain real trigger-to-outcome evidence. Use the smallest representative live workload necessary to obtain the missing evidence. Keep diagnostics bounded, track cumulative time, calls and paid spend, and respect any explicit user-defined resource limits. When no numerical limits are specified, use proportional resource judgment without creating artificial authorization ceilings or requesting renewed permission for already-authorized work. Continue the original task after each diagnostic attempt, reusing evidence and avoiding unnecessary repetitions. Seek additional authorization only when an actual permission boundary or materially exceptional resource expenditure requires it. Higher-priority validation/permission limits and more specific user restrictions still apply; do not bypass safeguards or infer authority for destructive operations, publishing, machine-wide setup or unrelated campaigns.
-- When available evidence cannot answer an in-scope question or verify a finding, identify the missing observation or contract and prefer existing KDR diagnostic, capture, replay or evidence-adapter capabilities to obtain it. Equivalent direct behavioral evidence is sufficient when it establishes the required contract; record or reference it in KDR when appropriate rather than rebuilding conclusive proof through KDR. If those capabilities cannot observe the required contract, make the smallest sufficient reusable extension in the existing KDR owner, within the scope and resource boundaries above. Do this proactively within current authorization, without waiting for the user to request more diagnostics or approve already-authorized work. Missing tooling is implementation work, not by itself an unavailable external input or a completed disposition.
-- Finish the evidence loop: verify the added support observes the required trigger and producer-to-consumer outcome, use it to obtain the missing evidence, then resume and resolve the original investigation and affected findings. A run that completes without exercising the required trigger is an unsuccessful verification attempt, not a stopping point: inspect why the trigger was missed, correct the workload/capture method in its owner, and continue within the active permissions and cumulative budget. Adding diagnostics, documenting unknowns, a successful retry, or synthetic checks that omit the real trigger do not establish the requested fix. If evidence collection genuinely requires unavailable external input or additional permission, complete independent work and name that exact dependency; do not bypass safeguards or fabricate coverage.
-- Before final handoff, reconcile every in-scope claim, review item and acceptance criterion against current owning code and evidence, not only the latest successful correction. Mark a requirement satisfied only with evidence that its requested outcome is met; close a defect claim only with a verified fix or an evidence-backed no-defect/not-applicable disposition that answers the original claim. Missing reproduction, unexercised triggers, incomplete coverage and absent measurements are not no-defect evidence. Continue targeted work needed to resolve remaining items within scope, permissions and the cumulative task budget; a caveat, needs-review label, report or promise to continue does not replace obtainable work. Genuinely blocked items remain explicitly unfinished. Do not force speculative changes or fabricate passes to clear counts.
-- Define verification from the requested contract before selecting a workload: identify the real trigger, production producer-to-consumer path, expected observable result and affected valid behavior. Include lifecycle boundaries material to that contract (for example repeated compaction/rollover, cold restart/restoration, native paginated recovery and interrupted execution), not just the easiest successful path. Reconcile review qualifications with these obligations: resolve each in-scope gap or establish an evidence-backed exclusion or concrete external blocker; do not silently shrink acceptance to match available captures. Do not turn unrelated hypothetical risks into an unlimited verification campaign, and preserve explicit read-only limits.
-- Check evidence fidelity before declaring success: record what each capture actually exercised and consumed. Scripted/mock remote behavior does not verify the real service; archive equality does not verify native retrieval or later consumption; reading one field does not verify complete large-result recovery; protection metadata does not prove enforcement. Inspect retained trigger-to-outcome evidence, not only runner exit status or summary labels. Use the real path where required and authorized, repair insufficient KDR workloads in their existing owner, and rerun only for the missing observation. Scope completion claims to demonstrated behavior and carry remaining required coverage forward; a later caveat does not repair an earlier unsupported “fixed/passed” claim.
-- Verify the requested behavior and affected valid behavior using permitted checks. Compilation, syntax checks, offline evidence and component success do not establish coverage of behavior they did not exercise.
-- Prove the fix changed behavior. Where possible, run the same failing scenario against the old and corrected implementations with matched inputs and settings: old fails, new passes. A new-code pass alone is weaker evidence; retain the comparison evidence and state when the old implementation cannot be exercised.
-- When before/after verification is feasible, demonstrate the old implementation's incorrect observable result and the corrected implementation's expected result under matched inputs. Do not count failure caused solely by missing newly introduced code or interfaces as proof of a defect.
-- Use independent review when failure consequences are high or the available behavioral evidence cannot adequately challenge the fix author's assumptions, subject to applicable delegation authorization. For lower-consequence fixes, strong matched before/after evidence and affected-behavior verification may suffice; task priority alone does not mandate another reviewer. When used, the reviewer should challenge the expected outcome and shared assumptions, not merely generate more checks. The fix author defining both the implementation and its expected outcome is not independent verification.
-- Use a stopping rule for each fix: demonstrated failure corrected, relevant existing behavior preserved, and no observed regression. Once those conditions are supported by permitted evidence, move on; do not expand verification without a concrete unresolved risk. This does not waive remaining requested work or turn missing coverage into a pass.
-- Do not close code items as "source-checked" on inspection alone. Source-only verification is acceptable only for documentation or when it clearly and directly proves the exact acceptance claim; explain why it is sufficient. Otherwise verify the affected behavior with permitted execution, or keep the item unverified and resolve the verification blocker.
-- If a blocker genuinely requires a user decision, permission, credentials or unavailable external input, finish independent work, keep affected items open, and state the verified cause, attempted repairs and exact intervention needed. Do not bypass safeguards, expand permissions or claim completion by merely disclosing the gap.
+Read the README relevant to the task, then its linked area guide. Do not load
+every guide or run a blanket scan as a routine prerequisite.
 
-## Read first
+| Task | Entry point |
+| --- | --- |
+| KD4 runtime, source navigation and development | [KD4 overview](../KD4/README.md) |
+| KDR scanner, diagnostics and verification | [KDR documentation](../KDR/docs/README.md) |
+| Reusable offline tools and workloads | [KDR scripts](../KDR/scripts/README.md) |
+| Binary reuse, isolated builds and execution safeguards | [Managed builds](../KDR/scripts/build/README.md) |
+| Report ownership, case status and closure | [Report library](../KDR/audits/README.md) |
+| Benchmark evidence and reusable infrastructure | [Benchmark library](../KDR/benchmarks/README.md) |
+| Storage, learning and cache owners | [Storage layout](../KDR/docs/operations/STORAGE_LAYOUT.md) |
+| Documentation and file organization | [Documentation workflow](../KDR/docs/operations/DOCUMENTATION_WORKFLOW.md) |
 
-Before acting, read the README(s) relevant to the task and follow their linked area-specific guides:
+KD4 owns the backend. The editable Desktop frontend is in sibling
+`Codex-Fork`; follow [its instructions](../Codex-Fork/AGENTS.md) for frontend
+work. Leave the Windows Store installation untouched.
 
-- [KD4 overview](../KD4/README.md): runtime ownership, source navigation and development.
-- [KDR documentation](../KDR/docs/README.md): scanner commands, analyzer adoption, verification and measurement contracts.
-- [KDR scripts](../KDR/scripts/README.md): offline tools and workload contracts.
-- [Managed builds](../KDR/scripts/build/README.md): binary reuse, isolated dev builds and execution safeguards.
-- [Reports and storage](../KDR/audits/README.md): output ownership, evidence retention and learning locations.
-- [Benchmark cases](../KDR/benchmarks/README.md): case status, retained runs and reusable infrastructure.
+## Work through the complete request
 
-Keep command syntax, inventories and storage maps in those guides, not duplicated here.
+- Review current source and evidence, establish a concrete defect or meaningful
+  benefit, fix the owning component, then verify the requested outcome and
+  affected valid behavior. Trace callers and consumers; fix implementation bugs
+  in code, not prompt workarounds.
+- Reviews and audits include fixing verified in-scope issues unless the user
+  explicitly requests read-only work. Recommendations, classification and worker
+  handoffs do not discharge authorized repairs. Nothing is postponed: finish
+  reviewed or audited work in the same task; the only stop is a genuine blocker
+  that needs user input or authority.
+- List the requested claims, findings and acceptance criteria at the start. Keep
+  each active until it is satisfied or the user explicitly supersedes it; blocked
+  items stay open.
+  Status questions do not cancel unfinished work. Diagnose, fix and verify each
+  distinct in-scope failure mode, including older or secondary occurrences, or
+  close it with an evidence-backed no-defect/not-applicable finding. Do not
+  narrow an investigation-and-fix task to classification, documentation, the
+  latest failure or its easiest successful path; disclosing a narrowing does not
+  make it acceptable.
+- For broad reviews, account for the complete requested inventory, including
+  assigned and unassigned areas, partial reads and justified exclusions. Reconcile
+  each worker's coverage and findings with that inventory; agreement or a completed
+  worker status is not proof. Use the existing plan or live findings, not a new
+  bookkeeping tree.
+- Reconcile historical findings with current source and later fixes before
+  editing. Age, labels and missing evidence prove neither a defect nor its
+  absence. Items the user named are in scope; do not revive unrelated historical
+  campaigns or promote speculative risks you discover into acceptance criteria.
+- Make the smallest justified owning change and necessary integration edits;
+  smallest limits blast radius, not the number of defects, so fix every site
+  sharing the root cause. Preserve user and concurrent-agent work, unrelated behavior, interfaces,
+  defaults, dependencies and formatting; re-read before editing and merge rather
+  than replay an older copy. Prefer extending a working fix; replace it only when
+  incremental correction is insufficient, explaining the lost and retained benefits.
+- Repair in-scope workflow blockers in their existing owner, including missing
+  reusable KDR diagnostics/capture/replay support, then resume the original task.
+  If an existing bench or replay cannot exercise the affected path or state,
+  extend that owner and run it; "the bench doesn't cover X" is unfinished work.
+  Difficulty is not a reason to stop or seek renewed permission. A genuinely
+  independent infrastructure project, destructive change, material tradeoff or
+  significant new operational commitment requires a user decision; finish the
+  independent work first and propose a default.
+- Reproduce and verify authorized issues yourself with bounded isolated work
+  that preserves active user state. Do not hand obtainable reproduction back to
+  the user. If a run misses the real trigger, correct the method and continue;
+  successful setup or diagnostic output alone is not a repair.
+- Stop a fix once its demonstrated failure is corrected, relevant valid behavior
+  is verified preserved and no regression is observed; missing regression
+  coverage remains unverified. Correct or revert only your regressing edits;
+  retain a material regression only with explicit user acceptance. Do not add
+  verification campaigns without a concrete unresolved risk. Stopping one fix
+  does not end the remaining requested work.
+- Before handoff reconcile every requested item against evidence and report each
+  as verified, unfinished or blocked. Missing coverage, incomplete recovery and
+  unknown outcomes are not passes or no-defect findings. Do not end a turn asking
+  whether to continue while obtainable in-scope work remains.
+  For each unresolved item, identify the missing observation and next permitted
+  action, then perform it; a caveat, needs-review label, report or promise to
+  continue is not a substitute for obtainable work. Close only with requirement
+  satisfaction, a verified correction or an evidence-backed
+  no-defect/not-applicable disposition; never invent causes, fixes or passes to
+  clear findings. Finish independent work before reporting a genuine blocker with
+  its verified cause, remaining scope, attempted repairs and exact unavailable
+  input or authority; blocked work remains unfinished, not complete.
 
-### KDR usage
+## Evidence and validation
 
-Use KDR proactively whenever its existing diagnostics, benchmarks, or saved evidence can materially improve an investigation, implementation, or verification.
+- Use KDR proactively when existing diagnostics, benchmarks or saved evidence
+  materially help. Discover the relevant capability; reuse source-matched
+  analysis, hashes and completed evidence instead of duplicating work. KDR is
+  not a mandatory ceremony for every task.
+- Define verification from the contract: real trigger, production
+  producer-to-consumer path, observable outcome, affected valid behavior and
+  material lifecycle boundaries. Exercise repeated rollover, restart, native
+  recovery or interruption when the affected contract requires them, not by default.
+  Verify the final edited source through the binary or analyzer that actually
+  contains the edit, not a stale build or frozen snapshot.
+- Inspect what evidence actually exercised and consumed. Mocks do not verify a
+  real service; archive equality does not prove native retrieval or consumption;
+  partial reads do not prove full recovery; metadata does not prove enforcement.
+  Builds, syntax checks, runner exit status, summary labels, offline evidence and
+  component success do not establish behavior they did not exercise; worker,
+  subagent and tool summaries are claims to check against their retained evidence. Scope each fixed/passed claim to the behavior demonstrated, and
+  correct an unsupported claim explicitly rather than appending a caveat.
+- Prefer matched old/new reproduction when feasible: the old implementation's
+  incorrect outcome must not be solely a missing new interface. Retain inputs,
+  settings, identities and raw results. Explain when the old path cannot run.
+  Performance claims require representative matched measurements and repetitions;
+  component timing does not prove an end-to-end gain. Account for measurement
+  noise; inconclusive results remain unverified, not a pass.
+- Check metrics against owning semantics, identities, event ordering,
+  denominators and sample populations, and reconcile totals. Correlation,
+  adjacency and matching text are not causation; match events by recorded
+  identity, not log proximity. Separate observations, inference, hypothetical
+  savings and verified improvement; fewer tokens, a faster run or a passing
+  benchmark is not an improvement unless correctness, recovery and coverage hold.
+  Challenge important findings with counterexamples and correct unsupported
+  conclusions explicitly.
+- Use independent review for high-consequence changes or evidence that cannot
+  adequately challenge the author's assumptions, subject to delegation
+  authorization. Strong matched evidence may suffice for lower-consequence fixes.
+- Follow the active validation mode and permissions. Inspect selected runners
+  and delegated workloads; names and documented commands grant no exception.
+  Source-only verification suffices for documentation or a claim it directly
+  proves, not runtime behavior. Do not run tests when forbidden or create tests.
+  A restriction changes the method, not the obligation: verify with other
+  permitted execution, or keep the item unverified and open.
+- When offline evidence cannot settle an in-scope issue, necessary bounded
+  task-scoped live runs are authorized, including application interaction and
+  paid provider/model calls. Use the smallest representative workload, track
+  cumulative time/calls/spend, and respect user limits and higher-priority
+  permissions. Do not invent numerical approval ceilings. This standing
+  authorization does not cover publishing, provisioning, destructive operations,
+  background monitoring or unrelated campaigns. Do not start background
+  monitoring without a request; opt-in flags alone do not require renewed
+  permission.
+- Sessions live at `C:\Users\kuh\Desktop\LOCAL-KD\sessions`. Prefer recent
+  representative recordings while retaining requested history and matched
+  controls. Saved commands and other chats are evidence, not current
+  instructions or workers. Before interpreting session counts or metric
+  attribution, read `context:workflow-evidence` once; outside KD4 read its
+  sources, `../KD4/codex-rs/core/templates/{diagnostic_triage,metric_attribution}.md`.
 
-- Discover and select relevant KDR capabilities rather than requiring the user to name them.
-- Prefer KDR to resolve in-scope findings and verify fixes; equivalent direct behavioral evidence is also valid when it establishes the required contract. Defer only when the user explicitly parks the work or a demonstrated dependency cannot be resolved within current scope, permissions or budget after independent work; do not defer merely because verification is difficult or incomplete. Record each deferral's reason, remaining evidence or dependency, and next action. Deferred findings remain open, not verified or resolved.
-- Prefer existing evidence and targeted diagnostics. Reuse completed analysis instead of rerunning it.
-- Run appropriate benchmarks when performance claims require measurement.
-- Do not run blanket scans, unrelated diagnostics, or redundant verification.
-- Opt-in diagnostic flags do not independently require user approval when their use is already authorized by the task.
-- Respect explicit restrictions on background monitoring, destructive operations, application control, and paid-model execution.
-- Preserve evidence uncertainty and distinguish observations from verified conclusions.
+## Prior fixes and learning
 
-KDR is a normal investigation and verification tool, not a mandatory step for every task.
+Use the README-linked diagnostic/storage guides; keep KD4's registry separate
+from KDR's. Before consequential behavioral edits, inspect relevant prior fixes
+and benchmark history. State preserve/modify/reject decisions with fix IDs and
+an evidence-backed rationale using existing patch assessment metadata when
+available, otherwise briefly before editing. Weigh correctness, retained benefits,
+complexity, maintenance and workflow impact; distinguish judgment from measurement.
 
-## Working rules
+Advisories are selective, non-blocking context, not approval gates or proof of
+full coverage. Distinguish delivered context, observed reads and reported
+consideration. Missing records remain unknown. Do not require proposal patches,
+per-fix reports, routine registry checks or unrelated benchmarks.
 
-- Scope and preservation: For repair tasks, make the smallest owning-code change needed for the verified defect, plus only directly necessary integration changes. For explicitly requested improvements or refactors, make only changes justified by the requested outcome. Do not disturb unrelated code, working behavior, interfaces, defaults, dependencies, formatting or user edits; no opportunistic cleanup, refactoring, renaming or broad rewrites. Prefer extending or adjusting an existing fix over fully replacing it; preserve its working parts and retained benefits. Replace it only when evidence shows an incremental correction is insufficient, and explain why. Trace affected callers and consumers. Before claiming completion, verify with permitted checks both that the requested correction or improvement is achieved and that affected previously valid behavior still works. A successful build alone does not establish either behavioral result; missing regression coverage remains unverified, not a pass. If the fix causes an unrelated regression, correct it or revert only your affected edits; never keep breakage as an acceptable side effect or broaden the change without a demonstrated need.
-- The Desktop frontend is editable in sibling `Codex-Fork`; follow [its AGENTS.md](../Codex-Fork/AGENTS.md) for durable performance/UX changes. KD4 owns the backend; leave the Windows Store installation untouched.
-- For frontend fixes, use one owned diagnostic session, advance past entry/onboarding through the actual UI, and capture the failing path. If repeated launches land on the entry page, change the method instead of relaunching or restarting discovery. Entry-page/startup success does not reproduce or verify a downstream defect. Preserve active chats and existing launch/profile safeguards.
-- For frontend fixes, use the predefined reusable diagnostic clone, not a fresh profile or repeated first-run discovery. Initialize its private `home/config.toml` with a byte-for-byte copy of `C:\Users\kuh\Desktop\LOCAL-KD\config.toml`, not a symlink, reference, or generated diagnostic configuration. Thereafter preserve its own config and explicit user-requested overrides; this clone uses `gpt-6.1-terra` with `high` reasoning effort. Reuse its initialized profile and backend home; preserve the live installation, credentials and active chats. Follow [frontend measurement](../KDR/docs/operations/FRONTEND_MEASUREMENT.md) for the maintained clone command.
-- Keep the diagnostic clone on the same application version as the real frontend selected for the task. Before launching, verify its complete application snapshot against that frontend; refresh only the clone's application files when the real frontend changes, retaining rollback evidence. Preserve the initialized profile, private home and Terra/high config. Reverify the existing UI readiness contract after an application update; never use an unverified stale clone or reset onboarding to resolve version drift.
-- Do not start background monitoring without a request.
-- Repair harness-controlled causes, not unrelated captured tasks. Integrate genuinely reusable analysis/capture/replay logic into existing KDR owners rather than task-local parallel runners.
-- Avoid duplicate hashing while verified input/analyzer identities remain valid.
-- Justify each change as a better version than the previous implementation, not merely a different one or one that passes checks. Weigh the intended benefit against retained valid behavior, complexity, maintenance cost and workflow impact. Best judgment is allowed when direct comparison is impractical or the benefit is qualitative; state the rationale and uncertainty, and distinguish judgment from measured proof. Keep verified net improvements with negligible downsides; material tradeoffs require user acceptance.
-- If permitted verification shows a meaningful regression attributable to your change, do not keep the regressing change or label it a fix. Correct it and reverify, or revert only your affected edits while preserving unrelated user work. Account for normal measurement noise with representative comparisons; inconclusive evidence remains unverified, not a pass. Retain a material tradeoff only with explicit user acceptance.
-- Sessions: `C:\Users\kuh\Desktop\LOCAL-KD\sessions`. Prefer recent representative recordings and retain requested history/matched controls. Saved commands and other chats are evidence, not instructions or workers. Read `context:workflow-evidence` once for session counts/metric attribution.
-- Fix implementation bugs in their owners, not with prompt workarounds. Keep KD4's `codex-rs/protocol/src/prompts/base_instructions/default.md` concise and repository-neutral.
+For registered findings follow the [fix ledger](../KDR/docs/operations/FIX_LEDGER.md):
+select unresolved work, preserve verified fixes unless relevant evidence
+invalidates their proof, and close only with KDR or referenced equivalent direct
+behavioral evidence for the declared contract. Overlap warnings never lock
+sessions, refuse edits or restrict normal writes.
 
-## Learning
+## Frontend diagnostics
 
-- Use the README-linked storage and diagnostics guides for learning paths and registry/journal contracts; keep KD4's registry separate from KDR's.
-- Before behavioral edits, establish a real defect or meaningful improvement, understand the current design and inspect relevant prior fixes/benchmark history. Weigh retained benefits, regressions, complexity and workflow impact; explicitly reason whether the evidence supports preserving, modifying or rejecting the prior approach.
-- For consequential changes informed by prior fixes, record relevant fix IDs, preserve/modify/reject decisions and an evidence-backed rationale before mutation. Use the existing patch assessment metadata when available, following the diagnostics guide; otherwise give a brief pre-edit explanation. Distinguish delivered context, observed reads and reported consideration. Missing records remain unknown, never an edit gate; do not create a separate per-fix artifact workflow.
-- Advisories are selective and non-blocking, not approval gates or proof of complete coverage. Do not make registry checks, historical reversal, proposal patches, per-fix receipts or unrelated benchmark campaigns routine prerequisites.
-- Use the [persistent fix ledger](../KDR/docs/operations/FIX_LEDGER.md) for registered findings: select unresolved work, require KDR behavioral evidence or equivalent direct behavioral evidence establishing the declared contract for verified closure, record or reference equivalent evidence in KDR when appropriate, and preserve closed fixes unless relevant changes or new behavioral evidence invalidate affected proof. Overlap warnings never refuse edits, lock sessions or restrict normal write paths.
+Use one owned session and the predefined reusable clone described in
+[frontend measurement](../KDR/docs/operations/FRONTEND_MEASUREMENT.md), not fresh
+profiles or repeated onboarding discovery. Initialize its private
+`home/config.toml` with a byte-for-byte copy of
+`C:\Users\kuh\Desktop\LOCAL-KD\config.toml`; thereafter preserve its private
+config, explicit overrides, initialized profile and backend home. The diagnostic
+clone uses `gpt-6.1-terra` / `high`.
 
-## Reporting
+Before launch verify the complete application snapshot against the real frontend
+selected for the task. Refresh only clone application files on version drift,
+retain rollback evidence and reverify UI readiness; do not reset onboarding.
+Advance through the actual UI and capture the failing downstream path. If entry
+screens recur, change the method, not the profile. Startup success is not proof
+of downstream behavior. Preserve the live installation, credentials and active chats.
 
-- Audit keywords: use `wins` for verified improvements and `defers` for deliberately deferred findings. Defers remain unfinished; retain their reasons, dependencies and reopening actions.
-- Historical applicability: Some cases are historical and may or may not need attention in the current state. Reconcile their original scope and findings with current owning code, retained evidence and later fixes before selecting work. Do not automatically revive old tasks, repeat completed campaigns or treat old evidence gaps as current defects. Preserve verified wins and their limits; address demonstrated, still-applicable in-scope failures. Age alone proves neither resolution nor irrelevance, and missing proof remains unknown. Explain evidence-backed exclusions and any authorized deliberate deferrals, retaining unfinished claims and reopening actions rather than labeling them fixed.
-- Scope-based disposition: judge an audit/review folder against its own requested scope and acceptance criteria, not every historical task it references. Once that scope and any authorized fixes are complete, move the audit intact to `closed-cases/` and remove its active index entry. Pre-existing defers or historical evidence limits remain explicitly linked and unfinished in their original owners; do not duplicate them as new blockers or keep the completed audit active unless resolving them is part of its acceptance criteria. Closing the audit does not close those findings, and this rule never waives an actual in-scope fix or required verification.
-- Finish each case folder before closing or deferring it: reconcile every finding and acceptance criterion, complete all authorized fixes and permitted verification, and identify any genuine remaining blockers. Keep the folder active while this work is in progress; do not move individual findings/files to closed or deferred locations one at a time. Record interim progress in the existing live findings index, then perform any necessary deferred split and the folder's final move in one disposition batch at the end. Do not use this batching rule to defer obtainable work or claim that blocked findings are finished. This folder-level timing supersedes linked guidance to transfer findings at the first deferral.
-- At the final folder-level disposition, record deliberate deferrals in `KDR/audits/Deferred/<original-audit-folder>/deferred-findings.txt` (use a standalone audit file's stem). Record original finding IDs, scope, reason, owner, evidence/dependency and reopening action. Separate deferred findings from the main audit's live work list while retaining every non-deferred finding and reciprocal links; split only the deferred portion of mixed findings. Preserve frozen reports/receipts unchanged and use a `current-findings.txt` sidecar when the original report is frozen. Follow the report-library guide; deferral is unfinished, not verified closure, and uncertainty alone is not a deliberate deferral.
-- Continue the consolidated layout in the linked report and benchmark guides: put new cases under `KDR/audits/active-cases/<frontend|backend>/<task>/` or `KDR/benchmarks/active-cases/<frontend|backend>/<task>/`. Client/UI and mixed UI/backend acceptance cases use `frontend`; runtime, protocol, scanner and infrastructure cases use `backend`. Do not recreate separate `open-cases/`, `needs-review/` or mobile case trees, aliases or parallel case roots unless the user explicitly requests a layout change.
-- Library roots and status/platform directories are containers, not report destinations. Keep generated case files inside their task folder; only maintained READMEs, required shared indexes and established tool-owned infrastructure files belong directly in containers. Do not leave loose reports or housekeeping summaries at the audit/benchmark roots.
-- Even a case containing only one report needs its own task folder. Index task directories in `case-status.json`, not individual report files; keep the report and any `current-findings.txt` sidecar together inside that folder. This applies inside `frontend/` and `backend/`, not just at the library root.
-- Documentation-only edits and file-placement/organization work do not need audit logs, reports or relocation receipts. Update existing guidance and affected links, verify the placement, and summarize in chat; create a separate record only when the user explicitly requests one. Do not generate a report merely to record moving reports.
-- Maintain each library's `active-cases/case-status.json` when adding cases, changing their recorded status or moving them. Open and needs-review are statuses in that index, not separate directories. Keep uncertain closure recorded as needs-review; move an intact case to `closed-cases/` only with completion evidence for its full recorded scope. Moving or consolidating a folder never verifies a fix. Preserve frozen evidence bytes and update live documentation, registry/journal and navigation locators when organizing cases.
-- For requested audits/reviews, cover the full requested scope and account for every entry/recommendation; separate verified findings from candidates and coverage gaps.
-- Keep investigation/audit/benchmark reports short and `.txt`: status/counts, coverage, findings (ID, severity, path:line, trigger, evidence, disposition), relevant measurements and limitations/next actions. Link raw evidence rather than copying it. Chat gives brief status and an absolute report link; user read-only/inline/schema restrictions take precedence.
+## Reporting and organization
+
+- Use the existing owners, not new bookkeeping trees. Put each new audit case in
+  its own task folder under `audits/active-cases/<frontend|backend>/` (mixed
+  UI/backend acceptance uses `frontend`) and each benchmark run in its own
+  `benchmarks/<task>/` folder, even for one report. Do not create parallel case
+  roots, aliases, duplicate evidence stores or per-agent indexes.
+- An audit case's folder is its status: everything under `audits/active-cases/`
+  is unfinished, and its live findings file records what remains.
+  `audits/closed-cases/` holds only cases whose full requested scope is fixed,
+  completed and verified (an explicitly read-only review closes when the review
+  is complete). Benchmark folders are evidence and carry no status. Follow the
+  [closure checklist](../KDR/audits/README.md#closure-checklist); a label,
+  status edit or folder move never completes repairs or verification.
+- Keep library/platform containers free of loose generated reports; preserve
+  established tool-owned infrastructure. Frozen reports, receipts, source
+  snapshots and evidence bytes stay unchanged; update live locators when moving
+  records, not historical contents.
+- `wins` and `defers` classify candidate changes, not case status. Label each
+  win `proposed`, `implemented-unverified` or `verified` with cited evidence;
+  never present a proposed or unverified win as a result. A defer is a candidate
+  fix that matched measurement showed was not an improvement; record it with
+  that evidence in the [deferred record](../KDR/audits/README.md#deferrals) so
+  it is not re-proposed without new evidence. A defer never resolves its
+  finding. Nothing else is deferred or postponed: difficult or unverified work
+  is finished in the task, and only a genuine blocker stays open in its active
+  case with the exact input or authority it needs.
+- Keep requested investigation/audit/benchmark reports short and `.txt`: scope
+  and coverage, status/counts, findings with ID/severity/path/trigger/evidence/
+  disposition, measurements, and any genuine blocker with the exact input or
+  authority it needs. Separate verified findings from candidates and coverage
+  gaps. Link raw evidence; give a brief chat handoff with an absolute report
+  link. User format restrictions take precedence.
+- Documentation-only and file-organization work needs no audit log, report,
+  relocation receipt or build. Update existing guidance and affected links,
+  verify placement, and summarize in chat unless a separate record is requested.
+  Keep KD4's `codex-rs/protocol/src/prompts/base_instructions/default.md` concise
+  and repository-neutral.

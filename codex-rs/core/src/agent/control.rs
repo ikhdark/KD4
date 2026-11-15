@@ -1032,6 +1032,14 @@ impl AgentControl {
         &self,
         root_thread_id: ThreadId,
     ) -> CodexResult<()> {
+        self.restore_cold_descendants_inner(root_thread_id, false).await
+    }
+
+    async fn restore_cold_descendants_inner(
+        &self,
+        root_thread_id: ThreadId,
+        retry_unavailable: bool,
+    ) -> CodexResult<()> {
         let state = self.upgrade()?;
         let Some(graph) = state.agent_graph_store() else {
             return Ok(());
@@ -1064,6 +1072,20 @@ impl AgentControl {
                     return Err(CodexErr::InvalidRequest(format!(
                         "repeated cold agent edge to {child}"
                     )));
+                }
+                if retry_unavailable
+                    && let Some(metadata) = self.get_agent_metadata(child)
+                    && let Some(path) = metadata.agent_path
+                {
+                    if path.as_str().rsplit_once('/').map(|(prefix, _)| prefix)
+                        != Some(parent_path.as_str())
+                    {
+                        return Err(CodexErr::InvalidRequest(format!(
+                            "registered agent `{path}` has inconsistent lineage"
+                        )));
+                    }
+                    queue.push_back((child, path));
+                    continue;
                 }
                 // A just-published live child's rollout may not yet be flushed.
                 // Its registered runtime is authoritative; do not read it back as cold.
@@ -1102,7 +1124,19 @@ impl AgentControl {
                     }
                     Err(error) => return Err(error),
                 };
-                self.task_coordinator().record_unavailable_descendant(child, false);
+                if stored.source.get_agent_path().is_none()
+                    && stored.source == SessionSource::default()
+                    && stored.parent_thread_id.is_none_or(|id| id == parent)
+                    && let Some(rollout_path) = stored.rollout_path.as_deref()
+                    && codex_rollout::has_unavailable_session_meta(rollout_path, child)
+                        .await
+                        .unwrap_or(false)
+                {
+                    // Preserve the edge and obligation until the actual metadata
+                    // returns; never infer an agent identity from a provisional row.
+                    self.task_coordinator().record_unavailable_descendant(child, true);
+                    continue;
+                }
                 let path = stored.source.get_agent_path().ok_or_else(|| {
                     CodexErr::InvalidRequest(format!(
                         "retained agent {child} has no canonical path"
@@ -1142,6 +1176,7 @@ impl AgentControl {
                         parent,
                     )?;
                 }
+                self.task_coordinator().record_unavailable_descendant(child, false);
                 queue.push_back((child, path));
             }
         }
@@ -1332,6 +1367,16 @@ impl AgentControl {
                     .map_err(CodexErr::UnsupportedOperation)
             })
             .transpose()?;
+
+        // Retry only when a previous cold traversal left an unresolved edge.
+        // Existing identities are traversed without re-registering them.
+        if !self.task_coordinator().unavailable_descendants().is_empty()
+            && let Err(error) = self
+                .restore_cold_descendants_inner(ThreadId::from(self.session_id), true)
+                .await
+        {
+            tracing::warn!(%error, "could not recover an unavailable descendant");
+        }
 
         // Hydrate identities only. No child runtime, bootstrap input or model call is started.
         let mut bindings = self.task_coordinator().bindings_for_recovery();

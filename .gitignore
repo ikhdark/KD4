@@ -108,7 +108,8 @@ coverage/
 personal/
 /kd-ui/
 # Local configuration and generated evidence (tracked files stay tracked).
-/.kda/
+.kda/
+/kdr-frontend-*.json
 /.codex/
 /.codex/config.toml
 /.codex/auth.json

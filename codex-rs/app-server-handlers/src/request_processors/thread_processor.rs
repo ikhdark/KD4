@@ -606,11 +606,27 @@ fn prepare_resume_response_history(
             ))
         }
         resumed @ InitialHistory::Resumed(_) => {
+            // The cold resume already owns an integrity-checked snapshot. Building
+            // its opening page through the store would reread the entire rollout
+            // and seed an index that runtime attachment immediately replaces.
+            // Keep the page on the same snapshot as the resumed runtime; the
+            // caller still revalidates persisted metadata before attachment.
+            let prepared_initial_turns_page = initial_turns_page
+                .filter(|_| !include_turns)
+                .map(|params| {
+                    build_thread_resume_initial_turns_page_from_history(
+                        resumed.get_rollout_items(),
+                        /*live_turn_id*/ None,
+                        /*active_turn*/ None,
+                        params,
+                    )
+                })
+                .transpose()?;
             let response_history = resumed.clone();
             Ok((
                 resumed,
                 ResumeResponseHistory::Resumed(response_history),
-                None,
+                prepared_initial_turns_page,
             ))
         }
         history @ (InitialHistory::New | InitialHistory::Cleared) => {

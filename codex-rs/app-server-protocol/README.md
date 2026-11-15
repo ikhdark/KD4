@@ -34,7 +34,8 @@ The protocol types are distinct from the core event models in
 - [src/bin/write_schema_fixtures.rs](src/bin/write_schema_fixtures.rs) delegates
   fixture replacement to the schema owner. Its default destination is this
   crate's `schema/` tree; it is not a read-only inspection command.
-- The [app-server guide](../app-server/README.md) describes the client-facing
-  protocol. [Core navigation](../core/README.md) follows runtime execution.
+- The [app-server guide](../app-server/README.md) describes service boundaries;
+  [protocol-types](../app-server-protocol-types/README.md) locates the wire
+  contract. [Core navigation](../core/README.md) follows runtime execution.
 
 This is an ownership map, not another instruction or wire-contract source.

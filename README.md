@@ -16,7 +16,7 @@ Publishing or republishing requires explicit permission.
 | Python SDK | [Overview](sdk/python/README.md), [getting started](sdk/python/docs/getting-started.md), [API reference](sdk/python/docs/api-reference.md), [FAQ](sdk/python/docs/faq.md) |
 | TypeScript SDK | [SDK guide](sdk/typescript/README.md) |
 | Python CLI runtime package | [Runtime packaging](sdk/python-runtime/README.md) |
-| Configuration | [Layer loader](codex-rs/config/src/loader/README.md), [schema generation](codex-rs/core/src/config/schema.md) |
+| Configuration | [Layer loader](codex-rs/config/src/loader/README.md), [schema generation](codex-rs/runtime-config/src/config/schema.md) |
 | Harness instructions and tool delivery | [Instruction architecture](codex-rs/core/instruction-architecture.md) |
 | Rust workspace owners and process boundaries | [Rust navigation](codex-rs/README.md) |
 | Core runtime ownership and request flow | [Core navigation](codex-rs/core/README.md) |

@@ -700,7 +700,8 @@ fn writable_assignment_schema() -> JsonSchema {
 
 
 // Keep tool/assignment mechanics here; audit policy belongs to the base instructions,
-// and role guidance belongs to config/mod.rs. See AGENTS.md for ownership.
+// and role guidance belongs to config/mod.rs. See core/instruction-architecture.md for
+// ownership.
 fn spawn_agent_tool_description_v2(
     usage_hint_text: Option<String>,
 ) -> String {

@@ -182,6 +182,7 @@ pub(crate) async fn extract_metadata_from_rollout_with_cache_status(
         accumulator,
         parse_errors,
         unresolved_payloads,
+        ..
     } = scan;
     let mut outcome = accumulator
         .finish(rollout_path, default_provider, parse_errors)
@@ -207,6 +208,40 @@ struct RolloutMetadataScan {
     accumulator: RolloutMetadataAccumulator,
     parse_errors: usize,
     unresolved_payloads: usize,
+    missing_session_meta_only: bool,
+}
+
+/// True only for a provisional rollout whose sole unreadable metadata record is
+/// a well-formed session metadata reference for the expected filename identity.
+/// This is an availability observation, never authority for agent lineage.
+pub async fn has_unavailable_session_meta(
+    rollout_path: &Path,
+    expected_id: ThreadId,
+) -> std::io::Result<bool> {
+    let filename_id = rollout_path.file_name().and_then(|name| name.to_str())
+        .and_then(compression::parse_rollout_file_name)
+        .and_then(parse_timestamp_uuid_from_filename)
+        .and_then(|(_, id)| ThreadId::from_string(&id.to_string()).ok());
+    if filename_id != Some(expected_id) {
+        return Ok(false);
+    }
+    let path = rollout_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let scan = scan_rollout_metadata(&path, "")?;
+        Ok(scan.unresolved_payloads == 1 && scan.missing_session_meta_only
+            && scan.parse_errors == 1 && !scan.accumulator.saw_first_session_meta)
+    }).await.map_err(std::io::Error::other)?
+}
+
+fn is_session_meta_reference(line: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { return false; };
+    let payload = &value["payload"];
+    value["type"] == crate::payload_artifact::KIND
+        && value["format_version"].as_u64() == Some(u64::from(codex_protocol::protocol::CURRENT_ROLLOUT_FORMAT_VERSION))
+        && value["timestamp"].as_str().is_some_and(|s| !s.is_empty())
+        && payload["item_type"] == "session_meta"
+        && payload["bytes"].as_u64().is_some_and(|n| n > 0)
+        && payload["sha256"].as_str().is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Project one rollout into thread metadata on a blocking thread.
@@ -237,6 +272,7 @@ fn scan_rollout_metadata(
     let mut decoder = crate::recorder::RolloutRecordDecoder::default();
     let mut accumulator = RolloutMetadataAccumulator::default();
     let mut unresolved_payloads = 0usize;
+    let mut missing_session_meta_only = true;
     let mut raw = Vec::new();
     loop {
         raw.clear();
@@ -254,6 +290,7 @@ fn scan_rollout_metadata(
         }
         let text = compression::decode_rollout_line(std::mem::take(&mut raw));
         let line = if crate::payload_artifact::may_be_reference(&text) {
+            let session_meta_reference = is_session_meta_reference(&text);
             match crate::payload_artifact::hydrate_line(&physical, text) {
                 Ok(line) => line,
                 Err(error) => {
@@ -261,6 +298,7 @@ fn scan_rollout_metadata(
                     // missing artifact must not warn per record across a whole corpus.
                     tracing::debug!(path = %rollout_path.display(), %error, "unreadable session metadata payload");
                     unresolved_payloads = unresolved_payloads.saturating_add(1);
+                    missing_session_meta_only &= session_meta_reference;
                     decoder.note_unreadable_record();
                     continue;
                 }
@@ -282,6 +320,7 @@ fn scan_rollout_metadata(
         accumulator,
         parse_errors: decoder.parse_errors(),
         unresolved_payloads,
+        missing_session_meta_only,
     })
 }
 

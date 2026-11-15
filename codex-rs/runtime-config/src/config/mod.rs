@@ -187,7 +187,8 @@ pub const DEFAULT_AGENT_MAX_THREADS: Option<usize> = Some(6);
 /// permits up to two concurrently resident child agents.
 // Compose role guidance here, including the execution templates;
 // shared audit policy belongs to
-// protocol/src/prompts/base_instructions/default.md. See AGENTS.md for ownership.
+// protocol/src/prompts/base_instructions/default.md. See core/instruction-architecture.md
+// for ownership.
 const DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT: &str = concat!(
     include_str!("../../templates/agents/root_execution.md"),
     "\n",

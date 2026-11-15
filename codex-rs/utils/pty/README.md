@@ -80,19 +80,24 @@ async fn run() -> anyhow::Result<(Vec<u8>, i32)> {
     )
     .await?;
 
-    // The PTY merges stderr into stdout; the stream closes after the final frame.
+    let capture = session.output_capture();
+    // The PTY merges stderr into stdout. Drain, then check the producer's EOF receipt.
     let mut output = Vec::new();
     while let Some(chunk) = stdout_rx.recv().await {
         output.extend_from_slice(&chunk);
     }
-    let exit_code = exit_rx.await.unwrap_or(-1);
+    let exit_code = exit_rx.await?;
+    anyhow::ensure!(capture.complete(), "process output capture incomplete");
     drop(session);
     Ok((output, exit_code))
 }
 ```
 
-Swap in `spawn_pipe_process` for a non-TTY subprocess with separate stdout and stderr; the rest
-of the API stays the same.
+For a non-TTY subprocess, `spawn_pipe_process` omits the terminal-size argument
+and returns separate stdout and stderr receivers. Drain both concurrently and
+retain their bytes: dropping or ignoring stderr loses output, and leaving its
+bounded queue undrained can stall the child. Close pipe stdin when input is done
+if the child needs EOF before exiting, then check the capture receipt after draining.
 
 ## Repository test coverage
 

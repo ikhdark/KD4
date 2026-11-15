@@ -2,11 +2,9 @@
 
 Small, dependency-free utilities for parsing streamed text incrementally.
 
-**Disclaimer**: This code is pretty complex and Codex did not manage to write it so before updating
-the code, make
-sure to deeply understand it and don't blindly trust Codex on it. Feel free to update the
-documentation as you
-modify the code
+The stateful [line parser](src/tagged_line_parser.rs) handles tag prefixes split
+across chunks. Preserve its buffering and segment-ordering behavior when changing
+the [plan parser](src/proposed_plan.rs); chunk boundaries are not line boundaries.
 
 ## What it provides
 
@@ -24,6 +22,10 @@ chunk boundaries (`<proposed` + `_plan>`). Parsing each chunk independently is i
 
 This crate keeps parser state across chunks, returns visible text safe to render immediately, and
 extracts plan segments separately.
+
+Consume `finish()` at the end of each stream or item as well as every `push_str()`
+result. It can release a buffered partial tag or emit the closing segment for an
+unterminated plan block; an empty result from one push does not mean completion.
 
 ## Example: plan streaming
 
@@ -54,6 +56,6 @@ assert!(parser.finish().is_empty());
 
 ## Known limitations
 
-- Tags are matched literally and case-sensitively, and only when alone on a line
+- Tags are case-sensitive and must be alone on a line; surrounding whitespace is ignored
 - No nested tag support
 - A stream can return empty objects.
