@@ -714,6 +714,37 @@ impl TurnDiffTracker {
         Some(message)
     }
 
+    /// Conservative preservation reminders from this turn's owned effects.
+    pub(crate) fn workflow_checkpoint_activity(&self) -> (bool, bool) {
+        // Activity is observed, not an NLP classification of the user's task.
+        // Unknown effects conservatively remind both preservation policies.
+        let unknown = !self.valid
+            || self.unproven_command_revision != 0
+            || !self.unavailable_paths.is_empty();
+        let file_edits = unknown || self.attributed_mutation_revision != 0;
+        let guidance_edits = unknown
+            || self
+                .baseline_by_path
+                .keys()
+                .chain(self.current_by_path.keys())
+                .any(|path| {
+                    path.path.components().any(|component| {
+                        component.as_os_str().to_str().is_some_and(|name| {
+                            ["prompts", "templates"].iter()
+                                .any(|candidate| name.eq_ignore_ascii_case(candidate))
+                        })
+                    }) || path.path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| {
+                            ["md", "mdx", "rst", "txt"]
+                                .iter()
+                                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+                        })
+                });
+        (file_edits, guidance_edits)
+    }
+
     /// The reported warning not yet delivered to the model, taken once.
     pub(crate) fn take_pending_model_warning(&mut self) -> Option<String> {
         self.pending_model_warning.take()

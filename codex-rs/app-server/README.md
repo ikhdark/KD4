@@ -59,7 +59,6 @@ Existing journal caps and failure behavior remain in force. An abandoned span,
 overflow, missing events or absent phone observations is incomplete evidence,
 not a successful lookup. Handler completion is not a phone-rendering or delivery
 acknowledgment. This instrumentation diagnoses discovery; it does not change
-filesystem responses, permissions or limits. The unresolved mobile Git-panel
-failure is tracked in KDR's
-[mobile-git-panel-20261115](../../../KDR/audits/active-cases/frontend/mobile-git-panel-20261115/current-findings.txt)
-case.
+filesystem responses, permissions or limits. The mobile Git-panel failure was
+never reproduced or fixed; the user withdrew it on 2026-11-15 (KDR closed case
+[mobile-git-panel-20261115](../../../KDR/audits/closed-cases/mobile-git-panel-20261115/current-findings.txt)).

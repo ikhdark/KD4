@@ -16,6 +16,7 @@ every guide or run a blanket scan as a routine prerequisite.
 | Binary reuse, isolated builds and execution safeguards | [Managed builds](../KDR/scripts/build/README.md) |
 | Audit cases, live findings and closure | [Audit library](../KDR/audits/README.md) |
 | Benchmark evidence and reusable infrastructure | [Benchmark library](../KDR/benchmarks/README.md) |
+| Implementation intent, changes, method and verification | [Implementation library](../KDR/implementation/README.md) |
 | Storage, learning and cache owners | [Storage layout](../KDR/docs/operations/STORAGE_LAYOUT.md) |
 | Documentation and file organization | [Documentation workflow](../KDR/docs/operations/DOCUMENTATION_WORKFLOW.md) |
 
@@ -24,6 +25,10 @@ KD4 owns the backend. The editable Desktop frontend is in sibling
 work. Leave the Windows Store installation untouched.
 
 ## Work through the complete request
+
+**Code preservation and change scope:** Treat existing code and behavior as intentional unless evidence indicates otherwise. Make the smallest changes necessary to accomplish the task. Do not remove, replace, or rewrite existing functionality merely because a new implementation overlaps with it or appears cleaner. Before replacing code, understand its responsibilities, dependencies, and existing guarantees. Replacement is justified when explicitly requested or supported by a concrete technical reason. Preserve unrelated behavior, contracts, error handling, and edge cases. Review the final diff for unintended removals, behavioral regressions, and unnecessary changes. Restore changes that cannot be justified by the task.
+
+**Guidance preservation:** Treat existing instructions as requirements to preserve, not text to freely rewrite. When adding or updating guidance, make the smallest change necessary. Do not remove, replace, or weaken existing instructions merely because new guidance addresses a related subject. Replacement is justified only when explicitly requested, when existing guidance is demonstrably obsolete, or when a concrete incompatibility requires it. Before completing, inspect the diff and restore any unrelated or unjustified changes.
 
 - Review current source and evidence, establish a concrete defect or meaningful
   benefit, fix the owning component, then verify the requested outcome and
@@ -100,6 +105,8 @@ work. Leave the Windows Store installation untouched.
   user stops the task first, report what remains as unfinished, never as done.
 
 ## Evidence and validation
+
+**Benchmark reuse and preservation:** Before modifying or creating benchmark scripts, identify existing workloads that measure the requested behavior. Prefer reusing or parameterizing established benchmarks over changing their definitions. Extend coverage without removing existing scenarios. Changes to shared benchmark logic are permitted when correcting defects or improving measurement reliability, but must not silently invalidate historical comparisons. Preserve reproducibility and clearly distinguish new measurements from previously established baselines. Prefer stable benchmark infrastructure with reusable, named scenarios rather than accumulating a separate Python script for every measurement.
 
 - Use KDR proactively when existing diagnostics, benchmarks or saved evidence
   materially help. Discover the relevant capability; reuse source-matched
@@ -209,10 +216,32 @@ of downstream behavior. Preserve the live installation, credentials and active c
   or blocked, through the [closure checklist](../KDR/audits/README.md#closure-checklist);
   an explicitly read-only review closes when the review is complete. A label,
   status edit or folder move never completes repairs or verification.
+- Automatically consolidate same-task follow-ups, corrections and small
+  adjustments into the existing audit case (when applicable) and implementation
+  record, including across sessions. A different date, title, wording or
+  implementation detail does not justify a new task folder. Create a separate
+  case or record only for a genuinely independent objective or explicit
+  user-requested separation.
 - Benchmark runs are evidence without status: one `KDR/benchmarks/<task>/`
   folder per run or task, referenced from the audit case it serves. Do not
   create status indexes, parallel case roots, aliases, duplicate evidence
   stores, per-agent indexes or separate "later"/"follow-up" lists.
+- For every implementation task, including source, configuration, documentation
+  and file-organization changes, keep one
+  `KDR/implementation/<task>/implementation.txt`. Record the request, intention
+  and acceptance criteria before editing; update what actually changed, how and
+  why as work proceeds, then add final source identity, verification results,
+  evidence links and any gaps before handoff. Follow the
+  [implementation library](../KDR/implementation/README.md); link the record in
+  the handoff. It explains implementation, not audit status, and does not replace
+  behavioral proof or duplicate raw evidence. Record every distinct fix made
+  along the way, including secondary bugs and diagnostic, tooling or workflow
+  repairs. For each, state the issue, correction, verification result and evidence
+  link; distinguish verified fixes from implemented-but-unverified changes. Do not
+  leave these details only in chat or logs. When implementation relates to an
+  audit or benchmark, state that relationship and link the relevant case, finding
+  IDs and run evidence, as applicable, in the implementation record. Read-only
+  work needs no record.
 - Keep library containers free of loose generated reports; preserve
   established tool-owned infrastructure. Frozen reports, receipts, source
   snapshots and evidence bytes stay unchanged; update live locators when moving
@@ -235,9 +264,10 @@ of downstream behavior. Preserve the live installation, credentials and active c
   attributable, since counts are not unique defects. Link raw evidence; give a
   brief chat handoff with an absolute report link. User format restrictions
   take precedence.
-- Documentation-only and file-organization work needs no audit log, report,
-  relocation receipt or build. Update existing guidance and affected links,
-  verify placement, and summarize in chat unless a separate record is requested.
+- Documentation-only and file-organization work needs no audit log, separate
+  report, relocation receipt or build. Keep its implementation record as above,
+  update existing guidance and affected links, verify placement, and summarize
+  in chat unless a separate report is requested.
   Keep KD4's `codex-rs/protocol/src/prompts/base_instructions/default.md` concise
   and repository-neutral; it is reread live by the harness, while other KD4
   prompt templates are compiled in and need a rebuilt binary.

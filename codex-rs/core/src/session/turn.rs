@@ -781,9 +781,15 @@ pub(crate) fn run_turn(
             };
             logical_generation_ordinal = logical_generation_ordinal.saturating_add(1);
             let sampling_request_result: CodexResult<_> = async {
+                // Resolve once: checkpoint references and this logical request
+                // must consume the same live policy, including explicit overrides.
+                let base_instructions = validation_mode_base_instructions(&turn_context);
                 // The partial/unavailable turn-diff warning tells the model not to claim
                 // unchanged files; deliver it once, at this request boundary, not only to the UI.
-                let diff_warning = turn_diff_tracker.lock().await.take_pending_model_warning();
+                let (diff_warning, (file_edits, guidance_edits)) = {
+                    let mut tracker = turn_diff_tracker.lock().await;
+                    (tracker.take_pending_model_warning(), tracker.workflow_checkpoint_activity())
+                };
                 if let Some(message) = diff_warning {
                     let item = ContextualUserFragment::into(RenderedContextFragment::new(
                         "developer", message,
@@ -794,6 +800,9 @@ pub(crate) fn run_turn(
                 super::workflow_checkpoint::maybe_record_workflow_checkpoint(
                     sess.as_ref(),
                     turn_context.as_ref(),
+                    &base_instructions.text,
+                    file_edits,
+                    guidance_edits,
                 )
                 .await?;
 
@@ -872,9 +881,6 @@ pub(crate) fn run_turn(
                     window_id,
                     CodexResponsesRequestKind::Turn,
                 );
-                // Read before each logical request, not just at turn creation.
-                // Changed text also invalidates the existing request scaffold.
-                let base_instructions = validation_mode_base_instructions(&turn_context);
                 Box::pin(run_sampling_request(
                     Arc::clone(&sess),
                     Arc::clone(&step_context),

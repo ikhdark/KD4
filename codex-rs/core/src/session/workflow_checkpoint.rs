@@ -48,13 +48,28 @@ impl WorkflowCheckpointState {
 pub(super) async fn maybe_record_workflow_checkpoint(
     sess: &Session,
     turn_context: &TurnContext,
+    base_policy: &str,
+    file_edits: bool,
+    guidance_edits: bool,
 ) -> CodexResult<()> {
+    // Explicit authored policies retain their replacement semantics. Never load
+    // canonical rules over an effective base that does not opt into policy IDs.
+    if !base_policy.contains("<!-- policy:") {
+        return Ok(());
+    }
     let workflow_checkpoint = {
         let mut state = sess.state.lock().await;
         state
             .workflow_checkpoint
             .take_workflow_checkpoint_due()
-            .then(|| crate::context::WorkflowCheckpoint::for_history(state.history.raw_items()))
+            .then(|| {
+                crate::context::WorkflowCheckpoint::for_history(
+                    state.history.raw_items(),
+                    base_policy,
+                    file_edits,
+                    guidance_edits,
+                )
+            })
     };
     if let Some(checkpoint) = workflow_checkpoint {
         let item = ContextualUserFragment::into(checkpoint);

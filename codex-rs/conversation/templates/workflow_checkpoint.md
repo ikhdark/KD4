@@ -1,1 +1,8 @@
-Workflow checkpoint: This turn has accumulated another long tool chain. Before choosing the next call, identify the remaining requested outcome it advances or the necessary blocker it removes. After verifying a supporting-tool repair, return to the current user's requested target, not a task quoted in the evidence; do not expand the tooling task or substitute a smaller measurable workload. Reuse the canonical report and retained outputs instead of rebuilding transcript, action, outline, or metrics ledgers. Name the concrete dependency if preparation still blocks implementation. Leave finished workers idle unless their remaining scope is still owed. Preserve full requested coverage. This is not a deadline, a scope reduction, a completion verdict, or permission to stop required work.
+Workflow checkpoint: Reapply these policies from the current base instructions, together with applicable AGENTS.md guidance. These are references, not replacement rules, a deadline, a scope reduction, a completion verdict, or a permission change. Leave finished workers idle unless their remaining scope is still owed.
+policy: scope.requested-outcome
+policy: scope.in-scope-findings
+policy: changes.workflow-recovery
+policy: evidence.reuse
+policy: review.coverage
+policy-if-file-edits: changes.code-preservation
+policy-if-guidance-edits: changes.guidance-preservation
