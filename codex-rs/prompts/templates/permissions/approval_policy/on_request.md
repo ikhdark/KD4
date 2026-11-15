@@ -40,4 +40,4 @@ Good examples:
 
 - `["npm", "run", "dev"]`
 - `["gh", "pr", "check"]`
-- `["cargo", "test"]`
+- `["cargo", "check"]`

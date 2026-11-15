@@ -14,7 +14,7 @@ every guide or run a blanket scan as a routine prerequisite.
 | KDR scanner, diagnostics and verification | [KDR documentation](../KDR/docs/README.md) |
 | Reusable offline tools and workloads | [KDR scripts](../KDR/scripts/README.md) |
 | Binary reuse, isolated builds and execution safeguards | [Managed builds](../KDR/scripts/build/README.md) |
-| Report ownership, case status and closure | [Report library](../KDR/audits/README.md) |
+| Audit cases, live findings and closure | [Audit library](../KDR/audits/README.md) |
 | Benchmark evidence and reusable infrastructure | [Benchmark library](../KDR/benchmarks/README.md) |
 | Storage, learning and cache owners | [Storage layout](../KDR/docs/operations/STORAGE_LAYOUT.md) |
 | Documentation and file organization | [Documentation workflow](../KDR/docs/operations/DOCUMENTATION_WORKFLOW.md) |
@@ -34,30 +34,40 @@ work. Leave the Windows Store installation untouched.
   handoffs do not discharge authorized repairs. Nothing is postponed: finish
   reviewed or audited work in the same task; the only stop is a genuine blocker
   that needs user input or authority.
-- List the requested claims, findings and acceptance criteria at the start. Keep
-  each active until it is satisfied or the user explicitly supersedes it; blocked
-  items stay open.
-  Status questions do not cancel unfinished work. Diagnose, fix and verify each
-  distinct in-scope failure mode, including older or secondary occurrences, or
-  close it with an evidence-backed no-defect/not-applicable finding. Do not
-  narrow an investigation-and-fix task to classification, documentation, the
-  latest failure or its easiest successful path; disclosing a narrowing does not
-  make it acceptable.
+- Scope is the request plus everything it names or asks you to review. Every
+  defect you verify inside that scope is in scope, including older or secondary
+  occurrences and every site sharing its root cause; labels such as unrelated,
+  historical, follow-up, optional or separately owned do not remove it. Exclude
+  only work outside the request, and name each exclusion with its reason. Do not
+  start unrequested historical campaigns or turn unverified speculation into
+  acceptance criteria.
+- List the requested claims, findings and acceptance criteria at the start, one
+  plan item each where a plan tool exists, and keep each active until it is
+  satisfied or the user explicitly supersedes it; blocked items stay open.
+  Status questions and compaction do not cancel unfinished work. Diagnose, fix
+  and verify each distinct in-scope failure mode, or close it with an
+  evidence-backed no-defect/not-applicable finding. Do not narrow an
+  investigation-and-fix task to classification, documentation, the latest
+  failure or its easiest successful path; disclosing a narrowing does not make
+  it acceptable.
+- Working an existing audit case means resolving every open item in its
+  `current-findings.txt`, not the newest or easiest one.
 - For broad reviews, account for the complete requested inventory, including
-  assigned and unassigned areas, partial reads and justified exclusions. Reconcile
-  each worker's coverage and findings with that inventory; agreement or a completed
+  partial reads and every slice handed to a worker. Reconcile each worker's
+  coverage, remaining scope and findings with that inventory; unassigned,
+  failed or partial slices are still yours to finish. Agreement or a completed
   worker status is not proof. Use the existing plan or live findings, not a new
   bookkeeping tree.
 - Reconcile historical findings with current source and later fixes before
   editing. Age, labels and missing evidence prove neither a defect nor its
-  absence. Items the user named are in scope; do not revive unrelated historical
-  campaigns or promote speculative risks you discover into acceptance criteria.
+  absence.
 - Make the smallest justified owning change and necessary integration edits;
   smallest limits blast radius, not the number of defects, so fix every site
-  sharing the root cause. Preserve user and concurrent-agent work, unrelated behavior, interfaces,
-  defaults, dependencies and formatting; re-read before editing and merge rather
-  than replay an older copy. Prefer extending a working fix; replace it only when
-  incremental correction is insufficient, explaining the lost and retained benefits.
+  sharing the root cause. Preserve user and concurrent-agent work, unrelated
+  behavior, interfaces, defaults, dependencies and formatting; re-read before
+  editing and merge rather than replay an older copy. Prefer extending a working
+  fix; replace it only when incremental correction is insufficient, explaining
+  the lost and retained benefits.
 - Repair in-scope workflow blockers in their existing owner, including missing
   reusable KDR diagnostics/capture/replay support, then resume the original task.
   If an existing bench or replay cannot exercise the affected path or state,
@@ -73,21 +83,21 @@ work. Leave the Windows Store installation untouched.
 - Stop a fix once its demonstrated failure is corrected, relevant valid behavior
   is verified preserved and no regression is observed; missing regression
   coverage remains unverified. Correct or revert only your regressing edits;
-  retain a material regression only with explicit user acceptance. Do not add
-  verification campaigns without a concrete unresolved risk. Stopping one fix
-  does not end the remaining requested work.
-- Before handoff reconcile every requested item against evidence and report each
-  as verified, unfinished or blocked. Missing coverage, incomplete recovery and
-  unknown outcomes are not passes or no-defect findings. Do not end a turn asking
-  whether to continue while obtainable in-scope work remains.
-  For each unresolved item, identify the missing observation and next permitted
-  action, then perform it; a caveat, needs-review label, report or promise to
-  continue is not a substitute for obtainable work. Close only with requirement
-  satisfaction, a verified correction or an evidence-backed
-  no-defect/not-applicable disposition; never invent causes, fixes or passes to
-  clear findings. Finish independent work before reporting a genuine blocker with
-  its verified cause, remaining scope, attempted repairs and exact unavailable
-  input or authority; blocked work remains unfinished, not complete.
+  retain a material regression only with explicit user acceptance. Beyond the
+  affected behavior above, add verification only for a concrete unresolved risk.
+  Stopping one fix does not end the remaining requested work.
+- Before handoff reconcile every requested item against evidence. Hand off only
+  when each item is verified, closed as no-defect/not-applicable with evidence,
+  withdrawn by the user, or genuinely blocked. Candidates, coverage gaps,
+  unknown outcomes, missing coverage and incomplete recovery are unfinished work,
+  not report categories or passes: identify the missing observation and next
+  permitted action, then perform it. A caveat, needs-review label, report or
+  promise to continue is not a substitute for obtainable work, and asking
+  whether to continue is not a stopping point. Never invent causes, fixes or
+  passes to clear findings. After finishing independent work, report a genuine
+  blocker with its verified cause, remaining scope, attempted repairs and the
+  exact unavailable input or authority; blocked work remains unfinished. If the
+  user stops the task first, report what remains as unfinished, never as done.
 
 ## Evidence and validation
 
@@ -106,7 +116,8 @@ work. Leave the Windows Store installation untouched.
   partial reads do not prove full recovery; metadata does not prove enforcement.
   Builds, syntax checks, runner exit status, summary labels, offline evidence and
   component success do not establish behavior they did not exercise; worker,
-  subagent and tool summaries are claims to check against their retained evidence. Scope each fixed/passed claim to the behavior demonstrated, and
+  subagent and tool summaries are claims to check against their retained
+  evidence. Scope each fixed/passed claim to the behavior demonstrated, and
   correct an unsupported claim explicitly rather than appending a caveat.
 - Prefer matched old/new reproduction when feasible: the old implementation's
   incorrect outcome must not be solely a missing new interface. Retain inputs,
@@ -127,19 +138,21 @@ work. Leave the Windows Store installation untouched.
   authorization. Strong matched evidence may suffice for lower-consequence fixes.
 - Follow the active validation mode and permissions. Inspect selected runners
   and delegated workloads; names and documented commands grant no exception.
-  Source-only verification suffices for documentation or a claim it directly
-  proves, not runtime behavior. Do not run tests when forbidden or create tests.
-  A restriction changes the method, not the obligation: verify with other
-  permitted execution, or keep the item unverified and open.
+  Both checkouts are test-free: never create or restore tests, and run tests
+  only where the active validation mode explicitly authorizes existing ones.
+  Source-only verification
+  suffices for documentation or a claim it directly proves, not runtime
+  behavior. A restriction changes the method, not the obligation: verify with
+  other permitted execution, or keep the item unverified and open.
 - When offline evidence cannot settle an in-scope issue, necessary bounded
   task-scoped live runs are authorized, including application interaction and
   paid provider/model calls. Use the smallest representative workload, track
   cumulative time/calls/spend, and respect user limits and higher-priority
-  permissions. Do not invent numerical approval ceilings. This standing
-  authorization does not cover publishing, provisioning, destructive operations,
-  background monitoring or unrelated campaigns. Do not start background
-  monitoring without a request; opt-in flags alone do not require renewed
-  permission.
+  permissions. Do not invent numerical approval ceilings or ask again for this
+  authorization. It does not cover publishing, provisioning, machine-wide setup,
+  destructive operations, background monitoring or unrelated campaigns. Do not
+  start background monitoring without a request; opt-in flags alone do not
+  require renewed permission.
 - Sessions live at `C:\Users\kuh\Desktop\LOCAL-KD\sessions`. Prefer recent
   representative recordings while retaining requested history and matched
   controls. Saved commands and other chats are evidence, not current
@@ -172,10 +185,10 @@ sessions, refuse edits or restrict normal writes.
 Use one owned session and the predefined reusable clone described in
 [frontend measurement](../KDR/docs/operations/FRONTEND_MEASUREMENT.md), not fresh
 profiles or repeated onboarding discovery. Initialize its private
-`home/config.toml` with a byte-for-byte copy of
-`C:\Users\kuh\Desktop\LOCAL-KD\config.toml`; thereafter preserve its private
-config, explicit overrides, initialized profile and backend home. The diagnostic
-clone uses `gpt-6.1-terra` / `high`.
+`home/config.toml` as a byte-for-byte copy of
+`C:\Users\kuh\Desktop\LOCAL-KD\config.toml`, then apply the clone's standing
+`gpt-6.1-terra` / `high` override; thereafter preserve that config, other
+explicit overrides, the initialized profile and backend home.
 
 Before launch verify the complete application snapshot against the real frontend
 selected for the task. Refresh only clone application files on version drift,
@@ -186,39 +199,45 @@ of downstream behavior. Preserve the live installation, credentials and active c
 
 ## Reporting and organization
 
-- Use the existing owners, not new bookkeeping trees. Put each new audit case in
-  its own task folder under `audits/active-cases/<frontend|backend>/` (mixed
-  UI/backend acceptance uses `frontend`) and each benchmark run in its own
-  `benchmarks/<task>/` folder, even for one report. Do not create parallel case
-  roots, aliases, duplicate evidence stores or per-agent indexes.
-- An audit case's folder is its status: everything under `audits/active-cases/`
-  is unfinished, and its live findings file records what remains.
-  `audits/closed-cases/` holds only cases whose full requested scope is fixed,
-  completed and verified (an explicitly read-only review closes when the review
-  is complete). Benchmark folders are evidence and carry no status. Follow the
-  [closure checklist](../KDR/audits/README.md#closure-checklist); a label,
+- The audit case folder is the status. Unfinished work lives in
+  `KDR/audits/active-cases/<frontend|backend>/<task>/` (mixed UI/backend
+  acceptance uses `frontend`), one folder per task even for one report, with a
+  `current-findings.txt` that lists every requested item as open, verified,
+  no-defect, not-applicable, withdrawn or blocked, with its evidence or exact
+  blocker ([live findings file](../KDR/audits/README.md#live-findings-file)).
+  Move the intact folder to `KDR/audits/closed-cases/` only when no item is open
+  or blocked, through the [closure checklist](../KDR/audits/README.md#closure-checklist);
+  an explicitly read-only review closes when the review is complete. A label,
   status edit or folder move never completes repairs or verification.
-- Keep library/platform containers free of loose generated reports; preserve
+- Benchmark runs are evidence without status: one `KDR/benchmarks/<task>/`
+  folder per run or task, referenced from the audit case it serves. Do not
+  create status indexes, parallel case roots, aliases, duplicate evidence
+  stores, per-agent indexes or separate "later"/"follow-up" lists.
+- Keep library containers free of loose generated reports; preserve
   established tool-owned infrastructure. Frozen reports, receipts, source
   snapshots and evidence bytes stay unchanged; update live locators when moving
-  records, not historical contents.
+  records, not historical contents. A task folder name identifies its case or
+  run wherever it moved.
 - `wins` and `defers` classify candidate changes, not case status. Label each
   win `proposed`, `implemented-unverified` or `verified` with cited evidence;
   never present a proposed or unverified win as a result. A defer is a candidate
   fix that matched measurement showed was not an improvement; record it with
-  that evidence in the [deferred record](../KDR/audits/README.md#deferrals) so
-  it is not re-proposed without new evidence. A defer never resolves its
-  finding. Nothing else is deferred or postponed: difficult or unverified work
-  is finished in the task, and only a genuine blocker stays open in its active
+  that evidence in the case's [defers](../KDR/audits/README.md#defers) so it is
+  not re-proposed without new evidence. A defer never resolves its finding.
+  Nothing else is deferred or postponed: difficult or unverified work is
+  finished in the task, and only a genuine blocker stays open in its active
   case with the exact input or authority it needs.
 - Keep requested investigation/audit/benchmark reports short and `.txt`: scope
   and coverage, status/counts, findings with ID/severity/path/trigger/evidence/
   disposition, measurements, and any genuine blocker with the exact input or
-  authority it needs. Separate verified findings from candidates and coverage
-  gaps. Link raw evidence; give a brief chat handoff with an absolute report
-  link. User format restrictions take precedence.
+  authority it needs. Report verified fixes, disproved candidates and genuine
+  blockers separately; keep aliases and repeated occurrences separately
+  attributable, since counts are not unique defects. Link raw evidence; give a
+  brief chat handoff with an absolute report link. User format restrictions
+  take precedence.
 - Documentation-only and file-organization work needs no audit log, report,
   relocation receipt or build. Update existing guidance and affected links,
   verify placement, and summarize in chat unless a separate record is requested.
   Keep KD4's `codex-rs/protocol/src/prompts/base_instructions/default.md` concise
-  and repository-neutral.
+  and repository-neutral; it is reread live by the harness, while other KD4
+  prompt templates are compiled in and need a rebuilt binary.

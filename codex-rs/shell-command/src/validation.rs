@@ -2492,13 +2492,13 @@ fn policy_kdr(args: &[String]) -> ValidationPolicyClassification {
 fn policy_kdr_python(args: &[String]) -> Option<ValidationPolicyClassification> {
     // Use the actual interpreter operand, not a later argument or -c payload.
     let tail = if let Some((module, tail)) = python_module(args) {
-        matches!(module, "kdr" | "rolloutdetect" | "tools.kdr_session_suite"
+        matches!(module, "kdr" | "rolloutdetect"
             | "tools.benchmark_frozen_analysis" | "tools.rollout_analysis.benchmark_scan")
             .then_some(tail)?
     } else {
         let index = python_script_index(args)?;
         let script = args[index].replace('\\', "/");
-        ["tools/kdr_session_suite.py", "tools/benchmark_frozen_analysis.py",
+        ["tools/benchmark_frozen_analysis.py",
             "tools/rollout_analysis/benchmark_scan.py",
         ].iter().any(|path| {
                 script == *path || script.strip_suffix(*path).is_some_and(|prefix| prefix.ends_with('/'))

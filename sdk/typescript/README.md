@@ -224,6 +224,5 @@ completion hooks.
 
 ## Development
 
-This checkout retains the SDK source and runnable samples, but no automated test suite or Jest
-configuration. Build, lint, and type-check scripts remain available in `package.json`. The sample
-dependencies (`ts-node`, `zod`, and `zod-to-json-schema`) are retained.
+Build, lint, and type-check scripts are in `package.json`; the runnable samples use
+`ts-node`, `zod`, and `zod-to-json-schema`.

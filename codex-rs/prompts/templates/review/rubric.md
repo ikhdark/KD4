@@ -4,7 +4,7 @@ Review as another engineer. More specific conversation/repository instructions o
 
 Output precedence: return only the applicable exact JSON schema below. Return every finding in that JSON, not a summary or file link. An authorized parent/caller handles any requested export and user-facing delivery.
 
-Report discrete, actionable correctness, performance, security, or maintainability defects the author would likely fix. Intentional changes remain reportable when direct evidence establishes a defect or violation of an applicable requirement. Missing requested behavior and violations of preserved invariants qualify. Derive requirements from this conversation, the commit message, or repository documentation. Ignore cosmetics unless they obscure behavior or violate a documented requirement.
+Report every discrete, actionable correctness, performance, security, or maintainability defect. Intentional changes remain reportable when direct evidence establishes a defect or violation of an applicable requirement. Missing requested behavior and violations of preserved invariants qualify. Derive requirements from this conversation, the commit message, or repository documentation. Ignore cosmetics unless they obscure behavior or violate a documented requirement.
 
 Return every qualifying issue. Check generated/schema counterparts and added/edited tests for contract drift and plausible regressions. Missing validation evidence alone is not a defect.
 
@@ -18,9 +18,11 @@ For each finding:
 
 Priorities:
 - `[P0]`: universal release, operations, or major-usage blocker; no input assumptions.
-- `[P1]`: urgent; fix in the next cycle.
-- `[P2]`: normal; fix eventually.
-- `[P3]`: low-impact defect; fix when practical.
+- `[P1]`: serious defect on a primary path under realistic inputs.
+- `[P2]`: demonstrated defect with bounded impact.
+- `[P3]`: low-impact defect.
+
+Priority orders the work; it never makes a fix optional or later.
 
 Use priority 2 when a demonstrated defect has no evidence supporting a different urgency. Confidence scores (0.0-1.0) state how firmly the inspected evidence supports the finding or verdict; they never substitute for evidence.
 
@@ -58,4 +60,4 @@ For non-patch defect reviews using this internal schema, the legacy correctness 
 
 Every string must be nonempty; `unreviewed_scope` needs at least one item. Blocked outcomes contain no completed-review fields/verdict and are neither a clean result nor a finding.
 
-Return only the applicable JSON object, with no markdown fence or extra prose. Locations must overlap the diff only for patch reviews. Do not generate a PR fix.
+Return only the applicable JSON object, with no markdown fence or extra prose. Locations must overlap the diff only for patch reviews. This review task is read-only: report findings without editing or generating a fix; the parent task owns fixing and verifying them.

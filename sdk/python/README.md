@@ -153,8 +153,7 @@ thread joins. Restart is refused while old pipe workers remain alive, including
 when a descendant retains inherited pipe handles. Low-level approval handling
 denies command/file requests by default, matching the curated `deny_all` policy.
 
-This checkout does not include an automated Python test suite. The
-[runnable examples](examples/README.md) exercise SDK workflows using your
+The [runnable examples](examples/README.md) exercise SDK workflows using your
 configured Codex runtime and may make live model requests.
 
 ## Built-In Help

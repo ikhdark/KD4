@@ -27,10 +27,10 @@ Publishing or republishing requires explicit permission.
 | Session persistence | [Rollout storage](codex-rs/rollout/README.md) |
 | Process and transport utilities | [Process hardening](codex-rs/process-hardening/README.md), [PTY](codex-rs/utils/pty/README.md), [stdio-to-UDS](codex-rs/stdio-to-uds/README.md) |
 | Parsing and rendering utilities | [Stream parser](codex-rs/utils/stream-parser/README.md), [templates](codex-rs/utils/template/README.md) |
-| Extensions and bundled skills | [Extension API](codex-rs/ext/extension-api/notes.md), [skill samples](codex-rs/skills/src/assets/samples/) |
+| Extensions and bundled skills | [Extension API](codex-rs/ext/extension-api/src/), [skill samples](codex-rs/skills/src/assets/samples/) |
 | Argument-comment lint | [Dylint guide](tools/argument-comment-lint/README.md) |
 | Vendored integration notes | [Notify patch](third_party/notify/KD4.md), [Tungstenite](third_party/tungstenite/README.md), [V8](third_party/v8/README.md) |
-| Local reports and captured evidence | [Workspace navigation](.codex/README.md), [audit library](.codex/audits/README.md) |
+| Local workspace and historical KD4 reports (read-only; new reports go to KDR) | [Workspace navigation](.codex/README.md), [historical audit library](.codex/audits/README.md) |
 
 ## Local development
 

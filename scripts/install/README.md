@@ -53,11 +53,10 @@ The local publisher explicitly enables `/OPT:REF` (unused-code removal) and
 builds and both PGO passes. These flags join the shared target flags; dev
 publishes are unchanged. Direct Cargo builds do not use this publisher overlay.
 
-`just publish-local-codex-final` remains the normal local publish command. It uses
-the `release` profile and `codex-rs/target/publish-release` build directory; `cargo build --release`
-uses the same optimization settings but does not install or restart Desktop.
-
-Use `just publish-local-codex-final` (or `-Profile release`) for final publishing.
+`just publish-local-codex-final` (or `-Profile release`) is the normal local
+publish command. It uses the `release` profile and `codex-rs/target/publish-release`
+build directory; `cargo build --release` uses the same optimization settings but
+does not install or restart Desktop.
 
 ## Local publishing
 

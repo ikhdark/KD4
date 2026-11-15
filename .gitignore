@@ -99,8 +99,6 @@ coverage/
 
 # personal files
 /current-diff.txt
-# Local task handoff reports.
-/*-handoff.txt
 # Local diff dumps; use .scratch/ for new scratch output.
 /.d[0-9a-f].txt
 /.e[0-9a-f].txt

@@ -75,7 +75,7 @@ impl ToolExecutor<ToolInvocation> for ListProcessesHandler {
                 ("names".into(), strings("Image names, case-insensitive; .exe is optional and * matches any run (python, rustc.exe, wall-clock-*). At most 64.")),
                 ("pids".into(), JsonSchema::array(JsonSchema::integer(None), Some("Process ids. At most 64.".into()))),
                 ("parent_pid".into(), JsonSchema::integer(Some("Only direct children of this process id.".into()))),
-                ("command_line_regex".into(), JsonSchema::string(Some("Case-insensitive Rust regex searched in each command line (benchmark_|kdr_session_suite).".into()))),
+                ("command_line_regex".into(), JsonSchema::string(Some("Case-insensitive Rust regex searched in each command line (benchmark_|rolloutdetect).".into()))),
                 ("include_command_line".into(), JsonSchema::boolean(Some("Return command lines (each capped at 4096 characters). Implied by command_line_regex. Default false.".into()))),
                 ("limit".into(), JsonSchema::integer(Some("Maximum processes returned, ordered by pid; default 100, at most 500. matched counts all.".into()))),
             ]), None, Some(false.into())),

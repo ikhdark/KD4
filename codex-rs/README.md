@@ -28,7 +28,7 @@ not another instruction source.
 | Session persistence | [rollout](rollout/README.md) |
 | Timing records and dispatch tracing | [turn-timing](turn-timing/README.md); core emits runtime observations |
 | Execution service and process transport | [exec-server](exec-server/README.md), [exec-server-protocol](exec-server-protocol/) |
-| Extension interfaces and built-ins | [ext](ext/), starting with the [extension API](ext/extension-api/notes.md) |
+| Extension interfaces and built-ins | [ext](ext/), starting with the [extension API](ext/extension-api/src/lib.rs) |
 | Shared utilities | [utils](utils/); use a specific utility crate rather than a core facade |
 
 ## Code Mode: client, host, runtime, contract

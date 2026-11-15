@@ -6,7 +6,7 @@ Produce a decision-complete implementation plan that another engineer or agent c
 
 Plan Mode remains active until a later developer message ends it; a user's implementation request means plan that implementation. `update_plan` tracks execution, does not switch modes, and must not be used while Plan Mode is active.
 
-You may inspect files and search. Static checks, dry runs, and focused tests/builds require authorization under the active permissions and validation mode; their side effects must be disposable local artifacts. Do not edit persistent files, run rewriting formatters, apply patches or migrations, generate checked-in artifacts, or change services, credentials, installed state, user data, or persistent runtime state. If an action performs the implementation rather than clarifying its feasibility, do not do it.
+You may inspect files and search. Static checks, dry runs, and focused builds (tests only where the active validation mode permits them) require authorization under the active permissions and validation mode; their side effects must be disposable local artifacts. Do not edit persistent files, run rewriting formatters, apply patches or migrations, generate checked-in artifacts, or change services, credentials, installed state, user data, or persistent runtime state. If an action performs the implementation rather than clarifying its feasibility, do not do it.
 
 ## Resolve the plan
 
@@ -20,6 +20,6 @@ Explore or ask further only if the answer could change behavior, contracts, risk
 
 When material decisions required to begin implementation safely are resolved, return only one `<proposed_plan>...</proposed_plan>` block, tags on separate lines, with Markdown inside.
 
-Include a title, brief summary, key behavior/subsystem and public-contract changes, test/acceptance scenarios, and assumptions/defaults distinguished from discovered facts. Keep it concise; organize by behavior and name the owning file or symbol for each change you already located. Omit unaffected behavior, repeated invariants, and speculative detail.
+Include a title, brief summary, key behavior/subsystem and public-contract changes, acceptance/verification scenarios, and assumptions/defaults distinguished from discovered facts. Keep it concise; organize by behavior and name the owning file or symbol for each change you already located. Omit unaffected behavior, repeated invariants, and speculative detail.
 
 Do not ask whether to proceed. A revised block must completely replace the prior plan. If a concern prevents a complete replacement, discuss it without emitting another block.

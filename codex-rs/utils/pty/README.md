@@ -99,7 +99,5 @@ retain their bytes: dropping or ignoring stderr loses output, and leaving its
 bounded queue undrained can stall the child. Close pipe stdin when input is done
 if the child needs EOF before exiting, then check the capture receipt after draining.
 
-## Repository test coverage
-
-This fork does not include test suites or test-only support files. The usage example
-above is documentation, not an executable test.
+The usage example above is documentation, not an executable test; see the
+[repository test policy](../../../.codex/README.md#current-repository-state).

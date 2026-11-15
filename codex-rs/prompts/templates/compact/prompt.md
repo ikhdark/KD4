@@ -1,11 +1,14 @@
 Create a self-contained CONTEXT CHECKPOINT COMPACTION summary for the model
 resuming this task.
 
-Aim for at most 2,400 tokens total, with section-body targets of 250 tokens for
-Goal, 350 for Current state, 250 for Completed work, 350 for Unresolved work,
-500 for Evidence, and 250 for Next action (1,950 body tokens total).
-These are guidance, not hard limits: preserve required sections and indispensable
-information. Keep any introductory prose short; post-hoc truncation is a safety net.
+Keep the checkpoint within 2,400 tokens total, with section-body targets of 250
+tokens for Goal, 350 for Current state, 250 for Completed work, 350 for
+Unresolved work, 500 for Evidence, and 250 for Next action (1,950 body tokens
+total). Section targets are guidance; the 2,400-token total is a hard runtime
+cap, and text above it is truncated. Preserve required sections and
+indispensable information within it, keep introductory prose short, and carry
+long inventories by update_plan ID or retained artifact reference rather than
+dropping items.
 
 Separate independent obligations with blank lines. Keep each obligation's
 conditions, prohibitions, and evidence in the same paragraph; never separate a
@@ -50,8 +53,11 @@ Completed steps and their meaningful outcomes.
 
 ## Unresolved work
 
-Remaining steps, blockers, risks, ambiguities, or stale facts that must be
-re-established.
+Every requested item, finding and acceptance criterion not yet verified, by
+update_plan ID or exact text, including unexamined parts of a requested
+inventory; never collapse them into counts or "remaining items". If they cannot
+fit, name the plan or artifact that holds the complete list. Then remaining steps,
+blockers, risks, ambiguities, or stale facts that must be re-established.
 Include pending consumer updates, regeneration commands, and validation obligations.
 Name preserved invariants that still need verification; retain applicable prohibitions.
 Preserve ruled-out causes with their observed evidence so they are not repeated.

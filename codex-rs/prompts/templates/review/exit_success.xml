@@ -1,5 +1,5 @@
 <user_action>
-  <context>User initiated a review task. Here's the full review output from reviewer model. User may select one or more comments to resolve.</context>
+  <context>User initiated a review task. Here's the full review output from reviewer model. Each finding stays open until it is fixed and verified or disproved with evidence; the verdict is not task completion.</context>
   <action>review</action>
   <results>
   {{results}}

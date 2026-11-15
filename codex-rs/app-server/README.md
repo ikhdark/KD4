@@ -27,7 +27,7 @@ remains the compatibility facade and schema-export CLI package. Runtime-only
 consumers do not depend on that tooling facade.
 
 The [thread follow-up queue contract](THREAD_QUEUE.md) is implemented by the
-handlers crate. This source refactor does not publish or activate a local binary.
+handlers crate.
 
 ## MCP OAuth completion correlation
 
@@ -58,5 +58,8 @@ Only transport-identified remote-control requests receive these observations.
 Existing journal caps and failure behavior remain in force. An abandoned span,
 overflow, missing events or absent phone observations is incomplete evidence,
 not a successful lookup. Handler completion is not a phone-rendering or delivery
-acknowledgment. This instrumentation diagnoses discovery; it does not itself fix
-the mobile Git failure or change filesystem responses, permissions or limits.
+acknowledgment. This instrumentation diagnoses discovery; it does not change
+filesystem responses, permissions or limits. The unresolved mobile Git-panel
+failure is tracked in KDR's
+[mobile-git-panel-20261115](../../../KDR/audits/active-cases/frontend/mobile-git-panel-20261115/current-findings.txt)
+case.

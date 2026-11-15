@@ -11,7 +11,7 @@ just cargo-lane auto cargo run -p codex-core --bin codex-write-config-schema
 ```
 
 Run this from the repository root when schema generation is authorized. The retained
-generator writes `codex-rs/core/config.schema.json` directly; no test fixture is involved.
+generator writes `codex-rs/core/config.schema.json` directly.
 
 ## Custom provider hosted search
 

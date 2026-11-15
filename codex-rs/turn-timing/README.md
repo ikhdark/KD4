@@ -128,7 +128,7 @@ adapter binds the callback to the physical retry attempt. Local `Instant`
 endpoints, wire-byte counts and static provenance flow into
 `performanceObservations.transportIntervals` and the native journal. DNS, TCP,
 TLS, upload/download and TCP round-trip callbacks are supported. The local
-reqwest/hyper-util/hyper-rustls forks now emit real DNS resolution, individual
+reqwest/hyper-util/hyper-rustls forks emit real DNS resolution, individual
 TCP connection attempts and Rustls handshakes, including proxy TLS and tunneled
 destination TLS. No application wait stands in for one of these phases.
 Raw TCP read/write callbacks include encrypted/framing bytes, pending-I/O waits
@@ -182,7 +182,7 @@ KDR exposes these under `mobile.owner_events`. This journal boundary survives
 missing terminal SQLite log rows; it records the server's retirement decision,
 not the initiating phone/network cause or successful close-event forwarding.
 
-The editable sibling Codex-Fork now supplies opt-in transcript receipt/application
+The editable sibling Codex-Fork supplies opt-in transcript receipt/application
 observations through the existing privileged host connection. Initialization
 advertises diagnostics schema/journal availability. Journaled live assistant-text
 deltas optionally carry `sourceOccurrence`; their UTF-16 subranges survive host
@@ -194,7 +194,7 @@ See [the frontend owner](../../../Codex-Fork/frontend/README.md) for explicit
 capture, privacy, installation and legacy/other-output limitations. Backend
 journaling remains launch-time opt-in and can add per-emission I/O overhead.
 
-Independent owner journals now include terminal emission/writer outcome spans,
+Independent owner journals include terminal emission/writer outcome spans,
 cancel claim and startup fences, replay candidate inventories, command approval
 submission and bounded shutdown inventories/dispositions. Timeouts do not imply
 that retained cleanup owners were aborted. Optional durable index checkpoints
@@ -212,8 +212,10 @@ scope cessation is never labeled as provider computation completion.
 
 KDR exposes saved journals with `tools diagnose native-observations --capture
 PATH` (repeat for separately clocked processes). Its existing app-server and
-projection workflows accept `--runtime-observations`. Ordinary Windows streams
-and tool measurement capture also accept `--observe-resources --resource-series`: a bounded, joined observer
+projection workflows accept `--runtime-observations`. The app-server workload
+(`KDR/tools/benchmark_app_server_backpressure.py`) also accepts
+`--observe-resources --resource-series` for ordinary Windows streams and tool
+measurement capture: a bounded, joined observer
 of the existing owning job retains process lifetimes, parent observations,
 CPU/private-memory/I/O samples and host-interface counters. No normal scan
 samples processes. Exported resource captures use the existing KDR import/health

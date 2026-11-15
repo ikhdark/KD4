@@ -9,8 +9,8 @@ including unchanged unresolved obligations and indispensable evidence; that body
 replaces ALL prior updates for its section. For other sections, the runtime appends
 your update to the existing checkpoint, so the output must stand alone as an
 addendum and must not include the checkpoint preamble.
-Always include `## Next action` with the single current immediate action (or
-state that no action remains). This is a complete replacement, not an action log,
+Always include `## Next action` with the single current immediate action; state
+that no action remains only when no requested item is unresolved. This is a complete replacement, not an action log,
 even when unchanged. Other sections remain additive unless explicitly rebased.
 Use only the applicable standard checkpoint headings: `## Goal`,
 `## Current state`, `## Completed work`, `## Unresolved work`, `## Evidence`,
@@ -35,12 +35,14 @@ status, supported continuation or cancellation calls, and indispensable artifact
 or recovery references. Retire completed handles.
 Preserve unknown status; do not infer completion or gather new evidence.
 
-Aim for at most 2,400 tokens total, with section-body targets of 250 tokens for
-Goal, 350 for Current state, 250 for Completed work, 350 for Unresolved work,
-500 for Evidence, and 250 for Next action (1,950 body tokens total).
-These are guidance, not hard limits: preserve indispensable changed information.
-An incremental update should normally be much shorter; omit unchanged sections
-rather than filling their budgets. Post-hoc truncation remains a safety net.
+Keep the combined checkpoint within 2,400 tokens total, with section-body
+targets of 250 tokens for Goal, 350 for Current state, 250 for Completed work,
+350 for Unresolved work, 500 for Evidence, and 250 for Next action (1,950 body
+tokens total). Section targets are guidance; the 2,400-token total is a hard
+runtime cap: an update that would exceed it forces a complete rebase or is
+truncated. Preserve indispensable changed information within it. An
+incremental update should normally be much shorter; omit unchanged sections
+rather than filling their budgets.
 
 Separate independent obligations with blank lines. Keep each obligation's
 conditions, prohibitions, and evidence in the same paragraph; never separate a

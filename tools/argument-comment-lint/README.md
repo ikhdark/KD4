@@ -83,8 +83,7 @@ python tools/argument-comment-lint/run.py -p codex-core
 If no package selection is provided, `just argument-comment-lint` checks the
 whole Cargo workspace. The wrapper defaults the underlying Cargo invocation to
 `--all-targets` unless you explicitly narrow the target set or select `--fix`,
-covering every retained target rather than only libraries. This checkout no longer contains
-Rust test implementations or test-only call sites. It also passes
+covering every retained target rather than only libraries. It also passes
 `--ignore-rust-version`: the pinned lint nightly (Rust 1.92) is older than the `rust-version` some
 `codex-rs` dependencies declare, and the lint only needs the code to type-check.
 

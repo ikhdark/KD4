@@ -10,11 +10,13 @@ The [root README](../README.md) indexes the active product and development guide
 | --- | --- |
 | [config.toml](config.toml) | Repository-local Codex configuration; kept at its runtime path. |
 | [test-runners.json](test-runners.json) | Validation runner registration; kept at its runtime path. |
-| [audits/](audits/README.md) | Retained historical reports/captures; new investigation reports use KDR's `audits/active-cases/<frontend|backend>/<task>/`; see [case status](../../KDR/audits/README.md). |
+| [audits/](audits/README.md) | Retained historical KD4 reports/captures (read-only). New investigation reports are KDR audit cases; see the [report library](../../KDR/audits/README.md). |
 | [fix-evidence/](fix-evidence/index.json) | Existing KD4 fix-to-receipt bindings; see the [registry guide](fix-evidence/README.md). Moved KDR evidence and shared benchmark learning are linked without copies. |
 | `gitdiff/` (when present) | Runtime output path for named patch receipts from the diff-saving tool. |
-| `benchmark-runs/` (when present) | Historical benchmark captures; new case output uses KDR's `benchmarks/active-cases/<frontend|backend>/<task>/`; see [benchmark cases](../../KDR/benchmarks/README.md). |
+| `benchmark-runs/` (when present) | Historical benchmark captures. New benchmark evidence goes to KDR; see the [storage layout](../../KDR/docs/operations/STORAGE_LAYOUT.md). |
 | [locks/](locks/) | Tool-managed coordination files; not disposable audit clutter. |
+| `sg/` | Unreferenced local source snapshot (`codex-rs/`, `third_party/`, 2026-11-03); not live source or configuration. |
+| `v/` | Unreferenced explicit Cargo lanes-root marker and lock files (2026-11-03); not live configuration. |
 
 New investigation evidence, proposals and benchmark learning use
 [KDR's canonical owners](../../KDR/docs/operations/STORAGE_LAYOUT.md), not new stores here.
