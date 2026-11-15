@@ -163,6 +163,13 @@ impl AgentTaskCoordinator {
         }
     }
 
+    pub(crate) fn record_descendant_binding_conflict(&self, thread: ThreadId) {
+        self.unavailable_descendants
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(thread.to_string(), "conflicting_binding: retained graph obligation is unresolved; reconcile the binding before restoring this descendant".into());
+    }
+
     pub(crate) fn unavailable_descendants(&self) -> Vec<(String, String)> {
         let mut records = self.unavailable_descendants.read().unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter().map(|(id, reason)| (id.clone(), reason.clone())).collect::<Vec<_>>();

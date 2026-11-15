@@ -868,7 +868,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
     // is using.
     event_processor.print_config_summary(&config, &prompt_summary, &session_configured);
     if let Some(error) = event_processor.take_output_error() {
-        let _ = client.shutdown().await;
+        let _ = client.shutdown_until_complete().await;
         return Err(error.into());
     }
     info!("Codex initialized with event: {session_configured:?}");
@@ -1131,7 +1131,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
         event_processor.process_event_stream_error(message.clone());
     }
 
-    let shutdown_error = client.shutdown().await.err();
+    let shutdown_error = client.shutdown_until_complete().await.err();
     if let Some(state_db) = state_db.as_ref() {
         state_db.stop_backfill_worker().await;
     }

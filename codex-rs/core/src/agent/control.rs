@@ -1119,9 +1119,15 @@ impl AgentControl {
                 }
                 if let Some(binding) = self.task_coordinator().binding_for_agent_path(&path) {
                     if binding.thread_id.as_deref() != Some(child.to_string().as_str()) {
-                        return Err(CodexErr::InvalidRequest(format!(
-                            "retained agent `{path}` has a conflicting binding"
-                        )));
+                        // Refuse this identity without making the parent's history
+                        // and unrelated descendants unavailable. Keep the durable
+                        // binding/edge intact and expose the unresolved obligation.
+                        self.task_coordinator().record_descendant_binding_conflict(child);
+                        tracing::warn!(
+                            %root_thread_id, %child, %path,
+                            "retained agent has a conflicting binding; leaving its subtree unavailable"
+                        );
+                        continue;
                     }
                     self.rehydrate_binding_with_stored(binding, Some(stored)).await?;
                 } else {

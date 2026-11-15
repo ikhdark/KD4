@@ -124,7 +124,9 @@ impl From<ToolDefinition> for WireToolDefinition {
         // V1 hosts reject unknown fields. Keep namespace guidance embedded in
         // the existing description until a future wire capability negotiates
         // the optional structured metadata.
-        let description = match value.namespace_description.as_deref().map(str::trim) {
+        let guidance = value.namespace_description.as_deref().map(str::trim)
+            .map(|text| text.replace('\u{1e}', " "));
+        let description = match guidance.as_deref() {
             Some(guidance) if !guidance.is_empty()
                 && !value.description.strip_prefix(guidance).is_some_and(|rest| rest.starts_with("\n\n")) => {
                 format!("{guidance}\n\n{}", value.description).into()
@@ -146,7 +148,9 @@ impl From<ToolDefinition> for WireToolDefinition {
 
 impl From<WireToolDefinition> for ToolDefinition {
     fn from(value: WireToolDefinition) -> Self {
-        let description = value.namespace_description.as_deref().map(str::trim)
+        let guidance = value.namespace_description.as_deref().map(str::trim)
+            .map(|text| text.replace('\u{1e}', " "));
+        let description = guidance.as_deref()
             .filter(|guidance| !guidance.is_empty())
             .map(|guidance| format!("{guidance}\n\n{}", value.description).into())
             .unwrap_or_else(|| value.description.clone());

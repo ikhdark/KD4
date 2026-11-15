@@ -2001,6 +2001,8 @@ struct ModelStreamDelivery {
     websocket_send_duration_us: Option<u64>,
     websocket_first_message_us: Option<u64>,
     first_provider_event_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_actionable_output_us: Option<u64>,
     request_send_started_ns: Option<u64>,
     response_headers_received_ns: Option<u64>,
     first_response_body_byte_ns: Option<u64>,
@@ -2117,6 +2119,7 @@ impl ModelStreamDeliveryObserver {
         self.summary.websocket_send_duration_us = offsets.websocket_send_duration_us;
         self.summary.websocket_first_message_us = offsets.websocket_first_message_us;
         self.summary.first_provider_event_us = offsets.first_provider_event_us;
+        self.summary.first_actionable_output_us = offsets.first_actionable_output_us;
         self.summary.request_send_started_ns = offsets.request_send_started_ns;
         self.summary.response_headers_received_ns = offsets.response_headers_received_ns;
         self.summary.first_response_body_byte_ns = offsets.first_response_body_byte_ns;

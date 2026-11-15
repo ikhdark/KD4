@@ -793,6 +793,8 @@ async fn run_compact_task_inner_impl(
                     ..Default::default()
                 };
                 let source_input_len = prompt.input.len();
+                let fit_capture = std::env::var_os("CODEX_KDR_LOCAL_COMPACTION_FIT_CAPTURE").is_some();
+                let unformatted_budget = fit_capture.then(|| prompt.budget_tokens_for_input(&prompt.input));
                 let mut pin_source = Some(history);
                 if prompt.output_schema.is_some() {
                     let mut input = prompt.input.to_vec();
@@ -807,6 +809,7 @@ async fn run_compact_task_inner_impl(
                 let mut retried_invalid_summary = false;
                 loop {
                     retry_state.check_retry_budget(cancellation_token)?;
+                    let complete_budget = fit_capture.then(|| prompt.budget_tokens_for_input(&prompt.input));
                     // Size the complete request, including format and repair
                     // instructions, before starting another provider attempt.
                     if local_compaction_input_exceeds_window(
@@ -821,6 +824,17 @@ async fn run_compact_task_inner_impl(
                         );
                         pinned_input.extend(prompt.input.iter().skip(source_input_len).cloned());
                         prompt.input = pinned_input.into();
+                    }
+                    if fit_capture {
+                        tracing::info!(
+                            unformatted_budget = ?unformatted_budget,
+                            complete_budget = ?complete_budget,
+                            dispatch_budget = prompt.budget_tokens_for_input(&prompt.input),
+                            context_window = ?turn_context.model_context_window(),
+                            pins_used = pin_source.is_none(),
+                            repair = retried_invalid_summary,
+                            "local_compaction_fit_capture"
+                        );
                     }
                     if local_compaction_input_exceeds_window(&prompt, turn_context.model_context_window()) {
                         sess.set_total_tokens_full(turn_context.as_ref()).await;

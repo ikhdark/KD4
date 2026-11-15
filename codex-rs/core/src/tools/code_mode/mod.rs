@@ -219,6 +219,8 @@ struct CodeModeNestedResultEvidence {
     #[serde(skip)]
     output_fingerprints: Vec<(String, usize, [u8; 32])>,
     #[serde(skip)]
+    printed_read_projection: Option<String>,
+    #[serde(skip)]
     failure_identity: Option<JsonValue>,
     #[serde(skip)]
     ordinal: usize,
@@ -2617,8 +2619,22 @@ fn format_runtime_response(
                     .is_some_and(|error| error.contains(result.output.as_str())
                         || reported_failure_ordinal == Some(result.ordinal)))
         })
-        .filter(|result| !nested_result_already_emitted(result, &emitted))
-        .collect();
+        // Structured outlines require the complete delivered projection below;
+        // their bounded diagnostic prefix cannot establish result identity.
+        .filter(|result| result.printed_read_projection.is_some()
+            || !nested_result_already_emitted(result, &emitted))
+        .collect::<Vec<_>>();
+    // Keep the complete print projection and the exact inline item together.
+    // The diagnostic may already be bounded; it cannot establish identity.
+    let printed_read_duplicates = nested_results.iter().filter_map(|result| {
+        let projection = result.printed_read_projection.as_ref()?;
+        let item = nested_result_content_items(vec![result.clone()], &nested_presentations)
+            .into_iter().next()?;
+        match item {
+            FunctionCallOutputContentItem::InputText { text } => Some((projection.clone(), text)),
+            _ => None,
+        }
+    }).collect::<Vec<_>>();
     content_items.extend(nested_result_content_items(nested_results, &nested_presentations));
     content_items.extend(post_tool_use_feedback);
     let mut diagnostic = required_terminal.as_ref().map(|terminal| {
@@ -2718,6 +2734,17 @@ fn format_runtime_response(
             Some((line_offset, total_lines)),
             recovery_whole_limit.filter(|_| success && !yielded),
         );
+    // Check the final delivered items, not the pre-truncation script output.
+    // A cut or modified print cannot prove that the entire projection arrived.
+    for (projection, diagnostic) in printed_read_duplicates {
+        if content_items.iter().any(|item| matches!(item,
+            FunctionCallOutputContentItem::InputText { text } if text == &projection))
+            && let Some(index) = content_items.iter().position(|item| matches!(item,
+                FunctionCallOutputContentItem::InputText { text } if text == &diagnostic))
+        {
+            content_items.remove(index);
+        }
+    }
     let semantic_evidence = serde_json::json!({
         "status": &script_status,
         "content_items": &content_items,
@@ -3121,6 +3148,82 @@ async fn call_nested_tool(
     result
 }
 
+async fn retain_failed_dispatch_result(
+    exec: &ExecContext,
+    cell_id: &CellId,
+    packet_ordinal: usize,
+    nested_call_id: &str,
+    tool_name: &ToolName,
+    result: JsonValue,
+    message: &str,
+    cancellation: &NestedCancellation,
+) {
+    let canonical = codex_tools::CanonicalToolResult::json(result.clone());
+    let service = &exec.session.services.code_mode_service;
+    let result_bytes = usize::try_from(canonical.exact_bytes).unwrap_or(usize::MAX);
+    if service.try_record_inline_packet_recovery(cell_id, packet_ordinal, result_bytes, || {
+        serde_json::json!({"call_id":nested_call_id, "tool_name":tool_name.to_string(),
+            "failed":true, "outcome":{"result":result}})
+    }) {
+        return;
+    }
+    let id = crate::tools::command_output_artifact::ToolOutputArtifactId::new();
+    let owner = crate::tools::command_output_artifact::reserve_canonical_retention(
+        &exec.turn.config.codex_home, &exec.session.thread_id.to_string(), id,
+    );
+    let bytes = canonical.exact_bytes;
+    service.record_packet_recovery(cell_id, packet_ordinal, serde_json::json!({
+        "call_id":nested_call_id, "tool_name":tool_name.to_string(), "failed":true,
+        "outcome":{"artifact_id":id.to_string(), "canonical_retention":"pending", "retry_safe":false,
+            "recovery":{"tool":"read_tool_output", "arguments":{"artifact_id":id.to_string(),
+                "selectors":[{"kind":"bytes", "start":0, "end":bytes}]}}}
+    }));
+    let exec = exec.clone();
+    let cell_id = cell_id.clone();
+    let nested_call_id = nested_call_id.to_owned();
+    let tool_name = tool_name.to_string();
+    let (retained_output, output_truncated, _) = bounded_failed_nested_text(message);
+    let retention_exec = exec.clone();
+    let retention_cell = cell_id.clone();
+    let retention = async move {
+        let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact_with_id(
+            &retention_exec.turn.config.codex_home, &retention_exec.session.thread_id.to_string(),
+            &canonical, id,
+        ).await;
+        owner.settle(&artifact);
+        let outcome = if artifact.complete && let Some(id) = artifact.artifact_id() {
+            retention_exec.session.register_tool_artifact_origin(
+                id.clone(), nested_call_id.clone(), canonical.exact_bytes, canonical.sha256.clone(),
+            ).await;
+            serde_json::json!({"artifact_id":id, "canonical_sha256":canonical.sha256,
+                "canonical_bytes":canonical.exact_bytes, "recovery":{"tool":"read_tool_output",
+                    "arguments":{"artifact_id":id, "selectors":[{"kind":"bytes", "start":0,
+                        "end":canonical.exact_bytes}]}}})
+        } else {
+            serde_json::json!({"output":retained_output, "output_truncated":output_truncated,
+                "recovery_available":!output_truncated,
+                "notice":"Canonical retention failed; do not replay effects."})
+        };
+        let settlement = serde_json::json!({"call_id":nested_call_id, "tool_name":tool_name,
+            "failed":true, "outcome":outcome});
+        if !retention_exec.session.services.code_mode_service.record_packet_recovery(
+            &retention_cell, packet_ordinal, settlement.clone(),
+        ) {
+            retention_exec.session.send_event(&retention_exec.turn,
+                codex_protocol::protocol::EventMsg::Warning(codex_protocol::protocol::WarningEvent {
+                    message: format!("Settled retained result for closed Code Mode cell {retention_cell}: {settlement}. Do not replay effects."),
+                })).await;
+        }
+    };
+    if let Some(previous) = service.queue_packet_retention(&exec.session, &cell_id, retention) {
+        tokio::select! {
+            biased;
+            _ = previous => {}
+            _ = cancellation.token().cancelled() => {}
+        }
+    }
+}
+
 async fn call_nested_tool_inner(
     exec: ExecContext,
     tool_runtime: ToolCallRuntime,
@@ -3192,6 +3295,10 @@ async fn call_nested_tool_inner(
     let payload = match build_nested_tool_payload(tool_kind, &tool_name, input) {
         Ok(payload) => payload,
         Err(error) => {
+            let failure = FunctionCallError::RespondToModel(error.clone());
+            retain_failed_dispatch_result(&exec, &cell_id, packet_ordinal, &nested_call_id,
+                &tool_name, serde_json::json!({"tool_failure":failure.failure(),
+                    "payload_authority":"requested"}), &error, &cancellation).await;
             let (retained_output, output_truncated, _) = bounded_failed_nested_text(&error);
             let (failure_fingerprint, failure_identity) =
                 nested_failure_evidence(&nested_call_id, &error);
@@ -3215,6 +3322,7 @@ async fn call_nested_tool_inner(
                         failed: true,
                         command_state: None,
                         output_fingerprints: Vec::new(),
+                        printed_read_projection: None,
                         failure_identity,
                         ordinal: packet_ordinal,
                         call_id: nested_call_id,
@@ -3305,6 +3413,8 @@ async fn call_nested_tool_inner(
             let failure_result = serde_json::json!({
                 "tool_failure": error.failure(), "payload_authority": "requested",
             });
+            retain_failed_dispatch_result(&exec, &cell_id, packet_ordinal, &nested_call_id,
+                &tool_name, failure_result.clone(), &message, &cancellation).await;
             let previous = operation_evidence::publish(
                 &exec,
                 &cell_id,
@@ -3354,6 +3464,7 @@ async fn call_nested_tool_inner(
                         failed: true,
                         command_state: None,
                         output_fingerprints: Vec::new(),
+                        printed_read_projection: None,
                         failure_identity,
                         ordinal: packet_ordinal,
                         call_id: nested_call_id,
@@ -3689,6 +3800,14 @@ async fn call_nested_tool_inner(
             &result_value,
         ),
         output_fingerprints: nested_output_fingerprints(&tool_name, &result_value),
+        printed_read_projection: (!nested_failed
+            && tool_name.namespace.is_none()
+            && matches!(tool_name.name.as_str(), "read_file" | "read_tool_output")
+            && script_result["results"].as_array().is_some_and(|rows| rows.iter().any(|row|
+                row["selector"]["kind"] == "section" && row["selector"]["id"] == "outline")))
+            .then(|| codex_code_mode::printed_tool_result(&tool_name, &script_result))
+            .flatten()
+            .map(|projection| projection.to_string()),
         failure_identity: None,
         ordinal: packet_ordinal,
         call_id: nested_call_id.clone(),
