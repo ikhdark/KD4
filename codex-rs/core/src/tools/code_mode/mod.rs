@@ -3148,7 +3148,7 @@ async fn call_nested_tool(
     result
 }
 
-async fn retain_failed_dispatch_result(
+fn retain_failed_dispatch_result(
     exec: &ExecContext,
     cell_id: &CellId,
     packet_ordinal: usize,
@@ -3156,8 +3156,7 @@ async fn retain_failed_dispatch_result(
     tool_name: &ToolName,
     result: JsonValue,
     message: &str,
-    cancellation: &NestedCancellation,
-) {
+) -> Option<futures::future::BoxFuture<'static, ()>> {
     let canonical = codex_tools::CanonicalToolResult::json(result.clone());
     let service = &exec.session.services.code_mode_service;
     let result_bytes = usize::try_from(canonical.exact_bytes).unwrap_or(usize::MAX);
@@ -3165,7 +3164,7 @@ async fn retain_failed_dispatch_result(
         serde_json::json!({"call_id":nested_call_id, "tool_name":tool_name.to_string(),
             "failed":true, "outcome":{"result":result}})
     }) {
-        return;
+        return None;
     }
     let id = crate::tools::command_output_artifact::ToolOutputArtifactId::new();
     let owner = crate::tools::command_output_artifact::reserve_canonical_retention(
@@ -3178,7 +3177,6 @@ async fn retain_failed_dispatch_result(
             "recovery":{"tool":"read_tool_output", "arguments":{"artifact_id":id.to_string(),
                 "selectors":[{"kind":"bytes", "start":0, "end":bytes}]}}}
     }));
-    let exec = exec.clone();
     let cell_id = cell_id.clone();
     let nested_call_id = nested_call_id.to_owned();
     let tool_name = tool_name.to_string();
@@ -3215,13 +3213,7 @@ async fn retain_failed_dispatch_result(
                 })).await;
         }
     };
-    if let Some(previous) = service.queue_packet_retention(&exec.session, &cell_id, retention) {
-        tokio::select! {
-            biased;
-            _ = previous => {}
-            _ = cancellation.token().cancelled() => {}
-        }
-    }
+    Some(retention.boxed())
 }
 
 async fn call_nested_tool_inner(
@@ -3296,9 +3288,19 @@ async fn call_nested_tool_inner(
         Ok(payload) => payload,
         Err(error) => {
             let failure = FunctionCallError::RespondToModel(error.clone());
-            retain_failed_dispatch_result(&exec, &cell_id, packet_ordinal, &nested_call_id,
+            let retention = retain_failed_dispatch_result(&exec, &cell_id, packet_ordinal, &nested_call_id,
                 &tool_name, serde_json::json!({"tool_failure":failure.failure(),
-                    "payload_authority":"requested"}), &error, &cancellation).await;
+                    "payload_authority":"requested"}), &error);
+            if let Some(retention) = retention
+                && let Some(previous) = exec.session.services.code_mode_service
+                    .queue_packet_retention(&exec.session, &cell_id, retention)
+            {
+                tokio::select! {
+                    biased;
+                    _ = previous => {}
+                    _ = cancellation.token().cancelled() => {}
+                }
+            }
             let (retained_output, output_truncated, _) = bounded_failed_nested_text(&error);
             let (failure_fingerprint, failure_identity) =
                 nested_failure_evidence(&nested_call_id, &error);
@@ -3413,8 +3415,8 @@ async fn call_nested_tool_inner(
             let failure_result = serde_json::json!({
                 "tool_failure": error.failure(), "payload_authority": "requested",
             });
-            retain_failed_dispatch_result(&exec, &cell_id, packet_ordinal, &nested_call_id,
-                &tool_name, failure_result.clone(), &message, &cancellation).await;
+            let retention = retain_failed_dispatch_result(&exec, &cell_id, packet_ordinal, &nested_call_id,
+                &tool_name, failure_result.clone(), &message);
             let previous = operation_evidence::publish(
                 &exec,
                 &cell_id,
@@ -3426,6 +3428,7 @@ async fn call_nested_tool_inner(
                 &failure_result,
                 true,
                 dispatch_started_at.elapsed(),
+                retention,
             );
             if let Some(previous) = previous {
                 tokio::select! {
@@ -3745,22 +3748,12 @@ async fn call_nested_tool_inner(
             }
         }
     };
-    if defer_retention {
-        let previous = exec
-            .session
-            .services
-            .code_mode_service
-            .queue_packet_retention(&exec.session, &cell_id, retention);
-        if let Some(previous) = previous {
-            tokio::select! {
-                biased;
-                _ = previous => {}
-                _ = cancellation.token().cancelled() => {}
-            }
-        }
+    let preceding = if defer_retention {
+        Some(retention.boxed())
     } else {
         retention.await;
-    }
+        None
+    };
     let previous_publication = operation_evidence::publish(
         &exec,
         &cell_id,
@@ -3772,6 +3765,7 @@ async fn call_nested_tool_inner(
         &result_value,
         nested_failed,
         dispatch_started_at.elapsed(),
+        preceding,
     );
     if let Some(previous) = previous_publication {
         tokio::select! {
@@ -4418,6 +4412,13 @@ fn nested_failure_evidence(instance: &str, error: &str) -> (String, Option<JsonV
             .and_then(JsonValue::as_str)
             .filter(|fingerprint| !fingerprint.is_empty())
             .map(str::to_owned)
+            .or_else(|| {
+                // A proven identical repeat keeps its predecessor's instance
+                // identity so the repeated-cycle owner can see it. Nested
+                // failures never arm dispatch suppression; similar ones stay distinct.
+                crate::session::turn_execution::unchanged_failure_repeat_of(&value)
+                    .map(|previous| format!("code_mode.unclassified_instance.{previous}"))
+            })
             .unwrap_or_else(|| format!("code_mode.unclassified_instance.{instance}"));
         let native_envelope = json_start == 0
             && error.len() > MAX_RETAINED_NESTED_RESULT_BYTES

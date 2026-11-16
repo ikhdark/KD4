@@ -685,7 +685,10 @@ fn writable_assignment_schema() -> JsonSchema {
         ..JsonSchema::object(BTreeMap::from([
             ("objective".into(), JsonSchema::string(None)),
             ("acceptance_criteria".into(), JsonSchema::array(criterion, None)),
-            ("read_scope".into(), scopes.clone()),
+            ("read_scope".into(), JsonSchema {
+                description: Some("Primary inputs and overlap identity for this assignment. Not a read restriction: the worker may read and search any other relevant, permitted file; only write_scope and prohibitions limit changes.".into()),
+                ..scopes.clone()
+            }),
             ("write_scope".into(), scopes),
             ("stop_condition".into(), JsonSchema::string(None)),
             ("required_evidence".into(), JsonSchema::array(inspection, Some("Every entry must have a matching criterion with an owned source-inspection policy; root owns execution/integration evidence.".into()))),

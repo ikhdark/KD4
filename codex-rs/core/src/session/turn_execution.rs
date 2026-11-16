@@ -55,6 +55,39 @@ pub(crate) fn bounded_path_list(paths: &[String]) -> String {
 
 const RECENT_CYCLE_LIMIT: usize = 32;
 
+// Cross-continuation convergence guard. These are triggers for one internal
+// progress assessment or advisory, never a stop, cap or tool restriction:
+// continued real progress always re-arms them.
+/// Consecutive tool continuations without progress before the first assessment.
+const NO_PROGRESS_ASSESSMENT_THRESHOLD: u32 = 4;
+/// Further no-progress continuations before a repeated assessment.
+const NO_PROGRESS_ASSESSMENT_REARM: u32 = 8;
+/// Source reads/searches since the last progress that also prompt an assessment
+/// once at least two continuations made no progress.
+const SOURCE_ACTIONS_WITHOUT_PROGRESS_BUDGET: u32 = 24;
+/// Consecutive single-observation continuations before batching advice.
+const SERIAL_SINGLE_ACTION_THRESHOLD: u32 = 4;
+/// Consecutive wait-only continuations without new information before wait advice.
+const UNPRODUCTIVE_WAIT_THRESHOLD: u32 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConvergenceGuardKind {
+    ProgressAssessment,
+    BatchingAdvice,
+    WaitAdvice,
+}
+
+/// What one settled continuation contributed, derived from existing signals.
+#[derive(Clone, Copy, Debug, Default)]
+struct ContinuationProgressObservation {
+    progressed: bool,
+    calls: usize,
+    source_actions: usize,
+    wait_only: bool,
+    observation_only: bool,
+    new_failure: bool,
+}
+
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum ContinuationDisposition {
@@ -158,6 +191,9 @@ struct SamplingToolOutcome {
     failure_recovery: Option<Value>,
     failure_is_terminal: bool,
     failure_diagnosis_reused: bool,
+    /// Operation history proves an identical failure of the same operation
+    /// and input against unchanged observed state; not new failure evidence.
+    failure_repeats_unchanged_attempt: bool,
     canonical_artifact_required: bool,
     nested_in_code_mode: bool,
     code_mode_cell_id: Option<String>,
@@ -224,6 +260,7 @@ impl SamplingToolOutcome {
             failure_recovery: signal.and_then(failure_recovery_from_value),
             failure_is_terminal: sampling_failure_is_terminal(signal),
             failure_diagnosis_reused: false,
+            failure_repeats_unchanged_attempt: false,
             canonical_artifact_required: false,
             nested_in_code_mode: false,
             code_mode_cell_id: None,
@@ -974,6 +1011,8 @@ impl SamplingRequestSignalCollector {
         if outcome.is_failure_evidence() {
             outcome.validation_failure_excerpt = validation_failure_excerpt(result);
             outcome.failure_recovery = failure_recovery_from_value(result);
+            outcome.failure_repeats_unchanged_attempt =
+                unchanged_failure_repeat_of(result).is_some();
         }
         if outcome.is_failure_evidence() && outcome.failure_fingerprint.is_none() {
             outcome.failure_fingerprint = Some(code_mode_result_failure_fingerprint(
@@ -1093,6 +1132,7 @@ impl SamplingRequestSignalCollector {
             SamplingToolOutcome::plain(ordinal, SamplingToolOutcomeKind::Failure, None);
         outcome.failure_fingerprint = Some(failure_fingerprint);
         outcome.failure_recovery = Some(failure_recovery_from_text(failure_message));
+        outcome.failure_repeats_unchanged_attempt = text_failure_repeats_unchanged_attempt(failure_message);
         outcome.nested_in_code_mode = true;
         outcome.code_mode_cell_id = Some(cell_id.to_string());
         let canonical = payload.map(canonical_tool_action);
@@ -1227,6 +1267,7 @@ impl SamplingRequestSignalCollector {
             .unwrap_or_else(|| format!("direct_tool.unclassified_instance.{ordinal}")));
         outcome.failure_is_terminal = failure_is_terminal;
         outcome.failure_recovery = Some(failure_recovery_from_text(failure));
+        outcome.failure_repeats_unchanged_attempt = text_failure_repeats_unchanged_attempt(failure);
         let mut state = self
             .state
             .lock()
@@ -1276,6 +1317,7 @@ impl SamplingRequestSignalCollector {
                 .and_then(|value| validation_failure_excerpt(&value))
                 .or_else(|| Some(bounded_validation_detail(&text)));
             outcome.failure_recovery = Some(failure_recovery_from_text(&text));
+            outcome.failure_repeats_unchanged_attempt = text_failure_repeats_unchanged_attempt(&text);
         }
         if outcome.is_failure_evidence() && outcome.failure_fingerprint.is_none() {
             outcome.failure_fingerprint = response_failure_fingerprint(response);
@@ -2063,6 +2105,42 @@ fn value_failure_signature(value: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Operation history (grouped by exact operation and input) proves that this
+/// failure repeats its predecessor: same observed state and configuration, no
+/// success since, and an identical settled owner failure. Returns the
+/// predecessor's call ID. Similar diagnostics never qualify, and the history's
+/// coarse-failure fingerprint policy is unchanged.
+pub(crate) fn unchanged_failure_repeat_of(envelope: &Value) -> Option<&str> {
+    let failure = envelope.get("tool_failure")?;
+    let history = failure.pointer("/details/operation_history")?;
+    let instance = history.get("instance")?;
+    let previous = history.get("last_unsuccessful_attempt")?;
+    let owner = previous.get("owner_failure")?;
+    let count = |key: &str| history.get(key).and_then(Value::as_u64);
+    let identical = ["code", "message"]
+        .iter()
+        .all(|key| failure.get(*key).is_some() && failure.get(*key) == owner.get(*key))
+        && ["execution_state", "effects", "live_operations", "retry_safe"]
+            .iter()
+            .all(|key| failure.get(*key) == owner.get(*key));
+    let repeated = identical
+        && instance["effective_input_known"] == true
+        && previous["same_observed_state"] == true
+        && count("unchanged_unsuccessful_attempt_count").is_some_and(|count| count > 0)
+        && count("previous_attempt_count") == count("previous_unsuccessful_attempt_count")
+        && !instance["input_revision"].is_null()
+        && previous["parameters_revision"] == instance["input_revision"]
+        && previous["strategy"] == instance["strategy"]
+        && previous["failure_code"] == instance["failure_code"];
+    repeated.then(|| previous["call_id"].as_str()).flatten()
+}
+
+fn text_failure_repeats_unchanged_attempt(text: &str) -> bool {
+    text.find('{')
+        .and_then(|start| serde_json::from_str::<Value>(&text[start..]).ok())
+        .is_some_and(|value| unchanged_failure_repeat_of(&value).is_some())
+}
+
 fn code_mode_result_failure_fingerprint(
     result: &Value,
     instance: &str,
@@ -2462,7 +2540,17 @@ pub(crate) struct TurnExecutionControl {
     successful_compilation_scopes: BTreeMap<crate::validation::CompilationCheckScope, (u64, u64)>,
     next_validation_request: AtomicU64,
     pending_validation_processes: BTreeMap<u64, PendingValidation>,
-
+    /// Consecutive tool continuations that added no progress kind, plan or
+    /// input change, delivered child event or process output.
+    no_progress_streak: u32,
+    source_actions_since_progress: u32,
+    next_assessment_at: u32,
+    /// Consecutive continuations that issued exactly one non-mutating observation.
+    serial_single_action_streak: u32,
+    batching_advice_issued: bool,
+    /// Consecutive wait-only continuations that returned no new information.
+    unproductive_wait_streak: u32,
+    wait_advice_issued: bool,
 }
 
 
@@ -2475,6 +2563,8 @@ pub(crate) struct SamplingConvergenceDecision {
     pub(crate) directive: Option<String>,
     pub(crate) proven_loop_activated: bool,
     pub(crate) authoritative_wait: Option<AuthoritativeWaitResolution>,
+    /// Set when the directive comes from the cross-continuation progress guard.
+    pub(crate) guard: Option<ConvergenceGuardKind>,
 }
 
 impl TurnExecutionControl {
@@ -2508,7 +2598,13 @@ impl TurnExecutionControl {
             successful_compilation_scopes: BTreeMap::new(),
             next_validation_request: AtomicU64::new(0),
             pending_validation_processes: BTreeMap::new(),
-
+            no_progress_streak: 0,
+            source_actions_since_progress: 0,
+            next_assessment_at: NO_PROGRESS_ASSESSMENT_THRESHOLD,
+            serial_single_action_streak: 0,
+            batching_advice_issued: false,
+            unproductive_wait_streak: 0,
+            wait_advice_issued: false,
         }
     }
 
@@ -2612,7 +2708,9 @@ impl TurnExecutionControl {
         signals: &SamplingRequestSignalCollector,
         settled: &SamplingRequestSettledState,
     ) -> Vec<TurnTimingProgressKind> {
-
+        // Both lock the collector state; read them before holding it below.
+        let process_progress = signals.observed_successful_process_monitor();
+        let wait_only = signals.is_wait_only();
         let state = signals
             .state
             .lock()
@@ -2647,6 +2745,11 @@ impl TurnExecutionControl {
                 if !outcome.is_failure_evidence() {
                     continue;
                 }
+            }
+            if outcome.is_failure_evidence() && outcome.failure_repeats_unchanged_attempt {
+                // An equivalent call against unchanged state, not new failure
+                // information, even though its instance identity is new.
+                continue;
             }
             let evidence = if outcome.is_failure_evidence() {
                 outcome.failure_fingerprint.clone()
@@ -2710,7 +2813,123 @@ impl TurnExecutionControl {
         if agent_delivery_progress {
             self.evidence_fingerprint.take();
         }
+
+        // Cross-continuation accounting reuses the classification above plus
+        // existing revisions; it neither hashes content nor builds a task graph.
+        let calls = state
+            .registered_count
+            .saturating_sub(state.direct_code_mode_exec_count)
+            .saturating_add(state.code_mode_nested_tool_count);
+        let source_actions = state
+            .structured_actions
+            .values()
+            .filter(|action| {
+                matches!(
+                    action.class,
+                    StructuredActionClass::BroadSource | StructuredActionClass::PreciseSource
+                )
+            })
+            .count();
+        let new_failure = state.outcomes.iter().any(|outcome| {
+            outcome.is_failure_evidence()
+                && !outcome.failure_diagnosis_reused
+                && !outcome.failure_repeats_unchanged_attempt
+        });
+        let observation_only = !state.saw_mutation && !state.saw_coordination;
+        drop(state);
+        let progressed = !progress.is_empty()
+            || agent_delivery_progress
+            || process_progress
+            || self.plan_revision != baselines.plan_revision
+            || self.input_revision != baselines.input_revision
+            || settled.tool_exposure_revision != baselines.tool_exposure_revision
+            || settled.attributed_mutation_revision != baselines.attributed_mutation_revision;
+        self.record_continuation_progress(ContinuationProgressObservation {
+            progressed,
+            calls,
+            source_actions,
+            wait_only,
+            observation_only,
+            new_failure,
+        });
         progress
+    }
+
+    /// Updates the cross-continuation streaks. Real progress re-arms the
+    /// assessment; a tool-free continuation is a protocol signal, not a cycle.
+    fn record_continuation_progress(&mut self, observation: ContinuationProgressObservation) {
+        if observation.calls == 0 {
+            return;
+        }
+        if observation.progressed {
+            self.no_progress_streak = 0;
+            self.source_actions_since_progress = 0;
+            self.next_assessment_at = NO_PROGRESS_ASSESSMENT_THRESHOLD;
+            self.unproductive_wait_streak = 0;
+        } else if observation.wait_only {
+            self.unproductive_wait_streak = self.unproductive_wait_streak.saturating_add(1);
+        } else {
+            self.unproductive_wait_streak = 0;
+            self.no_progress_streak = self.no_progress_streak.saturating_add(1);
+            self.source_actions_since_progress = self.source_actions_since_progress.saturating_add(
+                u32::try_from(observation.source_actions).unwrap_or(u32::MAX),
+            );
+        }
+        // Only productive single observations could have been batched; repeated
+        // or covered ones belong to the assessment above. A new failure decides
+        // the next action, and mutations or coordination are not independent.
+        if observation.progressed
+            && observation.calls == 1
+            && observation.observation_only
+            && !observation.wait_only
+            && !observation.new_failure
+        {
+            self.serial_single_action_streak = self.serial_single_action_streak.saturating_add(1);
+        } else {
+            self.serial_single_action_streak = 0;
+        }
+    }
+
+    /// At most one internal notice per continuation, only when one is due.
+    fn take_guard_directive(&mut self) -> Option<(ConvergenceGuardKind, String)> {
+        if !self.wait_advice_issued && self.unproductive_wait_streak >= UNPRODUCTIVE_WAIT_THRESHOLD {
+            self.wait_advice_issued = true;
+            return Some((
+                ConvergenceGuardKind::WaitAdvice,
+                format!(
+                    "Wait advice: the last {} continuations only polled a running process and received no new output or state change. Let the host wait instead of polling: use the existing owner wait (in Code Mode, await_command or a wait with a longer timeout; otherwise one poll with a longer yield) so control returns on new output, completion, failure or timeout. Act sooner only if independent work remains.",
+                    self.unproductive_wait_streak
+                ),
+            ));
+        }
+        let budget_reached = self.no_progress_streak >= 2
+            && self.source_actions_since_progress >= SOURCE_ACTIONS_WITHOUT_PROGRESS_BUDGET;
+        if self.no_progress_streak >= self.next_assessment_at || budget_reached {
+            self.next_assessment_at = self
+                .no_progress_streak
+                .saturating_add(NO_PROGRESS_ASSESSMENT_REARM);
+            let sources = std::mem::take(&mut self.source_actions_since_progress);
+            return Some((
+                ConvergenceGuardKind::ProgressAssessment,
+                format!(
+                    "Progress assessment: the last {} tool continuations added no new source evidence, workspace change, validation result, new failure, process output or plan change ({sources} source reads or searches since the last progress). Do not repeat equivalent observations or widen the search. From the evidence already retained, take the next decisive step: edit, validate or finish; batch every remaining read or check whose target is already known into one response; or name the exact unresolved dependency and the observation that would resolve it. This is an internal checkpoint, not a limit: genuinely new evidence or a changed strategy may continue.",
+                    self.no_progress_streak
+                ),
+            ));
+        }
+        if !self.batching_advice_issued
+            && self.serial_single_action_streak >= SERIAL_SINGLE_ACTION_THRESHOLD
+        {
+            self.batching_advice_issued = true;
+            return Some((
+                ConvergenceGuardKind::BatchingAdvice,
+                format!(
+                    "Batching advice: the last {} continuations each issued a single observation. When further reads, searches, Git observations or predetermined checks are independent and their targets are already known, issue them together in one response (in Code Mode, one cell) and interpret the results once. Keep a separate step only when one result determines the next action, and serialize work that shares a build target.",
+                    self.serial_single_action_streak
+                ),
+            ));
+        }
+        None
     }
 
     /// Native file snapshots and their retained artifacts share delivered bytes,
@@ -2893,6 +3112,16 @@ impl TurnExecutionControl {
         self.issued_directives.clear();
 
         self.input_revision = self.input_revision.saturating_add(1);
+        // New input is progress; advisories re-arm for the new request.
+        self.no_progress_streak = 0;
+        self.source_actions_since_progress = 0;
+        self.next_assessment_at = NO_PROGRESS_ASSESSMENT_THRESHOLD;
+        self.serial_single_action_streak = 0;
+        self.unproductive_wait_streak = 0;
+        if instructions_changed {
+            self.batching_advice_issued = false;
+            self.wait_advice_issued = false;
+        }
         // Without new instructions, accepted input is a child's or peer's
         // delivered report or final answer: new information. Only new
         // instructions re-arm the one-shot
@@ -2978,7 +3207,41 @@ impl TurnExecutionControl {
     }
 
 
+    /// Repeated-cycle and owner decisions keep precedence. Otherwise a due
+    /// progress-guard notice asks the next generation for a decision; it never
+    /// suppresses the continuation, restricts tools or ends the turn.
     pub(crate) fn evaluate_convergence_with_analysis(
+        &mut self,
+        baselines: &SamplingRequestBaselines,
+        analysis: &SamplingRequestAnalysis<'_>,
+        settled: &SamplingRequestSettledState,
+    ) -> SamplingConvergenceDecision {
+        let mut decision = self.evaluate_repeated_cycle_with_analysis(baselines, analysis, settled);
+        if decision.directive.is_some() {
+            if decision.proven_loop_activated {
+                // The repeated-cycle notice is this epoch's assessment.
+                self.next_assessment_at = self
+                    .no_progress_streak
+                    .saturating_add(NO_PROGRESS_ASSESSMENT_REARM);
+                self.source_actions_since_progress = 0;
+            }
+            return decision;
+        }
+        // Owner-held validation and authoritative waits are not churn.
+        if !self.pending_validation_processes.is_empty()
+            || decision.continuation != ContinuationDisposition::ModelRequired
+            || decision.authoritative_wait.is_some()
+        {
+            return decision;
+        }
+        if let Some((kind, text)) = self.take_guard_directive() {
+            decision.directive = Some(text);
+            decision.guard = Some(kind);
+        }
+        decision
+    }
+
+    fn evaluate_repeated_cycle_with_analysis(
         &mut self,
         baselines: &SamplingRequestBaselines,
         analysis: &SamplingRequestAnalysis<'_>,
@@ -3119,6 +3382,7 @@ impl TurnExecutionControl {
                         authoritative_wait: Some(AuthoritativeWaitResolution::Terminal(
                             observation.result,
                         )),
+                        guard: None,
                     }
                 }
                 AuthoritativeWaitDisposition::Blocked => {
@@ -3144,6 +3408,7 @@ impl TurnExecutionControl {
                         authoritative_wait: Some(AuthoritativeWaitResolution::Blocked(
                             observation.result,
                         )),
+                        guard: None,
                     }
                 }
             };
@@ -3163,6 +3428,7 @@ impl TurnExecutionControl {
                 ),
                 proven_loop_activated: true,
                 authoritative_wait: None,
+                guard: None,
             };
         }
 
@@ -3226,6 +3492,7 @@ impl TurnExecutionControl {
             directive: Some(directive),
             proven_loop_activated: true,
             authoritative_wait: None,
+            guard: None,
         }
     }
 

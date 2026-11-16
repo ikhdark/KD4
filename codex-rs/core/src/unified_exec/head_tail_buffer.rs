@@ -71,6 +71,8 @@ pub(crate) struct HeadTailBuffer {
     unreported_omitted_bytes: usize,
     lagged_chunks: u64,
     unreported_lagged_chunks: u64,
+    capture_incomplete: bool,
+    unreported_capture_incomplete: bool,
     /// Ascending producer positions (retained plus omitted bytes) of lag
     /// seams, excluding seams inside the omitted middle. Once full, later
     /// seams share `lag_overflow`, whose inner positions are unknown.
@@ -79,6 +81,7 @@ pub(crate) struct HeadTailBuffer {
 }
 
 const MAX_LAG_SEAMS: usize = 1024;
+const INCOMPLETE_CAPTURE_MARKER: &[u8] = b"\n[output capture incomplete: producer EOF unconfirmed; missing bytes unknown]\n";
 
 impl Default for HeadTailBuffer {
     fn default() -> Self {
@@ -108,6 +111,8 @@ impl HeadTailBuffer {
             unreported_omitted_bytes: 0,
             lagged_chunks: 0,
             unreported_lagged_chunks: 0,
+            capture_incomplete: false,
+            unreported_capture_incomplete: false,
             lag_seams: Vec::new(),
             lag_overflow: None,
         }
@@ -163,6 +168,17 @@ impl HeadTailBuffer {
 
     pub(crate) fn lagged_chunks(&self) -> u64 {
         self.lagged_chunks
+    }
+
+    pub(crate) fn record_incomplete_capture(&mut self) {
+        self.capture_incomplete = true;
+        self.unreported_capture_incomplete = true;
+        self.start_offset = None;
+        self.stream_ranges = None;
+    }
+
+    pub(crate) fn output_is_exact(&self) -> bool {
+        self.omitted_bytes == 0 && self.lagged_chunks == 0 && !self.capture_incomplete
     }
 
     /// Consume the lag count not yet reported by an interim tool response.
@@ -249,6 +265,7 @@ impl HeadTailBuffer {
         self.retained_bytes() > 0
             || self.unreported_omitted_bytes > 0
             || self.unreported_lagged_chunks > 0
+            || self.unreported_capture_incomplete
     }
 
     /// Keep the in-flight polling receipt with the producer until preparation
@@ -346,6 +363,7 @@ impl HeadTailBuffer {
 
     pub(crate) fn stream_layout(&self) -> StreamLayout {
         StreamLayout {
+            capture_incomplete: self.capture_incomplete,
             head: self.head.len(),
             omitted: self.omitted_bytes,
             lag_seams: self.lag_seams.clone(),
@@ -358,6 +376,7 @@ impl HeadTailBuffer {
         let (front, back) = self.tail.as_slices();
         RetainedStream {
             head: &self.head,
+            capture_incomplete: self.capture_incomplete,
             tail: [front, back],
             omitted: self.omitted_bytes,
             lag_seams: &self.lag_seams,
@@ -379,6 +398,7 @@ impl HeadTailBuffer {
         }
         let omitted = self.take_unreported_omitted_bytes();
         let lagged = self.take_unreported_lagged_chunks();
+        let capture_incomplete = std::mem::take(&mut self.unreported_capture_incomplete);
         let consumed = (self.retained_bytes() as u64).checked_add(omitted as u64);
         if self.start_offset.is_none() {
             target.start_offset = None;
@@ -388,6 +408,7 @@ impl HeadTailBuffer {
             .and_then(|start| start.checked_add(consumed?));
         let meaningful = omitted > 0
             || lagged > 0
+            || capture_incomplete
             || self
                 .head
                 .iter()
@@ -406,6 +427,9 @@ impl HeadTailBuffer {
         target.push_chunk(front);
         target.push_chunk(back);
         target.record_lagged_chunks(lagged);
+        if capture_incomplete {
+            target.record_incomplete_capture();
+        }
         self.head.clear();
         self.tail.clear();
         meaningful
@@ -422,7 +446,11 @@ impl HeadTailBuffer {
         } else {
             Vec::new()
         };
-        self.to_bytes_with_markers(&marker, suffix)
+        let mut output = self.to_bytes_with_markers(&marker, suffix);
+        if self.capture_incomplete {
+            output.extend_from_slice(INCOMPLETE_CAPTURE_MARKER);
+        }
+        output
     }
 
     fn to_bytes_with_markers(&self, omission_marker: &[u8], suffix: &[u8]) -> Vec<u8> {
@@ -490,6 +518,7 @@ impl HeadTailBuffer {
 /// `to_bytes_with_loss_notice(&[])`, so a retired process rescans it exactly.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct StreamLayout {
+    capture_incomplete: bool,
     head: usize,
     omitted: usize,
     lag_seams: Vec<usize>,
@@ -498,6 +527,7 @@ pub(crate) struct StreamLayout {
 
 /// Retained bytes of a cumulative stream in producer coordinates.
 pub(super) struct RetainedStream<'a> {
+    capture_incomplete: bool,
     head: &'a [u8],
     tail: [&'a [u8]; 2],
     omitted: usize,
@@ -507,6 +537,11 @@ pub(super) struct RetainedStream<'a> {
 
 impl<'a> RetainedStream<'a> {
     pub(super) fn frozen(snapshot: &'a [u8], layout: &'a StreamLayout) -> Self {
+        let snapshot = if layout.capture_incomplete {
+            &snapshot[..snapshot.len().saturating_sub(INCOMPLETE_CAPTURE_MARKER.len())]
+        } else {
+            snapshot
+        };
         let marker = if layout.omitted > 0 {
             omitted_output_marker(layout.omitted).len()
         } else {
@@ -514,6 +549,7 @@ impl<'a> RetainedStream<'a> {
         };
         let head = layout.head.min(snapshot.len());
         RetainedStream {
+            capture_incomplete: layout.capture_incomplete,
             head: &snapshot[..head],
             tail: [snapshot.get(head.saturating_add(marker)..).unwrap_or_default(), &[]],
             omitted: layout.omitted,
@@ -540,7 +576,7 @@ impl<'a> RetainedStream<'a> {
     pub(super) fn lost_since(&self, after: usize, closed: bool) -> bool {
         let total = self.total();
         let examined = |seam: usize| seam < total || closed;
-        (self.omitted > 0 && self.tail_start() > after)
+        self.capture_incomplete || (self.omitted > 0 && self.tail_start() > after)
             || self
                 .lag_seams
                 .get(self.lag_seams.partition_point(|&seam| seam < after))

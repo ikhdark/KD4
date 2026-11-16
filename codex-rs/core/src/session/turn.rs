@@ -110,6 +110,7 @@ use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_execution::AuthoritativeWaitResolution;
 use crate::session::turn_execution::ContinuationDisposition;
+use crate::session::turn_execution::ConvergenceGuardKind;
 use crate::session::turn_execution::GenerationRequestDisposition;
 use crate::session::turn_execution::SamplingConvergenceDecision;
 use crate::session::turn_execution::SamplingRequestSettledState;
@@ -2408,12 +2409,13 @@ fn generation_needs_follow_up(
 
 fn take_convergence_observation(
     decision: Option<&mut SamplingConvergenceDecision>,
-) -> (bool, Option<String>) {
+) -> (bool, Option<String>, Option<ConvergenceGuardKind>) {
     decision
         .map(|decision| {
             (
                 std::mem::take(&mut decision.proven_loop_activated),
                 decision.directive.take(),
+                decision.guard.take(),
             )
         })
         .unwrap_or_default()
@@ -2427,7 +2429,7 @@ async fn record_convergence_decision(
     turn_execution: &mut TurnExecutionControl,
     decision: Option<&mut SamplingConvergenceDecision>,
 ) -> std::io::Result<()> {
-    let (proven_loop_activated, directive) = take_convergence_observation(decision);
+    let (proven_loop_activated, directive, guard) = take_convergence_observation(decision);
     if proven_loop_activated {
         turn_context
             .turn_timing_state
@@ -2450,6 +2452,21 @@ async fn record_convergence_decision(
         turn_context
             .turn_timing_state
             .record_no_progress_directive();
+        if let Some(guard) = guard {
+            turn_context
+                .turn_timing_state
+                .record_convergence_guard_notice(match guard {
+                    ConvergenceGuardKind::ProgressAssessment => {
+                        codex_turn_timing::ConvergenceGuardNotice::ProgressAssessment
+                    }
+                    ConvergenceGuardKind::BatchingAdvice => {
+                        codex_turn_timing::ConvergenceGuardNotice::BatchingAdvice
+                    }
+                    ConvergenceGuardKind::WaitAdvice => {
+                        codex_turn_timing::ConvergenceGuardNotice::WaitAdvice
+                    }
+                });
+        }
     }
     Ok(())
 }

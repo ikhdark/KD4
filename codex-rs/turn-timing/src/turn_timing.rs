@@ -844,6 +844,9 @@ impl TurnTimingSnapshot {
             internally_drained_wait_count: profile.counters.internally_drained_wait_count,
             no_progress_directive_count: profile.counters.no_progress_directive_count,
             proven_loop_activation_count: profile.counters.proven_loop_activation_count,
+            progress_assessment_count: profile.counters.progress_assessment_count,
+            batching_advice_count: profile.counters.batching_advice_count,
+            wait_advice_count: profile.counters.wait_advice_count,
             tool_router_reuse_count: profile.counters.tool_router_reuse_count,
             tool_router_rebuild_count: profile.counters.tool_router_rebuild_count,
             projection_source_dependencies_reuse_count: profile
@@ -1266,6 +1269,14 @@ pub struct TimingMilestones {
     first_assistant_text_phase: Option<codex_protocol::models::MessagePhase>,
 }
 
+/// Kind of cross-continuation convergence notice delivered to the model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConvergenceGuardNotice {
+    ProgressAssessment,
+    BatchingAdvice,
+    WaitAdvice,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TimingCounters {
     pub logical_generation_count: u32,
@@ -1300,6 +1311,9 @@ pub struct TimingCounters {
     pub internally_drained_wait_count: u32,
     pub no_progress_directive_count: u32,
     pub proven_loop_activation_count: u32,
+    pub progress_assessment_count: u32,
+    pub batching_advice_count: u32,
+    pub wait_advice_count: u32,
     pub tool_router_reuse_count: u32,
     pub tool_router_rebuild_count: u32,
     pub projection_source_dependencies_reuse_count: u32,
@@ -3804,6 +3818,19 @@ impl TurnTimingState {
             .counters
             .proven_loop_activation_count
             .saturating_add(1);
+    }
+
+    /// A delivered cross-continuation guard notice (also counted as a directive).
+    pub fn record_convergence_guard_notice(&self, notice: ConvergenceGuardNotice) {
+        let mut state = self.state();
+        let counter = match notice {
+            ConvergenceGuardNotice::ProgressAssessment => {
+                &mut state.counters.progress_assessment_count
+            }
+            ConvergenceGuardNotice::BatchingAdvice => &mut state.counters.batching_advice_count,
+            ConvergenceGuardNotice::WaitAdvice => &mut state.counters.wait_advice_count,
+        };
+        *counter = counter.saturating_add(1);
     }
 
     pub fn record_tool_router_reuse(&self) {

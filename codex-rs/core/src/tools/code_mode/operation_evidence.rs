@@ -21,6 +21,7 @@ pub(super) fn publish(
     result: &JsonValue,
     failed: bool,
     duration: Duration,
+    preceding: Option<futures::future::BoxFuture<'static, ()>>,
 ) -> Option<futures::future::Shared<futures::future::BoxFuture<'static, ()>>> {
     // Keep the executed payload, including hook replacements, and the native
     // result before script-visible compaction. Neither JS prints nor cell/turn
@@ -53,6 +54,9 @@ pub(super) fn publish(
         &exec.session,
         cell_id,
         async move {
+            if let Some(preceding) = preceding {
+                preceding.await;
+            }
             let text = evidence.to_string();
             let text = if text.len() <= 64 * 1024 {
                 text

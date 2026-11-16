@@ -10,10 +10,13 @@ use serde_json::{Value, json};
 
 const MAX_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ROW_BYTES: usize = 1024 * 1024;
+const MAX_SEGMENTS: u32 = 128;
 
 struct Journal {
     lanes: [Option<Lane>; 3],
     sequence: u64,
+    directory: PathBuf,
+    rollover: bool,
 }
 
 struct Lane {
@@ -21,6 +24,9 @@ struct Lane {
     sequence: u64,
     bytes: usize,
     stopped: bool,
+    segment: u32,
+    last_id: Option<String>,
+    previous_segment_last_id: Option<String>,
 }
 
 fn journal() -> Option<&'static Mutex<Journal>> {
@@ -45,11 +51,16 @@ fn journal() -> Option<&'static Mutex<Journal>> {
                         suffix
                     )))
                     .ok()?;
-                Some(Lane { file, sequence: 0, bytes: 0, stopped: false })
+                Some(Lane {
+                    file, sequence: 0, bytes: 0, stopped: false, segment: 0,
+                    last_id: None, previous_segment_last_id: None,
+                })
             };
             Some(Mutex::new(Journal {
                 lanes: [Some(open("")?), open("-mobile"), open("-lifecycle")],
                 sequence: 0,
+                directory,
+                rollover: std::env::var_os("CODEX_RUNTIME_OBSERVATIONS_ROLLOVER").is_some_and(|value| value == "1"),
             }))
         })
         .as_ref()
@@ -77,6 +88,7 @@ pub fn record(
 ) -> Option<Receipt> {
     let journal = journal()?;
     let mut journal = journal.lock().ok()?;
+    let journal = &mut *journal;
     // Ordinary tool traffic must not exhaust connection evidence. Keep the
     // existing runtime cap and a separately bounded mobile lane, with a small
     // retirement reserve even when response telemetry itself is saturated.
@@ -98,6 +110,8 @@ pub fn record(
         return None;
     }
     let sequence = journal.sequence.checked_add(1)?;
+    let rollover = journal.rollover;
+    let directory = &journal.directory;
     let lane = journal.lanes[lane_index].as_mut()?;
     let lane_sequence = lane.sequence.checked_add(1)?;
     let at_ns = u64::try_from(super::process_monotonic_ns()).ok()?;
@@ -110,7 +124,31 @@ pub fn record(
     if !unavailable_lanes.is_empty() {
         row["unavailable_journal_lanes"] = json!(unavailable_lanes);
     }
+    if rollover {
+        row["journal_segment"] = json!(lane.segment);
+        row["previous_segment_last_id"] = json!(lane.previous_segment_last_id);
+    }
     let mut bytes = serde_json::to_vec(&row).ok()?;
+    if rollover && bytes.len() <= MAX_ROW_BYTES && lane.bytes + bytes.len() + 1024 > limit
+        && lane.segment + 1 < MAX_SEGMENTS
+    {
+        let suffix = ["", "-mobile", "-lifecycle"][lane_index];
+        let path = directory.join(format!(
+            "runtime-{}-{}{suffix}-part{:06}.jsonl",
+            std::process::id(), super::process_clock_domain_id(), lane.segment + 1
+        ));
+        if let Ok(file) = OpenOptions::new().write(true).create_new(true).open(path) {
+            lane.file = file;
+            lane.segment += 1;
+            lane.bytes = 0;
+            lane.sequence = 0;
+            lane.previous_segment_last_id = lane.last_id.clone();
+            row["lane_seq"] = json!(1);
+            row["journal_segment"] = json!(lane.segment);
+            row["previous_segment_last_id"] = json!(lane.previous_segment_last_id);
+            bytes = serde_json::to_vec(&row).ok()?;
+        }
+    }
     if bytes.len() > MAX_ROW_BYTES || lane.bytes + bytes.len() + 1024 > limit {
         row["kind"] = json!("capture_overflow");
         row["data"] = json!({"row_bytes":bytes.len(), "retained_bytes":lane.bytes});
@@ -122,7 +160,8 @@ pub fn record(
         lane.stopped = true;
         return None;
     }
-    lane.sequence = lane_sequence;
+    lane.sequence += 1;
+    lane.last_id = Some(id.clone());
     lane.bytes += bytes.len();
     let stopped = lane.stopped;
     journal.sequence = sequence;

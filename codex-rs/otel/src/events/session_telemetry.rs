@@ -1622,6 +1622,8 @@ impl SessionTelemetry {
             schema_version = 2_u32,
             clock_id = %record.clock_id,
             attempt_started_us = record.attempt_started_us,
+            // Origin and relative offsets are each truncated to microseconds.
+            clock_uncertainty_us = 2_u64,
             dispatch_boundary = "client_transport_submission",
             turn_id = record.turn_id.as_deref(),
             generation_index = record.generation_index,
@@ -1690,6 +1692,7 @@ impl SessionTelemetry {
                 diagnostics_available = record.diagnostics_available,
                 clock_id = %record.clock_id,
                 attempt_started_us = record.attempt_started_us,
+                clock_uncertainty_us = 2_u64,
                 dispatch_boundary = "client_transport_submission",
                 turn_id = record.turn_id.as_deref(),
                 generation_index = record.generation_index,

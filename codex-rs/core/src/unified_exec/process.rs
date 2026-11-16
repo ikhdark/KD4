@@ -214,9 +214,8 @@ async fn flush_aggregate_output(
 
 async fn snapshot_retained_output(buffer: &OutputBuffer) -> (Vec<u8>, bool, StreamLayout) {
     let guard = buffer.lock().await;
-    let omitted_bytes = guard.omitted_bytes();
     let bytes = guard.to_bytes_with_loss_notice(&[]);
-    (bytes, omitted_bytes == 0 && guard.lagged_chunks() == 0, guard.stream_layout())
+    (bytes, guard.output_is_exact(), guard.stream_layout())
 }
 
 #[derive(Clone, Debug)]
@@ -787,7 +786,7 @@ impl UnifiedExecProcess {
         let aggregated = self.completion_output_buffer.try_lock().ok()?;
         let stdout = self.stdout_buffer.try_lock().ok()?;
         let stderr = self.stderr_buffer.try_lock().ok()?;
-        let exact = |buffer: &HeadTailBuffer| buffer.omitted_bytes() == 0 && buffer.lagged_chunks() == 0;
+        let exact = |buffer: &HeadTailBuffer| buffer.output_is_exact();
         Some((Arc::new(ProcessOutputSnapshot {
             process_duration: state.exit_observed_at.map(|at| at.saturating_duration_since(self.launch_observed_at)),
             aggregated_output: aggregated.to_bytes_with_loss_notice(&[]),
@@ -843,7 +842,15 @@ impl UnifiedExecProcess {
                 // Closing the PTY helpers drops the output senders. Let the output task observe
                 // that closure so it can finalize the raw-output artifact before publishing the
                 // output-closed lifecycle signal.
-                process_handle.finish();
+                if process_handle.termination_is_confirmed() {
+                    process_handle.finish();
+                } else {
+                    // Root exit and the output grace deadline do not prove
+                    // that the native tree is empty. Keep cleanup control for
+                    // stored-process shutdown, releasing it only on the native
+                    // empty-tree observation used by replay retirement.
+                    process_handle.finish_for_replay();
+                }
             }
             ProcessHandle::ExecServer(_) => {
                 // The output worker owns artifact finalization and publishes
@@ -1570,13 +1577,13 @@ impl UnifiedExecProcess {
                     task.mark_output_gap();
                 }
                 for buffer in [&output_buffer, &completion_output_buffer] {
-                    buffer.lock().await.record_lagged_chunks(1);
+                    buffer.lock().await.record_incomplete_capture();
                 }
                 if !capture.stdout_complete() {
-                    stdout_buffer.lock().await.record_lagged_chunks(1);
+                    stdout_buffer.lock().await.record_incomplete_capture();
                 }
                 if !capture.stderr_complete() {
-                    stderr_buffer.lock().await.record_lagged_chunks(1);
+                    stderr_buffer.lock().await.record_incomplete_capture();
                 }
             }
             output_closed.store(true, Ordering::Release);

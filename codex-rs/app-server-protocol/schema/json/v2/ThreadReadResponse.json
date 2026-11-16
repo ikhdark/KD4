@@ -3563,6 +3563,12 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "batchingAdviceCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
         "clockRegressionCount": {
           "format": "uint32",
           "minimum": 0.0,
@@ -3753,6 +3759,13 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "progressAssessmentCount": {
+          "default": 0,
+          "description": "Cross-continuation guard notices; each is also a no-progress directive.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
         "projectionSourceDependenciesFallbackCount": {
           "default": 0,
           "format": "uint32",
@@ -3936,6 +3949,12 @@
           "type": "integer"
         },
         "userInputWaitCount": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "waitAdviceCount": {
+          "default": 0,
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"

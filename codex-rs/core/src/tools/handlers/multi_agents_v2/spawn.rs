@@ -1173,7 +1173,7 @@ async fn normalize_relevant_handles(
     Ok(normalized_handles)
 }
 
-const TYPED_RECEIPT_LIFECYCLE: &str = "This is an explicit typed assignment. Before acting on a follow-up, use get_agent_task with your own assignment_id to recover the current attempt and effective contract; the immutable bootstrap may describe an earlier attempt. Otherwise use get_agent_task only when contract details or captured validation call IDs are missing from the current context. Before your final response, call submit_agent_receipt with the actual outcome and available evidence; report missing validation honestly. A final response alone does not seal this typed assignment.";
+const TYPED_RECEIPT_LIFECYCLE: &str = "This is an explicit typed assignment. Before acting on a follow-up, use get_agent_task with your own assignment_id to recover the current attempt and effective contract; the immutable bootstrap may describe an earlier attempt. Otherwise use get_agent_task only when contract details or captured validation call IDs are missing from the current context. Before your final response, call submit_agent_receipt with the actual outcome and available evidence; report missing validation honestly. A final response alone does not seal this typed assignment. Your read_scope names primary inputs and overlap identity, not a read restriction: read and search any other relevant, permitted file; write_scope and prohibited_changes limit changes.";
 
 fn typed_assignment_message(
     assignment: &Assignment,

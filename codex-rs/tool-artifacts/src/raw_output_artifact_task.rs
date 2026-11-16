@@ -12,6 +12,8 @@ use super::{RawOutputArtifact, ToolOutputArtifactId, ToolOutputSelector};
 /// Plain command logs are separate from indexed source snapshots. Writes apply
 /// disk backpressure instead of retaining an unbounded queue or dropping a prefix.
 /// Disk exhaustion fails capture explicitly; it never turns a partial log complete.
+/// Each log keeps an exact prefix of at most `MAX_COMMAND_LOG_BYTES`; later
+/// producer bytes are counted as an explicit ceiling gap, never appended.
 #[derive(Debug)]
 pub struct RawOutputArtifactTask {
     state: Arc<Mutex<RawOutputArtifact>>,
@@ -24,6 +26,8 @@ pub struct RawOutputArtifactTask {
     bytes: u64,
     digest: Sha256,
     incomplete: bool,
+    /// Producer bytes not appended after the log reached its ceiling.
+    ceiling_omitted: Option<u64>,
     failure: Option<String>,
     finished: bool,
 }
@@ -163,23 +167,25 @@ impl RawOutputArtifactTask {
         let Some(state) = state else { ready.cancel(); return None; };
         let (codex_home, thread_id, previous) = match target {
             Some(RawOutputArtifact::Pending { codex_home, thread_id }) => (codex_home, thread_id, None),
-            Some(RawOutputArtifact::Stored { path, truncated, .. }) => {
+            Some(RawOutputArtifact::Stored { path, truncated, ceiling_gap, .. }) => {
                 let thread = path.parent()?;
                 let store = thread.parent()?;
                 if !matches!(store.file_name().and_then(|s| s.to_str()), Some("tool-output" | "command-output")) {
                     ready.cancel();
                     return None;
                 }
-                (store.parent()?.to_path_buf(), thread.file_name()?.to_string_lossy().into_owned(), Some((path, truncated)))
+                (store.parent()?.to_path_buf(), thread.file_name()?.to_string_lossy().into_owned(), Some((path, truncated, ceiling_gap)))
             }
             _ => { ready.cancel(); return None; }
         };
         let id = ToolOutputArtifactId::new();
         let path = codex_home.join("command-output").join(&thread_id).join(format!("{id}.log"));
         let mut capture = Self { state, ready, writer: None, handle: None, _residency: None, id, path, bytes: 0, digest: Sha256::new(),
-            incomplete: false, failure: None, finished: false };
-        if let Some((previous, incomplete)) = previous {
-            capture.incomplete = incomplete;
+            incomplete: false, ceiling_omitted: None, failure: None, finished: false };
+        if let Some((previous, incomplete, ceiling_gap)) = previous {
+            // Carry a previous ceiling gap as-is; only other loss stays unquantified.
+            capture.incomplete = ceiling_gap.map_or(incomplete, |gap| gap.other_loss);
+            capture.ceiling_omitted = ceiling_gap.map(|gap| gap.omitted_bytes);
             match File::open(previous) {
                 Ok(mut file) => {
                     let mut buffer = [0u8; 64 * 1024];
@@ -209,6 +215,18 @@ impl RawOutputArtifactTask {
 
     pub fn write_chunk(&mut self, output: &[u8]) {
         if output.is_empty() { return; }
+        // Keep the exact prefix up to the ceiling; count, never store, the rest.
+        let room = super::MAX_COMMAND_LOG_BYTES.saturating_sub(self.bytes);
+        let kept = usize::try_from(room).map_or(output.len(), |room| output.len().min(room));
+        if kept < output.len() {
+            let omitted = (output.len() - kept) as u64;
+            self.ceiling_omitted = Some(self.ceiling_omitted.unwrap_or(0).saturating_add(omitted));
+        }
+        let output = &output[..kept];
+        if output.is_empty() {
+            self.publish_live();
+            return;
+        }
         if self.writer.is_none()
             && self.failure.is_none()
             && let Err(error) = self.initialize_writer()
@@ -244,13 +262,36 @@ impl RawOutputArtifactTask {
         Ok(())
     }
 
+    fn ceiling_gap(&self) -> Option<super::CommandLogCeilingGap> {
+        self.ceiling_omitted.map(|omitted_bytes| super::CommandLogCeilingGap {
+            omitted_bytes, other_loss: self.incomplete,
+        })
+    }
+
+    /// Any loss, including the ceiling gap: never published as complete.
+    fn capture_incomplete(&self) -> bool {
+        self.incomplete || self.ceiling_omitted.is_some()
+    }
+
+    fn status(&self, complete: bool) -> serde_json::Value {
+        let mut status = serde_json::json!({
+            "complete": complete,
+            "bytes": self.bytes,
+            "sha256": hex::encode(self.digest.clone().finalize()),
+        });
+        if let Some(gap) = self.ceiling_gap() {
+            status["ceiling"] = gap.metadata();
+        }
+        status
+    }
+
     fn publish_live(&self) {
         let Some(handle) = &self.handle else { return; };
         if let Ok(mut state) = self.state.try_lock() {
             *state = RawOutputArtifact::Stored {
                 id: self.id, path: self.path.clone(), bytes: self.bytes,
-                truncated: self.incomplete, handle: Arc::clone(handle),
-                finalized: false,
+                truncated: self.capture_incomplete(), handle: Arc::clone(handle),
+                finalized: false, ceiling_gap: self.ceiling_gap(),
             };
         }
     }
@@ -280,11 +321,7 @@ impl RawOutputArtifactTask {
                 writer.flush()?;
                 writer.get_ref().sync_all()?;
                 let handle = Arc::clone(self.handle.as_ref().ok_or_else(|| std::io::Error::other("command log handle unavailable"))?);
-                let status = serde_json::json!({
-                    "complete": !self.incomplete,
-                    "bytes": self.bytes,
-                    "sha256": hex::encode(self.digest.clone().finalize()),
-                });
+                let status = self.status(!self.capture_incomplete());
                 codex_file_system::write_bytes_atomically(
                     &self.path.with_extension("status"), &serde_json::to_vec(&status)?,
                 )?;
@@ -293,7 +330,8 @@ impl RawOutputArtifactTask {
             match result {
                 Ok(handle) => RawOutputArtifact::Stored {
                     id: self.id, path: self.path.clone(), bytes: self.bytes,
-                    truncated: self.incomplete, handle, finalized: true,
+                    truncated: self.capture_incomplete(), handle, finalized: true,
+                    ceiling_gap: self.ceiling_gap(),
                 },
                 Err(error) => self.failed(error.to_string()),
             }
@@ -316,10 +354,7 @@ impl Drop for RawOutputArtifactTask {
             // Preserve an explicitly incomplete prefix even when the owner is
             // cancelled. No cancellation path publishes a complete transcript.
             if let Some(writer) = self.writer.as_mut() { let _ = writer.flush(); }
-            let status = serde_json::json!({
-                "complete": false, "bytes": self.bytes,
-                "sha256": hex::encode(self.digest.clone().finalize()),
-            });
+            let status = self.status(false);
             if self.handle.is_some()
                 && let Ok(bytes) = serde_json::to_vec(&status)
             {

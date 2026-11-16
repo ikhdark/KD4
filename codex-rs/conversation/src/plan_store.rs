@@ -413,7 +413,11 @@ impl PlanLineage {
             )]
             let requirement = self.requirements.get_mut(&id).expect("known requirement");
             requirement.status =
-                if completed && ((same_text && requirement.source.is_none())
+                // A completed obligation stays completed across a completed
+                // continuation, even when the checklist text changes. Pending
+                // descendants still reopen it and unresolved renames still need resolve.
+                if completed && (((same_text || requirement.status == StepStatus::Completed)
+                    && requirement.source.is_none())
                     || self.resolved_requirements.contains(&id)) {
                     requirement.superseded_reason = None;
                     StepStatus::Completed

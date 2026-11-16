@@ -73,7 +73,7 @@ impl TurnOutputState {
         } else if let Some(candidate) = candidate {
             self.answer = AnswerDelivery::Message(candidate);
         } else if allow_no_prose
-            && (self.no_prose_authorized || self.missing_answer_repair_attempted)
+            && self.no_prose_authorized
             && output.as_ref().is_some_and(|output| {
                 output.phase == Some(MessagePhase::FinalAnswer) && output.text.is_empty()
             })

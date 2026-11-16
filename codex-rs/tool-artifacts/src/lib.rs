@@ -117,6 +117,11 @@ impl ArtifactProtection {
     }
 }
 pub(crate) const MAX_RAW_OUTPUT_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+/// Per-command ceiling for a plain command log (user decision, 2026-11-15).
+/// Below it every producer byte is kept; past it nothing is appended and the
+/// omitted byte count is recorded as an explicit gap.
+pub const MAX_COMMAND_LOG_BYTES: u64 = 1024 * 1024 * 1024;
+const COMMAND_LOG_CEILING_RECOVERY_HINT: &str = "Bytes after the per-command log ceiling were not captured and cannot be recovered from this artifact. Read the retained prefix with read_tool_output; to see later output, rerun a narrower command (filter, limit, or write to a file) only if it is read-only or safely repeatable.";
 pub const LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES: usize = 64 * 1024;
 const STREAMING_ARTIFACT_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD: u64 = 256 * 1024 * 1024;
@@ -1401,6 +1406,26 @@ impl FromStr for ToolOutputArtifactId {
     }
 }
 
+/// Producer bytes a plain command log did not append after reaching
+/// [`MAX_COMMAND_LOG_BYTES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandLogCeilingGap {
+    pub omitted_bytes: u64,
+    /// The log is also incomplete for another reason, so total loss is unknown.
+    pub other_loss: bool,
+}
+
+impl CommandLogCeilingGap {
+    pub fn metadata(&self) -> Value {
+        serde_json::json!({
+            "limit_bytes": MAX_COMMAND_LOG_BYTES,
+            "omitted_bytes": self.omitted_bytes,
+            "other_loss": self.other_loss,
+            "recovery_hint": COMMAND_LOG_CEILING_RECOVERY_HINT,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum RawOutputArtifact {
     Pending {
@@ -1414,6 +1439,8 @@ pub enum RawOutputArtifact {
         truncated: bool,
         handle: Arc<File>,
         finalized: bool,
+        /// Set only for a plain command log that reached its ceiling.
+        ceiling_gap: Option<CommandLogCeilingGap>,
     },
     Failed {
         id: Option<ToolOutputArtifactId>,
@@ -1714,6 +1741,10 @@ impl RawOutputArtifact {
     /// Point-in-time recovery facts, not a retention lease or proof of delivery.
     /// Unknown producer loss must not be reported as zero missing bytes.
     pub fn output_reference(artifact: Option<&Self>) -> Value {
+        let ceiling = match artifact {
+            Some(Self::Stored { ceiling_gap: Some(gap), finalized, .. }) => Some((*gap, *finalized)),
+            _ => None,
+        };
         let (owner, id, bytes, complete, availability) = match artifact {
             Some(Self::Pending { thread_id, .. }) =>
                 (Some(thread_id.as_str()), None, None, false, "pending"),
@@ -1735,11 +1766,23 @@ impl RawOutputArtifact {
             "artifact_id": id.map(|id| id.to_string()),
             "capture_complete": complete,
             "retained_bytes": bytes,
-            "missing_bytes": complete.then_some(0u64),
+            // A finalized ceiling gap is exact unless another loss also occurred.
+            "missing_bytes": if complete { Some(0u64) } else {
+                ceiling.filter(|(gap, finalized)| *finalized && !gap.other_loss)
+                    .map(|(gap, _)| gap.omitted_bytes)
+            },
             "retrieval_availability": availability,
         });
         if !complete {
-            reference["missing_bytes_reason"] = "Producer loss is not quantified; pending capture or retained bytes alone do not establish total output.".into();
+            reference["missing_bytes_reason"] = match ceiling {
+                Some((gap, finalized)) => format!(
+                    "Capture stopped at the {MAX_COMMAND_LOG_BYTES}-byte per-command log ceiling; {} producer bytes after it were not captured{}{}. {COMMAND_LOG_CEILING_RECOVERY_HINT}",
+                    gap.omitted_bytes,
+                    if finalized { "" } else { " so far" },
+                    if gap.other_loss { "; other producer loss is not quantified" } else { "" },
+                ).into(),
+                None => "Producer loss is not quantified; pending capture or retained bytes alone do not establish total output.".into(),
+            };
         }
         if let Some(id) = id {
             reference["recovery"] = serde_json::json!({
@@ -1871,16 +1914,20 @@ impl RawOutputArtifact {
     }
 
     pub fn retention_limit_hit(&self) -> bool {
-        !self.is_plain_command_log() && matches!(
-            self,
-            Self::Stored {
-                truncated: true,
-                ..
-            }
-        )
+        matches!(self, Self::Stored { ceiling_gap: Some(_), .. })
+            || !self.is_plain_command_log() && matches!(
+                self,
+                Self::Stored {
+                    truncated: true,
+                    ..
+                }
+            )
     }
 
     pub fn retention_limit_reason(&self) -> Option<&'static str> {
+        if matches!(self, Self::Stored { ceiling_gap: Some(_), .. }) {
+            return Some("per_command_log_ceiling");
+        }
         self.retention_limit_hit()
             .then_some("per_artifact_safety_limit")
     }
@@ -2022,6 +2069,7 @@ async fn create_raw_output_artifact_inner(
                 truncated,
                 handle,
                 finalized: durable,
+                ceiling_gap: None,
             }
         }
         Err(err) => {
@@ -5346,6 +5394,7 @@ pub async fn replace_raw_output_artifact(
                 truncated,
                 handle: handle.clone(),
                 finalized: true,
+                ceiling_gap: None,
             }
         }
         Err(err) => {

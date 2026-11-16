@@ -1707,12 +1707,19 @@ impl ModelAttemptClock {
     }
 
     fn new() -> Self {
+        // Initialize the process origin before capturing the shared attempt instant.
+        let _ = codex_protocol::timing::process_clock_domain_id();
+        let started = Instant::now();
         Self {
-            started_at_us: u64::try_from(codex_protocol::timing::process_monotonic_ns() / 1_000)
-                .unwrap_or(u64::MAX),
+            started_at_us: u64::try_from(
+                codex_protocol::timing::process_monotonic_ns_at(started)
+                    .map(|ns| ns / 1_000)
+                    .unwrap_or(u128::MAX),
+            )
+            .unwrap_or(u64::MAX),
             provider_event_at_transport: false,
             websocket_first_message_seen: Arc::new(AtomicBool::new(false)),
-            started: Instant::now(),
+            started,
             offsets: Arc::new(StdMutex::new(ModelAttemptOffsets::default())),
         }
     }

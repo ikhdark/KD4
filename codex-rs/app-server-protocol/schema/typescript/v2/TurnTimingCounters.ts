@@ -76,7 +76,11 @@ modelRetryCount: number,
 /**
  * Schema 37+: unique fallback entries. A subset of model_retry_count.
  */
-modelFallbackCount: number, toolCallCount: number, approvalWaitCount: number, permissionWaitCount: number, userInputWaitCount: number, mcpElicitationWaitCount: number, waitOnlyGenerationCount: number, internallyDrainedWaitCount: number, noProgressDirectiveCount: number, provenLoopActivationCount: number, toolRouterReuseCount: number, toolRouterRebuildCount: number, projectionSourceDependenciesReuseCount: number, projectionSourceDependenciesFallbackCount: number, toolOutputTruncationCount: number, toolOutputProjectedTokenCount: number, toolOutputArtifactRereadCount: number, toolOutputCanonicalByteCount: number, toolOutputCanonicalTokenCount: number, toolOutputModelByteCount: number, toolOutputModelTokenCount: number, toolOutputArtifactCreationCount: number, toolOutputArtifactReuseCount: number, toolOutputProjectionTruncationCount: number, toolOutputOmittedSectionCount: number, toolOutputRecoveryCallCount: number,
+modelFallbackCount: number, toolCallCount: number, approvalWaitCount: number, permissionWaitCount: number, userInputWaitCount: number, mcpElicitationWaitCount: number, waitOnlyGenerationCount: number, internallyDrainedWaitCount: number, noProgressDirectiveCount: number, provenLoopActivationCount: number,
+/**
+ * Cross-continuation guard notices; each is also a no-progress directive.
+ */
+progressAssessmentCount: number, batchingAdviceCount: number, waitAdviceCount: number, toolRouterReuseCount: number, toolRouterRebuildCount: number, projectionSourceDependenciesReuseCount: number, projectionSourceDependenciesFallbackCount: number, toolOutputTruncationCount: number, toolOutputProjectedTokenCount: number, toolOutputArtifactRereadCount: number, toolOutputCanonicalByteCount: number, toolOutputCanonicalTokenCount: number, toolOutputModelByteCount: number, toolOutputModelTokenCount: number, toolOutputArtifactCreationCount: number, toolOutputArtifactReuseCount: number, toolOutputProjectionTruncationCount: number, toolOutputOmittedSectionCount: number, toolOutputRecoveryCallCount: number,
 /**
  * Recovery transactions performed inside code-mode cells, without a
  * separate provider tool-result generation.

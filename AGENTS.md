@@ -39,6 +39,11 @@ work. Leave the Windows Store installation untouched.
   handoffs do not discharge authorized repairs. Nothing is postponed: finish
   reviewed or audited work in the same task; the only stop is a genuine blocker
   that needs user input or authority.
+- Report evidence-backed findings and fix every verified in-scope defect they
+  reveal, rather than stopping at an explanation or report. Reconcile evidence
+  with current source, verify repairs and preserved valid behavior, and
+  distinguish verified fixes from unresolved findings; respect explicit
+  read-only limits.
 - Scope is the request plus everything it names or asks you to review. Every
   defect you verify inside that scope is in scope, including older or secondary
   occurrences and every site sharing its root cause; labels such as unrelated,

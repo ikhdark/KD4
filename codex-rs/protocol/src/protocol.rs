@@ -3506,6 +3506,13 @@ pub struct TurnTimingCounters {
     pub no_progress_directive_count: u32,
     #[serde(default)]
     pub proven_loop_activation_count: u32,
+    /// Cross-continuation guard notices; each is also a no-progress directive.
+    #[serde(default)]
+    pub progress_assessment_count: u32,
+    #[serde(default)]
+    pub batching_advice_count: u32,
+    #[serde(default)]
+    pub wait_advice_count: u32,
     #[serde(default)]
     pub tool_router_reuse_count: u32,
     #[serde(default)]

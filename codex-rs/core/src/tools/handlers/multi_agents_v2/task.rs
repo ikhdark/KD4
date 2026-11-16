@@ -1930,7 +1930,7 @@ fn submit_agent_receipt_spec() -> ToolSpec {
                 "read_scope",
                 JsonSchema::array(
                     architecture_scope.clone(),
-                    Some("Canonical worker read scope.".to_string()),
+                    Some("Canonical worker read scope: primary inputs and overlap identity, not a read restriction.".to_string()),
                 ),
             ),
             (

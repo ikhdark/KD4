@@ -368,6 +368,13 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
     }
     return size;
   };
+  // Labels print source_sha256 as `source_sha256 || canonical_sha256`. Name an
+  // equal decoded identity once, as the native protocol projection does;
+  // readers resolve canonical_sha256 ?? source_sha256. Native results, script
+  // provenance and capture records keep both fields.
+  const distinctCanonical = source =>
+    source.canonical_sha256 === (source.source_sha256 || source.canonical_sha256)
+      ? undefined : source.canonical_sha256;
   function displaySize(value, utf8 = false) {
     let stringSize = 0;
     // Keep native traversal, user serializers and BigInt display conversion.
@@ -464,7 +471,7 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
         }
         return {...item, recovery: {tool: 'read_tool_output',
           source_sha256: source.source_sha256 || source.canonical_sha256,
-          canonical_sha256: source.canonical_sha256, source_encoding: source.source_encoding,
+          canonical_sha256: distinctCanonical(source), source_encoding: source.source_encoding,
           selector_encoding: source.selector_encoding, selector_coordinate_space: source.selector_coordinate_space,
           arguments: {artifact_id: source.artifact_id,
             selectors: [{kind: 'bytes', start: range.start, end: range.end}]}}};
@@ -510,6 +517,8 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
     const display = {...projected, results};
     for (const field of ['source_sha256', 'canonical_sha256'])
       if (original[field] !== undefined) display[field] = original[field];
+    if (original.source_sha256 !== undefined && display.canonical_sha256 === original.source_sha256)
+      delete display.canonical_sha256;
     return display;
   }
   function rawText(projected, fragment, source = projected, original = projected, standalone = false) {
@@ -526,7 +535,7 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
       const envelope = unframed ? {source: {
         path: source.path, artifact_id: source.artifact_id,
         source_sha256: source.source_sha256 || source.canonical_sha256,
-        canonical_sha256: source.canonical_sha256, source_encoding: source.source_encoding,
+        canonical_sha256: distinctCanonical(source), source_encoding: source.source_encoding,
         selector_encoding: source.selector_encoding, selector_coordinate_space: source.selector_coordinate_space,
         environment_id: source.environment_id,
         canonical_uri: source.path === undefined ? source.canonical_uri : undefined,
@@ -569,7 +578,7 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
         texts.push({text, header, source: {
           ...(standalone ? {path: source.path, artifact_id: source.artifact_id,
             source_sha256: source.source_sha256 || source.canonical_sha256,
-            canonical_sha256: source.canonical_sha256, source_encoding: source.source_encoding,
+            canonical_sha256: distinctCanonical(source), source_encoding: source.source_encoding,
             selector_encoding: source.selector_encoding, selector_coordinate_space: source.selector_coordinate_space,
             environment_id: source.environment_id, canonical_uri: source.canonical_uri} : {}),
           // Compact display may omit native coordinates. Keep them once in the
