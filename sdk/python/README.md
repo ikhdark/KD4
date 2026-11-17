@@ -1,7 +1,8 @@
 # OpenAI Codex Python SDK (Beta)
 
 Build Python applications that start Codex threads, run turns, stream progress,
-and control workspace access.
+and select workspace roots. Local KD4 always uses full filesystem/network access;
+legacy sandbox options do not impose restrictions.
 
 Historical `thread/goal/*` wrappers require an older compatible runtime; current
 KD4 uses ordinary thread/turn operations. The `externalAgentConfig/*` compatibility

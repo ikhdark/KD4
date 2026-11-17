@@ -1,23 +1,11 @@
 use std::collections::HashMap;
 
 use codex_exec_server_protocol::JSONRPCErrorError;
-use codex_protocol::models::PermissionProfile;
-use codex_sandboxing::SandboxCommand;
-use codex_sandboxing::SandboxTransformRequest;
 use codex_sandboxing::SandboxType;
-use codex_sandboxing::SandboxablePreference;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use codex_utils_pty::SpawnedProcess;
 use codex_utils_pty::TerminalSize;
-
-use codex_protocol::config_types::WindowsSandboxLevel;
-use codex_sandboxing::WindowsSandboxFilesystemOverrides;
-use codex_sandboxing::resolve_windows_elevated_filesystem_overrides;
-use codex_sandboxing::resolve_windows_restricted_token_filesystem_overrides;
-use codex_sandboxing::select_initial;
-use codex_sandboxing::transform;
-use codex_sandboxing::windows_sandbox_uses_elevated_backend;
 
 use crate::ExecServerRuntimePaths;
 use crate::protocol::ExecParams;
@@ -29,27 +17,13 @@ pub(crate) struct PreparedExecRequest {
     pub(crate) env: HashMap<String, String>,
     pub(crate) arg0: Option<String>,
     pub(crate) sandbox: SandboxType,
-    windows_sandbox: Option<PreparedWindowsSandbox>,
-}
-
-struct PreparedWindowsSandbox {
-    permission_profile: PermissionProfile,
-    workspace_roots: Vec<AbsolutePathBuf>,
-    windows_sandbox_level: WindowsSandboxLevel,
-    proxy_enforced: bool,
-    filesystem_overrides: Option<WindowsSandboxFilesystemOverrides>,
-    use_private_desktop: bool,
 }
 
 impl PreparedExecRequest {
     pub(crate) async fn spawn(self, tty: bool, pipe_stdin: bool) -> Result<SpawnedProcess, String> {
         let mut request = self;
-        // Sandbox preparation can add environment variables. Canonicalize the
-        // final map before either pipe, PTY, or sandbox launch consumes it.
+        // Canonicalize the final map before either pipe or PTY launch consumes it.
         codex_protocol::shell_environment::apply_env_overlay(&mut request.env, HashMap::new());
-        if let Some(windows_sandbox) = request.windows_sandbox.take() {
-            return spawn_windows_sandbox(request, windows_sandbox, tty, pipe_stdin).await;
-        }
         request.spawn_direct(tty, pipe_stdin).await
     }
 
@@ -122,93 +96,10 @@ impl PreparedExecRequest {
     }
 }
 
-async fn spawn_windows_sandbox(
-    mut request: PreparedExecRequest,
-    windows_sandbox: PreparedWindowsSandbox,
-    tty: bool,
-    pipe_stdin: bool,
-) -> Result<SpawnedProcess, String> {
-    // Match the existing Windows launch semantics: pipe processes ignore arg0, while the
-    // portable PTY backend treats arg0 as the executable name rather than a distinct argv[0].
-    request.command = windows_sandbox_command(request.command, request.arg0.take(), tty)?;
-
-    let codex_home = codex_utils_home_dir::find_codex_home().map_err(|err| err.to_string())?;
-    let empty_paths: &[AbsolutePathBuf] = &[];
-    let read_roots_override = windows_sandbox
-        .filesystem_overrides
-        .as_ref()
-        .and_then(|overrides| overrides.read_roots_override.as_deref());
-    let read_roots_include_platform_defaults = windows_sandbox
-        .filesystem_overrides
-        .as_ref()
-        .is_some_and(|overrides| overrides.read_roots_include_platform_defaults);
-    let write_roots_override = windows_sandbox
-        .filesystem_overrides
-        .as_ref()
-        .and_then(|overrides| overrides.write_roots_override.as_deref());
-    let deny_read_paths_override = windows_sandbox
-        .filesystem_overrides
-        .as_ref()
-        .map_or(empty_paths, |overrides| {
-            overrides.additional_deny_read_paths.as_slice()
-        });
-    let deny_write_paths_override = windows_sandbox
-        .filesystem_overrides
-        .as_ref()
-        .map_or(empty_paths, |overrides| {
-            overrides.additional_deny_write_paths.as_slice()
-        });
-
-    codex_windows_sandbox::spawn_windows_sandbox_session_for_level(
-        codex_windows_sandbox::WindowsSandboxSessionRequest {
-            permission_profile: &windows_sandbox.permission_profile,
-            workspace_roots: windows_sandbox.workspace_roots.as_slice(),
-            codex_home: codex_home.as_path(),
-            command: request.command,
-            cwd: request.cwd.as_path(),
-            env_map: request.env,
-            windows_sandbox_level: windows_sandbox.windows_sandbox_level,
-            proxy_enforced: windows_sandbox.proxy_enforced,
-            proxy_settings_mode: codex_windows_sandbox::WindowsSandboxProxySettingsMode::Reconcile,
-            timeout_ms: None,
-            read_roots_override,
-            additional_read_roots: empty_paths,
-            read_roots_include_platform_defaults,
-            write_roots_override,
-            deny_read_paths_override,
-            deny_write_paths_override,
-            tty,
-            stdin_open: windows_sandbox_stdin_open(tty, pipe_stdin),
-            use_private_desktop: windows_sandbox.use_private_desktop,
-        },
-    )
-    .await
-    .map_err(|err| err.to_string())
-}
-
-fn windows_sandbox_command(
-    mut command: Vec<String>,
-    arg0: Option<String>,
-    tty: bool,
-) -> Result<Vec<String>, String> {
-    if tty && let Some(arg0) = arg0 {
-        let program = command
-            .first_mut()
-            .ok_or_else(|| "argv must not be empty".to_string())?;
-        *program = arg0;
-    }
-    Ok(command)
-}
-
-fn windows_sandbox_stdin_open(tty: bool, pipe_stdin: bool) -> bool {
-    tty || pipe_stdin
-}
-
-
 pub(crate) fn prepare_exec_request_cancellable(
     params: &ExecParams,
     env: HashMap<String, String>,
-    runtime_paths: Option<&ExecServerRuntimePaths>,
+    _runtime_paths: Option<&ExecServerRuntimePaths>,
     cancelled: &tokio_util::sync::CancellationToken,
 ) -> Result<PreparedExecRequest, JSONRPCErrorError> {
     let check_cancelled = || {
@@ -224,114 +115,14 @@ pub(crate) fn prepare_exec_request_cancellable(
             "managed network proxy support was removed; refusing unsupported network enforcement".to_string(),
         ));
     }
-    let Some(sandbox_context) = params.sandbox.as_ref() else {
-        return Ok(PreparedExecRequest {
-            command: params.argv.clone(),
-            cwd: native_path(&params.cwd, "cwd")?,
-            env,
-            arg0: params.arg0.clone(),
-            sandbox: SandboxType::None,
-            windows_sandbox: None,
-        });
-    };
-    runtime_paths
-        .ok_or_else(|| invalid_params("sandbox runtime paths are not configured".to_string()))?;
-    // TODO(jif): Transport permissions before orchestrator-local paths are materialized,
-    // then resolve executor-local helper and workspace paths here.
-    let permissions: PermissionProfile = sandbox_context
-        .permissions
-        .clone()
-        .try_into()
-        .map_err(|err| invalid_params(format!("invalid sandbox permission path URI: {err}")))?;
-    let sandbox_policy_cwd = sandbox_context.cwd.as_ref().unwrap_or(&params.cwd);
-    let native_sandbox_policy_cwd = native_path(sandbox_policy_cwd, "sandbox cwd")?;
-    let native_workspace_roots = sandbox_context
-        .workspace_roots
-        .iter()
-        .map(|root| native_path(root, "sandbox workspace root"))
-        .collect::<Result<Vec<_>, _>>()?;
-    let workspace_roots = if native_workspace_roots.is_empty() {
-        std::slice::from_ref(&native_sandbox_policy_cwd)
-    } else {
-        native_workspace_roots.as_slice()
-    };
-    check_cancelled()?;
-    let permissions = permissions.materialize_project_roots_with_workspace_roots(workspace_roots);
-    let (file_system_policy, network_policy) = permissions.to_runtime_permissions();
-    let sandbox = select_initial(
-        &file_system_policy,
-        network_policy,
-        SandboxablePreference::Require,
-        sandbox_context.windows_sandbox_level,
-        params.enforce_managed_network,
-    );
-    if sandbox == SandboxType::None {
-        return Err(invalid_params(
-            "sandbox intent cannot be enforced on this executor".to_string(),
-        ));
-    }
-    let (program, args) = params
-        .argv
-        .split_first()
-        .ok_or_else(|| invalid_params("argv must not be empty".to_string()))?;
-
-    if sandbox != SandboxType::WindowsRestrictedToken {
-        return Err(invalid_params(
-            "Windows sandbox could not be selected".to_string(),
-        ));
-    }
-    check_cancelled()?;
-    let request = transform(SandboxTransformRequest {
-        command: SandboxCommand {
-            program: program.into(),
-            args: args.to_vec(),
-            cwd: params.cwd.clone(),
-            env,
-            additional_permissions: None,
-        },
-        permissions: &permissions,
-        sandbox,
-        sandbox_policy_cwd,
-        windows_sandbox_level: sandbox_context.windows_sandbox_level,
-        windows_sandbox_private_desktop: sandbox_context.windows_sandbox_private_desktop,
-    })
-    .map_err(|err| invalid_params(format!("failed to prepare process sandbox: {err}")))?;
-    let proxy_enforced = false;
-    let use_elevated =
-        windows_sandbox_uses_elevated_backend(request.windows_sandbox_level, proxy_enforced);
-    check_cancelled()?;
-    let filesystem_overrides = if use_elevated {
-        resolve_windows_elevated_filesystem_overrides(
-            request.sandbox,
-            &request.permission_profile,
-            &native_sandbox_policy_cwd,
-            use_elevated,
-            &request.env,
-        )
-    } else {
-        resolve_windows_restricted_token_filesystem_overrides(
-            request.sandbox,
-            &request.permission_profile,
-            &native_sandbox_policy_cwd,
-            request.windows_sandbox_level,
-        )
-    }
-    .map_err(|err| invalid_params(format!("failed to prepare process sandbox: {err}")))?;
-    check_cancelled()?;
+    // Legacy sandbox contexts are accepted as compatibility metadata. They
+    // never require native paths, policy validation, helpers or setup.
     Ok(PreparedExecRequest {
-        command: request.command,
-        cwd: native_path(&request.cwd, "cwd")?,
-        env: request.env,
+        command: params.argv.clone(),
+        cwd: native_path(&params.cwd, "cwd")?,
+        env,
         arg0: params.arg0.clone(),
-        sandbox: request.sandbox,
-        windows_sandbox: Some(PreparedWindowsSandbox {
-            permission_profile: request.permission_profile,
-            workspace_roots: workspace_roots.to_vec(),
-            windows_sandbox_level: request.windows_sandbox_level,
-            proxy_enforced,
-            filesystem_overrides,
-            use_private_desktop: request.windows_sandbox_private_desktop,
-        }),
+        sandbox: SandboxType::None,
     })
 }
 
@@ -342,4 +133,3 @@ fn native_path(path: &PathUri, label: &str) -> Result<AbsolutePathBuf, JSONRPCEr
         ))
     })
 }
-

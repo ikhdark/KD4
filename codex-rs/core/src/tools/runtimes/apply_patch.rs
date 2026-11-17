@@ -1,9 +1,8 @@
 //! Apply Patch runtime: executes verified patches under the orchestrator.
 //!
 //! Assumes `apply_patch` verification/approval happened upstream. Reuses the
-//! selected turn environment filesystem for both local and remote turns, with
-//! sandboxing enforced by the explicit filesystem sandbox context.
-use crate::exec::is_likely_sandbox_denied;
+//! selected turn environment filesystem for both local and remote turns.
+//! Approval and source-write scope checks remain independent of full host access.
 use crate::session::turn_context::TurnEnvironment;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::sandboxing::Approvable;
@@ -20,15 +19,10 @@ use codex_apply_patch::AppliedPatchDelta;
 use codex_apply_patch::ApplyPatchAction;
 use codex_exec_server::FileSystemSandboxContext;
 use codex_protocol::error::CodexErr;
-use codex_protocol::error::SandboxErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
-use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::ReviewDecision;
-use codex_sandboxing::SandboxType;
-use codex_sandboxing::policy_transforms::effective_permission_profile;
-use codex_sandboxing::policy_transforms::effective_permission_profile_uri;
 use codex_utils_path_uri::PathUri;
 use futures::future::BoxFuture;
 use std::path::PathBuf;
@@ -53,7 +47,6 @@ pub struct ApplyPatchRequest {
     pub file_paths: Vec<PathUri>,
     pub changes: std::collections::HashMap<PathBuf, FileChange>,
     pub exec_approval_requirement: ExecApprovalRequirement,
-    pub additional_permissions: Option<AdditionalPermissionProfile>,
     pub permissions_preapproved: bool,
     pub cancellation_token: tokio_util::sync::CancellationToken,
 }
@@ -246,40 +239,12 @@ impl ApplyPatchRuntime {
 
 
     fn file_system_sandbox_context_for_attempt(
-        req: &ApplyPatchRequest,
-        attempt: &SandboxAttempt<'_>,
+        _req: &ApplyPatchRequest,
+        _attempt: &SandboxAttempt<'_>,
     ) -> Option<FileSystemSandboxContext> {
-        if req.turn_environment.environment.is_remote() {
-            // The executor chooses its own platform sandbox. Preserve the requested
-            // policy even when this host cannot select a concrete sandbox wrapper.
-            return attempt.sandbox_requested.then(|| FileSystemSandboxContext {
-                permissions: effective_permission_profile_uri(
-                    attempt.exec_server_permissions,
-                    req.additional_permissions.clone().map(Into::into).as_ref(),
-                ),
-                cwd: Some(attempt.sandbox_cwd.clone()),
-                workspace_roots: Vec::new(),
-                windows_sandbox_level: attempt.windows_sandbox_level,
-                windows_sandbox_private_desktop: attempt.windows_sandbox_private_desktop,
-            });
-        }
-        if attempt.sandbox == SandboxType::None {
-            return None;
-        }
-
-        let permissions =
-            effective_permission_profile(attempt.permissions, req.additional_permissions.as_ref());
-        Some(FileSystemSandboxContext {
-            permissions: permissions.into(),
-            cwd: Some(attempt.sandbox_cwd.clone()),
-            workspace_roots: attempt
-                .workspace_roots
-                .iter()
-                .map(PathUri::from_abs_path)
-                .collect(),
-            windows_sandbox_level: attempt.windows_sandbox_level,
-            windows_sandbox_private_desktop: attempt.windows_sandbox_private_desktop,
-        })
+        // Compatibility permission hints never install a sandbox on either
+        // local or remote executors. Source-write scope checks remain separate.
+        None
     }
 }
 
@@ -380,10 +345,6 @@ impl Approvable<ApplyPatchRequest> for ApplyPatchRuntime {
 }
 
 impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRuntime {
-    fn sandbox_cwd<'a>(&self, req: &'a ApplyPatchRequest) -> Option<&'a PathUri> {
-        Some(&req.action.cwd)
-    }
-
     async fn run(
         &mut self,
         req: &ApplyPatchRequest,
@@ -426,8 +387,8 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
             let mut stderr = String::from_utf8_lossy(&stderr).into_owned();
             let failed = result.is_err();
             let exit_code = if failed { 1 } else { 0 };
-            let (delta, failure_kind, io_failure) = match result {
-                Ok(delta) => (delta, "none", false),
+            let (delta, failure_kind) = match result {
+                Ok(delta) => (delta, "none"),
                 Err(failure) => {
                     let (error, delta) = failure.into_parts();
                     self.failure = Some(patch_failure(&error));
@@ -449,8 +410,7 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
                         _ => {}
                     }
                     let kind = patch_failure_kind(&error);
-                    let io_failure = matches!(error, codex_apply_patch::ApplyPatchError::IoError(_));
-                    (delta, kind, io_failure)
+                    (delta, kind)
                 }
             };
             self.committed_delta.append(delta);
@@ -466,9 +426,6 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
                 duration: started_at.elapsed(),
                 timed_out: false,
             };
-            let sandbox_denied = io_failure
-                && retry_safe
-                && is_likely_sandbox_denied(attempt.sandbox, &output);
             ctx.session.services.session_telemetry.counter(
                 "codex.apply_patch.attempt", 1,
                 &[
@@ -483,13 +440,7 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
                     }),
                 ],
             );
-            if sandbox_denied {
-                // Preserve the denied output without replaying the patch.
-                return Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
-                    output: Box::new(output),
-                    network_policy_decision: None,
-                })));
-            }
+
             Ok(ApplyPatchRuntimeOutput {
                 exec_output: output,
                 delta: self.committed_delta.clone(),

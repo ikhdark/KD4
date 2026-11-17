@@ -21,7 +21,7 @@ pub use login::run_logout;
 
 #[derive(Debug, Default, Args)]
 pub struct SandboxStateArgs {
-    /// JSON value from `codex/sandbox-state-meta` to apply directly.
+    /// Legacy sandbox state; only its working directory is used by KD4.
     #[arg(
         long = "sandbox-state-json",
         value_name = "JSON",
@@ -29,7 +29,7 @@ pub struct SandboxStateArgs {
     )]
     pub sandbox_state_json: Option<String>,
 
-    /// Add a readable root to the supplied sandbox state. Repeat for multiple roots.
+    /// Legacy compatibility option; KD4 already has full filesystem access.
     #[arg(
         long,
         requires = "sandbox_state_json",
@@ -37,7 +37,7 @@ pub struct SandboxStateArgs {
     )]
     pub sandbox_state_readable_root: Vec<AbsolutePathBuf>,
 
-    /// Disable direct network access in the supplied sandbox state.
+    /// Legacy compatibility option; KD4 does not restrict network access.
     #[arg(long, requires = "sandbox_state_json", default_value_t = false)]
     pub sandbox_state_disable_network: bool,
 }
@@ -85,7 +85,7 @@ pub struct WindowsCommand {
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
 
-    /// Full command args to run under Windows restricted token sandbox.
+    /// Command args to run directly with full access (legacy sandbox command).
     #[arg(trailing_var_arg = true)]
     pub command: Vec<String>,
 }

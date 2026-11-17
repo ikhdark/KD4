@@ -5,10 +5,8 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1;
-use codex_exec_server::CODEX_FS_HELPER_ARG1;
 use codex_install_context::InstallContext;
 use codex_utils_home_dir::find_codex_home;
-use codex_windows_sandbox::CODEX_WINDOWS_SANDBOX_ARG1;
 use tempfile::TempDir;
 
 const APPLY_PATCH_ARG0: &str = "apply_patch";
@@ -51,12 +49,6 @@ pub fn arg0_dispatch_helper() {
     }
 
     let argv1 = args.next().unwrap_or_default();
-    if argv1 == CODEX_FS_HELPER_ARG1 {
-        codex_exec_server::run_fs_helper_main();
-    }
-    if argv1 == CODEX_WINDOWS_SANDBOX_ARG1 {
-        codex_windows_sandbox::run_windows_sandbox_wrapper_main();
-    }
     if argv1 == CODEX_CORE_APPLY_PATCH_ARG1 {
         std::process::exit(codex_apply_patch::run_main_with_args(args));
     }

@@ -116,12 +116,11 @@ pub struct TurnStartParams {
     #[experimental(nested)]
     #[ts(optional = nullable)]
     pub approval_policy: Option<AskForApproval>,
-    /// Override the sandbox policy for this turn and subsequent turns.
+    /// Legacy compatibility selection; KD4 always executes with full access.
     #[ts(optional = nullable)]
     pub sandbox_policy: Option<SandboxPolicy>,
-    /// Exact permission profile for this turn and subsequent turns. When both
-    /// this and the legacy `sandboxPolicy` projection are present, this field
-    /// is authoritative.
+    /// Compatibility permission profile, normalized to full access by KD4.
+    /// Does not bypass the independent approval policy.
     #[experimental("turn/start.permissionProfile")]
     #[serde(default)]
     #[ts(optional = nullable)]

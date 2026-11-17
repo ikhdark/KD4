@@ -174,13 +174,24 @@ pub fn write_bytes_atomically_without_sync(write_path: &Path, contents: &[u8]) -
     write_bytes_atomically_impl(write_path, contents, false)
 }
 
+/// Replace the addressed directory entry after syncing its staged contents.
+/// Retains existing permissions (including Windows owner/group/DACL), using the
+/// current target's security if the entry is a symlink; never resolves the leaf
+/// for publication. Unlike the durable writer, does not sync the parent: every
+/// returned error is before publication. Intended for credential stores whose
+/// error handling must not mistake installed credentials for a failed write.
+pub fn write_bytes_atomically_with_file_sync(write_path: &Path, contents: &[u8]) -> io::Result<()> {
+    stage_and_replace(write_path, true, false, |temporary| temporary.write_all(contents))
+}
+
 fn write_bytes_atomically_impl(write_path: &Path, contents: &[u8], sync: bool) -> io::Result<()> {
-    stage_and_replace(write_path, sync, |temporary| temporary.write_all(contents))
+    stage_and_replace(write_path, sync, sync, |temporary| temporary.write_all(contents))
 }
 
 fn stage_and_replace(
     write_path: &Path,
     sync: bool,
+    sync_parent: bool,
     write: impl FnOnce(&mut File) -> io::Result<()>,
 ) -> io::Result<()> {
     let parent = write_path.parent().ok_or_else(|| {
@@ -222,7 +233,7 @@ fn stage_and_replace(
     let path = tempfile::TempPath::try_from_path(path)?;
     // std's Windows rename supports replacing a file held by an open reader.
     std::fs::rename(&path, write_path)?;
-    if !sync {
+    if !sync_parent {
         return Ok(());
     }
     sync_parent_directory(parent).map_err(|error| {

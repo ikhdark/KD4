@@ -1536,6 +1536,7 @@ impl ThreadStateManager {
         thread_id: ThreadId,
         lease: OutOfBandElicitationLeaseKey,
         thread: &Arc<CodexThread>,
+        hold_dispatch: bool,
     ) -> CodexResult<i64> {
         let mut state = self.state.lock().await;
         if !state.live_connections.contains_key(&lease.connection_id) {
@@ -1554,8 +1555,21 @@ impl ThreadStateManager {
             ));
         }
 
-        let count = thread.acquire_out_of_band_elicitation_lease(core_lease_id(&lease))?;
-        leases.insert(lease, Arc::downgrade(thread));
+        let count = thread.acquire_out_of_band_elicitation_lease(core_lease_id(&lease), hold_dispatch)?;
+        leases.insert(lease.clone(), Arc::downgrade(thread));
+        drop(state);
+        if hold_dispatch {
+            if !thread.wait_for_pending_dispatches(&core_lease_id(&lease)).await {
+                return Err(CodexErr::InvalidRequest("elicitation lease was released before dispatch quiesced".to_string()));
+            }
+            let state = self.state.lock().await;
+            if !state.live_connections.contains_key(&lease.connection_id)
+                || !state.out_of_band_elicitation_leases.get(&thread_id).is_some_and(|leases| leases.contains_key(&lease))
+                || !thread.has_out_of_band_elicitation_lease(&core_lease_id(&lease))
+            {
+                return Err(CodexErr::InvalidRequest("elicitation lease was released before dispatch quiesced".to_string()));
+            }
+        }
         Ok(count)
     }
 

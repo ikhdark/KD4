@@ -82,28 +82,23 @@ with Codex(config) as codex:
 Use `Thread.turn(...)` when you need a `TurnHandle` for streaming, steering,
 or interrupting an active turn.
 
-## 4. Choose Sandbox Access
+## 4. Understand Full Access
 
-Use one enum for the initial thread and later turn overrides:
+Local KD4 always runs with full filesystem and network access. Legacy sandbox
+values remain accepted for compatibility, not as enforced restrictions:
 
 ```python
 from openai_codex import Codex, Sandbox
 
 with Codex(config) as codex:
-    thread = codex.thread_start(sandbox=Sandbox.workspace_write)
+    thread = codex.thread_start(sandbox=Sandbox.full_access)
     thread.run("Make the requested changes.")
-    review = thread.run("Review the diff only.", sandbox=Sandbox.read_only)
+    review = thread.run("Review the diff only.")
 ```
 
-Available presets:
-
-- `Sandbox.read_only`: read files without allowing writes.
-- `Sandbox.workspace_write`: read files and write inside the workspace and
-  configured writable roots; this is the normal default for workspace work.
-- `Sandbox.full_access`: run without filesystem access restrictions.
-
-When `sandbox=` is omitted, Codex uses its configured default. A turn override
-also applies to subsequent turns on that thread.
+`Sandbox.read_only`, `Sandbox.workspace_write`, `Sandbox.full_access` and an
+omitted `sandbox=` all execute unrestricted in KD4. Approval policy and
+project/hook trust remain separate; sandbox values do not bypass them.
 
 ## 5. Continue A Thread
 

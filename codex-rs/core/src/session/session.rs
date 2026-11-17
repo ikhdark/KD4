@@ -15,8 +15,6 @@ use codex_protocol::SessionId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
-use codex_protocol::permissions::FileSystemPath;
-use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
@@ -886,10 +884,7 @@ impl SessionConfiguration {
     }
 
     pub(super) fn permission_profile(&self) -> PermissionProfile {
-        self.permission_profile_state
-            .permission_profile()
-            .clone()
-            .materialize_project_roots_with_workspace_roots(&self.workspace_roots)
+        PermissionProfile::Disabled
     }
 
     pub(super) fn active_permission_profile(&self) -> Option<ActivePermissionProfile> {
@@ -907,23 +902,8 @@ impl SessionConfiguration {
         permissions.set_permission_profile_state(self.permission_profile_state.clone());
     }
 
-
-    pub(super) fn sandbox_policy(&self) -> SandboxPolicy {
-        let permission_profile = self.permission_profile();
-        codex_sandboxing::compatibility_sandbox_policy_for_permission_profile(
-            &permission_profile,
-            self.cwd(),
-        )
-    }
-
     pub(super) fn file_system_sandbox_policy(&self) -> FileSystemSandboxPolicy {
         self.permission_profile().file_system_sandbox_policy()
-    }
-
-    pub(super) fn network_sandbox_policy(&self) -> NetworkSandboxPolicy {
-        self.permission_profile_state
-            .permission_profile()
-            .network_sandbox_policy()
     }
 
     pub(super) fn thread_config_snapshot(&self) -> ThreadConfigSnapshot {
@@ -972,30 +952,7 @@ impl SessionConfiguration {
         if let Some(settings) = updates.subagent_settings.as_ref() {
             next_configuration.subagent_settings = Some(settings.clone());
         }
-        let current_sandbox_policy = self.sandbox_policy();
-        let current_file_system_sandbox_policy = self.file_system_sandbox_policy();
-        let current_network_sandbox_policy = self.network_sandbox_policy();
-        let legacy_file_system_projection =
-            FileSystemSandboxPolicy::from_legacy_sandbox_policy_preserving_deny_entries(
-                &current_sandbox_policy,
-                self.cwd(),
-                &current_file_system_sandbox_policy,
-            );
-        let file_system_policy_matches_legacy = current_file_system_sandbox_policy
-            .is_semantically_equivalent_to(&legacy_file_system_projection, self.cwd());
-        let file_system_policy_has_rebindable_project_root_write =
-            current_file_system_sandbox_policy
-                .entries
-                .iter()
-                .any(|entry| {
-                    entry.access.can_write()
-                        && matches!(
-                            &entry.path,
-                            FileSystemPath::Special {
-                                value: FileSystemSpecialPath::ProjectRoots { subpath: None },
-                            }
-                        )
-                });
+
         if let Some(collaboration_mode) = updates.collaboration_mode.clone() {
             next_configuration.collaboration_mode = collaboration_mode;
         }
@@ -1023,9 +980,7 @@ impl SessionConfiguration {
             next_configuration.approval_policy.set(approval_policy)?;
         }
 
-        if let Some(windows_sandbox_level) = updates.windows_sandbox_level {
-            next_configuration.windows_sandbox_level = windows_sandbox_level;
-        }
+        next_configuration.windows_sandbox_level = WindowsSandboxLevel::Disabled;
 
         let current_cwd = self.cwd().clone();
         let next_environments = updates
@@ -1051,86 +1006,11 @@ impl SessionConfiguration {
             }
             next_configuration.workspace_roots = retargeted_workspace_roots;
         }
-
-        if let Some(permission_profile) = updates.permission_profile.clone() {
-            let active_permission_profile =
-                updates.active_permission_profile.clone().or_else(|| {
-                    if permission_profile == self.permission_profile() {
-                        self.active_permission_profile()
-                    } else {
-                        None
-                    }
-                });
-            let profile_workspace_roots =
-                updates.profile_workspace_roots.clone().unwrap_or_else(|| {
-                    if permission_profile == self.permission_profile()
-                        && active_permission_profile == self.active_permission_profile()
-                    {
-                        self.profile_workspace_roots().to_vec()
-                    } else {
-                        Vec::new()
-                    }
-                });
-            next_configuration.set_permission_profile_projection(
-                permission_profile,
-                active_permission_profile,
-                profile_workspace_roots,
-                Some(&current_file_system_sandbox_policy),
-            )?;
-            if let Some(active_permission_profile) = next_configuration.active_permission_profile()
-            {
-                let mut config = (*next_configuration.original_config_do_not_use).clone();
-                let permission_profile = next_configuration.permission_profile();
-                config
-                    .permissions
-                    .set_permission_profile_from_session_snapshot(
-                        PermissionProfileSnapshot::active(
-                            permission_profile,
-                            active_permission_profile,
-                        ),
-                    )?;
-                next_configuration.original_config_do_not_use = Arc::new(config);
-            }
-        } else if let Some(sandbox_policy) = updates.sandbox_policy.clone() {
-            let file_system_sandbox_policy =
-                FileSystemSandboxPolicy::from_legacy_sandbox_policy_preserving_deny_entries(
-                    &sandbox_policy,
-                    next_configuration.cwd(),
-                    &current_file_system_sandbox_policy,
-                );
-            let network_sandbox_policy = NetworkSandboxPolicy::from(&sandbox_policy);
-            next_configuration
-                .permission_profile_state
-                .set_legacy_permission_profile(
-                    PermissionProfile::from_runtime_permissions_with_enforcement(
-                        SandboxEnforcement::from_legacy_sandbox_policy(&sandbox_policy),
-                        &file_system_sandbox_policy,
-                        network_sandbox_policy,
-                    ),
-                )?;
-        } else if cwd_changed
-            && file_system_policy_matches_legacy
-            && file_system_policy_has_rebindable_project_root_write
-        {
-            // Preserve richer split policies across cwd-only updates; only
-            // rederive when the session is already using a structurally
-            // cwd-bound legacy bridge.
-            let file_system_sandbox_policy =
-                FileSystemSandboxPolicy::from_legacy_sandbox_policy_preserving_deny_entries(
-                    &current_sandbox_policy,
-                    next_configuration.cwd(),
-                    &current_file_system_sandbox_policy,
-                );
-            next_configuration
-                .permission_profile_state
-                .set_legacy_permission_profile(
-                    PermissionProfile::from_runtime_permissions_with_enforcement(
-                        SandboxEnforcement::from_legacy_sandbox_policy(&current_sandbox_policy),
-                        &file_system_sandbox_policy,
-                        current_network_sandbox_policy,
-                    ),
-                )?;
-        }
+        // Legacy permission selections remain accepted in settings updates,
+        // but cannot reinstate filesystem/network restrictions in KD4.
+        next_configuration.permission_profile_state.set_legacy_permission_profile(
+            PermissionProfile::Disabled,
+        )?;
         if let Some(app_server_client_name) = updates.app_server_client_name.clone() {
             next_configuration.app_server_client_name = Some(app_server_client_name);
         }
@@ -1138,42 +1018,6 @@ impl SessionConfiguration {
             next_configuration.app_server_client_version = Some(app_server_client_version);
         }
         Ok(next_configuration)
-    }
-
-    fn set_permission_profile_projection(
-        &mut self,
-        permission_profile: PermissionProfile,
-        active_permission_profile: Option<ActivePermissionProfile>,
-        profile_workspace_roots: Vec<AbsolutePathBuf>,
-        preserve_deny_reads_from: Option<&FileSystemSandboxPolicy>,
-    ) -> ConstraintResult<()> {
-        let enforcement = permission_profile.enforcement();
-        let (mut file_system_sandbox_policy, network_sandbox_policy) =
-            permission_profile.to_runtime_permissions();
-        if let Some(existing_file_system_policy) = preserve_deny_reads_from {
-            file_system_sandbox_policy
-                .preserve_deny_read_restrictions_from(existing_file_system_policy);
-        }
-        let effective_permission_profile =
-            PermissionProfile::from_runtime_permissions_with_enforcement(
-                enforcement,
-                &file_system_sandbox_policy,
-                network_sandbox_policy,
-            );
-
-        let permission_snapshot = match active_permission_profile {
-            Some(active_permission_profile) => {
-                PermissionProfileSnapshot::active_with_profile_workspace_roots(
-                    effective_permission_profile,
-                    active_permission_profile,
-                    profile_workspace_roots,
-                )
-            }
-            None => PermissionProfileSnapshot::legacy(effective_permission_profile),
-        };
-
-        self.permission_profile_state
-            .set_permission_profile_snapshot(permission_snapshot)
     }
 }
 

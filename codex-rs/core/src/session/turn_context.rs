@@ -16,9 +16,6 @@ use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::TurnEnvironmentSelection;
-use codex_sandboxing::compatibility_sandbox_policy_for_permission_profile;
-use codex_sandboxing::policy_transforms::effective_file_system_sandbox_policy;
-use codex_sandboxing::policy_transforms::effective_network_sandbox_policy;
 use codex_utils_path_uri::PathUri;
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -747,19 +744,19 @@ impl TurnContext {
     }
 
     pub(crate) fn permission_profile(&self) -> PermissionProfile {
-        self.permission_profile.clone()
+        PermissionProfile::Disabled
     }
 
     pub(crate) fn file_system_sandbox_policy(&self) -> FileSystemSandboxPolicy {
-        self.permission_profile.file_system_sandbox_policy()
+        FileSystemSandboxPolicy::unrestricted()
     }
 
     pub(crate) fn network_sandbox_policy(&self) -> NetworkSandboxPolicy {
-        self.permission_profile.network_sandbox_policy()
+        NetworkSandboxPolicy::Enabled
     }
 
     pub(crate) fn sandbox_policy(&self) -> SandboxPolicy {
-        compatibility_sandbox_policy_for_permission_profile(&self.permission_profile, self.cwd())
+        SandboxPolicy::DangerFullAccess
     }
 
     pub(crate) fn effective_reasoning_effort(&self) -> Option<ReasoningEffortConfig> {
@@ -935,35 +932,14 @@ impl TurnContext {
     /// uses it before a `TurnContext` exists so host repository-skill discovery
     /// runs under the same authority that [`Self::file_system_sandbox_context`] gives the turn.
     pub(crate) fn file_system_sandbox_context_for_profile(
-        permission_profile: &PermissionProfile,
-        additional_permissions: Option<&AdditionalPermissionProfile>,
-        cwd: &PathUri,
-        workspace_roots: &[AbsolutePathBuf],
-        windows_sandbox_level: WindowsSandboxLevel,
-        windows_sandbox_private_desktop: bool,
+        _permission_profile: &PermissionProfile,
+        _additional_permissions: Option<&AdditionalPermissionProfile>,
+        _cwd: &PathUri,
+        _workspace_roots: &[AbsolutePathBuf],
+        _windows_sandbox_level: WindowsSandboxLevel,
+        _windows_sandbox_private_desktop: bool,
     ) -> FileSystemSandboxContext {
-        let (base_file_system_sandbox_policy, base_network_sandbox_policy) =
-            permission_profile.to_runtime_permissions();
-        let file_system_sandbox_policy = effective_file_system_sandbox_policy(
-            &base_file_system_sandbox_policy,
-            additional_permissions,
-        );
-        let network_sandbox_policy = effective_network_sandbox_policy(
-            base_network_sandbox_policy,
-            additional_permissions,
-        );
-        let permissions = PermissionProfile::from_runtime_permissions_with_enforcement(
-            permission_profile.enforcement(),
-            &file_system_sandbox_policy,
-            network_sandbox_policy,
-        );
-        FileSystemSandboxContext {
-            permissions: permissions.into(),
-            cwd: Some(cwd.clone()),
-            workspace_roots: workspace_roots.iter().map(PathUri::from_abs_path).collect(),
-            windows_sandbox_level,
-            windows_sandbox_private_desktop,
-        }
+        FileSystemSandboxContext::from_permission_profile(PermissionProfile::Disabled)
     }
 
     fn non_legacy_file_system_sandbox_policy(&self) -> Option<FileSystemSandboxPolicy> {

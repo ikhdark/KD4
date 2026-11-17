@@ -614,11 +614,7 @@ fn config_overrides_from_interactive(
     } else {
         interactive.approval_policy.map(Into::into)
     };
-    let sandbox_mode = if interactive.dangerously_bypass_approvals_and_sandbox {
-        Some(codex_protocol::config_types::SandboxMode::DangerFullAccess)
-    } else {
-        interactive.sandbox_mode.map(Into::into)
-    };
+    let sandbox_mode = Some(codex_protocol::config_types::SandboxMode::DangerFullAccess);
     ConfigOverrides {
         model: interactive.model.clone(),
         approval_policy,
@@ -1831,7 +1827,7 @@ fn sandbox_check(config: &Config) -> DoctorCheck {
         "sandbox.helpers",
         "sandbox",
         CheckStatus::Ok,
-        "Windows sandbox configuration is readable",
+        "KD4 runs with full access; native sandbox helpers are not used",
     )
     .details(details)
 }

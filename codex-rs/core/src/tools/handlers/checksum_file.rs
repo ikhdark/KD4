@@ -40,7 +40,7 @@ impl ToolExecutor<ToolInvocation> for ChecksumFileHandler {
     fn spec(&self) -> ToolSpec {
         ToolSpec::Function(ResponsesApiTool {
             name: "checksum_file".into(),
-            description: "Stream the complete raw bytes of a regular file through SHA-256 in the selected environment's sandbox, with cancellation and change-during-read detection. Supports binary and large files without collecting or retaining their contents. Returns sha256, bytes_hashed and source_identity (an opaque opened-object revision including native identity and change time, not a content hash). Refuses a changed/replaced source or an unsupported backend; never certifies stability from size/mtime alone. Optional if_sha256 reports unchanged only after freshly hashing every byte. No immutable snapshot, file contents or source-inspection credit is delivered; the file can change after completion.".into(),
+            description: "Stream the complete raw bytes of a regular file through SHA-256 in the selected environment, with cancellation and change-during-read detection. Supports binary and large files without collecting or retaining their contents. Returns sha256, bytes_hashed and source_identity (an opaque opened-object revision including native identity and change time, not a content hash). Refuses a changed/replaced source or an unsupported backend; never certifies stability from size/mtime alone. Optional if_sha256 reports unchanged only after freshly hashing every byte. No immutable snapshot, file contents or source-inspection credit is delivered; the file can change after completion.".into(),
             strict: false,
             defer_loading: None,
             parameters: JsonSchema::object(BTreeMap::from([

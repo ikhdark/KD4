@@ -78,7 +78,6 @@ codex-utils-path-uri = { workspace = true }
 codex-utils-pty = { workspace = true }
 codex-utils-string = { workspace = true }
 codex-utils-stream-parser = { workspace = true }
-codex-windows-sandbox = { workspace = true }
 csv = { workspace = true }
 dunce = { workspace = true }
 futures = { workspace = true }

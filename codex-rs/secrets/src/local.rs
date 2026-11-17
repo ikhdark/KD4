@@ -1,13 +1,10 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::compiler_fence;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use age::decrypt;
 use age::encrypt;
@@ -286,64 +283,11 @@ impl SecretsBackend for LocalSecretsBackend {
 }
 
 fn write_file_atomically(path: &Path, contents: &[u8]) -> Result<()> {
-    let dir = path.parent().with_context(|| {
-        format!(
-            "failed to compute parent directory for secrets file at {}",
-            path.display()
-        )
-    })?;
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    let filename = path.file_name().with_context(|| {
-        format!(
-            "failed to compute filename for secrets file at {}",
-            path.display()
-        )
-    })?;
-    let tmp_path = dir.join(format!(
-        ".{}.tmp-{}-{nonce}",
-        filename.to_string_lossy(),
-        std::process::id()
-    ));
-
-    {
-        let mut tmp_file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&tmp_path)
-            .with_context(|| {
-                format!(
-                    "failed to create temp secrets file at {}",
-                    tmp_path.display()
-                )
-            })?;
-        tmp_file.write_all(contents).with_context(|| {
-            format!(
-                "failed to write temp secrets file at {}",
-                tmp_path.display()
-            )
-        })?;
-        tmp_file.sync_all().with_context(|| {
-            format!("failed to sync temp secrets file at {}", tmp_path.display())
-        })?;
-    }
-
-    match fs::rename(&tmp_path, path) {
-        Ok(()) => Ok(()),
-        Err(initial_error) => {
-            // Never delete the committed file to retry a failed atomic replace.
-            // Preserve it and clean up only this attempted write.
-            let _ = fs::remove_file(&tmp_path);
-            Err(initial_error).with_context(|| {
-                format!(
-                    "failed to atomically replace secrets file at {} with {}",
-                    path.display(),
-                    tmp_path.display()
-                )
-            })
-        }
-    }
+    // Keep publication as the last fallible operation. In particular, a later
+    // parent-sync error must not cause consumers to fall back to plaintext or
+    // leave their credential-authority fingerprint behind installed ciphertext.
+    codex_file_system::write_bytes_atomically_with_file_sync(path, contents)
+        .with_context(|| format!("failed to atomically replace secrets file at {}", path.display()))
 }
 
 fn generate_passphrase() -> Result<SecretString> {

@@ -41,8 +41,6 @@ WINDOWS_LLVM_LLD_LINK_DEFAULT = shared_rust_tool_env.WINDOWS_LLVM_LLD_LINK_DEFAU
 class SourceBuildOutputs:
     entrypoint_bin: Path
     code_mode_host_bin: Path
-    codex_command_runner_bin: Path | None
-    codex_windows_sandbox_setup_bin: Path | None
 
 
 _build_leases = ContextVar("package_build_leases", default=frozenset())
@@ -113,8 +111,6 @@ def build_source_binaries(
     profile: str,
     entrypoint_bin: Path | None,
     code_mode_host_bin: Path | None,
-    codex_command_runner_bin: Path | None,
-    codex_windows_sandbox_setup_bin: Path | None,
     reuse_existing: bool = False,
     force_rebuild: bool = False,
     release_version: str | None = None,
@@ -123,14 +119,10 @@ def build_source_binaries(
         spec,
         entrypoint_bin=entrypoint_bin,
         code_mode_host_bin=code_mode_host_bin,
-        codex_command_runner_bin=codex_command_runner_bin,
-        codex_windows_sandbox_setup_bin=codex_windows_sandbox_setup_bin,
     )
     validate_explicit_output_paths(
         entrypoint_bin=entrypoint_bin,
         code_mode_host_bin=code_mode_host_bin,
-        codex_command_runner_bin=codex_command_runner_bin,
-        codex_windows_sandbox_setup_bin=codex_windows_sandbox_setup_bin,
     )
 
     requested_binaries = source_binaries_for_target(
@@ -138,8 +130,6 @@ def build_source_binaries(
         variant,
         build_entrypoint=entrypoint_bin is None,
         build_code_mode_host=code_mode_host_bin is None,
-        build_codex_command_runner=codex_command_runner_bin is None,
-        build_codex_windows_sandbox_setup=codex_windows_sandbox_setup_bin is None,
     )
     target_dir = (
         cargo_package_target_dir(spec, profile)
@@ -155,14 +145,6 @@ def build_source_binaries(
         code_mode_host_bin=resolve_output_path(
             code_mode_host_bin,
             output_dir / spec.code_mode_host_name,
-        ),
-        codex_command_runner_bin=resolve_output_path(
-            codex_command_runner_bin,
-            output_dir / "codex-command-runner.exe",
-        ),
-        codex_windows_sandbox_setup_bin=resolve_output_path(
-            codex_windows_sandbox_setup_bin,
-            output_dir / "codex-windows-sandbox-setup.exe",
         ),
     )
     validate_distinct_output_paths(outputs)
@@ -231,8 +213,6 @@ def build_source_binaries(
                 for path in (
                     entrypoint_bin,
                     code_mode_host_bin,
-                    codex_command_runner_bin,
-                    codex_windows_sandbox_setup_bin,
                 )
             ):
                 raise RuntimeError(
@@ -343,18 +323,12 @@ def source_binaries_for_target(
     *,
     build_entrypoint: bool,
     build_code_mode_host: bool,
-    build_codex_command_runner: bool,
-    build_codex_windows_sandbox_setup: bool,
 ) -> list[str]:
     binaries = []
     if build_entrypoint:
         binaries.append(variant.cargo_bin)
     if build_code_mode_host:
         binaries.append("codex-code-mode-host")
-    if build_codex_command_runner:
-        binaries.append("codex-command-runner")
-    if build_codex_windows_sandbox_setup:
-        binaries.append("codex-windows-sandbox-setup")
     return binaries
 
 
@@ -363,15 +337,11 @@ def validate_prebuilt_executable_targets(
     *,
     entrypoint_bin: Path | None,
     code_mode_host_bin: Path | None,
-    codex_command_runner_bin: Path | None,
-    codex_windows_sandbox_setup_bin: Path | None,
 ) -> None:
     expected_machine = spec.pe_machine
     for role, path in (
         ("entrypoint", entrypoint_bin),
         ("code-mode-host", code_mode_host_bin),
-        ("codex-command-runner", codex_command_runner_bin),
-        ("codex-windows-sandbox-setup", codex_windows_sandbox_setup_bin),
     ):
         if path is None or not path.is_file():
             continue
@@ -389,8 +359,6 @@ def validate_explicit_output_paths(
     *,
     entrypoint_bin: Path | None,
     code_mode_host_bin: Path | None,
-    codex_command_runner_bin: Path | None,
-    codex_windows_sandbox_setup_bin: Path | None,
 ) -> None:
     explicit_paths = [
         ("--entrypoint-bin", "prebuilt entrypoint executable", entrypoint_bin),
@@ -398,16 +366,6 @@ def validate_explicit_output_paths(
             "--code-mode-host-bin",
             "prebuilt code-mode host executable",
             code_mode_host_bin,
-        ),
-        (
-            "--codex-command-runner-bin",
-            "prebuilt Windows codex-command-runner.exe executable",
-            codex_command_runner_bin,
-        ),
-        (
-            "--codex-windows-sandbox-setup-bin",
-            "prebuilt Windows codex-windows-sandbox-setup.exe executable",
-            codex_windows_sandbox_setup_bin,
         ),
     ]
     resolved: list[tuple[str, Path]] = []
@@ -809,16 +767,6 @@ def expected_output_for_binary(
         return outputs.entrypoint_bin
     if binary == "codex-code-mode-host":
         return outputs.code_mode_host_bin
-    if (
-        binary == "codex-command-runner"
-        and outputs.codex_command_runner_bin is not None
-    ):
-        return outputs.codex_command_runner_bin
-    if (
-        binary == "codex-windows-sandbox-setup"
-        and outputs.codex_windows_sandbox_setup_bin is not None
-    ):
-        return outputs.codex_windows_sandbox_setup_bin
     raise RuntimeError(f"unknown source binary output: {binary}")
 
 
@@ -831,10 +779,6 @@ def source_output_key_for_binary(
         return "entrypoint_bin"
     if binary == "codex-code-mode-host":
         return "code_mode_host_bin"
-    if binary == "codex-command-runner":
-        return "codex_command_runner_bin"
-    if binary == "codex-windows-sandbox-setup":
-        return "codex_windows_sandbox_setup_bin"
     raise RuntimeError(f"unknown source binary output: {binary}")
 
 
@@ -842,8 +786,6 @@ def validate_source_outputs(outputs: SourceBuildOutputs) -> None:
     for path in [
         outputs.entrypoint_bin,
         outputs.code_mode_host_bin,
-        outputs.codex_command_runner_bin,
-        outputs.codex_windows_sandbox_setup_bin,
     ]:
         if path is not None and not path.is_file():
             raise RuntimeError(f"cargo build did not produce expected binary: {path}")
@@ -1473,12 +1415,6 @@ def source_output_fingerprints(outputs: SourceBuildOutputs) -> dict[str, dict | 
     return {
         "entrypoint_bin": source_output_fingerprint(outputs.entrypoint_bin),
         "code_mode_host_bin": source_output_fingerprint(outputs.code_mode_host_bin),
-        "codex_command_runner_bin": source_output_fingerprint(
-            outputs.codex_command_runner_bin
-        ),
-        "codex_windows_sandbox_setup_bin": source_output_fingerprint(
-            outputs.codex_windows_sandbox_setup_bin
-        ),
     }
 
 
@@ -1507,8 +1443,6 @@ def source_outputs_match_fingerprints(
         for key, path in {
             "entrypoint_bin": outputs.entrypoint_bin,
             "code_mode_host_bin": outputs.code_mode_host_bin,
-            "codex_command_runner_bin": outputs.codex_command_runner_bin,
-            "codex_windows_sandbox_setup_bin": outputs.codex_windows_sandbox_setup_bin,
         }.items()
     )
 

@@ -44,11 +44,11 @@ pub(crate) async fn ledger_context(step: &crate::session::step_context::StepCont
                 repositories.push(json!({"ledger":path.to_string(),"coverage":"unavailable"})); continue;
             };
             let fixes = view["fixes"].as_array()?;
-            let unresolved: Vec<Value> = fixes.iter().filter(|f| f["status"] != "verified_closed")
+            let unresolved: Vec<Value> = fixes.iter().filter(|f| f["status"] != "verified_closed" && f["status"] != "superseded")
                 .take(8).map(|f| json!({"id":f["id"],"status":f["status"],"missing_conditions":f["missing_conditions"]})).collect();
             repositories.push(json!({"ledger":path.to_string(),"revision":view["revision"],
                 "recorded_at_ns":view["recorded_at_ns"],"unresolved":unresolved,
-                "unresolved_omitted":fixes.iter().filter(|f| f["status"] != "verified_closed").count().saturating_sub(8),
+                "unresolved_omitted":fixes.iter().filter(|f| f["status"] != "verified_closed" && f["status"] != "superseded").count().saturating_sub(8),
                 "closed_count":fixes.iter().filter(|f| f["status"] == "verified_closed").count(),
                 "evidence_gaps":view["evidence_gaps"]}));
         }
@@ -149,6 +149,7 @@ struct State {
     directories: HashMap<String, Option<PathUri>>,
     roots: HashMap<String, Option<Memory>>,
     shown: HashSet<String>,
+    reservation_notices: HashMap<String, String>,
     bytes: usize,
     budget_exhausted: bool,
     reads: Vec<Value>,
@@ -158,6 +159,28 @@ struct State {
 
 #[derive(Default)]
 struct EvidenceMemory(Mutex<State>);
+
+/// Requalify source-read reservations at the accepted-history lifecycle boundary.
+/// Keep retained notices, patch assessments and the bounded per-turn byte budget.
+pub(crate) async fn history_replaced(turn: &TurnContext, items: &[ResponseItem]) {
+    let present: HashSet<String> = items.iter().filter_map(|item| {
+        let ResponseItem::Message { role, content, .. } = item else { return None; };
+        if role != "developer" { return None; }
+        content.iter().find_map(|part| {
+            let ContentItem::InputText { text } = part else { return None; };
+            text.strip_prefix("<evidence_memory_advisory id=\"")?
+                .split_once('"').map(|(id, _)| id.to_owned())
+        })
+    }).collect();
+    let memory = turn.extension_data.get_or_init(EvidenceMemory::default);
+    let mut state = memory.0.lock().await;
+    let evicted: Vec<String> = state.reservation_notices.iter().filter(|(_, id)|
+        !present.contains(*id) && state.notices.get(*id)
+            .is_some_and(|notice| notice["payload"]["phase"] == "source_read"))
+        .map(|(key, _)| key.clone()).collect();
+    tracing::debug!(present = present.len(), reservations = state.reservation_notices.len(), evicted = evicted.len(), bytes = state.bytes, "evidence advisory history replacement");
+    for key in evicted { state.shown.remove(&key); state.reservation_notices.remove(&key); }
+}
 
 pub(super) struct Change {
     before_path: PathUri,
@@ -295,6 +318,7 @@ fn constraints(fix: &Value, relative: &str, symbol: Option<&str>, change: Option
         Some(json!({"id":bounded(&constraint["id"],120),
             "broken_behavior":bounded(&constraint["broken_behavior"],240),
             "correction":bounded(&constraint["correction"],240),
+            "causal_lesson_coverage":constraint["causal_lesson_coverage"].as_str().unwrap_or("authored_not_independently_verified"),
             "must_remain_true":bounded(&constraint["must_remain_true"],320),
             "scopes":assessments.into_iter().take(2).collect::<Vec<_>>(),
             "targeted_verification":verification,
@@ -329,7 +353,6 @@ async fn lookup(
     let key = directory.to_string();
     if !state.directories.contains_key(&key) {
         if state.directories.len() >= 64 { return None; }
-        state.directories.insert(key.clone(), None);
         let root = codex_file_system::find_nearest_ancestor_with_markers(
             fs, &directory, vec![".git".into(), ".local/evidence/fixes/index.json".into(), ".codex/fix-evidence/index.json".into()],
             FindUpErrorPolicy::Ignore, Some(sandbox),
@@ -340,7 +363,6 @@ async fn lookup(
     let root_key = root.to_string();
     if !state.roots.contains_key(&root_key) {
         if state.roots.len() >= 8 { return None; }
-        state.roots.insert(root_key.clone(), None);
         let candidates = [root.join(".local/evidence/fixes/index.json").ok()?,
             root.join(".codex/fix-evidence/index.json").ok()?];
         let ledger_paths = [root.join(".local/evidence/fixes/ledger-view.json").ok()?,
@@ -357,8 +379,14 @@ async fn lookup(
             && let Some((index, hash)) = loaded.as_mut()
         {
             for fix in view["fixes"].as_array().into_iter().flatten() {
+                if fix["status"] == "superseded" {
+                    if let Some(fixes) = index["fixes"].as_array_mut() { fixes.retain(|row| row["id"] != fix["id"]); }
+                    continue;
+                }
                 let mut receipts = Vec::new();
-                let rows: Vec<Value> = fix["contract"].as_array().into_iter().flatten().map(|condition| {
+                let active: Vec<&Value> = fix["contract"].as_array().into_iter().flatten()
+                    .filter(|c| c["id"].as_str().is_some_and(|id| fix["retired_conditions"].get(id).is_none())).collect();
+                let rows: Vec<Value> = active.iter().map(|condition| {
                     let verification: Vec<Value> = condition["id"].as_str().filter(|id| !id.is_empty() && id.len() <= 120)
                         .into_iter().flat_map(|id| fix["proofs"].as_array().into_iter().flatten().filter_map(move |proof| {
                             if proof["condition_id"].as_str() != Some(id) { return None; }
@@ -371,19 +399,44 @@ async fn lookup(
                                 json!({"kind":"ledger_proof", "receipt_sha256":hash, "selector":selector,
                                     "recorded_proof_valid":valid})))
                         })).take(2).map(|(receipt, target)| { receipts.push(receipt); target }).collect();
-                    json!({"id":condition["id"],"broken_behavior":condition["behavior"],
-                        "correction":"Recorded KDR behavioral verification; preserve the declared contract.",
+                    json!({"id":condition["id"],"broken_behavior":"not recorded",
+                        "correction":"not recorded", "causal_lesson_coverage":"not_recorded",
                         "must_remain_true":condition["behavior"],"scopes":condition["scopes"],
                         "verification":verification})
                 }).collect();
-                let paths: Vec<Value> = fix["contract"].as_array().into_iter().flatten()
+                let paths: Vec<Value> = active.iter()
                     .flat_map(|c| c["scopes"].as_array().into_iter().flatten().map(|s|s["path"].clone())).collect();
                 if let Some(fixes) = index["fixes"].as_array_mut() {
-                    fixes.push(json!({"id":fix["id"],"paths":paths,"receipts":receipts,
-                        "behavioral_constraints":rows,"ledger_status":fix["status"],"ledger_revision":view["revision"]}));
+                    let incoming = json!({"id":fix["id"],"paths":paths,"receipts":receipts,
+                        "behavioral_constraints":rows,"ledger_status":fix["status"],"ledger_revision":view["revision"]});
+                    if let Some(existing) = fixes.iter_mut().find(|row| row["id"] == fix["id"]) {
+                        // Registry lessons and ledger proof are complementary. Keep
+                        // authored causal detail, union references, select one fix row.
+                        for key in ["paths", "receipts"] {
+                            if !existing[key].is_array() { existing[key] = json!([]); }
+                            for value in incoming[key].as_array().into_iter().flatten() {
+                                let values = existing[key].as_array_mut()?;
+                                if !values.contains(value) { values.push(value.clone()); }
+                            }
+                        }
+                        if !existing["behavioral_constraints"].is_array() { existing["behavioral_constraints"] = json!([]); }
+                        let constraints = existing["behavioral_constraints"].as_array_mut()?;
+                        constraints.retain(|row| row["id"].as_str().is_none_or(|id| fix["retired_conditions"].get(id).is_none()));
+                        for row in &rows {
+                            if let Some(authored) = constraints.iter_mut().find(|c| c["id"] == row["id"]) {
+                                if !authored["verification"].is_array() { authored["verification"] = json!([]); }
+                                for target in row["verification"].as_array().into_iter().flatten() {
+                                    let targets = authored["verification"].as_array_mut()?;
+                                    if !targets.contains(target) { targets.push(target.clone()); }
+                                }
+                            } else { constraints.push(row.clone()); }
+                        }
+                        existing["ledger_status"] = fix["status"].clone();
+                        existing["ledger_revision"] = view["revision"].clone();
+                    } else { fixes.push(incoming); }
                 }
             }
-            if hash.is_empty() { *hash = view_hash; }
+            *hash = hex::encode(Sha256::digest(format!("{hash}:{view_hash}").as_bytes()));
         }
         let loaded = loaded
             .filter(|(v, _)| v["schema_version"] == 1 && v["fixes"].is_array())
@@ -465,9 +518,17 @@ async fn lookup(
     let mut reservations = Vec::new();
     for fix in &matches {
         let Some(id) = fix["id"].as_str().filter(|id| id.len() <= 240) else { continue; };
-        let reservation = format!("{root_key}:{}:{id}:{}:{revision}", memory.hash, symbol.unwrap_or(""));
+        let reservation = format!("{root_key}:{}:{id}:{relative}:{}:{revision}", memory.hash, symbol.unwrap_or(""));
         if state.shown.contains(&reservation) { continue; }
-        let receipts: Vec<Value> = fix["receipts"].as_array().into_iter().flatten()
+        let selected_constraints = constraints(fix, &relative, symbol, behavior.as_ref());
+        let selected_ids: HashSet<&str> = selected_constraints.iter().filter_map(|c| c["id"].as_str()).collect();
+        let target_hashes: HashSet<&str> = fix["behavioral_constraints"].as_array().into_iter().flatten()
+            .filter(|c| c["id"].as_str().is_some_and(|id| selected_ids.contains(id)))
+            .flat_map(|c| c["verification"].as_array().into_iter().flatten())
+            .filter_map(|v| v["receipt_sha256"].as_str()).collect();
+        let mut references: Vec<&Value> = fix["receipts"].as_array().into_iter().flatten().collect();
+        references.sort_by_key(|r| !r["sha256"].as_str().is_some_and(|hash| target_hashes.contains(hash)));
+        let receipts: Vec<Value> = references.into_iter()
             .take(if has_constraints { 1 } else { 2 }).map(|receipt| json!({
                 "kind": receipt["kind"], "path": receipt["path"], "sha256": receipt["sha256"],
             })).collect();
@@ -589,6 +650,10 @@ fn remember_notice(state: &mut State, id: String, payload: Value, status: &str,
 
 /// Use the existing ordered context channel, not JavaScript print visibility.
 pub(super) async fn source_read(invocation: &ToolInvocation, packet: &Value) -> Option<Value> {
+    tracing::debug!(path = ?packet["path"], environment = ?packet["environment_id"],
+        result_statuses = ?packet["results"].as_array().map(|rows| rows.iter().map(|row| &row["status"]).collect::<Vec<_>>()),
+        full_disk_read = invocation.step_context.turn.file_system_sandbox_policy().has_full_disk_read_access(),
+        "evidence advisory source hook");
     if packet.get("git_source").is_some()
         || !packet["results"].as_array().is_some_and(|r| r.iter().any(|r| r["status"] == "ok"))
     { return None; }
@@ -605,9 +670,27 @@ pub(super) async fn source_read(invocation: &ToolInvocation, packet: &Value) -> 
     let sandbox = turn.file_system_sandbox_context(None, environment.cwd());
     let ledger = turn.extension_data.get_or_init(EvidenceMemory::default);
     let started = Instant::now();
+    let current_history = invocation.session.clone_history().await;
+    let present_ids: HashSet<String> = current_history.raw_items().iter().filter_map(|item| {
+        let ResponseItem::Message { role, content, .. } = item else { return None; };
+        if role != "developer" { return None; }
+        let [ContentItem::InputText { text }] = content.as_slice() else { return None; };
+        text.strip_prefix("<evidence_memory_advisory id=\"")?
+            .split_once('"').map(|(id, _)| id.to_owned())
+    }).collect();
+    let pending_calls: HashSet<String> = turn.pending_post_tool_contexts.lock().await.keys().cloned().collect();
     // No new tasks, processes, model calls or waits on optional evidence.
     let found = tokio::time::timeout(Duration::from_millis(50), async {
         let mut state = ledger.0.lock().await;
+        // Same TurnContext can survive compaction. Release only reservations
+        // whose accepted notice was evicted; queued contexts remain reserved.
+        let evicted: Vec<String> = state.reservation_notices.iter().filter(|(_, id)|
+            !present_ids.contains(*id) && state.notices.get(*id).is_some_and(|notice|
+                matches!(notice["status"].as_str(), Some("context_recorded" | "context_reused"))
+                    || (notice["status"] == "context_queued"
+                        && !pending_calls.contains(notice["call_id"].as_str().unwrap_or("")))))
+            .map(|(key, _)| key.clone()).collect();
+        for key in evicted { state.shown.remove(&key); state.reservation_notices.remove(&key); }
         // Acquisition is observable; model reading/understanding is not. Keep
         // only bounded provenance, never source bodies or a second file hash.
         if let Some(hash) = packet["source_sha256"].as_str() {
@@ -622,9 +705,15 @@ pub(super) async fn source_read(invocation: &ToolInvocation, packet: &Value) -> 
         }
         let symbol = packet["selector_bindings"].as_array().filter(|rows| rows.len() == 1)
             .and_then(|rows| rows[0]["qualified_name"].as_str());
-        lookup(&mut state, fs.as_ref(), &PathUri::from_abs_path(&path), &sandbox, symbol, None).await
+        let found = lookup(&mut state, fs.as_ref(), &PathUri::from_abs_path(&path), &sandbox, symbol, None).await;
+        tracing::debug!(present = present_ids.len(), shown = state.shown.len(), reservations = state.reservation_notices.len(), bytes = state.bytes, found = found.is_some(), "evidence advisory source lookup");
+        found
     }).await.ok().flatten();
     let (text, reservations, id, payload) = found?;
+    {
+        let mut state = ledger.0.lock().await;
+        for key in &reservations { state.reservation_notices.insert(key.clone(), id.clone()); }
+    }
     let bytes = text.len();
     // Consult accepted current history, not a permanent per-thread seen set:
     // compaction/removal must allow a later turn to deliver the evidence again.
@@ -649,7 +738,10 @@ pub(super) async fn source_read(invocation: &ToolInvocation, packet: &Value) -> 
             "bytes":0,"existing_bytes":bytes,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0,
             "phase":"source_read"}));
     }
-    let item = ResponseItem::Message { id:None, role:"developer".into(),
+    // A genuinely new source-read delivery after compaction must not collide
+    // with the same turn's durable append retry key for the evicted notice.
+    // Retrying this invocation still uses the same identity.
+    let item = ResponseItem::Message { id:Some(codex_protocol::ResponseItemId::with_suffix("evidence", &invocation.call_id)), role:"developer".into(),
         content:vec![ContentItem::InputText { text }], phase:None,
         internal_chat_message_metadata_passthrough:None };
     let status = if matches!(invocation.source, ToolCallSource::Direct) {
@@ -663,6 +755,7 @@ pub(super) async fn source_read(invocation: &ToolInvocation, packet: &Value) -> 
         state.bytes = state.bytes.saturating_sub(bytes);
         "context_unavailable"
     };
+    tracing::debug!(advisory_id = %id, status, call_id = %invocation.call_id, "evidence advisory context publication");
     {
         let mut state = ledger.0.lock().await;
         remember_notice(&mut state, id.clone(), payload, status, invocation,
@@ -777,10 +870,10 @@ pub(super) async fn before_patch(invocation: &ToolInvocation, raw: Option<&str>)
             let fix = row["fix"].clone();
             row["advisory_fix_observed"] = json!(payload["fixes"].as_array().into_iter().flatten()
                 .any(|entry| entry["fix"] == fix));
-            let Some(registered) = memory.index["fixes"].as_array().into_iter().flatten()
-                .find(|entry| entry["id"] == fix) else { continue; };
-            row["registered_fix"] = json!("in_cached_index_not_fresh_integrity_check");
-            let receipts: Vec<&Value> = registered["receipts"].as_array().into_iter().flatten().collect();
+            let Some(selected) = payload["fixes"].as_array().into_iter().flatten()
+                .find(|entry| entry["fix"] == fix) else { continue; };
+            row["registered_fix"] = json!("in_selected_advisory_not_fresh_integrity_check");
+            let receipts: Vec<&Value> = selected["receipts"].as_array().into_iter().flatten().collect();
             row["receipts_omitted"] = json!(receipts.len().saturating_sub(4));
             row["native_receipt_reads"] = json!(receipts.into_iter().take(4).map(|receipt| {
                 let path = receipt["path"].as_str().and_then(|path| directory.join(path).ok());

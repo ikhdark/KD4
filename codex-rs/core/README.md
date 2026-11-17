@@ -30,10 +30,11 @@ process boundaries, start with the [workspace map](../README.md).
 | --- | --- |
 | Prompt and instruction composition | [instruction-architecture.md](instruction-architecture.md), [session/world_state.rs](src/session/world_state.rs), [agents_md_manager.rs](src/agents_md_manager.rs) |
 | Tool exposure and discovery | [tools/spec_plan.rs](src/tools/spec_plan.rs), [tools/exposure.rs](src/tools/exposure.rs), [tools/handlers/tool_search.rs](src/tools/handlers/tool_search.rs) |
+| Model-visible tool-output selection, authenticated recovery and bounded rendering | [tools/registry/output_projection.rs](src/tools/registry/output_projection.rs); registry retains dispatch and hook ordering |
 | Agent lifecycle and coordination | [agent/control.rs](src/agent/control.rs), its [domain modules](src/agent/control/), [multi-agent handlers](src/tools/handlers/multi_agents_v2/) |
 | History reconstruction and compaction | [session/rollout_reconstruction.rs](src/session/rollout_reconstruction.rs), [compact.rs](src/compact.rs), [compact_provenance.rs](src/compact_provenance.rs) |
 | Live recovery evidence | [session/resume_inventory.rs](src/session/resume_inventory.rs), [unified_exec/process_inventory.rs](src/unified_exec/process_inventory.rs) |
-| Approval and sandbox execution | [tools/orchestrator.rs](src/tools/orchestrator.rs), [tools/sandboxing.rs](src/tools/sandboxing.rs), [exec_policy.rs](src/exec_policy.rs) |
+| Approval and full-access execution | [tools/orchestrator.rs](src/tools/orchestrator.rs), [tools/sandboxing.rs](src/tools/sandboxing.rs) (legacy compatibility names), [exec_policy.rs](src/exec_policy.rs) |
 | MCP session integration | [mcp.rs](src/mcp.rs), [mcp_tool_call.rs](src/mcp_tool_call.rs), [session/mcp_runtime.rs](src/session/mcp_runtime.rs) |
 
 ## Focused modules behind the orchestration

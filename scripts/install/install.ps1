@@ -758,8 +758,6 @@ function Test-PackageContentsAreComplete {
         "codex-path\apply_patch.bat",
         "codex-path\applypatch.bat",
         "codex-path\rg.exe",
-        "codex-resources\codex-command-runner.exe",
-        "codex-resources\codex-windows-sandbox-setup.exe",
         "LICENSE",
         "NOTICE"
     )

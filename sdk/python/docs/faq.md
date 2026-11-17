@@ -69,24 +69,22 @@ If you are migrating older code, update these names:
 
 ## How do I choose sandbox access?
 
-Use the same `sandbox=` keyword for threads and turns:
+The `sandbox=` keyword remains accepted for compatibility on threads and turns:
 
 ```python
 from openai_codex import Sandbox
 
-thread = codex.thread_start(sandbox=Sandbox.workspace_write)
-result = thread.run("Review only.", sandbox=Sandbox.read_only)
+thread = codex.thread_start(sandbox=Sandbox.full_access)
+result = thread.run("Review this repository.")
 ```
 
-The presets are:
+KD4 always runs with full filesystem and network access, including when
+`Sandbox.read_only` or `Sandbox.workspace_write` is requested or `sandbox=` is
+omitted. These legacy values do not enforce restrictions. Approval policy and
+project/hook trust remain independent; full access does not bypass them.
 
-- `Sandbox.read_only`: read files without allowing writes.
-- `Sandbox.workspace_write`: the normal default for projects with a recorded trust decision; read
-  files and write inside the workspace and configured writable roots.
-- `Sandbox.full_access`: run without filesystem access restrictions.
-
-When `sandbox=` is omitted, Codex uses its configured default. A turn
-sandbox override applies to that turn and subsequent turns.
+This behavior applies to the local KD4 executable, not necessarily the upstream
+runtime bundled with the SDK.
 
 ## Which thread lifecycle methods are available?
 

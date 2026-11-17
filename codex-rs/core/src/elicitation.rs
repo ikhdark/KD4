@@ -19,15 +19,48 @@ pub(crate) struct ElicitationService {
 struct Inner {
     state: Mutex<ServiceState>,
     paused: watch::Sender<bool>,
+    dispatch_held: watch::Sender<bool>,
+    pending_dispatches: watch::Sender<usize>,
 }
 
 #[derive(Default)]
 struct ServiceState {
     outstanding: i64,
+    dispatch_holds: i64,
+    pending_dispatches: usize,
+}
+
+pub(crate) struct PendingDispatch {
+    service: ElicitationService,
+}
+
+tokio::task_local! {
+    static PENDING_DISPATCH: std::cell::RefCell<Option<PendingDispatch>>;
+}
+
+pub(crate) async fn scope_pending_dispatch<F: std::future::Future>(
+    permit: PendingDispatch,
+    future: F,
+) -> F::Output {
+    PENDING_DISPATCH.scope(std::cell::RefCell::new(Some(permit)), future).await
+}
+
+pub(crate) fn settle_pending_dispatch() {
+    let _ = PENDING_DISPATCH.try_with(|permit| drop(permit.borrow_mut().take()));
+}
+
+impl Drop for PendingDispatch {
+    fn drop(&mut self) {
+        let mut state = self.service.inner.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pending_dispatches -= 1;
+        self.service.inner.pending_dispatches.send_replace(state.pending_dispatches);
+    }
 }
 
 pub(crate) struct ElicitationRegistration {
     service: ElicitationService,
+    hold_dispatch: bool,
+    released: tokio_util::sync::CancellationToken,
 }
 
 /// Exact identity of one app-server-owned out-of-band elicitation lease.
@@ -68,22 +101,32 @@ impl Default for OutOfBandLeaseState {
 impl ElicitationService {
     pub(crate) fn new() -> Self {
         let (paused, _paused_rx) = watch::channel(false);
+        let (dispatch_held, _dispatch_held_rx) = watch::channel(false);
+        let (pending_dispatches, _pending_dispatches_rx) = watch::channel(0);
         Self {
             inner: Arc::new(Inner {
                 state: Mutex::new(ServiceState::default()),
                 paused,
+                dispatch_held,
+                pending_dispatches,
             }),
         }
     }
 
     pub(crate) fn register(&self) -> ElicitationRegistration {
-        self.increment();
+        self.register_with_dispatch_hold(false)
+    }
+
+    fn register_with_dispatch_hold(&self, hold_dispatch: bool) -> ElicitationRegistration {
+        self.increment(hold_dispatch);
         ElicitationRegistration {
             service: self.clone(),
+            hold_dispatch,
+            released: tokio_util::sync::CancellationToken::new(),
         }
     }
 
-    fn increment(&self) {
+    fn increment(&self, hold_dispatch: bool) {
         let mut state = self
             .inner
             .state
@@ -96,6 +139,13 @@ impl ElicitationService {
             "outstanding elicitation count overflowed"
         );
         state.outstanding += 1;
+        if hold_dispatch {
+            assert_ne!(state.dispatch_holds, i64::MAX, "dispatch hold count overflowed");
+            state.dispatch_holds += 1;
+            if state.dispatch_holds == 1 {
+                self.inner.dispatch_held.send_replace(true);
+            }
+        }
         if was_clear {
             self.inner.paused.send_replace(true);
         }
@@ -110,7 +160,59 @@ impl ElicitationService {
         let _ = paused.wait_for(|paused| !*paused).await;
     }
 
-    fn decrement(&self) {
+    /// Reserve admission before acquiring any workspace lease.
+    pub(crate) async fn reserve_dispatch(&self) -> PendingDispatch {
+        let mut held = self.inner.dispatch_held.subscribe();
+        loop {
+            {
+                let mut state = self.inner.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.dispatch_holds == 0 {
+                    state.pending_dispatches = state.pending_dispatches.checked_add(1).expect("pending dispatch count overflowed");
+                    self.inner.pending_dispatches.send_replace(state.pending_dispatches);
+                    return PendingDispatch { service: self.clone() };
+                }
+            }
+            held.wait_for(|held| !*held).await.expect("dispatch hold sender closed");
+        }
+    }
+
+    pub(crate) async fn acquire_while_dispatch_clear<T, F, Fut>(
+        &self,
+        permit: &mut Option<PendingDispatch>,
+        mut acquire: F,
+    ) -> T
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let mut held = self.inner.dispatch_held.subscribe();
+        loop {
+            if permit.is_none() {
+                *permit = Some(self.reserve_dispatch().await);
+            }
+            let result = tokio::select! {
+                biased;
+                _ = held.wait_for(|held| *held) => None,
+                result = acquire() => Some(result),
+            };
+            if let Some(result) = result {
+                return result;
+            }
+            // The acquisition future and any partial workspace lease have dropped.
+            drop(permit.take());
+        }
+    }
+
+    pub(crate) async fn wait_for_pending_dispatches(&self) {
+        let mut pending = self.inner.pending_dispatches.subscribe();
+        let mut held = self.inner.dispatch_held.subscribe();
+        tokio::select! {
+            _ = pending.wait_for(|count| *count == 0) => {},
+            _ = held.wait_for(|held| !*held) => {},
+        }
+    }
+
+    fn decrement(&self, hold_dispatch: bool) {
         let mut state = self
             .inner
             .state
@@ -121,6 +223,13 @@ impl ElicitationService {
             "elicitation registration count underflowed"
         );
         state.outstanding -= 1;
+        if hold_dispatch {
+            assert!(state.dispatch_holds > 0, "dispatch hold count underflowed");
+            state.dispatch_holds -= 1;
+            if state.dispatch_holds == 0 {
+                self.inner.dispatch_held.send_replace(false);
+            }
+        }
         if state.outstanding == 0 {
             self.inner.paused.send_replace(false);
         }
@@ -135,7 +244,7 @@ impl OutOfBandElicitationLeases {
         }
     }
 
-    pub(crate) fn acquire(&self, lease_id: OutOfBandElicitationLeaseId) -> CodexResult<i64> {
+    pub(crate) fn acquire(&self, lease_id: OutOfBandElicitationLeaseId, hold_dispatch: bool) -> CodexResult<i64> {
         let mut state = self
             .state
             .lock()
@@ -153,7 +262,7 @@ impl OutOfBandElicitationLeases {
 
         state
             .registrations
-            .insert(lease_id, self.service.register());
+            .insert(lease_id, self.service.register_with_dispatch_hold(hold_dispatch));
         Ok(lease_count(state.registrations.len()))
     }
 
@@ -179,6 +288,16 @@ impl OutOfBandElicitationLeases {
         lease_count(state.registrations.len())
     }
 
+    pub(crate) fn contains(&self, lease_id: &OutOfBandElicitationLeaseId) -> bool {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .registrations.contains_key(lease_id)
+    }
+
+    pub(crate) fn release_token(&self, lease_id: &OutOfBandElicitationLeaseId) -> Option<tokio_util::sync::CancellationToken> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .registrations.get(lease_id).map(|registration| registration.released.clone())
+    }
+
     pub(crate) fn close(&self) {
         let registrations = {
             let mut state = self
@@ -198,6 +317,7 @@ fn lease_count(count: usize) -> i64 {
 
 impl Drop for ElicitationRegistration {
     fn drop(&mut self) {
-        self.service.decrement();
+        self.released.cancel();
+        self.service.decrement(self.hold_dispatch);
     }
 }

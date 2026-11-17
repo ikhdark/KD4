@@ -78,6 +78,10 @@ work. Leave the Windows Store installation untouched.
   editing and merge rather than replay an older copy. Prefer extending a working
   fix; replace it only when incremental correction is insufficient, explaining
   the lost and retained benefits.
+- When edits overlap, merge complementary changes. Where alternatives conflict,
+  keep the best version based on the task's requirements, correctness and
+  available evidence, not merely recency or authorship. Preserve unrelated work
+  and valid behavior from both versions; explain material choices.
 - Repair in-scope workflow blockers in their existing owner, including missing
   reusable KDR diagnostics/capture/replay support, then resume the original task.
   If an existing bench or replay cannot exercise the affected path or state,
@@ -113,6 +117,14 @@ work. Leave the Windows Store installation untouched.
 
 **Benchmark reuse and preservation:** Before modifying or creating benchmark scripts, identify existing workloads that measure the requested behavior. Prefer reusing or parameterizing established benchmarks over changing their definitions. Extend coverage without removing existing scenarios. Changes to shared benchmark logic are permitted when correcting defects or improving measurement reliability, but must not silently invalidate historical comparisons. Preserve reproducibility and clearly distinguish new measurements from previously established baselines. Prefer stable benchmark infrastructure with reusable, named scenarios rather than accumulating a separate Python script for every measurement.
 
+- Before implementing a suggested new addition or feature, run a matched A/B
+  comparison of the current behavior (A) and proposed behavior (B) against explicit
+  improvement criteria using representative inputs and equivalent settings.
+  If measurement requires code, use a bounded isolated prototype first; proceed
+  with full implementation only when the comparison demonstrates an improvement
+  without regressions in required behavior. Consider correctness, performance,
+  usability and maintenance cost as relevant; retain evidence and tradeoffs.
+  An inconclusive comparison is not evidence of improvement.
 - Use KDR proactively when existing diagnostics, benchmarks or saved evidence
   materially help. Discover the relevant capability; reuse source-matched
   analysis, hashes and completed evidence instead of duplicating work. KDR is

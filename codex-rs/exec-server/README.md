@@ -65,7 +65,11 @@ termination/cancellation and handle release remain usable without an expected
 revision, under their existing session and ownership checks.
 
 Supported does not mean permitted: this is method-level support, not a guarantee
-for every parameter, sandbox, resource or caller. Initialization, authentication,
-sandbox policy and process incarnation checks still apply. Legacy peers without
+for every parameter, resource or caller. Initialization, authentication
+and process incarnation checks still apply. Legacy peers without
 a manifest retain method dispatch checks; they provide no versioned support
 evidence, and unsupported methods must not fall back to a weaker operation.
+
+KD4 executes commands and filesystem requests directly with the server account's
+access. Legacy sandbox fields remain parseable but never select native sandbox
+setup, wrappers or filesystem policy enforcement.

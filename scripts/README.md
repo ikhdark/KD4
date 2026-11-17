@@ -13,7 +13,7 @@ do not belong here.
   execution. Lane commands execute once; they do not publish validation receipts
   or enforce command-selection policy.
 - `maintenance/`: parallel formatting with explicit language/package selection.
-- `install/`: install and publish the CLI, Code Mode host and sandbox helpers.
+- `install/`: install and publish the CLI and Code Mode host.
 - `codex_package/`: construct and stage distributable packages.
 - `common/`: shared file locking, atomic writes and process-tree cleanup.
 

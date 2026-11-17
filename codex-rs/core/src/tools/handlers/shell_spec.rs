@@ -8,7 +8,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 
 const SHELL_SCRIPT_DESCRIPTION: &str = "Explicit source for the selected shell (the session default when omitted), for pipelines, redirection, expansion, compound statements, or builtins. Use `program`/`args` for executables; never concatenate executable arguments into shell source.";
-const EXECUTABLE_DESCRIPTION: &str = "Executable to launch directly through the existing process owner with `args`; shell builtins and Windows batch files require explicit shell source instead. Prefer this for executables. Normal permission and sandbox checks still apply.";
+const EXECUTABLE_DESCRIPTION: &str = "Executable to launch directly through the existing process owner with `args`; shell builtins and Windows batch files require explicit shell source instead. Prefer this for executables. Normal approval and policy checks still apply.";
 const ARGUMENTS_DESCRIPTION: &str = "Literal arguments for `program`, excluding the program name. Pass each argument separately without shell quoting; the process owner handles Windows argument serialization. Shell operators and expansions remain literal data unless a shell is explicitly invoked.";
 
 fn shell_parameter() -> JsonSchema {
@@ -510,45 +510,6 @@ pub(crate) fn create_shell_command_tool_for_policy(
     })
 }
 
-pub fn create_request_permissions_tool(description: String) -> ToolSpec {
-    let properties = BTreeMap::from([
-        (
-            "reason".to_string(),
-            JsonSchema::string(Some(
-                "Optional short explanation for why additional permissions are needed.".to_string(),
-            )),
-        ),
-        (
-            "environment_id".to_string(),
-            JsonSchema::string(Some(
-                "Environment id from <environment_context>. Omit to use the primary environment."
-                    .to_string(),
-            )),
-        ),
-        ("permissions".to_string(), permission_profile_schema()),
-    ]);
-
-    ToolSpec::Function(ResponsesApiTool {
-        name: "request_permissions".to_string(),
-        description,
-        strict: false,
-        defer_loading: None,
-        parameters: JsonSchema::object(
-            properties,
-            Some(vec!["permissions".to_string()]),
-            Some(false.into()),
-        ),
-        output_schema: Some(
-            codex_protocol::request_permissions::RequestPermissionsResponse::output_schema().into(),
-        ),
-    })
-}
-
-pub fn request_permissions_tool_description() -> String {
-    "Request additional filesystem or network permissions from the user and wait for the client to grant a subset of the requested permission profile. Use environment_id to target a specific attached environment; omit it to use the primary environment. Relative filesystem paths resolve against the selected environment cwd. Read the returned permissions and scope: a request can be partially granted or denied, and only the returned permissions are authorized. Granted permissions apply automatically to later shell-like commands in the current turn, or for the rest of the session if the client approves them at session scope."
-        .to_string()
-}
-
 fn unified_exec_output_schema() -> Value {
     json!({
         "type": "object",
@@ -639,7 +600,7 @@ fn unified_exec_output_schema() -> Value {
             "process_exited": { "type": "boolean" },
             "environment_receipt": {
                 "type": "object",
-                "description": "Redacted launch provenance: roots contain resolved_executable (actual created image in the selected environment, null when unavailable), executable_identity (resolution: created_process_image or unknown; kind: shell_launcher only for an observed owned shell, otherwise unknown; shim: unknown; underlying_program: null), instance_id/execution_id/os_pid and environment (cwd, selected_environment values/status, launcher_kind, shell). Direct launch mode does not establish program versus shim identity; shell payloads and shim targets are never inferred from command text. For shell launches, shell reports the prepared executable, startup_flags (no script payload), and profile_loading (enabled, not proof a profile existed). Includes sandbox-enforced -NoProfile; absent after direct-executable lowering. Covers root creation only, not shell commands or descendants. Dependencies are not captured; reproducibility is partial. Polls retain the original execution identity.",
+                "description": "Redacted launch provenance: roots contain resolved_executable (actual created image in the selected environment, null when unavailable), executable_identity (resolution: created_process_image or unknown; kind: shell_launcher only for an observed owned shell, otherwise unknown; shim: unknown; underlying_program: null), instance_id/execution_id/os_pid and environment (cwd, selected_environment values/status, launcher_kind, shell). Direct launch mode does not establish program versus shim identity; shell payloads and shim targets are never inferred from command text. For shell launches, shell reports the prepared executable, startup_flags (no script payload), and profile_loading (enabled, not proof a profile existed). Includes a harness-added -NoProfile; absent after direct-executable lowering. Covers root creation only, not shell commands or descendants. Dependencies are not captured; reproducibility is partial. Polls retain the original execution identity.",
                 "additionalProperties": true
             },
             "search_no_match": { "type": "boolean" },
@@ -886,129 +847,35 @@ pub(crate) fn unified_exec_eager_output_schema() -> Value {
 }
 
 fn create_approval_parameters(
-    exec_permission_approvals_enabled: bool,
+    _exec_permission_approvals_enabled: bool,
     allow_escalated_sandbox_permissions: bool,
 ) -> BTreeMap<String, JsonSchema> {
-    if !exec_permission_approvals_enabled && !allow_escalated_sandbox_permissions {
+    // KD4 runs every command with full access, so per-command sandbox
+    // overrides and additional-permission requests are not advertised. Legacy
+    // values are still accepted by the argument decoders and ignored. Approval
+    // hints remain when the active policy can prompt for a command.
+    if !allow_escalated_sandbox_permissions {
         return BTreeMap::new();
     }
-    let mut sandbox_permission_values = vec![json!("use_default")];
-    if exec_permission_approvals_enabled {
-        sandbox_permission_values.push(json!("with_additional_permissions"));
-    }
-    if allow_escalated_sandbox_permissions {
-        sandbox_permission_values.push(json!("require_escalated"));
-    }
-    let sandbox_permissions_description = match (
-        exec_permission_approvals_enabled,
-        allow_escalated_sandbox_permissions,
-    ) {
-        (true, true) => {
-            "Per-command sandbox override. Defaults to `use_default`; use `with_additional_permissions` with `additional_permissions`, or `require_escalated` for unsandboxed execution."
-        }
-        (true, false) => {
-            "Per-command sandbox override. Defaults to `use_default`; use `with_additional_permissions` with `additional_permissions`."
-        }
-        (false, true) => {
-            "Per-command sandbox override. Defaults to `use_default`; use `require_escalated` for unsandboxed execution."
-        }
-        (false, false) => "Per-command sandbox override. Defaults to `use_default`.",
-    };
-
-    let mut properties = BTreeMap::from([(
-        "sandbox_permissions".to_string(),
-        JsonSchema::string_enum(
-            sandbox_permission_values,
-            Some(sandbox_permissions_description.to_string()),
-        ),
-    )]);
-
-    if allow_escalated_sandbox_permissions {
-        properties.extend([
-            (
+    BTreeMap::from([
+        (
             "justification".to_string(),
             JsonSchema::string(Some(
-                "User-facing approval question for `require_escalated`; omit otherwise.".to_string(),
+                "Short user-facing approval question, shown only if this command requires approval."
+                    .to_string(),
             )),
-            ),
-            (
-                "prefix_rule".to_string(),
-                JsonSchema::array(JsonSchema::string(/*description*/ None), Some(
-                    r#"Reusable approval prefix for the command, only with `sandbox_permissions: "require_escalated"`; for example ["git", "pull"]."#.to_string(),
-                )),
-            ),
-        ]);
-    }
-
-    if exec_permission_approvals_enabled {
-        let mut additional_permissions = permission_profile_schema();
-        additional_permissions.description = Some(
-            "Sandboxed filesystem or network access for this command; only with `sandbox_permissions: \"with_additional_permissions\"`."
-                .to_string(),
-        );
-        properties.insert("additional_permissions".to_string(), additional_permissions);
-    }
-
-    properties
-}
-
-fn permission_profile_schema() -> JsonSchema {
-    let mut schema = JsonSchema::object(
-        BTreeMap::from([
-            ("network".to_string(), network_permissions_schema()),
-            ("file_system".to_string(), file_system_permissions_schema()),
-        ]),
-        /*required*/ None,
-        Some(false.into()),
-    );
-    schema.description = Some("Filesystem or network access request.".to_string());
-    schema
-}
-
-fn network_permissions_schema() -> JsonSchema {
-    let mut schema = JsonSchema::object(
-        BTreeMap::from([(
-            "enabled".to_string(),
-            JsonSchema::boolean(Some(
-                "True requests network access; false or omitted requests none.".to_string(),
-            )),
-        )]),
-        /*required*/ None,
-        Some(false.into()),
-    );
-    schema.description = Some("Network access request.".to_string());
-    schema
-}
-
-fn file_system_permissions_schema() -> JsonSchema {
-    let mut schema = JsonSchema::object(
-        BTreeMap::from([
-            (
-                "read".to_string(),
-                JsonSchema::array(
-                    JsonSchema::string(/*description*/ None),
-                    Some(
-                        "Absolute paths to grant read access; omit when none are needed."
-                            .to_string(),
-                    ),
+        ),
+        (
+            "prefix_rule".to_string(),
+            JsonSchema::array(
+                JsonSchema::string(/*description*/ None),
+                Some(
+                    r#"Reusable approval prefix proposed if this command requires approval; for example ["git", "pull"]."#
+                        .to_string(),
                 ),
             ),
-            (
-                "write".to_string(),
-                JsonSchema::array(
-                    JsonSchema::string(/*description*/ None),
-                    Some(
-                        "Absolute paths to grant write access; omit when none are needed."
-                            .to_string(),
-                    ),
-                ),
-            ),
-        ]),
-        /*required*/ None,
-        Some(false.into()),
-    );
-    schema.description = Some("Filesystem access request.".to_string());
-    schema
+        ),
+    ])
 }
 
 fn windows_shell_guidance() -> &'static str {

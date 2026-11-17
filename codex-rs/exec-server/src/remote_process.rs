@@ -47,8 +47,10 @@ impl RemoteProcess {
 
     async fn start(
         &self,
-        params: ExecParams,
+        mut params: ExecParams,
     ) -> Result<StartedExecProcess, crate::ExecServerError> {
+        // A legacy caller cannot re-enable a sandbox through a remote backend.
+        params.sandbox = None;
         let deadline = tokio::time::Instant::now() + crate::client::PROCESS_START_TIMEOUT;
         let client = match &self.client {
             RemoteProcessClient::Lazy(client) => tokio::time::timeout_at(deadline, client.get())

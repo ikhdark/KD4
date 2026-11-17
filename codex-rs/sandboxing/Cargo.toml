@@ -16,8 +16,4 @@ workspace = true
 codex-protocol = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-path-uri = { workspace = true }
-codex-windows-sandbox = { workspace = true }
-dunce = { workspace = true }
-tracing = { workspace = true, features = ["log"] }
-codex-utils-home-dir = { workspace = true }
 

@@ -985,6 +985,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a8241f3ebb85c056b509d4327ad0358fbbba6ffb340bf388f26350aeda225b1"
 
 [[package]]
+name = "bigdecimal"
+version = "0.4.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8fa3f3d8cbf4dffcfe4991de61d012bef509a409ecbe9dd41049bfe32b4d4653"
+dependencies = [
+ "autocfg",
+ "libm",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
 name = "bindgen"
 version = "0.72.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1754,7 +1767,6 @@ dependencies = [
  "codex-utils-output-truncation",
  "codex-utils-path-uri",
  "codex-utils-pty",
- "codex-windows-sandbox",
  "fs2",
  "futures",
  "hex",
@@ -1944,11 +1956,9 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "codex-apply-patch",
- "codex-exec-server",
  "codex-install-context",
  "codex-process-hardening",
  "codex-utils-home-dir",
- "codex-windows-sandbox",
  "dotenvy",
  "tempfile",
  "tokio",
@@ -2075,7 +2085,6 @@ dependencies = [
  "codex-utils-cli",
  "codex-utils-oss",
  "codex-utils-string",
- "codex-windows-sandbox",
  "crossterm",
  "hex",
  "http",
@@ -2401,7 +2410,6 @@ dependencies = [
  "codex-utils-pty",
  "codex-utils-stream-parser",
  "codex-utils-string",
- "codex-windows-sandbox",
  "csv",
  "dunce",
  "futures",
@@ -2565,12 +2573,10 @@ dependencies = [
  "codex-protocol",
  "codex-sandboxing",
  "codex-utils-absolute-path",
- "codex-utils-home-dir",
  "codex-utils-path-uri",
  "codex-utils-pty",
  "codex-utils-rustls-provider",
  "codex-websocket-client",
- "codex-windows-sandbox",
  "constant_time_eq 0.6.1",
  "futures",
  "http",
@@ -3276,7 +3282,6 @@ dependencies = [
  "codex-utils-absolute-path",
  "codex-utils-home-dir",
  "codex-utils-path-uri",
- "codex-windows-sandbox",
  "dunce",
  "rmcp",
  "serde",
@@ -3294,11 +3299,7 @@ version = "0.0.0"
 dependencies = [
  "codex-protocol",
  "codex-utils-absolute-path",
- "codex-utils-home-dir",
  "codex-utils-path-uri",
- "codex-windows-sandbox",
- "dunce",
- "tracing",
 ]
 
 [[package]]
@@ -3308,6 +3309,7 @@ dependencies = [
  "age",
  "anyhow",
  "base64 0.23.1",
+ "codex-file-system",
  "codex-git-utils",
  "codex-keyring-store",
  "hex",
@@ -3437,6 +3439,7 @@ name = "codex-tool-artifacts"
 version = "0.0.0"
 dependencies = [
  "base64 0.23.1",
+ "bigdecimal",
  "codex-command-analysis",
  "codex-file-system",
  "codex-protocol",
@@ -3705,33 +3708,6 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "url",
-]
-
-[[package]]
-name = "codex-windows-sandbox"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "base64 0.23.1",
- "chrono",
- "codex-otel",
- "codex-protocol",
- "codex-shell-command",
- "codex-utils-absolute-path",
- "codex-utils-pty",
- "codex-utils-string",
- "dirs",
- "dunce",
- "glob",
- "rand 0.10.3",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "tempfile",
- "tokio",
- "tracing-appender",
- "windows",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

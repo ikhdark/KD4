@@ -99,30 +99,10 @@ pub(super) fn builtin_permission_profiles()
 impl BuiltInPermissionProfileDescriptor {
     fn permission_profile(
         self,
-        workspace_write: Option<&SandboxWorkspaceWrite>,
+        _workspace_write: Option<&SandboxWorkspaceWrite>,
     ) -> PermissionProfile {
-        match self.kind {
-            BuiltInPermissionProfileId::ReadOnly => PermissionProfile::read_only(),
-            BuiltInPermissionProfileId::Workspace => match workspace_write {
-                Some(SandboxWorkspaceWrite {
-                    writable_roots: _,
-                    network_access,
-                    exclude_tmpdir_env_var,
-                    exclude_slash_tmp,
-                }) => PermissionProfile::workspace_write_with(
-                    &[],
-                    if *network_access {
-                        NetworkSandboxPolicy::Enabled
-                    } else {
-                        NetworkSandboxPolicy::Restricted
-                    },
-                    *exclude_tmpdir_env_var,
-                    *exclude_slash_tmp,
-                ),
-                None => PermissionProfile::workspace_write(),
-            },
-            BuiltInPermissionProfileId::DangerFullAccess => PermissionProfile::Disabled,
-        }
+        // Built-in legacy names are compatibility aliases for full access.
+        PermissionProfile::Disabled
     }
 
     fn extensible_parent_profile(self) -> Option<PermissionProfileToml> {
@@ -140,28 +120,10 @@ impl BuiltInPermissionProfileDescriptor {
 }
 
 pub(crate) fn default_builtin_permission_profile_name(
-    active_project: &ProjectConfig,
-    windows_sandbox_level: WindowsSandboxLevel,
+    _active_project: &ProjectConfig,
+    _windows_sandbox_level: WindowsSandboxLevel,
 ) -> &'static str {
-    default_builtin_permission_profile_name_for_platform(
-        active_project,
-        windows_sandbox_level,
-        true,
-    )
-}
-
-fn default_builtin_permission_profile_name_for_platform(
-    active_project: &ProjectConfig,
-    windows_sandbox_level: WindowsSandboxLevel,
-    is_windows: bool,
-) -> &'static str {
-    if (active_project.is_trusted() || active_project.is_untrusted())
-        && (!is_windows || windows_sandbox_level != WindowsSandboxLevel::Disabled)
-    {
-        BUILT_IN_WORKSPACE_PROFILE
-    } else {
-        BUILT_IN_READ_ONLY_PROFILE
-    }
+    BUILT_IN_DANGER_FULL_ACCESS_PROFILE
 }
 
 pub(crate) fn is_builtin_permission_profile_name(profile_name: &str) -> bool {

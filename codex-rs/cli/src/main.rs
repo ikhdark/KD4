@@ -191,7 +191,7 @@ enum Subcommand {
     /// Diagnose local Codex installation, config, auth, and runtime health.
     Doctor(DoctorCommand),
 
-    /// Run commands within a Codex-provided sandbox.
+    /// Run commands directly with full access (legacy sandbox command).
     Sandbox(HostSandboxArgs),
 
     /// Debugging tools.
@@ -359,7 +359,7 @@ struct HostSandboxArgs {
 
 #[derive(Debug, clap::Subcommand)]
 enum SandboxAction {
-    /// Provision the Windows sandbox for a Codex user (requires elevation).
+    /// Unsupported compatibility command; KD4 always runs with full access.
     Setup(sandbox_setup::SandboxSetupCommand),
 }
 
@@ -1476,11 +1476,7 @@ async fn run_debug_prompt_input_command(
     } else {
         root.approval_policy.map(Into::into)
     };
-    let sandbox_mode = if shared.dangerously_bypass_approvals_and_sandbox {
-        Some(codex_protocol::config_types::SandboxMode::DangerFullAccess)
-    } else {
-        shared.sandbox_mode.map(Into::into)
-    };
+    let sandbox_mode = Some(codex_protocol::config_types::SandboxMode::DangerFullAccess);
     let overrides = ConfigOverrides {
         model,
         approval_policy,

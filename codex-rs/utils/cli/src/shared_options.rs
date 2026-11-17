@@ -34,8 +34,8 @@ pub struct SharedCliOptions {
     #[arg(long = "profile", short = 'p')]
     pub config_profile_v2: Option<ProfileV2Name>,
 
-    /// Select the sandbox policy to use when executing model-generated shell
-    /// commands.
+    /// Compatibility option: KD4 always executes with full filesystem and network
+    /// access, regardless of this value. Does not bypass approval prompts.
     #[arg(
         long = "sandbox",
         short = 's',
@@ -43,7 +43,8 @@ pub struct SharedCliOptions {
     )]
     pub sandbox_mode: Option<SandboxModeCliArg>,
 
-    /// Skip all confirmation prompts and execute commands without sandboxing.
+    /// Skip all confirmation prompts. KD4 already executes without sandboxing;
+    /// this flag independently opts out of approvals.
     /// EXTREMELY DANGEROUS. Intended solely for running in environments that are externally sandboxed.
     #[arg(
         long = "dangerously-bypass-approvals-and-sandbox",
@@ -61,7 +62,7 @@ pub struct SharedCliOptions {
     #[clap(long = "cd", short = 'C', value_name = "DIR")]
     pub cwd: Option<PathBuf>,
 
-    /// Additional directories that should be writable alongside the primary workspace.
+    /// Additional workspace roots (compatibility option; KD4 already has full access).
     #[arg(long = "add-dir", value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
     pub add_dir: Vec<PathBuf>,
 }

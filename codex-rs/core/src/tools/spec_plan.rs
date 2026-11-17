@@ -33,7 +33,6 @@ use crate::tools::handlers::PlanHandler;
 use crate::tools::handlers::ReadFileHandler;
 use crate::tools::handlers::ReadMcpResourceHandler;
 use crate::tools::handlers::ReadToolOutputHandler;
-use crate::tools::handlers::RequestPermissionsHandler;
 use crate::tools::handlers::RequestPluginInstallHandler;
 use crate::tools::handlers::RequestUserInputHandler;
 use crate::tools::handlers::ShellCommandHandler;
@@ -1055,7 +1054,7 @@ fn build_code_mode_executors(
     if matches!(turn_context.session_source, SessionSource::SubAgent(_))
         && let ToolSpec::Freeform(tool) = &mut code_mode_tool
     {
-        tool.description.insert_str(0, "Worker capabilities: use native read/search and permitted commands to independently confirm findings. exec_command/shell_command inherit the parent's filesystem, network and Windows sandbox settings without worker-only restrictions; normal approval and managed-policy checks still apply. Commands are not OS-confined to assignment write scopes when the inherited sandbox is disabled: respect task scopes and read-only assignments. write_stdin and process waits retain ownership checks. Scoped apply_patch still requires a typed writable assignment. External tool and root-owned integration/delegation/acceptance restrictions remain in force. If permitted tools cannot finish the assignment, preserve useful results and report the exact blocked/unverified remainder; a blocked operation is not completion.\n\n");
+        tool.description.insert_str(0, "Worker capabilities: use native read/search and permitted commands to independently confirm findings. exec_command/shell_command run with the parent's full filesystem and network access and no worker-only restrictions; normal approval and managed-policy checks still apply. Commands are not OS-confined to assignment write scopes: respect task scopes and read-only assignments. write_stdin and process waits retain ownership checks. Scoped apply_patch still requires a typed writable assignment. External tool and root-owned integration/delegation/acceptance restrictions remain in force. If permitted tools cannot finish the assignment, preserve useful results and report the exact blocked/unverified remainder; a blocked operation is not completion.\n\n");
     }
     phases.mark("exec_description");
     let mut result: Vec<Arc<dyn CoreToolRuntime>> = vec![Arc::new(CodeModeExecuteHandler::new_with_input_schemas(
@@ -1620,18 +1619,8 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
         );
     }
 
-    let permission_requests_allowed = match turn_context.approval_policy.value() {
-        AskForApproval::Never => false,
-        AskForApproval::Granular(config) => config.allows_request_permissions(),
-        AskForApproval::OnRequest | AskForApproval::UnlessTrusted => true,
-    };
-    if environment_mode.has_environment()
-        && features.enabled(Feature::RequestPermissionsTool)
-        && permission_requests_allowed
-    {
-        planned_tools
-            .add_with_authorization_class(RequestPermissionsHandler, TypedToolClass::OwnTask);
-    }
+    // KD4 has no sandbox: commands and file tools already run with full access,
+    // so the legacy `request_permissions` tool is not offered.
 
     let plugin_install_exposure = if search_tool_enabled(turn_context) {
         ToolExposure::Deferred

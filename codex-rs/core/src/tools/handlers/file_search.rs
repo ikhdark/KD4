@@ -178,7 +178,7 @@ impl ToolExecutor<ToolInvocation> for FileSearchHandler {
                     .file_system_sandbox_policy()
                     .has_full_disk_read_access()
             {
-                return Err(settled(FunctionCallError::RespondToModel("file_search requires local full-disk read access; use sandboxed read_file search selectors for known files".into())));
+                return Err(settled(FunctionCallError::RespondToModel("file_search requires local full-disk read access; use read_file search selectors for known files".into())));
             }
             crate::tools::parallel::wait_for_workspace_baseline().await;
             let cwd = environment

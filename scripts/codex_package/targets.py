@@ -80,8 +80,6 @@ class PackageInputs:
     entrypoint_bin: Path
     code_mode_host_bin: Path
     rg_bin: Path
-    codex_command_runner_bin: Path | None
-    codex_windows_sandbox_setup_bin: Path | None
 
 
 PACKAGE_VARIANTS: dict[str, PackageVariant] = {

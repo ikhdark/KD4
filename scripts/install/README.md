@@ -60,7 +60,7 @@ does not install or restart Desktop.
 
 ## Local publishing
 
-The publisher builds the CLI, Code Mode host, and both sandbox helpers,
+The publisher builds the CLI and Code Mode host,
 including freshness checks, rollback, Desktop configuration, and restart
 safety. Desktop uses the fork home (`C:\Users\kuh\Desktop\LOCAL-KD`), not the
 upstream home. Publishing can restart Desktop; `-BuildOnly` only prepares the
@@ -95,8 +95,16 @@ Reuse its Cargo cache, pass `-RustyV8Archive` or `RUSTY_V8_ARCHIVE` with an
 existing local archive, or opt into `-AllowRustyV8Download` only when downloading
 is authorized. A missing archive is not permission to provision the machine.
 
-Before activation, close processes using any of the four installed bundle
-executables; before restart, close Desktop as well. The publisher cannot prove
+KD4 always runs with full filesystem and network access, including legacy
+restricted-mode config and CLI inputs. Approval policy remains independent.
+The legacy `codex sandbox` command runs its child directly; `codex sandbox setup`
+is unsupported and performs no provisioning or configuration changes. Current
+packages and local/PGO bundles do not build, require, or install sandbox helpers.
+Existing installed helper files and historical rollback evidence are left intact.
+
+Before activation, close processes using either installed bundle executable
+or retained legacy sandbox helpers; before restart, close Desktop as well. The
+publisher cannot prove
 home ownership or live chat state from an executable path, so it refuses to stop
 even apparently idle processes without `-Force`. That switch explicitly permits
 interruption across **all homes** sharing those executables. Historical unfinished
@@ -133,8 +141,8 @@ just publish-local-codex-pgo -Stage Optimize
 just publish-local-codex-pgo -Stage Publish
 ```
 
-Prepare builds an instrumented `pgo` bundle and copies the CLI, Code Mode host, and
-sandbox helpers into a private training bundle. It cannot install that bundle.
+Prepare builds an instrumented `pgo` bundle and copies the CLI and Code Mode host
+into a private training bundle. It cannot install that bundle.
 Train runs **your selected PowerShell script**, which must perform representative
 workloads, check their outcomes, fail with a nonzero exit code on failure, and wait
 for all child processes to exit normally. It receives these process-only variables:

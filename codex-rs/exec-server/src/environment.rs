@@ -439,7 +439,7 @@ impl Environment {
         mut params: crate::LookupExecutableParams,
     ) -> Result<crate::LookupExecutableResponse, ExecServerError> {
         if let Some(client) = &self.remote_client {
-            params.sandbox = params.sandbox.map(crate::FileSystemSandboxContext::drop_cwd_if_unused);
+            params.sandbox = None;
             return client.get().await?.lookup_executable(params).await;
         }
         crate::executable_lookup::lookup_executable(self.filesystem.as_ref(), &params)
@@ -453,7 +453,7 @@ impl Environment {
         mut params: crate::protocol::LookupExecutablesParams,
     ) -> Result<Vec<codex_file_system::FileSystemLookupResult>, ExecServerError> {
         if let Some(client) = &self.remote_client {
-            params.sandbox = params.sandbox.map(crate::FileSystemSandboxContext::drop_cwd_if_unused);
+            params.sandbox = None;
             return client.get().await?.lookup_executables(params).await;
         }
         crate::executable_lookup::lookup_executables(self.filesystem.as_ref(), &params)

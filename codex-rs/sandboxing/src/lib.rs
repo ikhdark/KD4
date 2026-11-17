@@ -1,11 +1,7 @@
-mod denial;
 mod manager;
 pub mod policy_transforms;
-mod windows;
 
-pub use codex_windows_sandbox::WindowsSandboxProxySettingsMode;
-pub use codex_windows_sandbox::windows_sandbox_uses_elevated_backend;
-pub use denial::is_likely_sandbox_denied;
+pub use manager::WindowsSandboxProxySettingsMode;
 pub use manager::SandboxCommand;
 pub use manager::SandboxDirectSpawnTransformRequest;
 pub use manager::SandboxExecRequest;
@@ -20,11 +16,6 @@ pub use manager::should_sandbox;
 pub use manager::transform;
 pub use manager::transform_for_direct_spawn;
 pub use manager::transform_for_direct_spawn_with_codex_home;
-pub use windows::WindowsSandboxFilesystemOverrides;
-pub use windows::permission_profile_supports_windows_restricted_token_sandbox;
-pub use windows::resolve_windows_elevated_filesystem_overrides;
-pub use windows::resolve_windows_restricted_token_filesystem_overrides;
-pub use windows::unsupported_windows_restricted_token_sandbox_reason;
 
 use codex_protocol::error::CodexErr;
 

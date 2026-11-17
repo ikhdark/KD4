@@ -16,8 +16,6 @@ param(
     [string]$RepoRoot,
     [string]$SourceExe,
     [string]$SourceCodeModeHostExe,
-    [string]$SourceWindowsSandboxSetupExe,
-    [string]$SourceCommandRunnerExe,
     [string]$SourceBundleManifest,
     [string]$InstallDir = $env:CODEX_LOCAL_PUBLISH_DIR,
     [string]$BackupDir,
@@ -164,7 +162,7 @@ function Get-LocalPublishBuildRecipeFingerprint {
     $codexRs = Join-Path $RepoRoot "codex-rs"
     $identity = [ordered]@{
         schemaVersion = 4
-        command = "cargo build -p codex-cli -p codex-code-mode-host -p codex-windows-sandbox --profile <profile>"
+        command = "cargo build -p codex-cli -p codex-code-mode-host --profile <profile>"
         noSccache = [bool]$NoSccache
         cargo = $null
         rustc = $null
@@ -410,7 +408,7 @@ function Resolve-SourceBundleManifest {
         if ([long]$file.size -ne (Get-Item -LiteralPath $path).Length -or [string]$file.sha256 -cne $digest) {
             throw "Source bundle file digest mismatch: $relative"
         }
-        if ($role -in @("entrypoint", "code-mode-host", "command-runner", "sandbox-setup")) {
+        if ($role -in @("entrypoint", "code-mode-host")) {
             if ($rolePaths.ContainsKey($role)) {
                 throw "Source bundle manifest contains duplicate role: $role"
             }
@@ -433,7 +431,7 @@ function Resolve-SourceBundleManifest {
     if ([string]$metadata.bundleId -cne $expectedBundleId) {
         throw "Source bundle identity does not match its canonical file inventory."
     }
-    foreach ($role in @("entrypoint", "code-mode-host", "command-runner", "sandbox-setup")) {
+    foreach ($role in @("entrypoint", "code-mode-host")) {
         if (-not $rolePaths.ContainsKey($role)) {
             throw "Source bundle manifest is missing required role: $role"
         }
@@ -445,8 +443,6 @@ function Resolve-SourceBundleManifest {
         RoleDigests = $roleDigests
         Codex = $rolePaths["entrypoint"]
         CodeModeHost = $rolePaths["code-mode-host"]
-        CommandRunner = $rolePaths["command-runner"]
-        SandboxSetup = $rolePaths["sandbox-setup"]
     }
 }
 
@@ -854,17 +850,13 @@ function Read-BuildStamp {
         $sourceNewestWriteUtc = $stamp.PSObject.Properties["sourceNewestWriteUtc"]
         $codexSha256 = $stamp.PSObject.Properties["codexSha256"]
         $codeModeHostSha256 = $stamp.PSObject.Properties["codeModeHostSha256"]
-        $windowsSandboxSetupSha256 = $stamp.PSObject.Properties["windowsSandboxSetupSha256"]
-        $commandRunnerSha256 = $stamp.PSObject.Properties["commandRunnerSha256"]
         $writtenAtUtc = $stamp.PSObject.Properties["writtenAtUtc"]
         if (
-            $null -eq $schemaVersion -or [string]$schemaVersion.Value -cne "3" -or
+            $null -eq $schemaVersion -or [string]$schemaVersion.Value -cne "4" -or
             $null -eq $profile -or [string]::IsNullOrWhiteSpace([string]$profile.Value) -or
             $null -eq $sourceFingerprint -or -not (Test-Sha256Text -Value $sourceFingerprint.Value) -or
             $null -eq $codexSha256 -or -not (Test-Sha256Text -Value $codexSha256.Value) -or
             $null -eq $codeModeHostSha256 -or -not (Test-Sha256Text -Value $codeModeHostSha256.Value) -or
-            $null -eq $windowsSandboxSetupSha256 -or -not (Test-Sha256Text -Value $windowsSandboxSetupSha256.Value) -or
-            $null -eq $commandRunnerSha256 -or -not (Test-Sha256Text -Value $commandRunnerSha256.Value) -or
             $null -eq $writtenAtUtc -or [string]::IsNullOrWhiteSpace([string]$writtenAtUtc.Value)
         ) {
             return $null
@@ -899,8 +891,6 @@ function Read-BuildStamp {
             SourceNewestWriteUtc = if ($null -eq $sourceNewestWriteUtc) { $null } else { $sourceNewestWriteUtc.Value }
             CodexSha256 = ([string]$codexSha256.Value).ToLowerInvariant()
             CodeModeHostSha256 = ([string]$codeModeHostSha256.Value).ToLowerInvariant()
-            WindowsSandboxSetupSha256 = ([string]$windowsSandboxSetupSha256.Value).ToLowerInvariant()
-            CommandRunnerSha256 = ([string]$commandRunnerSha256.Value).ToLowerInvariant()
         }
     }
     catch {
@@ -915,17 +905,13 @@ function Get-AutoSkipBuildDecision {
         [string]$Profile,
         [string]$SourceExe,
         [string]$SourceCodeModeHostExe,
-        [string]$SourceWindowsSandboxSetupExe,
-        [string]$SourceCommandRunnerExe,
         [AllowNull()]
         [object]$SourceSnapshot
     )
 
     if (
         -not (Test-Path -LiteralPath $SourceExe -PathType Leaf) -or
-        -not (Test-Path -LiteralPath $SourceCodeModeHostExe -PathType Leaf) -or
-        -not (Test-Path -LiteralPath $SourceWindowsSandboxSetupExe -PathType Leaf) -or
-        -not (Test-Path -LiteralPath $SourceCommandRunnerExe -PathType Leaf)
+        -not (Test-Path -LiteralPath $SourceCodeModeHostExe -PathType Leaf)
     ) {
         return [pscustomobject]@{ CanSkip = $false; Reason = "source artifact missing"; SourceSnapshot = $null; StampedArtifactsCurrent = $false }
     }
@@ -961,9 +947,7 @@ function Get-AutoSkipBuildDecision {
     # stamp are provably the build of the stamped inputs, not merely old files.
     $stampedArtifactsCurrent = (
         $stamp.CodexSha256 -ceq (Get-CachedLocalPublishFileSha256 -Path $SourceExe) -and
-        $stamp.CodeModeHostSha256 -ceq (Get-CachedLocalPublishFileSha256 -Path $SourceCodeModeHostExe) -and
-        $stamp.WindowsSandboxSetupSha256 -ceq (Get-CachedLocalPublishFileSha256 -Path $SourceWindowsSandboxSetupExe) -and
-        $stamp.CommandRunnerSha256 -ceq (Get-CachedLocalPublishFileSha256 -Path $SourceCommandRunnerExe)
+        $stamp.CodeModeHostSha256 -ceq (Get-CachedLocalPublishFileSha256 -Path $SourceCodeModeHostExe)
     )
     if ($stamp.SourceFingerprint -cne $sourceFingerprint) {
         return [pscustomobject]@{ CanSkip = $false; Reason = "tracked publish inputs changed"; SourceSnapshot = $SourceSnapshot; StampedArtifactsCurrent = $stampedArtifactsCurrent }
@@ -1020,8 +1004,6 @@ function Write-BuildStamp {
         [string]$SourceFingerprint,
         [string]$SourceExe,
         [string]$SourceCodeModeHostExe,
-        [string]$SourceWindowsSandboxSetupExe,
-        [string]$SourceCommandRunnerExe,
         [AllowNull()]
         [object]$SourceNewestUtc
     )
@@ -1031,15 +1013,11 @@ function Write-BuildStamp {
     }
     $codexSha256 = Get-FileSha256 -Path $SourceExe
     $codeModeHostSha256 = Get-FileSha256 -Path $SourceCodeModeHostExe
-    $windowsSandboxSetupSha256 = Get-FileSha256 -Path $SourceWindowsSandboxSetupExe
-    $commandRunnerSha256 = Get-FileSha256 -Path $SourceCommandRunnerExe
     if (
         -not (Test-Sha256Text -Value $codexSha256) -or
-        -not (Test-Sha256Text -Value $codeModeHostSha256) -or
-        -not (Test-Sha256Text -Value $windowsSandboxSetupSha256) -or
-        -not (Test-Sha256Text -Value $commandRunnerSha256)
+        -not (Test-Sha256Text -Value $codeModeHostSha256)
     ) {
-        $missingArtifact = @($SourceExe, $SourceCodeModeHostExe, $SourceWindowsSandboxSetupExe, $SourceCommandRunnerExe) |
+        $missingArtifact = @($SourceExe, $SourceCodeModeHostExe) |
             Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) } |
             Select-Object -First 1
         throw "Cannot write local publish build stamp because a built source artifact is missing: $missingArtifact"
@@ -1048,14 +1026,12 @@ function Write-BuildStamp {
     $parent = Split-Path -Parent $StampPath
     New-Item -ItemType Directory -Path $parent -Force | Out-Null
     $stamp = [ordered]@{
-        schemaVersion = 3
+        schemaVersion = 4
         profile = $Profile
         sourceFingerprint = $SourceFingerprint
         sourceNewestWriteUtc = if ($null -eq $SourceNewestUtc) { $null } else { ([DateTime]$SourceNewestUtc).ToString("o") }
         codexSha256 = $codexSha256
         codeModeHostSha256 = $codeModeHostSha256
-        windowsSandboxSetupSha256 = $windowsSandboxSetupSha256
-        commandRunnerSha256 = $commandRunnerSha256
         writtenAtUtc = [DateTime]::UtcNow.ToString("o")
     }
     $temporaryPath = "$StampPath.$([Guid]::NewGuid().ToString('N')).tmp"
@@ -1837,24 +1813,6 @@ function Get-LocalPublishBuildInputFingerprint {
         return $null
     }
     return $snapshot.Fingerprint
-}
-
-function Get-BuiltWindowsSandboxSetupPath {
-    param(
-        [string]$RepoRoot,
-        [string]$Profile
-    )
-
-    return Join-Path (Get-LocalPublishArtifactDirectory -RepoRoot $RepoRoot -Profile $Profile) "codex-windows-sandbox-setup.exe"
-}
-
-function Get-BuiltCommandRunnerPath {
-    param(
-        [string]$RepoRoot,
-        [string]$Profile
-    )
-
-    return Join-Path (Get-LocalPublishArtifactDirectory -RepoRoot $RepoRoot -Profile $Profile) "codex-command-runner.exe"
 }
 
 function Get-DesktopEnvironmentRoutingSnapshot {
@@ -3234,7 +3192,7 @@ function Invoke-CodexBuild {
                 $cargoConfigArgs = @("--config", $publishCargoConfigPath)
             }
         }
-        $publishPackages = @("-p", "codex-cli", "-p", "codex-code-mode-host", "-p", "codex-windows-sandbox")
+        $publishPackages = @("-p", "codex-cli", "-p", "codex-code-mode-host")
         $buildArgs = $cargoConfigArgs + @("build") + $publishPackages + @("--profile", $Profile)
         if ($null -ne $pgo) { $buildArgs += @("--target", $pgo.target) }
 
@@ -3261,9 +3219,7 @@ function Invoke-CodexBuild {
         # the paths publish reads.
         foreach ($builtArtifact in @(
                 (Get-BuiltCodexPath -RepoRoot $RepoRoot -Profile $Profile),
-                (Get-BuiltCodeModeHostPath -RepoRoot $RepoRoot -Profile $Profile),
-                (Get-BuiltWindowsSandboxSetupPath -RepoRoot $RepoRoot -Profile $Profile),
-                (Get-BuiltCommandRunnerPath -RepoRoot $RepoRoot -Profile $Profile)
+                (Get-BuiltCodeModeHostPath -RepoRoot $RepoRoot -Profile $Profile)
             )) {
             if (Test-Path -LiteralPath $builtArtifact -PathType Leaf) {
                 Remove-Item -LiteralPath $builtArtifact -Force
@@ -3626,6 +3582,8 @@ function Recover-CodexRuntimeBundleTransaction {
         $script:RunningTargetProcessProbeWarnings = [System.Collections.Generic.List[string]]::new()
         $recoveryPaths = @(
             foreach ($root in @($transaction.InstallDir, $transaction.StageRoot, $transaction.RollbackRoot, $failedRoot)) {
+                # Older journals can still contain sandbox helpers: retain their
+                # process-safety checks during recovery, never build or install them anew.
                 foreach ($relative in @("codex.exe", "codex-code-mode-host.exe", "codex-resources\codex-windows-sandbox-setup.exe", "codex-resources\codex-command-runner.exe")) {
                     Join-Path $root $relative
                 }
@@ -3865,9 +3823,7 @@ else {
 
 $hasExplicitSourceBinary = @(
     $SourceExe,
-    $SourceCodeModeHostExe,
-    $SourceWindowsSandboxSetupExe,
-    $SourceCommandRunnerExe
+    $SourceCodeModeHostExe
 ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1
 $sourceBundle = $null
 # Builds stamp and publish only Cargo's outputs; any other binary must arrive
@@ -3882,8 +3838,6 @@ if (-not [string]::IsNullOrWhiteSpace($SourceBundleManifest)) {
     $sourceBundle = Resolve-SourceBundleManifest -ManifestPath $SourceBundleManifest
     $SourceExe = Resolve-AbsolutePath $sourceBundle.Codex
     $SourceCodeModeHostExe = Resolve-AbsolutePath $sourceBundle.CodeModeHost
-    $SourceWindowsSandboxSetupExe = Resolve-AbsolutePath $sourceBundle.SandboxSetup
-    $SourceCommandRunnerExe = Resolve-AbsolutePath $sourceBundle.CommandRunner
     Write-ProofLine "sourceBundleId" $sourceBundle.BundleId
     Write-ProofLine "sourceBundleVersion" $sourceBundle.Version
     Write-ProofLine "sourceBundleTarget" $sourceBundle.Target
@@ -3892,8 +3846,6 @@ if (-not [string]::IsNullOrWhiteSpace($SourceBundleManifest)) {
 if ($null -eq $sourceBundle) {
     $SourceExe = Get-BuiltCodexPath -RepoRoot $repoRoot -Profile $Profile
     $SourceCodeModeHostExe = Get-BuiltCodeModeHostPath -RepoRoot $repoRoot -Profile $Profile
-    $SourceWindowsSandboxSetupExe = Get-BuiltWindowsSandboxSetupPath -RepoRoot $repoRoot -Profile $Profile
-    $SourceCommandRunnerExe = Get-BuiltCommandRunnerPath -RepoRoot $repoRoot -Profile $Profile
 }
 
 if ([string]::IsNullOrWhiteSpace($BackupDir)) {
@@ -3905,15 +3857,14 @@ else {
 
 $targetPath = Join-Path $InstallDir "codex.exe"
 $codeModeHostTargetPath = Join-Path $InstallDir "codex-code-mode-host.exe"
-$sandboxResourcesDir = Join-Path $InstallDir "codex-resources"
-$windowsSandboxSetupTargetPath = Join-Path $sandboxResourcesDir "codex-windows-sandbox-setup.exe"
-$commandRunnerTargetPath = Join-Path $sandboxResourcesDir "codex-command-runner.exe"
-$bundleTargetPaths = @($targetPath, $codeModeHostTargetPath, $windowsSandboxSetupTargetPath, $commandRunnerTargetPath)
+# Legacy installed helpers are unmanaged carry-forward files, not build inputs.
+# Still protect running old-version children before swapping the install directory.
+$bundleTargetPaths = @($targetPath, $codeModeHostTargetPath,
+    (Join-Path $InstallDir "codex-resources\codex-windows-sandbox-setup.exe"),
+    (Join-Path $InstallDir "codex-resources\codex-command-runner.exe"))
 $backupStamp = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssfffZ")
 $backupPath = Join-Path $BackupDir "codex-$backupStamp.exe"
 $codeModeHostBackupPath = Join-Path $BackupDir "codex-code-mode-host-$backupStamp.exe"
-$windowsSandboxSetupBackupPath = Join-Path $BackupDir "codex-windows-sandbox-setup-$backupStamp.exe"
-$commandRunnerBackupPath = Join-Path $BackupDir "codex-command-runner-$backupStamp.exe"
 $buildStampPath = Get-BuildStampPath -RepoRoot $repoRoot -Profile $Profile
 $installParentForTransaction = Split-Path -Parent ([IO.Path]::GetFullPath($InstallDir))
 $installLeafForTransaction = Split-Path -Leaf ([IO.Path]::GetFullPath($InstallDir))
@@ -3953,9 +3904,7 @@ $buildInputSnapshotBefore = $null
 if ($SkipBuild -and $null -eq $sourceBundle) {
     $rawSkipDecision = Get-AutoSkipBuildDecision `
         -RepoRoot $repoRoot -StampPath $buildStampPath -Profile $Profile `
-        -SourceExe $SourceExe -SourceCodeModeHostExe $SourceCodeModeHostExe `
-        -SourceWindowsSandboxSetupExe $SourceWindowsSandboxSetupExe `
-        -SourceCommandRunnerExe $SourceCommandRunnerExe
+        -SourceExe $SourceExe -SourceCodeModeHostExe $SourceCodeModeHostExe
     Write-ProofLine 'sourceBuildStampValidation' $rawSkipDecision.Reason
     if (-not $rawSkipDecision.CanSkip) {
         throw "SkipBuild requires a current content-bound build stamp or -SourceBundleManifest; timestamps cannot prove build origin. Run $publishCommand. $($rawSkipDecision.Reason)"
@@ -3969,9 +3918,7 @@ if ($AutoSkipBuild -and -not $SkipBuild) {
         -StampPath $buildStampPath `
         -Profile $Profile `
         -SourceExe $SourceExe `
-        -SourceCodeModeHostExe $SourceCodeModeHostExe `
-        -SourceWindowsSandboxSetupExe $SourceWindowsSandboxSetupExe `
-        -SourceCommandRunnerExe $SourceCommandRunnerExe
+        -SourceCodeModeHostExe $SourceCodeModeHostExe
     $buildInputSnapshotBefore = $autoSkipBuildDecision.SourceSnapshot
     if ($autoSkipBuildDecision.CanSkip) {
         $SkipBuild = $true
@@ -4023,8 +3970,6 @@ if (-not $SkipBuild) {
             -SourceFingerprint $buildInputFingerprintAfter `
             -SourceExe $SourceExe `
             -SourceCodeModeHostExe $SourceCodeModeHostExe `
-            -SourceWindowsSandboxSetupExe $SourceWindowsSandboxSetupExe `
-            -SourceCommandRunnerExe $SourceCommandRunnerExe `
             -SourceNewestUtc $builtSourceNewestUtc
         $sourceBuildStampMustRemainValid = $true
         Write-ProofLine "buildStamp" "written: content and artifact hashes recorded"
@@ -4038,8 +3983,6 @@ if ($BuildOnly) {
     Write-ProofLine "buildOnly" "true"
     Write-ProofLine "builtCodexPath" (Get-BuiltCodexPath -RepoRoot $repoRoot -Profile $Profile)
     Write-ProofLine "builtCodeModeHostPath" (Get-BuiltCodeModeHostPath -RepoRoot $repoRoot -Profile $Profile)
-    Write-ProofLine "builtWindowsSandboxSetupPath" (Get-BuiltWindowsSandboxSetupPath -RepoRoot $repoRoot -Profile $Profile)
-    Write-ProofLine "builtCommandRunnerPath" (Get-BuiltCommandRunnerPath -RepoRoot $repoRoot -Profile $Profile)
     Write-ProofLine "buildStampPath" $buildStampPath
     exit 0
 }
@@ -4065,26 +4008,6 @@ if (-not (Test-Path -LiteralPath $SourceCodeModeHostExe -PathType Leaf)) {
 else {
     Write-ProofLine "sourceCodeModeHostMissing" "false"
 }
-Write-ProofLine "sourceWindowsSandboxSetupPath" $SourceWindowsSandboxSetupExe
-if (-not (Test-Path -LiteralPath $SourceWindowsSandboxSetupExe -PathType Leaf)) {
-    if (-not $DryRun) {
-        throw "Source Windows sandbox setup helper does not exist: $SourceWindowsSandboxSetupExe"
-    }
-    Write-ProofLine "sourceWindowsSandboxSetupMissing" "true"
-}
-else {
-    Write-ProofLine "sourceWindowsSandboxSetupMissing" "false"
-}
-Write-ProofLine "sourceCommandRunnerPath" $SourceCommandRunnerExe
-if (-not (Test-Path -LiteralPath $SourceCommandRunnerExe -PathType Leaf)) {
-    if (-not $DryRun) {
-        throw "Source command runner does not exist: $SourceCommandRunnerExe"
-    }
-    Write-ProofLine "sourceCommandRunnerMissing" "true"
-}
-else {
-    Write-ProofLine "sourceCommandRunnerMissing" "false"
-}
 $sourceVersionLines = @(Get-VersionProofLines -Path $SourceExe)
 Write-VersionProofLinesBlock -Prefix "source" -VersionLines $sourceVersionLines
 if ($null -ne $sourceBundle) {
@@ -4092,8 +4015,6 @@ if ($null -ne $sourceBundle) {
 }
 Write-ProofLine "targetPath" $targetPath
 Write-ProofLine "codeModeHostTargetPath" $codeModeHostTargetPath
-Write-ProofLine "windowsSandboxSetupTargetPath" $windowsSandboxSetupTargetPath
-Write-ProofLine "commandRunnerTargetPath" $commandRunnerTargetPath
 Write-ProofLine "targetKind" "local CLI/TUI payload used by Codex Desktop; launching it directly opens a terminal."
 $publishLock = $null
 $desktopRoutingSnapshot = $null
@@ -4111,23 +4032,15 @@ elseif (Test-Path -LiteralPath $publishTransactionJournalPath -PathType Leaf) {
 
 $targetBeforeSha256 = Get-FileSha256 $targetPath
 $codeModeHostTargetBeforeSha256 = Get-FileSha256 $codeModeHostTargetPath
-$windowsSandboxSetupTargetBeforeSha256 = Get-FileSha256 $windowsSandboxSetupTargetPath
-$commandRunnerTargetBeforeSha256 = Get-FileSha256 $commandRunnerTargetPath
 Write-ProofLine "targetBeforeSha256" $targetBeforeSha256
 Write-ProofLine "codeModeHostTargetBeforeSha256" $codeModeHostTargetBeforeSha256
-Write-ProofLine "windowsSandboxSetupTargetBeforeSha256" $windowsSandboxSetupTargetBeforeSha256
-Write-ProofLine "commandRunnerTargetBeforeSha256" $commandRunnerTargetBeforeSha256
 $sourceSha256Mode = "hashed"
 $sourceSha256 = Get-CachedLocalPublishFileSha256 -Path $SourceExe -ForceRefresh
 $sourceCodeModeHostSha256 = Get-CachedLocalPublishFileSha256 -Path $SourceCodeModeHostExe -ForceRefresh
-$sourceWindowsSandboxSetupSha256 = Get-CachedLocalPublishFileSha256 -Path $SourceWindowsSandboxSetupExe -ForceRefresh
-$sourceCommandRunnerSha256 = Get-CachedLocalPublishFileSha256 -Path $SourceCommandRunnerExe -ForceRefresh
 if ($null -ne $sourceBundle) {
     $observedRoleDigests = @{
         "entrypoint" = $sourceSha256
         "code-mode-host" = $sourceCodeModeHostSha256
-        "sandbox-setup" = $sourceWindowsSandboxSetupSha256
-        "command-runner" = $sourceCommandRunnerSha256
     }
     foreach ($role in $observedRoleDigests.Keys) {
         if ($observedRoleDigests[$role] -cne $sourceBundle.RoleDigests[$role]) {
@@ -4138,8 +4051,6 @@ if ($null -ne $sourceBundle) {
 Write-ProofLine "sourceSha256Mode" $sourceSha256Mode
 Write-ProofLine "sourceSha256" $sourceSha256
 Write-ProofLine "sourceCodeModeHostSha256" $sourceCodeModeHostSha256
-Write-ProofLine "sourceWindowsSandboxSetupSha256" $sourceWindowsSandboxSetupSha256
-Write-ProofLine "sourceCommandRunnerSha256" $sourceCommandRunnerSha256
 # Manifest bundles have their own version/target/digest proof; local Cargo
 # inputs and build stamps cannot qualify (or invalidate) those external bytes.
 $finalBuildInputSnapshot = if ($null -eq $sourceBundle -and ($SkipBuild -or $sourceBuildStampMustRemainValid)) {
@@ -4158,21 +4069,13 @@ else {
 }
 $sourceLastWriteUtc = Get-FileLastWriteUtc $SourceExe
 $sourceCodeModeHostLastWriteUtc = Get-FileLastWriteUtc $SourceCodeModeHostExe
-$sourceWindowsSandboxSetupLastWriteUtc = Get-FileLastWriteUtc $SourceWindowsSandboxSetupExe
-$sourceCommandRunnerLastWriteUtc = Get-FileLastWriteUtc $SourceCommandRunnerExe
 $targetBeforeLastWriteUtc = Get-FileLastWriteUtc $targetPath
 $codeModeHostTargetBeforeLastWriteUtc = Get-FileLastWriteUtc $codeModeHostTargetPath
-$windowsSandboxSetupTargetBeforeLastWriteUtc = Get-FileLastWriteUtc $windowsSandboxSetupTargetPath
-$commandRunnerTargetBeforeLastWriteUtc = Get-FileLastWriteUtc $commandRunnerTargetPath
 Write-ProofLine "sourceTreeNewestWriteUtc" (Format-UtcTimestamp $sourceTreeNewestUtc)
 Write-ProofLine "sourceLastWriteUtc" (Format-UtcTimestamp $sourceLastWriteUtc)
 Write-ProofLine "sourceCodeModeHostLastWriteUtc" (Format-UtcTimestamp $sourceCodeModeHostLastWriteUtc)
-Write-ProofLine "sourceWindowsSandboxSetupLastWriteUtc" (Format-UtcTimestamp $sourceWindowsSandboxSetupLastWriteUtc)
-Write-ProofLine "sourceCommandRunnerLastWriteUtc" (Format-UtcTimestamp $sourceCommandRunnerLastWriteUtc)
 Write-ProofLine "targetBeforeLastWriteUtc" (Format-UtcTimestamp $targetBeforeLastWriteUtc)
 Write-ProofLine "codeModeHostTargetBeforeLastWriteUtc" (Format-UtcTimestamp $codeModeHostTargetBeforeLastWriteUtc)
-Write-ProofLine "windowsSandboxSetupTargetBeforeLastWriteUtc" (Format-UtcTimestamp $windowsSandboxSetupTargetBeforeLastWriteUtc)
-Write-ProofLine "commandRunnerTargetBeforeLastWriteUtc" (Format-UtcTimestamp $commandRunnerTargetBeforeLastWriteUtc)
 $sourceBuildFreshnessProvenByStamp = $false
 $sourceBuildStampInvalidated = $false
 $sourceBuildStaleByStamp = $false
@@ -4183,8 +4086,6 @@ if ($null -eq $sourceBundle -and ($SkipBuild -or $sourceBuildStampMustRemainVali
         -Profile $Profile `
         -SourceExe $SourceExe `
         -SourceCodeModeHostExe $SourceCodeModeHostExe `
-        -SourceWindowsSandboxSetupExe $SourceWindowsSandboxSetupExe `
-        -SourceCommandRunnerExe $SourceCommandRunnerExe `
         -SourceSnapshot $finalBuildInputSnapshot
     Write-ProofLine "sourceBuildStampValidation" $finalBuildStampDecision.Reason
     if ($finalBuildStampDecision.CanSkip) {
@@ -4202,22 +4103,16 @@ if ($null -eq $sourceBundle -and ($SkipBuild -or $sourceBuildStampMustRemainVali
 if ($sourceBuildFreshnessProvenByStamp) {
     $codexSourceBuildStale = $false
     $codeModeHostSourceBuildStale = $false
-    $windowsSandboxSetupSourceBuildStale = $false
-    $commandRunnerSourceBuildStale = $false
     Write-ProofLine "sourceBuildFreshnessBasis" "content-bound build stamp"
 }
 elseif ($null -ne $sourceBundle) {
     $codexSourceBuildStale = $false
     $codeModeHostSourceBuildStale = $false
-    $windowsSandboxSetupSourceBuildStale = $false
-    $commandRunnerSourceBuildStale = $false
     Write-ProofLine "sourceBuildFreshnessBasis" "digest-bound source bundle manifest"
 }
 elseif ($sourceBuildStampInvalidated -or $sourceBuildStaleByStamp) {
     $codexSourceBuildStale = $true
     $codeModeHostSourceBuildStale = $true
-    $windowsSandboxSetupSourceBuildStale = $true
-    $commandRunnerSourceBuildStale = $true
     Write-ProofLine "sourceBuildFreshnessBasis" $(if ($sourceBuildStampInvalidated) { "content-bound build stamp invalidated before publish" } else { "content-bound build stamp from different publish inputs" })
 }
 else {
@@ -4227,19 +4122,11 @@ else {
     $codeModeHostSourceBuildStale = Test-FileStaleAgainstSource `
         -SourceNewestUtc $sourceTreeNewestUtc `
         -FileLastWriteUtc $sourceCodeModeHostLastWriteUtc
-    $windowsSandboxSetupSourceBuildStale = Test-FileStaleAgainstSource `
-        -SourceNewestUtc $sourceTreeNewestUtc `
-        -FileLastWriteUtc $sourceWindowsSandboxSetupLastWriteUtc
-    $commandRunnerSourceBuildStale = Test-FileStaleAgainstSource `
-        -SourceNewestUtc $sourceTreeNewestUtc `
-        -FileLastWriteUtc $sourceCommandRunnerLastWriteUtc
-    Write-ProofLine "sourceBuildFreshnessBasis" "source/artifact timestamps"
+            Write-ProofLine "sourceBuildFreshnessBasis" "source/artifact timestamps"
 }
-$sourceBuildStale = $codexSourceBuildStale -or $codeModeHostSourceBuildStale -or $windowsSandboxSetupSourceBuildStale -or $commandRunnerSourceBuildStale
+$sourceBuildStale = $codexSourceBuildStale -or $codeModeHostSourceBuildStale
 Write-ProofLine "codexSourceBuildStale" $codexSourceBuildStale
 Write-ProofLine "codeModeHostSourceBuildStale" $codeModeHostSourceBuildStale
-Write-ProofLine "windowsSandboxSetupSourceBuildStale" $windowsSandboxSetupSourceBuildStale
-Write-ProofLine "commandRunnerSourceBuildStale" $commandRunnerSourceBuildStale
 Write-ProofLine "sourceBuildStale" $sourceBuildStale
 if ($sourceBuildStale) {
     Write-ProofLine "sourceBuildStaleRemedy" "Run $publishCommand, then restart Codex Desktop."
@@ -4250,17 +4137,9 @@ $codexTargetBeforeStale = Test-FileStaleAgainstSource `
 $codeModeHostTargetBeforeStale = Test-FileStaleAgainstSource `
     -SourceNewestUtc $sourceCodeModeHostLastWriteUtc `
     -FileLastWriteUtc $codeModeHostTargetBeforeLastWriteUtc
-$windowsSandboxSetupTargetBeforeStale = Test-FileStaleAgainstSource `
-    -SourceNewestUtc $sourceWindowsSandboxSetupLastWriteUtc `
-    -FileLastWriteUtc $windowsSandboxSetupTargetBeforeLastWriteUtc
-$commandRunnerTargetBeforeStale = Test-FileStaleAgainstSource `
-    -SourceNewestUtc $sourceCommandRunnerLastWriteUtc `
-    -FileLastWriteUtc $commandRunnerTargetBeforeLastWriteUtc
-$targetBeforeStale = $codexTargetBeforeStale -or $codeModeHostTargetBeforeStale -or $windowsSandboxSetupTargetBeforeStale -or $commandRunnerTargetBeforeStale
+$targetBeforeStale = $codexTargetBeforeStale -or $codeModeHostTargetBeforeStale
 Write-ProofLine "codexTargetBeforeStale" $codexTargetBeforeStale
 Write-ProofLine "codeModeHostTargetBeforeStale" $codeModeHostTargetBeforeStale
-Write-ProofLine "windowsSandboxSetupTargetBeforeStale" $windowsSandboxSetupTargetBeforeStale
-Write-ProofLine "commandRunnerTargetBeforeStale" $commandRunnerTargetBeforeStale
 Write-ProofLine "targetBeforeStale" $targetBeforeStale
 if ($targetBeforeStale) {
     Write-ProofLine "targetBeforeStaleRemedy" "Run $publishCommand, then restart Codex Desktop."
@@ -4283,8 +4162,6 @@ if ($script:RunningTargetProcessProbeWarnings.Count -gt 0) {
 
 $targetExists = Test-Path -LiteralPath $targetPath -PathType Leaf
 $codeModeHostTargetExists = Test-Path -LiteralPath $codeModeHostTargetPath -PathType Leaf
-$windowsSandboxSetupTargetExists = Test-Path -LiteralPath $windowsSandboxSetupTargetPath -PathType Leaf
-$commandRunnerTargetExists = Test-Path -LiteralPath $commandRunnerTargetPath -PathType Leaf
 $codexBinaryChanged = -not (
     $targetExists -and
     $sourceSha256 -ne "<missing>" -and
@@ -4299,21 +4176,9 @@ $codeModeHostBinaryChanged = -not (
         [System.StringComparison]::OrdinalIgnoreCase
     )
 )
-$windowsSandboxSetupBinaryChanged = -not (
-    $windowsSandboxSetupTargetExists -and
-    $sourceWindowsSandboxSetupSha256 -ne "<missing>" -and
-    [string]::Equals($sourceWindowsSandboxSetupSha256, $windowsSandboxSetupTargetBeforeSha256, [System.StringComparison]::OrdinalIgnoreCase)
-)
-$commandRunnerBinaryChanged = -not (
-    $commandRunnerTargetExists -and
-    $sourceCommandRunnerSha256 -ne "<missing>" -and
-    [string]::Equals($sourceCommandRunnerSha256, $commandRunnerTargetBeforeSha256, [System.StringComparison]::OrdinalIgnoreCase)
-)
-$binaryChanged = $codexBinaryChanged -or $codeModeHostBinaryChanged -or $windowsSandboxSetupBinaryChanged -or $commandRunnerBinaryChanged
+$binaryChanged = $codexBinaryChanged -or $codeModeHostBinaryChanged
 Write-ProofLine "codexBinaryChanged" $(if ($codexBinaryChanged) { "true" } else { "false" })
 Write-ProofLine "codeModeHostBinaryChanged" $(if ($codeModeHostBinaryChanged) { "true" } else { "false" })
-Write-ProofLine "windowsSandboxSetupBinaryChanged" $(if ($windowsSandboxSetupBinaryChanged) { "true" } else { "false" })
-Write-ProofLine "commandRunnerBinaryChanged" $(if ($commandRunnerBinaryChanged) { "true" } else { "false" })
 Write-ProofLine "binaryChanged" $(if ($binaryChanged) { "true" } else { "false" })
 if (
     $binaryChanged -and
@@ -4360,18 +4225,6 @@ if ($codeModeHostTargetExists) {
 }
 else {
     Write-ProofLine "codeModeHostBackupPath" "<none: target missing>"
-}
-if ($windowsSandboxSetupTargetExists) {
-    Write-ProofLine "windowsSandboxSetupBackupPath" $windowsSandboxSetupBackupPath
-}
-else {
-    Write-ProofLine "windowsSandboxSetupBackupPath" "<none: target missing>"
-}
-if ($commandRunnerTargetExists) {
-    Write-ProofLine "commandRunnerBackupPath" $commandRunnerBackupPath
-}
-else {
-    Write-ProofLine "commandRunnerBackupPath" "<none: target missing>"
 }
 
 $turnHostProcess = $null
@@ -4534,12 +4387,8 @@ if (-not $binaryChanged) {
     Write-ProofLine "replace" "skipped: target already current"
     Write-ProofLine "targetSha256" $targetBeforeSha256
     Write-ProofLine "codeModeHostTargetSha256" $codeModeHostTargetBeforeSha256
-    Write-ProofLine "windowsSandboxSetupTargetSha256" $windowsSandboxSetupTargetBeforeSha256
-    Write-ProofLine "commandRunnerTargetSha256" $commandRunnerTargetBeforeSha256
     Write-ProofLine "backupSha256" "<none: target already current>"
     Write-ProofLine "codeModeHostBackupSha256" "<none: target already current>"
-    Write-ProofLine "windowsSandboxSetupBackupSha256" "<none: target already current>"
-    Write-ProofLine "commandRunnerBackupSha256" "<none: target already current>"
     Write-ProofLine "restartRequired" $(if ($frontendChanged -or $desktopRoutingResult.RestartRequired) { "true" } else { "false" })
 
     $publishCommitted = $true
@@ -4569,9 +4418,7 @@ if ($sourceBuildFreshnessProvenByStamp) {
         -StampPath $buildStampPath `
         -Profile $Profile `
         -SourceExe $SourceExe `
-        -SourceCodeModeHostExe $SourceCodeModeHostExe `
-        -SourceWindowsSandboxSetupExe $SourceWindowsSandboxSetupExe `
-        -SourceCommandRunnerExe $SourceCommandRunnerExe
+        -SourceCodeModeHostExe $SourceCodeModeHostExe
     Write-ProofLine "sourceBuildStampPublishGate" "runtime bundle: $($publishGateDecision.Reason)"
     if (-not $publishGateDecision.CanSkip) {
         throw "The content-bound build stamp no longer matches the source bundle immediately before publishing the runtime bundle. Rerun $publishCommand."
@@ -4583,8 +4430,6 @@ try {
         -JournalPath $publishTransactionJournalPath `
         -InstallDir $InstallDir `
         -Entries @(
-            [pscustomobject]@{ Name = "commandRunner"; SourcePath = $SourceCommandRunnerExe; ExpectedSha256 = $sourceCommandRunnerSha256; TargetPath = $commandRunnerTargetPath; BackupPath = $commandRunnerBackupPath; HadPreviousTarget = $commandRunnerTargetExists; Changed = $commandRunnerBinaryChanged }
-            [pscustomobject]@{ Name = "windowsSandboxSetup"; SourcePath = $SourceWindowsSandboxSetupExe; ExpectedSha256 = $sourceWindowsSandboxSetupSha256; TargetPath = $windowsSandboxSetupTargetPath; BackupPath = $windowsSandboxSetupBackupPath; HadPreviousTarget = $windowsSandboxSetupTargetExists; Changed = $windowsSandboxSetupBinaryChanged }
             [pscustomobject]@{ Name = "codeModeHost"; SourcePath = $SourceCodeModeHostExe; ExpectedSha256 = $sourceCodeModeHostSha256; TargetPath = $codeModeHostTargetPath; BackupPath = $codeModeHostBackupPath; HadPreviousTarget = $codeModeHostTargetExists; Changed = $codeModeHostBinaryChanged }
             [pscustomobject]@{ Name = "codex"; SourcePath = $SourceExe; ExpectedSha256 = $sourceSha256; TargetPath = $targetPath; BackupPath = $backupPath; HadPreviousTarget = $targetExists; Changed = $codexBinaryChanged }
         )
@@ -4601,8 +4446,6 @@ try {
     Write-ProofLine "postPublishVerify" "version ok"
     $targetSha256 = Get-FileSha256 $targetPath
     $codeModeHostTargetSha256 = Get-FileSha256 $codeModeHostTargetPath
-    $windowsSandboxSetupTargetSha256 = Get-FileSha256 $windowsSandboxSetupTargetPath
-    $commandRunnerTargetSha256 = Get-FileSha256 $commandRunnerTargetPath
     if (-not [string]::Equals(
             $sourceSha256,
             $targetSha256,
@@ -4619,26 +4462,8 @@ try {
         throw "Published code-mode host failed SHA-256 verification."
     }
     Write-ProofLine "codeModeHostPostPublishVerify" "sha256 ok"
-    if (-not [string]::Equals(
-            $sourceWindowsSandboxSetupSha256,
-            $windowsSandboxSetupTargetSha256,
-            [System.StringComparison]::OrdinalIgnoreCase
-        )) {
-        throw "Published Windows sandbox setup helper failed SHA-256 verification."
-    }
-    Write-ProofLine "windowsSandboxSetupPostPublishVerify" "sha256 ok"
-    if (-not [string]::Equals(
-            $sourceCommandRunnerSha256,
-            $commandRunnerTargetSha256,
-            [System.StringComparison]::OrdinalIgnoreCase
-        )) {
-        throw "Published command runner failed SHA-256 verification."
-    }
-    Write-ProofLine "commandRunnerPostPublishVerify" "sha256 ok"
     Write-ProofLine "targetSha256" $targetSha256
     Write-ProofLine "codeModeHostTargetSha256" $codeModeHostTargetSha256
-    Write-ProofLine "windowsSandboxSetupTargetSha256" $windowsSandboxSetupTargetSha256
-    Write-ProofLine "commandRunnerTargetSha256" $commandRunnerTargetSha256
     if (-not $codexBinaryChanged) {
         Write-ProofLine "backupSha256" "<none: target already current>"
     }
@@ -4658,26 +4483,6 @@ try {
     else {
         Write-ProofLine "codeModeHostBackupSha256" $codeModeHostTargetBeforeSha256
         Write-ProofLine "codeModeHostRollbackCommand" "Copy-Item -LiteralPath `"$codeModeHostBackupPath`" -Destination `"$codeModeHostTargetPath`" -Force"
-    }
-    if (-not $windowsSandboxSetupBinaryChanged) {
-        Write-ProofLine "windowsSandboxSetupBackupSha256" "<none: target already current>"
-    }
-    elseif (-not $windowsSandboxSetupTargetExists) {
-        Write-ProofLine "windowsSandboxSetupBackupSha256" "<none: target missing>"
-    }
-    else {
-        Write-ProofLine "windowsSandboxSetupBackupSha256" $windowsSandboxSetupTargetBeforeSha256
-        Write-ProofLine "windowsSandboxSetupRollbackCommand" "Copy-Item -LiteralPath `"$windowsSandboxSetupBackupPath`" -Destination `"$windowsSandboxSetupTargetPath`" -Force"
-    }
-    if (-not $commandRunnerBinaryChanged) {
-        Write-ProofLine "commandRunnerBackupSha256" "<none: target already current>"
-    }
-    elseif (-not $commandRunnerTargetExists) {
-        Write-ProofLine "commandRunnerBackupSha256" "<none: target missing>"
-    }
-    else {
-        Write-ProofLine "commandRunnerBackupSha256" $commandRunnerTargetBeforeSha256
-        Write-ProofLine "commandRunnerRollbackCommand" "Copy-Item -LiteralPath `"$commandRunnerBackupPath`" -Destination `"$commandRunnerTargetPath`" -Force"
     }
     Write-ProofLine "restartRequired" "true"
     Write-ProofLine "restart" "Restart Codex Desktop from the Start menu or desktopAppLaunchCommand; do not launch targetPath directly."
@@ -4716,13 +4521,9 @@ if ($RestartDesktop) {
 
 $protectedBackupPath = if ($targetExists) { $backupPath } else { $null }
 $protectedCodeModeHostBackupPath = if ($codeModeHostTargetExists) { $codeModeHostBackupPath } else { $null }
-$protectedWindowsSandboxSetupBackupPath = if ($windowsSandboxSetupTargetExists) { $windowsSandboxSetupBackupPath } else { $null }
-$protectedCommandRunnerBackupPath = if ($commandRunnerTargetExists) { $commandRunnerBackupPath } else { $null }
 $backupPruneSpecs = @(
     @{ ArtifactName = "codex"; ProtectedPath = $protectedBackupPath },
-    @{ ArtifactName = "codex-code-mode-host"; ProtectedPath = $protectedCodeModeHostBackupPath },
-    @{ ArtifactName = "codex-windows-sandbox-setup"; ProtectedPath = $protectedWindowsSandboxSetupBackupPath },
-    @{ ArtifactName = "codex-command-runner"; ProtectedPath = $protectedCommandRunnerBackupPath }
+    @{ ArtifactName = "codex-code-mode-host"; ProtectedPath = $protectedCodeModeHostBackupPath }
 )
 foreach ($backupPruneSpec in $backupPruneSpecs) {
     try {
@@ -4738,7 +4539,7 @@ foreach ($backupPruneSpec in $backupPruneSpecs) {
 
 if (-not $Concise -or $VerbosePreference -eq "Continue") {
     Write-Output "Restart Codex Desktop from the Start menu or run: $(Get-CodexDesktopLaunchCommand)"
-    Write-Output "Published codex.exe, codex-code-mode-host.exe, and Windows sandbox helpers as one local runtime bundle."
+    Write-Output "Published codex.exe and codex-code-mode-host.exe as one local runtime bundle."
     Write-Output "Do not launch targetPath directly; it is the CLI/TUI payload and opens a terminal."
 }
 elseif (-not $RestartDesktop) {

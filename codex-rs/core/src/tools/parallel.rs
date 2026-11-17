@@ -352,6 +352,7 @@ pub(crate) struct WorkspaceExecutionCoordinator {
 
 tokio::task_local! {
     static HOOK_WORKSPACE_LEASE: Option<Arc<OwnedRwLockWriteGuard<()>>>;
+    static PRE_HOOK_DISPATCH: ();
 }
 
 /// Arbitrary command hooks have unknown effects. Keep their lease and mutation
@@ -392,6 +393,7 @@ pub(crate) async fn run_workspace_hook_with_receipt<T: Send + 'static>(
     work: impl std::future::Future<Output = T> + Send + 'static,
 ) -> Result<(T, Option<WorkspaceHookMutationReceipt>), FunctionCallError> {
     let inherited = HOOK_WORKSPACE_LEASE.try_with(Clone::clone).ok().flatten();
+    let pre_hook_dispatch = PRE_HOOK_DISPATCH.try_with(|_| ()).is_ok();
     let user_intent = HOOK_USER_INTENT.try_with(Clone::clone).ok().flatten();
     let commit = session.retain_tool_dispatch_commit();
     let terminal_tasks = session.terminal_tasks.clone();
@@ -399,11 +401,25 @@ pub(crate) async fn run_workspace_hook_with_receipt<T: Send + 'static>(
         let _commit = commit;
         close_read_cohort(&turn.workspace_execution_coordinator.global_gate_holders);
         let coordinator = &turn.workspace_execution_coordinator;
+        let mut permit = None;
         let _lease = match inherited {
             Some(lease) => lease,
-            None => tokio::select! {
-                lease = Arc::clone(&coordinator.parallel_execution).write_owned() => Arc::new(lease),
-                _ = cancellation.cancelled() => return Err(FunctionCallError::RespondToModel("hook cancelled before execution".into())),
+            None => {
+                let acquire = async {
+                    if pre_hook_dispatch {
+                        let lease = session.services.elicitations.acquire_while_dispatch_clear(
+                            &mut permit,
+                            || Arc::clone(&coordinator.parallel_execution).write_owned(),
+                        ).await;
+                        lease
+                    } else {
+                        Arc::clone(&coordinator.parallel_execution).write_owned().await
+                    }
+                };
+                tokio::select! {
+                    lease = acquire => Arc::new(lease),
+                    _ = cancellation.cancelled() => return Err(FunctionCallError::RespondToModel("hook cancelled before execution".into())),
+                }
             },
         };
         if cancellation.is_cancelled() {
@@ -414,9 +430,21 @@ pub(crate) async fn run_workspace_hook_with_receipt<T: Send + 'static>(
         // the synchronous input fence across execution or storage work.
         admit_code_mode_user_intent(&session, user_intent.as_ref(), || ())?;
         let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+        let mut hook = Box::pin(futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
             codex_hooks::observe_command_effects(Arc::clone(&entered), work),
-        )).await;
+        )));
+        // Like handler admission, hook entry is its first poll, not future
+        // construction. Keep the reservation until that boundary so a hold
+        // cannot acknowledge between workspace acquisition and hook entry.
+        let first_poll = std::future::poll_fn(|cx| {
+            let result = std::future::Future::poll(hook.as_mut(), cx);
+            drop(permit.take());
+            std::task::Poll::Ready(result)
+        }).await;
+        let result = match first_poll {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => hook.await,
+        };
         let mutation_receipt = if entered.load(std::sync::atomic::Ordering::Acquire) {
             let mut tracker = tracker.lock().await;
             let before_revision = tracker.current_mutation_revision();
@@ -2309,6 +2337,8 @@ impl ToolCallRuntime {
         let measurement_tool_name = call.tool_name.to_string();
         let mut dispatch_handle: AbortOnDropHandle<Result<AnyToolResult, FunctionCallError>> =
             AbortOnDropHandle::new(tokio::spawn(crate::tools::tool_dispatch_trace::scope_tool_blocking_timing(Arc::clone(&timing), Box::pin(async move {
+                // Reserve before hooks or any workspace gate; cancellation drops the permit.
+                drop(session.services.elicitations.reserve_dispatch().await);
                 let admission_tool_name = router.semantic_tool_name(&dispatch_call.tool_name);
                 let (admission, mut read_only) = match workspace_admission_hint {
                     Some(classification) => classification,
@@ -2344,7 +2374,7 @@ impl ToolCallRuntime {
                         .filter(|classification| classification.observes_workspace)
                         .map(|classification| classification.source_dependencies.clone())
                 });
-                let (dispatch_call, hook_notice) = HOOK_USER_INTENT
+                let (dispatch_call, hook_notice) = PRE_HOOK_DISPATCH.scope((), HOOK_USER_INTENT
                     .scope(
                         code_mode_user_intent.clone(),
                         scope_tool_dispatch_timing(
@@ -2362,8 +2392,9 @@ impl ToolCallRuntime {
                                 payload: dispatch_call.payload,
                             }),
                         ),
-                    )
+                    ))
                     .await?;
+                let mut pending_dispatch = Some(session.services.elicitations.reserve_dispatch().await);
                 let hook_rewrote_input = hook_notice.is_some();
                 let evidence_call = dispatch_call.clone();
                 let admission_tool_name = router.semantic_tool_name(&dispatch_call.tool_name);
@@ -2466,13 +2497,10 @@ impl ToolCallRuntime {
                     && !router.delegates_workspace_admission(&evidence_call)
                 {
                     close_read_cohort(&global_gate_holders);
-                    Some(Arc::new(
-                        acquire_exclusive_workspace_gate(
-                                Arc::clone(&lock),
-                                &turn.turn_timing_state,
-                            )
-                            .await,
-                    ))
+                    Some(Arc::new(session.services.elicitations.acquire_while_dispatch_clear(
+                        &mut pending_dispatch,
+                        || acquire_exclusive_workspace_gate(Arc::clone(&lock), &turn.turn_timing_state),
+                    ).await))
                 } else {
                     None
                 };
@@ -2533,16 +2561,40 @@ impl ToolCallRuntime {
                 } else if workspace_admission.bypass_outer_gate {
                     None
                 } else {
+                    // If a hold interrupts a queued scoped acquisition, retry
+                    // conservatively under the global gate after release. The
+                    // hook has already run and must never be replayed.
+                    let fallback_admission = WorkspaceAdmissionPlan {
+                        native_additions: None,
+                        native_read_cohort: false,
+                        bypass_outer_gate: false,
+                        resource_key: None,
+                        shared_resource: false,
+                        supports_parallel: false,
+                        workspace_capable: true,
+                    };
+                    let mut first_admission = Some(workspace_admission);
                     Some(
-                        match acquire_workspace_gate_for_call(
+                        match session.services.elicitations.acquire_while_dispatch_clear(
+                            &mut pending_dispatch,
+                            || acquire_workspace_gate_for_call(
                                 Arc::clone(&lock),
                                 Arc::clone(&workspace_execution),
-                                workspace_admission,
+                                first_admission.take().unwrap_or_else(|| WorkspaceAdmissionPlan {
+                                    native_additions: None,
+                                    native_read_cohort: fallback_admission.native_read_cohort,
+                                    bypass_outer_gate: fallback_admission.bypass_outer_gate,
+                                    resource_key: None,
+                                    shared_resource: fallback_admission.shared_resource,
+                                    supports_parallel: fallback_admission.supports_parallel,
+                                    workspace_capable: fallback_admission.workspace_capable,
+                                }),
                                 &turn.turn_timing_state,
                                 &global_gate_holders,
                                 &dispatch_call,
                                 &source,
-                            )
+                            ),
+                        )
                             .await
                         {
                             Ok(guard) => guard,
@@ -2690,7 +2742,7 @@ impl ToolCallRuntime {
 
                 // Keep the handler future out of every task-local/join wrapper's
                 // inline state; large handler variants otherwise exhaust a worker stack.
-                let dispatch = Box::pin(router.dispatch_tool_call_with_terminal_outcome(
+                let dispatch = Box::pin(crate::elicitation::scope_pending_dispatch(pending_dispatch.expect("dispatch reservation missing"), router.dispatch_tool_call_with_terminal_outcome(
                     Arc::clone(&session),
                     Arc::clone(&step_context),
                     invocation_cancellation_token,
@@ -2698,7 +2750,7 @@ impl ToolCallRuntime {
                     dispatch_call,
                     source,
                     router_dispatch_state,
-                ))
+                )))
                 .instrument(dispatch_span.clone());
                 let dispatch =
                     crate::tools::registry::with_prepared_hook_input(hook_notice, dispatch);

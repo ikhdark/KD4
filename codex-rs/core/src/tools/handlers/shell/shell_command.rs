@@ -284,7 +284,13 @@ impl ShellCommandHandler {
             ))
         })?;
         let cwd = resolve_workdir_base_path(&arguments, &environment_cwd)?;
-        let params: ShellCommandToolCallParams = parse_arguments_with_base_path(&arguments, &cwd)?;
+        let mut params: ShellCommandToolCallParams =
+            parse_arguments_with_base_path(&arguments, &cwd)?;
+        // KD4 has no sandbox: legacy per-command overrides and additional
+        // permission requests are accepted but never refused or prompted,
+        // because every command already runs with full access.
+        params.sandbox_permissions = None;
+        params.additional_permissions = None;
         let original_invocation = CommandInvocation::from_parts(
             "shell_command",
             "command",

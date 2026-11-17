@@ -10,39 +10,19 @@ use tokio::process::Child;
 use tokio::process::Command;
 use tracing::trace;
 
-use codex_protocol::permissions::NetworkSandboxPolicy;
-
-/// Experimental environment variable that will be set to some non-empty value
-/// if both of the following are true:
-///
-/// 1. The process was spawned by Codex as part of a shell tool call.
-/// 2. NetworkSandboxPolicy is restricted for the tool call.
-///
-/// We may try to have just one environment variable for all sandboxing
-/// attributes, so this may change in the future.
-pub const CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR: &str = "CODEX_SANDBOX_NETWORK_DISABLED";
-
-/// Set when the process is spawned under the Windows restricted-token sandbox.
-pub const CODEX_SANDBOX_ENV_VAR: &str = "CODEX_SANDBOX";
-
 #[derive(Debug, Clone, Copy)]
 pub enum StdioPolicy {
     RedirectForShellTool,
 }
 
-/// Spawns the appropriate child process for the exec params and sandbox settings,
-/// ensuring the args and environment variables used to create the `Command`
-/// (and `Child`) honor the configuration.
-///
-/// For now, we take `NetworkSandboxPolicy` as a parameter to spawn_child()
-/// because we need to determine whether to set the
-/// `CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR` environment variable.
+/// Spawns the child process for the exec params, ensuring the args and
+/// environment variables used to create the `Command` (and `Child`) honor the
+/// configuration. KD4 has no sandbox, so no sandbox environment is injected.
 pub(crate) struct SpawnChildRequest<'a> {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub arg0: Option<&'a str>,
     pub cwd: AbsolutePathBuf,
-    pub network_sandbox_policy: NetworkSandboxPolicy,
     pub stdio_policy: StdioPolicy,
     pub env: HashMap<String, String>,
 
@@ -57,23 +37,12 @@ pub(crate) async fn spawn_child_with_observation_async(
         args,
         arg0,
         cwd,
-        network_sandbox_policy,
         stdio_policy,
-        mut env,
+        env,
         creation_flags,
     } = request;
 
-
-    apply_network_sandbox_policy_to_env(&mut env, network_sandbox_policy);
-    trace_spawn_child(
-        &program,
-        &args,
-        arg0,
-        &cwd,
-        network_sandbox_policy,
-        stdio_policy,
-        &env,
-    );
+    trace_spawn_child(&program, &args, arg0, &cwd, stdio_policy, &env);
 
     let mut cmd = Command::new(&program);
     let _ = arg0;
@@ -111,25 +80,11 @@ pub(crate) async fn spawn_child_with_observation_async(
     .await
 }
 
-fn apply_network_sandbox_policy_to_env(
-    env: &mut HashMap<String, String>,
-    network_sandbox_policy: NetworkSandboxPolicy,
-) {
-    env.retain(|key, _| !key.eq_ignore_ascii_case(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR));
-    if !network_sandbox_policy.is_enabled() {
-        env.insert(
-            CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR.to_string(),
-            "1".to_string(),
-        );
-    }
-}
-
 fn trace_spawn_child(
     program: &PathBuf,
     args: &[String],
     arg0: Option<&str>,
     cwd: &AbsolutePathBuf,
-    network_sandbox_policy: NetworkSandboxPolicy,
     stdio_policy: StdioPolicy,
     env: &HashMap<String, String>,
 ) {
@@ -140,7 +95,6 @@ fn trace_spawn_child(
         args_len = args.len(),
         ?arg0,
         ?cwd,
-        ?network_sandbox_policy,
         ?stdio_policy,
         env_count = env.len(),
         "spawn_child_async"

@@ -262,12 +262,11 @@ pub struct ThreadSettingsUpdateParams {
     #[experimental(nested)]
     #[ts(optional = nullable)]
     pub approval_policy: Option<AskForApproval>,
-    /// Override the sandbox policy for subsequent turns.
+    /// Legacy compatibility selection; KD4 always executes with full access.
     #[ts(optional = nullable)]
     pub sandbox_policy: Option<SandboxPolicy>,
-    /// Exact permission profile for subsequent turns. When both this and the
-    /// legacy `sandboxPolicy` projection are present, this field is
-    /// authoritative.
+    /// Compatibility permission profile, normalized to full access by KD4.
+    /// Does not bypass the independent approval policy.
     #[experimental("thread/settings/update.permissionProfile")]
     #[serde(default)]
     #[ts(optional = nullable)]
@@ -768,6 +767,9 @@ pub enum ThreadUnsubscribeStatus {
 pub struct ThreadIncrementElicitationParams {
     /// Thread on which a connection-owned out-of-band elicitation lease should be acquired.
     pub thread_id: String,
+    /// Also hold new tool handler admissions until this lease is released.
+    #[serde(default)]
+    pub hold_dispatch: bool,
 }
 
 /// Response for `thread/incrementElicitation`.
@@ -913,8 +915,8 @@ pub struct ThreadShellCommandParams {
     pub thread_id: String,
     /// Shell command string evaluated by the thread's configured shell.
     /// Unlike `command/exec`, this intentionally preserves shell syntax
-    /// such as pipes, redirects, and quoting. This runs unsandboxed with full
-    /// access rather than inheriting the thread sandbox policy.
+    /// such as pipes, redirects, and quoting. Like other KD4 execution, this
+    /// runs unsandboxed with full access.
     pub command: String,
 }
 

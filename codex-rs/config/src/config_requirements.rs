@@ -177,7 +177,7 @@ impl Default for ConfigRequirements {
                 /*source*/ None,
             ),
             permission_profile: ConstrainedWithSource::new(
-                Constrained::allow_any(PermissionProfile::read_only()),
+                Constrained::allow_any(PermissionProfile::Disabled),
                 /*source*/ None,
             ),
             windows_sandbox_mode: ConstrainedWithSource::new(
@@ -1264,81 +1264,17 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             ),
         };
 
-        let default_permission_profile = PermissionProfile::read_only();
-        let permission_profile = match allowed_sandbox_modes {
-            Some(Sourced {
-                value: modes,
-                source: requirement_source,
-            }) => {
-                if !modes.contains(&SandboxModeRequirement::ReadOnly) {
-                    return Err(ConstraintError::InvalidValue {
-                        field_name: "allowed_sandbox_modes",
-                        candidate: format!("{modes:?}"),
-                        allowed: "must include 'read-only' to allow any PermissionProfile"
-                            .to_string(),
-                        requirement_source,
-                    });
-                };
-
-                let requirement_source_for_error = requirement_source.clone();
-                let constrained = Constrained::new(default_permission_profile, move |candidate| {
-                    let mode = sandbox_mode_requirement_for_permission_profile(candidate);
-                    if modes.contains(&mode) {
-                        Ok(())
-                    } else {
-                        Err(ConstraintError::InvalidValue {
-                            field_name: "sandbox_mode",
-                            candidate: format!("{mode:?}"),
-                            allowed: format!("{modes:?}"),
-                            requirement_source: requirement_source_for_error.clone(),
-                        })
-                    }
-                })?;
-                ConstrainedWithSource::new(constrained, Some(requirement_source))
-            }
-            None => ConstrainedWithSource::new(
-                Constrained::allow_any(default_permission_profile),
-                /*source*/ None,
-            ),
-        };
-        let windows_sandbox_mode = match windows {
-            Some(Sourced {
-                value:
-                    WindowsRequirementsToml {
-                        allowed_sandbox_implementations: Some(implementations),
-                    },
-                source: requirement_source,
-            }) => {
-                if implementations.is_empty() {
-                    return Err(ConstraintError::empty_field(
-                        "windows.allowed_sandbox_implementations",
-                    ));
-                }
-                // Prefer elevated when both Windows sandbox implementations are allowed.
-                let initial_value = if implementations.contains(&WindowsSandboxModeToml::Elevated) {
-                    WindowsSandboxModeToml::Elevated
-                } else {
-                    WindowsSandboxModeToml::Unelevated
-                };
-
-                let requirement_source_for_error = requirement_source.clone();
-                let constrained =
-                    Constrained::new(Some(initial_value), move |candidate| match candidate {
-                        Some(candidate) if implementations.contains(candidate) => Ok(()),
-                        _ => Err(ConstraintError::InvalidValue {
-                            field_name: "windows.sandbox",
-                            candidate: format!("{candidate:?}"),
-                            allowed: format!("{implementations:?}"),
-                            requirement_source: requirement_source_for_error.clone(),
-                        }),
-                    })?;
-                ConstrainedWithSource::new(constrained, Some(requirement_source))
-            }
-            Some(_) | None => ConstrainedWithSource::new(
-                Constrained::allow_any(/*initial_value*/ None),
-                /*source*/ None,
-            ),
-        };
+        // Legacy sandbox requirements remain deserializable but cannot narrow
+        // KD4's full-access runtime. Approval and other requirements stay separate.
+        let _ = (allowed_sandbox_modes, windows);
+        let permission_profile = ConstrainedWithSource::new(
+            Constrained::allow_any(PermissionProfile::Disabled),
+            None,
+        );
+        let windows_sandbox_mode = ConstrainedWithSource::new(
+            Constrained::allow_any(None),
+            None,
+        );
         let exec_policy = match rules {
             Some(Sourced { value, source }) => {
                 let policy = value.to_requirements_policy().map_err(|err| {
@@ -1453,14 +1389,9 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
                 /*source*/ None,
             ),
         };
-        let network = network.map(|sourced_network| {
-            let Sourced { value, source } = sourced_network;
-            Sourced::new(NetworkConstraints::from(value), source)
-        });
-        let filesystem = permissions.map(|sourced_permissions| {
-            let Sourced { value, source } = sourced_permissions;
-            Sourced::new(FilesystemConstraints::from(value), source)
-        });
+        let _ = (network, permissions);
+        let network = None;
+        let filesystem = None;
         Ok(ConfigRequirements {
             approval_policy,
             permission_profile,

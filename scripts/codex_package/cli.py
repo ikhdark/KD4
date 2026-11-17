@@ -136,24 +136,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--codex-command-runner-bin",
-        type=Path,
-        help=(
-            "Optional prebuilt Windows codex-command-runner.exe executable. "
-            "If omitted for Windows targets, codex-command-runner is built "
-            "with Cargo."
-        ),
-    )
-    parser.add_argument(
-        "--codex-windows-sandbox-setup-bin",
-        type=Path,
-        help=(
-            "Optional prebuilt Windows codex-windows-sandbox-setup.exe "
-            "executable. If omitted for Windows targets, "
-            "codex-windows-sandbox-setup is built with Cargo."
-        ),
-    )
-    parser.add_argument(
         "--rg-bin",
         type=Path,
         help=(
@@ -808,8 +790,6 @@ def resolve_package_inputs(
             entrypoint_bin=source_outputs.entrypoint_bin,
             code_mode_host_bin=source_outputs.code_mode_host_bin,
             rg_bin=rg_bin,
-            codex_command_runner_bin=source_outputs.codex_command_runner_bin,
-            codex_windows_sandbox_setup_bin=source_outputs.codex_windows_sandbox_setup_bin,
         ),
     )
 
@@ -819,8 +799,6 @@ def validate_cli_request(
     spec: TargetSpec,
     package_dir: Path,
 ) -> None:
-    command_runner_bin = getattr(args, "codex_command_runner_bin", None)
-    sandbox_setup_bin = getattr(args, "codex_windows_sandbox_setup_bin", None)
 
     if getattr(args, "skip_build_if_present", False):
         ignored_source_flags = [
@@ -831,8 +809,6 @@ def validate_cli_request(
                     "--code-mode-host-bin",
                     getattr(args, "code_mode_host_bin", None),
                 ),
-                ("--codex-command-runner-bin", command_runner_bin),
-                ("--codex-windows-sandbox-setup-bin", sandbox_setup_bin),
             ]
             if value is not None
         ]
@@ -962,16 +938,6 @@ def resolve_source_outputs(
             "prebuilt code-mode host executable",
             "--code-mode-host-bin",
         ),
-        codex_command_runner_bin=resolve_optional_input_path(
-            args.codex_command_runner_bin,
-            "prebuilt Windows codex-command-runner.exe executable",
-            "--codex-command-runner-bin",
-        ),
-        codex_windows_sandbox_setup_bin=resolve_optional_input_path(
-            args.codex_windows_sandbox_setup_bin,
-            "prebuilt Windows codex-windows-sandbox-setup.exe executable",
-            "--codex-windows-sandbox-setup-bin",
-        ),
         reuse_existing=getattr(args, "reuse_source_builds", False),
         force_rebuild=getattr(args, "force_source_rebuild", False),
         release_version=getattr(args, "release_version", None),
@@ -1062,8 +1028,6 @@ def source_outputs_from_existing(
     return SourceBuildOutputs(
         entrypoint_bin=output_dir / variant.entrypoint_name(spec),
         code_mode_host_bin=output_dir / spec.code_mode_host_name,
-        codex_command_runner_bin=output_dir / "codex-command-runner.exe",
-        codex_windows_sandbox_setup_bin=output_dir / "codex-windows-sandbox-setup.exe",
     )
 
 

@@ -10,11 +10,8 @@ use std::time::Duration;
 use codex_exec_server_protocol::JSONRPCErrorError;
 use codex_protocol::config_types::EnvironmentVariablePattern;
 use codex_protocol::config_types::ShellEnvironmentPolicy;
-use codex_protocol::exec_output::ExecToolCallOutput;
-use codex_protocol::exec_output::StreamOutput;
 use codex_protocol::shell_environment;
 use codex_sandboxing::SandboxType;
-use codex_sandboxing::is_likely_sandbox_denied;
 use codex_utils_pty::ExecCommandSession;
 use codex_utils_pty::ProcessSignal as PtyProcessSignal;
 use tokio::sync::Mutex;
@@ -72,7 +69,6 @@ const EXITED_PROCESS_RETENTION: Duration = Duration::from_secs(30);
 #[derive(Clone)]
 struct RetainedOutputChunk {
     seq: u64,
-    stream: ExecOutputStream,
     event: Arc<ExecProcessEvent>,
 }
 
@@ -1151,7 +1147,6 @@ async fn stream_output(
             process.retained_bytes += chunk_bytes;
             process.output.push_back(RetainedOutputChunk {
                 seq,
-                stream,
                 event: Arc::clone(&event),
             });
             while process.retained_bytes > RETAINED_OUTPUT_BYTES_PER_PROCESS {
@@ -1296,7 +1291,7 @@ async fn finish_output_stream(process_id: ProcessId, stream: ExecOutputStream, i
 }
 
 async fn maybe_emit_closed(process_id: ProcessId, inner: Arc<Inner>) {
-    let (sandbox, exit_code, output, identity, complete_output) = {
+    let identity = {
         let mut processes = inner.processes.lock().await;
         let Some(ProcessEntry::Running(process)) = processes.get_mut(&process_id) else {
             return;
@@ -1309,57 +1304,15 @@ async fn maybe_emit_closed(process_id: ProcessId, inner: Arc<Inner>) {
         {
             return;
         }
-        let Some(exit_code) = process.exit_code else {
+        if process.exit_code.is_none() {
             return;
-        };
-        process.finalizing = true;
-        (
-            process.sandbox,
-            exit_code,
-            // Unsandboxed and successful exits never classify output. Avoid copying up
-            // to the retention limit while holding the shared process-map lock.
-            if process.sandbox == SandboxType::None || exit_code == 0 {
-                VecDeque::new()
-            } else {
-                process.output.clone()
-            },
-            Arc::clone(&process.output_notify),
-            process.last_evicted_seq == 0,
-        )
-    };
-    // Output-dependent classification belongs after both streams drain, outside
-    // the process-map mutex used by unrelated reads and process controls.
-    let assessment = if sandbox == SandboxType::None {
-        Some(false)
-    } else if exit_code == 0 {
-        complete_output.then_some(false)
-    } else {
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let mut aggregated = Vec::new();
-        for chunk in output {
-            match chunk.stream {
-                ExecOutputStream::Stdout | ExecOutputStream::Pty => {
-                    stdout.extend_from_slice(chunk.bytes())
-                }
-                ExecOutputStream::Stderr => stderr.extend_from_slice(chunk.bytes()),
-            }
-            aggregated.extend_from_slice(chunk.bytes());
         }
-        let denied = is_likely_sandbox_denied(
-            sandbox,
-            &ExecToolCallOutput {
-                exit_code,
-                stdout: StreamOutput::new(String::from_utf8_lossy(&stdout).into_owned()),
-                stderr: StreamOutput::new(String::from_utf8_lossy(&stderr).into_owned()),
-                aggregated_output: StreamOutput::new(
-                    String::from_utf8_lossy(&aggregated).into_owned(),
-                ),
-                ..Default::default()
-            },
-        );
-        (denied || complete_output).then_some(denied)
+        process.finalizing = true;
+        Arc::clone(&process.output_notify)
     };
+    // KD4 launches local processes without a sandbox, so a close never reports
+    // a sandbox denial. The wire field stays for protocol compatibility.
+    let assessment = Some(false);
     let output_notify = {
         let mut processes = inner.processes.lock().await;
         let Some(ProcessEntry::Running(process)) = processes.get_mut(&process_id) else {

@@ -90,4 +90,3 @@ tokio-util = { workspace = true }
 tracing = { workspace = true, features = ["log"] }
 url = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v7"] }
-codex-windows-sandbox = { workspace = true }

@@ -5,7 +5,6 @@ use std::sync::atomic::AtomicBool;
 use axum::http::HeaderValue;
 use codex_analytics::AppServerRpcTransport;
 use codex_app_server_protocol_types::ServerLocalWatermark;
-use codex_app_server_protocol_types::WindowsWorldWritableWarningNotification;
 use codex_login::default_client::CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR;
 use codex_login::default_client::SetOriginatorError;
 use codex_login::default_client::USER_AGENT_SUFFIX;
@@ -274,7 +273,6 @@ impl InitializeRequestProcessor {
                 )
                 .await;
         }
-        self.spawn_windows_world_writable_warning(vec![connection_id]);
     }
 
     pub(crate) async fn send_initialize_notifications(&self) {
@@ -283,49 +281,6 @@ impl InitializeRequestProcessor {
                 .send_server_notification(ServerNotification::ConfigWarning(notification))
                 .await;
         }
-        self.spawn_windows_world_writable_warning(Vec::new());
-    }
-
-    fn spawn_windows_world_writable_warning(&self, connection_ids: Vec<ConnectionId>) {
-        let permission_profile = self.config.permissions.effective_permission_profile();
-        let should_scan =
-            codex_core::windows_sandbox::windows_sandbox_level_from_config(&self.config)
-                != codex_protocol::config_types::WindowsSandboxLevel::Disabled
-                && permission_profile.file_system_sandbox_policy().kind
-                    == codex_protocol::permissions::FileSystemSandboxKind::Restricted
-                && !self
-                    .config
-                    .notices
-                    .hide_world_writable_warning
-                    .unwrap_or(false);
-        if !should_scan {
-            return;
-        }
-
-        let codex_home = self.config.codex_home.clone();
-        let cwd = self.config.cwd.clone();
-        // A blocking advisory scan must not keep the runtime's outbound channel
-        // alive after shutdown. Deliver only while its original owner exists.
-        let outgoing = Arc::downgrade(&self.outgoing);
-        tokio::spawn(async move {
-            let details = match tokio::task::spawn_blocking(move || {
-                codex_windows_sandbox::world_writable_warning_details(codex_home, cwd)
-            })
-            .await
-            {
-                Ok(details) => details,
-                Err(err) => {
-                    tracing::warn!("world-writable scan task failed: {err}");
-                    Some((Vec::new(), 0, true))
-                }
-            };
-            if let Some(details) = details
-                && let Some(outgoing) = outgoing.upgrade()
-            {
-                send_windows_world_writable_warning_details(&outgoing, &connection_ids, details)
-                    .await;
-            }
-        });
     }
 
     pub(crate) fn track_initialized_request(
@@ -351,28 +306,4 @@ impl InitializeRequestProcessor {
     }
 }
 
-async fn send_windows_world_writable_warning_details(
-    outgoing: &OutgoingMessageSender,
-    connection_ids: &[ConnectionId],
-    (sample_paths, extra_count, failed_scan): (Vec<String>, usize, bool),
-) {
-    tracing::warn!(
-        ?sample_paths,
-        extra_count,
-        failed_scan,
-        "world-writable warning"
-    );
-    outgoing
-        .send_server_notification_to_connections(
-            connection_ids,
-            ServerNotification::WindowsWorldWritableWarning(
-                WindowsWorldWritableWarningNotification {
-                    sample_paths,
-                    extra_count,
-                    failed_scan,
-                },
-            ),
-        )
-        .await;
-}
 

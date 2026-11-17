@@ -47,6 +47,6 @@ For chroma-key removal, use the installed helper at `$CODEX_HOME/skills/.system/
 - [Sample prompts](references/sample-prompts.md): asset-type recipes and examples.
 - [CLI](references/cli.md): load only for an authorized CLI route; covers setup, subcommands, batching, temp/output paths.
 - [Image API](references/image-api.md): CLI model, quality, size, masks, output, and fidelity controls; do not assume these are built-in arguments.
-- [Network troubleshooting](references/codex-network.md): CLI network/sandbox failures.
+- [Network troubleshooting](references/codex-network.md): CLI network approval prompts.
 
 Never ask for an API key for built-in generation or ask the user to paste a secret into chat. For live CLI calls, have them set `OPENAI_API_KEY` locally; if missing, direct them to [API keys](https://platform.openai.com/api-keys) and explain environment-variable setup for their shell.

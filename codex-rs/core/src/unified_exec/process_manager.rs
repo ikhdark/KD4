@@ -72,7 +72,6 @@ use codex_sandboxing::SandboxCommand;
 
 use crate::tools::runtimes::prove_noprofile_powershell_direct_argv_async;
 use codex_tools::ToolName;
-use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_path_uri::PathUri;
 
@@ -258,50 +257,10 @@ async fn exec_server_params_for_request(
         tty,
         pipe_stdin,
         arg0: request.arg0.clone(),
-        sandbox: request.exec_server_sandbox.clone(),
+        sandbox: None,
         enforce_managed_network: false,
         managed_network: None,
     })
-}
-
-/// Backend selection stays with the shared Windows launcher, which every other
-/// launcher uses: a managed proxy needs the elevated backend's firewall identity.
-fn windows_sandbox_session_request<'a>(
-    request: &'a ExecRequest,
-    native_cwd: &'a std::path::Path,
-    tty: bool,
-    pipe_stdin: bool,
-) -> codex_windows_sandbox::WindowsSandboxSessionRequest<'a> {
-    let no_paths: &'a [AbsolutePathBuf] = &[];
-    let overrides = request.windows_sandbox_filesystem_overrides.as_ref();
-    codex_windows_sandbox::WindowsSandboxSessionRequest {
-        permission_profile: &request.permission_profile,
-        workspace_roots: request.windows_sandbox_workspace_roots.as_slice(),
-        codex_home: request.codex_home.as_path(),
-        command: request.command.clone(),
-        cwd: native_cwd,
-        env_map: request.env.clone(),
-        windows_sandbox_level: request.windows_sandbox_level,
-        proxy_enforced: false,
-        proxy_settings_mode: codex_windows_sandbox::WindowsSandboxProxySettingsMode::Reconcile,
-        timeout_ms: None,
-        read_roots_override: overrides
-            .and_then(|overrides| overrides.read_roots_override.as_deref()),
-        additional_read_roots: request.windows_sandbox_additional_read_roots.as_slice(),
-        read_roots_include_platform_defaults: overrides
-            .is_some_and(|overrides| overrides.read_roots_include_platform_defaults),
-        write_roots_override: overrides
-            .and_then(|overrides| overrides.write_roots_override.as_deref()),
-        deny_read_paths_override: overrides.map_or(no_paths, |overrides| {
-            overrides.additional_deny_read_paths.as_slice()
-        }),
-        deny_write_paths_override: overrides.map_or(no_paths, |overrides| {
-            overrides.additional_deny_write_paths.as_slice()
-        }),
-        tty,
-        stdin_open: tty || pipe_stdin,
-        use_private_desktop: request.windows_sandbox_private_desktop,
-    }
 }
 
 /// Borrowed process state prepared for a `write_stdin` or poll operation.
@@ -2352,7 +2311,6 @@ impl UnifiedExecProcessManager {
         &self,
         process_id: u32,
         command: SandboxCommand,
-        additional_read_roots: Vec<AbsolutePathBuf>,
         options: ExecOptions,
         additional_permissions_uri: Option<
             &codex_protocol::request_permissions::UriAdditionalPermissionProfile,
@@ -2383,7 +2341,6 @@ impl UnifiedExecProcessManager {
                 .await
         }
         .map_err(ToolError::Codex)?;
-        request.windows_sandbox_additional_read_roots = additional_read_roots;
         request.exec_server_env_config = exec_server_env_config;
         drop(setup_timing);
         drop(setup_phase);
@@ -2448,34 +2405,6 @@ impl UnifiedExecProcessManager {
             .map(|timing| timing.begin_local_phase(TurnLocalPhase::ExecutorReadinessWait));
         let inherited_fds = spawn_lifecycle.inherited_fds();
 
-        if request.sandbox == codex_sandboxing::SandboxType::WindowsRestrictedToken {
-            // TODO(anp): Keep PathUri through the Windows sandbox launch boundary.
-            let native_cwd =
-                request
-                    .cwd
-                    .to_abs_path()
-                    .map_err(|_| UnifiedExecError::ForeignPath {
-                        path: request.cwd.clone(),
-                    })?;
-            let spawned = codex_windows_sandbox::spawn_windows_sandbox_session_for_level(
-                windows_sandbox_session_request(request, native_cwd.as_path(), tty, pipe_stdin),
-            )
-            .await;
-            let spawned =
-                spawned.map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
-            spawn_lifecycle.after_spawn();
-            mark_exec_process_spawned();
-            drop(spawn_timing);
-            drop(spawn_phase);
-            return UnifiedExecProcess::from_spawned(
-                spawned,
-                request.sandbox,
-                spawn_lifecycle,
-                raw_output_artifact,
-                pending_spawns,
-            )
-            .await;
-        }
         if environment.is_remote() {
             if !inherited_fds.is_empty() {
                 return Err(UnifiedExecError::create_process(
@@ -2570,7 +2499,7 @@ impl UnifiedExecProcessManager {
         drop(spawn_phase);
         UnifiedExecProcess::from_spawned(
             spawned,
-            request.sandbox,
+            codex_sandboxing::SandboxType::None,
             spawn_lifecycle,
             raw_output_artifact,
             pending_spawns,
@@ -2723,7 +2652,6 @@ impl UnifiedExecProcessManager {
             hook_command: request.hook_command.clone(),
             process_id: request.process_id,
             cwd,
-            sandbox_cwd: request.sandbox_cwd.clone(),
             turn_environment: request.turn_environment.clone(),
             env,
             exec_server_env_config: Some(exec_server_env_config),

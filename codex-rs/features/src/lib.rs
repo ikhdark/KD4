@@ -119,9 +119,9 @@ pub enum Feature {
     UnifiedExec,
     /// Stream structured progress while apply_patch input is being generated.
     ApplyPatchStreamingEvents,
-    /// Allow exec tools to request additional permissions while staying sandboxed.
+    /// Legacy key for per-command additional permissions; KD4 has no sandbox and ignores it.
     ExecPermissionApprovals,
-    /// Expose the built-in request_permissions tool.
+    /// Legacy key for the removed request_permissions tool; KD4 has no sandbox and ignores it.
     RequestPermissionsTool,
     /// Expose the extension-backed standalone web search tool.
     StandaloneWebSearch,
@@ -211,9 +211,9 @@ pub enum Feature {
     UseAgentIdentity,
 
     // Internal-only features retained after removal from user configuration.
-    /// Enable Windows sandbox (restricted token) on Windows.
+    /// Legacy Windows sandbox selection; accepted for compatibility, never enforced.
     WindowsSandbox,
-    /// Use the elevated Windows sandbox pipeline (setup + runner).
+    /// Legacy elevated Windows sandbox selection; accepted for compatibility, never enforced.
     WindowsSandboxElevated,
 }
 

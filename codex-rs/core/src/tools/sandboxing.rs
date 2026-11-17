@@ -5,12 +5,10 @@
 //! and helpers (`ToolRuntime`, `SandboxAttempt`, etc.).
 
 use crate::sandboxing::ExecOptions;
-use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::state::SessionServices;
 use crate::tools::hook_names::HookToolName;
-use codex_file_system::FileSystemSandboxContext;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::approvals::ExecPolicyAmendment;
 use codex_protocol::approvals::NetworkApprovalContext;
@@ -22,13 +20,10 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::request_permissions::UriAdditionalPermissionProfile;
 use codex_sandboxing::SandboxCommand;
-use codex_sandboxing::SandboxTransformRequest;
+use codex_sandboxing::SandboxExecRequest;
 use codex_sandboxing::SandboxType;
-use codex_sandboxing::policy_transforms::effective_permission_profile_uri;
-use codex_sandboxing::transform;
 use codex_tools::ToolName;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use codex_utils_path_uri::PathUri;
 use futures::Future;
 use futures::future::BoxFuture;
 use serde::Serialize;
@@ -43,8 +38,8 @@ pub(crate) fn command_permission_profile(turn: &TurnContext) -> PermissionProfil
     turn.permission_profile()
 }
 
-pub(crate) fn command_windows_sandbox_level(turn: &TurnContext) -> WindowsSandboxLevel {
-    turn.windows_sandbox_level
+pub(crate) fn command_windows_sandbox_level(_turn: &TurnContext) -> WindowsSandboxLevel {
+    WindowsSandboxLevel::Disabled
 }
 
 #[derive(Clone, Default, Debug)]
@@ -268,55 +263,6 @@ pub(crate) fn default_exec_approval_requirement(
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SandboxOverride {
-    NoOverride,
-    BypassSandboxFirstAttempt,
-}
-
-pub(crate) fn sandbox_override_for_first_attempt(
-    sandbox_permissions: SandboxPermissions,
-    exec_approval_requirement: &ExecApprovalRequirement,
-    file_system_sandbox_policy: &FileSystemSandboxPolicy,
-) -> SandboxOverride {
-    // Deny-read restrictions are part of the active permission policy. Running
-    // without a filesystem sandbox would discard them, even if the command was
-    // otherwise approved by rules or explicit escalation.
-    if !unsandboxed_execution_allowed(file_system_sandbox_policy) {
-        return SandboxOverride::NoOverride;
-    }
-
-    // ExecPolicy `Allow` can intentionally imply full trust (Skip + bypass_sandbox=true),
-    // which supersedes `with_additional_permissions` sandboxed execution hints.
-    if matches!(
-        exec_approval_requirement,
-        ExecApprovalRequirement::Skip {
-            bypass_sandbox: true,
-            ..
-        }
-    ) {
-        return SandboxOverride::BypassSandboxFirstAttempt;
-    }
-
-    if sandbox_permissions.requires_escalated_permissions() {
-        SandboxOverride::BypassSandboxFirstAttempt
-    } else {
-        SandboxOverride::NoOverride
-    }
-}
-
-/// Returns true when the active filesystem policy can be represented by
-/// running without a filesystem sandbox.
-///
-/// Denied reads only exist inside the sandbox. If a policy contains any
-/// denied-read paths, bypassing the sandbox would silently grant those reads,
-/// so escalation must keep the command sandboxed with the denied reads intact.
-pub(crate) fn unsandboxed_execution_allowed(
-    file_system_sandbox_policy: &FileSystemSandboxPolicy,
-) -> bool {
-    !file_system_sandbox_policy.has_denied_read_restrictions()
-}
-
 
 pub(crate) trait Approvable<Req> {
     type ApprovalKey: Hash + Eq + Clone + Debug + Serialize;
@@ -330,11 +276,6 @@ pub(crate) trait Approvable<Req> {
     // requests touching a subset can be auto-approved.
     fn approval_keys(&self, req: &Req) -> Vec<Self::ApprovalKey>;
 
-    /// Return per-request sandbox permissions for first-attempt sandbox
-    /// selection. Most tools use the ambient sandbox policy unchanged.
-    fn sandbox_permissions(&self, _req: &Req) -> SandboxPermissions {
-        SandboxPermissions::UseDefault
-    }
 
     /// Return `Some(_)` to specify a custom exec approval requirement, or `None`
     /// to fall back to policy-based default.
@@ -378,10 +319,6 @@ pub(crate) enum ToolError {
 }
 
 pub(crate) trait ToolRuntime<Req, Out>: Approvable<Req> {
-    fn sandbox_cwd<'a>(&self, _req: &'a Req) -> Option<&'a PathUri> {
-        None
-    }
-
     async fn run(
         &mut self,
         req: &Req,
@@ -390,110 +327,50 @@ pub(crate) trait ToolRuntime<Req, Out>: Approvable<Req> {
     ) -> Result<Out, ToolError>;
 }
 
+/// Approval orchestration still supplies an attempt, but KD4 no longer installs
+/// filesystem or network sandboxes; every attempt launches directly.
 pub(crate) struct SandboxAttempt<'a> {
     pub(crate) codex_home: &'a AbsolutePathBuf,
-    pub sandbox: SandboxType,
-    /// Whether policy requested sandboxing, independent of this host's concrete wrapper.
-    pub sandbox_requested: bool,
-    pub permissions: &'a codex_protocol::models::PermissionProfile,
-    /// Canonical permissions before this host materializes workspace roots.
-    pub exec_server_permissions: &'a codex_protocol::models::PermissionProfile,
-    pub(crate) sandbox_cwd: &'a PathUri,
-    pub(crate) workspace_roots: &'a [AbsolutePathBuf],
-    pub windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel,
-    pub windows_sandbox_private_desktop: bool,
 }
 
-impl<'a> SandboxAttempt<'a> {
-
+impl SandboxAttempt<'_> {
     pub async fn env_for(
         &self,
         command: SandboxCommand,
         options: ExecOptions,
     ) -> Result<crate::sandboxing::ExecRequest, CodexErr> {
-        let execution = crate::tools::tool_dispatch_trace::active_tool_dispatch_timing()
-            .map(|timing| timing.execution_id().0.clone()).unwrap_or_default();
-        let observation = codex_protocol::timing::observations::Span::start(
-            "sandbox_preparation", "", "", &execution,
-            serde_json::json!({"boundary":"queue_through_prepared_request"}));
-        let permissions = self.permissions.clone();
-        let sandbox = self.sandbox;
-        let sandbox_cwd = self.sandbox_cwd.clone();
-        let windows_sandbox_level = self.windows_sandbox_level;
-        let windows_sandbox_private_desktop = self.windows_sandbox_private_desktop;
-        let workspace_roots = self.workspace_roots.to_vec();
-        let codex_home = self.codex_home.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let worker = codex_protocol::timing::observations::Span::start(
-                "sandbox_transform", "", "", &execution,
-                serde_json::json!({"boundary":"worker_only_excludes_queue_and_process_spawn"}));
-            let result = (|| {
-            let request = transform(SandboxTransformRequest {
-                command,
-                permissions: &permissions,
-                sandbox,
-                sandbox_policy_cwd: &sandbox_cwd,
-                windows_sandbox_level,
-                windows_sandbox_private_desktop,
-            })
-            .map_err(CodexErr::from)?;
-            crate::sandboxing::ExecRequest::from_sandbox_exec_request(
-                request,
-                options,
-                workspace_roots,
-                codex_home,
-            )
-            })();
-            worker.finish(if result.is_ok() {"success"} else {"failed"}, serde_json::Value::Null);
-            result
-        })
-        .await
-        .map_err(|error| CodexErr::Fatal(format!("sandbox preparation worker failed: {error}")));
-        observation.finish(if matches!(&result, Ok(Ok(_))) {"success"} else {"failed"}, serde_json::Value::Null);
-        result?
+        self.env_for_exec_server(command, options, None)
     }
 
     pub fn env_for_exec_server(
         &self,
         command: SandboxCommand,
         options: ExecOptions,
-        additional_permissions_uri: Option<&UriAdditionalPermissionProfile>,
+        _additional_permissions_uri: Option<&UriAdditionalPermissionProfile>,
     ) -> Result<crate::sandboxing::ExecRequest, CodexErr> {
-        let execution = crate::tools::tool_dispatch_trace::active_tool_dispatch_timing()
-            .map(|timing| timing.execution_id().0.clone()).unwrap_or_default();
-        let observation = codex_protocol::timing::observations::Span::start(
-            "sandbox_remote_preparation", "", "", &execution,
-            serde_json::json!({"boundary":"local_envelope_only_not_remote_sandbox"}));
-        let exec_server_permissions = effective_permission_profile_uri(
-            self.exec_server_permissions,
-            additional_permissions_uri,
-        );
-        let request = transform(SandboxTransformRequest {
-            command,
-            permissions: self.permissions,
-            // The exec-server must receive the native command, not this host's wrapper.
+        // Legacy permission hints are accepted but never reintroduce sandbox
+        // preparation, a blocking-worker hop, native policy paths or wrappers.
+        let mut argv = Vec::with_capacity(1 + command.args.len());
+        argv.push(command.program.to_string_lossy().into_owned());
+        argv.extend(command.args);
+        let request = SandboxExecRequest {
+            command: argv,
+            sandbox_policy_cwd: command.cwd.clone(),
+            cwd: command.cwd,
+            env: command.env,
             sandbox: SandboxType::None,
-            sandbox_policy_cwd: self.sandbox_cwd,
-            windows_sandbox_level: self.windows_sandbox_level,
-            windows_sandbox_private_desktop: self.windows_sandbox_private_desktop,
-        })
-        .map_err(CodexErr::from)?;
-        let mut exec_request = crate::sandboxing::ExecRequest::from_sandbox_exec_request(
+            windows_sandbox_level: WindowsSandboxLevel::Disabled,
+            windows_sandbox_private_desktop: false,
+            permission_profile: PermissionProfile::Disabled,
+            file_system_sandbox_policy: FileSystemSandboxPolicy::unrestricted(),
+            network_sandbox_policy: codex_protocol::permissions::NetworkSandboxPolicy::Enabled,
+            arg0: None,
+        };
+        crate::sandboxing::ExecRequest::from_sandbox_exec_request(
             request,
             options,
-            self.workspace_roots.to_vec(),
+            Vec::new(),
             self.codex_home.clone(),
-        )?;
-        if self.sandbox_requested {
-            exec_request.exec_server_sandbox = Some(FileSystemSandboxContext {
-                permissions: exec_server_permissions,
-                cwd: Some(exec_request.windows_sandbox_policy_cwd.clone()),
-                workspace_roots: Vec::new(),
-                windows_sandbox_level: self.windows_sandbox_level,
-                windows_sandbox_private_desktop: self.windows_sandbox_private_desktop,
-            });
-        }
-        observation.finish("success", serde_json::Value::Null);
-        Ok(exec_request)
+        )
     }
 }

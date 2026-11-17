@@ -21,13 +21,8 @@ use codex_app_server_protocol_types::ServerNotification;
 use codex_core::exec::ExecExpiration;
 use codex_core::exec::ExecExpirationOutcome;
 use codex_core::exec::IO_DRAIN_TIMEOUT_MS;
-use codex_core::exec::StdoutStream;
 use codex_core::sandboxing::ExecRequest;
 use codex_protocol::exec_output::bytes_to_string_smart;
-use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::ExecOutputStream;
-use codex_sandboxing::SandboxType;
-use codex_utils_pty::DEFAULT_OUTPUT_BYTES_CAP;
 use codex_utils_pty::ProcessHandle;
 use codex_utils_pty::SpawnedProcess;
 use codex_utils_pty::TerminalSize;
@@ -111,15 +106,6 @@ pub(crate) fn validate_command_argv(command: &[String]) -> Result<(), JSONRPCErr
     Ok(())
 }
 
-fn attach_connection_cancellation(
-    exec_request: &mut ExecRequest,
-    connection_cancellation: CancellationToken,
-) {
-    exec_request.expiration = exec_request
-        .expiration
-        .clone()
-        .with_cancellation(connection_cancellation);
-}
 
 pub(crate) trait ConnectionSessionKey: Eq + std::hash::Hash {
     fn connection_id(&self) -> ConnectionId;
@@ -192,7 +178,6 @@ enum CommandExecSession {
         write_tx: mpsc::Sender<StdinWriteRequest>,
         write_slots: Arc<Semaphore>,
     },
-    UnsupportedWindowsSandbox,
 }
 
 enum CommandControl {
@@ -282,12 +267,7 @@ struct UndeliveredOutput {
 }
 
 impl UndeliveredOutput {
-    fn note_cap(&mut self, stream: CommandExecOutputStream, cap_reached: bool) {
-        match stream {
-            CommandExecOutputStream::Stdout => self.stdout_cap_reached |= cap_reached,
-            CommandExecOutputStream::Stderr => self.stderr_cap_reached |= cap_reached,
-        }
-    }
+
     fn append(&mut self, stream: CommandExecOutputStream, bytes: &[u8]) {
         match stream {
             CommandExecOutputStream::Stdout => self.stdout.extend_from_slice(bytes),
@@ -359,152 +339,6 @@ impl CommandExecManager {
             connection_id: request_id.connection_id,
             process_id: process_id.clone(),
         };
-
-        if matches!(exec_request.sandbox, SandboxType::WindowsRestrictedToken) {
-            if tty || stream_stdin {
-                return Err(invalid_request(
-                    "tty and stdin streaming are not supported with windows sandbox",
-                ));
-            }
-            if output_bytes_cap != Some(DEFAULT_OUTPUT_BYTES_CAP) {
-                return Err(invalid_request(
-                    "custom outputBytesCap is not supported with windows sandbox",
-                ));
-            }
-            if let InternalProcessId::Client(_) = &process_id {
-                let mut sessions = self.sessions.lock().await;
-                rpc_gate
-                    .try_commit(|| {
-                        if sessions.contains_key(&process_key) {
-                            return Err(invalid_request(format!(
-                                "duplicate active command/exec process id: {}",
-                                process_key.process_id.error_repr(),
-                            )));
-                        }
-                        sessions.insert(
-                            process_key.clone(),
-                            CommandExecSession::UnsupportedWindowsSandbox,
-                        );
-                        Ok(())
-                    })
-                    .ok_or_else(|| invalid_request("connection is closed"))??;
-            }
-            let sessions = Arc::clone(&self.sessions);
-            let mut exec_request = exec_request;
-            attach_connection_cancellation(&mut exec_request, connection_cancellation.clone());
-            tokio::spawn(async move {
-                let _run_owner = run_owner;
-                let (delivery_relay, delivery_handle) = if stream_stdout_stderr {
-                    let (relay, handle) = spawn_output_delivery_relay(
-                        Arc::clone(&outgoing),
-                        request_id.connection_id,
-                        connection_cancellation.clone(),
-                    );
-                    (Some(relay), Some(handle))
-                } else {
-                    (None, None)
-                };
-                let notification_process_id = match &process_id {
-                    InternalProcessId::Generated(_) => None,
-                    InternalProcessId::Client(id) => Some(id.clone()),
-                };
-                let (stdout_stream, event_relay_handle, first_hop_recovery) =
-                    match (delivery_relay.clone(), notification_process_id) {
-                        (Some(delivery_relay), Some(process_id)) => {
-                            let (tx_event, rx_event) =
-                                async_channel::bounded::<codex_protocol::protocol::Event>(1);
-                            let handle = spawn_windows_output_relay(
-                                rx_event, delivery_relay, process_id, output_bytes_cap,
-                            );
-                            let (stream, recovery) = StdoutStream::with_delivery_recovery(
-                                String::new(),
-                                String::new(),
-                                tx_event,
-                                output_bytes_cap
-                                    .unwrap_or(DEFAULT_OUTPUT_BYTES_CAP)
-                                    .min(DEFAULT_OUTPUT_BYTES_CAP),
-                            );
-                            (Some(stream), Some(handle), Some(recovery))
-                        }
-                        _ => (None, None, None),
-                    };
-                let output = codex_core::sandboxing::execute_env(exec_request, stdout_stream).await;
-                if let Some(relay) = delivery_relay.as_ref() { relay.begin_settlement(); }
-                let event_fallback = if let Some(handle) = event_relay_handle {
-                    handle.await
-                } else {
-                    Ok(UndeliveredOutput::default())
-                };
-                drop(delivery_relay);
-                let undelivered = if let Some(handle) = delivery_handle {
-                    handle.await
-                } else {
-                    Ok(UndeliveredOutput::default())
-                };
-                sessions.lock().await.remove(&process_key);
-                let undelivered = match undelivered.and_then(|mut output| {
-                    output.append_tail(event_fallback?);
-                    if let Some(recovery) = first_hop_recovery {
-                        let (stdout_cap_reached, stderr_cap_reached) = recovery.cap_reached();
-                        let (stdout, stderr) = recovery.take_suffix();
-                        output.append_tail(UndeliveredOutput { stdout, stderr, stdout_cap_reached, stderr_cap_reached });
-                    }
-                    Ok(output)
-                }) {
-                    Ok(output) => output,
-                    Err(err) => {
-                        outgoing
-                            .send_error(
-                                request_id,
-                                internal_error(format!("command output capture failed: {err}")),
-                            )
-                            .await;
-                        return;
-                    }
-                };
-                match output {
-                    Ok(output) => {
-                        outgoing
-                            .send_response(
-                                request_id,
-                                CommandExecResponse {
-                                    exit_code: output.exit_code,
-                                    stdout_base64: (stream_stdout_stderr
-                                        && !undelivered.stdout.is_empty())
-                                    .then(|| STANDARD.encode(&undelivered.stdout)),
-                                    stderr_base64: (stream_stdout_stderr
-                                        && !undelivered.stderr.is_empty())
-                                    .then(|| STANDARD.encode(&undelivered.stderr)),
-                                    // This legacy sandbox backend has no per-stream EOF receipt.
-                                    stdout_capture: undelivered.stdout_cap_reached.then_some(codex_app_server_protocol_types::ProcessOutputCaptureState {
-                                        reached_eof: false, cap_reached: true, drain_timed_out: false,
-                                    }),
-                                    stderr_capture: undelivered.stderr_cap_reached.then_some(codex_app_server_protocol_types::ProcessOutputCaptureState {
-                                        reached_eof: false, cap_reached: true, drain_timed_out: false,
-                                    }),
-                                    stdout: if stream_stdout_stderr {
-                                        bytes_to_string_smart(&undelivered.stdout)
-                                    } else {
-                                        output.stdout.text
-                                    },
-                                    stderr: if stream_stdout_stderr {
-                                        bytes_to_string_smart(&undelivered.stderr)
-                                    } else {
-                                        output.stderr.text
-                                    },
-                                },
-                            )
-                            .await;
-                    }
-                    Err(err) => {
-                        outgoing
-                            .send_error(request_id, internal_error(format!("exec failed: {err}")))
-                            .await;
-                    }
-                }
-            });
-            return Ok(());
-        }
 
         let ExecRequest {
             command,
@@ -647,12 +481,7 @@ impl CommandExecManager {
             write_tx,
             write_slots,
             ..
-        } = session
-        else {
-            return Err(invalid_request(
-                "command/exec/write, command/exec/terminate, and command/exec/resize are not supported for windows sandbox processes",
-            ));
-        };
+        } = session;
         let busy = || invalid_request("command/exec stdin write queue is full; retry after a pending write completes");
         let slot = write_slots.try_acquire_owned().map_err(|_| busy())?;
         let write_permit = write_tx.try_reserve_owned().map_err(|error| match error {
@@ -735,14 +564,13 @@ impl CommandExecManager {
         };
 
         for control in controls {
-            if let CommandExecSession::Active { control_tx, .. } = control {
-                let _ = control_tx
-                    .send(CommandControlRequest {
-                        control: CommandControl::Terminate,
-                        response_tx: None,
-                    })
-                    .await;
-            }
+            let CommandExecSession::Active { control_tx, .. } = control;
+            let _ = control_tx
+                .send(CommandControlRequest {
+                    control: CommandControl::Terminate,
+                    response_tx: None,
+                })
+                .await;
         }
     }
 
@@ -769,11 +597,7 @@ impl CommandExecManager {
                     ))
                 })?
         };
-        let CommandExecSession::Active { control_tx, .. } = session else {
-            return Err(invalid_request(
-                "command/exec/write, command/exec/terminate, and command/exec/resize are not supported for windows sandbox processes",
-            ));
-        };
+        let CommandExecSession::Active { control_tx, .. } = session;
         let (response_tx, response_rx) = oneshot::channel();
         control_tx
             .send(CommandControlRequest {
@@ -1009,75 +833,6 @@ async fn run_command(params: RunCommandParams) {
             },
         )
         .await;
-}
-
-fn spawn_windows_output_relay(
-    events: async_channel::Receiver<codex_protocol::protocol::Event>,
-    relay: OutputDeliveryRelay,
-    process_id: String,
-    output_bytes_cap: Option<usize>,
-) -> tokio::task::JoinHandle<UndeliveredOutput> {
-    tokio::spawn(async move {
-        let capacity_changed = Arc::clone(&relay.capacity_changed);
-        let mut relay = Some(relay);
-        let mut pending = std::collections::VecDeque::<(CommandExecOutputStream, Vec<u8>, bool)>::new();
-        let mut undelivered = UndeliveredOutput::default();
-        let mut stdout_cap = OutputByteCap::new(output_bytes_cap);
-        let mut stderr_cap = OutputByteCap::new(output_bytes_cap);
-        let mut events_open = true;
-        loop {
-            let ready = Arc::clone(&capacity_changed).notified_owned();
-            tokio::pin!(ready);
-            ready.as_mut().enable();
-            if let Some((stream, bytes, cap_reached)) = pending.front() {
-                if let Some(delivery) = relay.as_ref() {
-                    let accounted = bytes.len().div_ceil(3).saturating_mul(4)
-                        .saturating_add(process_id.len()).saturating_add(OUTPUT_DELIVERY_EVENT_OVERHEAD_BYTES);
-                    if delivery.tx.is_closed() || accounted > OUTPUT_DELIVERY_MAX_QUEUED_BYTES {
-                        relay = None;
-                        continue;
-                    }
-                    if delivery.tx.capacity() > 0 && delivery.byte_budget.available_permits() >= accounted
-                        && delivery.enqueue(CommandExecOutputDeltaNotification {
-                            process_id: process_id.clone(), stream: *stream,
-                            delta_base64: STANDARD.encode(bytes), cap_reached: *cap_reached,
-                        }, accounted).is_ok()
-                    {
-                        pending.pop_front();
-                        continue;
-                    }
-                } else {
-                    let Some((stream, bytes, cap_reached)) = pending.pop_front() else { continue; };
-                    undelivered.append(stream, &bytes);
-                    undelivered.note_cap(stream, cap_reached);
-                    continue;
-                }
-            }
-            if !events_open && pending.is_empty() { break; }
-            tokio::select! {
-                _ = &mut ready, if !pending.is_empty() => {},
-                event = events.recv(), if events_open => {
-                    let Ok(event) = event else { events_open = false; continue; };
-                    let EventMsg::ExecCommandOutputDelta(delta) = event.msg else { continue; };
-                    let (stream, cap) = match delta.stream {
-                        ExecOutputStream::Stdout => (CommandExecOutputStream::Stdout, &mut stdout_cap),
-                        ExecOutputStream::Stderr => (CommandExecOutputStream::Stderr, &mut stderr_cap),
-                    };
-                    let (bytes, cap_reached) = cap.accept(&delta.chunk);
-                    undelivered.note_cap(stream, cap_reached);
-                    if bytes.is_empty() {
-                        if cap_reached { pending.push_back((stream, Vec::new(), true)); }
-                    } else {
-                        for (index, chunk) in bytes.chunks(OUTPUT_CHUNK_SIZE_HINT).enumerate() {
-                            pending.push_back((stream, chunk.to_vec(),
-                                cap_reached && (index + 1) * OUTPUT_CHUNK_SIZE_HINT >= bytes.len()));
-                        }
-                    }
-                }
-            }
-        }
-        undelivered
-    })
 }
 
 #[expect(
@@ -1447,4 +1202,3 @@ fn command_no_longer_running_error(process_id: &InternalProcessId) -> JSONRPCErr
         process_id.error_repr(),
     ))
 }
-

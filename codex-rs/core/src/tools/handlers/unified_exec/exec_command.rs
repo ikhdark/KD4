@@ -943,7 +943,6 @@ impl ExecCommandHandler {
                     } else {
                         native_cwd.as_ref().map(|cwd| cwd.as_path().to_path_buf())
                     },
-                    sandbox_cwd: native_environment_cwd,
                     turn_environment: turn_environment.clone(),
                     tty,
                     pipe_stdin,

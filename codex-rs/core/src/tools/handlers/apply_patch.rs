@@ -837,8 +837,6 @@ impl ApplyPatchHandler {
                                 file_paths,
                                 changes,
                                 exec_approval_requirement: apply.exec_approval_requirement,
-                                additional_permissions: effective_additional_permissions
-                                    .additional_permissions,
                                 permissions_preapproved: effective_additional_permissions
                                     .permissions_preapproved,
                             };
@@ -1657,8 +1655,6 @@ pub(crate) async fn intercept_apply_patch(
                         file_paths: approval_keys,
                         changes,
                         exec_approval_requirement: apply.exec_approval_requirement,
-                        additional_permissions: effective_additional_permissions
-                            .additional_permissions,
                         permissions_preapproved: effective_additional_permissions
                             .permissions_preapproved,
                     };

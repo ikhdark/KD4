@@ -40,14 +40,7 @@ pub use text_diagnostics::TextDiagnosticsScanner;
 
 use bytes::Bytes;
 use codex_protocol::config_types::WindowsSandboxLevel;
-use codex_protocol::models::ManagedFileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
-use codex_protocol::models::SandboxEnforcement;
-use codex_protocol::permissions::FileSystemPath;
-use codex_protocol::permissions::FileSystemSandboxKind;
-use codex_protocol::permissions::FileSystemSandboxPolicy;
-use codex_protocol::permissions::FileSystemSpecialPath;
-use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
@@ -58,7 +51,6 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
-use std::path::Path;
 use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
@@ -597,24 +589,14 @@ pub struct FileSystemSandboxContext {
 
 impl FileSystemSandboxContext {
     pub fn from_legacy_sandbox_policy(
-        sandbox_policy: SandboxPolicy,
+        _sandbox_policy: SandboxPolicy,
         cwd: PathUri,
     ) -> io::Result<Self> {
-        // Legacy policy projection materializes native roots, so convert at the receiving-host
-        // boundary while retaining the URI in the resulting sandbox context.
-        let native_cwd = cwd.to_abs_path()?;
-        let file_system_sandbox_policy =
-            FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
-                &sandbox_policy,
-                &native_cwd,
-            );
-        let permissions =
-            PermissionProfile::<AbsolutePathBuf>::from_runtime_permissions_with_enforcement(
-                SandboxEnforcement::from_legacy_sandbox_policy(&sandbox_policy),
-                &file_system_sandbox_policy,
-                NetworkSandboxPolicy::from(&sandbox_policy),
-            );
-        Ok(Self::from_permission_profile_with_cwd(permissions, cwd))
+        // Policy paths are compatibility metadata, not native IO inputs.
+        Ok(Self::from_permission_profile_with_cwd(
+            PermissionProfile::Disabled,
+            cwd,
+        ))
     }
 
     pub fn from_permission_profile(permissions: PermissionProfile<AbsolutePathBuf>) -> Self {
@@ -629,11 +611,11 @@ impl FileSystemSandboxContext {
     }
 
     fn from_permissions_and_cwd(
-        permissions: PermissionProfile<AbsolutePathBuf>,
+        _permissions: PermissionProfile<AbsolutePathBuf>,
         cwd: Option<PathUri>,
     ) -> Self {
         Self {
-            permissions: permissions.into(),
+            permissions: PermissionProfile::Disabled,
             cwd,
             workspace_roots: Vec::new(),
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
@@ -642,36 +624,11 @@ impl FileSystemSandboxContext {
     }
 
     pub fn should_run_in_sandbox(&self) -> bool {
-        let Ok(permissions) =
-            PermissionProfile::<AbsolutePathBuf>::try_from(self.permissions.clone())
-        else {
-            // A sandbox context for another host must not select the unsandboxed filesystem.
-            return true;
-        };
-        let file_system_policy = permissions.file_system_sandbox_policy();
-        matches!(file_system_policy.kind, FileSystemSandboxKind::Restricted)
-            && !file_system_policy.has_full_disk_write_access()
+        false
     }
 
     pub fn has_cwd_dependent_permissions(&self) -> bool {
-        match &self.permissions {
-            PermissionProfile::Managed {
-                file_system: ManagedFileSystemPermissions::Restricted { entries, .. },
-                ..
-            } => entries.iter().any(|entry| match &entry.path {
-                FileSystemPath::GlobPattern { pattern } => !Path::new(pattern).is_absolute(),
-                FileSystemPath::Special {
-                    value: FileSystemSpecialPath::ProjectRoots { .. },
-                } => true,
-                FileSystemPath::Path { .. } | FileSystemPath::Special { .. } => false,
-            }),
-            PermissionProfile::Managed {
-                file_system: ManagedFileSystemPermissions::Unrestricted,
-                ..
-            }
-            | PermissionProfile::Disabled
-            | PermissionProfile::External { .. } => false,
-        }
+        false
     }
 
     pub fn drop_cwd_if_unused(mut self) -> Self {
@@ -1874,4 +1831,5 @@ pub use atomic_write::try_acquire_atomic_write_lock;
 pub use atomic_write::write_atomically;
 pub use atomic_write::write_bytes_atomically;
 pub use atomic_write::write_bytes_atomically_preserving_permissions;
+pub use atomic_write::write_bytes_atomically_with_file_sync;
 pub use atomic_write::write_bytes_atomically_without_sync;

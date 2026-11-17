@@ -24,6 +24,7 @@ the selected workload and obtain any required setup authorization first.
 The helper writes tarballs to `dist/npm/` by default; `--output-dir` overrides it.
 Native tarballs contain the canonical runtime tree under `vendor/<target>/`;
 the launcher and SDK do not embed native payloads.
+Current KD4 native packages do not require or build sandbox helpers.
 
 When intentionally reusing GitHub artifacts instead, replace `--vendor-src` with
 an explicit `--workflow-url`, or supply `--workflow-name` and, where needed,

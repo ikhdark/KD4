@@ -436,10 +436,7 @@ async fn execute_local_user_shell_command(
         permission_profile: permission_profile.clone(),
         file_system_sandbox_policy: permission_profile.file_system_sandbox_policy(),
         network_sandbox_policy: permission_profile.network_sandbox_policy(),
-        windows_sandbox_filesystem_overrides: None,
-        windows_sandbox_additional_read_roots: Vec::new(),
         arg0: None,
-        exec_server_sandbox: None,
     };
     let stdout_stream = Some(StdoutStream {
         sub_id: turn_context.sub_id.clone(),

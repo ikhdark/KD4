@@ -41,6 +41,14 @@ pub enum ToolEffectsState {
     Unknown,
 }
 
+/// Owner-certified dispatch settlement, separate from housekeeping effects.
+/// Only the admission owner may prove that no requested action was admitted.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolDispatchState {
+    NotAdmitted,
+}
+
 /// An existing owner-issued continuation, never a replacement launch request.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ToolOperationHandle {
@@ -65,6 +73,8 @@ pub struct ToolFailure {
     pub message: String,
     #[serde(default)]
     pub execution_state: ToolExecutionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_state: Option<ToolDispatchState>,
     pub effects: ToolEffectsState,
     pub retry_safe: bool,
     pub safe_next_actions: Vec<String>,
@@ -94,6 +104,7 @@ impl ToolFailure {
             code,
             message: message.into(),
             execution_state: ToolExecutionState::Unknown,
+            dispatch_state: None,
             effects: ToolEffectsState::Unknown,
             retry_safe: false,
             safe_next_actions: vec![action.to_string()],

@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 base64 = { workspace = true }
+bigdecimal = { workspace = true }
 codex-command-analysis = { workspace = true }
 codex-file-system = { workspace = true }
 codex-protocol = { workspace = true }

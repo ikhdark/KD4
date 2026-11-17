@@ -23,7 +23,7 @@ New investigation evidence, proposals and benchmark learning use
 Both fix indexes link KDR's `learning/advisories/` projection, backed by
 `learning/history.json`. KD4 keeps its separate fix registry.
 Preserve existing receipt bytes and historical locations; do not mirror them.
-See [evidence memory](../../KDR/docs/operations/DIAGNOSTICS.md#evidence-memory-over-time)
+See [evidence memory](../../KDR/docs/operations/EVIDENCE_ADVISORIES.md)
 for selective behavioral constraints and warning-only advisories, not work-refusal gates.
 
 ## Current repository state

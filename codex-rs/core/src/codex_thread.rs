@@ -1093,8 +1093,9 @@ impl CodexThread {
     pub fn acquire_out_of_band_elicitation_lease(
         &self,
         lease_id: OutOfBandElicitationLeaseId,
+        hold_dispatch: bool,
     ) -> CodexResult<i64> {
-        self.out_of_band_elicitations.acquire(lease_id)
+        self.out_of_band_elicitations.acquire(lease_id, hold_dispatch)
     }
 
     pub fn release_out_of_band_elicitation_lease(
@@ -1102,6 +1103,21 @@ impl CodexThread {
         lease_id: &OutOfBandElicitationLeaseId,
     ) -> i64 {
         self.out_of_band_elicitations.release(lease_id)
+    }
+
+    pub async fn wait_for_pending_dispatches(&self, lease_id: &OutOfBandElicitationLeaseId) -> bool {
+        let Some(released) = self.out_of_band_elicitations.release_token(lease_id) else {
+            return false;
+        };
+        tokio::select! {
+            biased;
+            _ = released.cancelled() => false,
+            _ = self.codex.session.services.elicitations.wait_for_pending_dispatches() => !released.is_cancelled(),
+        }
+    }
+
+    pub fn has_out_of_band_elicitation_lease(&self, lease_id: &OutOfBandElicitationLeaseId) -> bool {
+        self.out_of_band_elicitations.contains(lease_id)
     }
 
     pub fn active_out_of_band_elicitation_lease_count(&self) -> i64 {

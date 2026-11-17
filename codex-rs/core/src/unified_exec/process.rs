@@ -19,7 +19,6 @@ use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-use crate::exec::is_likely_sandbox_denied;
 use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::command_output_artifact::capture::RawOutputArtifactTask;
 use codex_exec_server::ExecProcess;
@@ -1058,9 +1057,6 @@ impl UnifiedExecProcess {
         snapshot_retained_output(&self.output_buffer).await.0
     }
 
-    pub(crate) fn sandbox_type(&self) -> SandboxType {
-        self.sandbox_type
-    }
 
     pub(super) fn failure_message(&self) -> Option<String> {
         self.state_rx.borrow().failure_message.clone()
@@ -1095,9 +1091,10 @@ impl UnifiedExecProcess {
         &self,
         text: &str,
     ) -> Result<(), UnifiedExecError> {
+        // KD4 never sandboxes local processes; only an executor peer that
+        // explicitly reports a denial can produce this compatibility error.
         let executor_reported_denial = self.state_rx.borrow().sandbox_denied;
-        let sandbox_type = self.sandbox_type();
-        if !self.has_exited() || (!executor_reported_denial && sandbox_type == SandboxType::None) {
+        if !self.has_exited() || !executor_reported_denial {
             return Ok(());
         }
 
@@ -1108,23 +1105,20 @@ impl UnifiedExecProcess {
             aggregated_output: StreamOutput::new(text.to_string()),
             ..Default::default()
         };
-        if executor_reported_denial || is_likely_sandbox_denied(sandbox_type, &exec_output) {
-            let snippet = formatted_truncate_text(
-                text,
-                TruncationPolicy::Tokens(UNIFIED_EXEC_OUTPUT_MAX_TOKENS),
-            );
-            let message = if snippet.is_empty() {
-                format!("Process exited with code {exit_code}")
-            } else {
-                snippet
-            };
-            return Err(UnifiedExecError::sandbox_denied_with_artifact(
-                message,
-                exec_output,
-                self.raw_output_artifact().await,
-            ));
-        }
-        Ok(())
+        let snippet = formatted_truncate_text(
+            text,
+            TruncationPolicy::Tokens(UNIFIED_EXEC_OUTPUT_MAX_TOKENS),
+        );
+        let message = if snippet.is_empty() {
+            format!("Process exited with code {exit_code}")
+        } else {
+            snippet
+        };
+        Err(UnifiedExecError::sandbox_denied_with_artifact(
+            message,
+            exec_output,
+            self.raw_output_artifact().await,
+        ))
     }
 
     pub(super) async fn from_spawned(

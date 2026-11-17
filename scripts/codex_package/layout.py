@@ -101,8 +101,6 @@ def validate_package_input_roles(inputs: PackageInputs) -> None:
         ("entrypoint", inputs.entrypoint_bin),
         ("code-mode host", inputs.code_mode_host_bin),
         ("ripgrep", inputs.rg_bin),
-        ("Windows command runner", inputs.codex_command_runner_bin),
-        ("Windows sandbox setup", inputs.codex_windows_sandbox_setup_bin),
     )
     resolved: list[tuple[str, Path]] = []
     for role, path in role_paths:
@@ -134,8 +132,6 @@ def build_package_dir(
             ("entrypoint", inputs.entrypoint_bin),
             ("code-mode-host", inputs.code_mode_host_bin),
             ("ripgrep", inputs.rg_bin),
-            ("command-runner", inputs.codex_command_runner_bin),
-            ("sandbox-setup", inputs.codex_windows_sandbox_setup_bin),
         )
         if path is not None
     }
@@ -165,18 +161,6 @@ def build_package_dir(
             PureWindowsPath("..") / "bin" / entrypoint_name,
         )
 
-    if inputs.codex_command_runner_bin is not None:
-        copy_executable(
-            inputs.codex_command_runner_bin,
-            resources_dir / "codex-command-runner.exe",
-        )
-
-    if inputs.codex_windows_sandbox_setup_bin is not None:
-        copy_executable(
-            inputs.codex_windows_sandbox_setup_bin,
-            resources_dir / "codex-windows-sandbox-setup.exe",
-        )
-
     shutil.copyfile(REPO_ROOT / "LICENSE", package_dir / "LICENSE")
     shutil.copyfile(REPO_ROOT / "NOTICE", package_dir / "NOTICE")
 
@@ -198,8 +182,6 @@ def build_package_dir(
                     "entrypoint",
                     "code-mode-host",
                     "ripgrep",
-                    "command-runner",
-                    "sandbox-setup",
                 }
             },
         }
@@ -379,8 +361,6 @@ def package_file_roles(*, variant: PackageVariant, spec: TargetSpec) -> dict[str
     return {
         f"bin/{variant.entrypoint_name(spec)}": "entrypoint",
         f"bin/{spec.code_mode_host_name}": "code-mode-host",
-        "codex-resources/codex-command-runner.exe": "command-runner",
-        "codex-resources/codex-windows-sandbox-setup.exe": "sandbox-setup",
         f"codex-path/{spec.rg_name}": "ripgrep",
         "codex-path/apply_patch.bat": "apply-patch-alias",
         "codex-path/applypatch.bat": "apply-patch-alias",

@@ -559,13 +559,22 @@ impl LocalAgentTaskStore {
         };
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         ensure_task_workspace_tx(&mut transaction, &repository).await?;
-        let dependency_admissions = validate_dependencies_tx(
+        let dependency_admissions = match validate_dependencies_tx(
             &mut transaction,
             assignment.assignment_id,
             Some(&assignment.repository_id),
             &assignment.dependencies,
         )
-        .await?;
+        .await
+        {
+            Ok(admissions) => admissions,
+            Err(error) => {
+                // A dependency refusal certifies no admission only after the
+                // workspace metadata transaction has actually rolled back.
+                transaction.rollback().await?;
+                return Err(error);
+            }
+        };
         validate_architecture_contract_reference_tx(
             &mut transaction,
             &assignment,

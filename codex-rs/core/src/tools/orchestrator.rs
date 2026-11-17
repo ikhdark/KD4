@@ -9,24 +9,17 @@ use crate::tools::flat_tool_name;
 use crate::tools::sandboxing::ApprovalCtx;
 use crate::tools::sandboxing::ExecApprovalRequirement;
 use crate::tools::sandboxing::SandboxAttempt;
-use crate::tools::sandboxing::SandboxOverride;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::ToolRuntime;
 use crate::tools::sandboxing::command_permission_profile;
-use crate::tools::sandboxing::command_windows_sandbox_level;
 use crate::tools::sandboxing::default_exec_approval_requirement;
-use crate::tools::sandboxing::sandbox_override_for_first_attempt;
 use codex_hooks::PermissionRequestDecision;
 use codex_otel::ToolDecisionSource;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ReviewDecision;
-use codex_sandboxing::SandboxType;
-use codex_sandboxing::SandboxablePreference;
-use codex_sandboxing::select_initial;
-use codex_sandboxing::should_sandbox;
 use std::time::Instant;
 
 pub(crate) struct ToolOrchestrator;
@@ -73,12 +66,9 @@ impl ToolOrchestrator {
         // Root and worker commands share the inherited turn permissions and the
         // same approval/managed-policy path, including remote execution.
         let permissions = command_permission_profile(turn_ctx);
-        let exec_server_permissions = turn_ctx.config.permissions.permission_profile().clone();
-        let windows_sandbox_level = command_windows_sandbox_level(turn_ctx);
 
         // 1) Approval. Existing prohibitions and approval policy remain in force.
         let file_system_sandbox_policy = permissions.file_system_sandbox_policy();
-        let network_sandbox_policy = permissions.network_sandbox_policy();
         let requirement = tool.exec_approval_requirement(req).unwrap_or_else(|| {
             default_exec_approval_requirement(approval_policy, &file_system_sandbox_policy)
         });
@@ -116,52 +106,9 @@ impl ToolOrchestrator {
             }
         }
 
-        // 2) First attempt under the selected sandbox.
-        let sandbox_override = sandbox_override_for_first_attempt(
-            tool.sandbox_permissions(req),
-            &requirement,
-            &file_system_sandbox_policy,
-        );
-        let sandbox_preference = SandboxablePreference::Auto;
-        let sandbox_requested = match sandbox_override {
-            SandboxOverride::BypassSandboxFirstAttempt => false,
-            SandboxOverride::NoOverride => should_sandbox(
-                &file_system_sandbox_policy,
-                network_sandbox_policy,
-                sandbox_preference,
-                false,
-            ),
-        };
-        let initial_sandbox = if sandbox_requested {
-            select_initial(
-                &file_system_sandbox_policy,
-                network_sandbox_policy,
-                sandbox_preference,
-                windows_sandbox_level,
-                false,
-            )
-        } else {
-            SandboxType::None
-        };
-
-        let sandbox_policy_cwd = tool
-            .sandbox_cwd(req)
-            .cloned()
-            .unwrap_or_else(|| turn_ctx.cwd_uri());
-        let workspace_roots = turn_ctx.effective_workspace_roots();
+        // Approvals remain independent of KD4's full-access execution policy.
         let initial_attempt = SandboxAttempt {
             codex_home: &turn_ctx.config.codex_home,
-            sandbox: initial_sandbox,
-            sandbox_requested,
-            permissions: &permissions,
-            exec_server_permissions: &exec_server_permissions,
-            sandbox_cwd: &sandbox_policy_cwd,
-            workspace_roots,
-            windows_sandbox_level,
-            windows_sandbox_private_desktop: turn_ctx
-                .config
-                .permissions
-                .windows_sandbox_private_desktop,
         };
 
         let initial_attempt_start = Instant::now();

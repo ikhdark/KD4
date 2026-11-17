@@ -51,21 +51,18 @@ function Get-PgoBuildProof {
     return Invoke-PgoOwner -Options $Options -Action {
         $paths = @(
             (Get-BuiltCodexPath -RepoRoot $RepoRoot -Profile $Profile),
-            (Get-BuiltCodeModeHostPath -RepoRoot $RepoRoot -Profile $Profile),
-            (Get-BuiltWindowsSandboxSetupPath -RepoRoot $RepoRoot -Profile $Profile),
-            (Get-BuiltCommandRunnerPath -RepoRoot $RepoRoot -Profile $Profile)
+            (Get-BuiltCodeModeHostPath -RepoRoot $RepoRoot -Profile $Profile)
         )
         $stampPath = Get-BuildStampPath -RepoRoot $RepoRoot -Profile $Profile
         $stamp = Read-BuildStamp -StampPath $stampPath
         $decision = Get-AutoSkipBuildDecision -RepoRoot $RepoRoot -StampPath $stampPath `
-            -Profile $Profile -SourceExe $paths[0] -SourceCodeModeHostExe $paths[1] `
-            -SourceWindowsSandboxSetupExe $paths[2] -SourceCommandRunnerExe $paths[3]
+            -Profile $Profile -SourceExe $paths[0] -SourceCodeModeHostExe $paths[1]
         if (-not $decision.CanSkip) { throw "PGO build is not current: $($decision.Reason). Rerun its build stage." }
         if ($null -eq $stamp -or $stamp.SourceFingerprint -cne $decision.SourceSnapshot.Fingerprint) {
             throw "PGO build stamp changed while collecting proof. Rerun its build stage."
         }
-        $names = @("codex.exe", "codex-code-mode-host.exe", "codex-resources/codex-windows-sandbox-setup.exe", "codex-resources/codex-command-runner.exe")
-        $hashes = @($stamp.CodexSha256, $stamp.CodeModeHostSha256, $stamp.WindowsSandboxSetupSha256, $stamp.CommandRunnerSha256)
+        $names = @("codex.exe", "codex-code-mode-host.exe")
+        $hashes = @($stamp.CodexSha256, $stamp.CodeModeHostSha256)
         $entries = for ($index = 0; $index -lt $paths.Count; $index++) {
             [pscustomobject]@{ relativePath = $names[$index]; sourcePath = $paths[$index]; sha256 = $hashes[$index] }
         }
@@ -158,7 +155,7 @@ function Read-PgoState {
 
 function Assert-PgoTrainingBundle {
     param([object]$State)
-    $expected = @("codex.exe", "codex-code-mode-host.exe", "codex-resources/codex-windows-sandbox-setup.exe", "codex-resources/codex-command-runner.exe")
+    $expected = @("codex.exe", "codex-code-mode-host.exe")
     if (-not $State.prepared -or @($State.entries).Count -ne $expected.Count) { throw "PGO preparation is incomplete. Rerun Prepare." }
     foreach ($name in $expected) {
         $entry = @($State.entries | Where-Object { $_.relativePath -ceq $name })

@@ -15,7 +15,6 @@ use crate::shell::ShellType;
 use crate::tools::runtimes::ShellCommandPreparation;
 use crate::tools::runtimes::build_sandbox_command;
 use crate::tools::runtimes::prepare_shell_command;
-use crate::tools::runtimes::shell_snapshot_additional_read_roots;
 use crate::tools::sandboxing::Approvable;
 use crate::tools::sandboxing::ApprovalCtx;
 use crate::tools::sandboxing::ExecApprovalRequirement;
@@ -218,10 +217,6 @@ impl Approvable<ShellRequest> for ShellRuntime {
         // Shell requests execute on the host in this resolved command cwd.
         Some(codex_utils_path_uri::PathUri::from_abs_path(&req.cwd))
     }
-
-    fn sandbox_permissions(&self, req: &ShellRequest) -> SandboxPermissions {
-        req.sandbox_permissions
-    }
 }
 
 impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
@@ -231,15 +226,6 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         attempt: &SandboxAttempt<'_>,
         ctx: &ToolCtx,
     ) -> Result<ExecToolCallOutput, ToolError> {
-        // Only a sandbox enforces requested restrictions, and the orchestrator selects
-        // `SandboxType::None` when this host has no sandbox backend. Refuse such a
-        // launch like `build_exec_request` and unified exec instead of running it
-        // without enforcement. This runtime always launches on this host, so a
-        // remote-labelled environment is not exempt. Launches whose policy
-        // requested no sandbox are unchanged.
-        if attempt.sandbox_requested && attempt.sandbox == codex_sandboxing::SandboxType::None {
-            return Err(ToolError::Codex(crate::exec::unavailable_sandbox_error()));
-        }
         let session_shell = ctx
             .session
             .shell_for_environment(&req.turn_environment)
@@ -272,10 +258,6 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             explicit_env_overrides: &req.explicit_env_overrides,
             env: &mut env,
             shell_type: &shell.shell_type,
-            sandbox_shell_type: req.shell_type.as_ref(),
-            sandbox: attempt.sandbox,
-            windows_sandbox_level: attempt.windows_sandbox_level,
-            enforce_managed_network: false,
             approved_powershell_direct_argv: req.approved_powershell_direct_argv.as_ref(),
             proof_cwd: Some(req.cwd.as_path()),
         })
@@ -328,10 +310,6 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             }),
         )
         .with_shell_command(&command, req.shell_wrapper_is_owned);
-        let additional_read_roots = shell_snapshot_additional_read_roots(
-            shell_snapshot_location.as_deref(),
-            attempt.sandbox,
-        );
         let command = build_sandbox_command(
             &command,
             codex_utils_path_uri::PathUri::from_abs_path(&req.cwd),
@@ -348,11 +326,10 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             expiration,
             capture_policy: ExecCapturePolicy::ShellTool,
         };
-        let mut env = attempt
+        let env = attempt
             .env_for(command, options)
             .await
             .map_err(ToolError::Codex)?;
-        env.windows_sandbox_additional_read_roots = additional_read_roots;
         let validation_resource = crate::validation_task::acquire_execution_resources(
             ctx, &req.command_for_approval, Some(req.cwd.as_path()),
         ).await.map_err(ToolError::Rejected)?;
@@ -435,11 +412,8 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             Err(CodexErr::Sandbox(SandboxErr::Timeout { output })) if stalled => *output,
             Err(err) => {
                 let attempt_started = validation_attempt_started.load(Ordering::Acquire);
-                // `exec` reports creation through `after_spawn`. The Windows
-                // sandbox launcher never does, so its failures stay spent.
-                if !attempt_started
-                    && attempt.sandbox != codex_sandboxing::SandboxType::WindowsRestrictedToken
-                {
+                // The direct launcher reports creation through `after_spawn`.
+                if !attempt_started {
                     crate::validation_task::policy_attempt_not_started(ctx).await;
                 }
                 self.last_validation_attempt_started |= req.validation_launch && attempt_started;

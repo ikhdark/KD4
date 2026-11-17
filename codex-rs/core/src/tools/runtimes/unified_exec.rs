@@ -16,7 +16,6 @@ use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::runtimes::ShellCommandPreparation;
 use crate::tools::runtimes::build_sandbox_command;
 use crate::tools::runtimes::prepare_shell_command;
-use crate::tools::runtimes::shell_snapshot_additional_read_roots;
 use crate::tools::sandboxing::Approvable;
 use crate::tools::sandboxing::ApprovalCtx;
 use crate::tools::sandboxing::ExecApprovalRequirement;
@@ -56,7 +55,6 @@ pub struct UnifiedExecRequest {
     pub hook_command: String,
     pub process_id: u32,
     pub cwd: PathUri,
-    pub sandbox_cwd: PathUri,
     pub turn_environment: TurnEnvironment,
     pub env: HashMap<String, String>,
     pub exec_server_env_config: Option<ExecServerEnvConfig>,
@@ -246,34 +244,15 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
         // Hooks run on the host; a remote command cwd never replaces the host cwd.
         (!req.turn_environment.environment.is_remote()).then(|| req.cwd.clone())
     }
-
-    fn sandbox_permissions(&self, req: &UnifiedExecRequest) -> SandboxPermissions {
-        req.sandbox_permissions
-    }
 }
 
 impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExecRuntime<'a> {
-    fn sandbox_cwd<'b>(&self, req: &'b UnifiedExecRequest) -> Option<&'b PathUri> {
-        Some(&req.sandbox_cwd)
-    }
-
     async fn run(
         &mut self,
         req: &UnifiedExecRequest,
         attempt: &SandboxAttempt<'_>,
         ctx: &ToolCtx,
     ) -> Result<Arc<UnifiedExecProcess>, ToolError> {
-        // Only a sandbox enforces requested restrictions, and the orchestrator selects
-        // `SandboxType::None` when this host has no sandbox backend. Refuse such a
-        // local launch like `build_exec_request` instead of running it without
-        // enforcement. Remote executors select and enforce their own sandbox, and
-        // launches whose policy requested no sandbox are unchanged.
-        if attempt.sandbox_requested
-            && attempt.sandbox == codex_sandboxing::SandboxType::None
-            && !req.turn_environment.environment.is_remote()
-        {
-            return Err(ToolError::Codex(crate::exec::unavailable_sandbox_error()));
-        }
         let pending_spawns = self.pending_spawns.clone();
         let setup_timing = ctx
             .turn
@@ -310,10 +289,6 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
             explicit_env_overrides: &req.explicit_env_overrides,
             env: &mut env,
             shell_type: &req.shell_type,
-            sandbox_shell_type: Some(&req.shell_type),
-            sandbox: attempt.sandbox,
-            windows_sandbox_level: attempt.windows_sandbox_level,
-            enforce_managed_network: false,
             approved_powershell_direct_argv: req.approved_powershell_direct_argv.as_ref(),
             proof_cwd: req.normalization_cwd.as_deref(),
         })
@@ -348,10 +323,6 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
         }
 
         let shell_startup_command = command.clone();
-        let additional_read_roots = shell_snapshot_additional_read_roots(
-            shell_snapshot_location.as_deref(),
-            attempt.sandbox,
-        );
         let permissions = req.canonical_additional_permissions();
         let command = build_sandbox_command(
             &command,
@@ -434,7 +405,6 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
                 self.manager.open_session_with_exec_env(
                     req.process_id,
                     command,
-                    additional_read_roots,
                     options,
                     permissions.as_ref(),
                     attempt,
@@ -452,12 +422,9 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
                 ),
             )
             .await;
-        // Every launcher reports creation through `after_spawn`. A failed
-        // Windows sandbox launch may still leave a helper-owned child, so it
-        // stays spent like any possible start.
+        // The direct launcher reports creation through `after_spawn`.
         if result.is_err()
             && !spawned.load(std::sync::atomic::Ordering::Acquire)
-            && attempt.sandbox != codex_sandboxing::SandboxType::WindowsRestrictedToken
         {
             crate::validation_task::policy_attempt_not_started(ctx).await;
         }

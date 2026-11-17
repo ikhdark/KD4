@@ -31,7 +31,6 @@ codex-thread-store = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-home-dir = { workspace = true }
 codex-utils-path-uri = { workspace = true }
-codex-windows-sandbox = { workspace = true }
 dunce = { workspace = true }
 rmcp = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

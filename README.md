@@ -5,6 +5,11 @@ This checkout contains the Rust harness, CLI and app server, Code Mode runtime,
 SDKs, and local build/install tooling. It is not the upstream distribution.
 Publishing or republishing requires explicit permission.
 
+KD4 runs commands and file tools with full host access; it does not provide an
+OS sandbox. Legacy read-only/workspace sandbox selections remain accepted for
+client/config compatibility but do not restrict filesystem or network access.
+Approval policy, validation restrictions and project/hook trust remain separate.
+
 ## Documentation
 
 | Area | Guide |

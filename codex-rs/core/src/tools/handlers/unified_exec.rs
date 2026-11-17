@@ -99,10 +99,11 @@ struct RawExecCommandArgs {
     max_output_tokens: Option<usize>,
     #[serde(default)]
     quiet_on_success: bool,
+    // Legacy sandbox hints from older callers are accepted and ignored.
     #[serde(default)]
-    sandbox_permissions: SandboxPermissions,
+    sandbox_permissions: Option<serde_json::Value>,
     #[serde(default)]
-    additional_permissions: Option<AdditionalPermissionProfile>,
+    additional_permissions: Option<serde_json::Value>,
     #[serde(default)]
     justification: Option<String>,
     #[serde(default)]
@@ -171,7 +172,12 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
         // in a separate boundary pass before the command arguments are
         // decoded. Reading these fields here keeps this decoder permissive for
         // that shared surface without retaining either value internally.
-        let _compatibility_only_fields = (&raw.environment_id, &raw.workdir);
+        let _compatibility_only_fields = (
+            &raw.environment_id,
+            &raw.workdir,
+            &raw.sandbox_permissions,
+            &raw.additional_permissions,
+        );
 
         // Native PowerShell parsing can wait on IPC. Deserialization also runs
         // during synchronous Code Mode preflight, so only decode structure here.
@@ -204,8 +210,11 @@ impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
             stall_timeout_requested: raw.stall_timeout_ms.is_some(),
             max_output_tokens: raw.max_output_tokens,
             quiet_on_success: raw.quiet_on_success,
-            sandbox_permissions: raw.sandbox_permissions,
-            additional_permissions: raw.additional_permissions,
+            // KD4 has no sandbox: legacy per-command overrides and additional
+            // permission requests are accepted but never refused or prompted,
+            // because every command already runs with full access.
+            sandbox_permissions: SandboxPermissions::UseDefault,
+            additional_permissions: None,
             justification: raw.justification,
             prefix_rule: raw.prefix_rule,
             force_fresh: raw.force_fresh,

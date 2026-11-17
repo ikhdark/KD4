@@ -476,6 +476,21 @@ async fn handle_spawn_agent(
             Ok(task) => task,
             Err(error) => {
                 emit_admission_rejection_metric(&turn.session_telemetry, &error);
+                if matches!(&error, StoreError::DependencyBlocked { .. }) {
+                    let mut failure = codex_protocol::tool_failure::ToolFailure::new(
+                        codex_protocol::tool_failure::ToolFailureCode::Failed,
+                        format!("spawn_agent: {}", task_store_error_detail("spawn_agent", error)),
+                    )
+                    .with_completed_execution();
+                    failure.dispatch_state = Some(
+                        codex_protocol::tool_failure::ToolDispatchState::NotAdmitted,
+                    );
+                    failure.safe_next_actions = vec![
+                        "No downstream assignment or child was admitted. Reconcile the prerequisite's current accepted receipt before requesting fresh admission; existing permissions and admission checks still apply. Store initialization or residency housekeeping may have occurred."
+                            .to_string(),
+                    ];
+                    return Err(FunctionCallError::structured(failure));
+                }
                 return Err(typed_task_store_error(error));
             }
         };

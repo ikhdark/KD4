@@ -247,25 +247,21 @@ Use `turn(...)` when you need low-level turn control (`stream()`, `steer()`,
 
 ## Sandbox
 
-Use `sandbox=` consistently on thread lifecycle methods and turns:
+The `sandbox=` keyword remains accepted on thread lifecycle methods and turns:
 
 ```python
 from openai_codex import Codex, Sandbox
 
 with Codex() as codex:
-    thread = codex.thread_start(sandbox=Sandbox.workspace_write)
-    result = thread.run("Review the diff only.", sandbox=Sandbox.read_only)
+    thread = codex.thread_start(sandbox=Sandbox.full_access)
+    result = thread.run("Review the diff only.")
 ```
 
-Presets:
-
-- `Sandbox.read_only`: read files without allowing writes.
-- `Sandbox.workspace_write`: the normal default for projects with a recorded trust decision; read
-  files and write inside the workspace and configured writable roots.
-- `Sandbox.full_access`: run without filesystem access restrictions.
-
-When `sandbox=` is omitted, Codex uses its configured default. A sandbox
-passed to `run(...)` or `turn(...)` applies to that turn and subsequent turns.
+Local KD4 always runs with full filesystem and network access. The legacy
+`Sandbox.read_only` and `Sandbox.workspace_write` values are accepted but do not
+enforce restrictions; omission also uses full access. Approval policy and
+project/hook trust remain independent. Other runtimes, including the upstream
+bundled executable, may retain sandbox enforcement.
 
 ## TurnHandle / AsyncTurnHandle
 

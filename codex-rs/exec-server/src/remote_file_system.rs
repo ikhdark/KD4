@@ -211,12 +211,6 @@ impl RemoteFileSystem {
         path: &PathUri,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<FileSystemReadStream> {
-        if sandbox.is_some_and(FileSystemSandboxContext::should_run_in_sandbox) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "streaming file reads do not support platform sandboxing",
-            ));
-        }
         trace!("remote fs read_file_stream");
         let client = self.client.get().await.map_err(map_remote_error)?;
         file_stream::open(client, path.clone(), remote_sandbox_context(sandbox)).await
@@ -606,12 +600,6 @@ impl ExecutorFileSystem for RemoteFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
         Box::pin(async move {
-            if sandbox.is_some_and(FileSystemSandboxContext::should_run_in_sandbox) {
-                let bytes = RemoteFileSystem::read_file(self, path, sandbox).await?;
-                return Ok(FileSystemReadStream::new(futures::stream::once(
-                    std::future::ready(Ok(bytes.into())),
-                )));
-            }
             Ok(RemoteFileSystem::read_file_stream(self, path, sandbox).await?
                 .with_limit(MAX_FILE_PAYLOAD_BYTES as u64))
         })
@@ -739,11 +727,10 @@ impl Drop for CancelChecksumOnDrop {
 }
 
 fn remote_sandbox_context(
-    sandbox: Option<&FileSystemSandboxContext>,
+    _sandbox: Option<&FileSystemSandboxContext>,
 ) -> Option<FileSystemSandboxContext> {
-    sandbox
-        .cloned()
-        .map(FileSystemSandboxContext::drop_cwd_if_unused)
+    // Do not forward obsolete restrictions to an older remote executor.
+    None
 }
 
 fn map_remote_error(error: ExecServerError) -> io::Error {

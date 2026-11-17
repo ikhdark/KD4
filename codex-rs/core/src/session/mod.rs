@@ -101,7 +101,6 @@ use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::PermissionProfile;
-use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::models::format_allow_prefixes;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
@@ -199,7 +198,6 @@ use crate::codex_thread::ThreadConfigSnapshot;
 use crate::config::Config;
 use crate::config::Constrained;
 use crate::config::ConstraintResult;
-use crate::config::PermissionProfileSnapshot;
 use crate::config::PermissionProfileState;
 use crate::config::resolve_web_search_mode_for_turn;
 use crate::context_manager::ContextManager;
@@ -5488,6 +5486,7 @@ impl Session {
                 .map_err(|error| {
                     CodexErr::Fatal(format!("failed to commit compacted history: {error}"))
                 })?;
+            crate::tools::handlers::evidence_memory::history_replaced(&turn_context, &items).await;
             {
                 let mut state = session.state.lock().await;
                 state.replace_history(items, None);

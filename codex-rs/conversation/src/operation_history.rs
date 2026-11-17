@@ -119,9 +119,20 @@ impl OperationAttempt {
         let recovery_required = previous.iter().rev().find(same_state)
             .filter(|attempt| unsuccessful(attempt))
             .and_then(|attempt| attempt.original_failure.as_ref())
-            .is_some_and(|failure| failure.effects == codex_protocol::tool_failure::ToolEffectsState::Unknown
+            .is_some_and(|failure| {
+                let admission_refused = self.strategy.namespace.as_deref() == Some("agents")
+                    && self.strategy.name == "spawn_agent"
+                    && failure.dispatch_state
+                    == Some(codex_protocol::tool_failure::ToolDispatchState::NotAdmitted)
+                    && failure.execution_state == codex_protocol::tool_failure::ToolExecutionState::Completed
+                    && failure.code == ToolFailureCode::Failed
+                    && failure.live_operations.is_empty();
+                // Fresh admission does not duplicate a refused dispatch. This
+                // is not a no-effects claim or permission to skip current gates.
+                !admission_refused && (failure.effects == codex_protocol::tool_failure::ToolEffectsState::Unknown
                 || failure.execution_state == codex_protocol::tool_failure::ToolExecutionState::Unknown
-                || !failure.live_operations.is_empty());
+                || !failure.live_operations.is_empty())
+            });
         // All these records have the same exact strategy and parameters. Surface
         // its latest relevant failure and occurrence count, not an ever-growing
         // transcript. Every original instance remains in the history journal.

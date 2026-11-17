@@ -44,7 +44,6 @@ use codex_protocol::config_types::WebSearchToolConfig;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
-use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::validation::ValidationMode;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -699,15 +698,6 @@ pub struct AgentRoleToml {
     /// Candidate nicknames for agents spawned with this role.
     pub nickname_candidates: Option<Vec<String>>,
 }
-
-fn is_unsandboxed_windows(windows_sandbox_level: WindowsSandboxLevel, is_windows: bool) -> bool {
-    is_windows && windows_sandbox_level == WindowsSandboxLevel::Disabled
-}
-
-const fn current_platform_is_windows() -> bool {
-    cfg!(windows)
-}
-
 impl ConfigToml {
     pub fn validate_context_limits(&self) -> Result<(), String> {
         for (field, value) in [
@@ -733,81 +723,14 @@ impl ConfigToml {
         active_project: Option<&ProjectConfig>,
         permission_profile_constraint: Option<&crate::Constrained<PermissionProfile>>,
     ) -> PermissionProfile {
-        let is_unsandboxed_windows =
-            is_unsandboxed_windows(windows_sandbox_level, current_platform_is_windows());
-        let configured_sandbox_mode = sandbox_mode_override.or(self.sandbox_mode);
-        let resolved_sandbox_mode = configured_sandbox_mode
-            .or_else(|| {
-                // If no sandbox_mode is set but this directory has a trust decision,
-                // default to workspace-write except on unsandboxed Windows where we
-                // default to read-only.
-                active_project
-                    .filter(|project| project.is_trusted() || project.is_untrusted())
-                    .map(|_| {
-                        if is_unsandboxed_windows {
-                            SandboxMode::ReadOnly
-                        } else {
-                            SandboxMode::WorkspaceWrite
-                        }
-                    })
-            })
-            .unwrap_or_default();
-        let effective_sandbox_mode = if is_unsandboxed_windows
-            // If the experimental Windows sandbox is enabled, do not force a downgrade.
-            && matches!(resolved_sandbox_mode, SandboxMode::WorkspaceWrite)
-        {
-            SandboxMode::ReadOnly
-        } else {
-            resolved_sandbox_mode
-        };
-
-        let permission_profile = match effective_sandbox_mode {
-            SandboxMode::ReadOnly => PermissionProfile::read_only(),
-            SandboxMode::WorkspaceWrite => match self.sandbox_workspace_write.as_ref() {
-                Some(SandboxWorkspaceWrite {
-                    writable_roots,
-                    network_access,
-                    exclude_tmpdir_env_var,
-                    exclude_slash_tmp,
-                }) => {
-                    let network_policy = if *network_access {
-                        NetworkSandboxPolicy::Enabled
-                    } else {
-                        NetworkSandboxPolicy::Restricted
-                    };
-                    let writable_roots = writable_roots.clone();
-                    let exclude_tmpdir_env_var = *exclude_tmpdir_env_var;
-                    let exclude_slash_tmp = *exclude_slash_tmp;
-                    tokio::task::spawn_blocking(move || {
-                        PermissionProfile::workspace_write_with(
-                            &writable_roots,
-                            network_policy,
-                            exclude_tmpdir_env_var,
-                            exclude_slash_tmp,
-                        )
-                    })
-                    .await
-                    .unwrap_or_else(|error| {
-                        tracing::error!(%error, "permission profile projection worker failed; falling back to read-only");
-                        PermissionProfile::read_only()
-                    })
-                }
-                None => PermissionProfile::workspace_write(),
-            },
-            SandboxMode::DangerFullAccess => PermissionProfile::Disabled,
-        };
-        if configured_sandbox_mode.is_none()
-            && let Some(constraint) = permission_profile_constraint
-            && let Err(err) = constraint.can_set(&permission_profile)
-        {
-            tracing::warn!(
-                error = %err,
-                "default sandbox policy is disallowed by requirements; falling back to required default"
-            );
-            PermissionProfile::read_only()
-        } else {
-            permission_profile
-        }
+        // Retain the legacy call and config syntax without installing isolation.
+        let _ = (
+            sandbox_mode_override,
+            windows_sandbox_level,
+            active_project,
+            permission_profile_constraint,
+        );
+        PermissionProfile::Disabled
     }
 
     /// Resolves the cwd to an existing project, or returns None if ConfigToml

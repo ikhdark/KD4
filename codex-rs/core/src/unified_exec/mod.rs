@@ -1,17 +1,16 @@
-//! Unified Exec: interactive process execution orchestrated with approvals + sandboxing.
+//! Unified Exec: interactive process execution orchestrated with approvals.
 //!
 //! Responsibilities
 //! - Manages interactive processes (create, reuse, buffer output with caps).
-//! - Uses the shared ToolOrchestrator for approval and sandbox selection.
-//! - Spawns the PTY from a sandbox-transformed `ExecRequest`; sandbox denial
-//!   returns the original failure without replaying the command.
-//! - Uses the shared `is_likely_sandbox_denied` heuristic to keep denial messages
-//!   consistent with other exec paths.
+//! - Uses the shared ToolOrchestrator for approval; commands run with full
+//!   access because KD4 has no sandbox.
+//! - Spawns the PTY from a direct `ExecRequest`; a failure is returned without
+//!   replaying the command.
 //!
 //! Flow at a glance (open process)
 //! 1) Build a small request `{ command, cwd }`.
-//! 2) Orchestrator: approval (bypass/cache/prompt) → select sandbox → run.
-//! 3) Runtime: transform `SandboxTransformRequest` -> `ExecRequest` -> spawn PTY.
+//! 2) Orchestrator: approval (bypass/cache/prompt) → run.
+//! 3) Runtime: build a direct `ExecRequest` -> spawn PTY.
 //! 4) Return the process handle with streaming output + metadata, or the
 //!    original failure without a second launch.
 //!
@@ -145,7 +144,6 @@ pub(crate) struct ExecCommandRequest {
     pub cwd: PathUri,
 
     pub normalization_cwd: Option<PathBuf>,
-    pub sandbox_cwd: PathUri,
     pub turn_environment: TurnEnvironment,
     pub tty: bool,
     pub pipe_stdin: bool,

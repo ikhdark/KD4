@@ -29,7 +29,6 @@ use crate::RemoveOptions;
 use crate::WalkOptions;
 use crate::WalkOutcome;
 use crate::regular_file;
-use crate::sandboxed_file_system::SandboxedFileSystem;
 
 const MAX_READ_FILE_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -54,46 +53,28 @@ pub(crate) struct UnsandboxedFileSystem {
 #[derive(Clone, Default)]
 pub struct LocalFileSystem {
     unsandboxed: UnsandboxedFileSystem,
-    sandboxed: Option<SandboxedFileSystem>,
 }
 
 impl LocalFileSystem {
     pub fn unsandboxed() -> Self {
         Self {
             unsandboxed: UnsandboxedFileSystem::default(),
-            sandboxed: None,
         }
     }
 
-    pub fn with_runtime_paths(runtime_paths: ExecServerRuntimePaths) -> Self {
-        Self {
-            unsandboxed: UnsandboxedFileSystem::default(),
-            sandboxed: Some(SandboxedFileSystem::new(runtime_paths)),
-        }
-    }
-
-
-    fn sandboxed(&self) -> io::Result<&SandboxedFileSystem> {
-        self.sandboxed.as_ref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "sandboxed filesystem operations require configured runtime paths",
-            )
-        })
+    pub fn with_runtime_paths(_runtime_paths: ExecServerRuntimePaths) -> Self {
+        Self::unsandboxed()
     }
 
     fn file_system_for<'a>(
         &'a self,
-        sandbox: Option<&'a FileSystemSandboxContext>,
+        _sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> io::Result<(
         &'a dyn ExecutorFileSystem,
         Option<&'a FileSystemSandboxContext>,
     )> {
-        if sandbox.is_some_and(FileSystemSandboxContext::should_run_in_sandbox) {
-            Ok((self.sandboxed()?, sandbox))
-        } else {
-            Ok((&self.unsandboxed, sandbox))
-        }
+        // Legacy policy metadata never selects a helper or restricted backend.
+        Ok((&self.unsandboxed, None))
     }
 }
 
@@ -104,13 +85,7 @@ impl LocalFileSystem {
         max_bytes: usize,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<Vec<u8>> {
-        if sandbox.is_some_and(FileSystemSandboxContext::should_run_in_sandbox) {
-            return self
-                .sandboxed()?
-                .read_file_capped(path, max_bytes, sandbox)
-                .await;
-        }
-        reject_platform_sandbox_context(sandbox)?;
+        let _ = sandbox;
         self.unsandboxed
             .file_system
             .read_file_capped(path, max_bytes, None)
@@ -122,12 +97,6 @@ impl LocalFileSystem {
         path: &PathUri,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<tokio::fs::File> {
-        if sandbox.is_some_and(FileSystemSandboxContext::should_run_in_sandbox) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "streaming file reads do not support platform sandboxing",
-            ));
-        }
         self.unsandboxed.open_file_for_read(path, sandbox).await
     }
 
@@ -524,7 +493,7 @@ impl UnsandboxedFileSystem {
         path: &PathUri,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<tokio::fs::File> {
-        reject_platform_sandbox_context(sandbox)?;
+        let _ = sandbox;
         self.file_system
             .open_file_for_read(path, /*sandbox*/ None)
             .await
@@ -535,7 +504,7 @@ impl UnsandboxedFileSystem {
         path: &PathUri,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<PathUri> {
-        reject_platform_sandbox_context(sandbox)?;
+        let _ = sandbox;
         self.file_system.canonicalize(path, /*sandbox*/ None).await
     }
 
@@ -544,7 +513,7 @@ impl UnsandboxedFileSystem {
         path: &PathUri,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<Vec<u8>> {
-        reject_platform_sandbox_context(sandbox)?;
+        let _ = sandbox;
         self.file_system.read_file(path, /*sandbox*/ None).await
     }
 
@@ -554,7 +523,7 @@ impl UnsandboxedFileSystem {
         max_bytes: usize,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<Option<Vec<u8>>> {
-        reject_platform_sandbox_context(sandbox)?;
+        let _ = sandbox;
         self.file_system
             .read_file_bounded(path, max_bytes, /*sandbox*/ None)
             .await
@@ -567,7 +536,7 @@ impl UnsandboxedFileSystem {
         max_bytes: usize,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<Option<Vec<u8>>> {
-        reject_platform_sandbox_context(sandbox)?;
+        let _ = sandbox;
         self.file_system
             .read_file_bounded_confined(path, root, max_bytes, /*sandbox*/ None)
             .await
@@ -578,7 +547,7 @@ impl UnsandboxedFileSystem {
         path: &PathUri,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<FileSystemReadStream> {
-        reject_platform_sandbox_context(sandbox)?;
+        let _ = sandbox;
         self.file_system
             .read_file_stream(path, /*sandbox*/ None)
             .await
@@ -590,7 +559,7 @@ impl UnsandboxedFileSystem {
         contents: Vec<u8>,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<()> {
-        reject_platform_sandbox_context(sandbox)?;
+        let _ = sandbox;
         self.file_system
             .write_file(path, contents, /*sandbox*/ None)
             .await
@@ -602,7 +571,7 @@ impl UnsandboxedFileSystem {
         options: CreateDirectoryOptions,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<()> {
-        reject_platform_sandbox_context(sandbox)?;
+        let _ = sandbox;
         self.file_system
             .create_directory(path, options, /*sandbox*/ None)
             .await
@@ -613,7 +582,7 @@ impl UnsandboxedFileSystem {
         path: &PathUri,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<FileMetadata> {
-        reject_platform_sandbox_context(sandbox)?;
+        let _ = sandbox;
         self.file_system.get_metadata(path, /*sandbox*/ None).await
     }
 
@@ -622,7 +591,7 @@ impl UnsandboxedFileSystem {
         path: &PathUri,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<Vec<ReadDirectoryEntry>> {
-        reject_platform_sandbox_context(sandbox)?;
+        let _ = sandbox;
         self.file_system
             .read_directory(path, /*sandbox*/ None)
             .await
@@ -634,7 +603,7 @@ impl UnsandboxedFileSystem {
         max_entries: usize,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<ReadDirectoryOutcome> {
-        reject_platform_sandbox_context(sandbox)?;
+        let _ = sandbox;
         self.file_system
             .read_directory_bounded(path, max_entries, /*sandbox*/ None)
             .await
@@ -646,7 +615,7 @@ impl UnsandboxedFileSystem {
         options: RemoveOptions,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<()> {
-        reject_platform_sandbox_context(sandbox)?;
+        let _ = sandbox;
         self.file_system
             .remove(path, options, /*sandbox*/ None)
             .await
@@ -659,7 +628,7 @@ impl UnsandboxedFileSystem {
         options: CopyOptions,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<()> {
-        reject_platform_sandbox_context(sandbox)?;
+        let _ = sandbox;
         self.file_system
             .copy(
                 source_path,
@@ -681,7 +650,7 @@ impl ExecutorFileSystem for UnsandboxedFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, codex_file_system::FileRangeRead> {
         Box::pin(async move {
-            reject_platform_sandbox_context(sandbox)?;
+            let _ = sandbox;
             self.file_system
                 .read_file_range(path, start, len, expected_revision, None)
                 .await
@@ -695,7 +664,7 @@ impl ExecutorFileSystem for UnsandboxedFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, Option<codex_file_system::FileDigest>> {
         Box::pin(async move {
-            reject_platform_sandbox_context(sandbox)?;
+            let _ = sandbox;
             self.file_system.checksum_file(path, include_text_diagnostics, None).await
         })
     }
@@ -708,7 +677,7 @@ impl ExecutorFileSystem for UnsandboxedFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, codex_file_system::FileMutationOutcome> {
         Box::pin(async move {
-            reject_platform_sandbox_context(sandbox)?;
+            let _ = sandbox;
             self.file_system
                 .mutate_file_if_matches(path, expected, replacement, None)
                 .await
@@ -724,7 +693,7 @@ impl ExecutorFileSystem for UnsandboxedFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, codex_file_system::FileMutationOutcome> {
         Box::pin(async move {
-            reject_platform_sandbox_context(sandbox)?;
+            let _ = sandbox;
             self.file_system.mutate_file_if_matches_with_retention(path, expected, replacement, retention, None).await
         })
     }
@@ -739,7 +708,7 @@ impl ExecutorFileSystem for UnsandboxedFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, Option<bool>> {
         Box::pin(async move {
-            reject_platform_sandbox_context(sandbox)?;
+            let _ = sandbox;
             self.file_system.directory_case_sensitive(path, None).await
         })
     }
@@ -778,7 +747,7 @@ impl ExecutorFileSystem for UnsandboxedFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, Option<(Vec<u8>, Option<PathBuf>)>> {
         Box::pin(async move {
-            reject_platform_sandbox_context(sandbox)?;
+            let _ = sandbox;
             self.file_system
                 .read_file_bounded_with_source(path, max_bytes, None)
                 .await
@@ -811,7 +780,7 @@ impl ExecutorFileSystem for UnsandboxedFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
         Box::pin(async move {
-            reject_platform_sandbox_context(sandbox)?;
+            let _ = sandbox;
             self.file_system.read_file_metadata_stream(path, None).await
         })
     }
@@ -875,7 +844,7 @@ impl ExecutorFileSystem for UnsandboxedFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, WalkOutcome> {
         Box::pin(async move {
-            reject_platform_sandbox_context(sandbox)?;
+            let _ = sandbox;
             self.file_system.walk(path, options, None).await
         })
     }
@@ -912,7 +881,7 @@ impl DirectFileSystem {
         path: &PathUri,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<tokio::fs::File> {
-        reject_sandbox_context(sandbox)?;
+        let _ = sandbox;
         let path = path.to_abs_path()?;
         regular_file::open(path.as_path()).await
     }
@@ -922,7 +891,7 @@ impl DirectFileSystem {
         path: &PathUri,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<PathUri> {
-        reject_sandbox_context(sandbox)?;
+        let _ = sandbox;
         let path = path.to_abs_path()?;
         let canonicalized =
             AbsolutePathBuf::from_absolute_path(tokio::fs::canonicalize(path.as_path()).await?)?;
@@ -934,7 +903,7 @@ impl DirectFileSystem {
         path: &PathUri,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<Vec<u8>> {
-        reject_sandbox_context(sandbox)?;
+        let _ = sandbox;
         self.read_file_capped(path, MAX_READ_FILE_BYTES as usize, None)
             .await
     }
@@ -945,7 +914,7 @@ impl DirectFileSystem {
         max_bytes: usize,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<Vec<u8>> {
-        reject_sandbox_context(sandbox)?;
+        let _ = sandbox;
         let max_bytes = (max_bytes as u64).min(MAX_READ_FILE_BYTES);
         let path = path.to_abs_path()?;
         let (file, metadata) = regular_file::open_with_metadata(path.as_path()).await?;
@@ -958,7 +927,7 @@ impl DirectFileSystem {
         max_bytes: usize,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<Option<Vec<u8>>> {
-        reject_sandbox_context(sandbox)?;
+        let _ = sandbox;
         let path = path.to_abs_path()?;
         run_cancellable_file_system_task(move |cancel| {
             read_bounded_file_sync(
@@ -977,7 +946,7 @@ impl DirectFileSystem {
         max_bytes: usize,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<Option<Vec<u8>>> {
-        reject_sandbox_context(sandbox)?;
+        let _ = sandbox;
         let path = path.to_abs_path()?;
         let root = root.to_abs_path()?;
         run_cancellable_file_system_task(move |cancel| {
@@ -1023,7 +992,7 @@ impl DirectFileSystem {
         contents: Vec<u8>,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<()> {
-        reject_sandbox_context(sandbox)?;
+        let _ = sandbox;
         let path = path.to_abs_path()?;
         tokio::task::spawn_blocking(move || {
             let paths = codex_file_system::resolve_symlink_write_paths(path.as_path())?;
@@ -1039,7 +1008,7 @@ impl DirectFileSystem {
         options: CreateDirectoryOptions,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<()> {
-        reject_sandbox_context(sandbox)?;
+        let _ = sandbox;
         let path = path.to_abs_path()?;
         if options.recursive {
             tokio::fs::create_dir_all(path.as_path()).await?;
@@ -1054,7 +1023,7 @@ impl DirectFileSystem {
         path: &PathUri,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<FileMetadata> {
-        reject_sandbox_context(sandbox)?;
+        let _ = sandbox;
         let path = path.to_abs_path()?;
         // One blocking task. A path that is not a link is its own target, so
         // only links need a second, target-following query.
@@ -1084,7 +1053,7 @@ impl DirectFileSystem {
         path: &PathUri,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<Vec<ReadDirectoryEntry>> {
-        reject_sandbox_context(sandbox)?;
+        let _ = sandbox;
         let path = path.to_abs_path()?;
         run_cancellable_file_system_task(move |cancel| {
             read_directory_sync(path.as_path(), None, &cancel, true, directory_entry)
@@ -1099,7 +1068,7 @@ impl DirectFileSystem {
         max_entries: usize,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<ReadDirectoryOutcome> {
-        reject_sandbox_context(sandbox)?;
+        let _ = sandbox;
         if max_entries == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1125,7 +1094,7 @@ impl DirectFileSystem {
         options: RemoveOptions,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<()> {
-        reject_sandbox_context(sandbox)?;
+        let _ = sandbox;
         let path = path.to_abs_path()?;
         // Metadata and deletion share one worker handoff. Check cancellation
         // again before the destructive step, as the old await boundary allowed.
@@ -1144,7 +1113,7 @@ impl DirectFileSystem {
         options: CopyOptions,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<()> {
-        reject_sandbox_context(sandbox)?;
+        let _ = sandbox;
         let source_path = source_path.to_abs_path()?.into_path_buf();
         let destination_path = destination_path.to_abs_path()?.into_path_buf();
         run_cancellable_file_system_task(move |cancel| {
@@ -1194,7 +1163,7 @@ impl ExecutorFileSystem for DirectFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, codex_file_system::FileRangeRead> {
         Box::pin(async move {
-            reject_sandbox_context(sandbox)?;
+            let _ = sandbox;
             if !(1..=codex_file_system::FILE_RANGE_MAX_BYTES).contains(&len)
                 || start.checked_add(len as u64).is_none()
             {
@@ -1219,7 +1188,7 @@ impl ExecutorFileSystem for DirectFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, Option<codex_file_system::FileDigest>> {
         Box::pin(async move {
-            reject_sandbox_context(sandbox)?;
+            let _ = sandbox;
             let path = path.to_abs_path()?;
             run_cancellable_file_system_task(move |cancel| {
                 checksum_file_sync(path.as_path(), include_text_diagnostics, &cancel)
@@ -1247,7 +1216,7 @@ impl ExecutorFileSystem for DirectFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, codex_file_system::FileMutationOutcome> {
         Box::pin(async move {
-            reject_sandbox_context(sandbox)?;
+            let _ = sandbox;
             let path = path.to_abs_path()?;
             // Like ordinary writes, this owned worker must finish after caller
             // cancellation so publication/recovery can be reconciled truthfully.
@@ -1284,7 +1253,7 @@ impl ExecutorFileSystem for DirectFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, Option<bool>> {
         Box::pin(async move {
-            reject_sandbox_context(sandbox)?;
+            let _ = sandbox;
             let path = path.to_abs_path()?;
             run_cancellable_file_system_task(move |cancel| {
                 check_file_system_cancelled(&cancel)?;
@@ -1328,7 +1297,7 @@ impl ExecutorFileSystem for DirectFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, Option<(Vec<u8>, Option<PathBuf>)>> {
         Box::pin(async move {
-            reject_sandbox_context(sandbox)?;
+            let _ = sandbox;
             let path = path.to_abs_path()?;
             run_cancellable_file_system_task(move |cancel| {
                 let mut source = None;
@@ -1866,26 +1835,6 @@ fn is_changed_file_race_error(kind: io::ErrorKind) -> bool {
     )
 }
 
-fn reject_sandbox_context(sandbox: Option<&FileSystemSandboxContext>) -> io::Result<()> {
-    if sandbox.is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "direct filesystem operations do not accept sandbox context",
-        ));
-    }
-    Ok(())
-}
-
-fn reject_platform_sandbox_context(sandbox: Option<&FileSystemSandboxContext>) -> io::Result<()> {
-    if sandbox.is_some_and(FileSystemSandboxContext::should_run_in_sandbox) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "sandboxed filesystem operations require configured runtime paths",
-        ));
-    }
-    Ok(())
-}
-
 fn file_metadata(metadata: &std::fs::Metadata, is_symlink: bool) -> FileMetadata {
     FileMetadata {
         is_directory: metadata.is_dir(),
@@ -1990,7 +1939,7 @@ fn read_directory_for_walk<'a>(
     no_follow: bool,
 ) -> ExecutorFileSystemFuture<'a, ReadDirectoryOutcome<WalkDirectoryEntry>> {
     Box::pin(async move {
-        reject_sandbox_context(sandbox)?;
+        let _ = sandbox;
         if max_entries == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2264,12 +2213,6 @@ pub(crate) fn resolve_existing_path(path: &Path) -> io::Result<PathBuf> {
         resolved.push(file_name);
     }
     Ok(resolved)
-}
-
-pub(crate) fn current_sandbox_cwd() -> io::Result<PathBuf> {
-    let cwd = std::env::current_dir()
-        .map_err(|err| io::Error::other(format!("failed to read current dir: {err}")))?;
-    resolve_existing_path(cwd.as_path())
 }
 
 fn copy_symlink(source: &Path, target: &Path) -> io::Result<()> {

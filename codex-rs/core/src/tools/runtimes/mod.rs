@@ -20,14 +20,11 @@ use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_sandboxing::SandboxCommand;
-use codex_sandboxing::SandboxType;
-use codex_sandboxing::windows_sandbox_uses_elevated_backend;
 use codex_shell_command::powershell::ProvenPowershellDirectArgv;
 use codex_shell_command::powershell::extract_powershell_command;
 use codex_shell_command::powershell::prefix_powershell_script_with_utf8;
 use codex_shell_command::powershell::preserve_powershell_native_exit_code;
 use codex_shell_command::powershell::prove_noprofile_powershell_command_as_direct_argv;
-use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use std::collections::HashMap;
 use std::path::Path;
@@ -195,15 +192,11 @@ pub(crate) struct ShellCommandPreparation<'a> {
     pub(crate) explicit_env_overrides: &'a HashMap<String, String>,
     pub(crate) env: &'a mut HashMap<String, String>,
     pub(crate) shell_type: &'a ShellType,
-    pub(crate) sandbox_shell_type: Option<&'a ShellType>,
-    pub(crate) sandbox: SandboxType,
-    pub(crate) windows_sandbox_level: WindowsSandboxLevel,
-    pub(crate) enforce_managed_network: bool,
     pub(crate) approved_powershell_direct_argv: Option<&'a Vec<String>>,
     pub(crate) proof_cwd: Option<&'a Path>,
 }
 
-/// Applies the shared snapshot, sandbox-profile, and PowerShell handoff pipeline
+/// Applies the shared snapshot and PowerShell handoff pipeline
 /// used by direct shell and unified exec launches.
 pub(crate) async fn prepare_shell_command(input: ShellCommandPreparation<'_>) -> Vec<String> {
     let command = maybe_wrap_shell_lc_with_snapshot_file(
@@ -212,13 +205,6 @@ pub(crate) async fn prepare_shell_command(input: ShellCommandPreparation<'_>) ->
         input.shell_snapshot,
         input.explicit_env_overrides,
         input.env,
-    );
-    let command = disable_powershell_profile_for_elevated_windows_sandbox(
-        &command,
-        input.sandbox_shell_type,
-        input.sandbox,
-        input.windows_sandbox_level,
-        input.enforce_managed_network,
     );
     if input.shell_type != &ShellType::PowerShell || extract_powershell_command(&command).is_none()
     {
@@ -273,55 +259,7 @@ pub(crate) fn build_sandbox_command(
     })
 }
 
-/// Returns the exact runtime-owned local snapshot file that a Windows sandbox
-/// must make readable while starting the shell. This is launch plumbing, not a
-/// user-granted permission, and remote snapshots are owned by their executor.
-pub(crate) fn shell_snapshot_additional_read_roots(
-    shell_snapshot: Option<&ShellSnapshotFile>,
-    sandbox: SandboxType,
-) -> Vec<AbsolutePathBuf> {
-    if sandbox != SandboxType::WindowsRestrictedToken {
-        return Vec::new();
-    }
-    shell_snapshot
-        .and_then(ShellSnapshotFile::local_path)
-        .cloned()
-        .into_iter()
-        .collect()
-}
 
-
-
-
-pub(crate) fn disable_powershell_profile_for_elevated_windows_sandbox(
-    command: &[String],
-    shell_type: Option<&ShellType>,
-    sandbox: SandboxType,
-    windows_sandbox_level: WindowsSandboxLevel,
-    enforce_managed_network: bool,
-) -> Vec<String> {
-    if shell_type != Some(&ShellType::PowerShell)
-        || sandbox != SandboxType::WindowsRestrictedToken
-        || !windows_sandbox_uses_elevated_backend(windows_sandbox_level, enforce_managed_network)
-        || command.is_empty()
-    {
-        return command.to_vec();
-    }
-
-    if command[1..]
-        .iter()
-        .any(|arg| arg.eq_ignore_ascii_case("-NoProfile"))
-    {
-        return command.to_vec();
-    }
-
-    // The elevated Windows sandbox runs as a dedicated sandbox account while
-    // HOME/USERPROFILE may still point at the real user profile. Loading
-    // PowerShell profiles in that mixed context is not a valid login shell.
-    let mut command = command.to_vec();
-    command.insert(1, "-NoProfile".to_string());
-    command
-}
 
 /// Apply the matching Cmd snapshot's environment while preserving explicit,
 /// runtime-owned and transport overrides. Snapshot construction is disabled for

@@ -32,7 +32,7 @@ When Codex nouns or durable-instruction surfaces overlap, recommend the smallest
 
 - Prompt or thread context -> one-off task constraints.
 - `AGENTS.md` -> durable repo conventions, commands, verification steps, and review expectations; closer nested files apply under their subtree.
-- Project `.codex/config.toml` -> trusted-repo Codex settings such as sandbox, MCP, hooks, model, or reasoning defaults.
+- Project `.codex/config.toml` -> trusted-repo Codex settings such as approvals, MCP, hooks, model, or reasoning defaults.
 - Global config or global guidance -> personal defaults across repos.
 - Skill -> reusable task workflow with references or scripts.
 - Plugin -> installable bundle with skills plus commands, tools, MCP config, hooks, assets, apps, or marketplace metadata.
@@ -46,7 +46,7 @@ Use this quick product map when needed: CLI is terminal-first local repo work; I
 
 ### Boundaries And Output
 
-- Handle sandbox or network denials under the active permission policy; request scoped escalation only when that policy allows it. Otherwise report the blocker and continue permitted independent work. This reference grants no additional filesystem, network, or escalation permissions.
+- Handle permission or network failures under the active approval policy: report the blocker and continue permitted independent work. This reference grants no additional permissions.
 - Memory can provide user preference or context, but explicit prompt instructions win and memory is not a source for current external facts.
 - For affirmative surface-selection answers, use this shape: recommendation, why, what to avoid, and the manual/source evidence used.
 - When page-specific Codex citations are actually needed, these anchors often fit: `concepts/customization#agents-guidance` for `AGENTS.md`, `concepts/customization#skills` for skills, `plugins/build#plugin-structure` for plugins, `concepts/customization#mcp` for MCP, `config-advanced#hooks` for hooks, `app/automations#thread-automations` for thread automations, and `config-reference#configtoml` for config.

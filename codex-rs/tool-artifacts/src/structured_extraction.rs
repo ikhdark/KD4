@@ -84,8 +84,24 @@ fn valid_pointer(pointer: &str) -> bool {
             .any(|part| !part.starts_with(['0', '1']))
 }
 
-fn compare(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
-    match (left, right) {
+fn decimal(number: &serde_json::Number) -> Result<bigdecimal::BigDecimal, String> {
+    let text = number.to_string();
+    // Bound both parsing and scale alignment during comparison. Oversized
+    // operands are selector errors, never silently treated as non-matching.
+    if text.len() > 4096 {
+        return Err("numeric ordering operand exceeds 4096 bytes".into());
+    }
+    let exponent = text.split(['e', 'E']).nth(1)
+        .map(str::parse::<i64>).transpose()
+        .map_err(|_| "numeric ordering exponent out of range")?.unwrap_or(0);
+    if !(-4096..=4096).contains(&exponent) {
+        return Err("numeric ordering exponent exceeds +/-4096".into());
+    }
+    text.parse().map_err(|error| format!("invalid numeric ordering operand: {error}"))
+}
+
+fn compare(left: &Value, right: &Value) -> Result<Option<std::cmp::Ordering>, String> {
+    Ok(match (left, right) {
         (Value::String(left), Value::String(right)) => Some(left.cmp(right)),
         (Value::Number(left), Value::Number(right)) => {
             let integer = |number: &serde_json::Number| {
@@ -97,25 +113,16 @@ fn compare(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
             if let (Some(left), Some(right)) = (integer(left), integer(right)) {
                 Some(left.cmp(&right))
             } else {
-                // Refuse lossy ordering rather than round large integer operands.
-                let exact = |number: &serde_json::Number| {
-                    let value = number.as_f64()?;
-                    if number.is_f64() || value.abs() <= ((1_u64 << 53) - 1) as f64 {
-                        Some(value)
-                    } else {
-                        None
-                    }
-                };
-                exact(left)?.partial_cmp(&exact(right)?)
+                Some(decimal(left)?.cmp(&decimal(right)?))
             }
         }
         _ => None,
-    }
+    })
 }
 
-fn matches(row: &Value, filter: &Filter) -> bool {
+fn matches(row: &Value, filter: &Filter) -> Result<bool, String> {
     let field = row.pointer(&filter.pointer);
-    match filter.op {
+    Ok(match filter.op {
         Operator::Exists => field.is_some(),
         Operator::Missing => field.is_none(),
         Operator::Eq => field
@@ -133,7 +140,7 @@ fn matches(row: &Value, filter: &Filter) -> bool {
             }),
         op => field
             .zip(filter.value.as_ref())
-            .and_then(|(a, b)| compare(a, b))
+            .map(|(a, b)| compare(a, b)).transpose()?.flatten()
             .is_some_and(|order| match op {
                 Operator::Lt => order.is_lt(),
                 Operator::Le => order.is_le(),
@@ -141,7 +148,7 @@ fn matches(row: &Value, filter: &Filter) -> bool {
                 Operator::Ge => order.is_ge(),
                 _ => false,
             }),
-    }
+    })
 }
 
 fn jsonl_row(reader: &mut impl BufRead) -> Option<Result<Value, String>> {
@@ -367,7 +374,14 @@ pub(crate) fn select(
         }
         let (error_entry, entry) = match row {
             Ok(row) => {
-                if !filters.iter().all(|filter| matches(&row, filter)) {
+                let matched = filters.iter().try_fold(true, |matched, filter| {
+                    if matched { matches(&row, filter) } else { Ok(false) }
+                });
+                let matched = match matched {
+                    Ok(matched) => matched,
+                    Err(error) => return invalid(format!("row {number}: {error}")),
+                };
+                if !matched {
                     page.rows_scanned += 1;
                     continue;
                 }

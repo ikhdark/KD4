@@ -24,6 +24,8 @@ not another instruction source.
 | Retained tool output, source snapshots and recovery | [tool-artifacts](tool-artifacts/) |
 | History, context projection and durable plan state | [conversation](conversation/); live installation remains in core |
 | Model requests and response streams | [model-client](model-client/); core supplies live turn state |
+| Request cache diagnostics (not provider-history admission) | [model-client/src/client/request_measurements.rs](model-client/src/client/request_measurements.rs); transport selection and ordered state lifetime remain in client.rs |
+| Completed-tool history disk compatibility and journal replay | [conversation/src/tool_history/persistence.rs](conversation/src/tool_history/persistence.rs); public loader/writer paths remain in tool_history |
 | Resolved runtime configuration | [runtime-config](runtime-config/); [config](config/) owns configuration support and the [layer loader](config/src/loader/README.md) |
 | Session persistence | [rollout](rollout/README.md) |
 | Timing records and dispatch tracing | [turn-timing](turn-timing/README.md); core emits runtime observations |
