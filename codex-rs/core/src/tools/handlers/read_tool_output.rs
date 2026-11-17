@@ -1,5 +1,6 @@
 use crate::FunctionCallError;
 use crate::digest_writer::DigestWriter;
+use crate::session::session::Session;
 use crate::tools::command_output_artifact::RECOVERY_AGGREGATE_TOKEN_CEILING;
 use crate::tools::command_output_artifact::ReadToolOutputError;
 use crate::tools::command_output_artifact::ToolOutputSelector;
@@ -230,7 +231,7 @@ impl Drop for RecoveryAttemptObservation<'_> {
 
 // This handler only observes retained bytes. Settled legacy read failures do
 // not leave user mutations to reconcile; preserve any explicit owner contract.
-fn settled_recovery_failure(error: FunctionCallError) -> FunctionCallError {
+pub(super) fn settled_recovery_failure(error: FunctionCallError) -> FunctionCallError {
     match error {
         FunctionCallError::RespondToModel(message) => FunctionCallError::structured(
             codex_protocol::tool_failure::ToolFailure::no_effects(
@@ -494,9 +495,10 @@ async fn handle_read_tool_output(
     .await
     {
         Ok(snapshot) => snapshot,
-        Err(ReadToolOutputError::Expired) if !foreign_source => {
-            let error = missing_artifact_error(&invocation, &args.artifact_id).await;
-            return Err(FunctionCallError::RespondToModel(error.for_model()));
+        Err(ReadToolOutputError::Expired) => {
+            let message =
+                missing_artifact_error(&invocation, &args.artifact_id, source_thread_id).await;
+            return Err(FunctionCallError::RespondToModel(message));
         }
         Err(err) => return Err(FunctionCallError::RespondToModel(err.for_model())),
     };
@@ -651,6 +653,9 @@ async fn audit_evidence_handle(
         crate::tools::command_output_artifact::audit_tool_output_reference(
             home, &thread_id, artifact_id, READ_TOOL_OUTPUT_MAX_BYTES,
         ).await;
+    let owner_routed =
+        route_audit_to_readable_owner(&invocation.session, &mut audit, artifact_id, &mut None)
+            .await;
     let readable = audit["access"] == "readable";
     let directory = home.join(if command_log { "command-output" } else { "tool-output" }).join(&thread_id);
     audit["retention"]["pressure"] = crate::tools::command_output_artifact::pressure::audit(
@@ -660,12 +665,69 @@ async fn audit_evidence_handle(
         let history = invocation.session.clone_history().await;
         audit["retention"]["recovery_obligation"] = history.tool_history_state_ref()
             .retention_recovery_obligation(artifact_id);
-    } else if audit["recovery"]["arguments"].is_object() {
+    } else if !owner_routed && audit["recovery"]["arguments"].is_object() {
+        // An owner route already names the thread to read; do not repoint it.
         audit["recovery"]["arguments"]["source_thread_id"] = serde_json::json!(source_thread_id);
     }
     let output = JsonToolOutput::with_success(audit, Some(readable)).with_code_mode_failure_as_data();
     crate::tools::context::ensure_exact_model_delivery(&output, invocation)?;
     Ok(boxed_tool_output(output))
+}
+
+/// Shared by handle audits and compaction pins. The storage owner sees neither
+/// the calling thread nor spawn lineage, so a `different_owner` audit advises
+/// against a handle the caller can read: its own (audited through a foreign
+/// `source_thread_id`) or a known live descendant's. Name that route instead.
+/// Every other outcome, including an unknown relation, is left untouched.
+/// `descendants` reuses one bounded relation lookup across a caller's audits.
+pub(crate) async fn route_audit_to_readable_owner(
+    session: &Session,
+    audit: &mut Value,
+    artifact_id: &str,
+    descendants: &mut Option<Vec<codex_protocol::ThreadId>>,
+) -> bool {
+    if audit["reason"] != "different_owner" {
+        return false;
+    }
+    let Some(owner_thread_id) = audit["owner_thread_id"].as_str().map(str::to_string) else {
+        return false;
+    };
+    let Ok(owner) = codex_protocol::ThreadId::from_string(&owner_thread_id) else {
+        return false;
+    };
+    if owner == session.thread_id {
+        // The live subtree lists the caller itself; it is not a descendant.
+        audit["recovery"] = serde_json::json!({
+            "tool": "read_tool_output",
+            "owner_thread_id": owner_thread_id,
+            "arguments": {"artifact_id": artifact_id, "audit_only": true},
+            "instruction": "The handle was found in the calling thread. Audit or read it directly through read_tool_output without source_thread_id. Do not replay its producer.",
+        });
+        audit["message"] = caller_owned_handle_message(&owner_thread_id).into();
+        return true;
+    }
+    if descendants.is_none() {
+        *descendants = Some(known_live_descendants(session).await);
+    }
+    if !descendants
+        .as_ref()
+        .is_some_and(|known| known.contains(&owner))
+    {
+        return false;
+    }
+    audit["recovery"] = serde_json::json!({
+        "tool": "read_tool_output",
+        "owner_thread_id": owner_thread_id,
+        "arguments": {"artifact_id": artifact_id, "source_thread_id": owner_thread_id, "audit_only": true},
+        "instruction": "Audit or read it through read_tool_output with source_thread_id set to the owning descendant; that call re-verifies the descendant lineage. Do not replay its producer.",
+    });
+    audit["message"] = ReadToolOutputError::OwnedByOtherThread {
+        owner_thread_id,
+        known_descendant: true,
+    }
+    .for_model()
+    .into();
+    true
 }
 
 // Ownership diagnosis must not turn a failed lookup into a long wait.
@@ -674,38 +736,117 @@ const ARTIFACT_OWNER_RELATION_TIMEOUT: std::time::Duration = std::time::Duration
 /// A handle missing from this thread may still be retained by the thread that
 /// produced it, such as a subagent. Name that owner instead of reporting
 /// expiry; recovery itself stays confined to the calling thread.
+/// Under a foreign `source_thread_id` only an owner the caller can read is
+/// named: the caller itself or a known live descendant. Otherwise the storage
+/// owner's expiry answer stands.
 async fn missing_artifact_error(
     invocation: &ToolInvocation,
     artifact_id: &str,
-) -> ReadToolOutputError {
+    source_thread_id: codex_protocol::ThreadId,
+) -> String {
+    let session = &invocation.session;
     let Some(owner_thread_id) = find_other_thread_artifact_owner(
         invocation.step_context.turn.config.codex_home.as_path(),
-        &invocation.session.thread_id.to_string(),
+        &source_thread_id.to_string(),
         artifact_id,
     )
     .await
     else {
-        return ReadToolOutputError::Expired;
+        return ReadToolOutputError::Expired.for_model();
     };
-    // Report only positive membership: retained spawn edges cannot certify a
-    // complete subtree, and an unavailable or slow graph is not evidence.
-    let owner = codex_protocol::ThreadId::from_string(&owner_thread_id);
-    let known_descendant = tokio::time::timeout(
-        ARTIFACT_OWNER_RELATION_TIMEOUT,
-        invocation
-            .session
-            .services
-            .agent_control
-            .list_live_agent_subtree_thread_ids(invocation.session.thread_id),
-    )
-    .await
-    .is_ok_and(|subtree| {
-        subtree.is_ok_and(|subtree| owner.as_ref().is_ok_and(|owner| subtree.contains(owner)))
-    });
+    if codex_protocol::ThreadId::from_string(&owner_thread_id)
+        .is_ok_and(|owner| owner == session.thread_id)
+    {
+        return caller_owned_handle_message(&owner_thread_id);
+    }
+    let known_descendant = is_known_live_descendant(session, &owner_thread_id).await;
+    if !known_descendant && source_thread_id != session.thread_id {
+        return ReadToolOutputError::Expired.for_model();
+    }
     ReadToolOutputError::OwnedByOtherThread {
         owner_thread_id,
         known_descendant,
     }
+    .for_model()
+}
+
+// A handle the caller owns, addressed through a foreign `source_thread_id`.
+fn caller_owned_handle_message(owner_thread_id: &str) -> String {
+    format!(
+        "artifact handle was found in the calling thread ({owner_thread_id}), not the named source thread; this ownership hint does not authenticate its bytes or retention. To recover it, call read_tool_output again with the same arguments but without source_thread_id. Output already in context remains usable. Do not replay its producer."
+    )
+}
+
+/// `compare_artifacts` and `line_map` read only the calling thread's namespace,
+/// so the storage owner reports a known live descendant's handle as expired
+/// and invites a producer replay. Audit the handles in the tool's load order;
+/// the first one the calling thread cannot read is the one that failed. Name
+/// the `read_tool_output` route when its owner is a known live descendant.
+/// Every other outcome, including a non-descendant owner or an unknown
+/// relation, keeps the storage owner's answer.
+pub(super) async fn thread_confined_artifact_error(
+    invocation: &ToolInvocation,
+    artifact_ids: [&str; 2],
+    error: ReadToolOutputError,
+) -> String {
+    if error != ReadToolOutputError::Expired {
+        return error.for_model();
+    }
+    let home = invocation.step_context.turn.config.codex_home.as_path();
+    let thread_id = invocation.session.thread_id.to_string();
+    for artifact_id in artifact_ids {
+        let (mut audit, _) = crate::tools::command_output_artifact::audit_tool_output_reference(
+            home,
+            &thread_id,
+            artifact_id,
+            READ_TOOL_OUTPUT_MAX_BYTES,
+        )
+        .await;
+        if audit["access"] == "readable" {
+            continue;
+        }
+        if route_audit_to_readable_owner(&invocation.session, &mut audit, artifact_id, &mut None)
+            .await
+            && let Some(owner_thread_id) =
+                audit["recovery"]["arguments"]["source_thread_id"].as_str()
+        {
+            return format!(
+                "artifact handle {artifact_id} was found in another thread ({owner_thread_id}, a descendant agent of this thread), not this one; this ownership hint does not authenticate its bytes or retention. This tool reads only artifacts retained by the calling thread. To read it, call read_tool_output with source_thread_id \"{owner_thread_id}\" and artifact_id \"{artifact_id}\"; that call re-verifies the descendant lineage. Output already in context remains usable. Do not replay its producer."
+            );
+        }
+        break;
+    }
+    error.for_model()
+}
+
+/// The live-subtree relation that admits `source_thread_id`, bounded for
+/// diagnosis. Report only positive membership: retained spawn edges cannot
+/// certify a complete subtree, and an unavailable or slow graph is not evidence.
+async fn is_known_live_descendant(session: &Session, owner_thread_id: &str) -> bool {
+    let owner = codex_protocol::ThreadId::from_string(owner_thread_id);
+    known_live_descendants(session)
+        .await
+        .iter()
+        .any(|known| owner.as_ref().is_ok_and(|owner| owner == known))
+}
+
+/// The same relation as a set, without the calling thread that the live
+/// subtree lists first. Empty when the graph is unavailable or slow.
+async fn known_live_descendants(session: &Session) -> Vec<codex_protocol::ThreadId> {
+    tokio::time::timeout(
+        ARTIFACT_OWNER_RELATION_TIMEOUT,
+        session
+            .services
+            .agent_control
+            .list_live_agent_subtree_thread_ids(session.thread_id),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_default()
+    .into_iter()
+    .filter(|known| *known != session.thread_id)
+    .collect()
 }
 
 // Pagination is a successful bounded read, not a terminal selection failure.

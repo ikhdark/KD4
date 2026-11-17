@@ -121,7 +121,7 @@ pub(crate) const MAX_RAW_OUTPUT_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
 /// Below it every producer byte is kept; past it nothing is appended and the
 /// omitted byte count is recorded as an explicit gap.
 pub const MAX_COMMAND_LOG_BYTES: u64 = 1024 * 1024 * 1024;
-const COMMAND_LOG_CEILING_RECOVERY_HINT: &str = "Bytes after the per-command log ceiling were not captured and cannot be recovered from this artifact. Read the retained prefix with read_tool_output; to see later output, rerun a narrower command (filter, limit, or write to a file) only if it is read-only or safely repeatable.";
+const COMMAND_LOG_CEILING_RECOVERY_HINT: &str = "Bytes after the per-command log ceiling were not captured and cannot be recovered from this artifact. Read the retained prefix with read_tool_output. Do not repeat the same command to see later output; run a narrower one (filter, limit, or write to a file) only if it is read-only or safely repeatable.";
 pub const LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES: usize = 64 * 1024;
 const STREAMING_ARTIFACT_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD: u64 = 256 * 1024 * 1024;
@@ -1411,7 +1411,8 @@ impl FromStr for ToolOutputArtifactId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandLogCeilingGap {
     pub omitted_bytes: u64,
-    /// The log is also incomplete for another reason, so total loss is unknown.
+    /// The log is also incomplete for another reason (output gap, write failure,
+    /// capture dropped before finalization), so total loss is unknown.
     pub other_loss: bool,
 }
 
@@ -5458,16 +5459,19 @@ impl ReadToolOutputError {
             Self::InvalidRange(message) | Self::Io(message) => message.clone(),
             Self::Expired => ARTIFACT_EXPIRED_MESSAGE.to_string(),
             Self::StillWriting => ARTIFACT_WRITING_MESSAGE.to_string(),
+            // The descendant hint uses the same live-subtree relation that
+            // admits `source_thread_id`; that call re-verifies it.
             Self::OwnedByOtherThread {
                 owner_thread_id,
-                known_descendant,
+                known_descendant: true,
             } => format!(
-                "artifact handle was found in another thread ({owner_thread_id}{}), not this one; this ownership hint does not authenticate its bytes or retention. read_tool_output reads only artifacts retained by the calling thread. Have the owning thread recover it and share the needed evidence; output already in context remains usable. Do not replay its producer.",
-                if *known_descendant {
-                    ", a descendant agent of this thread"
-                } else {
-                    ""
-                }
+                "artifact handle was found in another thread ({owner_thread_id}, a descendant agent of this thread), not this one; this ownership hint does not authenticate its bytes or retention. To recover it, call read_tool_output again with source_thread_id \"{owner_thread_id}\" and the same artifact_id and selectors; that call re-verifies the descendant lineage. Output already in context remains usable. Do not replay its producer."
+            ),
+            Self::OwnedByOtherThread {
+                owner_thread_id,
+                known_descendant: false,
+            } => format!(
+                "artifact handle was found in another thread ({owner_thread_id}), not this one; this ownership hint does not authenticate its bytes or retention. read_tool_output reads only artifacts retained by the calling thread. Have the owning thread recover it and share the needed evidence; output already in context remains usable. Do not replay its producer."
             ),
         }
     }

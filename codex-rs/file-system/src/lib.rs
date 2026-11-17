@@ -1,4 +1,5 @@
 mod atomic_write;
+mod bound_output;
 mod conditional_mutation;
 mod confined_file;
 mod copy_failure;
@@ -8,6 +9,7 @@ mod persist_synced;
 mod text_diagnostics;
 mod walk_gitignore;
 
+pub use bound_output::BoundOutput;
 pub use conditional_mutation::FileMutationOutcome;
 pub use conditional_mutation::FileMutationRetention;
 pub use conditional_mutation::RetainedFile;

@@ -296,13 +296,13 @@ fn apply_read_acls(
         };
         if let Err(err) = result {
             refresh_errors.push(format!(
-                "grant {access_label} ACE failed on {} for sandbox_group: {err}",
+                "grant {access_label} ACE failed on {} for sandbox_group: {err:#}",
                 root.display()
             ));
             log_line(
                 log,
                 &format!(
-                    "grant {access_label} ACE failed on {} for sandbox_group: {err}",
+                    "grant {access_label} ACE failed on {} for sandbox_group: {err:#}",
                     root.display()
                 ),
             )?;
@@ -331,7 +331,7 @@ fn read_mask_allows_or_log(
                 .map(|value| format!(" for {value}"))
                 .unwrap_or_default();
             refresh_errors.push(format!(
-                "{access_label} mask check failed on {}{}: {}",
+                "{access_label} mask check failed on {}{}: {:#}",
                 root.display(),
                 label_suffix,
                 e
@@ -339,7 +339,7 @@ fn read_mask_allows_or_log(
             log_line(
                 log,
                 &format!(
-                    "{access_label} mask check failed on {}{}: {}; continuing",
+                    "{access_label} mask check failed on {}{}: {:#}; continuing",
                     root.display(),
                     label_suffix,
                     e
@@ -714,7 +714,7 @@ fn lock_persistent_sandbox_dirs(
         anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperSandboxLockFailed,
             format!(
-                "lock sandbox dir {} failed: {err}",
+                "lock sandbox dir {} failed: {err:#}",
                 sandbox_dir(&payload.codex_home).display()
             ),
         ))
@@ -731,7 +731,7 @@ fn lock_persistent_sandbox_dirs(
         anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperSandboxLockFailed,
             format!(
-                "lock sandbox secrets dir {} failed: {err}",
+                "lock sandbox secrets dir {} failed: {err:#}",
                 sandbox_secrets_dir(&payload.codex_home).display()
             ),
         ))
@@ -759,7 +759,7 @@ fn lock_sandbox_bin_dir(
         anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperSandboxLockFailed,
             format!(
-                "lock sandbox bin dir {} failed: {err}",
+                "lock sandbox bin dir {} failed: {err:#}",
                 sandbox_bin_dir(&payload.codex_home).display()
             ),
         ))
@@ -948,14 +948,14 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
                 Ok(needs_refresh) => needs_refresh,
                 Err(e) => {
                     refresh_errors.push(format!(
-                        "write ACE check failed on {} for {label}: {}",
+                        "write ACE check failed on {} for {label}: {:#}",
                         root.display(),
                         e
                     ));
                     log_line(
                         log,
                         &format!(
-                            "write ACE check failed on {} for {label}: {}; continuing",
+                            "write ACE check failed on {} for {label}: {:#}; continuing",
                             root.display(),
                             e
                         ),
@@ -1003,10 +1003,10 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
             match res {
                 Ok(_) => {}
                 Err(e) => {
-                    refresh_errors.push(format!("write ACE failed on {}: {}", root.display(), e));
+                    refresh_errors.push(format!("write ACE failed on {}: {:#}", root.display(), e));
                     if log_line(
                         log,
-                        &format!("write ACE grant failed on {}: {}", root.display(), e),
+                        &format!("write ACE grant failed on {}: {:#}", root.display(), e),
                     )
                     .is_err()
                     {
@@ -1057,10 +1057,10 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
                 }
                 Ok(false) => {}
                 Err(err) => {
-                    refresh_errors.push(format!("deny ACE failed on {}: {err}", path.display()));
+                    refresh_errors.push(format!("deny ACE failed on {}: {err:#}", path.display()));
                     log_line(
                         log,
-                        &format!("deny ACE failed on {}: {err}", path.display()),
+                        &format!("deny ACE failed on {}: {err:#}", path.display()),
                     )?;
                 }
             }

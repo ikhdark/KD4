@@ -177,7 +177,7 @@ impl ToolExecutor<ToolInvocation> for GitInspectionHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(async move {
+        let inspected = async move {
             let ToolPayload::Function { ref arguments } = invocation.payload else {
                 return Err(FunctionCallError::RespondToModel(
                     "Git inspection requires function arguments".into(),
@@ -260,6 +260,13 @@ impl ToolExecutor<ToolInvocation> for GitInspectionHandler {
                     }
                 ),
             )
+        };
+        // Native Git reads request no fetches or repository writes; a legacy
+        // failure leaves no effects to recover.
+        Box::pin(async move {
+            inspected
+                .await
+                .map_err(super::read_tool_output::settled_recovery_failure)
         })
     }
 }

@@ -1071,12 +1071,35 @@ pub async fn login_with_access_token(
     )
 }
 
+/// A stored credential rejected by the active login policy. This is a decision
+/// about the stored identity, not a transient load failure, so reloads log out
+/// instead of keeping the cached identity. Typed because `PermissionDenied`
+/// alone can also be a transient Windows sharing or rename failure.
+#[derive(Debug)]
+struct AuthPolicyDenied(String);
+
+impl std::fmt::Display for AuthPolicyDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AuthPolicyDenied {}
+
+fn is_auth_policy_denial(err: &std::io::Error) -> bool {
+    err.get_ref()
+        .is_some_and(|inner| inner.is::<AuthPolicyDenied>())
+}
+
 fn ensure_auth_workspace_allowed(
     expected_workspace_ids: Option<&[String]>,
     account_id: &str,
 ) -> std::io::Result<()> {
-    crate::server::ensure_workspace_account_allowed(expected_workspace_ids, account_id)
-        .map_err(|message| std::io::Error::new(std::io::ErrorKind::PermissionDenied, message))
+    crate::server::ensure_workspace_account_allowed(expected_workspace_ids, account_id).map_err(
+        |message| {
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, AuthPolicyDenied(message))
+        },
+    )
 }
 
 fn ensure_agent_identity_workspace_allowed(
@@ -2148,18 +2171,41 @@ impl UnauthorizedRecovery {
     }
 }
 
+/// How long an unbroken run of credential read or parse failures may keep the
+/// cached identity as its anchor. Covers a file being replaced or a Windows
+/// sharing violation; a failure that outlasts it is persistent and publishes
+/// as a logout, as every such failure did before anchoring.
+const AUTH_LOAD_ANCHOR_GRACE: Duration = Duration::from_secs(10);
+
+/// A recorded credential load failure. Dispatch fails closed while one exists.
+#[derive(Debug)]
+struct AuthLoadFailure {
+    /// Last load attempt; gates the next retry from `auth()`.
+    attempted_at: Instant,
+    /// Start of the unbroken run of read or parse failures; bounds how long the
+    /// anchor is kept. `None` while only busy transactions have been observed.
+    since: Option<Instant>,
+    kind: std::io::ErrorKind,
+    message: String,
+}
+
 /// Central manager providing a single source of truth for auth.json derived
 /// authentication data. It loads once (or on preference change) and then
 /// hands out cloned `CodexAuth` values so the rest of the program has a
 /// consistent snapshot.
 ///
-/// External modifications to `auth.json` will NOT be observed until
-/// `reload()` is called explicitly. This matches the design goal of avoiding
-/// different parts of the program seeing inconsistent auth data mid‑run.
+/// External modifications to `auth.json` are observed only when a load runs:
+/// an explicit `reload()`, the guarded reload before a token refresh, or the
+/// once-per-second retry in `auth()` after a recorded load failure. A failed
+/// read or parse keeps the cached identity for at most `AUTH_LOAD_ANCHOR_GRACE`
+/// while `check_auth_load()` fails closed; a policy denial logs out immediately.
 pub struct AuthManager {
     codex_home: PathBuf,
     inner: RwLock<CachedAuth>,
-    load_error: RwLock<Option<(std::time::Instant, std::io::ErrorKind, String)>>,
+    load_error: RwLock<Option<AuthLoadFailure>>,
+    /// Successful load publications; written only under `load_error`, so a
+    /// failed load can tell whether a later load already published.
+    load_publications: AtomicU64,
     auth_change_tx: watch::Sender<u64>,
     enable_codex_api_key_env: bool,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
@@ -2266,7 +2312,15 @@ impl AuthManager {
     async fn new_from_auth_config(auth_config: AuthConfig, enable_codex_api_key_env: bool) -> Self {
         let (managed_auth, load_error) = match auth_config.load_auth(enable_codex_api_key_env).await {
             Ok(auth) => (auth, None),
-            Err(err) => (None, Some((std::time::Instant::now(), err.kind(), err.to_string()))),
+            Err(err) => {
+                let now = Instant::now();
+                (None, Some(AuthLoadFailure {
+                    attempted_at: now,
+                    since: (err.kind() != std::io::ErrorKind::WouldBlock).then_some(now),
+                    kind: err.kind(),
+                    message: err.to_string(),
+                }))
+            }
         };
         let AuthConfig {
             codex_home,
@@ -2291,6 +2345,7 @@ impl AuthManager {
             }),
             auth_change_tx,
             load_error: RwLock::new(load_error),
+            load_publications: AtomicU64::new(0),
             enable_codex_api_key_env,
             auth_credentials_store_mode,
             keyring_backend_kind,
@@ -2326,6 +2381,7 @@ impl AuthManager {
             }),
             auth_change_tx,
             load_error: RwLock::new(None),
+            load_publications: AtomicU64::new(0),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
             keyring_backend_kind: AuthKeyringBackendKind::default(),
@@ -2431,9 +2487,14 @@ impl AuthManager {
         })
     }
 
-    /// Current cached auth (clone). May be `None` if not logged in or load failed.
-    /// For managed ChatGPT auth that needs a proactive refresh, first performs
-    /// a guarded reload and then refreshes only if the on-disk auth is unchanged.
+    /// Current cached auth (clone). `None` when not logged in, after a policy
+    /// denial, or after a load failure that outlasted `AUTH_LOAD_ANCHOR_GRACE`.
+    /// While a younger load failure is recorded, returns the anchored identity
+    /// and retries the load at most once per second; callers that dispatch
+    /// credentials must also consult `check_auth_load()`. For managed ChatGPT
+    /// auth that needs a proactive refresh and has no recorded load failure,
+    /// first performs a guarded reload and then refreshes only if the on-disk
+    /// auth is unchanged.
     #[instrument(level = "trace", skip_all)]
     pub async fn auth(&self) -> Option<CodexAuth> {
         let (expected_epoch, initial_auth) = self.policy_auth_snapshot().ok()?;
@@ -2454,15 +2515,15 @@ impl AuthManager {
             .and_then(|error| {
                 error
                     .as_ref()
-                    .map(|(at, _, _)| at.elapsed() >= std::time::Duration::from_secs(1))
+                    .map(|failure| failure.attempted_at.elapsed() >= Duration::from_secs(1))
             })
             .unwrap_or(false);
         if retry_load {
             let admitted = self.load_error.write().ok().is_some_and(|mut error| {
-                if let Some((at, _, _)) = error.as_mut()
-                    && at.elapsed() >= std::time::Duration::from_secs(1)
+                if let Some(failure) = error.as_mut()
+                    && failure.attempted_at.elapsed() >= Duration::from_secs(1)
                 {
-                    *at = std::time::Instant::now();
+                    failure.attempted_at = Instant::now();
                     true
                 } else {
                     false
@@ -2473,7 +2534,10 @@ impl AuthManager {
             }
         }
         let auth = self.auth_cached()?;
-        if Self::should_refresh_proactively(&auth)
+        // Unreadable stored credentials cannot be refreshed; the guarded reload
+        // inside the refresh would fail and log on every call until a load succeeds.
+        if self.check_auth_load().is_ok()
+            && Self::should_refresh_proactively(&auth)
             && let Err(err) = self.refresh_token_internal(/*proactive*/ true).await
         {
             tracing::error!("Failed to refresh token: {}", err);
@@ -2556,34 +2620,46 @@ impl AuthManager {
     }
 
     /// Reloads auth from the active source. Returns whether the auth value changed.
+    /// A transient load failure keeps the cached identity (see `record_load_failure`).
     pub async fn reload(&self) -> bool {
         tracing::info!("Reloading auth");
+        self.reload_with(/*keep_anchor*/ true).await
+    }
+
+    /// Reload after stored credentials were retired. A read or parse failure
+    /// here must not keep the retired identity as an anchor, so it publishes as
+    /// a logout, as it did before `reload()` anchored such failures.
+    async fn reload_after_logout(&self) -> bool {
+        tracing::info!("Reloading auth after logout");
+        self.reload_with(/*keep_anchor*/ false).await
+    }
+
+    async fn reload_with(&self, keep_anchor: bool) -> bool {
         let Some((generation, source)) = self.external_auth_snapshot() else {
             return false;
         };
+        let started = self.load_publications.load(Ordering::Acquire);
         let new_auth = self.load_auth(source.as_ref()).await;
-        self.with_current_external_auth(&generation, || self.publish_auth_load(new_auth))
-            .unwrap_or(false)
+        self.with_current_external_auth(&generation, || {
+            self.publish_auth_load(new_auth, started, keep_anchor)
+        })
+        .unwrap_or(false)
     }
 
-    /// Retries a failed credential load. A repeated read or parse failure is not
-    /// a logout: like the guarded reload, keep the identity anchor and record the
-    /// failure so dispatch stays fail-closed until a load succeeds.
+    /// Retries a failed credential load from `auth()`. Same publication rules
+    /// as `reload()`; logged separately so the retry path is attributable.
     async fn retry_failed_auth_load(&self) {
         tracing::info!("Retrying failed auth load");
         let Some((generation, source)) = self.external_auth_snapshot() else {
             return;
         };
+        let started = self.load_publications.load(Ordering::Acquire);
         let new_auth = self.load_auth(source.as_ref()).await;
-        let _ = self.with_current_external_auth(&generation, || match new_auth {
-            Ok(auth) => {
-                let changed = self.publish_auth_load(Ok(auth));
+        let _ = self.with_current_external_auth(&generation, || {
+            let succeeded = new_auth.is_ok();
+            let changed = self.publish_auth_load(new_auth, started, /*keep_anchor*/ true);
+            if succeeded {
                 tracing::info!("Reloaded auth after failed load, changed: {changed}");
-            }
-            Err(err) => {
-                if let Ok(mut error) = self.load_error.write() {
-                    *error = Some((std::time::Instant::now(), err.kind(), err.to_string()));
-                }
             }
         });
     }
@@ -2591,37 +2667,84 @@ impl AuthManager {
     /// Distinguishes missing credentials from an unavailable or malformed store.
     pub fn check_auth_load(&self) -> std::io::Result<()> {
         if let Ok(error) = self.load_error.read()
-            && let Some((_, kind, message)) = error.as_ref()
+            && let Some(failure) = error.as_ref()
         {
             return Err(std::io::Error::new(
-                *kind,
-                format!("credentials unavailable: {message}"),
+                failure.kind,
+                format!("credentials unavailable: {}", failure.message),
             ));
         }
         Ok(())
     }
 
-    fn publish_auth_load(&self, result: std::io::Result<Option<CodexAuth>>) -> bool {
-        let preserve_cached_auth = result
-            .as_ref()
-            .is_err_and(|err| err.kind() == std::io::ErrorKind::WouldBlock);
-        let (auth, error) = match result {
-            Ok(auth) => (auth, None),
-            Err(err) => (
-                None,
-                Some((std::time::Instant::now(), err.kind(), err.to_string())),
-            ),
-        };
-        if let Ok(mut current) = self.load_error.write() {
-            *current = error;
+    /// Publishes a load started after `started` successful publications.
+    /// Returns whether the cached auth value changed.
+    fn publish_auth_load(
+        &self,
+        result: std::io::Result<Option<CodexAuth>>,
+        started: u64,
+        keep_anchor: bool,
+    ) -> bool {
+        match result {
+            Ok(auth) => {
+                if let Ok(mut current) = self.load_error.write() {
+                    *current = None;
+                    self.load_publications.fetch_add(1, Ordering::AcqRel);
+                }
+                self.set_cached_auth(auth)
+            }
+            Err(err) => self.record_load_failure(&err, started, keep_anchor),
         }
-        if preserve_cached_auth {
-            // A busy lifecycle transaction is not a logout. Keep the identity
-            // anchor, but retain the load error so dispatch still fails closed
-            // until a successful reload establishes the current credentials.
+    }
+
+    /// Records a failed credential load and keeps dispatch fail-closed. A read
+    /// or parse failure is not a logout: the cached identity stays as the
+    /// anchor, so a store that is briefly unreadable while being replaced does
+    /// not move the policy epoch. A policy denial, a run of read or parse
+    /// failures older than `AUTH_LOAD_ANCHOR_GRACE`, or `keep_anchor == false`
+    /// publishes a logout. A busy lifecycle transaction never read the store:
+    /// it always keeps the anchor and does not count towards that run. A
+    /// failure from a load that a later successful load already superseded is
+    /// dropped, except a policy denial, which always publishes. Returns whether
+    /// the cached auth value changed.
+    fn record_load_failure(&self, err: &std::io::Error, started: u64, keep_anchor: bool) -> bool {
+        let policy_denied = is_auth_policy_denial(err);
+        let busy = err.kind() == std::io::ErrorKind::WouldBlock;
+        let log_out = match self.load_error.write() {
+            Ok(mut current) => {
+                if !policy_denied && self.load_publications.load(Ordering::Acquire) != started {
+                    return false;
+                }
+                let now = Instant::now();
+                let run_start = current.as_ref().and_then(|failure| failure.since);
+                let since = if busy { run_start } else { Some(run_start.unwrap_or(now)) };
+                *current = Some(AuthLoadFailure {
+                    attempted_at: now,
+                    since,
+                    kind: err.kind(),
+                    message: err.to_string(),
+                });
+                !busy
+                    && (!keep_anchor
+                        || policy_denied
+                        || since.is_some_and(|since| {
+                            now.duration_since(since) >= AUTH_LOAD_ANCHOR_GRACE
+                        }))
+            }
+            // Without the failure record dispatch cannot fail closed on an
+            // anchor, so publish the logout this failure produced before anchoring.
+            Err(_) => !busy,
+        };
+        if !log_out {
             return false;
         }
-        self.set_cached_auth(auth)
+        let changed = self.set_cached_auth(None);
+        if changed && policy_denied {
+            tracing::info!("Stored credentials are denied by login policy; logged out");
+        } else if changed && keep_anchor {
+            tracing::info!("Credential load failure persisted past the anchor grace; logged out");
+        }
+        changed
     }
 
     async fn reload_if_account_id_matches(
@@ -2639,15 +2762,16 @@ impl AuthManager {
         let Some((generation, source)) = self.external_auth_snapshot() else {
             return Ok(ReloadOutcome::Skipped);
         };
+        let started = self.load_publications.load(Ordering::Acquire);
         let new_auth = match self.load_auth(source.as_ref()).await {
             Ok(auth) => auth,
             Err(err) => {
                 self.with_current_external_auth(&generation, || {
-                    // Preserve the recovery identity and its revision, but keep
-                    // dispatch fail-closed until a successful credential load.
-                    if let Ok(mut error) = self.load_error.write() {
-                        *error = Some((std::time::Instant::now(), err.kind(), err.to_string()));
-                    }
+                    // Preserve the recovery identity and its revision for a
+                    // transient failure, but keep dispatch fail-closed until a
+                    // successful credential load. A policy denial or a
+                    // persistent failure publishes a logout.
+                    self.record_load_failure(&err, started, /*keep_anchor*/ true);
                 })?;
                 return Err(err);
             }
@@ -2667,7 +2791,7 @@ impl AuthManager {
             let cached_before_reload = self.auth_cached();
             let auth_changed =
                 !Self::auths_equal_for_refresh(cached_before_reload.as_ref(), new_auth.as_ref());
-            self.publish_auth_load(Ok(new_auth));
+            self.publish_auth_load(Ok(new_auth), started, /*keep_anchor*/ true);
             if auth_changed {
                 ReloadOutcome::ReloadedChanged
             } else {
@@ -3407,7 +3531,8 @@ impl AuthManager {
         })?;
         // Reload rather than clearing the current cache: another process may
         // have replaced storage, or this manager may have a newer external source.
-        self.reload().await;
+        // A failed load must not keep the revoked identity as an anchor.
+        self.reload_after_logout().await;
         Ok(removed || removed_external)
     }
 

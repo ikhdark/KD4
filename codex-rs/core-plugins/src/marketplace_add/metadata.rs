@@ -86,10 +86,21 @@ pub(super) fn installed_marketplace_root_for_source(
         if !install_metadata.matches_config(marketplace) {
             continue;
         }
-        let Some(root) =
-            resolve_configured_marketplace_root(marketplace_name, marketplace, install_root)
-        else {
-            continue;
+        let root = match &install_metadata.source {
+            // The match above may go through a configured alias (for example a Windows
+            // junction). Return the resolved request root, which the caller validates and
+            // re-records, so retargeting that alias cannot switch the returned root.
+            InstalledMarketplaceSource::Local { path } => PathBuf::from(path),
+            InstalledMarketplaceSource::Git { .. } => {
+                let Some(root) = resolve_configured_marketplace_root(
+                    marketplace_name,
+                    marketplace,
+                    install_root,
+                ) else {
+                    continue;
+                };
+                root
+            }
         };
         if validate_marketplace_root(&root).is_ok() {
             let last_revision = marketplace

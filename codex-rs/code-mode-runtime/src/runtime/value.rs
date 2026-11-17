@@ -431,7 +431,25 @@ pub(super) fn v8_value_to_json_with_limit(
     if stringified.utf8_length(&tc) > max_bytes {
         return Err(JsonConversionError::TooLarge);
     }
-    serde_json::from_str(&copy_string(&mut tc, stringified))
+    let json = copy_string(&mut tc, stringified);
+    // V8 emits compact JSON with these ASCII key names unescaped. The object/comma
+    // prefix and colon distinguish keys from string contents. Reject these before
+    // serde_json (raw_value/arbitrary_precision enabled) can reinterpret them as
+    // values and bypass its normal recursion limit (upstream #52681).
+    if [
+        r#"{"$serde_json::private::RawValue":"#,
+        r#","$serde_json::private::RawValue":"#,
+        r#"{"$serde_json::private::Number":"#,
+        r#","$serde_json::private::Number":"#,
+    ]
+    .into_iter()
+    .any(|key| json.contains(key))
+    {
+        return Err(JsonConversionError::Invalid(
+            "failed to serialize JavaScript value: reserved JSON object key".to_string(),
+        ));
+    }
+    serde_json::from_str(&json)
         .map(Some)
         .map_err(|err| {
             JsonConversionError::Invalid(format!("failed to serialize JavaScript value: {err}"))

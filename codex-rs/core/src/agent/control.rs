@@ -381,6 +381,31 @@ impl AgentControl {
             .map_err(|error| format!("failed to checkpoint root validation admissions: {error}"))
     }
 
+    /// The scope, mode and exact shared budget of the turn this tree's root is
+    /// running now, for a non-root agent whose captured scope names that root.
+    /// `None` without such an active root turn. The caller decides whether its
+    /// turn may act for it; this never mints a scope or budget.
+    pub(crate) async fn current_root_validation_context(
+        &self,
+        captured: &(String, String),
+    ) -> Option<super::task_coordinator::ValidationTurnContext> {
+        let root_id = ThreadId::from(self.session_id);
+        if root_id.to_string() != captured.0 {
+            return None;
+        }
+        let root = self.upgrade().ok()?.get_thread(root_id).await.ok()?;
+        // Leaf lock: nothing is awaited while the root's active turn is held.
+        let active = root.codex.session.active_turn.lock().await;
+        let root_turn = &active.as_ref()?.task.as_ref()?.turn_context;
+        (root_turn.validation_root_turn.0 == captured.0
+            && !root_turn.session_source.is_non_root_agent())
+        .then(|| super::task_coordinator::ValidationTurnContext {
+            scope: root_turn.validation_root_turn.clone(),
+            mode: root_turn.validation_mode,
+            budget: Arc::clone(&root_turn.full_suite_budget),
+        })
+    }
+
     /// Whether this tree has ever had a live sub-agent.
     ///
     /// The tool surface uses this rather than the registry's live-graph view, so
@@ -663,6 +688,20 @@ impl AgentControl {
         let queue = (!communication.trigger_turn)
             .then(|| self.state.input_queue_for_delivery(agent_id))
             .flatten();
+        // Publish the sending turn's validation scope before the receiver can
+        // observe the follow-up: admission of the turn it starts reads it.
+        if communication.trigger_turn
+            && let Some(scope) = context.followup_validation_scope()
+            && let Some(id) = communication.id.as_ref()
+            && let Ok(receiver) = state.get_thread(agent_id).await
+        {
+            receiver
+                .codex
+                .session
+                .input_queue
+                .record_mail_validation_origin(id.clone(), scope.clone())
+                .await;
+        }
         let result = if let Some(queue) = queue {
             state
                 .enqueue_queue_only_communication(agent_id, &queue, communication)
@@ -1084,9 +1123,37 @@ impl AgentControl {
                             "registered agent `{path}` has inconsistent lineage"
                         )));
                     }
+                    // Registered since it was recorded (addressed by id, or a spawn
+                    // committed): its identity is resolved, so the record is stale.
+                    self.task_coordinator().record_unavailable_descendant(child, false);
                     queue.push_back((child, path));
                     continue;
                 }
+                // A loaded child not yet registered is an in-flight spawn between
+                // publishing its edge and committing its path. That spawn owns the
+                // identity; reading its unflushed rollout would misreport it missing.
+                // Only a spawn from this tree shares its registry; a child loaded by a
+                // direct resume has its own and must still be re-read here. A spawn
+                // under such a child is in flight while its own registry has not
+                // committed it and still holds the parent's spawn reservation.
+                let loaded_unregistered =
+                    if retry_unavailable && self.get_agent_metadata(child).is_none() {
+                        state.get_thread(child).await.ok()
+                    } else {
+                        None
+                    };
+                if let Some(thread) = loaded_unregistered.as_ref() {
+                    let registry = thread.codex.session.services.agent_control.registry();
+                    if Arc::ptr_eq(registry, &self.state)
+                        || (registry.agent_metadata_for_thread(child).is_none()
+                            && registry.has_parent_spawn_reservation(parent))
+                    {
+                        continue;
+                    }
+                }
+                // A child loaded outside this registry is re-read below; a failure there
+                // is its own, so it stays unavailable and its siblings are still repaired.
+                let foreign_loaded = loaded_unregistered.is_some();
                 // A just-published live child's rollout may not yet be flushed.
                 // Its registered runtime is authoritative; do not read it back as cold.
                 if let Ok(thread) = state.get_thread(child).await
@@ -1122,34 +1189,60 @@ impl AgentControl {
                         self.task_coordinator().record_unavailable_descendant(child, true);
                         continue;
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        self.keep_foreign_loaded_unavailable(foreign_loaded, child, error)?;
+                        continue;
+                    }
                 };
                 if stored.source.get_agent_path().is_none()
                     && stored.source == SessionSource::default()
                     && stored.parent_thread_id.is_none_or(|id| id == parent)
                     && let Some(rollout_path) = stored.rollout_path.as_deref()
-                    && codex_rollout::has_unavailable_session_meta(rollout_path, child)
-                        .await
-                        .unwrap_or(false)
+                    // A retry finding the row still provisional for a child already
+                    // recorded unavailable keeps it so without rescanning its rollout.
+                    && ((retry_unavailable
+                        && self
+                            .task_coordinator()
+                            .unavailable_descendants()
+                            .iter()
+                            .any(|(id, _)| *id == child.to_string()))
+                        || codex_rollout::has_unavailable_session_meta(rollout_path, child)
+                            .await
+                            .unwrap_or_else(|error| {
+                                // An unreadable provisional rollout proves no identity
+                                // either; keep it unavailable rather than abort the tree.
+                                tracing::warn!(%child, %error, "cold agent rollout metadata scan failed");
+                                true
+                            }))
                 {
                     // Preserve the edge and obligation until the actual metadata
                     // returns; never infer an agent identity from a provisional row.
                     self.task_coordinator().record_unavailable_descendant(child, true);
                     continue;
                 }
-                let path = stored.source.get_agent_path().ok_or_else(|| {
-                    CodexErr::InvalidRequest(format!(
-                        "retained agent {child} has no canonical path"
-                    ))
-                })?;
+                let Some(path) = stored.source.get_agent_path() else {
+                    self.keep_foreign_loaded_unavailable(
+                        foreign_loaded,
+                        child,
+                        CodexErr::InvalidRequest(format!(
+                            "retained agent {child} has no canonical path"
+                        )),
+                    )?;
+                    continue;
+                };
                 if stored.parent_thread_id != Some(parent)
                     || stored.source.parent_thread_id() != Some(parent)
                     || path.as_str().rsplit_once('/').map(|(prefix, _)| prefix)
                         != Some(parent_path.as_str())
                 {
-                    return Err(CodexErr::InvalidRequest(format!(
-                        "retained agent `{path}` has inconsistent lineage"
-                    )));
+                    self.keep_foreign_loaded_unavailable(
+                        foreign_loaded,
+                        child,
+                        CodexErr::InvalidRequest(format!(
+                            "retained agent `{path}` has inconsistent lineage"
+                        )),
+                    )?;
+                    continue;
                 }
                 if let Some(binding) = self.task_coordinator().binding_for_agent_path(&path) {
                     if binding.thread_id.as_deref() != Some(child.to_string().as_str()) {
@@ -1163,23 +1256,45 @@ impl AgentControl {
                         );
                         continue;
                     }
-                    self.rehydrate_binding_with_stored(binding, Some(stored)).await?;
-                } else {
-                    self.state.restore_cold_agent(
-                        AgentMetadata {
-                            agent_id: Some(child),
-                            agent_path: Some(path.clone()),
-                            agent_nickname: stored.agent_nickname,
-                            agent_role: stored.agent_role,
-                            last_task_message: None,
-                        },
-                        parent,
-                    )?;
+                    if let Err(error) = self.rehydrate_binding_with_stored(binding, Some(stored)).await {
+                        self.keep_foreign_loaded_unavailable(foreign_loaded, child, error)?;
+                        continue;
+                    }
+                } else if let Err(error) = self.state.restore_cold_agent(
+                    AgentMetadata {
+                        agent_id: Some(child),
+                        agent_path: Some(path.clone()),
+                        agent_nickname: stored.agent_nickname,
+                        agent_role: stored.agent_role,
+                        last_task_message: None,
+                    },
+                    parent,
+                ) {
+                    self.keep_foreign_loaded_unavailable(foreign_loaded, child, error)?;
+                    continue;
                 }
                 self.task_coordinator().record_unavailable_descendant(child, false);
                 queue.push_back((child, path));
             }
         }
+        Ok(())
+    }
+
+    /// A retry re-reads a child loaded outside this tree's registry (a direct
+    /// resume), which the earlier skip never did. Its own failure keeps it
+    /// unavailable instead of ending its siblings' repair; a fatal error, and any
+    /// error for a child this traversal always read, still propagates.
+    fn keep_foreign_loaded_unavailable(
+        &self,
+        foreign_loaded: bool,
+        child: ThreadId,
+        error: CodexErr,
+    ) -> CodexResult<()> {
+        if !foreign_loaded || matches!(error, CodexErr::Fatal(_)) {
+            return Err(error);
+        }
+        tracing::warn!(%child, %error, "directly resumed agent could not be restored; keeping it unavailable");
+        self.task_coordinator().record_unavailable_descendant(child, true);
         Ok(())
     }
 
@@ -1312,7 +1427,11 @@ impl AgentControl {
                 last_task_message: None,
             },
             parent,
-        )
+        )?;
+        // Its identity, lineage and open edge are proven: any earlier
+        // unavailable record for this child no longer holds.
+        self.task_coordinator().record_unavailable_descendant(thread_id, false);
+        Ok(())
     }
 
     /// Subscribe to status updates for `agent_id`, yielding the latest value and changes.

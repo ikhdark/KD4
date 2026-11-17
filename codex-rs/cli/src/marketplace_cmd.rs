@@ -169,25 +169,25 @@ async fn run_add(overrides: Vec<(String, toml::Value)>, args: AddMarketplaceArgs
 
     if json {
         let output = JsonMarketplaceAddOutput::from_outcome(outcome);
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        out_println!("{}", serde_json::to_string_pretty(&output)?)?;
         return Ok(());
     }
 
     if outcome.already_added {
-        println!(
+        out_println!(
             "Marketplace `{}` is already added from {}.",
             outcome.marketplace_name, outcome.source_display
-        );
+        )?;
     } else {
-        println!(
+        out_println!(
             "Added marketplace `{}` from {}.",
             outcome.marketplace_name, outcome.source_display
-        );
+        )?;
     }
-    println!(
+    out_println!(
         "Installed marketplace root: {}",
         outcome.installed_root.as_path().display()
-    );
+    )?;
 
     Ok(())
 }
@@ -253,12 +253,12 @@ async fn run_list(overrides: Vec<(String, toml::Value)>, args: ListMarketplaceAr
             configured_marketplace_sources_by_root(config.codex_home.as_path(), &plugins_input);
         let output =
             JsonMarketplaceListOutput::from_marketplaces(marketplaces, &marketplace_sources);
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        out_println!("{}", serde_json::to_string_pretty(&output)?)?;
         return Ok(());
     }
 
     if marketplaces.is_empty() {
-        println!("No plugin marketplaces in scope.");
+        out_println!("No plugin marketplaces in scope.")?;
         return Ok(());
     }
 
@@ -281,13 +281,13 @@ async fn run_list(overrides: Vec<(String, toml::Value)>, args: ListMarketplaceAr
         .unwrap_or("MARKETPLACE".len())
         .max("MARKETPLACE".len());
 
-    println!("{:<marketplace_width$}  ROOT", "MARKETPLACE");
+    out_println!("{:<marketplace_width$}  ROOT", "MARKETPLACE")?;
     for (marketplace_name, root) in rows {
-        println!(
+        out_println!(
             "{:<marketplace_width$}  {}",
             marketplace_name,
             root.display()
-        );
+        )?;
     }
 
     Ok(())
@@ -418,16 +418,16 @@ async fn run_remove(
 
     if json {
         let output = JsonMarketplaceRemoveOutput::from_outcome(outcome);
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        out_println!("{}", serde_json::to_string_pretty(&output)?)?;
         return Ok(());
     }
 
-    println!("Removed marketplace `{}`.", outcome.marketplace_name);
+    out_println!("Removed marketplace `{}`.", outcome.marketplace_name)?;
     if let Some(installed_root) = outcome.removed_installed_root {
-        println!(
+        out_println!(
             "Removed installed marketplace root: {}",
             installed_root.as_path().display()
-        );
+        )?;
     }
 
     Ok(())
@@ -460,7 +460,7 @@ fn print_upgrade_outcome_json(outcome: &PluginMarketplaceUpgradeOutcome) -> Resu
     }
 
     let output = JsonMarketplaceUpgradeOutput::from_outcome(outcome);
-    println!("{}", serde_json::to_string_pretty(&output)?);
+    out_println!("{}", serde_json::to_string_pretty(&output)?)?;
     if !outcome.all_succeeded() {
         bail!("{} upgrade failure(s) occurred.", outcome.errors.len());
     }
@@ -516,24 +516,24 @@ fn print_upgrade_outcome(
 
     let selection_label = marketplace_name.unwrap_or("all configured Git marketplaces");
     if outcome.selected_marketplaces.is_empty() {
-        println!("No configured Git marketplaces to upgrade.");
+        out_println!("No configured Git marketplaces to upgrade.")?;
     } else if outcome.upgraded_roots.is_empty() {
         if !outcome.all_succeeded() {
-            println!("No marketplace upgrades completed.");
+            out_println!("No marketplace upgrades completed.")?;
         } else if marketplace_name.is_some() {
-            println!("Marketplace `{selection_label}` is already up to date.");
+            out_println!("Marketplace `{selection_label}` is already up to date.")?;
         } else {
-            println!("All configured Git marketplaces are already up to date.");
+            out_println!("All configured Git marketplaces are already up to date.")?;
         }
     } else if marketplace_name.is_some() {
-        println!("Upgraded marketplace `{selection_label}` to the latest configured revision.");
+        out_println!("Upgraded marketplace `{selection_label}` to the latest configured revision.")?;
         for root in &outcome.upgraded_roots {
-            println!("Installed marketplace root: {}", root.display());
+            out_println!("Installed marketplace root: {}", root.display())?;
         }
     } else {
-        println!("Upgraded {} marketplace(s).", outcome.upgraded_roots.len());
+        out_println!("Upgraded {} marketplace(s).", outcome.upgraded_roots.len())?;
         for root in &outcome.upgraded_roots {
-            println!("Installed marketplace root: {}", root.display());
+            out_println!("Installed marketplace root: {}", root.display())?;
         }
     }
 

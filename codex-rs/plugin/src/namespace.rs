@@ -20,19 +20,21 @@ struct RawPluginManifestName {
     name: String,
 }
 
+/// Probes and reads the manifest under `sandbox`, the caller's filesystem authority.
 pub async fn plugin_namespace_for_root_uri(
     fs: &dyn ExecutorFileSystem,
     plugin_root: &PathUri,
+    sandbox: Option<&codex_file_system::FileSystemSandboxContext>,
 ) -> Option<String> {
     let mut manifest_path = None;
     for relative_path in DISCOVERABLE_PLUGIN_MANIFEST_PATHS {
         let candidate = plugin_root.join(relative_path).ok()?;
-        if matches!(fs.get_metadata(&candidate, None).await, Ok(metadata) if metadata.is_file) {
+        if matches!(fs.get_metadata(&candidate, sandbox).await, Ok(metadata) if metadata.is_file) {
             manifest_path = Some(candidate);
             break;
         }
     }
-    let contents = fs.read_file_text(&manifest_path?, None).await.ok()?;
+    let contents = fs.read_file_text(&manifest_path?, sandbox).await.ok()?;
     let RawPluginManifestName { name } = serde_json::from_str(&contents).ok()?;
     Some(
         plugin_root

@@ -835,13 +835,31 @@ impl ReceiptEvidenceRefArgs {
     ) -> Result<codex_agent_task_store::CriterionEvidenceRef, FunctionCallError> {
         let evidence_epoch = match self.evidence_epoch {
             Some(epoch) => epoch,
-            None => task.validation_calls.iter()
-                .find(|call| call.call_id == self.call_id && call.attempt_id == task.current_attempt.attempt_id)
-                .and_then(|call| call.evidence.end_epoch)
-                .ok_or_else(|| FunctionCallError::RespondToModel(format!(
+            None => {
+                let attempt_id = &task.current_attempt.attempt_id;
+                let Some(call) = task.validation_calls.iter()
+                    .find(|call| call.call_id == self.call_id && &call.attempt_id == attempt_id)
+                else {
+                    // An id that is not a recorded call has no epoch to be missing;
+                    // name the recorded id the model probably meant instead.
+                    let suffix = format!(":{}", self.call_id);
+                    let mut recorded = task.validation_calls.iter().filter(|call| {
+                        &call.attempt_id == attempt_id && call.call_id.ends_with(&suffix)
+                    });
+                    let hint = match (recorded.next(), recorded.next()) {
+                        (Some(call), None) => format!(" Cite its recorded id `{}`.", call.call_id),
+                        _ => " Cite evidence_ref.call_id exactly as returned in the call's criterion_evidence.".to_string(),
+                    };
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "{SUBMIT_AGENT_RECEIPT_TOOL}: {} is not a recorded validation or source-inspection call of the bound attempt {attempt_id}.{hint}",
+                        self.call_id
+                    )));
+                };
+                call.evidence.end_epoch.ok_or_else(|| FunctionCallError::RespondToModel(format!(
                     "{SUBMIT_AGENT_RECEIPT_TOOL}: validation call {} has no recorded end epoch in the bound attempt",
                     self.call_id
-                )))?,
+                )))?
+            }
         };
         let kind = self
             .kind

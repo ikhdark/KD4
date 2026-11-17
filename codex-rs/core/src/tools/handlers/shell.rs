@@ -27,6 +27,8 @@ use crate::tools::events::ToolEventCtx;
 use crate::tools::handlers::allows_inline_sandbox_approval;
 use crate::tools::handlers::apply_granted_turn_permissions;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
+use crate::tools::handlers::command_not_started;
+use crate::tools::handlers::command_permission_refusal;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::command_shape::powershell_script_failure_advisory;
 use crate::tools::handlers::implicit_granted_permissions;
@@ -547,7 +549,7 @@ pub(super) async fn run_exec_like_with_exit_code(
         .await;
         if !effective_permissions.permissions_preapproved {
             let approval_policy = args.turn.approval_policy.value();
-            return Err(FunctionCallError::RespondToModel(format!(
+            return Err(command_permission_refusal(format!(
                 "approval policy is {approval_policy:?}; reject command — you should not ask for escalated permissions if the approval policy is {approval_policy:?}"
             )));
         }
@@ -642,8 +644,7 @@ async fn run_exec_like_with_exit_code_inner(
             )
         },
         |permissions| Ok(Some(permissions)),
-    )
-    .map_err(FunctionCallError::RespondToModel)?;
+    )?;
 
     let effective_permission_context = format!(
         "sandbox={:?};additional={:?};preapproved={};normalized={:?}",
@@ -665,7 +666,7 @@ async fn run_exec_like_with_exit_code_inner(
         && !allows_inline_sandbox_approval(turn.approval_policy.value())
     {
         let approval_policy = turn.approval_policy.value();
-        return Err(FunctionCallError::RespondToModel(format!(
+        return Err(command_permission_refusal(format!(
             "approval policy is {approval_policy:?}; reject command — you should not ask for escalated permissions if the approval policy is {approval_policy:?}"
         )));
     }
@@ -677,7 +678,7 @@ async fn run_exec_like_with_exit_code_inner(
             .begin_attempt_with_freshness(attempt_key, command_repaired, force_fresh)
             .await
     {
-        return Err(FunctionCallError::RespondToModel(
+        return Err(command_not_started(
             blocked.render_for_model(),
         ));
     }

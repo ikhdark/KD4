@@ -315,6 +315,7 @@ struct PreparedProcessHandles {
     pause_state: Option<watch::Receiver<bool>>,
     call_id: String,
     hook_command: String,
+    hook_cwd: Option<PathUri>,
     process_id: u32,
     search_exit_one_is_no_match: bool,
     tty: bool,
@@ -837,7 +838,7 @@ impl UnifiedExecProcessManager {
         cleanup_confirmed: bool,
         started: Instant,
     ) -> UnifiedExecError {
-        let (call_id, hook_command, tty) = {
+        let (call_id, hook_command, tool_cwd, tty) = {
             let store = self.process_store.lock().await;
             store
                 .processes
@@ -847,6 +848,7 @@ impl UnifiedExecProcessManager {
                     (
                         entry.call_id.clone(),
                         Some(entry.hook_command.clone()),
+                        entry.hook_cwd.clone(),
                         entry.tty,
                     )
                 })
@@ -888,6 +890,7 @@ impl UnifiedExecProcessManager {
             search_no_match: false,
             original_token_count: None,
             hook_command,
+            tool_cwd,
             raw_output_artifact,
             repair_notice: None,
             pending_deferred_completions: Vec::new(),
@@ -1119,6 +1122,8 @@ impl UnifiedExecProcessManager {
                         if let UnifiedExecError::ProcessFailedWithOutput { output, .. } = &mut error {
                             output.event_call_id = context.call_id.clone();
                             output.hook_command = Some(request.hook_command.clone());
+                            output.tool_cwd = (!request.turn_environment.environment.is_remote())
+                                .then(|| request.cwd.clone());
                         }
                         result = Err(error);
                     }
@@ -1190,6 +1195,8 @@ impl UnifiedExecProcessManager {
         event_delivery: &tokio::sync::Mutex<()>,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let cwd = request.cwd.clone();
+        // Hooks run on the host; only a local command cwd can replace the host cwd.
+        let hook_cwd = (!request.turn_environment.environment.is_remote()).then(|| cwd.clone());
         let mut tool_history_error = None;
         self.reserve_process_capacity(process_id_reservation)
             .await?;
@@ -1256,6 +1263,7 @@ impl UnifiedExecProcessManager {
                     context,
                     &request.command_for_safety,
                     request.hook_command.clone(),
+                    hook_cwd.clone(),
                     cwd.clone(),
                     start,
                     request.process_id,
@@ -1481,6 +1489,7 @@ impl UnifiedExecProcessManager {
                     )),
             original_token_count: Some(original_token_count),
             hook_command: Some(request.hook_command.clone()),
+            tool_cwd: hook_cwd,
             raw_output_artifact: match poll_bound {
                 Some(bound) => tokio::time::timeout_at(bound, process.raw_output_artifact())
                     .await
@@ -1698,6 +1707,7 @@ impl UnifiedExecProcessManager {
             pause_state,
             call_id,
             hook_command,
+            hook_cwd,
             process_id,
             search_exit_one_is_no_match,
             tty,
@@ -1918,6 +1928,7 @@ impl UnifiedExecProcessManager {
             search_no_match: search_exit_one_is_no_match && exit_code == Some(1),
             original_token_count: Some(original_token_count),
             hook_command: Some(hook_command),
+            tool_cwd: hook_cwd,
             raw_output_artifact: match poll_bound {
                 Some(bound) => tokio::time::timeout_at(bound, process.raw_output_artifact())
                     .await
@@ -2048,7 +2059,7 @@ impl UnifiedExecProcessManager {
             quiet_on_success: false,
             process_id: None, session_capabilities: process.shutdown_status().map(|_| process.session_capabilities(entry.tty)), exit_code, process_exited: true,
             search_no_match: entry.search_exit_one_is_no_match && exit_code == Some(1),
-            hook_command: None, raw_output_artifact: artifact, repair_notice: None,
+            hook_command: None, tool_cwd: None, raw_output_artifact: artifact, repair_notice: None,
             pending_deferred_completions: Vec::new(),
         };
         buffer.acknowledge_pending_output();
@@ -2156,6 +2167,7 @@ impl UnifiedExecProcessManager {
             search_no_match: handles.search_exit_one_is_no_match && exit_code == Some(1),
             original_token_count: Some(0),
             hook_command: Some(handles.hook_command.clone()),
+            tool_cwd: handles.hook_cwd.clone(),
             raw_output_artifact: handles.process.try_raw_output_artifact(),
             repair_notice: Some(notice),
             pending_deferred_completions: Vec::new(),
@@ -2199,6 +2211,7 @@ impl UnifiedExecProcessManager {
             pause_state,
             call_id: entry.call_id.clone(),
             hook_command: entry.hook_command.clone(),
+            hook_cwd: entry.hook_cwd.clone(),
             process_id: entry.process_id,
             search_exit_one_is_no_match: entry.search_exit_one_is_no_match,
             tty: entry.tty,
@@ -2213,6 +2226,7 @@ impl UnifiedExecProcessManager {
         context: &UnifiedExecContext,
         command: &[String],
         hook_command: String,
+        hook_cwd: Option<PathUri>,
         cwd: PathUri,
         started_at: Instant,
         process_id: u32,
@@ -2249,6 +2263,7 @@ impl UnifiedExecProcessManager {
                     && process.validation().is_none()
                     && crate::tools::shell_output_summary::ends_with_native_search(&hook_command)),
             hook_command,
+            hook_cwd,
             tty,
             validation_launch,
             session: Arc::downgrade(&context.session),

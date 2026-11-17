@@ -84,6 +84,10 @@ struct ContinuationProgressObservation {
     calls: usize,
     source_actions: usize,
     wait_only: bool,
+    /// A wait that delivered new output from its running owner.
+    wait_output: bool,
+    /// A dependency wait or a result whose semantics the guard cannot classify.
+    unclassified: bool,
     observation_only: bool,
     new_failure: bool,
 }
@@ -204,6 +208,8 @@ struct SamplingToolOutcome {
     validation_mutation_revision: Option<u64>,
     background_process_id: Option<u64>,
     observed_process_id: Option<u64>,
+    /// The authoritative wait owner reported its dependency already terminal.
+    owner_wait_terminal: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -277,6 +283,9 @@ impl SamplingToolOutcome {
             background_process_id: signal
                 .and_then(|signal| signal["background_process_id"].as_u64()),
             observed_process_id: signal.and_then(|signal| signal["observed_process_id"].as_u64()),
+            owner_wait_terminal: signal.is_some_and(|signal| {
+                signal["authoritative_wait_owner_v1"]["disposition"] == "terminal"
+            }),
         }
     }
 
@@ -427,6 +436,13 @@ struct DeterministicDispatchLedger {
     blocked_wait_gate: Option<BlockedWaitGate>,
     repeated_failure_gate: Option<RepeatedFailureGate>,
     argument_syntax_failures: BTreeMap<String, String>,
+    /// Settled failure call ID -> failure identity. A proven unchanged repeat
+    /// takes its predecessor's identity, so a chain of repeats stays one cycle.
+    failure_identities: BTreeMap<String, String>,
+    /// Failures without an owner signature: (action, failure content, observed
+    /// state at request start) -> first identity. History cannot prove these
+    /// repeats because every command advances its observed-state revision.
+    content_failure_identities: BTreeMap<String, String>,
 
     timing: Arc<TurnTimingState>,
 }
@@ -437,6 +453,8 @@ impl DeterministicDispatchLedger {
             blocked_wait_gate: None,
             repeated_failure_gate: None,
             argument_syntax_failures: BTreeMap::new(),
+            failure_identities: BTreeMap::new(),
+            content_failure_identities: BTreeMap::new(),
 
             timing,
         }
@@ -612,6 +630,9 @@ pub(crate) struct SamplingRequestSignalCollector {
     state: Arc<Mutex<SamplingRequestSignalState>>,
     dispatch_ledger: Option<Arc<Mutex<DeterministicDispatchLedger>>>,
     request_state_revision: String,
+    /// Attributed workspace, plan, input, instruction and tool exposure state
+    /// this request observed; command execution alone does not advance it.
+    observed_state: String,
     request_ordinal: u64,
 }
 
@@ -1008,23 +1029,36 @@ impl SamplingRequestSignalCollector {
         let ordinal = self.next_ordinal.fetch_add(1, Ordering::Relaxed);
         let plan = sampling_plan(signal);
         let mut outcome = SamplingToolOutcome::from_signal(ordinal, outcome_context, plan, signal);
+        let canonical = canonical_tool_action(payload);
+        let structured_action =
+            structured_action_identity_from_canonical(tool_name, payload, &canonical);
         if outcome.is_failure_evidence() {
             outcome.validation_failure_excerpt = validation_failure_excerpt(result);
             outcome.failure_recovery = failure_recovery_from_value(result);
-            outcome.failure_repeats_unchanged_attempt =
-                unchanged_failure_repeat_of(result).is_some();
-        }
-        if outcome.is_failure_evidence() && outcome.failure_fingerprint.is_none() {
-            outcome.failure_fingerprint = Some(code_mode_result_failure_fingerprint(
-                result, call_id.unwrap_or(cell_id), ordinal,
-            ));
+            let envelope = failure_envelope_for_call(result, call_id);
+            let own = outcome.failure_fingerprint.take().unwrap_or_else(|| {
+                code_mode_result_failure_fingerprint(
+                    envelope.unwrap_or(&Value::Null),
+                    call_id.unwrap_or(cell_id),
+                    ordinal,
+                )
+            });
+            let content = outcome
+                .source_evidence
+                .clone()
+                .unwrap_or_else(|| failure_content_without_history(result));
+            let (fingerprint, repeated) = self.settle_failure_identity(
+                call_id,
+                envelope,
+                own,
+                structured_action.as_ref().map(|action| (action, &content)),
+            );
+            outcome.failure_fingerprint = Some(fingerprint);
+            outcome.failure_repeats_unchanged_attempt = repeated;
         }
         outcome.canonical_artifact_required = canonical_artifact_required;
         outcome.nested_in_code_mode = true;
         outcome.code_mode_cell_id = Some(cell_id.to_string());
-        let canonical = canonical_tool_action(payload);
-        let structured_action =
-            structured_action_identity_from_canonical(tool_name, payload, &canonical);
         let validation = self.validation_semantics(tool_name, &canonical.value);
         let semantics = self.runtime_semantics(tool_name);
         let mutation = semantics.mutation;
@@ -1118,9 +1152,14 @@ impl SamplingRequestSignalCollector {
             .cloned()
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a nested failure carries its call, action, dependencies and failure evidence together"
+    )]
     pub(crate) fn record_code_mode_failure(
         &self,
         cell_id: &str,
+        call_id: &str,
         tool_name: &ToolName,
         payload: Option<&ToolPayload>,
         source_dependencies: Option<BTreeSet<SourceDependencyV1>>,
@@ -1130,17 +1169,28 @@ impl SamplingRequestSignalCollector {
         let ordinal = self.next_ordinal.fetch_add(1, Ordering::Relaxed);
         let mut outcome =
             SamplingToolOutcome::plain(ordinal, SamplingToolOutcomeKind::Failure, None);
-        outcome.failure_fingerprint = Some(failure_fingerprint);
-        outcome.failure_recovery = Some(failure_recovery_from_text(failure_message));
-        outcome.failure_repeats_unchanged_attempt = text_failure_repeats_unchanged_attempt(failure_message);
-        outcome.nested_in_code_mode = true;
-        outcome.code_mode_cell_id = Some(cell_id.to_string());
         let canonical = payload.map(canonical_tool_action);
         let structured_action = payload
             .zip(canonical.as_ref())
             .and_then(|(payload, canonical)| {
                 structured_action_identity_from_canonical(tool_name, payload, canonical)
             });
+        let envelope = failure_envelope_from_text(failure_message);
+        let envelope = envelope
+            .as_ref()
+            .and_then(|envelope| failure_envelope_for_call(envelope, Some(call_id)));
+        let content = text_failure_content(failure_message, envelope, call_id);
+        let (failure_fingerprint, repeated) = self.settle_failure_identity(
+            Some(call_id),
+            envelope,
+            failure_fingerprint,
+            structured_action.as_ref().map(|action| (action, &content)),
+        );
+        outcome.failure_fingerprint = Some(failure_fingerprint);
+        outcome.failure_recovery = Some(failure_recovery_from_text(failure_message));
+        outcome.failure_repeats_unchanged_attempt = repeated;
+        outcome.nested_in_code_mode = true;
+        outcome.code_mode_cell_id = Some(cell_id.to_string());
         let validation = canonical
             .as_ref()
             .map(|canonical| self.validation_semantics(tool_name, &canonical.value))
@@ -1259,15 +1309,108 @@ impl SamplingRequestSignalCollector {
             .collect()
     }
 
+    /// Turn-scoped identity of a settled failure. Operation history proving an
+    /// unchanged repeat (unchanged_failure_repeat_of) gives it the identity of
+    /// the predecessor it repeats. A failure without an owner signature also
+    /// repeats an earlier one with the same action and failure content against
+    /// the same observed request state (`failure`: action and content). Every
+    /// other failure keeps `own`. `envelope` must already be bound to `call_id`.
+    fn settle_failure_identity(
+        &self,
+        call_id: Option<&str>,
+        envelope: Option<&Value>,
+        own: String,
+        failure: Option<(&StructuredActionIdentity, &Value)>,
+    ) -> (String, bool) {
+        let previous = call_id
+            .zip(envelope)
+            .and_then(|(call_id, envelope)| unchanged_failure_repeat_of(envelope, call_id));
+        let content_key = failure
+            .filter(|_| is_unclassified_failure_instance(&own))
+            .and_then(|(action, content)| {
+                serialized_evidence_identity(&(
+                    &action.evidence_identity,
+                    canonicalize_json(content),
+                    &self.observed_state,
+                ))
+            });
+        let Some(ledger) = self.dispatch_ledger.as_ref() else {
+            return (own, previous.is_some());
+        };
+        let mut ledger = ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let content_previous = content_key
+            .as_ref()
+            .and_then(|key| ledger.content_failure_identities.get(key).cloned());
+        let repeated = previous.is_some() || content_previous.is_some();
+        let identity = previous
+            .and_then(|previous| ledger.failure_identities.get(previous).cloned())
+            .or(content_previous)
+            .unwrap_or(own);
+        if let Some(key) = content_key {
+            ledger
+                .content_failure_identities
+                .entry(key)
+                .or_insert_with(|| identity.clone());
+        }
+        if let Some(call_id) = call_id {
+            ledger
+                .failure_identities
+                .insert(call_id.to_string(), identity.clone());
+        }
+        (identity, repeated)
+    }
+
+    /// The call ID and structured action registered for a direct call ordinal.
+    fn registered_call(&self, ordinal: u64) -> (Option<String>, Option<StructuredActionIdentity>) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let call_id = state
+            .call_ordinals
+            .iter()
+            .find(|(_, registered)| **registered == ordinal)
+            .map(|(call_id, _)| call_id.clone());
+        (call_id, state.structured_actions.get(&ordinal).cloned())
+    }
+
+    /// Request ordinals restart at zero, so they alone do not identify an instance.
+    fn direct_failure_instance(&self, envelope: Option<&Value>, ordinal: u64) -> String {
+        match envelope.and_then(failure_history_call_id) {
+            Some(call_id) => format!("direct_tool.unclassified_instance.{call_id}"),
+            None => format!(
+                "direct_tool.unclassified_instance.{}.{ordinal}",
+                self.request_ordinal
+            ),
+        }
+    }
+
     pub(crate) fn record_failure(&self, ordinal: u64, failure: &str, failure_is_terminal: bool) {
         let mut outcome =
             SamplingToolOutcome::plain(ordinal, SamplingToolOutcomeKind::Failure, None);
-        outcome.failure_fingerprint = Some(serde_json::from_str::<Value>(failure).ok()
-            .and_then(|value| value_failure_signature(&value))
-            .unwrap_or_else(|| format!("direct_tool.unclassified_instance.{ordinal}")));
+        let (call_id, action) = self.registered_call(ordinal);
+        let envelope = failure_envelope_from_text(failure);
+        let envelope = envelope
+            .as_ref()
+            .and_then(|envelope| failure_envelope_for_call(envelope, call_id.as_deref()));
+        let own = envelope
+            .and_then(value_failure_signature)
+            .unwrap_or_else(|| self.direct_failure_instance(envelope, ordinal));
+        let content = call_id
+            .as_deref()
+            .map(|call_id| text_failure_content(failure, envelope, call_id));
+        let (fingerprint, repeated) = self.settle_failure_identity(
+            call_id.as_deref(),
+            envelope,
+            own,
+            action.as_ref().zip(content.as_ref()),
+        );
+        outcome.failure_fingerprint = Some(fingerprint);
         outcome.failure_is_terminal = failure_is_terminal;
         outcome.failure_recovery = Some(failure_recovery_from_text(failure));
-        outcome.failure_repeats_unchanged_attempt = text_failure_repeats_unchanged_attempt(failure);
+        outcome.failure_repeats_unchanged_attempt = repeated;
         let mut state = self
             .state
             .lock()
@@ -1317,10 +1460,30 @@ impl SamplingRequestSignalCollector {
                 .and_then(|value| validation_failure_excerpt(&value))
                 .or_else(|| Some(bounded_validation_detail(&text)));
             outcome.failure_recovery = Some(failure_recovery_from_text(&text));
-            outcome.failure_repeats_unchanged_attempt = text_failure_repeats_unchanged_attempt(&text);
         }
-        if outcome.is_failure_evidence() && outcome.failure_fingerprint.is_none() {
-            outcome.failure_fingerprint = response_failure_fingerprint(response);
+        if outcome.is_failure_evidence() {
+            // Owner JSON carries its history inline; other text results carry
+            // the registry's appended settlement notice.
+            let call_id = response_call_id(response);
+            let envelope = response_failure_envelope(response);
+            let envelope = envelope
+                .as_ref()
+                .and_then(|envelope| failure_envelope_for_call(envelope, call_id));
+            let own = outcome.failure_fingerprint.take()
+                .or_else(|| envelope.and_then(value_failure_signature))
+                .unwrap_or_else(|| self.direct_failure_instance(envelope, ordinal));
+            let content = outcome.source_evidence.clone().or_else(|| {
+                call_id.and_then(|call_id| response_failure_content(response, call_id))
+            });
+            let action = self.registered_call(ordinal).1;
+            let (fingerprint, repeated) = self.settle_failure_identity(
+                call_id,
+                envelope,
+                own,
+                action.as_ref().zip(content.as_ref()),
+            );
+            outcome.failure_fingerprint = Some(fingerprint);
+            outcome.failure_repeats_unchanged_attempt = repeated;
         }
         let evidence_identity = outcome
             .source_evidence
@@ -2077,12 +2240,6 @@ fn validation_failure_excerpt(value: &Value) -> Option<String> {
     }
 }
 
-fn response_failure_fingerprint(response: &ResponseInputItem) -> Option<String> {
-    let value = response_output_text(response)
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())?;
-    value_failure_signature(&value)
-}
-
 fn value_failure_is_terminal(value: &Value) -> bool {
     let Value::Object(fields) = value else {
         return false;
@@ -2105,25 +2262,168 @@ fn value_failure_signature(value: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The registry's settled attempt history: a thrown failure carries it in its
+/// typed failure details, a settled result with a failed outcome at top level.
+fn failure_operation_history(envelope: &Value) -> Option<&Value> {
+    envelope
+        .pointer("/tool_failure/details/operation_history")
+        .or_else(|| envelope.get("operation_history"))
+        .filter(|history| history.is_object())
+}
+
+fn failure_history_call_id(envelope: &Value) -> Option<&str> {
+    failure_operation_history(envelope)?
+        .pointer("/instance/call_id")
+        .and_then(Value::as_str)
+        .filter(|call_id| !call_id.is_empty())
+}
+
+/// Attempt history describes only the call it was settled for. History found
+/// in tool-controlled content (a JSON body, a printed nested result) that
+/// names another call, or any history when the call is unknown, is not host
+/// metadata for this failure.
+fn failure_envelope_for_call<'a>(envelope: &'a Value, call_id: Option<&str>) -> Option<&'a Value> {
+    if failure_operation_history(envelope).is_none()
+        || call_id.is_some_and(|call_id| failure_history_call_id(envelope) == Some(call_id))
+    {
+        Some(envelope)
+    } else {
+        None
+    }
+}
+
+/// The registry's appended settlement notice for exactly this call.
+fn settlement_notice_for_call(notice: &str, call_id: &str) -> bool {
+    serde_json::from_str::<Value>(notice).is_ok_and(|notice| {
+        notice.get("operation_history").is_some()
+            && failure_history_call_id(&notice) == Some(call_id)
+    })
+}
+
+/// Fallback identities given to failures without an owner failure signature
+/// (registry, direct dispatch and Code Mode); each names one call or instance.
+fn is_unclassified_failure_instance(fingerprint: &str) -> bool {
+    [
+        "tool_failure.unclassified_instance.",
+        "direct_tool.unclassified_instance.",
+        "code_mode.unclassified_instance.",
+    ]
+    .iter()
+    .any(|prefix| fingerprint.starts_with(prefix))
+}
+
+/// A failure's own content, without the host's per-attempt history.
+fn failure_content_without_history(value: &Value) -> Value {
+    let mut value = value.clone();
+    if let Some(object) = value.as_object_mut() {
+        object.remove("operation_history");
+        if let Some(details) = object
+            .get_mut("tool_failure")
+            .and_then(|failure| failure.get_mut("details"))
+            .and_then(Value::as_object_mut)
+        {
+            details.remove("operation_history");
+        }
+    }
+    value
+}
+
+/// Failure text without this call's settlement notice; owner JSON (whole or
+/// after a carrier prefix) without its history.
+fn text_failure_content(text: &str, envelope: Option<&Value>, call_id: &str) -> Value {
+    if let Some((body, notice)) = text.rsplit_once("\n\nHost settlement: ")
+        && settlement_notice_for_call(notice, call_id)
+    {
+        return Value::String(body.to_string());
+    }
+    match (envelope, text.find('{')) {
+        (Some(envelope), Some(start)) => serde_json::json!([
+            &text[..start],
+            failure_content_without_history(envelope),
+        ]),
+        _ => Value::String(text.to_string()),
+    }
+}
+
+fn response_call_id(response: &ResponseInputItem) -> Option<&str> {
+    match response {
+        ResponseInputItem::FunctionCallOutput { call_id, .. }
+        | ResponseInputItem::McpToolCallOutput { call_id, .. }
+        | ResponseInputItem::CustomToolCallOutput { call_id, .. }
+        | ResponseInputItem::ToolSearchOutput { call_id, .. } => Some(call_id.as_str()),
+        ResponseInputItem::Message { .. } => None,
+    }
+}
+
+/// A failed result's own content, without this call's settlement notice or
+/// inline history, which differ on every attempt.
+fn response_failure_content(response: &ResponseInputItem, call_id: &str) -> Option<Value> {
+    match response {
+        ResponseInputItem::FunctionCallOutput { output, .. }
+        | ResponseInputItem::CustomToolCallOutput { output, .. } => match &output.body {
+            codex_protocol::models::FunctionCallOutputBody::Text(text) => {
+                Some(match serde_json::from_str::<Value>(text) {
+                    Ok(value) if value.is_object() => failure_content_without_history(&value),
+                    _ => text_failure_content(text, None, call_id),
+                })
+            }
+            codex_protocol::models::FunctionCallOutputBody::ContentItems(items) => {
+                let items = items
+                    .iter()
+                    .filter(|item| !matches!(item,
+                        codex_protocol::models::FunctionCallOutputContentItem::InputText { text }
+                            if settlement_notice_for_call(text, call_id)))
+                    .collect::<Vec<_>>();
+                serde_json::to_value(items).ok()
+            }
+        },
+        ResponseInputItem::McpToolCallOutput { output, .. } => {
+            let content = output
+                .content
+                .iter()
+                .filter(|item| {
+                    !item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| settlement_notice_for_call(text, call_id))
+                })
+                .collect::<Vec<_>>();
+            serde_json::to_value((content, &output.structured_content, &output.is_error)).ok()
+        }
+        ResponseInputItem::ToolSearchOutput { .. } | ResponseInputItem::Message { .. } => None,
+    }
+}
+
 /// Operation history (grouped by exact operation and input) proves that this
-/// failure repeats its predecessor: same observed state and configuration, no
-/// success since, and an identical settled owner failure. Returns the
-/// predecessor's call ID. Similar diagnostics never qualify, and the history's
-/// coarse-failure fingerprint policy is unchanged.
-pub(crate) fn unchanged_failure_repeat_of(envelope: &Value) -> Option<&str> {
-    let failure = envelope.get("tool_failure")?;
-    let history = failure.pointer("/details/operation_history")?;
+/// call's failure repeats its predecessor: same observed state and
+/// configuration, no success since, the same outcome and an identical settled
+/// typed owner failure (code, message and effect state). Returns the
+/// predecessor's call ID. History is accepted only for `call_id`. Failures
+/// without a typed owner failure carry no comparable content in the history,
+/// so it cannot prove them; the caller compares their content instead.
+/// Similar diagnostics never qualify, and the history's coarse-failure
+/// fingerprint policy is unchanged.
+pub(crate) fn unchanged_failure_repeat_of<'a>(envelope: &'a Value, call_id: &str) -> Option<&'a str> {
+    let history = failure_operation_history(envelope)?;
     let instance = history.get("instance")?;
+    if instance.get("call_id").and_then(Value::as_str) != Some(call_id) {
+        return None;
+    }
     let previous = history.get("last_unsuccessful_attempt")?;
-    let owner = previous.get("owner_failure")?;
+    let owner = previous.get("owner_failure").filter(|owner| !owner.is_null());
     let count = |key: &str| history.get(key).and_then(Value::as_u64);
-    let identical = ["code", "message"]
-        .iter()
-        .all(|key| failure.get(*key).is_some() && failure.get(*key) == owner.get(*key))
-        && ["execution_state", "effects", "live_operations", "retry_safe"]
+    let identical = match (envelope.get("tool_failure"), owner) {
+        (Some(failure), Some(owner)) => ["code", "message"]
             .iter()
-            .all(|key| failure.get(*key) == owner.get(*key));
+            .all(|key| failure.get(*key).is_some() && failure.get(*key) == owner.get(*key))
+            && ["execution_state", "effects", "live_operations", "retry_safe"]
+                .iter()
+                .all(|key| failure.get(*key) == owner.get(*key)),
+        _ => false,
+    };
     let repeated = identical
+        && instance["outcome"].is_string()
+        && previous["outcome"] == instance["outcome"]
         && instance["effective_input_known"] == true
         && previous["same_observed_state"] == true
         && count("unchanged_unsuccessful_attempt_count").is_some_and(|count| count > 0)
@@ -2135,10 +2435,42 @@ pub(crate) fn unchanged_failure_repeat_of(envelope: &Value) -> Option<&str> {
     repeated.then(|| previous["call_id"].as_str()).flatten()
 }
 
-fn text_failure_repeats_unchanged_attempt(text: &str) -> bool {
-    text.find('{')
-        .and_then(|start| serde_json::from_str::<Value>(&text[start..]).ok())
-        .is_some_and(|value| unchanged_failure_repeat_of(&value).is_some())
+/// A failure's owner JSON: the whole text, the registry's appended settlement
+/// notice, or JSON after a carrier prefix (for example `fatal:`).
+fn failure_envelope_from_text(text: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .filter(Value::is_object)
+        .or_else(|| {
+            text.rsplit_once("\n\nHost settlement: ")
+                .and_then(|(_, notice)| serde_json::from_str::<Value>(notice).ok())
+                .filter(|notice| notice.get("operation_history").is_some())
+        })
+        .or_else(|| {
+            text.find('{')
+                .and_then(|start| serde_json::from_str::<Value>(&text[start..]).ok())
+                .filter(Value::is_object)
+        })
+}
+
+fn response_failure_envelope(response: &ResponseInputItem) -> Option<Value> {
+    if let ResponseInputItem::FunctionCallOutput { output, call_id }
+    | ResponseInputItem::CustomToolCallOutput { output, call_id, .. } = response
+        && let codex_protocol::models::FunctionCallOutputBody::ContentItems(items) = &output.body
+    {
+        // Content-item results carry the settlement notice as their last text
+        // item; printed results of other calls are not this call's notice.
+        return items.iter().rev().find_map(|item| match item {
+            codex_protocol::models::FunctionCallOutputContentItem::InputText { text } => {
+                serde_json::from_str::<Value>(text).ok().filter(|value| {
+                    value.get("operation_history").is_some()
+                        && failure_history_call_id(value) == Some(call_id.as_str())
+                })
+            }
+            _ => None,
+        });
+    }
+    response_output_text(response).and_then(|text| failure_envelope_from_text(&text))
 }
 
 fn code_mode_result_failure_fingerprint(
@@ -2543,6 +2875,9 @@ pub(crate) struct TurnExecutionControl {
     /// Consecutive tool continuations that added no progress kind, plan or
     /// input change, delivered child event or process output.
     no_progress_streak: u32,
+    /// Tool continuations without observed progress, including those whose
+    /// results the guard cannot classify (which do not advance the streak).
+    continuations_without_progress: u32,
     source_actions_since_progress: u32,
     next_assessment_at: u32,
     /// Consecutive continuations that issued exactly one non-mutating observation.
@@ -2599,6 +2934,7 @@ impl TurnExecutionControl {
             next_validation_request: AtomicU64::new(0),
             pending_validation_processes: BTreeMap::new(),
             no_progress_streak: 0,
+            continuations_without_progress: 0,
             source_actions_since_progress: 0,
             next_assessment_at: NO_PROGRESS_ASSESSMENT_THRESHOLD,
             serial_single_action_streak: 0,
@@ -2835,6 +3171,36 @@ impl TurnExecutionControl {
                 && !outcome.failure_diagnosis_reused
                 && !outcome.failure_repeats_unchanged_attempt
         });
+        let unwrapped = || {
+            state
+                .outcomes
+                .iter()
+                .filter(|outcome| !wrappers.contains(&outcome.ordinal))
+        };
+        let wait_output = unwrapped().any(|outcome| {
+            outcome.kind == SamplingToolOutcomeKind::Yielded && outcome.process_observation_progress
+        });
+        // As for the repeated-cycle owner, unknown semantics can neither prove
+        // a repeat nor erase earlier observations, and a dependency wait is
+        // not a no-progress attempt while its owner has not advanced. A wait
+        // on an owner already terminal (new deliveries are progress above)
+        // and a background process launch are known, classified results.
+        let unclassified = unwrapped().any(|outcome| {
+            matches!(
+                outcome.kind,
+                SamplingToolOutcomeKind::Success
+                    | SamplingToolOutcomeKind::Yielded
+                    | SamplingToolOutcomeKind::Unknown
+            ) && outcome.background_process_id.is_none()
+                && if state.dependency_wait_ordinals.contains(&outcome.ordinal) {
+                    !outcome.owner_wait_terminal
+                } else {
+                    outcome.source_evidence.is_none()
+                        && outcome.plan.is_none()
+                        && !state.validation_ordinals.contains(&outcome.ordinal)
+                        && !state.process_monitor_ordinals.contains(&outcome.ordinal)
+                }
+        });
         let observation_only = !state.saw_mutation && !state.saw_coordination;
         drop(state);
         let progressed = !progress.is_empty()
@@ -2849,6 +3215,8 @@ impl TurnExecutionControl {
             calls,
             source_actions,
             wait_only,
+            wait_output,
+            unclassified,
             observation_only,
             new_failure,
         });
@@ -2863,14 +3231,27 @@ impl TurnExecutionControl {
         }
         if observation.progressed {
             self.no_progress_streak = 0;
+            self.continuations_without_progress = 0;
             self.source_actions_since_progress = 0;
             self.next_assessment_at = NO_PROGRESS_ASSESSMENT_THRESHOLD;
             self.unproductive_wait_streak = 0;
         } else if observation.wait_only {
-            self.unproductive_wait_streak = self.unproductive_wait_streak.saturating_add(1);
+            self.unproductive_wait_streak = if observation.wait_output {
+                0
+            } else {
+                self.unproductive_wait_streak.saturating_add(1)
+            };
         } else {
-            self.unproductive_wait_streak = 0;
-            self.no_progress_streak = self.no_progress_streak.saturating_add(1);
+            // An unclassified result is neither a repeat nor progress: it does
+            // not advance the streak, but its classified siblings' source
+            // actions and the continuation itself still count, so a mixed loop
+            // reaches the source budget or the longer bound below.
+            if !observation.unclassified {
+                self.unproductive_wait_streak = 0;
+                self.no_progress_streak = self.no_progress_streak.saturating_add(1);
+            }
+            self.continuations_without_progress =
+                self.continuations_without_progress.saturating_add(1);
             self.source_actions_since_progress = self.source_actions_since_progress.saturating_add(
                 u32::try_from(observation.source_actions).unwrap_or(u32::MAX),
             );
@@ -2890,6 +3271,15 @@ impl TurnExecutionControl {
         }
     }
 
+    /// The next assessment is due one re-arm interval after this one. Without
+    /// unclassified continuations both counters are equal, as before.
+    fn rearm_assessment(&mut self) {
+        self.next_assessment_at = self
+            .no_progress_streak
+            .max(self.continuations_without_progress)
+            .saturating_add(NO_PROGRESS_ASSESSMENT_REARM);
+    }
+
     /// At most one internal notice per continuation, only when one is due.
     fn take_guard_directive(&mut self) -> Option<(ConvergenceGuardKind, String)> {
         if !self.wait_advice_issued && self.unproductive_wait_streak >= UNPRODUCTIVE_WAIT_THRESHOLD {
@@ -2902,18 +3292,23 @@ impl TurnExecutionControl {
                 ),
             ));
         }
-        let budget_reached = self.no_progress_streak >= 2
+        let budget_reached = self.continuations_without_progress >= 2
             && self.source_actions_since_progress >= SOURCE_ACTIONS_WITHOUT_PROGRESS_BUDGET;
-        if self.no_progress_streak >= self.next_assessment_at || budget_reached {
-            self.next_assessment_at = self
-                .no_progress_streak
-                .saturating_add(NO_PROGRESS_ASSESSMENT_REARM);
+        // Unclassified continuations do not advance the streak; they still
+        // bound the assessment, one re-arm interval later than classified ones.
+        let unclassified_bound_reached = self.continuations_without_progress
+            >= self.next_assessment_at.saturating_add(NO_PROGRESS_ASSESSMENT_REARM);
+        if self.no_progress_streak >= self.next_assessment_at
+            || budget_reached
+            || unclassified_bound_reached
+        {
+            self.rearm_assessment();
             let sources = std::mem::take(&mut self.source_actions_since_progress);
             return Some((
                 ConvergenceGuardKind::ProgressAssessment,
                 format!(
                     "Progress assessment: the last {} tool continuations added no new source evidence, workspace change, validation result, new failure, process output or plan change ({sources} source reads or searches since the last progress). Do not repeat equivalent observations or widen the search. From the evidence already retained, take the next decisive step: edit, validate or finish; batch every remaining read or check whose target is already known into one response; or name the exact unresolved dependency and the observation that would resolve it. This is an internal checkpoint, not a limit: genuinely new evidence or a changed strategy may continue.",
-                    self.no_progress_streak
+                    self.continuations_without_progress
                 ),
             ));
         }
@@ -3062,6 +3457,14 @@ impl TurnExecutionControl {
             state: Arc::new(Mutex::new(SamplingRequestSignalState::default())),
             dispatch_ledger: Some(Arc::clone(&self.dispatch_ledger)),
             request_state_revision: baselines.revision_key(),
+            observed_state: format!(
+                "attributed_mutation={};plan={};input={};instruction={};tool_exposure={}",
+                baselines.attributed_mutation_revision,
+                baselines.plan_revision,
+                baselines.input_revision,
+                baselines.instruction_revision,
+                baselines.tool_exposure_revision,
+            ),
             request_ordinal: self.next_validation_request.fetch_add(1, Ordering::Relaxed),
         }
     }
@@ -3114,6 +3517,7 @@ impl TurnExecutionControl {
         self.input_revision = self.input_revision.saturating_add(1);
         // New input is progress; advisories re-arm for the new request.
         self.no_progress_streak = 0;
+        self.continuations_without_progress = 0;
         self.source_actions_since_progress = 0;
         self.next_assessment_at = NO_PROGRESS_ASSESSMENT_THRESHOLD;
         self.serial_single_action_streak = 0;
@@ -3139,9 +3543,13 @@ impl TurnExecutionControl {
         let timing = Arc::clone(&ledger.timing);
 
         let syntax_failures = std::mem::take(&mut ledger.argument_syntax_failures);
+        let failure_identities = std::mem::take(&mut ledger.failure_identities);
         *ledger = DeterministicDispatchLedger::new(timing);
 
         ledger.argument_syntax_failures = syntax_failures;
+        // Attempt identity is not dispatch proof; the history's observed state
+        // decides whether a later attempt is still an unchanged repeat.
+        ledger.failure_identities = failure_identities;
         drop(ledger);
     }
 
@@ -3220,9 +3628,7 @@ impl TurnExecutionControl {
         if decision.directive.is_some() {
             if decision.proven_loop_activated {
                 // The repeated-cycle notice is this epoch's assessment.
-                self.next_assessment_at = self
-                    .no_progress_streak
-                    .saturating_add(NO_PROGRESS_ASSESSMENT_REARM);
+                self.rearm_assessment();
                 self.source_actions_since_progress = 0;
             }
             return decision;

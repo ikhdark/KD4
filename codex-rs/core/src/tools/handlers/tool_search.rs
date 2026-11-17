@@ -920,7 +920,13 @@ impl ToolExecutor<ToolInvocation> for ToolSearchHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(self.handle_call(invocation))
+        // Every legacy failure precedes activation and context queueing; the
+        // local search only fills its own result cache.
+        Box::pin(async move {
+            self.handle_call(invocation)
+                .await
+                .map_err(super::read_tool_output::settled_recovery_failure)
+        })
     }
 }
 
@@ -1229,8 +1235,25 @@ impl ToolSearchHandler {
             && (key.query.split_whitespace().count() == 1
                 || query_terms.iter().all(|term| term.contains('_')))
         {
+            // Legacy native names that now run as an operation of a grouped
+            // front door get that callable instead of a dead-end search.
+            let grouped = missing_names
+                .iter()
+                .filter_map(|name| {
+                    let (group, operation) =
+                        super::native_tools::grouped_operation_for(name)?;
+                    let access = if self.exact_name_index.contains_key(group) {
+                        format!("search `{group}` to load it")
+                    } else {
+                        format!("call `{group}` directly if it is in your tool list")
+                    };
+                    Some(format!(
+                        " `{name}` is operation `{operation}` of the grouped tool `{group}` ({access}); pass {{\"operation\":\"{operation}\",\"arguments\":{{...}}}}."
+                    ))
+                })
+                .collect::<String>();
             return Err(FunctionCallError::RespondToModel(format!(
-                "No deferred tool by these exact names exists in the current inventory: {}. Use plain-language capability terms to search for alternatives.",
+                "No deferred tool by these exact names exists in the current inventory: {}. Use plain-language capability terms to search for alternatives.{grouped}",
                 missing_names
                     .iter()
                     .map(String::as_str)

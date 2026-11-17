@@ -121,7 +121,7 @@ impl ToolExecutor<ToolInvocation> for CheckSnapshotFreshnessHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(async move {
+        let checked = async move {
             let ToolPayload::Function { ref arguments } = invocation.payload else {
                 return Err(FunctionCallError::RespondToModel(
                     "check_snapshot_freshness requires function arguments".into(),
@@ -179,6 +179,13 @@ impl ToolExecutor<ToolInvocation> for CheckSnapshotFreshnessHandler {
             let result = JsonToolOutput::new(value);
             crate::tools::context::ensure_exact_model_delivery(&result, &invocation)?;
             Ok(boxed_tool_output(result))
+        };
+        // Checksums and history reads only observe; a legacy failure leaves no
+        // effects to recover.
+        Box::pin(async move {
+            checked
+                .await
+                .map_err(super::read_tool_output::settled_recovery_failure)
         })
     }
 }

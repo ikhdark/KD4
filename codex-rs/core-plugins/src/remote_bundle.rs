@@ -19,6 +19,8 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 use url::Host;
 use url::Url;
@@ -57,7 +59,7 @@ impl fmt::Debug for ValidatedRemotePluginBundle {
 }
 
 // Never retain URL userinfo, path, query or fragment in diagnostics.
-fn safe_bundle_url(url: &str) -> String {
+pub(crate) fn safe_bundle_url(url: &str) -> String {
     match Url::parse(url) {
         Ok(url) => match url.host() {
             Some(host) => format!("{}://{}", url.scheme(), host),
@@ -244,7 +246,7 @@ pub fn validate_remote_plugin_bundle(
     })
 }
 
-fn allow_test_loopback_http_bundle_downloads() -> bool {
+pub(crate) fn allow_test_loopback_http_bundle_downloads() -> bool {
     #[cfg(debug_assertions)]
     {
         if let Ok(value) = std::env::var(TEST_ALLOW_LOOPBACK_HTTP_REMOTE_PLUGIN_BUNDLES_ENV) {
@@ -255,7 +257,7 @@ fn allow_test_loopback_http_bundle_downloads() -> bool {
     false
 }
 
-fn is_allowed_bundle_download_url(url: &Url, allow_loopback_http: bool) -> bool {
+pub(crate) fn is_allowed_bundle_download_url(url: &Url, allow_loopback_http: bool) -> bool {
     match url.scheme() {
         "https" => true,
         "http" => allow_loopback_http && is_loopback_url(url),
@@ -350,14 +352,32 @@ async fn download_remote_plugin_bundle_with_limit(
     max_bytes: u64,
     http_clients: &RouteAwareClientPool,
 ) -> Result<Vec<u8>, RemotePluginBundleInstallError> {
+    // Apply the bundle URL policy to every redirect hop before it is routed or sent, so a signed
+    // target never reaches a peer the initial and final URL checks would refuse.
+    let allow_loopback_http = allow_test_loopback_http_bundle_downloads();
+    let refused_redirect = Arc::new(OnceLock::new());
+    let refused_redirect_slot = Arc::clone(&refused_redirect);
     let response = http_clients
         .get(bundle_download_url)
         .timeout(REMOTE_PLUGIN_BUNDLE_DOWNLOAD_TIMEOUT)
+        .redirect_filter(move |url| {
+            let allowed = is_allowed_bundle_download_url(url, allow_loopback_http);
+            if !allowed {
+                let _ = refused_redirect_slot.set(safe_bundle_url(url.as_str()));
+            }
+            allowed
+        })
         .send()
         .await
-        .map_err(|source| RemotePluginBundleInstallError::DownloadRequest {
-            url: safe_bundle_url(bundle_download_url),
-            category: source.safe_category(),
+        .map_err(|source| match refused_redirect.get() {
+            Some(final_url) => RemotePluginBundleInstallError::UnsupportedBundleDownloadFinalUrl {
+                url: safe_bundle_url(bundle_download_url),
+                final_url: final_url.clone(),
+            },
+            None => RemotePluginBundleInstallError::DownloadRequest {
+                url: safe_bundle_url(bundle_download_url),
+                category: source.safe_category(),
+            },
         })?;
 
     let final_url = response.url().clone();

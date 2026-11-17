@@ -2039,7 +2039,10 @@ fn command_control_receipts(
                 "cumulative_streams_complete": state["streams_complete"],
             });
             if let Some(artifact_id) = state["raw_output_artifact_id"].as_str() {
-                if shows_command_recovery(visible, state) {
+                // A shown route does not show that its log stopped at the ceiling.
+                if shows_command_recovery(visible, state)
+                    && state["raw_output_artifact_retention_limit_reason"] != "per_command_log_ceiling"
+                {
                     continue;
                 }
                 receipt["artifact_id"] = artifact_id.into();
@@ -2061,6 +2064,12 @@ fn command_control_receipts(
             }
             if state["raw_output_artifact_retention_limit_hit"] == true {
                 receipt["raw_output_artifact_retention_limit_hit"] = JsonValue::Bool(true);
+                // The flag alone does not say the retained log is only a prefix.
+                for key in ["raw_output_artifact_retention_limit_reason", "missing_bytes_reason"] {
+                    if let Some(value) = state.get(key).filter(|value| value.is_string()) {
+                        receipt[key] = value.clone();
+                    }
+                }
             }
             items.push(FunctionCallOutputContentItem::InputText {
                 text: receipt.to_string(),
@@ -2548,6 +2557,11 @@ fn format_runtime_response(
             (content_items, outcome, success, error_text)
         }
     };
+    // Only output the script itself produced, before host-generated nested
+    // results, settlements, feedback or truncation notices are merged in.
+    let script_output_delivered = content_items.iter().any(|item| {
+        !matches!(item, FunctionCallOutputContentItem::InputText { text } if text.trim().is_empty())
+    });
 
     // Host-generated helper envelopes identify the exact automatically emitted
     // item. Keep its full evidence under the existing canonical artifact owner,
@@ -2779,11 +2793,17 @@ fn format_runtime_response(
         (false, OutputOutcome::TimedOut) => codex_tools::ToolOutputOutcome::TimedOut,
         (false, OutputOutcome::Skipped) => codex_tools::ToolOutputOutcome::Skipped,
     };
-    let sampling_request_signal = if success {
+    let mut sampling_request_signal = if success {
         crate::tools::context::semantic_evidence_sampling_signal(semantic_evidence)
     } else {
         crate::tools::context::semantic_failure_sampling_signal(semantic_evidence)
     };
+    if yielded {
+        // As for a polled process: output delivered by a still-running cell
+        // is a new observation, not an unproductive poll.
+        sampling_request_signal["process_observation_progress"] =
+            JsonValue::Bool(script_output_delivered);
+    }
     let mut output = FunctionToolOutput::from_content(content_items, Some(success))
         .with_canonical_body(canonical_content_items)
         .with_outcome(typed_outcome)
@@ -3307,6 +3327,7 @@ async fn call_nested_tool_inner(
             tool_runtime
                 .record_code_mode_failure(
                     cell_id.as_str(),
+                    &nested_call_id,
                     &tool_name,
                     None,
                     failure_fingerprint,
@@ -3348,6 +3369,7 @@ async fn call_nested_tool_inner(
         tool_runtime
             .record_code_mode_failure(
                 cell_id.as_str(),
+                &nested_call_id,
                 &tool_name,
                 Some(&payload),
                 nested_failure_evidence(&nested_call_id, &message).0,
@@ -3450,6 +3472,7 @@ async fn call_nested_tool_inner(
             tool_runtime
                 .record_code_mode_failure(
                     cell_id.as_str(),
+                    &nested_call_id,
                     &tool_name,
                     failure_payload,
                     failure_fingerprint,
@@ -4372,6 +4395,15 @@ pub(crate) fn command_result_state(result: &JsonValue) -> Option<JsonValue> {
             state[key] = value.clone();
         }
     }
+    // A ceiling-limited log is only a prefix: keep the owner's omitted-byte
+    // statement with the limit flag wherever just this state survives.
+    if result["raw_output_artifact_retention_limit_reason"] == "per_command_log_ceiling"
+        && let Some(reason) = result
+            .pointer("/output_reference/missing_bytes_reason")
+            .filter(|reason| reason.is_string())
+    {
+        state["missing_bytes_reason"] = reason.clone();
+    }
     if let Some(session_id) = result.get("session_id").filter(|id| id.as_u64().is_some())
         && let Some(incarnation) = result
             .pointer("/session_capabilities/incarnation")
@@ -4407,8 +4439,15 @@ fn nested_failure_evidence(instance: &str, error: &str) -> (String, Option<JsonV
     if let Some(json_start) = error.find('{')
         && let Ok(mut value) = serde_json::from_str::<JsonValue>(&error[json_start..])
     {
+        // Host history describes only this nested call; history embedded in
+        // a tool's own error text for another call is not its settlement.
+        let own_history = value
+            .pointer("/tool_failure/details/operation_history/instance/call_id")
+            .and_then(JsonValue::as_str)
+            == Some(instance);
         let fingerprint = value
             .pointer("/tool_failure/details/operation_history/instance/fingerprint")
+            .filter(|_| own_history)
             .and_then(JsonValue::as_str)
             .filter(|fingerprint| !fingerprint.is_empty())
             .map(str::to_owned)
@@ -4416,7 +4455,7 @@ fn nested_failure_evidence(instance: &str, error: &str) -> (String, Option<JsonV
                 // A proven identical repeat keeps its predecessor's instance
                 // identity so the repeated-cycle owner can see it. Nested
                 // failures never arm dispatch suppression; similar ones stay distinct.
-                crate::session::turn_execution::unchanged_failure_repeat_of(&value)
+                crate::session::turn_execution::unchanged_failure_repeat_of(&value, instance)
                     .map(|previous| format!("code_mode.unclassified_instance.{previous}"))
             })
             .unwrap_or_else(|| format!("code_mode.unclassified_instance.{instance}"));

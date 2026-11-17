@@ -1275,7 +1275,8 @@ pub(super) fn tool_result_to_v8<'s>(
     let presentation = raw.is_object()
         && (tool.namespace.is_some() || tool.name.starts_with("mcp__")
             || matches!(tool.name.as_str(), "update_plan" | "apply_patch" | "read_file"
-                | "read_tool_output" | "exec_command" | "write_stdin" | "inspect_files" | "list_files"));
+                | "read_tool_output" | "exec_command" | "write_stdin" | "inspect_files" | "list_files"
+                | "get_agent_task"));
     let native = json_to_v8(scope, &serde_json::json!({
         "presentation": presentation,
         "callId": runtime_tool_call_id,

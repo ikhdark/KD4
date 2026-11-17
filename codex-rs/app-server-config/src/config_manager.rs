@@ -48,6 +48,7 @@ struct ConfigLoadCacheKey {
     cli_overrides: Vec<(String, TomlValue)>,
     typesafe_overrides: String,
     fallback_cwd: Option<PathBuf>,
+    ignore_project_config: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -326,6 +327,46 @@ impl ConfigManager {
         self.with_current_policy(generation, || ())
     }
 
+    /// Replaces a cloud-config loader that an auth change has retired. A change
+    /// published outside an explicit auth transition (a credential reload, a
+    /// load retry, a policy or persistent-failure logout) leaves the loader
+    /// bound to the previous policy epoch, and every load through it then fails
+    /// with a relogin error for good. The check and the replacement share the
+    /// loader lock, so a loader an explicit transition already installed is
+    /// never overwritten. Returns whether the loader was replaced.
+    fn rebind_retired_cloud_config_bundle_loader(
+        &self,
+        auth_manager: Arc<AuthManager>,
+        chatgpt_base_url: String,
+        http_client_factory: codex_http_client::HttpClientFactory,
+    ) -> bool {
+        if self.current_cloud_config_bundle().validate_current().is_ok() {
+            return false;
+        }
+        let mut guard = self
+            .cloud_config_bundle
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.validate_current().is_ok() {
+            return false;
+        }
+        // Built only once the replacement is certain: constructing a loader
+        // spawns its first bundle fetch. Construction itself awaits nothing.
+        let loader = cloud_config_bundle_loader(
+            auth_manager,
+            chatgpt_base_url,
+            self.codex_home.clone(),
+            http_client_factory,
+        );
+        let previous = std::mem::replace(&mut *guard, loader);
+        self.invalidate_load_cache_locked();
+        drop(guard);
+        // As in `replace_cloud_config_bundle_loader`: run loader destructors
+        // only after the publication lock is released.
+        drop(previous);
+        true
+    }
+
     pub(crate) fn with_current_policy<T>(
         &self,
         generation: u64,
@@ -361,6 +402,11 @@ impl ConfigManager {
     /// id. Cloud requirements are fetched per account, yet such a completion runs no explicit
     /// auth transition, so remote control holds backend contact for the completed account until
     /// this re-check records a decision for it, and a denial disables remote control.
+    ///
+    /// The same holds for an identity change that a credential reload publishes on its own
+    /// (another process replaced the store, a policy denial or a persistent load failure logged
+    /// out, or a failed load recovered): it retires the cloud-config loader, so this task also
+    /// rebinds a retired loader and re-checks requirements for the identity that replaced it.
     pub async fn recheck_requirements_after_identity_completion(
         self,
         auth_manager: Arc<AuthManager>,
@@ -371,7 +417,16 @@ impl ConfigManager {
         let mut auth_changes = auth_manager.auth_change_receiver();
         let mut retry_delay = Duration::from_secs(1);
         loop {
-            if self.remote_control_policy_recheck_pending() {
+            if self.rebind_retired_cloud_config_bundle_loader(
+                Arc::clone(&auth_manager),
+                chatgpt_base_url.clone(),
+                http_client_factory.clone(),
+            ) {
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    () = self.sync_default_client_residency_requirement() => {}
+                }
+            } else if self.remote_control_policy_recheck_pending() {
                 tokio::select! {
                     () = shutdown.cancelled() => return,
                     () = self.complete_auth_transition(
@@ -407,15 +462,20 @@ impl ConfigManager {
             .is_some_and(RemoteControlHandle::policy_recheck_pending)
     }
 
+    /// Loads the latest config for `fallback_cwd`. Without a cwd the request is
+    /// threadless/global, so project layers are not discovered from the
+    /// server process's launch directory.
     pub async fn load_latest_config(
         &self,
         fallback_cwd: Option<PathBuf>,
     ) -> std::io::Result<Config> {
-        self.load_with_cli_overrides(
+        let ignore_project_config = fallback_cwd.is_none();
+        self.load_with_cli_overrides_inner(
             &self.current_cli_overrides(),
             /*request_overrides*/ None,
             ConfigOverrides::default(),
             fallback_cwd,
+            ignore_project_config,
         )
         .await
     }
@@ -517,17 +577,35 @@ impl ConfigManager {
         .await
     }
 
+    pub async fn load_with_cli_overrides(
+        &self,
+        cli_overrides: &[(String, TomlValue)],
+        request_overrides: Option<HashMap<String, serde_json::Value>>,
+        typesafe_overrides: ConfigOverrides,
+        fallback_cwd: Option<PathBuf>,
+    ) -> std::io::Result<Config> {
+        self.load_with_cli_overrides_inner(
+            cli_overrides,
+            request_overrides,
+            typesafe_overrides,
+            fallback_cwd,
+            /*ignore_project_config*/ false,
+        )
+        .await
+    }
+
     #[instrument(level = "trace", skip_all)]
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "Single-flight gate: equal concurrent loads wait for the first build and reuse its cached config"
     )]
-    pub async fn load_with_cli_overrides(
+    async fn load_with_cli_overrides_inner(
         &self,
         cli_overrides: &[(String, TomlValue)],
         request_overrides: Option<HashMap<String, serde_json::Value>>,
         mut typesafe_overrides: ConfigOverrides,
         fallback_cwd: Option<PathBuf>,
+        ignore_project_config: bool,
     ) -> std::io::Result<Config> {
         let mut request_overrides = request_overrides.unwrap_or_default();
         // RPC maps have no last-write order, unlike the ordered CLI flags below.
@@ -577,6 +655,7 @@ impl ConfigManager {
             cli_overrides: merged_cli_overrides.clone(),
             typesafe_overrides: format!("{typesafe_overrides:?}"),
             fallback_cwd: fallback_cwd.clone(),
+            ignore_project_config,
         };
         let generation = self.load_generation.load(Ordering::Acquire);
         self.validate_policy_generation(generation)?;
@@ -621,6 +700,7 @@ impl ConfigManager {
             .fallback_cwd(fallback_cwd)
             .cloud_config_bundle(self.current_cloud_config_bundle())
             .thread_config_loader(self.current_thread_config_loader())
+            .ignore_project_config(ignore_project_config)
             .build()
             .await?;
         self.apply_runtime_feature_enablement(&mut config);
@@ -670,6 +750,18 @@ impl ConfigManager {
         let runtime = tokio::runtime::Handle::current();
         Arc::new(move || runtime
             .block_on(manager.load_uncached_config(Some(cwd.to_path_buf()), false))
+            .map(|config| config.config_layer_stack.as_ref().clone()))
+    }
+
+    /// Reloads config layers without deriving project context from the server
+    /// process's working directory, for threadless/global plugin operations.
+    pub fn plugin_config_reload_global(
+        &self,
+    ) -> codex_core_plugins::marketplace_upgrade::ConfigLayerReload {
+        let manager = self.clone();
+        let runtime = tokio::runtime::Handle::current();
+        Arc::new(move || runtime
+            .block_on(manager.load_non_project_config())
             .map(|config| config.config_layer_stack.as_ref().clone()))
     }
 

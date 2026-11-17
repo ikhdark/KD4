@@ -247,6 +247,53 @@ fn drain_released_pty_reader(reader: JoinHandle<()>) {
     });
 }
 
+/// Bounds how long an exited pipe root's native job may take to report empty.
+/// Windows makes the console host of a CREATE_NO_WINDOW child a job member, and
+/// it exits about a millisecond after the root, so one query at exit can still
+/// count it. A real descendant keeps the job nonempty past this bound.
+const PIPE_TREE_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+const PIPE_TREE_SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Pipe readers after the root exited. Once its native tree is observed empty,
+/// no tracked process can still hold the inherited write ends, so EOF is due;
+/// aborting then only races it and marks complete output as incomplete. Keep
+/// the readers through EOF under the same bounded cutoff as a released PTY.
+/// `settle` is the job of a tree that was not yet empty: poll it briefly and
+/// abort as before unless it empties. Every stream handle shares the deadline:
+/// a driver-backed `reader` is only the stdout forwarder.
+fn drain_released_pipe_readers(
+    reader: JoinHandle<()>,
+    streams: Vec<AbortHandle>,
+    settle: Option<Box<dyn ChildTerminator>>,
+) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        reader.abort();
+        streams.iter().for_each(AbortHandle::abort);
+        return;
+    };
+    let abort = reader.abort_handle();
+    runtime.spawn(async move {
+        let deadline = tokio::time::Instant::now() + PTY_OUTPUT_DRAIN_TIMEOUT;
+        if let Some(tree) = settle {
+            let settle_deadline = tokio::time::Instant::now() + PIPE_TREE_SETTLE_TIMEOUT;
+            while !tree.tree_is_empty().unwrap_or(false) {
+                if tokio::time::Instant::now() >= settle_deadline {
+                    // A live descendant may hold the write ends indefinitely.
+                    abort.abort();
+                    streams.iter().for_each(AbortHandle::abort);
+                    return;
+                }
+                tokio::time::sleep(PIPE_TREE_SETTLE_POLL).await;
+            }
+        }
+        if tokio::time::timeout_at(deadline, reader).await.is_err() {
+            abort.abort();
+        }
+        tokio::time::sleep_until(deadline).await;
+        streams.iter().for_each(AbortHandle::abort);
+    });
+}
+
 /// Callback used by driver-backed sessions to resize a PTY-like backend when
 /// there is no local `PtyHandles` instance to resize directly.
 type ResizeFn = Box<dyn FnMut(TerminalSize) -> anyhow::Result<()> + Send>;
@@ -542,7 +589,8 @@ impl ProcessHandle {
     /// This is used after the root process has already exited. In particular,
     /// pipe descendants may intentionally outlive the root while retaining an
     /// inherited output handle. Native PTY readers drain to EOF with a bounded
-    /// cutoff, rather than discarding kernel-buffered bytes at root exit.
+    /// cutoff, rather than discarding kernel-buffered bytes at root exit; pipe
+    /// readers do the same once the exited root's native tree is observed empty.
     pub fn finish(&self) {
         self.finish_inner(false);
     }
@@ -567,27 +615,55 @@ impl ProcessHandle {
             // tree cleanup is pending or uncertain, even after root exit.
             return;
         }
+        // Pipe drain needs a native empty-tree observation after root exit, not
+        // only a termination receipt: a Unix group kill cannot see setsid
+        // descendants, and Unix has no tree accounting, so it always aborts.
+        let exited_pipe = !self.has_pty && self.has_exited();
+        let mut pipe_tree_empty = false;
+        let mut pipe_tree_settle = None;
         if for_replay && !self.termination_is_confirmed() {
             self.finished_for_replay.store(true, Ordering::Release);
             if killer_opt.as_ref().is_some_and(|killer| killer.tree_is_empty().unwrap_or(false)) {
                 self.termination.store(2, Ordering::Release);
                 killer_opt.take();
+                pipe_tree_empty = true;
             } else if let Some(control) = killer_opt.as_ref().and_then(|killer| killer.replay_control()) {
+                if exited_pipe {
+                    // Same retained job; the probe only reads its accounting.
+                    pipe_tree_settle = killer_opt.as_ref().and_then(|killer| killer.replay_control());
+                }
                 // The root has exited. Keep its job, not its execution permit,
                 // so unrelated launches do not queue behind replay retention.
                 *killer_opt = Some(control);
             }
         } else {
+            pipe_tree_empty = exited_pipe
+                && killer_opt
+                    .as_ref()
+                    .is_some_and(|killer| killer.tree_is_empty().unwrap_or(false));
             killer_opt.take();
         }
         drop(killer_opt);
         self.close_stdin();
 
+        // Descendants that may outlive the root keep the pipe abort.
+        let drain_pipe = exited_pipe && (pipe_tree_empty || pipe_tree_settle.is_some());
         if let Ok(mut h) = self.reader_handle.lock()
             && let Some(handle) = h.take()
         {
             if self.has_pty {
                 drain_released_pty_reader(handle);
+            } else if drain_pipe {
+                let streams = self
+                    .reader_abort_handles
+                    .lock()
+                    .map(|mut handles| handles.drain(..).collect())
+                    .unwrap_or_default();
+                drain_released_pipe_readers(
+                    handle,
+                    streams,
+                    pipe_tree_settle.filter(|_| !pipe_tree_empty),
+                );
             } else {
                 handle.abort();
             }

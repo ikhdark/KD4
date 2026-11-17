@@ -117,6 +117,13 @@ work. Leave the Windows Store installation untouched.
   materially help. Discover the relevant capability; reuse source-matched
   analysis, hashes and completed evidence instead of duplicating work. KDR is
   not a mandatory ceremony for every task.
+- "Verify with KDR" means verify the changed behavior using an applicable
+  workload, not a successful session scan or receipt-file hash check. Follow the
+  [verification workflow](../KDR/docs/operations/VERIFICATION.md): identify coverage,
+  inspect actual observations, and report behavior, final source/binary identity,
+  preserved valid behavior, evidence and gaps. If no suitable workload exists,
+  use permitted direct verification or extend the existing owner; never imply a
+  pass from unsupported coverage. Assess maintenance value before adding machinery.
 - Define verification from the contract: real trigger, production
   producer-to-consumer path, observable outcome, affected valid behavior and
   material lifecycle boundaries. Exercise repeated rollover, restart, native

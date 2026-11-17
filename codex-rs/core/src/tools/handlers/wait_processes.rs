@@ -161,12 +161,14 @@ impl ToolExecutor<ToolInvocation> for WaitProcessesHandler {
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
         Box::pin(async move {
             let started = Instant::now();
+            // Argument refusals below precede every subscription: settled, no effects.
+            let settled = super::read_tool_output::settled_recovery_failure;
             let ToolPayload::Function { ref arguments } = invocation.payload else {
-                return Err(FunctionCallError::RespondToModel(
+                return Err(settled(FunctionCallError::RespondToModel(
                     "wait_processes requires function arguments".into(),
-                ));
+                )));
             };
-            let args: Arguments = parse_arguments(arguments)?;
+            let args: Arguments = parse_arguments(arguments).map_err(settled)?;
             let timeout_ms = args
                 .timeout_ms
                 .unwrap_or(30_000_u64.min(self.max_timeout_ms));
@@ -174,10 +176,10 @@ impl ToolExecutor<ToolInvocation> for WaitProcessesHandler {
                 || args.processes.len() > MAX_UNIFIED_EXEC_PROCESSES
                 || !(1..=self.max_timeout_ms).contains(&timeout_ms)
             {
-                return Err(FunctionCallError::RespondToModel(format!(
+                return Err(settled(FunctionCallError::RespondToModel(format!(
                     "wait_processes requires 1–{MAX_UNIFIED_EXEC_PROCESSES} handles and timeout_ms from 1 to {}",
                     self.max_timeout_ms
-                )));
+                ))));
             }
             let mut ids = HashSet::new();
             if args
@@ -185,10 +187,10 @@ impl ToolExecutor<ToolInvocation> for WaitProcessesHandler {
                 .iter()
                 .any(|handle| !ids.insert(handle.session_id))
             {
-                return Err(FunctionCallError::RespondToModel(
+                return Err(settled(FunctionCallError::RespondToModel(
                     "wait_processes requires distinct session_id values; no subscriptions created"
                         .into(),
-                ));
+                )));
             }
             let requested = started + Duration::from_millis(timeout_ms);
             let deadline =

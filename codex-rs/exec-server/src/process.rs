@@ -33,6 +33,10 @@ pub enum ExecProcessEvent {
     /// Missing output only; does not imply exit, closure, or process failure.
     OutputGap {
         through_seq: u64,
+        /// Set when this gap is the producer's own capture loss for one
+        /// stream (no EOF receipt), occupying only `through_seq`. Absent for
+        /// retention eviction, recovery gaps and legacy peers.
+        capture_incomplete: Option<crate::protocol::ExecOutputStream>,
     },
     Exited {
         seq: u64,
@@ -82,7 +86,7 @@ impl ExecProcessEvent {
             ExecProcessEvent::Exited { seq, .. } | ExecProcessEvent::Closed { seq, .. } => {
                 Some(*seq)
             }
-            ExecProcessEvent::OutputGap { through_seq } => Some(*through_seq),
+            ExecProcessEvent::OutputGap { through_seq, .. } => Some(*through_seq),
             ExecProcessEvent::Failed(_) => None,
         }
     }

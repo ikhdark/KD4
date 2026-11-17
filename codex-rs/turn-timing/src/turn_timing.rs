@@ -1395,6 +1395,37 @@ struct TurnTimingStateInner {
     deterministic_continuation_receipts:
         BTreeMap<String, TurnTimingDeterministicContinuationReceipt>,
     deterministic_continuation_receipt_overflow: u32,
+    undispatched_generation: Option<UndispatchedGeneration>,
+    /// The continuation cause consumed by a generation that was then undone.
+    /// Its replacement is the same request retried and reuses the cause when
+    /// the caller supplies none.
+    undispatched_continuation_cause: Option<ContinuationCause>,
+}
+
+/// What starting the current generation changed. A generation that never
+/// records a model request (admission refusal, cancellation or another failure
+/// before dispatch) did not reach the model, so its start is undone before the
+/// next generation or turn completion: generation indices stay contiguous and
+/// `logical_generation_count` counts generations that own request rows.
+#[derive(Clone, Debug)]
+struct UndispatchedGeneration {
+    index: u32,
+    generations_by_reason: TurnTimingGenerationReasonCounts,
+    generations_by_purpose: TurnTimingGenerationPurposeCounts,
+    generations_by_disposition: TurnTimingGenerationDispositionCounts,
+    same_purpose_continuation_count: u32,
+    truncation_induced_continuation_count: u32,
+    attributable_recovery_generation_count: u32,
+    tool_output_truncation_pending_continuation: bool,
+    tool_output_recovery_read_pending_continuation: bool,
+    continuation_cause: Option<ContinuationCause>,
+    current_generation_index: Option<u32>,
+    current_generation_reason: TurnTimingGenerationReason,
+    current_generation_purpose: Option<TurnTimingGenerationPurpose>,
+    current_generation_disposition: TurnTimingGenerationDisposition,
+    current_relevant_state_fingerprint: Option<String>,
+    current_failure_fingerprint: Option<String>,
+    next_attempt_kind: TurnTimingAttemptKind,
 }
 
 /// Item id, first-content ms, full-content ms and content SHA-256.
@@ -1538,6 +1569,8 @@ impl TurnTimingStateInner {
             deterministic_continuation_receipts: self.deterministic_continuation_receipts.clone(),
             deterministic_continuation_receipt_overflow: self
                 .deterministic_continuation_receipt_overflow,
+            undispatched_generation: self.undispatched_generation.clone(),
+            undispatched_continuation_cause: self.undispatched_continuation_cause,
         }
     }
 }
@@ -2421,10 +2454,21 @@ impl TurnTimingState {
         let mut state = self.state();
         let sample = self.clock.sample();
         state.advance(sample.time.monotonic_ns);
-        let cause = pending.take();
-        if let Some(cause) = cause {
-            state.legacy.record_continuation(cause);
-        }
+        // Undo an undispatched previous generation before the counters below
+        // (and the Initial-reason test) read or change state.
+        state.release_undispatched_generation();
+        let truncation_count_before = state.counters.truncation_induced_continuation_count;
+        let recovery_count_before = state.counters.attributable_recovery_generation_count;
+        // Without a new cause, a replacement for an undone generation keeps the
+        // cause that generation consumed. The legacy profile counted it then.
+        let released_cause = state.undispatched_continuation_cause.take();
+        let cause = match pending.take() {
+            Some(cause) => {
+                state.legacy.record_continuation(cause);
+                Some(cause)
+            }
+            None => released_cause,
+        };
         let truncated_tool_output = state.tool_output_truncation_pending_continuation;
         state.tool_output_truncation_pending_continuation = false;
         let recovery_read = state.tool_output_recovery_read_pending_continuation;
@@ -2456,6 +2500,13 @@ impl TurnTimingState {
             _ => TurnTimingGenerationReason::Other,
         };
         state.start_generation(reason, purpose, disposition, relevant_state_fingerprint);
+        if let Some(undo) = state.undispatched_generation.as_mut() {
+            undo.truncation_induced_continuation_count = truncation_count_before;
+            undo.attributable_recovery_generation_count = recovery_count_before;
+            undo.tool_output_truncation_pending_continuation = truncated_tool_output;
+            undo.tool_output_recovery_read_pending_continuation = recovery_read;
+            undo.continuation_cause = cause;
+        }
     }
 
     pub fn begin_model_generation_with_failure_metadata(
@@ -2980,6 +3031,10 @@ impl TurnTimingState {
         let pending_process_exit = state
             .background_tool_process_exits
             .remove(&(call_id.to_string(), timing.execution_id.clone()));
+        // Typed owner cessation for work that never delivers (cancelled or
+        // interrupted); readers use it only without a delivery/release boundary.
+        state.measurements.tool_owner_end(&timing.execution_id.0, accepted_at_ms,
+            observed_at_ms, timing.outcome, delivered_at_ms.is_some());
 
         let mut tool_call = TurnTimingToolCall {
             call_id: call_id.to_string(),
@@ -4215,9 +4270,22 @@ impl TurnTimingState {
         action: retries::RetryAction,
         backoff: Option<Duration>,
     ) {
+        self.record_retry_decision_with_stream_failure(trigger, http_status, None, action, backoff);
+    }
+
+    /// Same decision, plus allowlisted facts about the stream failure it answers.
+    pub fn record_retry_decision_with_stream_failure(
+        &self,
+        trigger: retries::RetryTrigger,
+        http_status: Option<u16>,
+        stream_failure: Option<retries::RetryStreamFailure>,
+        action: retries::RetryAction,
+        backoff: Option<Duration>,
+    ) {
         if codex_protocol::timing::observations::enabled() {
             self.observe_runtime("recovery_retry_decision", "", serde_json::json!({
-                "trigger":trigger, "http_status":http_status, "action":action,
+                "trigger":trigger, "http_status":http_status, "stream_failure":stream_failure,
+                "action":action,
                 "requested_backoff_ns":backoff.map(|delay| delay.as_nanos())}));
         }
         let mut state = self.state();
@@ -4239,6 +4307,7 @@ impl TurnTimingState {
             clock_id: codex_protocol::timing::process_clock_domain_id(),
             trigger,
             http_status,
+            stream_failure,
             action,
             source: source.as_ref().map(|(request, attempt)| (request.as_str(), attempt.as_str())),
             backoff_ns: backoff.map(|duration| duration.as_nanos()),
@@ -4899,6 +4968,30 @@ impl TurnTimingStateInner {
         disposition: TurnTimingGenerationDisposition,
         relevant_state_fingerprint: Option<String>,
     ) {
+        self.release_undispatched_generation();
+        let undo = UndispatchedGeneration {
+            index: self.counters.logical_generation_count,
+            generations_by_reason: self.counters.generations_by_reason.clone(),
+            generations_by_purpose: self.counters.generations_by_purpose.clone(),
+            generations_by_disposition: self.counters.generations_by_disposition.clone(),
+            same_purpose_continuation_count: self.counters.same_purpose_continuation_count,
+            truncation_induced_continuation_count: self
+                .counters
+                .truncation_induced_continuation_count,
+            attributable_recovery_generation_count: self
+                .counters
+                .attributable_recovery_generation_count,
+            tool_output_truncation_pending_continuation: false,
+            tool_output_recovery_read_pending_continuation: false,
+            continuation_cause: None,
+            current_generation_index: self.current_generation_index,
+            current_generation_reason: self.current_generation_reason,
+            current_generation_purpose: self.current_generation_purpose,
+            current_generation_disposition: self.current_generation_disposition,
+            current_relevant_state_fingerprint: self.current_relevant_state_fingerprint.clone(),
+            current_failure_fingerprint: self.current_failure_fingerprint.clone(),
+            next_attempt_kind: self.next_attempt_kind,
+        };
         let generation_index = self.counters.logical_generation_count;
         self.counters.logical_generation_count =
             self.counters.logical_generation_count.saturating_add(1);
@@ -4995,6 +5088,55 @@ impl TurnTimingStateInner {
         } else {
             TurnTimingAttemptKind::Primary
         };
+        self.undispatched_generation = Some(undo);
+    }
+
+    /// Undo the current generation's start when it never recorded a model
+    /// request. Its index is then reused by the next generation. A generation
+    /// with a request row (any attempt kind) or a pending retry decision that
+    /// may belong to it is kept; an earlier generation's pending decision does
+    /// not keep it. The legacy continuation profile is not undone: it counts
+    /// the continuation decision, which did happen. The consumed cause is kept
+    /// for the replacement.
+    fn release_undispatched_generation(&mut self) {
+        let Some(undo) = self.undispatched_generation.take() else {
+            return;
+        };
+        if self.completed_snapshot.is_some()
+            || self.current_generation_index != Some(undo.index)
+            || self.counters.logical_generation_count != undo.index.saturating_add(1)
+            || self
+                .model_requests
+                .last()
+                .is_some_and(|request| request.generation_index == undo.index)
+            || self.retry_decisions.has_pending_for(undo.index)
+        {
+            return;
+        }
+        // A compaction generation consumes no cause; keep one already released.
+        self.undispatched_continuation_cause = undo
+            .continuation_cause
+            .or(self.undispatched_continuation_cause);
+        self.counters.logical_generation_count = undo.index;
+        self.counters.generations_by_reason = undo.generations_by_reason;
+        self.counters.generations_by_purpose = undo.generations_by_purpose;
+        self.counters.generations_by_disposition = undo.generations_by_disposition;
+        self.counters.same_purpose_continuation_count = undo.same_purpose_continuation_count;
+        self.counters.truncation_induced_continuation_count =
+            undo.truncation_induced_continuation_count;
+        self.counters.attributable_recovery_generation_count =
+            undo.attributable_recovery_generation_count;
+        self.tool_output_truncation_pending_continuation |=
+            undo.tool_output_truncation_pending_continuation;
+        self.tool_output_recovery_read_pending_continuation |=
+            undo.tool_output_recovery_read_pending_continuation;
+        self.current_generation_index = undo.current_generation_index;
+        self.current_generation_reason = undo.current_generation_reason;
+        self.current_generation_purpose = undo.current_generation_purpose;
+        self.current_generation_disposition = undo.current_generation_disposition;
+        self.current_relevant_state_fingerprint = undo.current_relevant_state_fingerprint;
+        self.current_failure_fingerprint = undo.current_failure_fingerprint;
+        self.next_attempt_kind = undo.next_attempt_kind;
     }
 
     fn start(&mut self, sample: ClockSample) -> i64 {
@@ -5419,6 +5561,8 @@ impl TurnTimingStateInner {
             return snapshot.clone();
         }
         self.advance(sample.time.monotonic_ns);
+        // A turn ending before its last generation dispatched did not run it.
+        self.release_undispatched_generation();
         let started_sample = self.started_sample;
         let inclusive_duration_ns = started_sample
             .map(|started| {

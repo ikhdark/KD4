@@ -7,6 +7,8 @@ use crate::retry::backoff_with_cap;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::turn_timing::retries::RetryAction;
+use crate::turn_timing::retries::RetryStreamFailure;
+use crate::turn_timing::retries::RetryStreamFailureClass;
 use crate::turn_timing::retries::RetryTrigger;
 use codex_http_client::RetryAfter;
 use codex_model_provider_info::ModelProviderInfo;
@@ -898,13 +900,36 @@ pub(crate) fn retry_trigger(err: &CodexErr) -> RetryTrigger {
     }
 }
 
+/// Same allowlist property as [`retry_trigger`]: only the classification
+/// booleans and the numeric close code are copied, never messages or ids.
+fn retry_stream_failure(err: &CodexErr) -> Option<RetryStreamFailure> {
+    let (class, close_code, reconnectable_close) = match err {
+        CodexErr::TerminalResponse { source, .. } => return retry_stream_failure(source),
+        CodexErr::ResponseStreamFailed(failed) => (
+            if failed.idle_timeout {
+                RetryStreamFailureClass::IdleTimeout
+            } else if failed.close_code.is_some() || failed.reconnectable_close {
+                RetryStreamFailureClass::WebsocketClose
+            } else {
+                RetryStreamFailureClass::Transport
+            },
+            failed.close_code,
+            failed.reconnectable_close,
+        ),
+        CodexErr::Stream(..) => (RetryStreamFailureClass::StreamError, None, false),
+        CodexErr::IncompleteResponse(_) => (RetryStreamFailureClass::IncompleteResponse, None, false),
+        _ => return None,
+    };
+    Some(RetryStreamFailure { class, close_code, reconnectable_close })
+}
+
 fn record_retry_decision(
     turn_context: &TurnContext,
     err: &CodexErr,
     action: RetryAction,
     backoff: Option<Duration>,
 ) {
-    turn_context.turn_timing_state.record_retry_decision(
-        retry_trigger(err), err.http_status_code_value(), action, backoff,
+    turn_context.turn_timing_state.record_retry_decision_with_stream_failure(
+        retry_trigger(err), err.http_status_code_value(), retry_stream_failure(err), action, backoff,
     );
 }

@@ -7,6 +7,7 @@ mod host;
 mod orchestrator;
 
 use codex_core_skills::HostSkillsSnapshot;
+use codex_extension_api::EnvironmentFileSystemSandbox;
 use codex_mcp::McpResourceClient;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 
@@ -27,6 +28,8 @@ pub struct SkillListQuery {
     pub turn_id: String,
     pub executor_roots: Vec<SelectedCapabilityRoot>,
     pub bound_executor_roots: Vec<codex_exec_server::ResolvedSelectedCapabilityRoot>,
+    /// Current-turn filesystem permissions for executor discovery; roots without one are refused.
+    pub executor_file_system_sandboxes: Vec<EnvironmentFileSystemSandbox>,
     pub host_snapshot: Option<Arc<HostSkillsSnapshot>>,
     pub include_host_skills: bool,
     pub include_bundled_skills: bool,
@@ -39,6 +42,8 @@ pub struct SkillReadRequest {
     pub authority: SkillAuthority,
     pub package: SkillPackageId,
     pub resource: SkillResourceId,
+    /// Current-turn filesystem permissions for executor reads; resources without one are refused.
+    pub executor_file_system_sandboxes: Vec<EnvironmentFileSystemSandbox>,
     pub host_snapshot: Option<Arc<HostSkillsSnapshot>>,
     pub mcp_resources: Option<Arc<McpResourceClient>>,
 }

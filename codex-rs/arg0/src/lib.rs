@@ -287,7 +287,13 @@ fn prepare_path_entry_for_codex_aliases(
 
     std::fs::create_dir_all(&codex_home)?;
     // Use a CODEX_HOME-scoped temp root to avoid cluttering the top-level directory.
-    let temp_root = codex_home.join("tmp").join("arg0");
+    // Windows and WSL can share CODEX_HOME without sharing a lock namespace.
+    // Keep each OS outside the legacy `tmp/arg0` root so the janitor never
+    // retires another platform's live helpers, and older clients cannot
+    // delete these helpers while their owning process is still running.
+    let temp_root = codex_home
+        .join("tmp")
+        .join(format!("arg0-{}", std::env::consts::OS));
     std::fs::create_dir_all(&temp_root)?;
     // Best-effort cleanup of stale per-session dirs. Ignore failures so startup proceeds.
     if let Err(err) = janitor_cleanup(&temp_root) {

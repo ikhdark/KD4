@@ -130,7 +130,14 @@ pub(super) async fn assess_with_calls_tx(
                 reason: if satisfied {
                     "successful owned exact-command execution; historical applicability only".into()
                 } else {
-                    "validation_execution requires a cited successful owned exact-command receipt; current input binding is unsupported".into()
+                    let gap = if policy.freshness != EvidenceFreshness::Historical {
+                        "current-freshness binding is unsupported".to_string()
+                    } else {
+                        reference_gap(assignment, attempt, requirement, result, reference,
+                            cited_call_ids, allow_uncited, calls, CriterionEvidenceKind::ValidationExecution)
+                            .unwrap_or_else(|| "cited call is not a successful owned run of the exact required command".into())
+                    };
+                    format!("validation_execution requires a cited successful owned exact-command receipt; current input binding is unsupported ({gap})")
                 },
             });
             continue;
@@ -171,11 +178,78 @@ pub(super) async fn assess_with_calls_tx(
             }
         } else {
             satisfied = false;
-            "source_inspection requires a cited, successful, owned native acquisition for the exact inspect:path obligation".into()
+            let gap = reference_gap(assignment, attempt, requirement, result, reference,
+                cited_call_ids, allow_uncited, calls, CriterionEvidenceKind::SourceInspection)
+                .unwrap_or_else(|| match call {
+                    Some(call) if call.command_summary != requirement => format!(
+                        "cited call {} acquired `{}`, not `{requirement}`", call.call_id, call.command_summary),
+                    Some(call) if call.verified_evidence_kind() != Some(CriterionEvidenceKind::SourceInspection) => format!(
+                        "cited call {} is not a successful complete native source acquisition", call.call_id),
+                    _ => "the acquired path does not match the inspect:path obligation".into(),
+                });
+            format!("source_inspection requires a cited, successful, owned native acquisition for the exact inspect:path obligation ({gap})")
         };
         assessments.push(CriterionAssessment { criterion_id: criterion.id.clone(), satisfied, reason });
     }
     Ok(assessments)
+}
+
+/// First unmet citation condition, so a rejected receipt names its correction.
+/// Diagnostic only: acceptance is decided by the caller's own predicate.
+#[allow(clippy::too_many_arguments)]
+fn reference_gap(
+    assignment: &Assignment,
+    attempt: &Attempt,
+    requirement: &str,
+    result: Option<&CriterionResult>,
+    reference: Option<&crate::CriterionEvidenceRef>,
+    cited_call_ids: &[String],
+    allow_uncited: bool,
+    calls: &[ValidationCall],
+    kind: CriterionEvidenceKind,
+) -> Option<String> {
+    if !allow_uncited && !result.is_some_and(|result| result.status == CriterionStatus::Passed) {
+        return Some("criterion result is not passed".into());
+    }
+    if !assignment.required_evidence.iter().any(|required| required == requirement) {
+        return Some(format!("`{requirement}` is not required evidence of the assignment"));
+    }
+    let Some(reference) = reference else {
+        return Some(if allow_uncited {
+            format!("no successful owned acquisition of `{requirement}` is recorded in attempt {}", attempt.attempt_id)
+        } else {
+            "the criterion result cites no evidence_ref".into()
+        });
+    };
+    let Some(call) = calls.iter()
+        .find(|call| call.call_id == reference.call_id && call.attempt_id == attempt.attempt_id)
+    else {
+        return Some(format!(
+            "cited call {} is not a recorded call of the bound attempt {}; cite the criterion_evidence ref this attempt's call returned",
+            reference.call_id, attempt.attempt_id
+        ));
+    };
+    if !cited_call_ids.contains(&call.call_id) {
+        return Some(format!("cited call {} is missing from validation_call_ids", call.call_id));
+    }
+    if reference.workspace_id != assignment.workspace_id {
+        return Some(format!(
+            "evidence_ref.workspace_id {} is not the assignment workspace {}",
+            reference.workspace_id, assignment.workspace_id
+        ));
+    }
+    if reference.kind != kind {
+        return Some("evidence_ref.kind does not match the criterion's evidence policy".into());
+    }
+    if call.evidence.end_epoch != Some(reference.evidence_epoch) {
+        return Some(format!(
+            "evidence_epoch {} does not match call {}'s recorded end epoch {}",
+            reference.evidence_epoch,
+            call.call_id,
+            call.evidence.end_epoch.map_or_else(|| "(none)".to_string(), |epoch| epoch.to_string())
+        ));
+    }
+    None
 }
 
 pub(super) fn require_passed(

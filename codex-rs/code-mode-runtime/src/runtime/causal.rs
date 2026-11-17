@@ -1,16 +1,32 @@
 //! Bounded async provenance, not a scheduler or an interpretation of JS source.
-//! Private promise IDs retain no promise/value handles. Unsupported aggregate
-//! adoption and retention loss stay unknown rather than inventing fork edges.
+//! Private promise IDs retain no promise/value handles. Promise.all/allSettled/
+//! race/any over arrays of intrinsic promises or plain values join through the
+//! members V8 actually settled; other aggregate shapes and retention loss stay
+//! unknown rather than inventing fork edges. Timestamps never create an edge.
 use std::collections::{BTreeMap, BTreeSet};
 use super::RuntimeState;
 
 const LIMIT: usize = 8192;
+const AGGREGATE_MEMBERS: u32 = 1024;
+const AGGREGATE_DEPTH: usize = 16;
+
+/// Members observed by the private aggregate wrapper. `None` is a plain value
+/// (no dependency); an unsupported member makes the whole aggregate unknown.
+struct Aggregate {
+    join_all: bool,
+    members: Option<Vec<Option<usize>>>,
+}
 
 #[derive(Default)]
 struct Promise {
     parent: Option<usize>,
     tool: Option<String>,
     helper: Option<String>,
+    aggregate: Option<Aggregate>,
+    /// Order of this promise's first V8 resolve/reject hook.
+    settled: Option<u64>,
+    /// Reaction whose job was running when the first resolve hook fired.
+    resolved_by: Option<usize>,
 }
 
 #[derive(Default)]
@@ -20,6 +36,7 @@ pub(super) struct Capture {
     current: Option<usize>,
     stack: Vec<Option<usize>>,
     received: u64,
+    resolves: u64,
     dropped: bool,
     graph_deps: BTreeMap<String, Vec<String>>,
     graph_calls: BTreeMap<String, Vec<String>>,
@@ -84,16 +101,58 @@ impl Capture {
         // Before any tool result arrives there cannot be a result-consumption
         // dependency on another nested tool. All such calls form root forks.
         if self.received == 0 { return Some(Vec::new()); }
-        let mut next = self.current;
+        self.walk(self.current, 0)
+    }
+
+    fn walk(&self, start: Option<usize>, depth: usize) -> Option<Vec<String>> {
+        let mut next = start;
         let mut seen = BTreeSet::new();
         while let Some(id) = next {
             if !seen.insert(id) { return None; }
             let row = self.promises.get(id)?;
             if let Some(tool) = &row.tool { return Some(vec![tool.clone()]); }
             if let Some(helper) = &row.helper { return self.helper_join(helper); }
+            if let Some(aggregate) = &row.aggregate { return self.aggregate_join(row, aggregate, depth); }
             next = row.parent;
         }
         None
+    }
+
+    /// all/allSettled consume every member only when each member settled before
+    /// the aggregate. Otherwise (early all rejection, race, any) the aggregate
+    /// was settled inside exactly one member's reaction; that member is the
+    /// consumed result. A settling context outside the members stays unknown.
+    fn aggregate_join(&self, row: &Promise, aggregate: &Aggregate, depth: usize) -> Option<Vec<String>> {
+        if depth >= AGGREGATE_DEPTH { return None; }
+        let members = aggregate.members.as_ref()?;
+        let resolved = row.settled?;
+        if members.is_empty() { return Some(Vec::new()); }
+        let all_before = members.iter().flatten().all(|member| self.promises.get(*member)
+            .and_then(|member| member.settled).is_some_and(|settled| settled < resolved));
+        if aggregate.join_all && all_before {
+            let mut result = BTreeSet::new();
+            for member in members.iter().flatten() {
+                result.extend(self.walk(Some(*member), depth + 1)?);
+            }
+            return (result.len() <= 128).then(|| result.into_iter().collect());
+        }
+        let mut next = row.resolved_by;
+        let mut seen = BTreeSet::new();
+        while let Some(id) = next {
+            if !seen.insert(id) { return None; }
+            if members.contains(&Some(id)) { return self.walk(Some(id), depth + 1); }
+            next = self.promises.get(id)?.parent;
+        }
+        None
+    }
+
+    fn resolved(&mut self, id: Option<usize>) {
+        let current = self.current;
+        let Some(row) = id.and_then(|id| self.promises.get_mut(id)) else { return; };
+        if row.settled.is_some() { return; }
+        self.resolves = self.resolves.saturating_add(1);
+        row.settled = Some(self.resolves);
+        row.resolved_by = current;
     }
 }
 
@@ -124,7 +183,7 @@ pub(super) unsafe extern "C" fn promise_hook(
             let Some(state) = scope.get_slot_mut::<RuntimeState>() else { return; };
             if state.causal.promises.len() >= LIMIT { state.causal.dropped = true; return; }
             let id = state.causal.promises.len();
-            state.causal.promises.push(Promise { parent, tool: None, helper: None });
+            state.causal.promises.push(Promise { parent, ..Promise::default() });
             // End the mutable runtime-state borrow before borrowing the isolate
             // to create a local handle. The key lookup itself is read-only.
             let Some(key) = scope.get_slot::<RuntimeState>()
@@ -147,7 +206,11 @@ pub(super) unsafe extern "C" fn promise_hook(
                 state.causal.current = state.causal.stack.pop().flatten();
             }
         }
-        v8::PromiseHookType::Resolve => {}
+        v8::PromiseHookType::Resolve => {
+            // Fires before the state change, for resolve and reject alike.
+            let id = identity(scope, promise);
+            if let Some(state) = scope.get_slot_mut::<RuntimeState>() { state.causal.resolved(id); }
+        }
     }
 }
 
@@ -194,5 +257,39 @@ pub(super) fn bind_helper(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<'_,
             row.helper = Some(group);
             row.parent = None;
         } else { state.causal.dropped = true; }
+    }
+}
+
+/// Membership reported by the private wrapper around the intrinsic Promise
+/// statics after the original builtin returned. Reads only V8 type checks,
+/// prototypes and own-property presence; never a getter or user property.
+/// Members are intrinsic promises without an own `then`, or primitives.
+pub(super) fn aggregate(
+    scope: &mut v8::PinScope<'_, '_>, join_all: bool,
+    result: v8::Local<'_, v8::Value>, members: v8::Local<'_, v8::Value>,
+) {
+    let Ok(result) = v8::Local::<v8::Promise>::try_from(result) else { return; };
+    let Some(index) = identity(scope, result) else { return; };
+    let prototype = result.get_prototype(scope);
+    let then = v8::String::new(scope, "then");
+    let rows = v8::Local::<v8::Array>::try_from(members).ok()
+        .filter(|members| members.length() <= AGGREGATE_MEMBERS)
+        .zip(prototype).zip(then).and_then(|((members, prototype), then)| {
+            let mut rows = Vec::new();
+            for position in 0..members.length() {
+                let member = members.get_index(scope, position)?;
+                if !member.is_object() { rows.push(None); continue; }
+                let promise = v8::Local::<v8::Promise>::try_from(member).ok()?;
+                let intrinsic = promise.get_prototype(scope)
+                    .is_some_and(|value| value.strict_equals(prototype))
+                    && promise.has_own_property(scope, then.into()) == Some(false);
+                if !intrinsic { return None; }
+                rows.push(Some(identity(scope, promise)?));
+            }
+            Some(rows)
+        });
+    if let Some(row) = scope.get_slot_mut::<RuntimeState>()
+        .and_then(|state| state.causal.promises.get_mut(index)) {
+        row.aggregate = Some(Aggregate { join_all, members: rows });
     }
 }

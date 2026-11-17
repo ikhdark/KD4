@@ -75,10 +75,12 @@ impl MarketplaceRequestProcessor {
         &self,
         params: MarketplaceRemoveParams,
     ) -> Result<MarketplaceRemoveResponse, JSONRPCErrorError> {
-        let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
+        // Surface config load errors as before; the removal itself rereads the
+        // global (non-project) layers through the reload callback.
+        self.load_latest_config(/*fallback_cwd*/ None).await?;
         remove_marketplace(
             self.config.codex_home.to_path_buf(),
-            self.config_manager.plugin_config_reload_for_cwd(config.cwd.clone()),
+            self.config_manager.plugin_config_reload_global(),
             CoreMarketplaceRemoveRequest {
                 marketplace_name: params.marketplace_name,
             },
@@ -110,7 +112,7 @@ impl MarketplaceRequestProcessor {
         let plugins_manager = self.thread_manager.plugins_manager();
         let MarketplaceUpgradeParams { marketplace_name } = params;
         let plugins_input = config.plugins_config_input();
-        let reload_config = self.config_manager.plugin_config_reload_for_cwd(config.cwd.clone());
+        let reload_config = self.config_manager.plugin_config_reload_global();
         let thread_manager = Arc::clone(&self.thread_manager);
         let config_manager = self.config_manager.clone();
 

@@ -130,6 +130,16 @@ impl Session {
             .iter()
             .map(|root| root.selected_root().clone())
             .collect::<Vec<_>>();
+        let file_system_sandboxes = step_context
+            .environments
+            .turn_environments
+            .iter()
+            .map(|environment| codex_extension_api::EnvironmentFileSystemSandbox {
+                environment_id: environment.environment_id.clone(),
+                sandbox: turn_context
+                    .file_system_sandbox_context(/*additional_permissions*/ None, environment.cwd()),
+            })
+            .collect::<Vec<_>>();
         // World-state contributors are independent. Poll them concurrently while preserving
         // registration order, and do not let an optional contributor block the model request.
         let deadline = tokio::time::Instant::now() + EXTENSION_CONTEXT_CONTRIBUTOR_TIMEOUT;
@@ -148,6 +158,7 @@ impl Session {
                 environments: &environments,
                 ready_selected_capability_roots: &ready_selected_capability_roots,
                 bound_selected_capability_roots: &step_context.selected_capability_roots,
+                file_system_sandboxes: &file_system_sandboxes,
                 session_store: &self.services.session_extension_data,
                 thread_store: &self.services.thread_extension_data,
                 turn_store: turn_context.extension_data.as_ref(),

@@ -579,8 +579,11 @@ async fn run_main_owned(
         Arc::new(NoopThreadConfigLoader),
     );
     let mut config_warnings = Vec::new();
+    // Startup config keeps the launch directory's project context; threadless
+    // `load_latest_config(None)` requests are global.
+    let startup_cwd = std::env::current_dir().ok();
     let bootstrap = match config_manager
-        .load_latest_config(/*fallback_cwd*/ None)
+        .load_latest_config(startup_cwd.clone())
         .await
     {
         Ok(config) => {
@@ -600,7 +603,7 @@ async fn run_main_owned(
         }
     };
     let (config, auth_manager, config_resolved) = match config_manager
-        .load_latest_config(/*fallback_cwd*/ None)
+        .load_latest_config(startup_cwd)
         .await
     {
         Ok(config) => {

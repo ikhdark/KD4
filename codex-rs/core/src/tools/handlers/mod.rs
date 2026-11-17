@@ -117,6 +117,7 @@ pub(crate) use read_file::existing_tests_changed;
 pub(crate) use read_file::validate_read_file_arguments;
 pub use read_tool_output::ReadToolOutputHandler;
 pub(crate) use read_tool_output::file_only_selector_hint as read_tool_output_file_only_selector_hint;
+pub(crate) use read_tool_output::route_audit_to_readable_owner;
 pub use request_permissions::RequestPermissionsHandler;
 pub use request_plugin_install::RequestPluginInstallHandler;
 pub use request_user_input::RequestUserInputHandler;
@@ -460,6 +461,49 @@ pub(crate) async fn wait_for_observed_tool_environment(
     Ok(ready)
 }
 
+/// For `exec_command` and `shell_command` returns made before the handler
+/// intercepts a patch, reserves a process or starts anything: the failure then
+/// says nothing ran instead of the legacy unknown certainty, which blocks an
+/// unchanged retry. Some of these returns hold a validation-policy permit; it
+/// is released on drop.
+/// A refusal of arguments the decoder accepted.
+pub(crate) fn command_argument_refusal(message: String) -> FunctionCallError {
+    FunctionCallError::structured(codex_protocol::tool_failure::ToolFailure::handler_refusal(
+        codex_protocol::tool_failure::ToolFailureCode::InvalidInput,
+        message,
+        "command_arguments",
+    ))
+}
+
+/// As above, for an environment, shell-discovery or analysis failure and for
+/// a suppressed repeat. No argument error is established, so it stays `failed`
+/// and makes no retry claim.
+pub(crate) fn command_not_started(message: String) -> FunctionCallError {
+    FunctionCallError::structured(codex_protocol::tool_failure::ToolFailure::no_effects(
+        codex_protocol::tool_failure::ToolFailureCode::Failed,
+        message,
+    ))
+}
+
+/// As above, for a request the active approval policy does not allow.
+pub(crate) fn command_permission_refusal(message: String) -> FunctionCallError {
+    FunctionCallError::structured(codex_protocol::tool_failure::ToolFailure::no_effects(
+        codex_protocol::tool_failure::ToolFailureCode::PermissionDenied,
+        message,
+    ))
+}
+
+/// Settles a shared helper's legacy text error at such a return; typed errors
+/// pass through unchanged.
+pub(crate) fn before_launch(
+    settle: fn(String) -> FunctionCallError,
+) -> impl Fn(FunctionCallError) -> FunctionCallError {
+    move |error| match error {
+        FunctionCallError::RespondToModel(message) => settle(message),
+        other => other,
+    }
+}
+
 /// Whether a fresh inline sandbox override may reach its approval flow.
 /// Untrusted mode still classifies ordinary commands itself; it does not accept
 /// model-requested sandbox overrides. Preapproved grants bypass this check.
@@ -473,13 +517,14 @@ pub(crate) fn allows_inline_sandbox_approval(policy: AskForApproval) -> bool {
 
 /// Validates feature/policy constraints for `with_additional_permissions` and
 /// normalizes any path-based permissions. Errors if the request is invalid.
+/// Both callers validate before they start anything, so a refusal says so.
 pub(crate) fn normalize_and_validate_additional_permissions(
     additional_permissions_allowed: bool,
     approval_policy: AskForApproval,
     sandbox_permissions: SandboxPermissions,
     additional_permissions: Option<AdditionalPermissionProfile>,
     permissions_preapproved: bool,
-) -> Result<Option<AdditionalPermissionProfile>, String> {
+) -> Result<Option<AdditionalPermissionProfile>, FunctionCallError> {
     normalize_and_validate_permission_profile(
         additional_permissions_allowed,
         approval_policy,
@@ -499,7 +544,7 @@ pub(super) fn normalize_and_validate_additional_permissions_uri(
     sandbox_permissions: SandboxPermissions,
     additional_permissions: Option<UriAdditionalPermissionProfile>,
     permissions_preapproved: bool,
-) -> Result<Option<UriAdditionalPermissionProfile>, String> {
+) -> Result<Option<UriAdditionalPermissionProfile>, FunctionCallError> {
     normalize_and_validate_permission_profile(
         additional_permissions_allowed,
         approval_policy,
@@ -529,7 +574,7 @@ fn normalize_and_validate_permission_profile<T>(
     permissions_preapproved: bool,
     normalize: fn(T) -> Result<T, String>,
     is_empty: fn(&T) -> bool,
-) -> Result<Option<T>, String> {
+) -> Result<Option<T>, FunctionCallError> {
     let uses_additional_permissions = matches!(
         sandbox_permissions,
         SandboxPermissions::WithAdditionalPermissions
@@ -539,39 +584,39 @@ fn normalize_and_validate_permission_profile<T>(
         && !additional_permissions_allowed
         && (uses_additional_permissions || additional_permissions.is_some())
     {
-        return Err(
+        return Err(command_argument_refusal(
             "additional permissions are disabled; enable `features.exec_permission_approvals` before using `with_additional_permissions`"
                 .to_string(),
-        );
+        ));
     }
 
     if uses_additional_permissions {
         if !permissions_preapproved && !allows_inline_sandbox_approval(approval_policy) {
-            return Err(format!(
+            return Err(command_permission_refusal(format!(
                 "approval policy is {approval_policy:?}; reject command — this policy does not allow inline sandbox approval requests"
-            ));
+            )));
         }
         let Some(additional_permissions) = additional_permissions else {
-            return Err(
+            return Err(command_argument_refusal(
                 "missing `additional_permissions`; provide at least one of `network` or `file_system` when using `with_additional_permissions`"
                     .to_string(),
-            );
+            ));
         };
-        let normalized = normalize(additional_permissions)?;
+        let normalized = normalize(additional_permissions).map_err(command_argument_refusal)?;
         if is_empty(&normalized) {
-            return Err(
+            return Err(command_argument_refusal(
                 "`additional_permissions` must include at least one requested permission in `network` or `file_system`"
                     .to_string(),
-            );
+            ));
         }
         return Ok(Some(normalized));
     }
 
     if additional_permissions.is_some() {
-        Err(
+        Err(command_argument_refusal(
             "`additional_permissions` requires `sandbox_permissions` set to `with_additional_permissions`"
                 .to_string(),
-        )
+        ))
     } else {
         Ok(None)
     }

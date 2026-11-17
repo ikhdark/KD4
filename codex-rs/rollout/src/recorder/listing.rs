@@ -194,10 +194,6 @@ impl RolloutRecorder {
             ThreadListArchiveFilter::Active => false,
             ThreadListArchiveFilter::Archived => true,
         };
-        if cwd_filters.is_some_and(<[std::path::PathBuf]>::is_empty) {
-            return Ok(ThreadsPage::default());
-        }
-
         if matches!(repair_mode, ThreadListRepairMode::StateDbOnly) {
             let page = state_integration::list_threads_db(
                 state_db_ctx.as_deref(),
@@ -217,6 +213,9 @@ impl RolloutRecorder {
             .await
             .ok_or_else(|| std::io::Error::other("state DB unavailable for thread listing"))?;
             return Ok(page.into());
+        }
+        if cwd_filters.is_some_and(<[std::path::PathBuf]>::is_empty) {
+            return Ok(ThreadsPage::default());
         }
 
         let listing_has_metadata_filters = !allowed_sources.is_empty()

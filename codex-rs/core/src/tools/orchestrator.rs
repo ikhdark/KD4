@@ -210,6 +210,7 @@ impl ToolOrchestrator {
                 approval_ctx.turn,
                 permission_request_run_id,
                 permission_request,
+                tool.permission_request_cwd(req),
             )
             .await
             {

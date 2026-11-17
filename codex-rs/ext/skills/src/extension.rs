@@ -126,6 +126,7 @@ where
                         turn_id: thread_store.level_id().to_string(),
                         bound_executor_roots: Vec::new(),
                         executor_roots: Vec::new(),
+                        executor_file_system_sandboxes: Vec::new(),
                         host_snapshot: None,
                         include_host_skills: false,
                         include_bundled_skills: config.bundled_skills_enabled,
@@ -163,6 +164,7 @@ where
                         turn_id: thread_store.level_id().to_string(),
                         bound_executor_roots: Vec::new(),
                         executor_roots: Vec::new(),
+                        executor_file_system_sandboxes: Vec::new(),
                         host_snapshot: None,
                         include_host_skills: false,
                         include_bundled_skills: config.bundled_skills_enabled,
@@ -206,6 +208,7 @@ where
                         turn_id: input.turn_id.to_string(),
                         bound_executor_roots: input.bound_selected_capability_roots.to_vec(),
                         executor_roots: input.ready_selected_capability_roots.to_vec(),
+                        executor_file_system_sandboxes: input.file_system_sandboxes.to_vec(),
                         host_snapshot: None,
                         include_host_skills: false,
                         include_bundled_skills: config.bundled_skills_enabled,
@@ -238,6 +241,7 @@ where
                         turn_id: input.turn_id.to_string(),
                         bound_executor_roots: input.bound_selected_capability_roots.to_vec(),
                         executor_roots: input.ready_selected_capability_roots.to_vec(),
+                        executor_file_system_sandboxes: input.file_system_sandboxes.to_vec(),
                         host_snapshot: None,
                         include_host_skills: false,
                         include_bundled_skills: config.bundled_skills_enabled,
@@ -314,6 +318,7 @@ where
                 turn_id: input.turn_id.clone(),
                 bound_executor_roots: Vec::new(),
                 executor_roots: Vec::new(),
+                executor_file_system_sandboxes: Vec::new(),
                 host_snapshot: host_snapshot.clone(),
                 include_host_skills: true,
                 include_bundled_skills: config.bundled_skills_enabled,
@@ -333,6 +338,9 @@ where
                                     .bound_selected_capability_roots
                                     .to_vec(),
                                 executor_roots: input.ready_selected_capability_roots.clone(),
+                                executor_file_system_sandboxes: input
+                                    .file_system_sandboxes
+                                    .clone(),
                                 host_snapshot: None,
                                 include_host_skills: false,
                                 include_bundled_skills: config.bundled_skills_enabled,
@@ -399,7 +407,17 @@ where
                     let snapshot = host_snapshot.clone();
                     let state = &thread_state;
                     async move {
-                        (entry, self.read_main_prompt(entry, snapshot, session_store, state).await)
+                        (
+                            entry,
+                            self.read_main_prompt(
+                                entry,
+                                snapshot,
+                                &input.file_system_sandboxes,
+                                session_store,
+                                state,
+                            )
+                            .await,
+                        )
                     }
                 })
                 .buffered(4);
@@ -584,6 +602,7 @@ impl<C> SkillsExtension<C> {
         &self,
         entry: &SkillCatalogEntry,
         host_snapshot: Option<Arc<HostSkillsSnapshot>>,
+        file_system_sandboxes: &[codex_extension_api::EnvironmentFileSystemSandbox],
         session_store: &ExtensionData,
         thread_state: &SkillsThreadState,
     ) -> Result<Arc<SkillReadResult>, String> {
@@ -594,6 +613,13 @@ impl<C> SkillsExtension<C> {
                     authority: entry.authority.clone(),
                     package: entry.id.clone(),
                     resource: entry.main_prompt.clone(),
+                    executor_file_system_sandboxes: if entry.authority.kind
+                        == SkillSourceKind::Executor
+                    {
+                        file_system_sandboxes.to_vec()
+                    } else {
+                        Vec::new()
+                    },
                     host_snapshot,
                     mcp_resources: session_store.get::<McpResourceClient>(),
                 },

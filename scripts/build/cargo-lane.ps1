@@ -698,6 +698,21 @@ function Test-CargoLaneWarm {
             (Test-Path -LiteralPath (Join-Path $profile.FullName "deps") -PathType Container) -and
             ((Test-Path -LiteralPath (Join-Path $profile.FullName "build") -PathType Container) -or
              (Test-Path -LiteralPath (Join-Path $profile.FullName "incremental") -PathType Container))) { return $true }
+        if (Test-CargoBuildUnitFingerprint -ProfileDir $profile.FullName) { return $true }
+    }
+    return $false
+}
+
+# Newer Cargo build-dir layout (default in Cargo 1.100; codex-rs pins 1.99.1,
+# which writes the older one): per-unit fingerprints live in
+# build/<package>/<hash>/fingerprint, with no .fingerprint/ or deps/. Mirrors
+# rust_build_status._has_build_unit_fingerprint; an unreadable tree is not warm.
+function Test-CargoBuildUnitFingerprint {
+    param([string]$ProfileDir)
+    foreach ($package in @(Get-ChildItem -LiteralPath (Join-Path $ProfileDir "build") -Directory -ErrorAction SilentlyContinue)) {
+        foreach ($unit in @(Get-ChildItem -LiteralPath $package.FullName -Directory -ErrorAction SilentlyContinue)) {
+            if (Test-Path -LiteralPath (Join-Path $unit.FullName "fingerprint") -PathType Container) { return $true }
+        }
     }
     return $false
 }

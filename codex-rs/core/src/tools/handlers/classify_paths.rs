@@ -52,7 +52,7 @@ impl ToolExecutor<ToolInvocation> for ClassifyPathsHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(async move {
+        let classified = async move {
             let ToolPayload::Function { ref arguments } = invocation.payload else {
                 return Err(FunctionCallError::RespondToModel(
                     "classify_paths requires function arguments".into(),
@@ -99,6 +99,12 @@ impl ToolExecutor<ToolInvocation> for ClassifyPathsHandler {
             let output = JsonToolOutput::new(value);
             crate::tools::context::ensure_exact_model_delivery(&output, &invocation).map_err(|_| FunctionCallError::RespondToModel("Path classification exceeds the model delivery budget; nothing was delivered. Select fewer paths.".into()))?;
             Ok(boxed_tool_output(output))
+        };
+        // A read-only Git classification leaves no effects to recover.
+        Box::pin(async move {
+            classified
+                .await
+                .map_err(super::read_tool_output::settled_recovery_failure)
         })
     }
 }

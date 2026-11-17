@@ -151,21 +151,25 @@ impl ToolExecutor<ToolInvocation> for FileSearchHandler {
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
         Box::pin(async move {
+            // Until ripgrep is launched nothing has run. After launch a PATH
+            // executable may have run, so later failures keep unknown effects.
+            let settled = super::read_tool_output::settled_recovery_failure;
             let ToolPayload::Function { ref arguments } = invocation.payload else {
-                return Err(FunctionCallError::RespondToModel(
+                return Err(settled(FunctionCallError::RespondToModel(
                     "file_search requires function arguments".into(),
-                ));
+                )));
             };
             let args: Arguments = parse_arguments(arguments)?;
-            let argv = args.argv()?;
+            let argv = args.argv().map_err(settled)?;
             let environment = wait_for_tool_environment(
                 &invocation.step_context.environments,
                 None,
                 &invocation.cancellation_token,
             )
-            .await?
+            .await
+            .map_err(settled)?
             .ok_or_else(|| {
-                FunctionCallError::RespondToModel("file_search requires an environment".into())
+                settled(FunctionCallError::RespondToModel("file_search requires an environment".into()))
             })?;
             if environment.environment.is_remote()
                 || !invocation
@@ -174,13 +178,13 @@ impl ToolExecutor<ToolInvocation> for FileSearchHandler {
                     .file_system_sandbox_policy()
                     .has_full_disk_read_access()
             {
-                return Err(FunctionCallError::RespondToModel("file_search requires local full-disk read access; use sandboxed read_file search selectors for known files".into()));
+                return Err(settled(FunctionCallError::RespondToModel("file_search requires local full-disk read access; use sandboxed read_file search selectors for known files".into())));
             }
             crate::tools::parallel::wait_for_workspace_baseline().await;
             let cwd = environment
                 .cwd()
                 .to_abs_path()
-                .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
+                .map_err(|e| settled(FunctionCallError::RespondToModel(e.to_string())))?;
             let env = std::env::vars()
                 .filter(|(key, _)| key != "RIPGREP_CONFIG_PATH")
                 .collect();
@@ -198,10 +202,10 @@ impl ToolExecutor<ToolInvocation> for FileSearchHandler {
             };
             let executable = tokio::select! {
                 biased;
-                _ = invocation.cancellation_token.cancelled() => return Err(FunctionCallError::RespondToModel("file search cancelled before lookup".into())),
+                _ = invocation.cancellation_token.cancelled() => return Err(settled(FunctionCallError::RespondToModel("file search cancelled before lookup".into()))),
                 result = environment.environment.lookup_executable(lookup) => result
-                    .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
-                    .path.ok_or_else(|| FunctionCallError::RespondToModel("configured ripgrep executable unavailable".into()))?,
+                    .map_err(|e| settled(FunctionCallError::RespondToModel(e.to_string())))?
+                    .path.ok_or_else(|| settled(FunctionCallError::RespondToModel("configured ripgrep executable unavailable".into())))?,
             }.inferred_native_path_string();
             // Existing pipe owner contains descendants, drains exact split streams,
             // and retains failed cleanup custody on cancellation/drop. No new tasks

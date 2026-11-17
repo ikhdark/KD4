@@ -55,6 +55,10 @@ def policy(env):
     }
 
 
+class ResourceCoordinationTimeout(TimeoutError):
+    """Another process kept coordination.lock past one 10s acquisition grace."""
+
+
 class WindowsResources:
     def __init__(self):
         if os.name != "nt":
@@ -93,7 +97,7 @@ class WindowsResources:
             handle = self.exclusive(root / "coordination.lock")
             if handle is None:
                 if time.monotonic() >= deadline:
-                    raise TimeoutError("build resource coordination lock did not become free")
+                    raise ResourceCoordinationTimeout("build resource coordination lock did not become free")
                 time.sleep(0.02)
         try:
             yield
@@ -331,6 +335,7 @@ class BuildLease:
         self.rows = []
         self.wait_started = None
         self.wait_reasons = set()
+        self.coordination_reported_at = float("-inf")
         self.finished = False
         self.receipt_path = self.root / "receipts" / (self.token + ".json")
         self.record["receiptPath"] = str(self.receipt_path)
@@ -342,7 +347,24 @@ class BuildLease:
         reasons = self.wait_reasons
         while True:
             check_operation()
-            with self.api.coordination(self.root):
+            coordination = contextlib.ExitStack()
+            try:
+                coordination.enter_context(self.api.coordination(self.root))
+            except ResourceCoordinationTimeout as busy:
+                # A holder stalled past the grace: a refused pass, retried like
+                # the others (bounded by check_operation or the caller).
+                reasons.add("coordination_lock_busy")
+                now = time.perf_counter()
+                if now - self.coordination_reported_at >= 60:
+                    self.coordination_reported_at = now
+                    print(f"waiting for global Cargo resources: {busy}; retrying", file=sys.stderr)
+                self.record.update(status="waiting", waitReasons=sorted(reasons),
+                                   resourceWaitMs=(now - started) * 1000)
+                if not wait:
+                    return False
+                time.sleep(0.25)
+                continue
+            with coordination:
                 rows = _active(self.api, self.root)
                 policies = [self.policy] + [row["policy"] for row in rows]
                 memory = self.api.snapshot()
@@ -391,8 +413,12 @@ class BuildLease:
     def ready(self, job):
         self.job = job
         self.started_at = time.perf_counter()
-        with self.api.coordination(self.root):
-            _rebalance(self.api, _active(self.api, self.root))
+        try:
+            with self.api.coordination(self.root):
+                _rebalance(self.api, _active(self.api, self.root))
+        except ResourceCoordinationTimeout:
+            # A stalled holder must not stop the build; later polls rebalance.
+            self.record["coordinationSkips"] = self.record.get("coordinationSkips", 0) + 1
         self.paging = PagingCounters()
         self.poll()
 
@@ -401,10 +427,15 @@ class BuildLease:
         if not self.job or (not force and now - self.last_poll < 0.5):
             return
         self.last_poll = now
-        with self.api.coordination(self.root):
-            rows = _active(self.api, self.root)
-            _rebalance(self.api, rows)
-            rate = self.api.cpu_rate(self.job.handle)
+        try:
+            with self.api.coordination(self.root):
+                rows = _active(self.api, self.root)
+                _rebalance(self.api, rows)
+                rate = self.api.cpu_rate(self.job.handle)
+        except ResourceCoordinationTimeout:
+            # A stalled holder must not kill the running build: skip this sample.
+            self.record["coordinationSkips"] = self.record.get("coordinationSkips", 0) + 1
+            return
         sample = {"elapsedSeconds": now - self.started_at, "activeBuilds": len(rows),
                   "cpuRate": rate,
                   "job": self.job.build_resource_receipt(), "system": self.api.snapshot(),
@@ -452,6 +483,20 @@ class BuildLease:
                 if not quarantined:
                     self.path.with_suffix(".lock").unlink(missing_ok=True)
                     _rebalance(self.api, _active(self.api, self.root))
+        except ResourceCoordinationTimeout:
+            if quarantined:
+                # Runs while CleanupFailed propagates: raising would replace it
+                # and skip the callers' lane quarantine. The lease lock is still
+                # held, so _active cannot reclaim the row; the replace is atomic.
+                try:
+                    write_json_atomic(self.path, {**self.row, "quarantined": True})
+                    self.record["quarantineWrittenWithoutCoordination"] = True
+                except OSError as error:
+                    self.record["quarantineWriteError"] = f"{type(error).__name__}: {error}"
+            else:
+                # The lease lock closes below; the next coordination holder's
+                # _active reclaims the unheld row once its job has no processes.
+                self.record["releaseDeferred"] = True
         finally:
             if self.handle is not None:
                 self.api.api.CloseHandle(self.handle)

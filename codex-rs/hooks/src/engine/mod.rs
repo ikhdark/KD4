@@ -2,6 +2,8 @@ pub(crate) mod command_runner;
 pub(crate) mod discovery;
 pub(crate) mod dispatcher;
 pub(crate) mod output_parser;
+mod plugin_fingerprint;
+pub(crate) mod plugin_trust;
 
 use crate::events::common::ContextInjectingHookOutcome;
 use crate::events::common::StatelessHookOutcome;
@@ -56,6 +58,8 @@ pub(crate) struct ConfiguredHandler {
     pub source: HookSource,
     pub display_order: i64,
     pub env: HashMap<String, String>,
+    /// Approved plugin contents, re-verified before each command or MCP execution.
+    pub plugin_trust: Option<plugin_trust::PluginHookTrust>,
 }
 
 impl ConfiguredHandler {
@@ -219,6 +223,7 @@ impl ClaudeHooksEngine {
             plugin_hook_sources,
             plugin_hook_load_warnings,
             bypass_hook_trust,
+            discovery::DiscoveryMode::Runtime,
         );
         Self {
             handlers: discovered.handlers,

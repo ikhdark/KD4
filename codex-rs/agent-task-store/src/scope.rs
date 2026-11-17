@@ -211,10 +211,21 @@ pub fn normalize_repo_path(repo_root: &Path, path: &str) -> StoreResult<String> 
     canonical_relative_identity(&canonical_root, &normalized)
 }
 
+/// `normalize_repo_path` for a patch endpoint. A filesystem failure while resolving
+/// an existing ancestor stays an I/O error, so the caller can tell an endpoint it
+/// could not resolve from one the assignment does not own.
+pub(crate) fn normalize_endpoint_path(repo_root: &Path, path: &str) -> StoreResult<String> {
+    let canonical_root = std::fs::canonicalize(repo_root)?;
+    let normalized = normalize_lexically(path)?;
+    resolve_relative_identity(&canonical_root, &normalized, |message, error| {
+        StoreError::Io(std::io::Error::new(error.kind(), message))
+    })
+}
+
 fn normalize_lexically(path: &str) -> StoreResult<String> {
     if path.trim().is_empty() {
         return Err(StoreError::InvalidScope(
-            "scope path cannot be empty".to_string(),
+            "scope path cannot be empty; use \".\" for the repository root".to_string(),
         ));
     }
     let candidate = Path::new(path);
@@ -251,13 +262,24 @@ fn normalize_lexically(path: &str) -> StoreResult<String> {
     }
     if components.is_empty() {
         return Err(StoreError::InvalidScope(
-            "scope path cannot be empty".to_string(),
+            "scope path cannot be empty; use \".\" for the repository root".to_string(),
         ));
     }
     Ok(components.join("/"))
 }
 
 fn canonical_relative_identity(canonical_root: &Path, relative: &str) -> StoreResult<String> {
+    // Declared scopes report an unresolvable ancestor as a scope refusal.
+    resolve_relative_identity(canonical_root, relative, |message, _| {
+        StoreError::InvalidScope(message)
+    })
+}
+
+fn resolve_relative_identity(
+    canonical_root: &Path,
+    relative: &str,
+    io_failure: impl Fn(String, std::io::Error) -> StoreError,
+) -> StoreResult<String> {
     let target = canonical_root.join(relative);
     let mut existing = target.as_path();
     loop {
@@ -268,16 +290,19 @@ fn canonical_relative_identity(canonical_root: &Path, relative: &str) -> StoreRe
                     StoreError::InvalidScope(format!("scope has no existing ancestor: {relative}"))
                 })?;
             }
-            Err(error) => return Err(StoreError::InvalidScope(format!(
+            Err(error) => return Err(io_failure(format!(
                 "scope ancestor {} cannot be inspected: {error}", existing.display()
-            ))),
+            ), error)),
         }
     }
     let canonical_existing = std::fs::canonicalize(existing).map_err(|error| {
-        StoreError::InvalidScope(format!(
-            "scope ancestor {} cannot be canonicalized: {error}",
-            existing.display()
-        ))
+        io_failure(
+            format!(
+                "scope ancestor {} cannot be canonicalized: {error}",
+                existing.display()
+            ),
+            error,
+        )
     })?;
     if !canonical_existing.starts_with(canonical_root) {
         return Err(StoreError::InvalidScope(format!(

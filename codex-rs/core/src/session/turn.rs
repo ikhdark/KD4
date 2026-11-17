@@ -765,7 +765,12 @@ pub(crate) fn run_turn(
                     break 'sampling_loop;
                 }
             };
-            if let Some(reason) = budget_forced_terminal {
+            // A replacement for a refused terminal generation keeps its directive;
+            // the boundary warning was already sent.
+            let replaces_refused_terminal = logical_generation_budget.take_terminal_refund();
+            if let Some(reason) = budget_forced_terminal
+                && !replaces_refused_terminal
+            {
                 record_forced_terminal_budget_boundary(
                     sess.as_ref(),
                     turn_context.as_ref(),
@@ -1269,7 +1274,17 @@ pub(crate) fn run_turn(
                             }
                         };
                         can_drain_pending_input = true;
-                        pending_continuation_cause = Some(ContinuationCause::Compaction);
+                        // Only a summary/replacement is a compaction. Routine retirement
+                        // keeps the ordinary label, as proactive retirement does.
+                        pending_continuation_cause = if relief == ContextPressureRelief::Compaction {
+                            Some(ContinuationCause::Compaction)
+                        } else {
+                            ordinary_continuation_cause(
+                                tool_result_continuation,
+                                server_end_turn_false,
+                                has_pending_input,
+                            )
+                        };
                         // Routine retirement is the exact, recoverable operation that
                         // proactive retirement performs uncounted; only pressure it
                         // cannot absorb spends a spawned agent's compaction budget.
@@ -1826,6 +1841,11 @@ pub(crate) fn run_turn(
                             ConsumedOutputRetirement::Unavailable
                         }
                     };
+                    // Refused before dispatch, the request produced no response, so a
+                    // terminal admission must not leave its replacement Exhausted.
+                    if admission_refusal.is_some() {
+                        logical_generation_budget.release_undispatched(generation_budget_admission);
+                    }
                     if !admit_regular_follow_up(
                         sess.as_ref(),
                         turn_context.as_ref(),
@@ -1870,7 +1890,11 @@ pub(crate) fn run_turn(
                     };
                     unsampled_overflow_relief = Some(relief);
                     pending_generation_request = None;
-                    pending_continuation_cause = Some(ContinuationCause::Compaction);
+                    // The refused request is retried; after routine retirement it keeps
+                    // its own continuation cause rather than a compaction label.
+                    if relief == ContextPressureRelief::Compaction {
+                        pending_continuation_cause = Some(ContinuationCause::Compaction);
+                    }
                     if relief == ContextPressureRelief::Compaction {
                         subagent_context_budget_reached |= observe_context_pressure_event(
                             &turn_context.session_source,
@@ -2435,8 +2459,13 @@ async fn record_convergence_decision(
             .turn_timing_state
             .record_proven_loop_activation();
     }
+    // Guard notices carry their own cadence (re-armed assessment, one-shot
+    // advice); exact-text deduplication would drop a due repeat assessment.
+    // A proven-loop notice is already limited to one per relevant-state
+    // epoch by the repeated-cycle owner; an authoritative wait starts a new
+    // epoch, so its re-proven notice is delivered rather than deduplicated.
     if let Some(text) = directive
-        && turn_execution.admit_directive(&text)
+        && (guard.is_some() || proven_loop_activated || turn_execution.admit_directive(&text))
     {
         sess.record_conversation_items(
             turn_context,
@@ -2834,6 +2863,11 @@ async fn inspect_inputs(
                 accepted_context_input = true;
             }
             renews_budget |= effective_input && renews_generation_budget(input_item);
+            if let TurnInput::UserInput { content, .. } = input_item {
+                // Prompt telemetry can carry the full text, so emit it only after the
+                // UserPromptSubmit inspection accepts it (upstream #8c7affbe).
+                turn_context.session_telemetry.user_prompt(content);
+            }
             items.push(input_item.clone());
         }
         items.extend(
@@ -3915,6 +3949,16 @@ async fn build_extension_turn_input_items(
             .selected_capability_roots
             .iter()
             .map(|root| root.selected_root().clone())
+            .collect(),
+        file_system_sandboxes: step_context
+            .environments
+            .turn_environments
+            .iter()
+            .map(|environment| codex_extension_api::EnvironmentFileSystemSandbox {
+                environment_id: environment.environment_id.clone(),
+                sandbox: turn_context
+                    .file_system_sandbox_context(/*additional_permissions*/ None, environment.cwd()),
+            })
             .collect(),
     };
 

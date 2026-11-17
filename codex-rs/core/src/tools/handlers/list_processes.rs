@@ -102,7 +102,7 @@ impl ToolExecutor<ToolInvocation> for ListProcessesHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(async move {
+        let listed = async move {
             let ToolPayload::Function { ref arguments } = invocation.payload else {
                 return Err(FunctionCallError::RespondToModel(
                     "list_processes requires function arguments".into(),
@@ -169,6 +169,13 @@ impl ToolExecutor<ToolInvocation> for ListProcessesHandler {
                 ));
             }
             Ok(boxed_tool_output(output))
+        };
+        // A Toolhelp snapshot and limited-query handles only observe processes;
+        // a legacy failure leaves no effects to recover.
+        Box::pin(async move {
+            listed
+                .await
+                .map_err(super::read_tool_output::settled_recovery_failure)
         })
     }
 }

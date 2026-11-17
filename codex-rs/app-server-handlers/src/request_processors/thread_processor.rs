@@ -487,6 +487,30 @@ fn persisted_settings_override_mask(
     }
 }
 
+/// Config loading validates approval and permissions against requirements
+/// before persisted settings are reconstructed. Seed that load with the
+/// thread's saved approval/permission state when the request and startup CLI
+/// did not override them, so a configured default that requirements now reject
+/// cannot block resuming or forking a thread whose saved state is valid.
+/// Explicit overrides keep precedence, and reconstruction still applies and
+/// revalidates the complete saved state afterwards.
+fn seed_persisted_permission_overrides(
+    typesafe_overrides: &mut ConfigOverrides,
+    settings: &PersistedThreadSettings,
+    explicit_overrides: &PersistedThreadSettingsOverrideMask,
+) {
+    if !explicit_overrides.approval_policy
+        && let Some(approval_policy) = settings.approval_policy
+    {
+        typesafe_overrides.approval_policy = Some(approval_policy);
+    }
+    if !explicit_overrides.permission_profile
+        && let Some(permission_profile) = settings.permission_profile.as_ref()
+    {
+        typesafe_overrides.permission_profile = Some(permission_profile.clone());
+    }
+}
+
 fn normalize_thread_list_cwd_filters(
     cwd: Option<ThreadListCwdFilter>,
 ) -> Result<Option<Vec<PathBuf>>, JSONRPCErrorError> {
@@ -3608,7 +3632,7 @@ impl ThreadRequestProcessor {
             .map(|environments| environments.legacy_fallback_cwd.to_path_buf())
             .or_else(|| thread_history.session_cwd());
         let runtime_workspace_roots = runtime_workspace_roots.map(resolve_runtime_workspace_roots);
-        let typesafe_overrides = self.build_thread_config_overrides(
+        let mut typesafe_overrides = self.build_thread_config_overrides(
             model,
             model_provider,
             service_tier,
@@ -3626,6 +3650,11 @@ impl ThreadRequestProcessor {
             request_overrides.as_ref(),
             &typesafe_overrides,
             &self.config_manager.current_cli_overrides(),
+        );
+        seed_persisted_permission_overrides(
+            &mut typesafe_overrides,
+            &reduced_settings,
+            &explicit_overrides,
         );
 
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
@@ -4637,6 +4666,11 @@ impl ThreadRequestProcessor {
             request_overrides.as_ref(),
             &typesafe_overrides,
             &self.config_manager.current_cli_overrides(),
+        );
+        seed_persisted_permission_overrides(
+            &mut typesafe_overrides,
+            &reduced_settings,
+            &explicit_overrides,
         );
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
         let policy_generation = self.config_manager.policy_generation();

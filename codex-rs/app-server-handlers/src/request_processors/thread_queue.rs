@@ -433,14 +433,23 @@ impl ThreadQueueRequestProcessor {
             if loaded.is_none() {
                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    // Read coverage before the row: a row indexed just before
+                    // certification is then visible, so certified absence is real.
+                    let certified = match db.get_backfill_state().await {
+                        Ok(state) => state.coverage_certified(),
+                        Err(error) => {
+                            tracing::warn!(%error, "failed to read thread index coverage");
+                            return Err(internal_error("thread index is still being built; retry shortly"));
+                        }
+                    };
                     metadata = db.get_thread(id).await.map_err(queue_error)?;
-                    if metadata.is_some() || db.thread_index_certified().await {
+                    if metadata.is_some() || certified {
                         break;
                     }
                     if tokio::time::Instant::now() >= deadline {
                         return Err(internal_error("thread index is still being built; retry shortly"));
                     }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 }
             }
         }

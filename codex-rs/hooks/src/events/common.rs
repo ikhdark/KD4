@@ -10,6 +10,18 @@ use codex_utils_output_truncation::formatted_truncate_text;
 use crate::engine::ConfiguredHandler;
 use crate::engine::dispatcher;
 
+/// Hook stdin `cwd` for tool events: the local command's execution cwd when the
+/// tool supplied one, otherwise the host cwd used to launch the hook process.
+pub(crate) fn command_input_cwd(
+    cwd: &std::path::Path,
+    tool_cwd: Option<&codex_utils_absolute_path::AbsolutePathBuf>,
+) -> String {
+    tool_cwd.map_or_else(
+        || cwd.display().to_string(),
+        |tool_cwd| tool_cwd.display().to_string(),
+    )
+}
+
 /// Identifies a thread-spawned subagent when a normal hook runs inside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubagentHookContext {

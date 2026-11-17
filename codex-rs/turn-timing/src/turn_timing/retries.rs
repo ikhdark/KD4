@@ -20,6 +20,35 @@ pub enum RetryTrigger {
     Other,
 }
 
+/// Which stream failure a `Stream`-triggered decision answered. Additive to
+/// schema_version 1: older rows omit the field; `null` means no stream failure.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryStreamFailureClass {
+    /// The provider went silent past the idle or model-progress deadline.
+    IdleTimeout,
+    /// The provider sent a WebSocket close frame mid-response.
+    WebsocketClose,
+    /// Any other transport or read failure, including a connection that ended
+    /// without a close frame.
+    Transport,
+    /// A stream error without transport facts: a provider-declared retryable
+    /// event, or a response stream that ended before completion.
+    StreamError,
+    /// A provider-declared incomplete response.
+    IncompleteResponse,
+}
+
+/// Allowlisted facts only: an enum, a boolean and a numeric close code.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct RetryStreamFailure {
+    pub class: RetryStreamFailureClass,
+    /// RFC 6455 connection close code; 1005 when the frame carried none.
+    pub close_code: Option<u16>,
+    /// The close code invites another connection.
+    pub reconnectable_close: bool,
+}
+
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetryAction {
@@ -48,6 +77,7 @@ pub struct RetryDecision {
     phase: &'static str,
     trigger: RetryTrigger,
     http_status: Option<u16>,
+    stream_failure: Option<RetryStreamFailure>,
     action: RetryAction,
     generation_index: Option<u32>,
     source_sampling_request_id: Option<String>,
@@ -92,6 +122,7 @@ pub struct RetryPlan<'a> {
     pub clock_id: &'static str,
     pub trigger: RetryTrigger,
     pub http_status: Option<u16>,
+    pub stream_failure: Option<RetryStreamFailure>,
     pub action: RetryAction,
     pub source: Option<(&'a str, &'a str)>,
     /// None means the account/network recovery deadline is not a scheduled sleep.
@@ -108,6 +139,15 @@ pub struct RetryExecution<'a> {
 impl RetryDecisionLedger {
     pub fn has_pending(&self) -> bool {
         self.pending.is_some()
+    }
+
+    /// A pending decision that may belong to `generation_index`; an unscoped
+    /// decision may belong to any generation.
+    pub fn has_pending_for(&self, generation_index: u32) -> bool {
+        self.pending.as_ref().is_some_and(|decision| {
+            decision.generation_index.is_none()
+                || decision.generation_index == Some(generation_index)
+        })
     }
 
     pub fn is_fallback_for(&self, generation_index: Option<u32>) -> bool {
@@ -128,6 +168,7 @@ impl RetryDecisionLedger {
             phase: "planned",
             trigger: plan.trigger,
             http_status: plan.http_status,
+            stream_failure: plan.stream_failure,
             action: plan.action,
             generation_index: plan.generation_index,
             source_sampling_request_id: plan.source.map(|source| source.0.to_owned()),

@@ -146,17 +146,7 @@ impl ResolvedWindowsSandboxPermissions {
         env_map: &HashMap<String, String>,
     ) -> Vec<WindowsWritableRoot> {
         let mut file_system = self.file_system.clone();
-        let temp_roots = windows_temp_env_roots(env_map);
-        file_system.entries = file_system.entries.into_iter().flat_map(|entry| {
-            match entry.path {
-                FileSystemPath::Special { value: codex_protocol::permissions::FileSystemSpecialPath::Tmpdir } => temp_roots.iter()
-                    .filter_map(|root| AbsolutePathBuf::from_absolute_path(root).ok())
-                    .map(|path| FileSystemSandboxEntry { path: FileSystemPath::Path { path }, access: entry.access })
-                    .collect::<Vec<_>>(),
-                FileSystemPath::Special { value: codex_protocol::permissions::FileSystemSpecialPath::SlashTmp } => Vec::new(),
-                _ => vec![entry],
-            }
-        }).collect();
+        resolve_workload_temp_paths(&mut file_system, env_map);
 
         file_system
             .get_writable_roots_with_cwd(cwd)
@@ -195,14 +185,38 @@ pub fn validate_windows_read_policy(file_system: &FileSystemSandboxPolicy, cwd: 
     Ok(())
 }
 
+/// Replace `:tmpdir` with the absolute TEMP/TMP paths of the workload
+/// environment the child receives and drop `/tmp`. Never consult the host
+/// TEMP/TMP: a missing, empty or relative child value grants nothing. Access
+/// modes are preserved so read-only and deny carveouts still apply.
+pub fn resolve_workload_temp_paths(
+    file_system: &mut FileSystemSandboxPolicy,
+    workload_env: &HashMap<String, String>,
+) {
+    let temp_roots = windows_temp_env_roots(workload_env);
+    file_system.entries = std::mem::take(&mut file_system.entries).into_iter().flat_map(|entry| {
+        match entry.path {
+            FileSystemPath::Special { value: FileSystemSpecialPath::Tmpdir } => temp_roots.iter()
+                .filter_map(|root| AbsolutePathBuf::from_absolute_path(root).ok())
+                .map(|path| FileSystemSandboxEntry { path: FileSystemPath::Path { path }, access: entry.access })
+                .collect::<Vec<_>>(),
+            FileSystemPath::Special { value: FileSystemSpecialPath::SlashTmp } => Vec::new(),
+            _ => vec![entry],
+        }
+    }).collect();
+}
+
 fn windows_temp_env_roots(env_map: &HashMap<String, String>) -> Vec<PathBuf> {
     ["TEMP", "TMP"]
         .into_iter()
         .filter_map(|key| {
+            // Case-equivalent spellings resolve like env::normalize_environment:
+            // ordinal key order, first spelling wins (conflicts are rejected there).
             env_map
-                .iter().find(|(name, _)| name.eq_ignore_ascii_case(key)).map(|(_, value)| value)
-                .map(|value| PathBuf::from(value.as_str()))
-                .or_else(|| std::env::var_os(key).map(PathBuf::from))
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case(key))
+                .min_by(|a, b| a.0.cmp(b.0))
+                .map(|(_, value)| PathBuf::from(value.as_str()))
         })
         .filter(|path| path.is_absolute())
         .collect()

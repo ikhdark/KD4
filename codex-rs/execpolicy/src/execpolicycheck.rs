@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write as _;
 use std::path::PathBuf;
 
 use anyhow::Context;
@@ -52,7 +53,12 @@ impl ExecPolicyCheckCommand {
         );
 
         let json = format_matches_json(&matched_rules, self.pretty)?;
-        println!("{json}");
+        // Unlike `println!`, a reader that closes the pipe early is not a panic.
+        let mut stdout = std::io::stdout().lock();
+        match writeln!(stdout, "{json}").and_then(|()| stdout.flush()) {
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+            result => result?,
+        }
 
         Ok(())
     }

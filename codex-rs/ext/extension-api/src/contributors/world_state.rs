@@ -15,6 +15,8 @@ pub struct WorldStateContributionInput<'a> {
     /// Selected roots whose stable environments are ready in this sampling step.
     pub ready_selected_capability_roots: &'a [SelectedCapabilityRoot],
     pub bound_selected_capability_roots: &'a [codex_exec_server::ResolvedSelectedCapabilityRoot],
+    /// Current filesystem permissions for each turn environment.
+    pub file_system_sandboxes: &'a [crate::EnvironmentFileSystemSandbox],
     pub session_store: &'a ExtensionData,
     pub thread_store: &'a ExtensionData,
     pub turn_store: &'a ExtensionData,

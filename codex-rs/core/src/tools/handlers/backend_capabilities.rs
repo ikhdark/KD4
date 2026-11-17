@@ -160,7 +160,7 @@ impl ToolExecutor<ToolInvocation> for BackendCapabilitiesHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(async move {
+        let discovered = async move {
             let ToolPayload::Function { ref arguments } = invocation.payload else {
                 return Err(FunctionCallError::RespondToModel(
                     "backend_capabilities requires function arguments".into(),
@@ -192,6 +192,13 @@ impl ToolExecutor<ToolInvocation> for BackendCapabilitiesHandler {
             ).await?);
             crate::tools::context::ensure_exact_model_delivery(&output, &invocation)?;
             Ok(boxed_tool_output(output))
+        };
+        // Discovery never probes by executing operations; a legacy failure
+        // leaves no effects to recover. `effective_snapshot` callers keep theirs.
+        Box::pin(async move {
+            discovered
+                .await
+                .map_err(super::read_tool_output::settled_recovery_failure)
         })
     }
 }

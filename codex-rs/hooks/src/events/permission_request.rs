@@ -39,6 +39,9 @@ pub struct PermissionRequestRequest {
     pub turn_id: String,
     pub subagent: Option<common::SubagentHookContext>,
     pub cwd: PathBuf,
+    /// Local approval action cwd reported in hook stdin. `None` retains `cwd`.
+    /// The hook process still runs in `cwd`.
+    pub tool_cwd: Option<codex_utils_absolute_path::AbsolutePathBuf>,
     pub transcript_path: Option<PathBuf>,
     pub model: String,
     pub permission_mode: String,
@@ -185,7 +188,7 @@ fn build_command_input(request: PermissionRequestRequest) -> PermissionRequestCo
         agent_id: subagent.agent_id,
         agent_type: subagent.agent_type,
         transcript_path: crate::schema::NullableString::from_path(request.transcript_path),
-        cwd: request.cwd.display().to_string(),
+        cwd: common::command_input_cwd(request.cwd.as_path(), request.tool_cwd.as_ref()),
         hook_event_name: "PermissionRequest".to_string(),
         model: request.model,
         permission_mode: request.permission_mode,

@@ -317,6 +317,7 @@ pub(crate) async fn apply_spawn_agent_model_defaults_and_overrides(
         .list_models_shared(RefreshStrategy::Offline, config.http_client_factory())
         .await
         .map_err(|error| {
+            // Leading text matched by multi_agents_v2/spawn.rs pre_effect_settings_refusal.
             FunctionCallError::RespondToModel(format!(
                 "could not resolve the child model catalog: {error}"
             ))
@@ -389,6 +390,7 @@ pub(crate) async fn apply_spawn_agent_service_tier(
     }
 
     let model = config.model.clone().ok_or_else(|| {
+        // Leading text matched by multi_agents_v2/spawn.rs pre_effect_settings_refusal.
         FunctionCallError::RespondToModel(
             "spawn_agent could not resolve the child model for service tier validation".to_string(),
         )
@@ -411,6 +413,7 @@ pub(crate) async fn apply_spawn_agent_service_tier(
                 .collect::<Vec<_>>()
                 .join(", ")
         };
+        // Leading text matched by multi_agents_v2/spawn.rs pre_effect_settings_refusal.
         return Err(FunctionCallError::RespondToModel(format!(
             "Service tier `{requested_service_tier}` is not supported for model `{model}`. Supported service tiers: {supported_service_tiers}"
         )));
@@ -458,6 +461,7 @@ fn find_spawn_agent_model_name(
                 .map(|model| model.model.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
+            // Leading text matched by multi_agents_v2/spawn.rs pre_effect_settings_refusal.
             FunctionCallError::RespondToModel(format!(
                 "Unknown model `{requested_model}` for spawn_agent. Available models: {available}"
             ))
@@ -494,6 +498,7 @@ fn find_default_spawn_agent_model_name(
         .or_else(|| available_models.first())
         .map(|model| model.model.clone())
         .ok_or_else(|| {
+            // Leading text matched by multi_agents_v2/spawn.rs pre_effect_settings_refusal.
             FunctionCallError::RespondToModel(
                 "spawn_agent has no models in the effective provider catalog".to_string(),
             )

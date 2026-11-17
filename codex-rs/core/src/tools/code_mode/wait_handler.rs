@@ -38,9 +38,10 @@ use super::wait_spec::create_wait_tool;
 // matching that inner deadline races cleanup and discards recoverable evidence.
 const INTERRUPTED_CELL_TERMINATION_GRACE: Duration = Duration::from_secs(5);
 // Bounds the detached termination observer for runtimes without their own
-// deadline. It must outlast the remote host's ten-second terminate deadline:
-// that request settles itself, and dropping it while the host still owes an
-// acknowledgment fails the shared host connection closed for every thread.
+// deadline. The remote session keeps an accepted terminate in its own task
+// until the host's stall-compensated deadline settles it (dropping it would
+// fail the shared host connection closed for every thread), so this limit
+// ends only the observation, never that request.
 const DETACHED_TERMINATION_OBSERVATION_LIMIT: Duration = Duration::from_secs(60);
 // Most cells preempted by already-queued mail finish well inside a second,
 // which is far less than the model request needed to wait for them again.

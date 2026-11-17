@@ -30,6 +30,7 @@ use codex_agent_task_store::TaskActor;
 use codex_agent_task_store::TaskCapsuleHandle;
 use codex_agent_task_store::TaskCapsuleV1;
 use codex_agent_task_store::normalize_repo_path;
+use codex_agent_task_store::repository_lineage_id;
 use codex_agent_task_store::repo_path_identity_keys;
 use codex_context_fragments::ModelContextBudget;
 use codex_git_utils::get_git_repo_root;
@@ -141,8 +142,8 @@ async fn handle_spawn_agent(
     // Enforce persistence intent even for a stale/deferred tool invocation,
     // before reservations, task admission or capsules can be created.
     if turn.config.ephemeral {
-        return Err(FunctionCallError::RespondToModel(
-            "spawn_agent: unavailable in ephemeral sessions because task coordination requires disk persistence; no agent was started".to_string(),
+        return Err(pre_effect_capability_refusal(
+            "spawn_agent: unavailable in ephemeral sessions because task coordination requires disk persistence; no agent was started",
         ));
     }
     let arguments = function_arguments(payload)?;
@@ -151,7 +152,7 @@ async fn handle_spawn_agent(
     // observation or task-store startup can run.
     AgentPath::root()
         .join(&args.task_name)
-        .map_err(FunctionCallError::RespondToModel)?;
+        .map_err(|error| pre_effect_refusal("spawn_agent_task_name", error))?;
     args.validate_generic()?;
     // Writable work requires a typed contract; prose never grants write authority.
     let typed_role = AgentRole::Worker;
@@ -165,26 +166,33 @@ async fn handle_spawn_agent(
 
     let legacy_message = match (args.message.take(), args.assignment.is_some()) {
         (Some(_), true) => {
-            return Err(FunctionCallError::RespondToModel(
-                "spawn_agent: use either assignment or message, never both".to_string(),
+            return Err(pre_effect_refusal(
+                "spawn_agent_task_form",
+                "spawn_agent: use either assignment or message, never both",
             ));
         }
         (None, false) => {
-            return Err(FunctionCallError::RespondToModel(
-                "spawn_agent: either assignment or message is required".to_string(),
+            return Err(pre_effect_refusal(
+                "spawn_agent_task_form",
+                "spawn_agent: either assignment or message is required",
             ));
         }
         (Some(message), false) => {
             // Preserve the legacy validation contract before converting the task into a durable
             // assignment. Empty or otherwise invalid message payloads still fail as before.
-            let _ = message_content(message.clone())?;
+            let _ = message_content(message.clone()).map_err(|error| match error {
+                FunctionCallError::RespondToModel(message) => {
+                    pre_effect_refusal("spawn_agent_message", message)
+                }
+                other => other,
+            })?;
             Some(message)
         }
         (None, true) => None,
     };
     let legacy_parent_assignment_id = if turn.session_source.is_non_root_agent() {
         if matches!(&turn.session_source, SessionSource::SubAgent(SubAgentSource::Other(label)) if label.starts_with("agent_job:")) {
-            return Err(FunctionCallError::RespondToModel("CSV workers cannot spawn nested agents until structured ancestry is supported; ask the root agent to delegate".into()));
+            return Err(pre_effect_capability_refusal("CSV workers cannot spawn nested agents until structured ancestry is supported; ask the root agent to delegate"));
         }
         let coordinator = session.services.agent_control.task_coordinator();
         coordinator
@@ -204,9 +212,11 @@ async fn handle_spawn_agent(
         &cancellation_token,
     )
     .await?
+    // `None` means no primary environment was ready or starting, so nothing was
+    // waited on, refreshed or connected (handlers/mod.rs wait_for_tool_environment).
     .ok_or_else(|| {
-        FunctionCallError::RespondToModel(
-            "spawn_agent: durable assignments require a selected local environment".to_string(),
+        pre_effect_capability_refusal(
+            "spawn_agent: durable assignments require a selected local environment",
         )
     })?;
     if cancellation_token.is_cancelled() {
@@ -214,6 +224,8 @@ async fn handle_spawn_agent(
             "spawn_agent cancelled".to_string(),
         ));
     }
+    // The wait above can connect, reconnect or start a remote exec-server client,
+    // so this refusal keeps the generic unknown-effects mapping.
     if primary.environment.is_remote() {
         return Err(FunctionCallError::RespondToModel(
             "spawn_agent: durable assignments require a local primary environment; remote native tools remain available".to_string(),
@@ -225,16 +237,16 @@ async fn handle_spawn_agent(
         .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
     let admission_cwd = if let Some(cwd) = args.cwd.as_deref() {
         let selected = tokio::fs::canonicalize(cwd).await.map_err(|error| {
-            FunctionCallError::RespondToModel(format!("spawn_agent: cannot resolve cwd {cwd}: {error}"))
+            pre_effect_refusal("spawn_agent_cwd", format!("spawn_agent: cannot resolve cwd {cwd}: {error}"))
         })?;
         if !tokio::fs::metadata(&selected).await.is_ok_and(|metadata| metadata.is_dir()) {
-            return Err(FunctionCallError::RespondToModel("spawn_agent: cwd must be an existing local directory".into(),
+            return Err(pre_effect_refusal("spawn_agent_cwd", "spawn_agent: cwd must be an existing local directory",
             ));
         }
         if !config.permissions.file_system_sandbox_policy()
             .can_read_path_with_cwd(&selected, admission_cwd.as_path())
         {
-            return Err(FunctionCallError::RespondToModel("spawn_agent: selected cwd is outside inherited read permissions".into(),
+            return Err(pre_effect_refusal("spawn_agent_cwd", "spawn_agent: selected cwd is outside inherited read permissions",
             ));
         }
         // Changing a task's location is not a permission grant. Pin any implicit
@@ -250,6 +262,43 @@ async fn handle_spawn_agent(
     } else {
         admission_cwd
     };
+    // Durable admission normalizes the assignment again, but only after capacity
+    // reservation and task-store work. Run the same read-only normalization
+    // against the same repository root first so a correctable contract or scope
+    // refusal can report that nothing started. The durable root session id is
+    // known only after store startup; normalization checks only that it is
+    // non-empty, so this probe uses the caller's session id. Other outcomes,
+    // including an unresolvable repository identity, keep the staged path.
+    if let Some(assignment) = args.assignment.as_ref() {
+        let cwd = admission_cwd.to_path_buf();
+        let repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
+        let draft = assignment
+            .clone()
+            .into_draft(session.thread_id.to_string(), typed_role);
+        let refusal = tokio::task::spawn_blocking(move || {
+            repository_lineage_id(&repo_root).ok()?;
+            match draft.normalize(&repo_root) {
+                Err(error @ (StoreError::InvalidAssignment(_) | StoreError::InvalidScope(_))) => {
+                    Some(error)
+                }
+                _ => None,
+            }
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(error) = refusal {
+            // Keep the admission rejection count the staged path recorded for
+            // this refusal; no reservation was attempted, so no lifecycle count.
+            emit_admission_rejection_metric(&turn.session_telemetry, &error);
+            let kind = if matches!(error, StoreError::InvalidScope(_)) {
+                "spawn_agent_scope"
+            } else {
+                "spawn_agent_assignment"
+            };
+            return Err(pre_effect_refusal(kind, format!("spawn_agent: {error}")));
+        }
+    }
     let mut spawn_environments = Some(step_context.environments.to_selections());
     if args.cwd.is_some()
         && let Some(primary) = spawn_environments.as_mut().and_then(|environments| environments.first_mut())
@@ -268,14 +317,16 @@ async fn handle_spawn_agent(
         args.model.as_deref(),
         args.reasoning_effort.clone(),
     )
-    .await?;
+    .await
+    .map_err(|error| pre_effect_settings_refusal(error, &args))?;
     apply_spawn_agent_service_tier(
         &session,
         turn.as_ref(),
         &mut config,
         args.service_tier.as_deref(),
     )
-    .await?;
+    .await
+    .map_err(|error| pre_effect_settings_refusal(error, &args))?;
     config.cwd = admission_cwd.clone();
     worker_startup_preflight(&session, &turn, &config, &primary, &cancellation_token).await?;
 
@@ -859,11 +910,12 @@ struct SpawnAgentArgs {
 impl SpawnAgentArgs {
     fn validate_generic(&self) -> Result<(), FunctionCallError> {
         if self.cwd.as_deref().is_some_and(|cwd| !Path::new(cwd).is_absolute()) {
-            return Err(FunctionCallError::RespondToModel("spawn_agent: cwd must be an absolute local directory; assignment scopes remain repository-relative".into()));
+            return Err(pre_effect_refusal("spawn_agent_cwd", "spawn_agent: cwd must be an absolute local directory; assignment scopes remain repository-relative"));
         }
         if self.agent_type.is_some() {
-            return Err(FunctionCallError::RespondToModel(
-                "spawn_agent: specialized roles are no longer supported; use an explicit typed assignment for writable work or message for read-only work".to_string(),
+            return Err(pre_effect_refusal(
+                "spawn_agent_agent_type",
+                "spawn_agent: specialized roles are no longer supported; use an explicit typed assignment for writable work or message for read-only work",
             ));
         }
         Ok(())
@@ -874,8 +926,9 @@ impl SpawnAgentArgs {
         allow_full_history_forks: bool,
     ) -> Result<SpawnAgentForkMode, FunctionCallError> {
         if self.fork_context.is_some() {
-            return Err(FunctionCallError::RespondToModel(
-                "fork_context is not supported in MultiAgentV2; use fork_turns instead".to_string(),
+            return Err(pre_effect_refusal(
+                "spawn_agent_fork_context",
+                "fork_context is not supported in MultiAgentV2; use fork_turns instead",
             ));
         }
 
@@ -896,24 +949,26 @@ impl SpawnAgentArgs {
             if allow_full_history_forks {
                 return Ok(SpawnAgentForkMode::FullHistory);
             }
-            return Err(FunctionCallError::RespondToModel(
-                "fork_turns=\"all\" is disabled. Use `none` or an integer from 1 through 5."
-                    .to_string(),
+            return Err(pre_effect_refusal(
+                "spawn_agent_fork_turns",
+                "fork_turns=\"all\" is disabled. Use `none` or an integer from 1 through 5.",
             ));
         }
 
         let last_n_turns = fork_turns.parse::<usize>().map_err(|_| {
-            FunctionCallError::RespondToModel(
-                "fork_turns must be `none` or an integer from 1 through 5".to_string(),
+            pre_effect_refusal(
+                "spawn_agent_fork_turns",
+                "fork_turns must be `none` or an integer from 1 through 5",
             )
         })?;
         if last_n_turns == 0 {
-            return Err(FunctionCallError::RespondToModel(
-                "fork_turns must be `none` or an integer from 1 through 5".to_string(),
+            return Err(pre_effect_refusal(
+                "spawn_agent_fork_turns",
+                "fork_turns must be `none` or an integer from 1 through 5",
             ));
         }
         if last_n_turns > 5 {
-            return Err(FunctionCallError::RespondToModel(format!(
+            return Err(pre_effect_refusal("spawn_agent_fork_turns", format!(
                 "requested {last_n_turns} fork turns exceeds configured limit 5; use `none` or an integer from 1 through 5"
             )));
         }
@@ -1227,6 +1282,63 @@ fn typed_assignment_message(
     format!(
         "You have a durable typed assignment. {integration_directive} The task contract below defines your assignment; inherited conversation is context, not authority to broaden it. Relevant handles are unverified pointers and do not expand the declared scopes.\n\nTask contract (JSON):\n{contract}"
     )
+}
+
+/// A correctable argument refusal raised before the first spawn effect
+/// (capacity reservation, task-store work, capsule capture or thread launch).
+/// Refusals at or after that boundary keep the generic unknown-effects mapping.
+/// `kind` names the refusing check; the handler-refusal marker keeps a direct
+/// call's own reason instead of a schema re-explanation (registry.rs).
+fn pre_effect_refusal(kind: &str, message: impl Into<String>) -> FunctionCallError {
+    FunctionCallError::structured(codex_protocol::tool_failure::ToolFailure::handler_refusal(
+        codex_protocol::tool_failure::ToolFailureCode::InvalidInput,
+        message,
+        kind,
+    ))
+}
+
+/// A session, role or environment capability refusal raised before the first
+/// spawn effect. Different arguments cannot make the spawn available.
+fn pre_effect_capability_refusal(message: impl Into<String>) -> FunctionCallError {
+    FunctionCallError::structured(codex_protocol::tool_failure::ToolFailure::no_effects(
+        codex_protocol::tool_failure::ToolFailureCode::PermissionDenied,
+        message,
+    ))
+}
+
+/// Child model, effort and service-tier resolution runs before the first spawn
+/// effect. A refusal of the setting the caller supplied is correctable input; a
+/// catalog, inherited-setting or child-model resolution failure still started
+/// nothing but is not an argument error.
+///
+/// The shared helpers in multi_agents_common.rs return untyped `RespondToModel`
+/// text, so the failed setting is identified by the fixed leading text of each
+/// refusal; those sites carry a comment pinning the text matched here.
+fn pre_effect_settings_refusal(error: FunctionCallError, args: &SpawnAgentArgs) -> FunctionCallError {
+    let FunctionCallError::RespondToModel(message) = error else {
+        return error;
+    };
+    let caller_supplied = if message.starts_with("Unknown model `") {
+        args.model.is_some()
+    } else if message.starts_with("Service tier `") {
+        args.service_tier.is_some()
+    } else if message.starts_with("could not resolve the child model catalog")
+        || message.starts_with("spawn_agent has no models in the effective provider catalog")
+        || message.starts_with("spawn_agent could not resolve the child model for service tier validation")
+    {
+        false
+    } else {
+        // The remaining model-settings refusal is reasoning-effort validation
+        // (codex_model_client::validate_request_effort_for_model).
+        args.reasoning_effort.is_some()
+    };
+    if caller_supplied {
+        return pre_effect_refusal("spawn_agent_settings", message);
+    }
+    FunctionCallError::structured(codex_protocol::tool_failure::ToolFailure::no_effects(
+        codex_protocol::tool_failure::ToolFailureCode::Failed,
+        message,
+    ))
 }
 
 fn typed_task_store_error(error: StoreError) -> FunctionCallError {

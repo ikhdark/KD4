@@ -2796,13 +2796,24 @@ LIMIT 1
                     continue;
                 }
             }
-            let Some(_capsule_lease) = try_capsule_lease(capsule_dir.join(format!("{stem}.lock"))).await? else {
+            let lease_path = capsule_dir.join(format!("{stem}.lock"));
+            let _capsule_lease = match try_capsule_lease(lease_path.clone()).await {
+                Ok(Some(lease)) => lease,
                 // A live publisher owns recovery; unrelated roots need not wait.
-                continue;
+                Ok(None) => continue,
+                // An inaccessible lease is assignment-local like an inaccessible
+                // sidecar: settle nothing without it, as for a busy lease.
+                Err(StoreError::Io(error)) => {
+                    tracing::warn!(path = %lease_path.display(), capsule = %path.display(), %error, "task capsule lease unavailable; capsule left unsettled and its assignment remains unavailable");
+                    continue;
+                }
+                Err(error) => return Err(error),
             };
             // Each incomplete publication is isolated. Retain its bytes and
             // make the affected assignment fail closed, not the entire store.
             let mut invalid_payload = false;
+            // Set once a stage has left its path for the published slot.
+            let mut published_path: Option<PathBuf> = None;
             let result: StoreResult<()> = async {
                 let payload = match tokio::fs::read_to_string(&path).await {
                     Ok(payload) => payload,
@@ -2845,7 +2856,11 @@ LIMIT 1
                     }
                 };
                 if let Err(error) = validate_capsule_contract_tx(&mut transaction, &assignment, &capsule).await {
-                    invalid_payload = matches!(error, StoreError::CorruptData(_) | StoreError::AttemptNotFound(_));
+                    // A capsule whose manifest no longer matches its assignment,
+                    // e.g. an uncommitted publication after a repository identity
+                    // upgrade, is payload-local like any other contract mismatch.
+                    invalid_payload = matches!(error, StoreError::CorruptData(_)
+                        | StoreError::AttemptNotFound(_) | StoreError::InvalidTaskCapsule(_));
                     return Err(error);
                 }
                 let expected_path = if is_stage {
@@ -2869,13 +2884,28 @@ LIMIT 1
                         }
                         tokio::fs::remove_file(&path).await?;
                     } else {
-                        tokio::fs::rename(&path, final_path).await?;
+                        tokio::fs::rename(&path, &final_path).await?;
                     }
+                    published_path = Some(final_path);
                 }
                 let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-                let current = load_assignment_tx(&mut transaction, capsule.assignment_id).await?;
-                validate_capsule_contract_tx(&mut transaction, &current, &capsule).await?;
+                // Another process may have changed the assignment since the first
+                // check (e.g. upgraded its repository binding); classify exactly
+                // as that check does, so a mismatch fails only this assignment.
+                let current = match load_assignment_tx(&mut transaction, capsule.assignment_id).await {
+                    Ok(current) => current,
+                    Err(error) => {
+                        invalid_payload = matches!(error, StoreError::AssignmentNotFound(_));
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = validate_capsule_contract_tx(&mut transaction, &current, &capsule).await {
+                    invalid_payload = matches!(error, StoreError::CorruptData(_)
+                        | StoreError::AttemptNotFound(_) | StoreError::InvalidTaskCapsule(_));
+                    return Err(error);
+                }
                 if current.task_capsule.as_ref().is_some_and(|expected| expected != &payload) {
+                    invalid_payload = true;
                     return Err(StoreError::CorruptData("capsule authority changed during recovery".into()));
                 }
                 if current.task_capsule.is_none() {
@@ -2897,12 +2927,15 @@ LIMIT 1
                 if !invalid_payload {
                     return Err(error);
                 }
-                if !is_stage {
+                if !is_stage || published_path.is_some() {
                     // One damaged published capsule must not fail every store
                     // open, and with it every session start. Its bytes stay in
                     // place: attach cannot substitute them, nothing is
                     // backfilled, and each read of that assignment fails closed.
-                    tracing::warn!(path = %path.display(), %error, "invalid published task capsule retained; its assignment fails closed and unrelated tasks remain available");
+                    // A stage settled before its revalidation failed is that
+                    // published capsule now; no stage remains to quarantine.
+                    let retained = published_path.as_ref().unwrap_or(&path);
+                    tracing::warn!(path = %retained.display(), %error, "invalid published task capsule retained; its assignment fails closed and unrelated tasks remain available");
                     continue;
                 }
                 // Keep one diagnostic payload per staging name without making

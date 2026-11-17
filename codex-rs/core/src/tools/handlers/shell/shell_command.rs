@@ -25,6 +25,9 @@ use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
+use crate::tools::handlers::before_launch;
+use crate::tools::handlers::command_argument_refusal;
+use crate::tools::handlers::command_not_started;
 use crate::tools::handlers::command_preflight::preflight_invocation_for_kd4_runtime;
 use crate::tools::handlers::command_search::rg_search_no_match_eligible;
 use crate::tools::handlers::command_shape::CommandInvocation;
@@ -216,9 +219,10 @@ impl ShellCommandHandler {
             None,
             &invocation.cancellation_token,
         )
-        .await?
+        .await
+        .map_err(before_launch(command_not_started))?
         else {
-            return Err(FunctionCallError::RespondToModel(
+            return Err(command_not_started(
                 "shell is unavailable in this session".to_string(),
             ));
         };
@@ -228,7 +232,7 @@ impl ShellCommandHandler {
             let turn = &invocation.step_context.turn;
             let allow_login_shell = turn.config.permissions.allow_login_shell;
             let ToolPayload::Function { arguments } = &mut invocation.payload else {
-                return Err(FunctionCallError::RespondToModel(
+                return Err(command_argument_refusal(
                     "unsupported payload for shell_command handler".to_string(),
                 ));
             };
@@ -236,7 +240,8 @@ impl ShellCommandHandler {
                 arguments,
                 &turn_environment.environment_id,
                 allow_login_shell,
-            )?;
+            )
+            .map_err(before_launch(command_argument_refusal))?;
             return ExecCommandHandler::new(ExecCommandHandlerOptions {
                 allow_login_shell: self.options.allow_login_shell,
                 allow_escalated_sandbox_permissions: self
@@ -267,13 +272,13 @@ impl ShellCommandHandler {
 
         let tool_name = self.tool_name();
         let ToolPayload::Function { arguments } = payload else {
-            return Err(FunctionCallError::RespondToModel(format!(
+            return Err(command_argument_refusal(format!(
                 "unsupported payload for shell_command handler: {tool_name}"
             )));
         };
 
         let environment_cwd = turn_environment.cwd().to_abs_path().map_err(|err| {
-            FunctionCallError::RespondToModel(format!(
+            command_not_started(format!(
                 "shell_command cwd `{}` is not native to the Codex host: {err}",
                 turn_environment.cwd()
             ))
@@ -288,15 +293,16 @@ impl ShellCommandHandler {
             params.program.as_deref(),
             params.args.as_deref(),
             params.script_body.as_deref(),
-        )?;
+        )
+        .map_err(before_launch(command_argument_refusal))?;
         let prefix_rule = params.prefix_rule.clone();
         let allow_login_shell = turn.config.permissions.allow_login_shell;
         let use_login_shell = resolve_use_login_shell(params.login, allow_login_shell)
-            .map_err(FunctionCallError::RespondToModel)?;
+            .map_err(command_argument_refusal)?;
         let session_shell = session
             .shell_for_environment(&turn_environment)
             .await
-            .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+            .map_err(|error| command_not_started(error.to_string()))?;
         let original_safety_shell = resolve_command_shell_async(
             &original_invocation,
             &turn_environment,
@@ -305,12 +311,12 @@ impl ShellCommandHandler {
         )
         .await?;
         if original_invocation.is_argv() && params.login.is_some() {
-            return Err(FunctionCallError::RespondToModel(
+            return Err(command_argument_refusal(
                 "`login` is only valid for shell scripts, not program/args.".into(),
             ));
         }
         if original_safety_shell.shell_type == ShellType::Cmd && params.login == Some(true) {
-            return Err(FunctionCallError::RespondToModel(
+            return Err(command_argument_refusal(
                 "cmd.exe does not support login/profile loading; omit `login` or set it to false."
                     .into(),
             ));
@@ -320,8 +326,9 @@ impl ShellCommandHandler {
                 original_safety_shell.shell_path.to_string_lossy().into_owned(),
             );
         }
-        let original_safety_command =
-            original_invocation.to_safety_args(&original_safety_shell, use_login_shell)?;
+        let original_safety_command = original_invocation
+            .to_safety_args(&original_safety_shell, use_login_shell)
+            .map_err(before_launch(command_argument_refusal))?;
         let original_shell_type = if original_invocation.is_argv() {
             None
         } else {
@@ -345,10 +352,11 @@ impl ShellCommandHandler {
             allow_native_analysis.then_some(cwd.as_path()),
         )
         .await
+        // Returned before the runtime launches anything below.
         .map_err(|issue| {
-            FunctionCallError::RespondToModel(format!(
-                "{issue}\nRegenerate the command and call `shell_command` again."
-            ))
+            let message =
+                format!("{issue}\nRegenerate the command and call `shell_command` again.");
+            issue.into_pre_launch_error(message)
         })?;
         let command_repaired = preflight.repaired();
         let repair_notice = preflight.model_notice();
@@ -394,7 +402,9 @@ impl ShellCommandHandler {
             original_safety_shell
         };
         let safety_command = if invocation_changed {
-            command_invocation.to_safety_args(&safety_shell, use_login_shell)?
+            command_invocation
+                .to_safety_args(&safety_shell, use_login_shell)
+                .map_err(before_launch(command_argument_refusal))?
         } else {
             original_safety_command.clone()
         };
@@ -413,7 +423,8 @@ impl ShellCommandHandler {
             cwd,
             allow_login_shell,
             &safety_shell,
-        )?;
+        )
+        .map_err(before_launch(command_argument_refusal))?;
         let sandbox_context = (
             params.sandbox_permissions.unwrap_or_default(),
             &params.additional_permissions,
@@ -466,7 +477,7 @@ impl ShellCommandHandler {
             let eligible = crate::tools::run_blocking_command_analysis(move || {
                 rg_search_no_match_eligible(&search_command, shell_type)
             }).await.map_err(|error| {
-                FunctionCallError::RespondToModel(format!("command search worker failed: {error}"))
+                command_not_started(format!("command search worker failed: {error}"))
             })?;
             let attempt_key = attempt_key
                 .with_search_no_match_eligibility(eligible)
@@ -549,7 +560,7 @@ async fn resolve_command_shell_async(
     })
     .await
     .map_err(|error| {
-        FunctionCallError::RespondToModel(format!("shell discovery worker failed: {error}"))
+        command_not_started(format!("shell discovery worker failed: {error}"))
     })?
 }
 
@@ -562,21 +573,21 @@ pub(super) fn resolve_command_shell(
     let environment_shell = turn_environment.shell.as_ref().unwrap_or(session_shell);
     if let Some(requested) = requested_shell {
         if invocation.is_argv() {
-            return Err(FunctionCallError::RespondToModel(
+            return Err(command_argument_refusal(
                 "`shell` is only valid for shell scripts, not program/args.".into(),
             ));
         }
         let selected = if turn_environment.environment.is_remote() {
             if requested != environment_shell.shell_path.to_string_lossy() {
-                return Err(FunctionCallError::RespondToModel("Remote shell overrides must exactly match the reported executable; alternate executables are not supported.".into()));
+                return Err(command_argument_refusal("Remote shell overrides must exactly match the reported executable; alternate executables are not supported.".into()));
             }
             environment_shell.clone()
         } else {
             crate::shell::get_shell_by_model_provided_path(&std::path::PathBuf::from(requested))
-                .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
+                .map_err(|error| command_argument_refusal(error.to_string()))?
         };
         if invocation.is_powershell_script() && selected.shell_type != ShellType::PowerShell {
-            return Err(FunctionCallError::RespondToModel(
+            return Err(command_argument_refusal(
                 "`script_body` requires a PowerShell executable.".into(),
             ));
         }
@@ -589,14 +600,14 @@ pub(super) fn resolve_command_shell(
         return Ok(environment_shell.clone());
     }
     if turn_environment.environment.is_remote() {
-        return Err(FunctionCallError::RespondToModel(
+        return Err(command_argument_refusal(
             "`kind: \"powershell_script\"` requires the selected remote environment to report PowerShell."
                 .to_string(),
         ));
     }
 
     get_shell(ShellType::PowerShell, /*path*/ None).ok_or_else(|| {
-        FunctionCallError::RespondToModel(
+        command_argument_refusal(
             "`kind: \"powershell_script\"` requires PowerShell in this environment; use `kind: \"script\"` with an available shell instead."
                 .to_string(),
         )
@@ -643,6 +654,28 @@ impl CoreToolRuntime for ShellCommandHandler {
                 tool_name,
                 tool_input: command.hook_input(),
             })
+    }
+
+    /// Mirrors `handle_call`'s local cwd resolution. Remote or non-native
+    /// environments are forwarded to `exec_command` and keep the host cwd.
+    fn pre_tool_use_cwd(&self, invocation: &ToolInvocation) -> Option<PathUri> {
+        let ToolPayload::Function { arguments } = &invocation.payload else {
+            return None;
+        };
+        let environment = crate::tools::handlers::resolve_tool_environment(
+            &invocation.step_context.environments,
+            None,
+        )
+        .ok()??;
+        if environment.environment.is_remote()
+            || environment.cwd().infer_path_convention() != Some(PathConvention::native())
+        {
+            return None;
+        }
+        let environment_cwd = environment.cwd().to_abs_path().ok()?;
+        resolve_workdir_base_path(arguments, &environment_cwd)
+            .ok()
+            .map(|cwd| PathUri::from_abs_path(&cwd))
     }
 
     fn post_tool_use_hook_name(&self, invocation: &ToolInvocation) -> Option<HookToolName> {

@@ -165,7 +165,7 @@ impl Session {
         }
 
         let turn_context = self
-            .new_default_turn_with_sub_id(uuid::Uuid::new_v4().to_string())
+            .new_default_admitted_turn_with_sub_id(uuid::Uuid::new_v4().to_string())
             .await;
         if turn_context.collaboration_mode.mode == ModeKind::Plan {
             self.clear_reserved_idle_turn(&turn_state).await;
@@ -200,8 +200,9 @@ impl Session {
             return Err(TryStartTurnIfIdleError::new(reason, input));
         }
         let start_result = self
-            .start_task_with_admission(
+            .start_reserved_task_with_admission(
                 &task_start_permit,
+                &turn_state,
                 turn_context,
                 Vec::new(),
                 RegularTask::new(),

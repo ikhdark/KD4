@@ -84,7 +84,7 @@ impl ToolExecutor<ToolInvocation> for LineEndingDiagnosticsHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(async move {
+        let diagnosed = async move {
             let ToolPayload::Function { ref arguments } = invocation.payload else {
                 return Err(FunctionCallError::RespondToModel(
                     "line_ending_diagnostics requires function arguments".into(),
@@ -111,6 +111,13 @@ impl ToolExecutor<ToolInvocation> for LineEndingDiagnosticsHandler {
             }));
             crate::tools::context::ensure_exact_model_delivery(&result, &invocation)?;
             Ok(boxed_tool_output(result))
+        };
+        // The shared checksum owner only reads the source (it settles its own
+        // failures the same way); nothing is left to recover.
+        Box::pin(async move {
+            diagnosed
+                .await
+                .map_err(super::read_tool_output::settled_recovery_failure)
         })
     }
 }

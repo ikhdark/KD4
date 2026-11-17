@@ -612,7 +612,20 @@ impl ToolEmitter {
                     message: bounded.clone(),
                     applied_patch_delta,
                 });
-                let result = Err(FunctionCallError::RespondToModel(bounded));
+                // Only the orchestrator denies a shell command, at approval and
+                // before its launch attempt, so nothing ran. A patch denial can
+                // follow applied changes and keeps the legacy unknown certainty.
+                let result = Err(match self {
+                    Self::Shell { .. } => FunctionCallError::structured(
+                        codex_protocol::tool_failure::ToolFailure::no_effects(
+                            codex_protocol::tool_failure::ToolFailureCode::PermissionDenied,
+                            bounded,
+                        ),
+                    ),
+                    Self::ApplyPatch { .. } | Self::UnifiedExec { .. } => {
+                        FunctionCallError::RespondToModel(bounded)
+                    }
+                });
                 (event, result)
             }
         };
@@ -620,6 +633,7 @@ impl ToolEmitter {
             let outcome = match &result {
                 Ok(content) => content.as_str(),
                 Err(FunctionCallError::RespondToModel(content)) => content.as_str(),
+                Err(FunctionCallError::Structured(failure)) => failure.message.as_str(),
                 _ => "The tool outcome was recorded in the completion event.",
             };
             return Err(FunctionCallError::Fatal(format!(

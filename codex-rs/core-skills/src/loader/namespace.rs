@@ -42,6 +42,7 @@ impl SkillNamespaceResolver {
         skill_paths: &[PathUri],
         plugin_roots: HashSet<PathUri>,
         namespace_roots: HashSet<PathUri>,
+        sandbox: Option<&codex_exec_server::FileSystemSandboxContext>,
     ) -> Self {
         // Only probe plugin roots above loaded skills; unused siblings cannot affect names.
         let mut skill_ancestors = HashSet::new();
@@ -89,7 +90,8 @@ impl SkillNamespaceResolver {
             namespaces_by_root.extend(
                 futures::stream::iter(probe_roots)
                     .map(|manifest_root| async move {
-                        let namespace = plugin_namespace_for_root_uri(fs, &manifest_root).await;
+                        let namespace =
+                            plugin_namespace_for_root_uri(fs, &manifest_root, sandbox).await;
                         (manifest_root, namespace)
                     })
                     // Roots are unique and collected by key; a slow probe must not

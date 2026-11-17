@@ -137,6 +137,12 @@ pub struct PersistedThreadSettingsReducer {
     settings: PersistedThreadSettings,
     saw_initial_session_meta: bool,
     saw_authoritative_environments: bool,
+    /// Turn most recently started in rollout order.
+    last_started_turn_id: Option<String>,
+    /// Turn that had already started when the latest settings snapshot was
+    /// acknowledged. Its context was frozen before that snapshot, so a
+    /// `TurnContext` it commits later must not overwrite the snapshot.
+    stale_turn_id: Option<String>,
 }
 
 impl PersistedThreadSettingsReducer {
@@ -145,6 +151,8 @@ impl PersistedThreadSettingsReducer {
             settings: fallback,
             saw_initial_session_meta: false,
             saw_authoritative_environments: false,
+            last_started_turn_id: None,
+            stale_turn_id: None,
         }
     }
 
@@ -175,9 +183,23 @@ impl PersistedThreadSettingsReducer {
                         Some(TurnEnvironmentSelections::new(cwd, Vec::new()));
                 }
             }
-            RolloutItem::TurnContext(turn_context) => self.apply_turn_context(turn_context),
+            RolloutItem::TurnContext(turn_context) => {
+                // A turn's context is frozen when it starts but committed lazily,
+                // so it can land after a settings snapshot acknowledged while the
+                // turn was running. That context predates the snapshot.
+                let predates_snapshot = turn_context.turn_id.is_some()
+                    && turn_context.turn_id == self.stale_turn_id;
+                if !predates_snapshot {
+                    self.apply_turn_context(turn_context);
+                }
+            }
             RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => {
                 self.apply_snapshot(&event.thread_settings);
+                self.stale_turn_id = self.last_started_turn_id.clone();
+            }
+            RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => {
+                self.last_started_turn_id = Some(event.turn_id.clone());
+                self.stale_turn_id = None;
             }
             RolloutItem::SessionMeta(_)
             | RolloutItem::ToolManifest(_)

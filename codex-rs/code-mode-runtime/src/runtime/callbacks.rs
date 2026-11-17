@@ -136,6 +136,17 @@ pub(super) fn tool_callback(
     retval.set(promise.into());
 }
 
+/// Private capability of the Promise aggregate wrapper, removed from globals
+/// before cell code runs: (joinAll, resultPromise, membersArray). Provenance
+/// only; it returns nothing and changes no scheduling or settlement.
+pub(super) fn aggregate_observation_callback(
+    scope: &mut v8::PinScope<'_, '_>, args: v8::FunctionCallbackArguments,
+    _retval: v8::ReturnValue<v8::Value>,
+) {
+    let join_all = args.get(0).is_true();
+    super::causal::aggregate(scope, join_all, args.get(1), args.get(2));
+}
+
 /// Private adapter captured by the validated run_graph helper and then removed
 /// from globals. V8 preserves this tag across async continuations, including
 /// awaits and Promise.all. It changes no scheduling, admission or tool result.

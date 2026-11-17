@@ -362,7 +362,9 @@ pub(super) async fn user_input_or_turn_inner(
         };
     }
     // A fresh top-level user turn gets a new launch scope. Child input and
-    // resumed/internal contexts keep the captured root turn and shared ledger.
+    // resumed/internal contexts keep the captured root turn and shared ledger
+    // unless an admitted turn start adopts their root's current turn for a
+    // follow-up sent under it.
     if !session_configuration.session_source.is_non_root_agent() {
         let scope = Some((sess.thread_id().to_string(), sub_id.clone()));
         session_configuration.validation_root_turn = scope.clone();
@@ -391,7 +393,8 @@ pub(super) async fn user_input_or_turn_inner(
             .turn_metadata_state
             .set_responsesapi_client_metadata(responsesapi_client_metadata);
     }
-    current_context.session_telemetry.user_prompt(&items);
+    // Prompt telemetry is emitted only after UserPromptSubmit inspection accepts the
+    // input (session/turn.rs inspect_inputs), so rejected prompts are never exported.
     sess.refresh_mcp_servers_if_requested(&current_context)
         .await;
     let additional_context = match sess

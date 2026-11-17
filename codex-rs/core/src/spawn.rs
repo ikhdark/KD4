@@ -133,9 +133,11 @@ fn trace_spawn_child(
     stdio_policy: StdioPolicy,
     env: &HashMap<String, String>,
 ) {
+    // Arguments carry user and model command text; the log database keeps TRACE, so
+    // record only their count.
     trace!(
         ?program,
-        ?args,
+        args_len = args.len(),
         ?arg0,
         ?cwd,
         ?network_sandbox_policy,

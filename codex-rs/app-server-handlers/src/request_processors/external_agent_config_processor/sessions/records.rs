@@ -61,6 +61,16 @@ pub fn summarize_session(path: &Path) -> io::Result<Option<SessionSummary>> {
             continue;
         }
         let mut record = serde_json::from_str::<JsonValue>(trimmed).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("invalid session JSON record: {error}")))?;
+        // Backgrounding replaces this session with a continuation that includes its
+        // history; offer only the continuation (upstream #55365).
+        if record.get("type").and_then(JsonValue::as_str) == Some("continued-in")
+            && record
+                .get("continuedInSessionId")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|id| !id.trim().is_empty())
+        {
+            return Ok(None);
+        }
         if let Some(title) = custom_title_from_record(&record) {
             custom_title = Some(title.to_string());
         }

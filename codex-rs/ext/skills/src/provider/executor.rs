@@ -3,6 +3,7 @@ use std::sync::Arc;
 use codex_core_skills::loader::EnvironmentSkillMetadata;
 use codex_core_skills::loader::load_environment_skills_from_root;
 use codex_exec_server::EnvironmentManager;
+use codex_extension_api::environment_file_system_sandbox;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::protocol::Product;
 use codex_utils_path_uri::PathConvention;
@@ -71,11 +72,22 @@ impl SkillProvider for ExecutorSkillProvider {
                         "Selected capability root `{selected_root_id}` references unavailable environment `{environment_id}`."
                     )));
                 };
+                // Discovery runs under the turn's current filesystem permissions, never
+                // with ambient executor access. Without them the root is refused.
+                let Some(sandbox) = environment_file_system_sandbox(
+                    &query.executor_file_system_sandboxes,
+                    &environment_id,
+                ) else {
+                    return Err(SkillProviderError::new(format!(
+                        "Selected capability root `{selected_root_id}` has no current filesystem permissions for environment `{environment_id}`."
+                    )));
+                };
                 let file_system = environment.get_filesystem();
                 let outcome = load_environment_skills_from_root(
                     file_system.as_ref(),
                     &path,
                     self.restriction_product,
+                    Some(sandbox),
                 )
                 .await;
                 catalog.warnings.extend(outcome.warnings);
@@ -122,9 +134,20 @@ impl SkillProvider for ExecutorSkillProvider {
                     "executor skill resource references unavailable environment `{environment_id}`"
                 )));
             };
+            // A cached catalog entry never authorizes the read: it runs under the
+            // requesting turn's current filesystem permissions or is refused.
+            let Some(sandbox) = environment_file_system_sandbox(
+                &request.executor_file_system_sandboxes,
+                environment_id,
+            ) else {
+                return Err(SkillProviderError::new(format!(
+                    "executor skill resource {} has no current filesystem permissions for environment `{environment_id}`",
+                    request.resource.as_str()
+                )));
+            };
             let contents = environment
                 .get_filesystem()
-                .read_file_text(resource_path, /*sandbox*/ None)
+                .read_file_text(resource_path, Some(sandbox))
                 .await
                 .map_err(|err| {
                     SkillProviderError::new(format!(

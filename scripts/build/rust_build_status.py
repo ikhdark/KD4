@@ -12,6 +12,7 @@ if __package__ in (None, ""):
 
 import argparse
 from contextlib import contextmanager
+from contextlib import ExitStack
 from dataclasses import dataclass
 from dataclasses import field
 import errno
@@ -158,6 +159,10 @@ RUST_PROCESS_TOKEN_RE = re.compile(
 )
 RUST_MIN_STACK_BYTES = "8388608"
 LANE_COORDINATION_GRACE_SECONDS = 1.0
+LANE_COORDINATION_RETRY_FLOOR_SECONDS = 0.05
+# A reservation stops retrying once opening the lock file has been refused for
+# a non-sharing reason (read-only, ACL) this long; no holder will release that.
+LANE_COORDINATION_DENIED_LIMIT_SECONDS = 30.0
 # Lanes of one family (`core-tests`, `core-tests-2`, ...) that may build at
 # once when cold overflow is allowed. Each lane holds a whole Cargo target, so
 # the bound limits memory and disk; maintenance keeps as many lanes warm.
@@ -752,16 +757,126 @@ def _is_file_lock_contention(exc: OSError) -> bool:
     }
 
 
+def _lock_open_denial(lock_path: Path, exc: OSError) -> OSError | None:
+    """The open failure when it is an access denial rather than a holder.
+
+    Windows open() reports a sharing holder and a read-only or ACL-denied file
+    alike (EACCES, no winerror); CreateFile with the CRT's read/write access and
+    sharing tells them apart (32/33/36 = held). POSIX open() is never refused by
+    a holder (flock is separate), so EACCES there is a denial.
+    """
+    if os.name != "nt":
+        return exc if exc.errno == errno.EACCES else None
+    import _winapi
+
+    try:
+        _winapi.CloseHandle(_winapi.CreateFile(str(lock_path), 0xC0000000, 3, 0, 4, 0x80, 0))
+    except OSError as probe:
+        return None if getattr(probe, "winerror", None) in {32, 33, 36} else probe
+    return None  # The holder released it meanwhile.
+
+
+class LaneCoordinationTimeout(TimeoutError):
+    """One acquisition grace expired; names the recorded holder when known."""
+
+    def __init__(
+        self, lock_path: Path, waited_seconds: float, open_error: OSError | None = None,
+    ) -> None:
+        self.lock_path = lock_path
+        self.waited_seconds = waited_seconds
+        self.access_denied: OSError | None = None
+        try:
+            if open_error is not None:
+                self.access_denied = _lock_open_denial(lock_path, open_error)
+            self.holder = (
+                f"access denied opening the lock file, not held by another process ({self.access_denied})"
+                if self.access_denied is not None else describe_lane_coordination_holder(lock_path)
+            )
+        except Exception as exc:  # Attribution must never change the timeout's type.
+            self.holder = f"holder unknown ({type(exc).__name__}: {exc})"
+        super().__init__(
+            f"timed out waiting for lane coordination lock {lock_path} after "
+            f"{waited_seconds:.1f}s; {self.holder}"
+        )
+
+
+def _process_is_running(pid: int) -> bool | None:
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except (OSError, OverflowError):  # OverflowError: pid beyond signed pid_t
+            return None
+        return True
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+    if not handle:
+        return False if ctypes.get_last_error() == 87 else None  # invalid parameter
+    try:
+        code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(ctypes.c_void_p(handle), ctypes.byref(code)):
+            return None
+        return code.value == 259  # STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+
+
+def describe_lane_coordination_holder(lock_path: Path) -> str:
+    """Read the holder record that follows the locked first byte (best effort)."""
+    try:
+        with lock_path.open("rb") as handle:
+            handle.seek(1)
+            raw = handle.read(1024)
+    except OSError as exc:
+        if _is_file_lock_contention(exc):
+            return "holder opened the lock file exclusively (KD4 PowerShell lane owner or another process)"
+        return f"holder unknown ({exc})"
+    try:
+        record = json.loads(raw.decode("utf-8"))
+        pid, purpose = int(record["pid"]), str(record["purpose"])
+        acquired_at = float(record["acquiredAt"])
+        if not 0 < pid < 2**32 or not math.isfinite(acquired_at):
+            raise ValueError(pid)
+        age = max(0.0, time.time() - acquired_at)
+    except (KeyError, TypeError, ValueError, OverflowError, UnicodeError):
+        return "holder not recorded (an older runner or another process holds it)"
+    running = _process_is_running(pid)
+    state = "" if running else (" (recorded pid not running; record is stale)" if running is False
+                                else " (pid state unknown)")
+    return f"last recorded holder pid {pid} ({purpose}) acquired {age:.1f}s ago{state}"
+
+
+def _write_lane_coordination_holder(handle: BinaryIO, purpose: str | None) -> None:
+    # Byte 0 is the lock; the holder record is additive and ignored by older
+    # runners. Truncating to 1 keeps the locked byte; the append-mode
+    # descriptor writes at 1. Unbuffered descriptor calls leave nothing pending
+    # for the release seek/unlock, so a failure here never fails the lock path.
+    try:
+        os.ftruncate(handle.fileno(), 1)
+        if purpose is not None:
+            os.write(handle.fileno(), json.dumps({
+                "pid": os.getpid(), "purpose": purpose, "acquiredAt": time.time(),
+            }).encode("utf-8"))
+    except OSError:
+        pass  # Attribution only; never fail or extend the locked work for it.
+
+
 @contextmanager
 def cargo_lane_coordination_lock(
     lane_root: Path,
     *,
     timeout_seconds: float = 30.0,
+    purpose: str = "lane coordination",
 ) -> Iterator[None]:
     """Serialize lane creation with the final prune check and rename."""
 
     lock_path = lane_root / ".lane-coordination.lock"
-    deadline = time.monotonic() + timeout_seconds
+    started = time.monotonic()
+    deadline = started + timeout_seconds
     handle = None
     retry_delay = 0.002
     while handle is None:
@@ -771,9 +886,7 @@ def cargo_lane_coordination_lock(
             if not _is_file_lock_contention(exc):
                 raise
             if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"timed out waiting for lane coordination lock {lock_path}"
-                )
+                raise LaneCoordinationTimeout(lock_path, time.monotonic() - started, exc)
             time.sleep(min(retry_delay, max(0.0, deadline - time.monotonic())))
             retry_delay = min(0.02, retry_delay * 2)
     acquired = False
@@ -799,15 +912,15 @@ def cargo_lane_coordination_lock(
                 if not _is_file_lock_contention(exc):
                     raise
                 if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        f"timed out waiting for lane coordination lock {lock_path}"
-                    )
+                    raise LaneCoordinationTimeout(lock_path, time.monotonic() - started)
                 time.sleep(min(retry_delay, max(0.0, deadline - time.monotonic())))
                 retry_delay = min(0.02, retry_delay * 2)
+        _write_lane_coordination_holder(handle, purpose)
         yield
     finally:
         try:
             if acquired:
+                _write_lane_coordination_holder(handle, None)
                 _release_binary_file_lock(handle)
         finally:
             handle.close()
@@ -1255,6 +1368,112 @@ def _busy_lane_paths(candidates: Sequence[LaneReservationCandidate]) -> list[Pat
 
 
 @contextmanager
+def _reservation_coordination_lock(
+    lane_root: Path, timeout_seconds: float, waits: dict[str, float | str],
+) -> Iterator[None]:
+    """Coordinate one reservation pass without discarding the wait around it.
+
+    A reservation already waits for busy lanes and refused admission until the
+    caller stops it (no runner deadline). An expired per-attempt grace is
+    reported with its holder and retried, not raised, unless the lock file has
+    been access-denied for LANE_COORDINATION_DENIED_LIMIT_SECONDS; prune keeps
+    its bounded failure.
+    """
+    stack = ExitStack()
+    while True:
+        try:
+            stack.enter_context(cargo_lane_coordination_lock(
+                lane_root, timeout_seconds=timeout_seconds, purpose="lane reservation",
+            ))
+            break
+        except LaneCoordinationTimeout as timeout:
+            now = time.monotonic()
+            waits["count"] = waits.get("count", 0) + 1
+            waits["lastHolder"] = timeout.holder
+            if timeout.access_denied is None:
+                waits.pop("deniedSince", None)
+            elif now - waits.setdefault("deniedSince", now) >= LANE_COORDINATION_DENIED_LIMIT_SECONDS:
+                raise  # Not contention: nothing releases a read-only or ACL-denied file.
+            if now - waits.get("reportedAt", -math.inf) >= 60:
+                waits["reportedAt"] = now
+                print(
+                    f"waiting for lane coordination (the {timeout_seconds:g}s grace expired "
+                    f"{int(waits['count'])} time(s) so far; retrying): {timeout}",
+                    file=sys.stderr,
+                )
+            # A zero or tiny grace must not turn the retry into a busy spin.
+            time.sleep(LANE_COORDINATION_RETRY_FLOOR_SECONDS)
+    waits.pop("deniedSince", None)
+    with stack:
+        yield
+
+
+class _ReservationProgress:
+    """Wait phases of one lane reservation, kept in a caller-owned dict.
+
+    Phases: coordination-lock (acquiring the shared lock), lane-selection
+    (holding it), resource-admission (the caller's admit check, lock released),
+    retry-wait (sleep before the next pass), then reserved. `phaseMs` holds
+    closed phases; `phase`/`phaseEnteredAt` name the open one.
+    """
+
+    REPORT_SECONDS = 60.0
+
+    def __init__(self, base_lane: str, record: dict[str, object] | None) -> None:
+        self.base_lane = base_lane
+        self.record = {} if record is None else record
+        self.started = self.phase_started = self.reported_at = time.monotonic()
+        self.phase: str | None = None
+        self.record.update(phase=None, phaseMs={}, passes=0, outcomes={}, lastOutcome=None,
+                           coordinationGraceExpiries=0, lastCoordinationHolder=None)
+
+    def enter(self, phase: str) -> None:
+        now = time.monotonic()
+        if self.phase is not None:
+            totals = self.record["phaseMs"]
+            totals[self.phase] = totals.get(self.phase, 0.0) + (now - self.phase_started) * 1000
+        self.phase, self.phase_started = phase, now
+        self.record.update(phase=phase, phaseEnteredAt=time.time(),
+                           elapsedMs=(now - self.started) * 1000)
+
+    def locked(self, coordination_waits: Mapping[str, object]) -> None:
+        self.enter("lane-selection")
+        self._copy_coordination(coordination_waits)
+
+    @contextmanager
+    def coordinating(self, coordination_waits: Mapping[str, object]) -> Iterator[None]:
+        # A raise while acquiring the lock (the access-denied limit or an interrupt)
+        # skips locked().
+        try:
+            yield
+        finally:
+            self._copy_coordination(coordination_waits)
+
+    def _copy_coordination(self, coordination_waits: Mapping[str, object]) -> None:
+        self.record["coordinationGraceExpiries"] = int(coordination_waits.get("count", 0))
+        if "lastHolder" in coordination_waits:
+            self.record["lastCoordinationHolder"] = coordination_waits["lastHolder"]
+
+    def retrying(self, outcome: str) -> None:
+        outcomes = self.record["outcomes"]
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        self.record.update(passes=self.record["passes"] + 1, lastOutcome=outcome,
+                           lastPassAt=time.time())
+        self.enter("retry-wait")
+        now = time.monotonic()
+        if now - self.reported_at >= self.REPORT_SECONDS:
+            # Phase totals only; the coordination holder has its own report.
+            self.reported_at = now
+            phases = ", ".join(f"{name} {ms / 1000:.1f}s" for name, ms in self.record["phaseMs"].items())
+            print(
+                f"still waiting for a Cargo lane for {self.base_lane!r} after "
+                f"{now - self.started:.0f}s ({self.record['passes']} passes, last {outcome}; "
+                f"by outcome {outcomes}; by phase {phases})",
+                file=sys.stderr,
+            )
+
+
+@contextmanager
 def reserve_cargo_lane(
     *,
     repo_root: Path,
@@ -1269,8 +1488,13 @@ def reserve_cargo_lane(
     source_identity: str | None = None,
     rank: Callable[[Path], int] | None = None,
     admit: Callable[[Path], bool] | None = None,
+    progress: dict[str, object] | None = None,
 ) -> Iterator[tuple[str, Path]]:
-    """Reserve a lane; `rank` orders warm candidates (lower first) before LRU."""
+    """Reserve a lane; `rank` orders warm candidates (lower first) before LRU.
+
+    `progress`, when given, is updated in place with the current wait phase and
+    per-phase totals, so a caller's receipt keeps them even if the wait fails.
+    """
     warm_wait_seconds = _nonnegative_wait_seconds(warm_wait_seconds)
     lock_timeout_seconds = _nonnegative_wait_seconds(lock_timeout_seconds)
     if max_active_lanes is not None and max_active_lanes < 1:
@@ -1290,10 +1514,16 @@ def reserve_cargo_lane(
     resolved_lane: str | None = None
     deadline = time.monotonic() + max(0.0, warm_wait_seconds)
     announced_wait = False
+    coordination_waits: dict[str, float | str] = {}
     retry_delay = 0.01
+    waits = _ReservationProgress(base_lane, progress)
     while active_handle is None:
         busy_reusable = False
-        with cargo_lane_coordination_lock(root, timeout_seconds=lock_timeout_seconds):
+        waits.enter("coordination-lock")
+        with waits.coordinating(coordination_waits), _reservation_coordination_lock(
+            root, lock_timeout_seconds, coordination_waits,
+        ):
+            waits.locked(coordination_waits)
             candidates = _lane_reservation_candidates(root, base_lane)
             warm_paths = {
                 candidate.path for candidate in candidates if _is_warm_lane_dir(candidate.path)
@@ -1350,7 +1580,9 @@ def reserve_cargo_lane(
                     resolved_lane = candidate_name
                     break
                 busy_reusable |= compatible or not compatible_paths
+        outcome = "at-capacity" if at_capacity else "lanes-busy"
         if active_handle is not None:
+            waits.enter("resource-admission")
             admitted = False
             try:
                 admitted = admit is None or admit(target_dir)
@@ -1363,6 +1595,8 @@ def reserve_cargo_lane(
                         active_handle = None
             if admitted:
                 break
+            outcome = "admission-refused"
+        waits.retrying(outcome)
         if not announced_wait:
             print(
                 f"waiting for a reusable Cargo lane for {base_lane!r}",
@@ -1373,6 +1607,7 @@ def reserve_cargo_lane(
         # other work can reserve unrelated lanes.
         time.sleep(retry_delay)
         retry_delay = min(0.05, retry_delay * 1.5)
+    waits.enter("reserved")
     assert active_handle is not None and target_dir is not None and resolved_lane is not None
     stamp = target_dir / LANE_LAST_USED_STAMP
     try:
@@ -2444,6 +2679,19 @@ def _cargo_command_with_message_format(command: Sequence[str]) -> list[str]:
     return [*result[: index + 1], FREEZE_MESSAGE_FORMAT, *result[index + 1 :]]
 
 
+def _build_unit_dir(path: Path, crate: str) -> Path | None:
+    """Unit directory of a library output in Cargo's newer build-dir layout, else None.
+
+    That layout (default in Cargo 1.100; 1.99.1 lanes use deps/ and .fingerprint/)
+    writes build/<package>/<hash>/out/lib<crate>-<hash>.rlib, with the unit's
+    compiler fingerprint in build/<package>/<hash>/fingerprint.
+    """
+    unit = path.parent.parent
+    if path.parent.name == "out" and unit.parent.parent.name == "build" and path.stem == f"lib{crate}-{unit.name}":
+        return unit
+    return None
+
+
 def _cargo_executables(
     messages: Path, freshness: dict[str, object] | None = None,
     *, link_crates: Sequence[str] = (), link_artifacts: list[dict[str, object]] | None = None,
@@ -2473,9 +2721,27 @@ def _cargo_executables(
                         path = Path(name)
                         if path.suffix != ".rlib" or any(row["cargoPath"] == str(path) for row in link_artifacts):
                             continue
-                        suffix = path.stem.rsplit("-", 1)[1]
-                        fingerprints = list((path.parent.parent / ".fingerprint").glob(
-                            f"*-{suffix}/lib-{crate}.json"))
+                        # Selected library targets may expose only an unhashed
+                        # hardlink. Bind its exact file identity, never a newest glob.
+                        if path.parent.name != "deps" and _build_unit_dir(path, crate) is None:
+                            matches = [candidate for candidate in (path.parent / "deps").glob(
+                                f"lib{crate}-*.rlib") if path.samefile(candidate)]
+                            if not matches:  # newer layout: no deps/, per-unit out/ directories
+                                matches = [candidate for candidate in (path.parent / "build").glob(
+                                    f"*/*/out/lib{crate}-*.rlib") if path.samefile(candidate)]
+                            if len(matches) != 1:
+                                raise ValueError(f"no unique fingerprinted identity for {path}")
+                            path = matches[0]
+                        if any(row["cargoPath"] == str(path) for row in link_artifacts):
+                            continue
+                        unit = _build_unit_dir(path, crate)
+                        if unit is not None:
+                            fingerprints = [fingerprint for fingerprint in [unit / "fingerprint" / f"lib-{crate}.json"]
+                                            if fingerprint.is_file()]
+                        else:
+                            suffix = path.stem.rsplit("-", 1)[1]
+                            fingerprints = list((path.parent.parent / ".fingerprint").glob(
+                                f"*-{suffix}/lib-{crate}.json"))
                         if len(fingerprints) != 1:
                             raise ValueError(f"no unique compiler fingerprint for {path}")
                         fingerprint = fingerprints[0]
@@ -3087,12 +3353,15 @@ def run_in_cargo_lane(
                 resource_lease.cold = not _is_warm_lane_dir(path) or _read_lane_build_context(path) != build_context
                 return resource_lease.acquire(wait=False)
         lane_wait_started = time.perf_counter()
+        # Kept in the receipt even when the wait ends without a lane.
+        record["laneReservation"] = {}
         with reserve_cargo_lane(
             repo_root=owner_root, requested_lane=requested_lane, command=command,
             lane_root=lane_root, lock_timeout_seconds=lock_timeout_seconds,
             warm_wait_seconds=warm_wait_seconds, allow_cold_overflow=allow_cold_overflow,
             build_context=build_context, max_active_lanes=max_active_lanes,
             source_identity=source_identity, rank=rank, admit=admission,
+            progress=record["laneReservation"],
         ) as (resolved_lane, target_dir):
             record["laneAdmissionMs"] = (time.perf_counter() - lane_wait_started) * 1000
             record["laneWaitMs"] = max(0, record["laneAdmissionMs"] - record.get("resources", {}).get("resourceWaitMs", 0))
@@ -3290,6 +3559,10 @@ def run_in_cargo_lane(
         if resource_lease is not None and not resource_lease.finished:
             record["resources"].update(status="failed", error="build setup interrupted before compilation")
             resource_lease.finish(quarantined=isinstance(sys.exception(), CleanupFailed))
+        reservation = record.get("laneReservation")
+        if reservation and reservation.get("phase") not in (None, "reserved"):
+            # The wait ended without a lane; time the phase it ended in.
+            reservation["openPhaseMs"] = (time.time() - reservation["phaseEnteredAt"]) * 1000
         if timing_path is not None:
             if timing_evidence is not None:
                 capture_started = time.perf_counter()
@@ -3319,7 +3592,21 @@ def is_cargo_artifact_dir(path: Path) -> bool:
         (path / ".fingerprint").is_dir()
         and (path / "deps").is_dir()
         and ((path / "build").is_dir() or (path / "incremental").is_dir())
-    )
+    ) or _has_build_unit_fingerprint(path)
+
+
+def _has_build_unit_fingerprint(path: Path) -> bool:
+    # Newer Cargo build-dir layout (default in Cargo 1.100; 1.99.1 lanes use the
+    # older one): per-unit fingerprints live in build/<package>/<hash>/fingerprint,
+    # with no .fingerprint/ or deps/. The older layout has none there.
+    try:
+        return any(
+            (unit / "fingerprint").is_dir()
+            for package in (path / "build").iterdir() if package.is_dir()
+            for unit in package.iterdir()
+        )
+    except OSError:
+        return False
 
 
 def is_stray_cargo_target_dir(path: Path) -> bool:
@@ -3667,7 +3954,7 @@ def prune_stale_lanes(
         if not dry_run:
             trash_path: Path | None = None
             try:
-                with cargo_lane_coordination_lock(lane_root):
+                with cargo_lane_coordination_lock(lane_root, purpose="lane prune"):
                     if not path.exists():
                         continue
                     if is_indirect_directory(path):
@@ -3992,7 +4279,8 @@ def main(argv: list[str] | None = None) -> int:
         "--lock-timeout-seconds",
         type=positive_float,
         default=LANE_COORDINATION_GRACE_SECONDS,
-        help="Short creation/prune lock grace (default: 1 second). Does not wait for busy builds.",
+        help="Short creation/prune lock grace (default: 1 second). Does not wait for busy builds. "
+        "Lane reservation reports an expired grace with its holder and keeps waiting.",
     )
     run_lane_parser.add_argument(
         "--source-mirror",

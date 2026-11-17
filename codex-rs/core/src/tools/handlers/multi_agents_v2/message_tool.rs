@@ -391,7 +391,8 @@ pub(crate) async fn handle_message_string_tool(
         MessageDeliveryMode::TriggerTurn => AgentCommunicationKind::Followup,
     };
     let context = AgentCommunicationContext::new(kind, session.thread_id)
-        .with_sender_turn(turn.sub_id.clone());
+        .with_sender_turn(turn.sub_id.clone())
+        .with_sender_validation_scope(turn.validation_root_turn.clone());
     let mut communication = mode.apply(communication);
     use sha2::Digest;
     let retry_identity = message_id.as_deref()

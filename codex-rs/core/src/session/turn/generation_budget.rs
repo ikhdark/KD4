@@ -24,12 +24,31 @@ pub(super) enum LogicalGenerationAdmission {
 pub(crate) struct LogicalGenerationBudget {
     regular_generations_exhausted: bool,
     terminal_generation_used: bool,
+    /// A terminal generation refused before dispatch returned the allowance;
+    /// its replacement repeats the directive but not the boundary warning.
+    terminal_generation_refunded: bool,
 }
 
 impl LogicalGenerationBudget {
     pub(super) fn accepted_user_input(&mut self) {
         self.regular_generations_exhausted = false;
         self.terminal_generation_used = false;
+        self.terminal_generation_refunded = false;
+    }
+
+    /// A request refused before dispatch produced no response, so its terminal
+    /// admission does not spend the turn's one terminal allowance.
+    pub(super) fn release_undispatched(&mut self, admission: LogicalGenerationAdmission) {
+        if matches!(admission, LogicalGenerationAdmission::Terminal { .. }) {
+            self.terminal_generation_used = false;
+            self.terminal_generation_refunded = true;
+        }
+    }
+
+    /// Whether the admission just made replaces a refused terminal generation
+    /// whose boundary was already announced. Read once after each admission.
+    pub(super) fn take_terminal_refund(&mut self) -> bool {
+        std::mem::take(&mut self.terminal_generation_refunded)
     }
 
     /// The next regular request becomes the one forced final synthesis.

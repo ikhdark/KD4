@@ -59,9 +59,9 @@ impl ReadMcpResourceHandler {
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
             _ => {
-                return Err(FunctionCallError::RespondToModel(
+                return Err(super::settled_recovery_failure(FunctionCallError::RespondToModel(
                     "read_mcp_resource handler received unsupported payload".to_string(),
-                ));
+                )));
             }
         };
 

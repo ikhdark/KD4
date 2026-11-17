@@ -96,6 +96,7 @@ impl fmt::Debug for PluginSkillSnapshots {
 pub(crate) async fn load_and_merge_skill_roots<I>(
     roots: I,
     plugin_skill_snapshots: Option<&PluginSkillSnapshots>,
+    repository_sandbox: Option<&codex_exec_server::FileSystemSandboxContext>,
 ) -> SkillLoadOutcome
 where
     I: IntoIterator<Item = SkillRoot>,
@@ -136,7 +137,8 @@ where
         let snapshot = match cached_snapshot {
             Some(snapshot) => snapshot,
             None => {
-                let snapshot = load_skill_root(root).await;
+                // Plugin-cached roots are never repository-scoped, so the cache stays valid.
+                let snapshot = load_skill_root(root, repository_sandbox).await;
                 if let Some(plugin_skill_snapshots) = plugin_skill_snapshots
                     && let Some(cache_key) = cache_key
                 {
@@ -154,6 +156,7 @@ where
 
     let mut outcome = merge_skill_root_snapshots(root_snapshots);
     outcome.plugin_installations = plugin_skill_snapshots.cloned();
+    outcome.repository_sandbox = repository_sandbox.cloned();
     outcome
 }
 

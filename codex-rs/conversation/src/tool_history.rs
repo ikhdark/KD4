@@ -3488,10 +3488,15 @@ pub enum ToolHistoryLoadOutcome {
         state: ToolHistoryState,
         path: std::path::PathBuf,
         error: String,
+        /// This load checkpointed the prefix and quarantined the journal, so a
+        /// later load does not report it again.
+        source_retired: bool,
     },
     Corrupt {
         path: std::path::PathBuf,
         error: String,
+        /// This load quarantined the ledger, so a later load does not report it again.
+        source_retired: bool,
     },
     UnsupportedVersion {
         path: std::path::PathBuf,
@@ -3505,18 +3510,29 @@ pub enum ToolHistoryLoadOutcome {
 }
 
 impl ToolHistoryLoadOutcome {
+    /// True when the warning reports a change this load made to the thread's
+    /// durable ledger state. Unsupported, unreadable or unretired sources are
+    /// reported again by every load.
+    pub fn warning_is_one_shot(&self) -> bool {
+        matches!(
+            self,
+            Self::RecoveredJournalPrefix { source_retired: true, .. }
+                | Self::Corrupt { source_retired: true, .. }
+        )
+    }
+
     pub fn into_state_and_warning(self) -> (ToolHistoryState, Option<String>) {
         match self {
             Self::Missing => (ToolHistoryState::default(), None),
             Self::Loaded(state) => (state, None),
-            Self::RecoveredJournalPrefix { state, path, error } => (
+            Self::RecoveredJournalPrefix { state, path, error, .. } => (
                 state,
                 Some(format!(
                     "Recovered completed-tool history up to the first corrupt record of journal {}: {error}",
                     path.display()
                 )),
             ),
-            Self::Corrupt { path, error } => (
+            Self::Corrupt { path, error, .. } => (
                 ToolHistoryState::default(),
                 Some(format!(
                     "Ignoring corrupt completed-tool history ledger {}: {error}",
@@ -3552,10 +3568,10 @@ pub async fn load_tool_history_state_for_initialization(
     thread_id: &str,
 ) -> ToolHistoryLoadOutcome {
     match load_tool_history_state_for_fork(codex_home, thread_id).await {
-        ToolHistoryLoadOutcome::RecoveredJournalPrefix { state, path, error } => {
+        ToolHistoryLoadOutcome::RecoveredJournalPrefix { state, path, error, .. } => {
             // The source must survive until a durable checkpoint owns its valid
             // prefix. A failed or cancelled recovery can then safely be retried.
-            let error = match persist_tool_history_checkpoint(
+            let (error, source_retired) = match persist_tool_history_checkpoint(
                 codex_home,
                 thread_id,
                 &state,
@@ -3564,18 +3580,23 @@ pub async fn load_tool_history_state_for_initialization(
             )
             .await
             {
-                Ok(()) => format!("{error}; recovered prefix checkpointed and journal quarantined"),
-                Err(commit_error) => {
-                    format!("{error}; failed to checkpoint recovered prefix: {commit_error}")
-                }
+                Ok(()) => (
+                    format!("{error}; recovered prefix checkpointed and journal quarantined"),
+                    true,
+                ),
+                Err(commit_error) => (
+                    format!("{error}; failed to checkpoint recovered prefix: {commit_error}"),
+                    false,
+                ),
             };
             ToolHistoryLoadOutcome::RecoveredJournalPrefix {
                 state,
                 path,
                 error,
+                source_retired,
             }
         }
-        ToolHistoryLoadOutcome::Corrupt { path, error } => {
+        ToolHistoryLoadOutcome::Corrupt { path, error, .. } => {
             let quarantine_path = corrupt_ledger_quarantine_path(&path);
             match tokio::fs::rename(&path, &quarantine_path).await {
                 Ok(()) => ToolHistoryLoadOutcome::Corrupt {
@@ -3585,10 +3606,12 @@ pub async fn load_tool_history_state_for_initialization(
                         path.display(),
                         quarantine_path.display()
                     ),
+                    source_retired: true,
                 },
                 Err(rename_error) => ToolHistoryLoadOutcome::Corrupt {
                     path,
                     error: format!("{error}; failed to quarantine ledger: {rename_error}"),
+                    source_retired: false,
                 },
             }
         }
@@ -3644,6 +3667,7 @@ pub async fn load_tool_history_state_for_fork(
                     return ToolHistoryLoadOutcome::Corrupt {
                         path,
                         error: format!("{error:?}"),
+                        source_retired: false,
                     };
                 }
             }
@@ -3673,6 +3697,7 @@ pub async fn load_tool_history_state_for_fork(
                     state,
                     path: journal_path,
                     error,
+                    source_retired: false,
                 };
             }
             Err(ToolHistoryJournalLoadError::UnsupportedVersion(found)) => {

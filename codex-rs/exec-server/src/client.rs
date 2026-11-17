@@ -1572,7 +1572,10 @@ impl SessionState {
         }
 
         match &event {
-            ExecProcessEvent::OutputGap { through_seq } => {
+            // Capture loss occupies only its own sequence. Order it like any
+            // sequenced event so its reason is published, not merged into an
+            // eviction interval.
+            ExecProcessEvent::OutputGap { through_seq, capture_incomplete: None } => {
                 ordered_events.output_gap_through =
                     ordered_events.output_gap_through.max(*through_seq);
                 return Ok(self.publish_ready(&mut ordered_events));
@@ -1602,7 +1605,10 @@ impl SessionState {
                         .map_or(ordered_events.output_gap_through, |(seq, _)| seq.saturating_sub(1))
                         .min(ordered_events.output_gap_through);
                     ordered_events.last_published_seq = through_seq;
-                    self.events.publish(ExecProcessEvent::OutputGap { through_seq });
+                    self.events.publish(ExecProcessEvent::OutputGap {
+                        through_seq,
+                        capture_incomplete: None,
+                    });
                     continue;
                 }
                 break;
@@ -2141,6 +2147,7 @@ async fn handle_server_notification(
                 // it in order releases events already queued behind it.
                 let result = session.publish_ordered_event(ExecProcessEvent::OutputGap {
                     through_seq: params.through_seq,
+                    capture_incomplete: params.capture_incomplete,
                 });
                 if result.is_ok() {
                     session.note_change(params.through_seq);

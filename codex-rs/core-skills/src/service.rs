@@ -11,6 +11,7 @@ use std::sync::atomic::Ordering;
 
 use codex_config::ConfigLayerStack;
 use codex_exec_server::ExecutorFileSystem;
+use codex_exec_server::FileSystemSandboxContext;
 use codex_plugin::PluginSkillRoot;
 use codex_protocol::protocol::Product;
 use codex_protocol::protocol::SkillScope;
@@ -27,7 +28,7 @@ use crate::config_rules::SkillConfigRules;
 use crate::config_rules::resolve_disabled_skill_paths;
 use crate::config_rules::skill_config_rules_from_stack;
 use crate::loader::SkillRoot;
-use crate::loader::load_skills_from_roots;
+use crate::loader::load_skills_from_roots_with_repository_sandbox;
 use crate::loader::skill_roots;
 use crate::system::install_system_skills;
 use codex_config::SkillsConfig;
@@ -39,6 +40,7 @@ struct SnapshotCacheOptions<'a> {
     force_reload: bool,
     cwd_cache_key: Option<&'a AbsolutePathBuf>,
     plugin_skill_preload: Option<&'a PluginSkillSnapshots>,
+    repository_sandbox: Option<&'a FileSystemSandboxContext>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,16 +152,21 @@ impl SkillsService {
         skip_all,
         fields(otel.name = "skills_for_config")
     )]
+    ///
+    /// `repository_sandbox` is the turn's current filesystem authority for repository-scoped
+    /// roots, which `fs` serves; discovery and later reads of those skills use it. Host-owned
+    /// user, system, admin and plugin roots keep their own authority.
     pub async fn snapshot_for_config(
         &self,
         input: &SkillsLoadInput,
         fs: Option<Arc<dyn ExecutorFileSystem>>,
+        repository_sandbox: Option<&FileSystemSandboxContext>,
     ) -> HostSkillsSnapshot {
         let generation = self.cache_generation.load(Ordering::SeqCst);
         let plugin_installations_current = input.plugin_skill_snapshots.as_ref()
             .is_none_or(PluginSkillSnapshots::is_current);
         let input_cache_key = (plugin_installations_current && !self.cache_reuse_disabled.load(Ordering::Acquire))
-            .then(|| SkillsInputCacheKey::new(input, fs.as_ref(), generation));
+            .then(|| SkillsInputCacheKey::new(input, fs.as_ref(), repository_sandbox, generation));
         if let Some(snapshot) = input_cache_key
             .as_ref()
             .and_then(|key| self.cached_input_snapshot(key))
@@ -198,6 +205,7 @@ impl SkillsService {
                     force_reload: false,
                     cwd_cache_key: None,
                     plugin_skill_preload: None,
+                    repository_sandbox,
                 },
             )
             .await;
@@ -267,6 +275,8 @@ impl SkillsService {
                 force_reload,
                 cwd_cache_key: Some(&input.cwd),
                 plugin_skill_preload,
+                // Thread-less listings have no turn authority to apply.
+                repository_sandbox: None,
             },
         )
         .await
@@ -284,6 +294,7 @@ impl SkillsService {
             force_reload,
             cwd_cache_key,
             plugin_skill_preload,
+            repository_sandbox,
         } = cache_options;
         let plugin_installations_current = input.plugin_skill_snapshots.as_ref().or(plugin_skill_preload)
             .is_none_or(PluginSkillSnapshots::is_current);
@@ -294,6 +305,7 @@ impl SkillsService {
                     &skill_config_rules,
                     input.plugin_skill_snapshots.as_ref().or(plugin_skill_preload),
                     cwd_cache_key,
+                    repository_sandbox,
                     generation,
                 )
             });
@@ -320,8 +332,14 @@ impl SkillsService {
         }
 
         let snapshot = HostSkillsSnapshot::new(Arc::new(
-            self.build_skill_outcome(input, roots, &skill_config_rules, plugin_skill_preload)
-                .await,
+            self.build_skill_outcome(
+                input,
+                roots,
+                &skill_config_rules,
+                plugin_skill_preload,
+                repository_sandbox,
+            )
+            .await,
         ));
         if let Some(cache_key) = cache_key
             && !self.cache_reuse_disabled.load(Ordering::Acquire)
@@ -352,9 +370,12 @@ impl SkillsService {
         roots: Vec<SkillRoot>,
         skill_config_rules: &SkillConfigRules,
         plugin_skill_preload: Option<&PluginSkillSnapshots>,
+        repository_sandbox: Option<&FileSystemSandboxContext>,
     ) -> SkillLoadOutcome {
         let snapshots = input.plugin_skill_snapshots.as_ref().or(plugin_skill_preload);
-        let outcome = load_skills_from_roots(roots, snapshots).await;
+        let outcome =
+            load_skills_from_roots_with_repository_sandbox(roots, snapshots, repository_sandbox)
+                .await;
         let mut outcome =
             crate::filter_skill_load_outcome_for_product(outcome, self.restriction_product);
         crate::config_rules::apply_skill_metadata_overrides(&mut outcome.skills, skill_config_rules);
@@ -567,6 +588,18 @@ impl Hash for FileSystemIdentity {
     }
 }
 
+/// Repository-skill filesystem authority that produced a cached catalog, so a
+/// narrowed turn never reuses a catalog discovered under broader authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RepositorySandboxIdentity(Option<FileSystemSandboxContext>);
+
+impl Hash for RepositorySandboxIdentity {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // The context has no `Hash`; presence is consistent with its equality.
+        self.0.is_some().hash(state);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SkillsInputCacheKey {
     generation: u64,
@@ -576,12 +609,14 @@ struct SkillsInputCacheKey {
     bundled_skills_enabled: bool,
     plugin_skill_snapshots_identity: Option<u64>,
     file_system_identity: Option<FileSystemIdentity>,
+    repository_sandbox: RepositorySandboxIdentity,
 }
 
 impl SkillsInputCacheKey {
     fn new(
         input: &SkillsLoadInput,
         fs: Option<&Arc<dyn ExecutorFileSystem>>,
+        repository_sandbox: Option<&FileSystemSandboxContext>,
         generation: u64,
     ) -> Self {
         Self {
@@ -595,6 +630,7 @@ impl SkillsInputCacheKey {
                 .as_ref()
                 .map(PluginSkillSnapshots::cache_identity),
             file_system_identity: fs.map(|fs| FileSystemIdentity(Arc::clone(fs))),
+            repository_sandbox: RepositorySandboxIdentity(repository_sandbox.cloned()),
         }
     }
 }
@@ -606,6 +642,7 @@ struct SkillsCacheKey {
     roots: Vec<SkillRootCacheKey>,
     skill_config_rules: SkillConfigRules,
     plugin_skill_snapshots_identity: Option<u64>,
+    repository_sandbox: RepositorySandboxIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -645,6 +682,7 @@ fn skills_cache_key(
     skill_config_rules: &SkillConfigRules,
     plugin_skill_snapshots: Option<&PluginSkillSnapshots>,
     cwd_cache_key: Option<&AbsolutePathBuf>,
+    repository_sandbox: Option<&FileSystemSandboxContext>,
     generation: u64,
 ) -> SkillsCacheKey {
     SkillsCacheKey {
@@ -674,6 +712,7 @@ fn skills_cache_key(
         skill_config_rules: skill_config_rules.clone(),
         plugin_skill_snapshots_identity: plugin_skill_snapshots
             .map(PluginSkillSnapshots::cache_identity),
+        repository_sandbox: RepositorySandboxIdentity(repository_sandbox.cloned()),
     }
 }
 

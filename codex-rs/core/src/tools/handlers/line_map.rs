@@ -87,7 +87,7 @@ impl ToolExecutor<ToolInvocation> for LineMapHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(async move {
+        let mapped = async move {
             let ToolPayload::Function { ref arguments } = invocation.payload else {
                 return Err(FunctionCallError::RespondToModel(
                     "line_map requires function arguments".into(),
@@ -105,13 +105,30 @@ impl ToolExecutor<ToolInvocation> for LineMapHandler {
                 args.end_line,
                 &invocation.cancellation_token,
             )
-            .await
-            .map_err(|error| FunctionCallError::RespondToModel(error.for_model()))?;
+            .await;
+            let mapping = match mapping {
+                Ok(mapping) => mapping,
+                Err(error) => {
+                    let message = super::read_tool_output::thread_confined_artifact_error(
+                        &invocation,
+                        [&args.before_artifact_id, &args.after_artifact_id],
+                        error,
+                    )
+                    .await;
+                    return Err(FunctionCallError::RespondToModel(message));
+                }
+            };
             let result = JsonToolOutput::new(serde_json::to_value(mapping).map_err(|error| {
                 FunctionCallError::RespondToModel(format!("failed to serialize line map: {error}"))
             })?);
             crate::tools::context::ensure_exact_model_delivery(&result, &invocation)?;
             Ok(boxed_tool_output(result))
+        };
+        // Like `read_tool_output`, this handler only observes retained bytes.
+        Box::pin(async move {
+            mapped
+                .await
+                .map_err(super::read_tool_output::settled_recovery_failure)
         })
     }
 }

@@ -77,7 +77,7 @@ impl ToolExecutor<ToolInvocation> for LookupExecutableHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(async move {
+        let looked_up = async move {
             let ToolPayload::Function { ref arguments } = invocation.payload else {
                 return Err(FunctionCallError::RespondToModel(
                     "lookup_executable requires function arguments".into(),
@@ -153,6 +153,13 @@ impl ToolExecutor<ToolInvocation> for LookupExecutableHandler {
             }));
             crate::tools::context::ensure_exact_model_delivery(&output, &invocation)?;
             Ok(boxed_tool_output(output))
+        };
+        // Lookup probes candidate files without launching anything; a legacy
+        // failure leaves no effects to recover.
+        Box::pin(async move {
+            looked_up
+                .await
+                .map_err(super::read_tool_output::settled_recovery_failure)
         })
     }
 }

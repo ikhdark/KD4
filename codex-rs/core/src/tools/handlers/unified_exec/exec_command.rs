@@ -21,6 +21,9 @@ use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::allows_inline_sandbox_approval;
 use crate::tools::handlers::apply_granted_turn_permissions_uri;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
+use crate::tools::handlers::before_launch;
+use crate::tools::handlers::command_argument_refusal;
+use crate::tools::handlers::command_not_started;
 use crate::tools::handlers::command_preflight::preflight_invocation_for_kd4_runtime;
 use crate::tools::handlers::command_search::missing_rg_path_advisory_with_cancellation;
 use crate::tools::handlers::command_search::rg_search_no_match_eligible;
@@ -75,9 +78,9 @@ async fn get_command_async(
     })
     .await
     .map_err(|error| {
-        FunctionCallError::RespondToModel(format!("shell discovery worker failed: {error}"))
+        command_not_started(format!("shell discovery worker failed: {error}"))
     })?
-    .map_err(FunctionCallError::RespondToModel)
+    .map_err(command_argument_refusal)
 }
 
 #[derive(Debug, Deserialize)]
@@ -373,7 +376,7 @@ impl ExecCommandHandler {
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
             _ => {
-                return Err(FunctionCallError::RespondToModel(
+                return Err(command_argument_refusal(
                     "exec_command handler received unsupported payload".to_string(),
                 ));
             }
@@ -394,9 +397,10 @@ impl ExecCommandHandler {
             environment_args.environment_id.as_deref(),
             &cancellation_token,
         )
-        .await?;
+        .await
+        .map_err(before_launch(command_not_started))?;
         let Some(turn_environment) = turn_environment.as_ref() else {
-            return Err(FunctionCallError::RespondToModel(
+            return Err(command_not_started(
                 "exec_command requires a selected execution environment".to_string(),
             ));
         };
@@ -409,7 +413,7 @@ impl ExecCommandHandler {
                 || Ok(native_environment_cwd.clone()),
                 |workdir| native_environment_cwd.join(workdir),
             )
-            .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
+            .map_err(|err| command_argument_refusal(err.to_string()))?;
         let environment = Arc::clone(&turn_environment.environment);
         let fs = environment.get_filesystem();
 
@@ -432,9 +436,9 @@ impl ExecCommandHandler {
         let native_cwd = match cwd.to_abs_path() {
             Ok(cwd) if cwd_uses_native_convention => Some(cwd),
             _ if sandbox == SandboxType::None => None,
-            Err(err) => return Err(FunctionCallError::RespondToModel(err.to_string())),
+            Err(err) => return Err(command_argument_refusal(err.to_string())),
             Ok(_) => {
-                return Err(FunctionCallError::RespondToModel(format!(
+                return Err(command_argument_refusal(format!(
                     "path URI `{cwd}` does not use the host's native {} path convention",
                     PathConvention::native()
                 )));
@@ -454,10 +458,12 @@ impl ExecCommandHandler {
         };
         context.env_overrides.clone_from(&args.env);
         let environment_is_remote = environment.is_remote();
+        // PostToolUse reports where a local command ran; remote paths keep the host cwd.
+        let hook_tool_cwd = (!environment_is_remote).then(|| cwd.clone());
         let quiet_on_success = args.quiet_on_success;
         if environment_is_remote && !args.command_invocation().is_argv() {
             if turn_environment.shell.is_none() {
-                return Err(FunctionCallError::RespondToModel(format!(
+                return Err(command_argument_refusal(format!(
                     "environment `{}` does not report a shell",
                     turn_environment.environment_id
                 )));
@@ -469,14 +475,14 @@ impl ExecCommandHandler {
                 turn_environment.shell.as_ref(),
                 &turn_environment.environment_id,
             )
-            .map_err(FunctionCallError::RespondToModel)?;
+            .map_err(command_argument_refusal)?;
         }
         // A remote shell is required above for every shell-wrapped command. The local session
         // fallback can therefore only be reached by local commands or structured remote argv.
         let shell = session
             .shell_for_environment(turn_environment)
             .await
-            .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+            .map_err(|error| command_not_started(error.to_string()))?;
         let allow_login_shell = turn.config.permissions.allow_login_shell;
         let (mut args, original_resolved_command) = get_command_async(
             args,
@@ -517,10 +523,10 @@ impl ExecCommandHandler {
             policy_cwd,
         )
         .await
+        // Returned before process reservation or spawn below.
         .map_err(|issue| {
-            FunctionCallError::RespondToModel(format!(
-                "{issue}\nRegenerate the command and call `exec_command` again."
-            ))
+            let message = format!("{issue}\nRegenerate the command and call `exec_command` again.");
+            issue.into_pre_launch_error(message)
         })?;
         let repaired = preflight.repaired();
         let mut repair_notice = {
@@ -573,7 +579,7 @@ impl ExecCommandHandler {
             })
             .await
             .map_err(|error| {
-                FunctionCallError::RespondToModel(format!("command search worker failed: {error}"))
+                command_not_started(format!("command search worker failed: {error}"))
             })
         };
         // Pure launch analyses share inputs but not results. Join them before
@@ -689,7 +695,7 @@ impl ExecCommandHandler {
         } {
             Ok(normalized) => normalized,
             Err(err) => {
-                return Err(FunctionCallError::RespondToModel(err));
+                return Err(err);
             }
         };
         // A foreign grant cannot be represented by the host path type. Keep
@@ -804,7 +810,7 @@ impl ExecCommandHandler {
             .begin_attempt_with_freshness(&attempt_key, repaired, force_fresh)
             .await
         {
-            return Err(FunctionCallError::RespondToModel(
+            return Err(command_not_started(
                 blocked.render_for_model(),
             ));
         }
@@ -874,6 +880,7 @@ impl ExecCommandHandler {
                     search_no_match: false,
                     original_token_count: None,
                     hook_command: Some(hook_command),
+                    tool_cwd: hook_tool_cwd.clone(),
                     raw_output_artifact,
                     repair_notice,
                     pending_deferred_completions: Vec::new(),
@@ -1112,6 +1119,7 @@ impl ExecCommandHandler {
                     search_no_match: false,
                     original_token_count: Some(original_token_count),
                     hook_command: Some(hook_command),
+                    tool_cwd: hook_tool_cwd.clone(),
                     raw_output_artifact: Some(finalized_artifact),
                     repair_notice,
                     pending_deferred_completions: Vec::new(),
@@ -1252,6 +1260,33 @@ impl CoreToolRuntime for ExecCommandHandler {
         })
     }
 
+    /// Resolves `workdir` against the selected environment exactly as
+    /// `handle_call` does. Remote commands and unresolvable selections keep the
+    /// host cwd; the handler still rejects invalid selections before launch.
+    fn pre_tool_use_cwd(&self, invocation: &ToolInvocation) -> Option<codex_utils_path_uri::PathUri> {
+        let ToolPayload::Function { arguments } = &invocation.payload else {
+            return None;
+        };
+        let args: ExecCommandEnvironmentArgs = parse_arguments(arguments).ok()?;
+        let environment = crate::tools::handlers::resolve_tool_environment(
+            &invocation.step_context.environments,
+            args.environment_id.as_deref(),
+        )
+        .ok()??;
+        if environment.environment.is_remote() {
+            return None;
+        }
+        let environment_cwd = environment.cwd();
+        args.workdir
+            .as_deref()
+            .filter(|workdir| !workdir.is_empty())
+            .map_or_else(
+                || Ok(environment_cwd.clone()),
+                |workdir| environment_cwd.join(workdir),
+            )
+            .ok()
+    }
+
     fn post_tool_use_hook_name(&self, invocation: &ToolInvocation) -> Option<HookToolName> {
         matches!(&invocation.payload, ToolPayload::Function { .. }).then(HookToolName::exec_command)
     }
@@ -1325,6 +1360,10 @@ fn exec_command_error_output(
         }
         UnifiedExecError::MissingCommandLine | UnifiedExecError::ForeignPath { .. } => {
             ToolFailure::no_effects(ToolFailureCode::InvalidInput, message)
+        }
+        // Only the orchestrator's approval stage denies, before the launch attempt.
+        UnifiedExecError::PermissionDenied { .. } if no_process_registered => {
+            ToolFailure::no_effects(ToolFailureCode::PermissionDenied, message)
         }
         UnifiedExecError::SandboxDenied { .. } | UnifiedExecError::PermissionDenied { .. } => {
             ToolFailure::new(ToolFailureCode::PermissionDenied, message)

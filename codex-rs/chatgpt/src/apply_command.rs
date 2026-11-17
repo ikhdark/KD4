@@ -1,3 +1,4 @@
+use std::io::Write as _;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -71,6 +72,11 @@ async fn apply_diff(diff: String, cwd: Option<PathBuf>) -> anyhow::Result<()> {
             res.stderr
         );
     }
-    println!("Successfully applied diff");
+    // Unlike `println!`, a reader that closes the pipe early is not a panic.
+    let mut stdout = std::io::stdout().lock();
+    match writeln!(stdout, "Successfully applied diff").and_then(|()| stdout.flush()) {
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+        result => result?,
+    }
     Ok(())
 }

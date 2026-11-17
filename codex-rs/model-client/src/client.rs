@@ -5573,6 +5573,7 @@ impl ModelClientSession {
                                 clock_id: codex_protocol::timing::process_clock_domain_id(),
                                 trigger: codex_turn_timing::retries::RetryTrigger::Http,
                                 http_status: Some(status.as_u16()),
+                                stream_failure: None,
                                 action: codex_turn_timing::retries::RetryAction::FallbackHttp,
                                 source: None,
                                 backoff_ns: Some(0),
@@ -8092,7 +8093,15 @@ impl RequestTelemetry for ApiTelemetry {
                 TransportError::Network(_) => (RetryTrigger::Stream, None),
                 _ => (RetryTrigger::Other, None),
             };
-            timing.record_retry_decision(trigger, status, RetryAction::TransportRetry, Some(delay));
+            // Only a network failure is Stream-triggered here; record its class.
+            let stream_failure = matches!(error, TransportError::Network(_)).then_some(
+                codex_turn_timing::retries::RetryStreamFailure {
+                    class: codex_turn_timing::retries::RetryStreamFailureClass::Transport,
+                    close_code: None,
+                    reconnectable_close: false,
+                });
+            timing.record_retry_decision_with_stream_failure(
+                trigger, status, stream_failure, RetryAction::TransportRetry, Some(delay));
             let guard = timing.begin_retry_backoff();
             let previous = self.retry_backoff.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner).replace(guard);

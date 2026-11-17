@@ -83,7 +83,15 @@ async fn run_command_with_reservation(
 ) -> CommandRunResult {
     let mut command = build_command(shell, handler);
     command.current_dir(cwd);
-    run_owned_command(command, input_json, handler.timeout_sec, true, reservation).await
+    run_owned_command(
+        command,
+        input_json,
+        handler.timeout_sec,
+        true,
+        reservation,
+        handler.plugin_trust.as_ref(),
+    )
+    .await
 }
 
 pub(crate) async fn run_finalizer_command(command: Command, timeout_sec: u64) -> CommandRunResult {
@@ -93,6 +101,7 @@ pub(crate) async fn run_finalizer_command(command: Command, timeout_sec: u64) ->
         timeout_sec,
         false,
         codex_utils_pty::ManagedRootProcess::reserve_with_reclaim(),
+        /*plugin_trust*/ None,
     )
     .await
 }
@@ -103,6 +112,7 @@ async fn run_owned_command(
     timeout_sec: u64,
     stdout_is_protocol: bool,
     reservation: impl Future<Output = io::Result<codex_utils_pty::ManagedRootProcess>>,
+    plugin_trust: Option<&super::plugin_trust::PluginHookTrust>,
 ) -> CommandRunResult {
     let started_at = chrono::Utc::now().timestamp();
     let started = Instant::now();
@@ -121,6 +131,27 @@ async fn run_owned_command(
             },
         );
     };
+    // Approved plugin contents are re-verified within the hook's own deadline, so a
+    // script changed after discovery cannot run under the earlier approval.
+    if let Some(trust) = plugin_trust {
+        match timeout_at(timeout_deadline, trust.verify()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                return finish_command_run(
+                    started_at,
+                    started,
+                    CommandRunCompletion {
+                        exit_code: None,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        error: Some(err.to_string()),
+                        outcome: "trust_error",
+                    },
+                );
+            }
+            Err(_) => return finish_timeout(started_at, started, timeout_sec),
+        }
+    }
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

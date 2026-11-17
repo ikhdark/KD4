@@ -70,7 +70,7 @@ impl ToolExecutor<ToolInvocation> for GitConflictsHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(async move {
+        let inspected = async move {
             let ToolPayload::Function { ref arguments } = invocation.payload else {
                 return Err(FunctionCallError::RespondToModel(
                     "git_conflicts requires function arguments".into(),
@@ -101,6 +101,12 @@ impl ToolExecutor<ToolInvocation> for GitConflictsHandler {
                 &invocation,
                 || "Git conflicts exceeds the current model delivery budget; nothing was delivered. Use smaller max_files/max_markers or narrower paths.".into(),
             )
+        };
+        // Like `git_status`, a read-only Git observation leaves no effects.
+        Box::pin(async move {
+            inspected
+                .await
+                .map_err(super::read_tool_output::settled_recovery_failure)
         })
     }
 }

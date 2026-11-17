@@ -50,6 +50,8 @@ struct Lane {
     cuts: BTreeSet<u64>,
     prerequisites: Vec<String>,
     joins: Vec<String>,
+    /// The end is the tool owner's typed cessation, not a delivery/release.
+    owner_end: bool,
 }
 
 impl Lane {
@@ -60,12 +62,33 @@ impl Lane {
     }
 }
 
-fn release_ms(timing: &TurnTiming, call: &codex_protocol::protocol::TurnTimingToolCall) -> Option<u64> {
+fn delivered_release_ms(timing: &TurnTiming, call: &codex_protocol::protocol::TurnTimingToolCall) -> Option<u64> {
     if call.source == TurnTimingToolCallSource::Direct { return call.delivered_at_ms; }
     timing.measurement_evidence.as_ref()?.get("nestedDependencies")?.get("rows")?.as_array()?
         .iter().find(|row| row["cellId"].as_str() == call.parent_cell_id.as_deref()
             && row["runtimeCallId"].as_str() == call.runtime_tool_call_id.as_deref())?
         .get("releasedAtMs")?.as_u64()
+}
+
+// A cancelled/interrupted tool whose dispatch owner exited without any
+// delivery/release boundary has an exact typed cessation. It never replaces a
+// recorded delivery or release, and it is not tool success or output delivery.
+fn tool_owner_end(timing: &TurnTiming, call: &codex_protocol::protocol::TurnTimingToolCall) -> Option<u64> {
+    let packet = timing.measurement_evidence.as_ref()?.get("toolOwnerClosures")?;
+    if packet["complete"] != true || packet["schemaVersion"] != 1 { return None; }
+    let rows = packet["rows"].as_array()?;
+    if packet["actualCount"].as_u64()? != rows.len() as u64 { return None; }
+    let matches = rows.iter().filter(|row| row["executionId"].as_str() == Some(call.execution_id.0.as_str()))
+        .collect::<Vec<_>>();
+    if matches.len() != 1 { return None; }
+    let row = matches[0];
+    if row["basis"] != "tool_dispatch_owner_exit" || row["deliveredAtOwnerExit"] != false
+        || row["acceptedMs"].as_u64() != call.accepted_at_ms { return None; }
+    row["ownerEndMs"].as_u64()
+}
+
+fn release_ms(timing: &TurnTiming, call: &codex_protocol::protocol::TurnTimingToolCall) -> Option<u64> {
+    delivered_release_ms(timing, call).or_else(|| tool_owner_end(timing, call))
 }
 
 pub(super) fn snapshot(timing: &TurnTiming) -> Option<TurnTimingDependencyGraph> {
@@ -79,8 +102,16 @@ pub(super) fn snapshot(timing: &TurnTiming) -> Option<TurnTimingDependencyGraph>
     {
         reasons.insert("incomplete_clock_or_activity_coverage");
     }
+    // Stream retries and transport fallbacks record one row per physical
+    // attempt under their generation's index. Bind each generation to its rows
+    // in record order instead of comparing rows with logical generations.
+    let mut generations = BTreeMap::<u32, Vec<&codex_protocol::protocol::TurnTimingModelRequest>>::new();
+    for request in &timing.model_requests {
+        generations.entry(request.generation_index).or_default().push(request);
+    }
     if timing.model_request_history_truncated != Some(false)
-        || timing.model_requests.len() != timing.counters.logical_generation_count as usize
+        || !generations.keys().copied().eq(0..timing.counters.logical_generation_count)
+        || timing.model_requests.windows(2).any(|pair| pair[1].generation_index < pair[0].generation_index)
         || timing.counters.saturation_count != 0
     {
         reasons.insert("incomplete_request_inventory");
@@ -92,19 +123,44 @@ pub(super) fn snapshot(timing: &TurnTiming) -> Option<TurnTimingDependencyGraph>
         reasons.insert("incomplete_tool_inventory");
     }
     let mut lanes = BTreeMap::new();
-    for (index, request) in timing.model_requests.iter().enumerate() {
-        let id = format!("generation-{}", request.generation_index);
-        let (Some(start), Some(end)) = (ns(request.dispatch_ms), ns(request_end(timing, request))) else {
+    // Physical attempt dispatches per retried generation lane, with each
+    // attempt's sampling identity and whether the provider never completed it.
+    let mut attempt_starts = BTreeMap::<String, Vec<(u64, Option<String>, bool)>>::new();
+    for (index, (generation, attempts)) in generations.iter().enumerate() {
+        let id = format!("generation-{generation}");
+        let starts = attempts.iter().map(|attempt| ns(attempt.dispatch_ms)).collect::<Option<Vec<_>>>();
+        let end = attempts.last().and_then(|last| ns(request_end(timing, last)));
+        let (Some(starts), Some(end)) = (starts, end) else {
             reasons.insert("missing_request_endpoint");
             continue;
         };
-        if request.sampling_request_id.is_none() { reasons.insert("missing_request_identity"); }
+        if attempts.iter().any(|attempt| attempt.sampling_request_id.is_none()) {
+            reasons.insert("missing_request_identity");
+        }
+        // A superseded attempt ended no later than its successor's dispatch;
+        // without its own endpoint, that dispatch bounds it. Overlap is invalid.
+        for (position, attempt) in attempts.iter().enumerate().take(attempts.len() - 1) {
+            let next = starts[position + 1];
+            if next < starts[position]
+                || ns(request_end(timing, attempt)).is_some_and(|ended| ended > next)
+            {
+                reasons.insert("ambiguous_or_invalid_request_span");
+            }
+        }
+        let start = starts[0];
+        let mut cuts = BTreeSet::from([start, end]);
+        cuts.extend(starts.iter().copied().filter(|at| *at <= end));
         let row = Lane {
-            kind: Kind::Model, start, end, request: request.sampling_request_id.clone(),
-            cuts: BTreeSet::from([start, end]),
+            kind: Kind::Model, start, end, request: attempts[0].sampling_request_id.clone(),
+            cuts,
             prerequisites: if index == 0 { vec!["start".into()] } else { Vec::new() },
-            joins: Vec::new(),
+            joins: Vec::new(), owner_end: false,
         };
+        if attempts.len() > 1 {
+            attempt_starts.insert(id.clone(), starts.iter().copied().zip(attempts.iter())
+                .map(|(at, attempt)| (at, attempt.sampling_request_id.clone(), attempt.completed_ms.is_none()))
+                .collect());
+        }
         if start > end || end > timeline.duration_ns || lanes.insert(id, row).is_some() {
             reasons.insert("ambiguous_or_invalid_request_span");
         }
@@ -122,6 +178,7 @@ pub(super) fn snapshot(timing: &TurnTiming) -> Option<TurnTimingDependencyGraph>
         if lanes.insert(id, Lane {
             kind: Kind::Tool, start, end, request: None,
             cuts: BTreeSet::from([start, end]), prerequisites: Vec::new(), joins: Vec::new(),
+            owner_end: delivered_release_ms(timing, call).is_none(),
         }).is_some() { reasons.insert("ambiguous_tool_identity"); }
     }
 
@@ -228,9 +285,22 @@ pub(super) fn snapshot(timing: &TurnTiming) -> Option<TurnTimingDependencyGraph>
             let segment = if index == 0 { id.clone() } else { format!("{id}:segment-{index}") };
             let mut work = node(segment.clone(), lane.kind, start, end, vec![previous.clone()]);
             work.sampling_request_id = lane.request.clone();
-            if lane.kind == Kind::Model && timing.model_requests.iter().any(|request|
+            if let Some(attempts) = attempt_starts.get(id) {
+                // A retried generation's segment belongs to the attempt dispatched
+                // last at or before it; only the final attempt can end by an owner
+                // closure, superseded attempts end at their successor's dispatch.
+                let current = attempts.iter().rposition(|(at, ..)| *at <= start).unwrap_or(0);
+                let (_, request, open) = &attempts[current];
+                work.sampling_request_id = request.clone();
+                if current + 1 == attempts.len() && *open {
+                    work.evidence_ref = request.as_ref().map(|id| format!("requestOwnerClosures:{id}"));
+                }
+            } else if lane.kind == Kind::Model && timing.model_requests.iter().any(|request|
                 request.sampling_request_id == lane.request && request.completed_ms.is_none()) {
                 work.evidence_ref = lane.request.as_ref().map(|id| format!("requestOwnerClosures:{id}"));
+            }
+            if lane.kind == Kind::Tool && lane.owner_end {
+                work.evidence_ref = Some(format!("toolOwnerClosures:{id}"));
             }
             nodes.insert(segment.clone(), work);
             let boundary = format!("{id}:at-{end}");

@@ -72,7 +72,7 @@ impl ToolExecutor<ToolInvocation> for GitStatusHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(async move {
+        let observed = async move {
             let ToolPayload::Function { ref arguments } = invocation.payload else {
                 return Err(FunctionCallError::RespondToModel(
                     "git_status requires function arguments".into(),
@@ -126,6 +126,13 @@ impl ToolExecutor<ToolInvocation> for GitStatusHandler {
                 &invocation,
                 || "Git status exceeds the current model delivery budget; nothing was delivered. Use smaller max_files or narrower paths.".into(),
             )
+        };
+        // Git reads use a private index copy and request no repository writes;
+        // a legacy failure leaves no effects to recover.
+        Box::pin(async move {
+            observed
+                .await
+                .map_err(super::read_tool_output::settled_recovery_failure)
         })
     }
 }

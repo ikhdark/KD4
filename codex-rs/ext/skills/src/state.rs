@@ -367,6 +367,9 @@ impl SkillsThreadState {
             .iter()
             .find(|bound| bound.selected_root() == &root)
             .cloned();
+        // Discovery is authorized by the turn's current permissions, so a catalog
+        // discovered under different permissions is not reused.
+        let sandbox = executor_root_sandbox(&root, &query);
         let (slot, deadline) = {
             let mut cache = self
                 .executor_cache
@@ -375,6 +378,7 @@ impl SkillsThreadState {
             if let Some(cached) = cache.iter().find(|cached| {
                 cached.root == root
                     && cached.binding == binding
+                    && cached.sandbox == sandbox
                     && (cached.reusable_success()
                         || cached.turn_id == query.turn_id)
             }) {
@@ -386,6 +390,7 @@ impl SkillsThreadState {
                 cache.push(CachedExecutorCatalog {
                     root,
                     binding,
+                    sandbox,
                     turn_id: query.turn_id.clone(),
                     catalog: Arc::clone(&slot),
                     discovery_deadline: deadline,
@@ -423,6 +428,7 @@ impl SkillsThreadState {
                             .bound_executor_roots
                             .iter()
                             .find(|bound| bound.selected_root() == root)
+                    && cached.sandbox.as_ref() == executor_root_sandbox(root, query).as_ref()
                     && (cached.reusable_success()
                         || cached.turn_id == query.turn_id)
             })
@@ -431,9 +437,24 @@ impl SkillsThreadState {
     }
 }
 
+/// The current-turn filesystem permissions that authorize discovery of `root`.
+fn executor_root_sandbox(
+    root: &SelectedCapabilityRoot,
+    query: &SkillListQuery,
+) -> Option<codex_exec_server::FileSystemSandboxContext> {
+    let codex_protocol::capabilities::CapabilityRootLocation::Environment { environment_id, .. } =
+        &root.location;
+    codex_extension_api::environment_file_system_sandbox(
+        &query.executor_file_system_sandboxes,
+        environment_id,
+    )
+    .cloned()
+}
+
 struct CachedExecutorCatalog {
     root: SelectedCapabilityRoot,
     binding: Option<codex_exec_server::ResolvedSelectedCapabilityRoot>,
+    sandbox: Option<codex_exec_server::FileSystemSandboxContext>,
     turn_id: String,
     catalog: Arc<OnceCell<SkillProviderResult<Arc<SkillCatalog>>>>,
     discovery_deadline: tokio::time::Instant,

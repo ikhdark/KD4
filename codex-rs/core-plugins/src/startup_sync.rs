@@ -1212,16 +1212,37 @@ async fn fetch_public_bytes(
     url: &str,
     context: &str,
 ) -> Result<Vec<u8>, String> {
+    // The backend-supplied download URL is signed: apply the remote bundle URL policy to it and to
+    // every redirect hop before that hop is routed or sent, and format only scheme://host.
+    let allow_loopback_http = crate::remote_bundle::allow_test_loopback_http_bundle_downloads();
+    let safe_url = crate::remote_bundle::safe_bundle_url(url);
+    let parsed_url = url::Url::parse(url).map_err(|err| {
+        format!("failed to {context}: backend returned an invalid download URL: {err}")
+    })?;
+    if !crate::remote_bundle::is_allowed_bundle_download_url(&parsed_url, allow_loopback_http) {
+        return Err(format!(
+            "failed to {context}: backend returned an unsupported download URL {safe_url}"
+        ));
+    }
     let response = http_clients
         .get(url)
         .timeout(CURATED_PLUGINS_BACKUP_ARCHIVE_TIMEOUT)
+        .redirect_filter(move |hop| {
+            crate::remote_bundle::is_allowed_bundle_download_url(hop, allow_loopback_http)
+        })
         .send()
         .await
-        .map_err(|err| format!("failed to {context} from {url}: {err}"))?;
+        .map_err(|err| format!("failed to {context} from {safe_url}: {}", err.without_url()))?;
     let body =
         crate::remote::read_plugin_http_response(response, CURATED_PLUGINS_MAX_ARCHIVE_BYTES)
             .await
-            .map_err(|err| format!("failed to read {context} response from {url}: {err}"))?;
+            .map_err(|err| match err {
+                // A server can echo the signed URL or its credentials in arbitrary body text.
+                crate::remote::PluginHttpResponseError::Status { status, .. } => format!(
+                    "failed to read {context} response from {safe_url}: HTTP status {status} [response body omitted]"
+                ),
+                err => format!("failed to read {context} response from {safe_url}: {err}"),
+            })?;
     Ok(body)
 }
 

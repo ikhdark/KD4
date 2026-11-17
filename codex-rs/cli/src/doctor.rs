@@ -301,15 +301,15 @@ pub async fn run_doctor(
     let report = build_report(&command, root_config_overrides, interactive, arg0_paths).await;
 
     if command.json {
-        println!(
+        out_println!(
             "{}",
             serde_json::to_string_pretty(&redacted_json_report(&report))?
-        );
+        )?;
     } else {
-        print!(
+        out_print!(
             "{}",
             render_human_report(&report, human_output_options(&command))
-        );
+        )?;
     }
 
     if report.overall_status == CheckStatus::Fail {

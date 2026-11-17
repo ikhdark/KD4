@@ -61,6 +61,8 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                     request_id: None,
                     idle_timeout: false,
                     reconnectable_close: matches!(code, Some(1000 | 1001 | 1012 | 1013)),
+                    // RFC 6455 7.1.5: a close frame without a code is 1005.
+                    close_code: Some(code.unwrap_or(1005)),
                 })
             }
         }
@@ -80,6 +82,8 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                 request_id: None,
                 idle_timeout,
                 reconnectable_close,
+                // The marker keeps only the reconnect decision, not the code.
+                close_code: None,
             })
         }
         ApiError::ServerOverloaded { retry_after } => CodexErr::ServerOverloaded { retry_after },
@@ -229,6 +233,7 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                     idle_timeout: false,
                     // The transport broke; the provider never closed the stream.
                     reconnectable_close: false,
+                    close_code: None,
                 })
             }
             TransportError::Build(msg) => CodexErr::RequestBuild(msg),

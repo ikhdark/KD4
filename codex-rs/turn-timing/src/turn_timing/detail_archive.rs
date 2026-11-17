@@ -39,7 +39,13 @@ impl PendingRecord {
         match encoded {
             Ok(mut bytes) => {
                 bytes.push(b'\n');
-                if let Some(task) = capture.task.as_mut() { task.write_chunk(&bytes); }
+                // Whole records only: one that would cross the shared sink's
+                // per-log ceiling is dropped as a journal gap, never cut.
+                let fits = capture.bytes.saturating_add(bytes.len() as u64)
+                    <= codex_tool_artifacts::MAX_COMMAND_LOG_BYTES;
+                if let Some(task) = capture.task.as_mut() {
+                    if fits { task.write_chunk(&bytes); } else { task.mark_output_gap(); }
+                }
                 capture.bytes = capture.bytes.saturating_add(bytes.len() as u64);
                 capture.digest.update(&bytes);
             }
@@ -57,7 +63,7 @@ impl Capture {
         let reference = self.artifact.try_lock().ok()
             .map(|artifact| RawOutputArtifact::output_reference(Some(&artifact)))
             .unwrap_or_else(|| json!({}));
-        json!({
+        let mut receipt = json!({
             "schema_version": 1, "format": "turn-timing-overflow-jsonl-v1",
             "artifact_id": reference.get("artifact_id"),
             "owner_thread_id": self.thread_id, "turn_id": self.turn_id,
@@ -66,7 +72,11 @@ impl Capture {
             "complete": self.received == expected && reference.get("capture_complete") == Some(&Value::Bool(true)),
             "output_reference": reference,
             "ordering": "sequence; disk order may differ",
-        })
+        });
+        if self.bytes > codex_tool_artifacts::MAX_COMMAND_LOG_BYTES {
+            receipt["reason"] = "journal reached its size limit; later records were not retained".into();
+        }
+        receipt
     }
 }
 

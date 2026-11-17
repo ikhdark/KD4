@@ -414,6 +414,9 @@ struct ProcessEntry {
     cwd: PathUri,
     initial_exec_command_active: Arc<std::sync::atomic::AtomicBool>,
     hook_command: String,
+    /// `PostToolUse` cwd captured at launch: the command cwd for local
+    /// environments, `None` for remote ones. Later polls may run in other turns.
+    hook_cwd: Option<PathUri>,
     search_exit_one_is_no_match: bool,
     tty: bool,
     /// This process was launched as a noninteractive validation run.

@@ -432,6 +432,10 @@ pub struct ResponseStreamFailed {
     /// request. Retry routing rebuilds the transport once before abandoning it,
     /// so one such close cannot degrade the rest of the session.
     pub reconnectable_close: bool,
+    /// RFC 6455 connection close code when the provider sent a close frame
+    /// (1005 when that frame carried no code). Diagnostics only: retry routing
+    /// keeps using `reconnectable_close`.
+    pub close_code: Option<u16>,
 }
 
 impl std::fmt::Display for ResponseStreamFailed {

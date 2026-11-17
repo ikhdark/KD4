@@ -81,7 +81,7 @@ impl ToolExecutor<ToolInvocation> for GitBlameHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(async move {
+        let blamed = async move {
             let ToolPayload::Function { ref arguments } = invocation.payload else {
                 return Err(FunctionCallError::RespondToModel(
                     "git_blame requires function arguments".into(),
@@ -122,6 +122,12 @@ impl ToolExecutor<ToolInvocation> for GitBlameHandler {
                 &invocation,
                 || "git_blame result exceeds the current model delivery budget; nothing was delivered. Request a smaller line range.".into(),
             )
+        };
+        // Like `git_status`, a read-only Git observation leaves no effects.
+        Box::pin(async move {
+            blamed
+                .await
+                .map_err(super::read_tool_output::settled_recovery_failure)
         })
     }
 }

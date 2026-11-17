@@ -27,6 +27,7 @@ pub(crate) struct AgentCommunicationContext {
     kind: AgentCommunicationKind,
     sender_thread_id: ThreadId,
     sender_turn_id: Option<String>,
+    sender_validation_scope: Option<(String, String)>,
 }
 
 impl AgentCommunicationContext {
@@ -35,12 +36,27 @@ impl AgentCommunicationContext {
             kind,
             sender_thread_id,
             sender_turn_id: None,
+            sender_validation_scope: None,
         }
     }
 
     pub(crate) fn with_sender_turn(mut self, turn_id: String) -> Self {
         self.sender_turn_id = Some(turn_id);
         self
+    }
+
+    /// The root validation turn the sending turn acts for.
+    pub(crate) fn with_sender_validation_scope(mut self, scope: (String, String)) -> Self {
+        self.sender_validation_scope = Some(scope);
+        self
+    }
+
+    /// Only a deliberate follow-up delegates its sender's validation scope.
+    /// Terminal results and host nudges never move a receiver between scopes.
+    pub(crate) fn followup_validation_scope(&self) -> Option<&(String, String)> {
+        (self.kind == AgentCommunicationKind::Followup)
+            .then_some(self.sender_validation_scope.as_ref())
+            .flatten()
     }
 
     pub(crate) fn followup_turn_owner(&self) -> Option<(ThreadId, &str)> {

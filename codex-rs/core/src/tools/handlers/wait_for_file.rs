@@ -194,7 +194,7 @@ impl ToolExecutor<ToolInvocation> for WaitForFileHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(async move {
+        let waited = async move {
             let error = |message: String| FunctionCallError::RespondToModel(message);
             let ToolPayload::Function { ref arguments } = invocation.payload else {
                 return Err(error("wait_for_file requires function arguments".into()));
@@ -323,6 +323,13 @@ impl ToolExecutor<ToolInvocation> for WaitForFileHandler {
                 value["last_probe_error"] = json!(message);
             }
             Ok(boxed_tool_output(JsonToolOutput::new(value)))
+        };
+        // Watching and probing only observe the path; expiry and cancellation
+        // are results, not errors. A legacy failure leaves no effects.
+        Box::pin(async move {
+            waited
+                .await
+                .map_err(super::read_tool_output::settled_recovery_failure)
         })
     }
 }

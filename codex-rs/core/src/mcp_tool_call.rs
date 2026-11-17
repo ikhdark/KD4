@@ -1400,6 +1400,7 @@ async fn maybe_request_mcp_tool_approval(
                 .clone()
                 .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
         },
+        /*tool_cwd*/ None,
     )
     .await
     {

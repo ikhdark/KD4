@@ -40,13 +40,13 @@ pub(super) fn ensure_codex_app_runtime_paths_readable(
             Ok(has_access) => has_access,
             Err(err) => {
                 refresh_errors.push(format!(
-                    "runtime read/execute mask check failed on {} for sandbox_group: {err}",
+                    "runtime read/execute mask check failed on {} for sandbox_group: {err:#}",
                     runtime_path.display()
                 ));
                 super::log_line(
                     log,
                     &format!(
-                        "runtime read/execute mask check failed on {} for sandbox_group: {err}; continuing",
+                        "runtime read/execute mask check failed on {} for sandbox_group: {err:#}; continuing",
                         runtime_path.display()
                     ),
                 )?;
@@ -76,13 +76,13 @@ pub(super) fn ensure_codex_app_runtime_paths_readable(
         };
         if let Err(err) = result {
             refresh_errors.push(format!(
-                "grant read/execute ACE failed on {} for sandbox_group: {err}",
+                "grant read/execute ACE failed on {} for sandbox_group: {err:#}",
                 runtime_path.display()
             ));
             super::log_line(
                 log,
                 &format!(
-                    "grant read/execute ACE failed on {} for sandbox_group: {err}",
+                    "grant read/execute ACE failed on {} for sandbox_group: {err:#}",
                     runtime_path.display()
                 ),
             )?;

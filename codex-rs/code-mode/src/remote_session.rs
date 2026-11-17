@@ -456,15 +456,24 @@ impl ProcessOwnedCodeModeSession {
     pub async fn terminate(&self, cell_id: CellId) -> Result<WaitOutcome, String> {
         let binding = self.connection().await?;
         let key = (binding.remote.generation, cell_id.clone());
-        let result = binding.connection.terminate(binding.remote, cell_id).await;
-        if result.is_ok() {
-            self.inner
-                .pending_waits
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&key);
-        }
-        result
+        let inner = Arc::clone(&self.inner);
+        // Dropping an accepted terminate retires the shared host for every
+        // session, and its stall-compensated host deadline can outlast any
+        // caller's own bound. Keep it in session custody until that deadline
+        // settles it; a caller that stops waiting only stops observing.
+        tokio::spawn(async move {
+            let result = binding.connection.terminate(binding.remote, cell_id).await;
+            if result.is_ok() {
+                inner
+                    .pending_waits
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&key);
+            }
+            result
+        })
+        .await
+        .unwrap_or_else(|error| Err(format!("code-mode cell termination task failed: {error}")))
     }
 
     pub async fn shutdown(&self) -> Result<(), String> {

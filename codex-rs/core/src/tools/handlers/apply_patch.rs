@@ -82,8 +82,10 @@ impl ApplyPatchInterceptionError {
             }
             _ => None,
         };
+        let mut failure = crate::tools::runtimes::apply_patch::patch_failure(&error);
+        mark_intercepted_patch_refusal(&mut failure);
         Self {
-            error: FunctionCallError::structured(crate::tools::runtimes::apply_patch::patch_failure(&error)),
+            error: FunctionCallError::structured(failure),
             proof,
         }
     }
@@ -707,6 +709,21 @@ impl ApplyPatchHandler {
             };
             unattempted = codex_apply_patch::AppliedPatchDelta::unattempted(&requested_hunks, turn_environment.cwd());
             response_environment_id = Some(turn_environment.environment_id.clone());
+            // The router's gate refuses an unauthorized apply_patch before this
+            // handler but cannot see the selected environment. Ask the patch owner
+            // once it is known, before the workspace wait, verification, safety
+            // assessment or approval can decide the call first.
+            let refusal_ctx = ToolCtx {
+                session: session.clone(),
+                turn: turn.clone(),
+                call_id: call_id.clone(),
+                tool_name: tool_name.clone(),
+            };
+            if let Some(refusal) =
+                ApplyPatchRuntime::assignment_refusal(&refusal_ctx, turn_environment).await
+            {
+                return Err(FunctionCallError::structured(refusal));
+            }
             tracker.lock().await.observe_environment_scope(&step_context.environments, turn_environment);
             if retry_scope.as_ref().is_some_and(|(id, instance, cwd)| {
                 id != &turn_environment.environment_id
@@ -1493,9 +1510,35 @@ fn intercepted_patch_failure(
             codex_protocol::tool_failure::ToolFailureCode::Failed, "Intercepted patch failed.",
         ));
     // Preserve the established mutation/recovery receipt through shell relay.
+    // A capability refusal keeps the `denial_kind` the direct route reports.
     let receipt = output.code_mode_result(&ToolPayload::Custom { input: String::new() });
-    failure.details = Some(serde_json::json!({"patch_result": receipt}));
+    let mut details = serde_json::json!({"patch_result": receipt});
+    if let Some(kind) = failure.details.as_ref().and_then(|details| details.get("denial_kind")) {
+        details["denial_kind"] = kind.clone();
+    }
+    failure.details = Some(details);
+    mark_intercepted_patch_refusal(&mut failure);
     FunctionCallError::structured(failure)
+}
+
+/// A no-effects `InvalidInput` from an intercepted patch is the patch owner's
+/// verdict on a command the shell tool's decoder accepted, so mark it as the
+/// handler's own refusal. A direct-call dispatcher otherwise re-explains such a
+/// failure from the shell tool's schema, which omits accepted compatibility
+/// fields, and the model never sees the patch reason.
+fn mark_intercepted_patch_refusal(failure: &mut codex_protocol::tool_failure::ToolFailure) {
+    use codex_protocol::tool_failure::{ToolEffectsState, ToolFailure, ToolFailureCode};
+    if failure.code != ToolFailureCode::InvalidInput || failure.effects != ToolEffectsState::None {
+        return;
+    }
+    let Some(serde_json::Value::Object(marker)) =
+        ToolFailure::handler_refusal(failure.code, String::new(), "intercepted_patch").details
+    else {
+        return;
+    };
+    if let Some(details) = failure.details.get_or_insert_with(|| serde_json::json!({})).as_object_mut() {
+        details.extend(marker);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1519,9 +1562,26 @@ pub(crate) async fn intercept_apply_patch(
     // wait for the patch gate. Verification below must run while holding the permit.
     // Like the apply_patch tool, the permit claims only this patch's endpoints when
     // they are safely narrow, so an approval wait does not hold every other patch.
-    let workspace_operation_permit = if let Some((patch_cwd, hunks)) =
-        codex_apply_patch::apply_patch_command_scope(command, cwd)
+    let patch_scope = codex_apply_patch::apply_patch_command_scope(command, cwd);
+    // The router refuses an unauthorized apply_patch tool call before the workspace
+    // wait, verification, safety assessment or approval. A patch relayed through a
+    // shell tool passed that gate as a shell call, so give it the same refusal
+    // here: otherwise a gate timeout, a patch error, a sandbox verdict or a user
+    // prompt decides an unauthorized write first and the refusal is never recorded.
+    let refusal_ctx = || ToolCtx {
+        session: session.clone(),
+        turn: turn.clone(),
+        call_id: call_id.to_string(),
+        tool_name: ToolName::plain(tool_name),
+    };
+    let scoped = patch_scope.is_some();
+    if scoped
+        && let Some(refusal) =
+            ApplyPatchRuntime::assignment_refusal(&refusal_ctx(), &turn_environment).await
     {
+        return Err(FunctionCallError::structured(refusal).into());
+    }
+    let workspace_operation_permit = if let Some((patch_cwd, hunks)) = patch_scope {
         acquire_patch_workspace(
             &turn_environment,
             &patch_cwd,
@@ -1538,15 +1598,28 @@ pub(crate) async fn intercept_apply_patch(
         None
     };
     let sandbox = turn.file_system_sandbox_context(/*additional_permissions*/ None, cwd);
-    match codex_apply_patch::maybe_parse_apply_patch_verified_for_environment(
+    let verified = codex_apply_patch::maybe_parse_apply_patch_verified_for_environment(
         command,
         cwd,
         fs,
         Some(&sandbox),
         &turn_environment.environment_id,
     )
-    .await
+    .await;
+    // A patch command with no scope to claim (malformed, or a bare patch body)
+    // waited for no gate and read no file above; it is refused the same way here.
+    if !scoped
+        && matches!(
+            verified,
+            codex_apply_patch::MaybeApplyPatchVerified::Body(_)
+                | codex_apply_patch::MaybeApplyPatchVerified::CorrectnessError(_)
+        )
+        && let Some(refusal) =
+            ApplyPatchRuntime::assignment_refusal(&refusal_ctx(), &turn_environment).await
     {
+        return Err(FunctionCallError::structured(refusal).into());
+    }
+    match verified {
         codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
             let (approval_keys, effective_additional_permissions, file_system_sandbox_policy) =
                 effective_patch_permissions(

@@ -134,6 +134,17 @@ const GROUPS: &[Group] = &[
     ),
 ];
 
+/// Grouped front door and operation that carry a legacy native tool name, so
+/// a lookup by that name can point at its current callable.
+pub(crate) fn grouped_operation_for(legacy_name: &str) -> Option<(&'static str, &'static str)> {
+    GROUPS.iter().find_map(|&(group, _, _, operations)| {
+        operations
+            .iter()
+            .find(|(_, old)| *old == legacy_name)
+            .map(|&(operation, _)| (group, operation))
+    })
+}
+
 pub(crate) fn consolidate_native_tools(runtimes: &mut Vec<RegisteredTool>, deferred: bool) {
     for &(name, description, class, operations) in GROUPS {
         let mut namespaces = BTreeMap::<Option<String>, Vec<(Operation, usize)>>::new();

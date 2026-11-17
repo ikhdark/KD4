@@ -1344,8 +1344,20 @@ impl PluginsManager {
         // Even an equal observation supersedes older in-flight responses.
         self.remote_installed_plugins_accepted_fetch
             .store(ticket, Ordering::Release);
-        if cache.as_ref().is_some_and(|cache| cache.eq(&plugins)) {
-            return Some(false);
+        match cache.as_ref() {
+            Some(cache) if cache.eq(&plugins) => return Some(false),
+            // An absent cache and an empty one yield the same effective plugin
+            // set (remote_installed_plugin_configs is empty for both), so a first
+            // empty fetch records the observation without invalidating loaded
+            // plugins or notifying an effective change. Readers that distinguish
+            // the two (remote marketplace listing, remote discoverable
+            // suggestions, and the app-server installed-marketplace read that
+            // fetches when the cache is absent) read this cache live on each request.
+            None if plugins.is_empty() => {
+                *cache = Some(plugins);
+                return Some(false);
+            }
+            _ => {}
         }
         *cache = Some(plugins);
         drop(cache);
@@ -1396,10 +1408,14 @@ impl PluginsManager {
         &self,
         mut cache: std::sync::RwLockWriteGuard<'_, Option<Vec<RemoteInstalledPlugin>>>,
     ) -> bool {
-        if cache.is_none() {
-            return false;
+        // Dropping an empty observation leaves the effective plugin set unchanged
+        // (see write_remote_installed_plugins_cache_if_generation), so it only
+        // resets the cache for the next live read.
+        match cache.take() {
+            None => return false,
+            Some(plugins) if plugins.is_empty() => return false,
+            Some(_) => {}
         }
-        *cache = None;
         drop(cache);
         self.clear_loaded_plugins_cache();
         true

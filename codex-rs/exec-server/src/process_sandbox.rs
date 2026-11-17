@@ -306,6 +306,7 @@ pub(crate) fn prepare_exec_request_cancellable(
             &request.permission_profile,
             &native_sandbox_policy_cwd,
             use_elevated,
+            &request.env,
         )
     } else {
         resolve_windows_restricted_token_filesystem_overrides(

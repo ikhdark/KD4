@@ -925,6 +925,10 @@ pub struct ExecClosedNotification {
 pub struct ExecOutputGapNotification {
     pub process_id: ProcessId,
     pub through_seq: u64,
+    /// The stream whose producer stopped without an EOF receipt, when this gap
+    /// is that capture loss rather than eviction; absent from legacy peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_incomplete: Option<ExecOutputStream>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

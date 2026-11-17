@@ -261,5 +261,7 @@ pub fn normalize_absolute_source_path(root: &Path, path: &Path) -> StoreResult<S
     for component in suffix.into_iter().rev() { canonical.push(component); }
     let relative = canonical.strip_prefix(&root)
         .map_err(|_| StoreError::InvalidScope("patch endpoint is outside its assigned repository".into()))?;
-    crate::normalize_repo_path(&root, &relative.to_string_lossy())
+    // An endpoint whose existing ancestor cannot be resolved (a dangling link, an
+    // unreadable directory) is an I/O failure here, not a scope outcome.
+    crate::scope::normalize_endpoint_path(&root, &relative.to_string_lossy())
 }

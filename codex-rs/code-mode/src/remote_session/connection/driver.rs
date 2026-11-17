@@ -55,6 +55,27 @@ pub(super) struct ConnectionDriver {
     failure: Arc<std::sync::Mutex<Option<String>>>,
     cancellation: CancellationToken,
     failed: bool,
+    // Last scheduler observation for backend-stall accounting while a control
+    // deadline is armed (charged per deadline in `RequestTracker`); see
+    // `within_host_budget` in the parent module for the same accounting.
+    stall_observed: tokio::time::Instant,
+}
+
+type BackendStallProbe =
+    std::pin::Pin<Box<dyn std::future::Future<Output = std::time::Duration> + Send>>;
+
+/// Waits at most `BACKEND_STALL_EVIDENCE` for a no-op on the blocking pool,
+/// which Windows child pipes share, and returns how long that took.
+fn backend_stall_probe() -> BackendStallProbe {
+    Box::pin(async {
+        let started = tokio::time::Instant::now();
+        let _ = tokio::time::timeout(
+            super::BACKEND_STALL_EVIDENCE,
+            tokio::task::spawn_blocking(|| ()),
+        )
+        .await;
+        started.elapsed()
+    })
 }
 
 impl ConnectionDriver {
@@ -85,6 +106,7 @@ impl ConnectionDriver {
                 failure: lifecycle.failure,
                 cancellation: lifecycle.cancellation,
                 failed: false,
+                stall_observed: tokio::time::Instant::now(),
             },
             execute_claim_tx,
         )
@@ -93,24 +115,39 @@ impl ConnectionDriver {
     pub(super) async fn run(mut self) {
         enum Ready {
             ControlTimeout,
+            StallProbe(std::time::Duration),
+            StallTick,
             Event(Option<DriverEvent>),
             Claim(Option<RequestId>),
             Command(Option<DriverCommand>),
         }
+        let mut ticks = tokio::time::interval(super::BACKEND_STALL_TICK);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Runs beside traffic rather than inline, so an acknowledgement that
+        // arrives while it waits still settles its request.
+        let mut stall_probe: Option<BackendStallProbe> = None;
         loop {
             let deadline = self.requests.next_control_deadline();
+            let probing = stall_probe.is_some();
             let ready = tokio::select! {
                 biased;
                 _ = self.cancellation.cancelled() => {
                     self.fail("code-mode host connection closed".to_string());
                     return;
                 }
+                waited = async {
+                    match stall_probe.as_mut() {
+                        Some(probe) => probe.await,
+                        None => std::future::pending().await,
+                    }
+                } => Ready::StallProbe(waited),
                 _ = async {
                     match deadline {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        None => std::future::pending::<()>().await,
+                        Some(deadline) if !probing => tokio::time::sleep_until(deadline).await,
+                        _ => std::future::pending::<()>().await,
                     }
                 } => Ready::ControlTimeout,
+                _ = ticks.tick(), if deadline.is_some() && !probing => Ready::StallTick,
                 ready = async {
                     // Cancellation stays first; traffic channels share the
                     // default fair selector rather than event-first priority.
@@ -121,10 +158,35 @@ impl ConnectionDriver {
                     }
                 } => ready,
             };
+            // Only a gap spent with a deadline armed, and not inside a probe
+            // (which measures its own interval), is backend stall; time the
+            // driver sat idle before a deadline existed is not.
+            if deadline.is_some() && !probing {
+                let mut stalled = std::time::Duration::ZERO;
+                super::note_backend_gap(&mut self.stall_observed, &mut stalled);
+                self.requests.note_control_stall(stalled, self.stall_observed);
+            } else {
+                self.stall_observed = tokio::time::Instant::now();
+            }
             match ready {
-                Ready::ControlTimeout => {
-                    self.fail("code-mode destructive cleanup acknowledgement timed out; external effects are unknown; do not replay work".to_string());
-                    return;
+                Ready::StallTick => {}
+                Ready::ControlTimeout => stall_probe = Some(backend_stall_probe()),
+                Ready::StallProbe(waited) => {
+                    stall_probe = None;
+                    // Host messages already received win over the expired
+                    // window, as the request does in `within_host_budget`.
+                    for _ in 0..self.event_rx.len() {
+                        let Ok(event) = self.event_rx.try_recv() else {
+                            break;
+                        };
+                        if !self.cancel_dropped_callers() || !self.handle_event(event) {
+                            return;
+                        }
+                    }
+                    if !self.backend_stalled_through_deadline(waited) {
+                        self.fail("code-mode destructive cleanup acknowledgement timed out; external effects are unknown; do not replay work".to_string());
+                        return;
+                    }
                 }
                 Ready::Event(event) => {
                     let Some(event) = event else {
@@ -153,6 +215,29 @@ impl ConnectionDriver {
                 }
             }
         }
+    }
+
+    /// After a control deadline's blocking-pool probe, re-arms the expired
+    /// windows (bounded per request) in which this backend measurably stalled:
+    /// late scheduler ticks, or a probe (Windows child pipes share that pool)
+    /// that could not start. A host is not charged with time its client could
+    /// not observe. False when an expired window has no such evidence.
+    fn backend_stalled_through_deadline(&mut self, probe_wait: std::time::Duration) -> bool {
+        let now = tokio::time::Instant::now();
+        if probe_wait > super::BACKEND_STALL_TICK {
+            self.requests.note_control_stall(probe_wait, now);
+        }
+        self.stall_observed = now;
+        let Some(stalled) = self.requests.rearm_expired_control_deadlines(now) else {
+            return false;
+        };
+        if !stalled.is_zero() {
+            tracing::warn!(
+                stalled = ?stalled,
+                "code-mode backend stalled during a cleanup acknowledgement window; re-arming it"
+            );
+        }
+        true
     }
 
     fn handle_event(&mut self, event: DriverEvent) -> bool {

@@ -348,6 +348,12 @@ pub(crate) trait Approvable<Req> {
         None
     }
 
+    /// Local execution cwd reported as the PermissionRequest hook `cwd`. `None`
+    /// keeps the turn cwd (remote commands, other tools); hooks still launch there.
+    fn permission_request_cwd(&self, _req: &Req) -> Option<codex_utils_path_uri::PathUri> {
+        None
+    }
+
     fn start_approval_async<'a>(
         &'a mut self,
         req: &'a Req,

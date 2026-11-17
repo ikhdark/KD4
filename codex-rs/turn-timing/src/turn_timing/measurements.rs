@@ -44,6 +44,8 @@ pub(super) struct Capture {
     final_candidates: BTreeMap<String, Value>,
     pub(super) request_owner_ends: BTreeMap<String, Value>,
     pub(super) request_owner_end_count: u64,
+    tool_owner_ends: BTreeMap<String, Value>,
+    tool_owner_end_count: u64,
 }
 
 fn digest(value: &impl serde::Serialize) -> Option<String> {
@@ -123,6 +125,20 @@ impl Capture {
             return;
         }
         self.outputs.insert(execution.to_owned(), row);
+    }
+
+    /// Exit of an accepted tool's dispatch owner (its timing guard), including
+    /// cancelled/interrupted work. Not delivery, release or tool success.
+    pub(super) fn tool_owner_end(&mut self, execution: &str, accepted_ms: Option<u64>,
+                                 owner_end_ms: Option<u64>, outcome: Option<&str>, delivered: bool) {
+        self.enabled = true;
+        self.tool_owner_end_count = self.tool_owner_end_count.saturating_add(1);
+        // A repeated identity stays ambiguous: the count no longer matches the rows.
+        if self.tool_owner_ends.len() >= LIMIT || self.tool_owner_ends.contains_key(execution) { return; }
+        self.tool_owner_ends.insert(execution.to_owned(), json!({
+            "executionId":execution, "acceptedMs":accepted_ms, "ownerEndMs":owner_end_ms,
+            "outcome":outcome, "deliveredAtOwnerExit":delivered,
+            "basis":"tool_dispatch_owner_exit"}));
     }
 
     pub(super) fn snapshot(&self, requests: &[TurnTimingModelRequest], duration_ms: u64,
@@ -285,6 +301,11 @@ impl Capture {
                 "complete":self.request_owner_ends.len() as u64 == self.request_owner_end_count,
                 "actualCount":self.request_owner_end_count,
                 "rows":self.request_owner_ends.values().collect::<Vec<_>>()},
+            "toolOwnerClosures":{"schemaVersion":1,
+                "complete":self.tool_owner_ends.len() as u64 == self.tool_owner_end_count,
+                "actualCount":self.tool_owner_end_count,
+                "rows":self.tool_owner_ends.values().collect::<Vec<_>>(),
+                "scope":"accepted tool dispatch owner exits; not delivery, release or tool success"},
             "artifactRecoveries":{"complete":self.dropped_artifact_recoveries == 0 && self.actual_artifact_recoveries != u64::MAX,
                 "actualCount":self.actual_artifact_recoveries,
                 "rows":self.artifact_recoveries.values().collect::<Vec<_>>(),

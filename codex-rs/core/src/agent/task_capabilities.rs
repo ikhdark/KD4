@@ -270,23 +270,49 @@ struct CapabilityRefusal {
     /// Reads can stand in for refused inspection, never for a refused source edit.
     replaceable: bool,
     followed_by_work: bool,
+    /// The one refused target of a tool the assignment may otherwise use (a patch
+    /// endpoint outside a writable scope, a remote environment); `None` when it
+    /// may not use the tool.
+    target: Option<String>,
 }
 
 impl CapabilityRefusals {
+    /// Distinct refused targets kept per turn; the first ones already make the
+    /// disposition incomplete, so later ones add no decision.
+    const TARGET_LIMIT: usize = 8;
+
     fn entries(&self) -> std::sync::MutexGuard<'_, Vec<CapabilityRefusal>> {
         self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub(crate) fn record(&self, tool: &str, class: TypedToolClass) {
+        self.record_refusal(tool, class, None);
+    }
+
+    /// A refusal of one target; the assignment keeps the tool for permitted targets.
+    pub(crate) fn record_target(&self, tool: &str, class: TypedToolClass, target: &str) {
+        self.record_refusal(tool, class, Some(target));
+    }
+
+    fn record_refusal(&self, tool: &str, class: TypedToolClass, target: Option<&str>) {
         let mut entries = self.entries();
-        match entries.iter_mut().find(|refusal| refusal.tool == tool) {
-            Some(refusal) => refusal.followed_by_work = false,
-            None => entries.push(CapabilityRefusal {
-                tool: tool.to_string(),
-                replaceable: class != TypedToolClass::StructuredEdit,
-                followed_by_work: false,
-            }),
+        if let Some(refusal) = entries.iter_mut()
+            .find(|refusal| refusal.tool == tool && refusal.target.as_deref() == target)
+        {
+            refusal.followed_by_work = false;
+            return;
         }
+        if target.is_some()
+            && entries.iter().filter(|refusal| refusal.target.is_some()).count() >= Self::TARGET_LIMIT
+        {
+            return;
+        }
+        entries.push(CapabilityRefusal {
+            tool: tool.to_string(),
+            replaceable: class != TypedToolClass::StructuredEdit,
+            followed_by_work: false,
+            target: target.map(str::to_owned),
+        });
     }
 
     pub(crate) fn record_permitted_work(&self) {
@@ -303,16 +329,22 @@ impl CapabilityRefusals {
     ) {
         for refusal in self.entries().iter() {
             let tool = &refusal.tool;
+            // A refused target is named, so the wording covers that write only and
+            // not the tool the assignment used for its permitted targets.
+            let refused = match &refusal.target {
+                Some(target) => format!("`{tool}` on `{target}`"),
+                None => format!("`{tool}`"),
+            };
             if refusal.replaceable && refusal.followed_by_work {
                 assessment.advisories.push(format!(
-                    "Refused `{tool}`; permitted work followed, but the report may not cover the refused operation."
+                    "Refused {refused}; permitted work followed, but the report may not cover the refused operation."
                 ));
                 continue;
             }
             assessment.verification_gaps.push(if refusal.replaceable {
-                format!("Refused `{tool}` and no permitted work followed, so the report may not establish the assignment.")
+                format!("Refused {refused} and no permitted work followed, so the report may not establish the assignment.")
             } else {
-                format!("Refused `{tool}`; this assignment has no permitted route to that work, so the report may not establish it.")
+                format!("Refused {refused}; this assignment has no permitted route to that work, so the report may not establish it.")
             });
             let disposition = assessment.task_disposition.get_or_insert_with(|| {
                 codex_protocol::protocol::TurnTaskDisposition {
@@ -330,7 +362,10 @@ impl CapabilityRefusals {
             });
             disposition.request_state = "incomplete".into();
             disposition.terminal_action = "handoff_with_gaps".into();
-            disposition.evidence_refs.push(format!("native:capability_refusal:{tool}"));
+            let evidence = format!("native:capability_refusal:{tool}");
+            if !disposition.evidence_refs.contains(&evidence) {
+                disposition.evidence_refs.push(evidence);
+            }
         }
     }
 }
@@ -344,9 +379,16 @@ pub(crate) struct CapabilityDenied {
     reason: String,
 }
 
-impl From<CapabilityDenied> for crate::FunctionCallError {
-    fn from(denied: CapabilityDenied) -> Self {
-        let CapabilityDenied { semantic_name, reason } = denied;
+impl CapabilityDenied {
+    /// A refusal found by a runtime owner that re-checks the assignment after the
+    /// router (shell-intercepted patches reach `ApplyPatchRuntime` without the router gate).
+    pub(crate) fn new(semantic_name: &str, reason: impl Into<String>) -> Self {
+        Self { semantic_name: semantic_name.to_string(), reason: reason.into() }
+    }
+
+    /// The one model-facing refusal envelope, so every route reports the same cause.
+    pub(crate) fn tool_failure(&self) -> codex_protocol::tool_failure::ToolFailure {
+        let CapabilityDenied { semantic_name, reason } = self;
         let mut failure = codex_protocol::tool_failure::ToolFailure::no_effects(
             codex_protocol::tool_failure::ToolFailureCode::PermissionDenied,
             format!("{semantic_name}: {reason}"),
@@ -355,7 +397,13 @@ impl From<CapabilityDenied> for crate::FunctionCallError {
         failure.safe_next_actions.push(
             "Continue the assignment using native read/search or already-authorized scoped apply_patch; return the available evidence or a precise blocker. Do not retry the prohibited action through another route.".into(),
         );
-        Self::structured(failure)
+        failure
+    }
+}
+
+impl From<CapabilityDenied> for crate::FunctionCallError {
+    fn from(denied: CapabilityDenied) -> Self {
+        Self::structured(denied.tool_failure())
     }
 }
 
@@ -398,12 +446,14 @@ pub(crate) fn authorize_assignment_tool(
             codex_agent_task_store::require_write_contract(&authorization.assignment,
                 authorization.current_attempt.amendment.as_ref())
                 .map_err(|error| refused(&error.to_string()))?;
-            codex_agent_task_store::dispatch_manifest(&authorization.assignment,
-                authorization.current_attempt.amendment.as_ref())
-                .map_err(|error| refused(&error.to_string()))?;
+            // Read-only attempts intentionally carry no source baseline; name the
+            // actual authority gap before checking a baseline they never need.
             if authorization.assignment.write_scope.is_empty() {
                 return Err(refused("message-only/read-only assignments cannot write source"));
             }
+            codex_agent_task_store::dispatch_manifest(&authorization.assignment,
+                authorization.current_attempt.amendment.as_ref())
+                .map_err(|error| refused(&error.to_string()))?;
             Ok(())
         }
         TypedToolClass::RootTaskControl => Err(refused(

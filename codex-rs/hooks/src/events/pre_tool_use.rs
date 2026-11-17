@@ -26,6 +26,9 @@ pub struct PreToolUseRequest {
     pub turn_id: String,
     pub subagent: Option<common::SubagentHookContext>,
     pub cwd: AbsolutePathBuf,
+    /// Local command execution cwd reported in hook stdin. `None` retains `cwd`
+    /// (remote commands and tools without a per-call cwd). Hooks still run in `cwd`.
+    pub tool_cwd: Option<AbsolutePathBuf>,
     pub transcript_path: Option<PathBuf>,
     pub model: String,
     pub permission_mode: String,
@@ -195,7 +198,7 @@ fn command_input_json(request: PreToolUseRequest) -> Result<String, serde_json::
         agent_id: subagent.agent_id,
         agent_type: subagent.agent_type,
         transcript_path: crate::schema::NullableString::from_path(request.transcript_path),
-        cwd: request.cwd.display().to_string(),
+        cwd: common::command_input_cwd(request.cwd.as_path(), request.tool_cwd.as_ref()),
         hook_event_name: "PreToolUse".to_string(),
         model: request.model,
         permission_mode: request.permission_mode,

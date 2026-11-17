@@ -921,34 +921,48 @@ impl TurnContext {
         additional_permissions: Option<AdditionalPermissionProfile>,
         cwd: &PathUri,
     ) -> FileSystemSandboxContext {
+        Self::file_system_sandbox_context_for_profile(
+            &self.permission_profile,
+            additional_permissions.as_ref(),
+            cwd,
+            self.effective_workspace_roots(),
+            self.windows_sandbox_level,
+            self.config.permissions.windows_sandbox_private_desktop,
+        )
+    }
+
+    /// Builds the filesystem sandbox context for a permission profile. Turn setup
+    /// uses it before a `TurnContext` exists so host repository-skill discovery
+    /// runs under the same authority that [`Self::file_system_sandbox_context`] gives the turn.
+    pub(crate) fn file_system_sandbox_context_for_profile(
+        permission_profile: &PermissionProfile,
+        additional_permissions: Option<&AdditionalPermissionProfile>,
+        cwd: &PathUri,
+        workspace_roots: &[AbsolutePathBuf],
+        windows_sandbox_level: WindowsSandboxLevel,
+        windows_sandbox_private_desktop: bool,
+    ) -> FileSystemSandboxContext {
         let (base_file_system_sandbox_policy, base_network_sandbox_policy) =
-            self.permission_profile.to_runtime_permissions();
+            permission_profile.to_runtime_permissions();
         let file_system_sandbox_policy = effective_file_system_sandbox_policy(
             &base_file_system_sandbox_policy,
-            additional_permissions.as_ref(),
+            additional_permissions,
         );
         let network_sandbox_policy = effective_network_sandbox_policy(
             base_network_sandbox_policy,
-            additional_permissions.as_ref(),
+            additional_permissions,
         );
         let permissions = PermissionProfile::from_runtime_permissions_with_enforcement(
-            self.permission_profile.enforcement(),
+            permission_profile.enforcement(),
             &file_system_sandbox_policy,
             network_sandbox_policy,
         );
         FileSystemSandboxContext {
             permissions: permissions.into(),
             cwd: Some(cwd.clone()),
-            workspace_roots: self
-                .effective_workspace_roots()
-                .iter()
-                .map(PathUri::from_abs_path)
-                .collect(),
-            windows_sandbox_level: self.windows_sandbox_level,
-            windows_sandbox_private_desktop: self
-                .config
-                .permissions
-                .windows_sandbox_private_desktop,
+            workspace_roots: workspace_roots.iter().map(PathUri::from_abs_path).collect(),
+            windows_sandbox_level,
+            windows_sandbox_private_desktop,
         }
     }
 
@@ -1418,6 +1432,9 @@ impl Session {
         }
     }
 
+    /// Context for an admitted regular turn start. Only this entry may bind a
+    /// child to its root's current validation turn; history-only, resume and
+    /// other internal contexts use the `new_default_turn*` entries.
     pub(crate) async fn new_turn_from_configuration(
         &self,
         sub_id: String,
@@ -1429,6 +1446,7 @@ impl Session {
             session_configuration,
             final_output_json_schema,
             TurnMultiAgentRuntime::ResolveAndStore,
+            /*admitted_turn_start*/ true,
         )
         .await
     }
@@ -1443,6 +1461,7 @@ impl Session {
             session_configuration,
             /*final_output_json_schema*/ None,
             TurnMultiAgentRuntime::Preview,
+            /*admitted_turn_start*/ false,
         )
         .await
     }
@@ -1454,10 +1473,54 @@ impl Session {
         session_configuration: SessionConfiguration,
         final_output_json_schema: Option<Option<Arc<PreparedOutputSchema>>>,
         multi_agent_runtime: TurnMultiAgentRuntime,
+        admitted_turn_start: bool,
     ) -> Arc<TurnContext> {
         // Preview exists only to prepare the startup router/transport. Its
         // metadata state is discarded; the admitted turn owns fresh enrichment.
         let enrich_git_metadata = matches!(&multi_agent_runtime, TurnMultiAgentRuntime::ResolveAndStore);
+        // A child turn start binds to the turn its root is running now only in
+        // two cases. Already in that scope: take the root's exact budget, so a
+        // reattached child's fresh control handle cannot detach it. In an older
+        // scope: move only when a queued follow-up was sent under the current
+        // scope, by the root or an agent acting in it; timing alone never
+        // moves stale work. Historical attempts belong to the old scope and
+        // are never carried into the current root budget.
+        let mut session_configuration = session_configuration;
+        let root_validation = if admitted_turn_start
+            && session_configuration.session_source.is_non_root_agent()
+            && let Some(captured) = session_configuration.validation_root_turn.as_ref()
+        {
+            self.services
+                .agent_control
+                .current_root_validation_context(captured)
+                .await
+        } else {
+            None
+        };
+        let root_validation = match root_validation {
+            Some(current)
+                if session_configuration.validation_root_turn.as_ref() == Some(&current.scope) =>
+            {
+                Some(current)
+            }
+            Some(current)
+                if self
+                    .input_queue
+                    .pending_turn_start_validation_origins()
+                    .await
+                    .contains(&current.scope) =>
+            {
+                session_configuration.validation_root_turn = Some(current.scope.clone());
+                session_configuration.validation_mode = current.mode;
+                session_configuration.validation_attempts.clear();
+                let mut state = self.state.lock().await;
+                state.session_configuration.validation_root_turn = Some(current.scope.clone());
+                state.session_configuration.validation_mode = current.mode;
+                state.session_configuration.validation_attempts.clear();
+                Some(current)
+            }
+            _ => None,
+        };
         let turn_environments = self.services.turn_environments.snapshot().await;
         let git_metadata_source = self
             .services
@@ -1494,9 +1557,24 @@ impl Session {
                     .plugin_skill_snapshots_for_config(&plugins_input);
                 let skills_input = skills_load_input_from_config(&per_turn_config, effective_skill_roots)
                     .with_plugin_skill_snapshots(plugin_skill_snapshots);
+                // Repository skills come from the primary environment; discover and read
+                // them under the authority this turn's TurnContext will enforce there.
+                let repository_sandbox = primary_turn_environment.as_ref().map(|environment| {
+                    TurnContext::file_system_sandbox_context_for_profile(
+                        &session_configuration.permission_profile(),
+                        /*additional_permissions*/ None,
+                        environment.cwd(),
+                        &per_turn_config.effective_workspace_roots(),
+                        session_configuration.windows_sandbox_level,
+                        per_turn_config.permissions.windows_sandbox_private_desktop,
+                    )
+                });
                 let fs = primary_turn_environment
                     .map(|environment| environment.environment.get_filesystem());
-                self.services.skills_service.snapshot_for_config(&skills_input, fs).await
+                self.services
+                    .skills_service
+                    .snapshot_for_config(&skills_input, fs, repository_sandbox.as_ref())
+                    .await
             },
             self.services.models_manager.list_models_shared(
                 RefreshStrategy::Offline, per_turn_config.http_client_factory(),
@@ -1578,6 +1656,9 @@ impl Session {
             && inherited.scope == turn_context.validation_root_turn
         {
             turn_context.full_suite_budget = Arc::clone(&inherited.budget);
+        }
+        if let Some(current) = root_validation {
+            turn_context.full_suite_budget = current.budget;
         }
         turn_context.full_suite_budget
             .restore_policy_attempts(&session_configuration.validation_attempts);
@@ -1675,6 +1756,23 @@ impl Session {
     }
 
     pub(crate) async fn new_default_turn_with_sub_id(&self, sub_id: String) -> Arc<TurnContext> {
+        let session_configuration = self.default_turn_configuration().await;
+        self.new_turn_context_from_configuration(
+            sub_id,
+            session_configuration,
+            /*final_output_json_schema*/ None,
+            TurnMultiAgentRuntime::ResolveAndStore,
+            /*admitted_turn_start*/ false,
+        )
+        .await
+    }
+
+    /// Default-settings context for an admitted regular turn start, such as a
+    /// mailbox or idle-work wake.
+    pub(crate) async fn new_default_admitted_turn_with_sub_id(
+        &self,
+        sub_id: String,
+    ) -> Arc<TurnContext> {
         let session_configuration = self.default_turn_configuration().await;
         self.new_turn_from_configuration(
             sub_id,

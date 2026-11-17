@@ -17,6 +17,7 @@ use serde::Serialize;
 const SESSION_INDEX_FILE: &str = "session_index.jsonl";
 const SESSION_INDEX_LOCK_FILE: &str = "session_index.jsonl.lock";
 const READ_CHUNK_SIZE: usize = 8192;
+const SESSION_INDEX_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionIndexEntry {
@@ -96,7 +97,24 @@ fn with_session_index_lock<T>(
         .write(true)
         .truncate(false)
         .open(lock_path)?;
-    lock_file.lock()?;
+    // Bound contention: a suspended or wedged holder (this or another process) must
+    // not block every later index mutation forever (upstream #57358).
+    let deadline = std::time::Instant::now() + SESSION_INDEX_LOCK_TIMEOUT;
+    loop {
+        match lock_file.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    "timed out waiting for the session index lock; another Codex process may be suspended",
+                ));
+            }
+            Err(std::fs::TryLockError::Error(err)) => return Err(err),
+        }
+    }
     operation()
 }
 

@@ -126,6 +126,14 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     v8::Script::compile(scope, text_encoding, None)
         .and_then(|script| script.run(scope))
         .ok_or_else(|| "failed to install text encoding helpers".to_string())?;
+    let observe_aggregate = helper_function(scope, "__codex_aggregate_observation",
+        super::callbacks::aggregate_observation_callback)?;
+    set_global(scope, global, "__codex_aggregate_observation", observe_aggregate.into())?;
+    let aggregates = v8::String::new(scope, include_str!("promise_aggregates.js"))
+        .ok_or_else(|| "failed to allocate promise aggregate provenance".to_string())?;
+    v8::Script::compile(scope, aggregates, None)
+        .and_then(|script| script.run(scope))
+        .ok_or_else(|| "failed to install promise aggregate provenance".to_string())?;
     let graph_source = v8::String::new(scope, include_str!("dependency_graph.js"))
         .ok_or_else(|| "failed to allocate dependency graph helper".to_string())?;
     v8::Script::compile(scope, graph_source, None)

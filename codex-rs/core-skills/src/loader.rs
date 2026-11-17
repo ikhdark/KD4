@@ -21,6 +21,7 @@ use codex_config::default_project_root_markers;
 use codex_config::merge_toml_values;
 use codex_config::project_root_markers_from_config;
 use codex_exec_server::ExecutorFileSystem;
+use codex_exec_server::FileSystemSandboxContext;
 use codex_exec_server::LOCAL_FS;
 use codex_plugin::PluginSkillRoot;
 use codex_protocol::protocol::Product;
@@ -199,9 +200,27 @@ where
     I: IntoIterator<Item = SkillRoot> + Send,
     I::IntoIter: Send,
 {
-    crate::root_loader::load_and_merge_skill_roots(roots, plugin_skill_snapshots)
-        .boxed()
-        .await
+    load_skills_from_roots_with_repository_sandbox(roots, plugin_skill_snapshots, None).await
+}
+
+/// Like [`load_skills_from_roots`], but discovers and later reads repository-scoped
+/// roots under `repository_sandbox`, the turn's current filesystem authority.
+pub(crate) async fn load_skills_from_roots_with_repository_sandbox<I>(
+    roots: I,
+    plugin_skill_snapshots: Option<&crate::PluginSkillSnapshots>,
+    repository_sandbox: Option<&FileSystemSandboxContext>,
+) -> SkillLoadOutcome
+where
+    I: IntoIterator<Item = SkillRoot> + Send,
+    I::IntoIter: Send,
+{
+    crate::root_loader::load_and_merge_skill_roots(
+        roots,
+        plugin_skill_snapshots,
+        repository_sandbox,
+    )
+    .boxed()
+    .await
 }
 
 #[derive(Clone)]
@@ -212,7 +231,10 @@ pub(crate) struct SkillRootSnapshot {
     pub(crate) file_system: Arc<dyn ExecutorFileSystem>,
 }
 
-pub(crate) async fn load_skill_root(root: SkillRoot) -> SkillRootSnapshot {
+pub(crate) async fn load_skill_root(
+    root: SkillRoot,
+    repository_sandbox: Option<&FileSystemSandboxContext>,
+) -> SkillRootSnapshot {
     let SkillRoot {
         path,
         scope,
@@ -221,7 +243,9 @@ pub(crate) async fn load_skill_root(root: SkillRoot) -> SkillRootSnapshot {
         plugin_namespace,
         plugin_root,
     } = root;
-    let root = canonicalize_for_skill_identity(file_system.as_ref(), &path).await;
+    // Only repository roots follow the turn's authority; host-owned roots keep theirs.
+    let sandbox = repository_sandbox.filter(|_| scope == SkillScope::Repo);
+    let root = canonicalize_for_skill_identity(file_system.as_ref(), &path, sandbox).await;
     let mut outcome = SkillLoadOutcome::default();
     load_skills_under_root(
         file_system.as_ref(),
@@ -230,6 +254,7 @@ pub(crate) async fn load_skill_root(root: SkillRoot) -> SkillRootSnapshot {
         plugin_id.as_deref(),
         plugin_namespace.as_deref(),
         plugin_root.as_ref(),
+        sandbox,
         &mut outcome,
     )
     .await;
@@ -557,9 +582,10 @@ fn dedupe_skill_roots_by_path(roots: &mut Vec<SkillRoot>) {
 async fn canonicalize_for_skill_identity(
     fs: &dyn ExecutorFileSystem,
     path: &AbsolutePathBuf,
+    sandbox: Option<&FileSystemSandboxContext>,
 ) -> AbsolutePathBuf {
     let path_uri = PathUri::from_abs_path(path);
-    fs.canonicalize(&path_uri, /*sandbox*/ None)
+    fs.canonicalize(&path_uri, sandbox)
         .await
         .and_then(|path| path.to_abs_path())
         .unwrap_or_else(|_| path.clone())
@@ -572,10 +598,11 @@ async fn load_skills_under_root(
     plugin_id: Option<&str>,
     plugin_namespace: Option<&str>,
     plugin_root: Option<&AbsolutePathBuf>,
+    sandbox: Option<&FileSystemSandboxContext>,
     outcome: &mut SkillLoadOutcome,
 ) {
     let plugin_root = match plugin_root {
-        Some(plugin_root) => Some(canonicalize_for_skill_identity(fs, plugin_root).await),
+        Some(plugin_root) => Some(canonicalize_for_skill_identity(fs, plugin_root, sandbox).await),
         None => None,
     };
     let directory_symlinks = match scope {
@@ -596,6 +623,7 @@ async fn load_skills_under_root(
             directory_symlinks,
             hidden_directories: HiddenDirectoryPolicy::Skip,
         },
+        sandbox,
     )
     .await;
     for warning in warnings {
@@ -615,7 +643,7 @@ async fn load_skills_under_root(
     let mut resolved_skills = futures::stream::iter(skills.into_iter().enumerate())
         .map(|(index, skill)| async move {
             let path_uri = fs
-                .canonicalize(&skill.path, /*sandbox*/ None)
+                .canonicalize(&skill.path, sandbox)
                 .await
                 .unwrap_or_else(|_| skill.path.clone());
             let path = match path_uri.to_abs_path() {
@@ -657,6 +685,7 @@ async fn load_skills_under_root(
                     &skill_paths,
                     plugin_roots,
                     namespace_roots,
+                    sandbox,
                 )
                 .await
             }
@@ -674,6 +703,7 @@ async fn load_skills_under_root(
                     scope,
                     plugin_id,
                     plugin_root,
+                    sandbox,
                 )
                 .await
                 .map_err(|err| err.to_string());
@@ -713,6 +743,7 @@ async fn parse_skill_file(
     scope: SkillScope,
     plugin_id: Option<&str>,
     plugin_root: Option<&AbsolutePathBuf>,
+    sandbox: Option<&FileSystemSandboxContext>,
 ) -> Result<(SkillMetadata, Vec<SkillError>), SkillParseError> {
     let metadata_path = path_uri
         .parent()
@@ -725,8 +756,8 @@ async fn parse_skill_file(
     }
     .unwrap_or(SkillMetadataDiscovery::Absent);
     let (contents, loaded_metadata) = tokio::join!(
-        read_skill_frontmatter(fs, path_uri),
-        load_skill_metadata(fs, path, &metadata, plugin_root),
+        read_skill_frontmatter(fs, path_uri, sandbox),
+        load_skill_metadata(fs, path, &metadata, plugin_root, sandbox),
     );
     let contents = contents.map_err(SkillParseError::Read)?;
     let ParsedSkillFrontmatter {
@@ -846,6 +877,7 @@ async fn load_skill_metadata(
     skill_path: &AbsolutePathBuf,
     metadata: &SkillMetadataDiscovery,
     plugin_root: Option<&AbsolutePathBuf>,
+    sandbox: Option<&FileSystemSandboxContext>,
 ) -> LoadedSkillMetadata {
     // Optional metadata failures are reported without blocking valid SKILL.md content.
     let mut diagnostics = Vec::new();
@@ -859,7 +891,7 @@ async fn load_skill_metadata(
         SkillMetadataDiscovery::Present(path) => path,
         SkillMetadataDiscovery::Absent => return LoadedSkillMetadata::default(),
         SkillMetadataDiscovery::Probe(path) => {
-            match fs.get_metadata(path, /*sandbox*/ None).await {
+            match fs.get_metadata(path, sandbox).await {
                 Ok(metadata) if metadata.is_file => {}
                 Ok(_) => return LoadedSkillMetadata::default(),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -882,7 +914,7 @@ async fn load_skill_metadata(
         }
     };
 
-    let contents = match fs.read_file_text(metadata_path_uri, /*sandbox*/ None).await {
+    let contents = match fs.read_file_text(metadata_path_uri, sandbox).await {
         Ok(contents) => contents,
         Err(error) => {
             diagnostics.push(format!(
@@ -1318,7 +1350,11 @@ fn resolve_color_str(
 
 /// Retain only metadata, but drain and validate the complete source just as the
 /// former collecting UTF-8 read did. Streaming owners preserve their read caps.
-async fn read_skill_frontmatter(fs: &dyn ExecutorFileSystem, path: &PathUri) -> io::Result<String> {
+async fn read_skill_frontmatter(
+    fs: &dyn ExecutorFileSystem,
+    path: &PathUri,
+    sandbox: Option<&codex_exec_server::FileSystemSandboxContext>,
+) -> io::Result<String> {
     #[derive(Default)]
     struct Prefix {
         retained: String,
@@ -1364,7 +1400,7 @@ async fn read_skill_frontmatter(fs: &dyn ExecutorFileSystem, path: &PathUri) -> 
             }
         }
     }
-    let mut stream = fs.read_file_metadata_stream(path, None).await?;
+    let mut stream = fs.read_file_metadata_stream(path, sandbox).await?;
     let mut prefix = Prefix::default();
     let mut pending = Vec::new();
     let mut invalid_utf8 = None;

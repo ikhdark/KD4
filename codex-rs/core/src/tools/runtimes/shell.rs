@@ -214,6 +214,11 @@ impl Approvable<ShellRequest> for ShellRuntime {
         ))
     }
 
+    fn permission_request_cwd(&self, req: &ShellRequest) -> Option<codex_utils_path_uri::PathUri> {
+        // Shell requests execute on the host in this resolved command cwd.
+        Some(codex_utils_path_uri::PathUri::from_abs_path(&req.cwd))
+    }
+
     fn sandbox_permissions(&self, req: &ShellRequest) -> SandboxPermissions {
         req.sandbox_permissions
     }

@@ -106,6 +106,10 @@ struct MailboxState {
     seen_communication_id_order: VecDeque<codex_protocol::ResponseItemId>,
     // Retain revision watermarks after consumption, not just while mail is queued.
     progress_revisions: indexmap::IndexMap<(codex_protocol::AgentPath, codex_protocol::AgentPath, String, String), u64>,
+    // Root validation turn each identified follow-up was sent under, recorded
+    // by the sending host before submission. Keyed by mail identity so it
+    // follows the mail through recovery; dropped at history acknowledgment.
+    validation_origins: HashMap<codex_protocol::ResponseItemId, (String, String)>,
 }
 
 impl InputQueue {
@@ -404,8 +408,61 @@ impl InputQueue {
         let mut mailbox = self.mailbox.lock().await;
         if let Some(id) = &communication.id {
             if let Some(outstanding) = mailbox.seen_communication_ids.get_mut(id) { *outstanding = false; }
+            mailbox.validation_origins.remove(id);
         }
         compact_seen_mailbox_ids(&mut mailbox, self.max_seen_mailbox_communication_ids);
+    }
+
+    /// Records the validation scope a turn-starting follow-up was sent under.
+    /// The sender calls this before submitting the mail, so admission of the
+    /// turn that mail starts always observes it. A full index keeps only mail
+    /// still awaiting acknowledgment and otherwise leaves the mail unstamped.
+    pub(crate) async fn record_mail_validation_origin(
+        &self,
+        id: codex_protocol::ResponseItemId,
+        scope: (String, String),
+    ) {
+        let mut mailbox = self.mailbox.lock().await;
+        if mailbox.validation_origins.len() >= self.max_seen_mailbox_communication_ids
+            && !mailbox.validation_origins.contains_key(&id)
+        {
+            let MailboxState {
+                validation_origins,
+                seen_communication_ids,
+                ..
+            } = &mut *mailbox;
+            validation_origins.retain(|id, _| seen_communication_ids.get(id) == Some(&true));
+            if validation_origins.len() >= self.max_seen_mailbox_communication_ids {
+                return;
+            }
+        }
+        mailbox.validation_origins.insert(id, scope);
+    }
+
+    /// Validation scopes of the queued mail that would start the next turn,
+    /// recovered input first. Unstamped or queue-only mail contributes nothing.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Read recovered input and mailbox input as one snapshot in recovery -> mailbox lock order"
+    )]
+    pub(crate) async fn pending_turn_start_validation_origins(&self) -> Vec<(String, String)> {
+        let recovered = self.startup_recovery_items.lock().await;
+        let mailbox = self.mailbox.lock().await;
+        recovered
+            .iter()
+            .filter_map(|item| match item {
+                TurnInput::InterAgentCommunication(mail) if mail.trigger_turn => mail.id.as_ref(),
+                _ => None,
+            })
+            .chain(
+                mailbox
+                    .pending_mails
+                    .iter()
+                    .filter(|(mail, _)| mail.trigger_turn)
+                    .filter_map(|(mail, _)| mail.id.as_ref()),
+            )
+            .filter_map(|id| mailbox.validation_origins.get(id).cloned())
+            .collect()
     }
 
     #[expect(

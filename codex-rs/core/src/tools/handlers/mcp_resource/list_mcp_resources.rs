@@ -61,9 +61,9 @@ impl ListMcpResourcesHandler {
         let arguments = match &invocation.payload {
             ToolPayload::Function { arguments } => parse_arguments(arguments)?,
             _ => {
-                return Err(FunctionCallError::RespondToModel(
+                return Err(super::settled_recovery_failure(FunctionCallError::RespondToModel(
                     "list_mcp_resources handler received unsupported payload".to_string(),
-                ));
+                )));
             }
         };
         // Keep the original arguments for lifecycle evidence; only the selector
@@ -76,9 +76,9 @@ impl ListMcpResourcesHandler {
             .map(serde_json::from_value)
             .transpose()
             .map_err(|err| {
-                FunctionCallError::RespondToModel(format!(
+                super::settled_recovery_failure(FunctionCallError::RespondToModel(format!(
                     "failed to parse function arguments: {err}"
-                ))
+                )))
             })?
             .unwrap_or_default();
         let args: ListResourcesArgs = parse_args_with_default(selectors)?;

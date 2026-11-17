@@ -63,6 +63,9 @@ pub fn hook_states_from_stack(
             if let Some(trusted_hash) = state.trusted_hash {
                 effective_state.trusted_hash = Some(trusted_hash);
             }
+            if let Some(trusted_content_hash) = state.trusted_content_hash {
+                effective_state.trusted_content_hash = Some(trusted_content_hash);
+            }
             if let Some(once_per) = state.once_per {
                 effective_state.once_per = Some(once_per);
             }

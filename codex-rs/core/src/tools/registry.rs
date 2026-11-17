@@ -399,6 +399,16 @@ pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
         })
     }
 
+    /// Local execution cwd reported as `PreToolUse` hook `cwd` for tools with a
+    /// per-call working directory. `None` keeps the host cwd (remote commands,
+    /// other tools). This never moves the hook process.
+    fn pre_tool_use_cwd(
+        &self,
+        _invocation: &ToolInvocation,
+    ) -> Option<codex_utils_path_uri::PathUri> {
+        None
+    }
+
     /// Rebuilds a tool invocation from hook-facing `tool_input`.
     ///
     /// Tools that opt into input-rewriting hooks should invert the same stable
@@ -1848,6 +1858,7 @@ impl ToolRegistry {
         let Some(payload) = payload else {
             return Ok((invocation, expansion_notice));
         };
+        let tool_cwd = tool.pre_tool_use_cwd(&invocation);
         let started = Instant::now();
         let hook_invocation = invocation.clone();
         let result = crate::tools::parallel::run_workspace_hook(
@@ -1862,6 +1873,7 @@ impl ToolRegistry {
                     hook_invocation.call_id,
                     &payload.tool_name,
                     &payload.tool_input,
+                    tool_cwd,
                 )
                 .await
             },
@@ -2307,12 +2319,15 @@ impl ToolRegistry {
                         .await;
                         // Direct native calls retain their decoder's accepted
                         // compatibility surface. Explain only an established
-                        // no-effects argument rejection, before logging it.
+                        // no-effects argument rejection, before logging it. A
+                        // handler's own refusal of accepted arguments keeps its
+                        // reason: the schema omits accepted compatibility fields.
                         result.map_err(|error| {
                             if !validate_arguments
                                 && matches!(&error, FunctionCallError::Structured(failure)
                                     if failure.code == codex_protocol::tool_failure::ToolFailureCode::InvalidInput
-                                    && failure.effects == codex_protocol::tool_failure::ToolEffectsState::None)
+                                    && failure.effects == codex_protocol::tool_failure::ToolEffectsState::None
+                                    && !failure.is_handler_refusal())
                                 && let Err(failure) = argument_preflight.validate(
                                     &tool_name, input_schema, payload,
                                     parsed_function_arguments.as_ref(), true,
@@ -2359,15 +2374,24 @@ impl ToolRegistry {
                     })
                 })
                 .await;
+            // The output owns the originating command cwd, so a result collected
+            // after the turn cwd changed still reports where the command ran.
+            // Synchronous tools without an output-owned cwd resolve it from this
+            // same invocation, as PreToolUse did.
+            let tool_cwd = result
+                .as_ref()
+                .ok()
+                .and_then(|result| result.result.post_tool_use_cwd())
+                .or_else(|| tool.pre_tool_use_cwd(&invocation));
             payload.map(|payload| {
                 debug_assert_eq!(payload.tool_name, tool_name);
-                (plan, payload)
+                (plan, payload, tool_cwd)
             })
         } else {
             None
         };
         let (post_tool_use_outcome, post_tool_workspace_mutated) =
-            if let Some((plan, post_tool_use_payload)) = post_tool_use_payload {
+            if let Some((plan, post_tool_use_payload, tool_cwd)) = post_tool_use_payload {
                 let phase_started = Instant::now();
                 let hook_invocation = invocation.clone();
                 let (outcome, workspace_mutated) = crate::tools::parallel::run_workspace_hook_with_receipt(
@@ -2384,6 +2408,7 @@ impl ToolRegistry {
                             post_tool_use_payload.tool_name,
                             post_tool_use_payload.tool_input,
                             post_tool_use_payload.tool_response,
+                            tool_cwd,
                         )
                         .await
                     },

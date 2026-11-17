@@ -7,8 +7,8 @@
 //!
 //! Responsibilities:
 //!
-//! 1. Define strongly typed config contexts/actions with unknown-field
-//!    rejection.
+//! 1. Define strongly typed config contexts/actions. Unknown fields are ignored
+//!    during deserialization and reported by the shared strict-config policy.
 //! 2. Normalize accepted key aliases into canonical names.
 //! 3. Reject malformed bindings early with user-facing diagnostics.
 //!
@@ -125,7 +125,6 @@ impl KeybindingsSpec {
 
 /// Global keybindings. These are used when a context does not define an override.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
-#[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct TuiGlobalKeymap {
     /// Open the transcript overlay.
@@ -152,7 +151,6 @@ pub struct TuiGlobalKeymap {
 
 /// Chat context keybindings.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
-#[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct TuiChatKeymap {
     /// Interrupt the active turn.
@@ -167,7 +165,6 @@ pub struct TuiChatKeymap {
 
 /// Composer context keybindings. These override corresponding `global` actions.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
-#[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct TuiComposerKeymap {
     /// Submit the current composer draft.
@@ -184,7 +181,6 @@ pub struct TuiComposerKeymap {
 
 /// Editor context keybindings for text editing inside text areas.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
-#[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct TuiEditorKeymap {
     /// Insert a newline in the editor.
@@ -229,7 +225,6 @@ pub struct TuiEditorKeymap {
 /// be specified as `shift-a` in config; the runtime matcher handles
 /// cross-terminal shift-reporting differences automatically.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
-#[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct TuiVimNormalKeymap {
     /// Enter insert mode at cursor (`i`).
@@ -291,7 +286,6 @@ pub struct TuiVimNormalKeymap {
 /// `Esc` cancels the pending operator and returns to normal mode without
 /// modifying text.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
-#[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct TuiVimOperatorKeymap {
     /// Repeat delete operator to delete the whole line (`dd`).
@@ -326,7 +320,6 @@ pub struct TuiVimOperatorKeymap {
 
 /// Vim text-object keybindings for modal editing inside text areas.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
-#[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct TuiVimTextObjectKeymap {
     /// Text object: word.
@@ -351,7 +344,6 @@ pub struct TuiVimTextObjectKeymap {
 
 /// Pager context keybindings for transcript and static overlays.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
-#[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct TuiPagerKeymap {
     /// Scroll up by one row.
@@ -378,7 +370,6 @@ pub struct TuiPagerKeymap {
 
 /// List selection context keybindings for popup-style selectable lists.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
-#[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct TuiListKeymap {
     /// Move list selection up.
@@ -405,7 +396,6 @@ pub struct TuiListKeymap {
 
 /// Approval overlay keybindings.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
-#[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct TuiApprovalKeymap {
     /// Open the full-screen approval details view.
@@ -437,7 +427,6 @@ pub struct TuiApprovalKeymap {
 /// `RuntimeKeymap` first so precedence, empty-list unbinding, and duplicate-key
 /// validation are applied consistently.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
-#[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct TuiKeymap {
     #[serde(default)]

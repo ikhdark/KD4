@@ -1271,9 +1271,12 @@ async fn finish_output_stream(process_id: ProcessId, stream: ExecOutputStream, i
             let through_seq = process.next_seq;
             process.next_seq += 1;
             process.last_evicted_seq = through_seq;
-            process
-                .events
-                .publish(ExecProcessEvent::OutputGap { through_seq });
+            // Name the stream, so consumers report capture loss rather than
+            // receiver lag. The read/replay gap contract stays reason-free.
+            process.events.publish(ExecProcessEvent::OutputGap {
+                through_seq,
+                capture_incomplete: Some(stream),
+            });
             let _ = process.wake_tx.send(through_seq);
             gap = Some(Arc::clone(&process.output_notify));
         }
@@ -1468,12 +1471,16 @@ async fn forward_process_notifications(
                     {
                         let through_seq = seq.saturating_sub(1);
                         if through_seq > last_seq {
-                            replay.push((through_seq, ExecProcessEvent::OutputGap { through_seq }));
+                            replay.push((through_seq, ExecProcessEvent::OutputGap {
+                                through_seq,
+                                capture_incomplete: None,
+                            }));
                         }
                     }
                     if notification_gap > last_seq && process.exit_seq != Some(notification_gap) {
                         replay.push((notification_gap, ExecProcessEvent::OutputGap {
                             through_seq: notification_gap,
+                            capture_incomplete: None,
                         }));
                     }
                     if let (Some(seq), Some(exit_code)) = (process.exit_seq, process.exit_code)
@@ -1522,8 +1529,9 @@ async fn forward_process_notifications(
             ExecProcessEvent::Output(chunk) => (crate::protocol::EXEC_OUTPUT_DELTA_METHOD,
                 serde_json::to_value(BorrowedOutputDelta { process_id: &process_id,
                     seq: chunk.seq, stream: chunk.stream, chunk: &chunk.chunk })),
-            ExecProcessEvent::OutputGap { through_seq } => (crate::protocol::EXEC_OUTPUT_GAP_METHOD,
-                serde_json::to_value(crate::protocol::ExecOutputGapNotification { process_id: process_id.clone(), through_seq: *through_seq })),
+            ExecProcessEvent::OutputGap { through_seq, capture_incomplete } => (crate::protocol::EXEC_OUTPUT_GAP_METHOD,
+                serde_json::to_value(crate::protocol::ExecOutputGapNotification { process_id: process_id.clone(), through_seq: *through_seq,
+                    capture_incomplete: *capture_incomplete })),
             ExecProcessEvent::Exited { seq, exit_code, sandbox_denied } => (crate::protocol::EXEC_EXITED_METHOD,
                 serde_json::to_value(ExecExitedNotification { process_id: process_id.clone(), seq: *seq, exit_code: *exit_code, sandbox_denied: *sandbox_denied })),
             ExecProcessEvent::Closed { seq, sandbox_denied } => (EXEC_CLOSED_METHOD,

@@ -386,7 +386,7 @@ async fn discover_streamable_http_oauth_with_headers(
     )
     .await?;
     authorization_manager.set_allow_missing_issuer(true);
-    discover_streamable_http_oauth_with_manager(&authorization_manager).await
+    discover_streamable_http_oauth_with_manager(&mut authorization_manager).await
 }
 
 async fn discover_streamable_http_oauth_with_headers_and_http_client(
@@ -407,26 +407,32 @@ async fn discover_streamable_http_oauth_with_headers_and_http_client(
     )
     .await?;
     authorization_manager.set_allow_missing_issuer(true);
-    discover_streamable_http_oauth_with_manager(&authorization_manager).await
+    discover_streamable_http_oauth_with_manager(&mut authorization_manager).await
 }
 
 async fn discover_streamable_http_oauth_with_manager(
-    authorization_manager: &AuthorizationManager,
+    authorization_manager: &mut AuthorizationManager,
 ) -> Result<Option<StreamableHttpOAuthDiscovery>> {
     match authorization_manager.resolve_metadata().boxed().await {
         // rmcp 3 synthesizes legacy endpoints when nothing is published; that is not OAuth support.
         Ok(resolution) if !resolution.source.is_discovered() => Ok(None),
-        Ok(resolution) => Ok(Some(StreamableHttpOAuthDiscovery {
-            scopes_supported: normalize_scopes(resolution.metadata.scopes_supported),
-        })),
+        Ok(resolution) => {
+            // Authorization-server `scopes_supported` can list scopes unrelated to this MCP
+            // resource. Prefer the initial challenge's scopes, then protected-resource metadata;
+            // the metadata is installed only so rmcp can append a supported `offline_access`.
+            authorization_manager.set_metadata(resolution.metadata);
+            Ok(Some(StreamableHttpOAuthDiscovery {
+                scopes_supported: normalize_scopes(
+                    authorization_manager.select_initial_scopes(&[]).await,
+                ),
+            }))
+        }
         Err(AuthError::NoAuthorizationSupport) => Ok(None),
         Err(err) => Err(err.into()),
     }
 }
 
-fn normalize_scopes(scopes_supported: Option<Vec<String>>) -> Option<Vec<String>> {
-    let scopes_supported = scopes_supported?;
-
+fn normalize_scopes(scopes_supported: Vec<String>) -> Option<Vec<String>> {
     let mut normalized = Vec::new();
     for scope in scopes_supported {
         let scope = scope.trim();

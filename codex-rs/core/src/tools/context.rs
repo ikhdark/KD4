@@ -1596,6 +1596,9 @@ pub struct ExecCommandToolOutput {
     pub search_no_match: bool,
     pub original_token_count: Option<usize>,
     pub hook_command: Option<String>,
+    /// Local execution cwd retained for `PostToolUse`, independent of the
+    /// collecting turn. Remote commands leave this unset to keep the host cwd.
+    pub tool_cwd: Option<codex_utils_path_uri::PathUri>,
     pub raw_output_artifact: Option<RawOutputArtifact>,
     pub repair_notice: Option<String>,
     /// Deferred results already in history that no request has carried yet.
@@ -1771,6 +1774,10 @@ impl ToolOutput for ExecCommandToolOutput {
         self.hook_command
             .as_ref()
             .map(|command| serde_json::json!({ "command": command }))
+    }
+
+    fn post_tool_use_cwd(&self) -> Option<codex_utils_path_uri::PathUri> {
+        self.tool_cwd.clone()
     }
 
     fn post_tool_use_response(&self, _call_id: &str, _payload: &ToolPayload) -> Option<JsonValue> {

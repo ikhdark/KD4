@@ -223,19 +223,61 @@ fn preflight_command_issues(
 }
 
 
+/// A preflight refusal. Display is the unchanged model-facing text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandPreflightError {
+    /// The typed rejection; `None` when analysis itself failed.
+    pub issue: Option<CommandPreflightIssueCode>,
+    message: String,
+}
+
+impl std::fmt::Display for CommandPreflightError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl CommandPreflightError {
+    /// Only for handlers that return this before launching anything, so no
+    /// command started either way. A typed rejection is the handler's own
+    /// refusal. An analysis failure establishes no cause, so it stays `failed`
+    /// and makes no retry claim.
+    pub fn into_pre_launch_error(self, message: String) -> codex_tools::FunctionCallError {
+        use codex_protocol::tool_failure::ToolFailure;
+        use codex_protocol::tool_failure::ToolFailureCode;
+        let failure = match self.issue {
+            None => ToolFailure::no_effects(ToolFailureCode::Failed, message),
+            Some(issue) => {
+                let code = match issue {
+                    CommandPreflightIssueCode::PowerShellSyntax => ToolFailureCode::InvalidSyntax,
+                    _ => ToolFailureCode::InvalidInput,
+                };
+                ToolFailure::handler_refusal(code, message, issue.tool_error_kind())
+            }
+        };
+        codex_tools::FunctionCallError::structured(failure)
+    }
+}
+
 pub async fn preflight_invocation_with_equivalent_repair_async(
     invocation: &CommandInvocation,
     command: &[String],
     shell_type: Option<ShellType>,
-) -> Result<CommandPreflightOutcome, String> {
+) -> Result<CommandPreflightOutcome, CommandPreflightError> {
     let invocation = invocation.clone();
     let command = command.to_vec();
     crate::run_blocking_command_analysis(move || {
         preflight_invocation_with_equivalent_repair_detailed(&invocation, &command, shell_type)
-            .map_err(|issue| issue.render_for_model())
+            .map_err(|issue| CommandPreflightError {
+                issue: Some(issue.code),
+                message: issue.render_for_model(),
+            })
     })
     .await
-    .map_err(|error| format!("command preflight worker failed: {error}"))?
+    .map_err(|error| CommandPreflightError {
+        issue: None,
+        message: format!("command preflight worker failed: {error}"),
+    })?
 }
 
 pub async fn preflight_invocation_for_kd4_runtime(
@@ -244,7 +286,7 @@ pub async fn preflight_invocation_for_kd4_runtime(
     command: &[String],
     shell_type: Option<ShellType>,
     local_cwd: Option<&Path>,
-) -> Result<CommandPreflightOutcome, String> {
+) -> Result<CommandPreflightOutcome, CommandPreflightError> {
     if !kd4_runtime {
         return Ok(CommandPreflightOutcome {
             invocation: invocation.clone(),

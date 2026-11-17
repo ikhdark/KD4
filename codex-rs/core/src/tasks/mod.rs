@@ -482,7 +482,9 @@ impl Session {
         };
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
         self.clear_connector_selection().await;
-        let _ = self.start_task_locked(turn_context, input, task).await;
+        let _ = self
+            .start_task_locked(/*reservation*/ None, turn_context, input, task)
+            .await;
     }
 
 
@@ -493,7 +495,24 @@ impl Session {
         input: Vec<TurnInput>,
         task: T,
     ) -> CodexResult<()> {
-        self.start_task_locked(turn_context, input, task).await
+        self.start_task_locked(/*reservation*/ None, turn_context, input, task)
+            .await
+    }
+
+    /// Installs a task only into the taskless reservation its caller published.
+    /// Interrupt or shutdown can clear that placeholder while the caller awaits
+    /// turn-context construction; startup must then fail instead of creating a
+    /// new reservation for work the interrupt already returned to the queue.
+    pub(crate) async fn start_reserved_task_with_admission<T: SessionTask>(
+        self: &Arc<Self>,
+        _task_start_permit: &tokio::sync::SemaphorePermit<'_>,
+        reservation: &Arc<tokio::sync::Mutex<TurnState>>,
+        turn_context: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        task: T,
+    ) -> CodexResult<()> {
+        self.start_task_locked(Some(reservation), turn_context, input, task)
+            .await
     }
 
     #[expect(
@@ -502,6 +521,7 @@ impl Session {
     )]
     async fn start_task_locked<T: SessionTask>(
         self: &Arc<Self>,
+        reservation: Option<&Arc<tokio::sync::Mutex<TurnState>>>,
         turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
         task: T,
@@ -517,8 +537,28 @@ impl Session {
                         "a turn is already active".to_string(),
                     ));
                 }
-                Some(active_turn) => Arc::clone(&active_turn.turn_state),
-                None => Arc::clone(&active_turn.insert(ActiveTurn::default()).turn_state),
+                Some(active_turn)
+                    if reservation.is_none_or(|reservation| {
+                        Arc::ptr_eq(&active_turn.turn_state, reservation)
+                    }) =>
+                {
+                    Arc::clone(&active_turn.turn_state)
+                }
+                None if reservation.is_none() => {
+                    Arc::clone(&active_turn.insert(ActiveTurn::default()).turn_state)
+                }
+                // The caller's reservation was cleared or replaced before startup
+                // reached installation. Never recreate it here.
+                _ => {
+                    drop(active_turn);
+                    if let Some(reservation) = reservation {
+                        self.recover_cancelled_taskless_placeholder(reservation)
+                            .await;
+                    }
+                    return Err(CodexErr::Fatal(
+                        "turn start reservation was lost before task installation".to_string(),
+                    ));
+                }
             }
         };
         let mut startup_guard = TasklessTurnStartupGuard::new(self, Arc::clone(&turn_state));
@@ -867,13 +907,16 @@ impl Session {
         };
         let mut startup_guard = TasklessTurnStartupGuard::new(self, Arc::clone(&turn_state));
 
-        let turn_context = self.new_default_turn_with_sub_id(sub_id).await;
+        let turn_context = self.new_default_admitted_turn_with_sub_id(sub_id).await;
         self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
             .await;
         let retry_context = Arc::clone(&turn_context);
+        // Context construction can outlive an interrupt that clears this wakeup's
+        // placeholder; installation stays bound to the original reservation.
         let result = self
-            .start_task_with_admission(
+            .start_reserved_task_with_admission(
                 &task_start_permit,
+                &turn_state,
                 turn_context,
                 Vec::new(),
                 RegularTask::new(),

@@ -404,10 +404,28 @@ impl Session {
                 "status": owner["status"], "shutdown": owner["shutdown"],
                 "verified_live": owner["verified_live"],
             })).collect::<Vec<_>>();
+        // Outstanding evidence comes from the owners' own state: a reference held
+        // by an unfinished operation or live process owner, retention still being
+        // written, or an identity that differs from the recorded one. Settled
+        // references stay counted and complete at /retained_evidence.
+        let held = inventory["operations"].as_array().into_iter().flatten()
+            .filter(|record| record["outcome"] != "durable_terminal_receipt")
+            .chain(inventory["current_process_owner"].as_array().into_iter().flatten()
+                .filter(|owner| owner["status"] != "exited"))
+            .filter_map(|record| record["raw_output_artifact_id"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        // Identity and access only. The recorded obligation repeats fixed
+        // coverage text per row (about 560 bytes) and stays at the pointer.
         let evidence = inventory["retained_evidence"].as_array().into_iter().flatten()
-            .enumerate().take(32).map(|(index, evidence)| json!({
+            .enumerate().filter(|(_, evidence)| filter.is_some()
+                || evidence["access"] == "writing"
+                || evidence["identity_matches_record"] == false
+                || evidence["artifact_id"].as_str().is_some_and(|id| held.contains(id)))
+            .take(32).map(|(index, evidence)| json!({
                 "pointer": format!("/retained_evidence/{index}"),
-                "reference": evidence["recorded_reference"],
+                "artifact_id": evidence["artifact_id"],
+                "access": evidence["access"],
+                "reference_status": evidence["recorded_reference"]["reference_status"],
                 "identity_matches_record": evidence["identity_matches_record"],
             })).collect::<Vec<_>>();
         inventory["outstanding"] = json!({
@@ -418,6 +436,7 @@ impl Session {
             "rollout_parse_complete": inventory["rollout_parse_complete"],
             "operations": operations, "unresolved_invocations": invocations,
             "retained_evidence": evidence,
+            "retained_evidence_selection": "unfiltered view lists only references held by an unfinished operation or live owner, still being written, or whose identity differs from the record; counts.evidence_references includes every reference",
             "current_process_owner": owners, "limit_per_group": 32,
             "recovery": "Use read_tool_output on this read's retained artifact with the exact JSON pointers above. For remaining rows use structured selectors over /operations, /unresolved_invocations, /current_process_owner or /retained_evidence; do not reconstruct the inventory to page it. Counts include omitted rows. No new control authority is granted.",
         });

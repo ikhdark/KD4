@@ -87,7 +87,7 @@ impl ToolExecutor<ToolInvocation> for CompareArtifactsHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(async move {
+        let compared = async move {
             let ToolPayload::Function { ref arguments } = invocation.payload else {
                 return Err(FunctionCallError::RespondToModel(
                     "compare_artifacts requires function arguments".into(),
@@ -108,8 +108,19 @@ impl ToolExecutor<ToolInvocation> for CompareArtifactsHandler {
                 max_bytes,
                 &invocation.cancellation_token,
             )
-            .await
-            .map_err(|error| FunctionCallError::RespondToModel(error.for_model()))?;
+            .await;
+            let comparison = match comparison {
+                Ok(comparison) => comparison,
+                Err(error) => {
+                    let message = super::read_tool_output::thread_confined_artifact_error(
+                        &invocation,
+                        [&args.left_artifact_id, &args.right_artifact_id],
+                        error,
+                    )
+                    .await;
+                    return Err(FunctionCallError::RespondToModel(message));
+                }
+            };
             let result =
                 JsonToolOutput::new(serde_json::to_value(comparison).map_err(|error| {
                     FunctionCallError::RespondToModel(format!(
@@ -118,6 +129,12 @@ impl ToolExecutor<ToolInvocation> for CompareArtifactsHandler {
                 })?);
             crate::tools::context::ensure_exact_model_delivery(&result, &invocation)?;
             Ok(boxed_tool_output(result))
+        };
+        // Like `read_tool_output`, this handler only observes retained bytes.
+        Box::pin(async move {
+            compared
+                .await
+                .map_err(super::read_tool_output::settled_recovery_failure)
         })
     }
 }

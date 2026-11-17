@@ -3,6 +3,7 @@ use std::path::Path;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_core::config::Config;
+use codex_file_system::BoundOutput;
 use codex_protocol::protocol::SessionConfiguredEvent;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,17 +46,21 @@ pub(crate) trait EventProcessor {
         None
     }
 
-    fn print_final_output(&mut self) -> std::io::Result<()> {
+    /// `output` is the last-message destination bound before the agent started.
+    fn print_final_output(&mut self, _output: Option<BoundOutput>) -> std::io::Result<()> {
         Ok(())
     }
 }
 
+/// Writes through the destination bound before sandboxed tools ran, so tool
+/// activity cannot redirect this unsandboxed write through a link or rename.
 pub(crate) fn handle_last_message(
     last_agent_message: Option<&str>,
     output_file: &Path,
+    output: BoundOutput,
 ) -> std::io::Result<()> {
     let message = last_agent_message.unwrap_or_default();
-    write_last_message(output_file, message).map_err(|error| {
+    output.write(message.as_bytes()).map_err(|error| {
         std::io::Error::new(
             error.kind(),
             format!(
@@ -71,22 +76,6 @@ pub(crate) fn handle_last_message(
         );
     }
     Ok(())
-}
-
-fn write_last_message(output_file: &Path, message: &str) -> std::io::Result<()> {
-    let metadata = match std::fs::symlink_metadata(output_file) {
-        Ok(metadata) => Some(metadata),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error),
-    };
-    // Follow symlinks and keep device/pipe targets as writable streams.
-    if metadata
-        .as_ref()
-        .is_some_and(|metadata| !metadata.is_file())
-    {
-        return std::fs::write(output_file, message);
-    }
-    codex_file_system::write_bytes_atomically_without_sync(output_file, message.as_bytes())
 }
 
 /// Bounded selector for streamed and recovered items. Keep only the

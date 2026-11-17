@@ -807,6 +807,7 @@ impl Codex {
             fast_mode_enabled,
             &model_info,
         );
+        let resumes_existing_rollout = matches!(&conversation_history, InitialHistory::Resumed(_));
         // Preserve the requested preference across metadata refreshes. Sampling
         // still filters unsupported tiers using the current model metadata.
         let service_tier = config.service_tier.clone();
@@ -914,14 +915,19 @@ impl Codex {
                 .set_root_service_tier(config.service_tier.clone());
         }
         if let Some(message) = initial_service_tier_warning {
-            // The ordered writer retains this even before the lazy rollout
-            // exists; the normal persistence barrier will write it later.
-            session
-                .send_event_raw(Event {
-                    id: INITIAL_SUBMIT_ID.to_owned(),
-                    msg: EventMsg::Warning(WarningEvent { message }),
-                })
-                .await;
+            let event = Event {
+                id: INITIAL_SUBMIT_ID.to_owned(),
+                msg: EventMsg::Warning(WarningEvent { message }),
+            };
+            if resumes_existing_rollout {
+                // Configuration warnings are live-only on resume: persisting
+                // them appended to idle completed rollouts on every reload.
+                session.deliver_event_raw(event).await;
+            } else {
+                // The ordered writer retains this even before the lazy rollout
+                // exists; the normal persistence barrier will write it later.
+                session.send_event_raw(event).await;
+            }
         }
         let thread_id = session.thread_id;
 
@@ -6845,16 +6851,26 @@ impl Session {
         &self,
         pin: &mut serde_json::Value,
         checks: &mut BTreeMap<String, serde_json::Value>,
+        descendants: &mut Option<Vec<codex_protocol::ThreadId>>,
     ) {
         let Some(id) = pin["artifact_id"].as_str() else { return };
         let id = id.to_string();
         let mut check = if let Some(check) = checks.get(&id) {
             check.clone()
         } else {
-            let (check, _) = crate::tools::command_output_artifact::audit_tool_output_reference(
+            let (mut check, _) = crate::tools::command_output_artifact::audit_tool_output_reference(
                 self.codex_home().await.as_path(), &self.thread_id.to_string(), &id,
                 crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_MAX_BYTES,
             ).await;
+            // History can reference a descendant's handle, such as a foreign
+            // read result. One bounded lineage lookup serves every such pin.
+            crate::tools::handlers::route_audit_to_readable_owner(
+                self,
+                &mut check,
+                &id,
+                descendants,
+            )
+            .await;
             checks.insert(id, check.clone());
             check
         };
@@ -6891,9 +6907,11 @@ impl Session {
         let mut payload = prepared.payload;
         let mut rendered_candidates = prepared.rendered_candidates;
         let mut checks = BTreeMap::new();
+        let mut descendants = None;
         if let Some(pins) = payload["artifacts"].as_array_mut() {
             for pin in pins {
-                self.check_compaction_artifact_pin(pin, &mut checks).await;
+                self.check_compaction_artifact_pin(pin, &mut checks, &mut descendants)
+                    .await;
             }
         }
         if payload["omitted_artifact_count"].as_u64().unwrap_or(0) != 0
@@ -6908,7 +6926,8 @@ impl Session {
             if let Some(pins) = pins.as_array_mut() {
                 pins.extend(prepared.additional_references);
                 for pin in pins {
-                    self.check_compaction_artifact_pin(pin, &mut checks).await;
+                    self.check_compaction_artifact_pin(pin, &mut checks, &mut descendants)
+                        .await;
                 }
             }
             let members = pins
@@ -8234,7 +8253,6 @@ impl Session {
         if input.is_empty() {
             return Err(SteerInputError::EmptyInput);
         }
-        let input_for_telemetry = input.clone();
         let additional_context = self
             .recoverable_additional_context(additional_context)
             .await
@@ -8293,9 +8311,8 @@ impl Session {
             )
             .await?;
         drop(active);
-        active_turn_context
-            .session_telemetry
-            .user_prompt(&input_for_telemetry);
+        // Prompt telemetry is emitted once the UserPromptSubmit inspection accepts this
+        // input (session/turn.rs inspect_inputs), never at steer admission.
         Ok(active_turn_id)
     }
 

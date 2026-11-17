@@ -110,6 +110,17 @@ is the entire lane/resource admission phase; `laneWaitMs` subtracts the resource
 queue interval (which includes retried lane probes). `cargoMs` starts after this
 phase; `resources.compileTreeMs` times the owned tree. Resource capture
 and CPU control add overhead, particularly for already-fresh short checks.
+Python run-lane receipts also carry `laneReservation`: time per wait phase
+(coordination-lock, lane-selection, resource-admission, retry-wait), pass counts
+per outcome, coordination-lock grace expiries and the last holder. The record is
+kept when the wait fails. Lane reservation has no runner deadline, so it ends
+without a lane only when admission raises, the lock file stays access-denied
+past its limit, or the process is interrupted. `openPhaseMs` then times the phase
+the wait ended in, up to receipt finalization; it is not where the wait spent
+its time. A wait past 60 s prints one progress line per minute. A lane is warm
+when it holds Cargo fingerprints in the `.fingerprint`/`deps` layout or the newer
+`build/<package>/<hash>/fingerprint` layout. The reservation is cold unless the
+lane is warm and its recorded build context matches.
 
 ## Cargo artifact receipts
 
@@ -168,6 +179,9 @@ Formatting remains opt-in: `just fmt` selects Just and Rust;
 `--rust-package PACKAGE` scopes Rust formatting; `--only GROUP` selects an
 explicit formatter group. The `pnpm format` family checks formatting;
 `pnpm format:fix` writes it. Check recipes remain subject to validation policy.
+A direct `rustfmt FILE` rewrites every hunk of FILE and of its out-of-line
+child modules, including concurrent edits. For a shared file, run it with
+`--check` (no writes) and apply only the owned hunks.
 The `scripts/` Python project retains only formatting and archive dependencies.
 `just sdk-python-check` first synchronizes development dependencies into
 `.cache/sdk-python-check` (excluding the pinned CLI runtime), then runs Ruff.

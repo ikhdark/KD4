@@ -10,13 +10,25 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
     if tool.namespace.is_none() && tool.name == "apply_patch" {
         return patch_without_repeated_summary(raw);
     }
+    // The task capsule projection composes with the generic rules below; a
+    // result it does not apply to keeps exactly the generic projection.
+    let capsule = is_get_agent_task(tool)
+        .then(|| task_without_repeated_capsule_values(raw))
+        .flatten();
+    let raw = capsule.as_ref().unwrap_or(raw);
     let local_text_tool = tool.namespace.is_none()
         && matches!(
             tool.name.as_str(),
             "read_file" | "read_tool_output" | "exec_command" | "write_stdin"
         );
     if !local_text_tool && tool.namespace.is_none() && !tool.name.starts_with("mcp__") {
-        return None;
+        // Plain-named task reads get the same first-attempt history rule as
+        // namespaced ones; other plain tools stay unprojected.
+        let mut projected = capsule?;
+        if let Some(object) = projected.as_object_mut() {
+            omit_first_attempt_history(object);
+        }
+        return Some(projected);
     }
     let object = raw.as_object()?;
     // Registration is what lets a whole printed result show its source or
@@ -88,35 +100,35 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
     }
     if tool.namespace.is_none() && matches!(tool.name.as_str(), "exec_command" | "write_stdin") {
         // Chunk IDs identify transport frames, not resumable commands or artifacts.
-        projected.remove("chunk_id");
+        projected.shift_remove("chunk_id");
         for key in [
             "raw_output_artifact_error",
             "raw_output_artifact_retention_limit_reason",
             "output_decoding_notice",
         ] {
             if projected.get(key) == Some(&Value::Null) {
-                projected.remove(key);
+                projected.shift_remove(key);
             }
         }
         if projected.get("raw_output_artifact_retention_limit_hit") == Some(&Value::Bool(false)) {
-            projected.remove("raw_output_artifact_retention_limit_hit");
+            projected.shift_remove("raw_output_artifact_retention_limit_hit");
         }
         // Omit only facts implied by an explicit, matching control field.
         // Contradictions and unknown lifecycle states must remain diagnosable.
         if object.get("execution_state").and_then(Value::as_str) == Some("exited")
             && object.get("process_exited") == Some(&Value::Bool(true))
         {
-            projected.remove("process_exited");
+            projected.shift_remove("process_exited");
         }
         if object.get("output_complete") == Some(&Value::Bool(true))
             && object.get("output_reduced") == Some(&Value::Bool(false))
         {
-            projected.remove("output_reduced");
+            projected.shift_remove("output_reduced");
             // Every retained byte is already in view, so the locator recovers
             // nothing; direct responses likewise name it only when reduced.
             // Scripts keep both fields, and history pins carry their own.
-            projected.remove("raw_output_artifact_id");
-            projected.remove("raw_output_artifact_bytes");
+            projected.shift_remove("raw_output_artifact_id");
+            projected.shift_remove("raw_output_artifact_bytes");
             // The same holds for its reference once the exited command's whole,
             // completely captured log is this view. Polls and partial captures keep it.
             if object.get("execution_state").and_then(Value::as_str) == Some("exited")
@@ -126,7 +138,7 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
                     reference["capture_complete"] == true && reference["missing_bytes"] == 0
                 })
             {
-                projected.remove("output_reference");
+                projected.shift_remove("output_reference");
             }
         }
         // Routine launch provenance repeats per call and often outweighs the
@@ -146,11 +158,11 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
                 "current_chunk_display_complete".into(),
                 Value::Bool(!reduced),
             );
-            projected.remove("output_reduced");
+            projected.shift_remove("output_reduced");
         }
         if let Some(complete) = object.get("streams_complete").and_then(Value::as_bool) {
             projected.insert("cumulative_streams_complete".into(), Value::Bool(complete));
-            projected.remove("streams_complete");
+            projected.shift_remove("streams_complete");
         }
         // A producer that emits this field also knows capture finalization and
         // exact aggregation, which these envelope fields cannot show. Print the
@@ -171,23 +183,23 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
                     == Some(&Value::Bool(false));
             projected.insert("retained_artifact_complete".into(), Value::Bool(complete));
         }
-        projected.remove("output_complete");
+        projected.shift_remove("output_complete");
     } else if tool.namespace.is_none()
         && matches!(tool.name.as_str(), "read_file" | "read_tool_output")
     {
         if object.get("source_sha256").is_some_and(Value::is_string)
             && object.get("canonical_sha256") == object.get("source_sha256")
         {
-            projected.remove("canonical_sha256");
+            projected.shift_remove("canonical_sha256");
         }
         if tool.name == "read_file"
             && object.get("complete").is_some_and(Value::is_boolean)
             && object.get("delivered_selection_complete") == object.get("complete")
         {
-            projected.remove("delivered_selection_complete");
+            projected.shift_remove("delivered_selection_complete");
         }
         if object.get("artifact_id") == Some(&Value::Null) {
-            projected.remove("artifact_id");
+            projected.shift_remove("artifact_id");
         }
         // Native results retain source identity for history and scripts.
         // Presentation need not repeat an exactly reconstructible file URI.
@@ -207,13 +219,13 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
                 None
             };
             if expected.as_deref() == Some(uri) {
-                projected.remove("canonical_uri");
+                projected.shift_remove("canonical_uri");
             }
         }
         if object.get("complete") == Some(&Value::Bool(true))
             && object.get("selection_status").and_then(Value::as_str) == Some("complete")
         {
-            projected.remove("selection_status");
+            projected.shift_remove("selection_status");
         }
         // Inline-only reads have no recovery handle. Keep failure diagnostics,
         // partial retention and every live artifact's controls explicit.
@@ -224,8 +236,8 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
             && object.get("retained_artifact_complete") == Some(&Value::Bool(false))
             && object.get("snapshot_error").is_none_or(Value::is_null)
         {
-            projected.remove("retained_bytes");
-            projected.remove("retained_artifact_complete");
+            projected.shift_remove("retained_bytes");
+            projected.shift_remove("retained_artifact_complete");
         }
         // Keep required retention and search fields even when reconstructible:
         // direct tool responses must still satisfy their advertised schema.
@@ -245,7 +257,7 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
                     result.get("exact_bytes").and_then(Value::as_u64),
                 ) && end.checked_sub(start) == Some(bytes)
                 {
-                    result.remove("exact_bytes");
+                    result.shift_remove("exact_bytes");
                 }
                 // A completed drain no longer needs a traversal plan. Keep its
                 // diagnostic message, selector and exact range for provenance.
@@ -253,7 +265,7 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
                     && result.get("complete") == Some(&Value::Bool(true))
                     && !result.contains_key("continuation")
                 {
-                    result.remove("subdivision_plan");
+                    result.shift_remove("subdivision_plan");
                 }
             }
         }
@@ -262,7 +274,8 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
     if local_text_tool {
         omit_first_failure_history(&mut projected);
     }
-    (raw_text || mcp_text || projected != *object).then_some(Value::Object(projected))
+    (raw_text || mcp_text || capsule.is_some() || projected != *object)
+        .then_some(Value::Object(projected))
 }
 
 /// Apply the same display-only retry-memory rule to an uncaught native error.
@@ -305,7 +318,7 @@ fn omit_first_attempt_history(projected: &mut serde_json::Map<String, Value>) ->
             && history["last_unsuccessful_attempt"].is_null()
             && history["recovery_required"] != true
     });
-    omit && projected.remove("operation_history").is_some()
+    omit && projected.shift_remove("operation_history").is_some()
 }
 
 /// Keep each instrumented root's created executable and prepared shell startup.
@@ -374,7 +387,7 @@ pub fn printed_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> {
             .is_some_and(|ranges| ranges.as_slice() == std::slice::from_ref(selector))
         && let Some(binding) = binding.as_object_mut()
     {
-        binding.remove("resolved_selectors");
+        binding.shift_remove("resolved_selectors");
         binding.insert("result_index".into(), Value::from(0));
     }
     if let (Some(routine), Some(object)) = (routine, projected.as_object_mut()) {
@@ -393,12 +406,12 @@ pub fn printed_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> {
             && object.get("canonical_bytes").is_some_and(Value::is_u64)
             && object.get("retained_bytes") == object.get("canonical_bytes")
         {
-            object.remove("retained_bytes");
+            object.shift_remove("retained_bytes");
         }
         if object.get("complete").is_some_and(Value::is_boolean)
             && object.get("delivered_selection_complete") == object.get("complete")
         {
-            object.remove("delivered_selection_complete");
+            object.shift_remove("delivered_selection_complete");
         }
         if tool.name == "read_file"
             && let Some(recovery) = object.get_mut("recovery").and_then(Value::as_object_mut)
@@ -428,28 +441,28 @@ fn is_complete_read(tool: &ToolName, raw: &Value) -> bool {
 /// that only restate success go, and so do ranges that only restate the selector or the whole
 /// source. Scripts keep the native value, and a partial or failed read prints in full.
 fn compact_complete_read(raw: &Value, printed: &mut serde_json::Map<String, Value>) {
-    printed.remove("complete");
+    printed.shift_remove("complete");
     for key in ["file_complete", "retained_artifact_complete"] {
         if raw[key] == true {
-            printed.remove(key);
+            printed.shift_remove(key);
         }
     }
     if raw["environment_id"] == "local" {
-        printed.remove("environment_id");
+        printed.shift_remove("environment_id");
     }
     if raw["file_complete"] == true {
-        printed.remove("canonical_bytes");
+        printed.shift_remove("canonical_bytes");
     } else if raw["file_complete"] == false && raw.get("continuation").is_none_or(Value::is_null) {
         // The caller selected this part; only a first page has more to continue into.
-        printed.remove("file_complete");
+        printed.shift_remove("file_complete");
     }
     shorten_digest(printed, "source_sha256");
     // Recovered log text is the evidence here; read_file keeps the hash patches anchor on.
     if raw.get("source_sha256").is_none() {
-        printed.remove("canonical_sha256");
+        printed.shift_remove("canonical_sha256");
     }
     if raw["historical_authenticity"] == "unverified" {
-        printed.remove("historical_authenticity");
+        printed.shift_remove("historical_authenticity");
     }
     let whole_source = raw["file_complete"] == true
         && raw["results"].as_array().is_some_and(|rows| rows.len() == 1);
@@ -457,8 +470,8 @@ fn compact_complete_read(raw: &Value, printed: &mut serde_json::Map<String, Valu
         return;
     };
     for row in rows.iter_mut().filter_map(Value::as_object_mut) {
-        row.remove("status");
-        row.remove("complete");
+        row.shift_remove("status");
+        row.shift_remove("complete");
         compact_structured_row(row);
         compact_outline_row(row);
         // Hydrated search ranges resolve against their parent, so those rows stay as they are.
@@ -473,9 +486,9 @@ fn compact_complete_read(raw: &Value, printed: &mut serde_json::Map<String, Valu
                     && selector["end"] == raw["canonical_bytes"]
             });
         if whole_bytes {
-            row.remove("selector");
+            row.shift_remove("selector");
         }
-        row.remove("canonical_range");
+        row.shift_remove("canonical_range");
     }
 }
 
@@ -503,16 +516,16 @@ fn compact_outline_row(row: &mut serde_json::Map<String, Value>) {
         if item.get("name").is_some_and(Value::is_string)
             && item.get("qualified_name") == item.get("name")
         {
-            item.remove("qualified_name");
+            item.shift_remove("qualified_name");
         }
         if item.get("start_line").is_some_and(Value::is_u64)
             && item.get("definition_line") == item.get("start_line")
         {
-            item.remove("definition_line");
+            item.shift_remove("definition_line");
         }
         for key in ["signature_truncated", "title_truncated"] {
             if item.get(key) == Some(&Value::Bool(false)) {
-                item.remove(key);
+                item.shift_remove(key);
             }
         }
     }
@@ -630,7 +643,7 @@ impl RoutineSuccess {
     fn compact(self, raw: &Value, printed: &mut serde_json::Map<String, Value>) {
         let remove = |printed: &mut serde_json::Map<String, Value>, keys: &[&str]| {
             for key in keys {
-                printed.remove(*key);
+                printed.shift_remove(*key);
             }
         };
         match self {
@@ -659,7 +672,7 @@ impl RoutineSuccess {
                         .and_then(routine_launch_receipt)
                         .is_some()
                 {
-                    printed.remove("environment_receipt");
+                    printed.shift_remove("environment_receipt");
                 }
                 if matches!(self, Self::RunningCommand) {
                     // The next poll or await needs the handle and its capabilities. The log
@@ -669,7 +682,7 @@ impl RoutineSuccess {
                     // A cancellation's nonzero exit code does not say the process is gone, and
                     // cells spent a generation asking. Every other finish needs no such word.
                     if shutdown.is_none() {
-                        printed.remove("execution_state");
+                        printed.shift_remove("execution_state");
                     }
                     // A finished process has no capabilities left; its shutdown state is the
                     // one fact here that the exit code does not already give.
@@ -681,7 +694,7 @@ impl RoutineSuccess {
                             capabilities.is_empty()
                         });
                     if no_capabilities {
-                        printed.remove("session_capabilities");
+                        printed.shift_remove("session_capabilities");
                     }
                 }
                 if matches!(self, Self::FinishedPoll) {
@@ -699,11 +712,11 @@ impl RoutineSuccess {
                     // A complete transcript in view leaves nothing to recover, and a printed
                     // route invites reading the same bytes back. Scripts keep the native route.
                     if raw["retained_output_complete"] == true && raw["retained_output"].is_string() {
-                        printed.remove("recovery");
+                        printed.shift_remove("recovery");
                     }
                 } else if printed.get("output").and_then(Value::as_str).is_some_and(str::is_empty) {
                     // Nothing was printed, so there is nothing to recover.
-                    printed.remove("output_reference");
+                    printed.shift_remove("output_reference");
                 }
             }
             Self::Patch => {
@@ -717,15 +730,15 @@ impl RoutineSuccess {
                     no_diagnostics = diagnostics.is_empty();
                 }
                 if no_diagnostics {
-                    printed.remove("diagnostics");
+                    printed.shift_remove("diagnostics");
                 }
                 if let Some(changes) = printed.get_mut("changes").and_then(Value::as_array_mut) {
                     for change in changes.iter_mut().filter_map(Value::as_object_mut) {
                         if change.get("move_path").is_some_and(Value::is_null) {
-                            change.remove("move_path");
+                            change.shift_remove("move_path");
                         }
                         if change.get("outcome").is_some_and(|outcome| outcome == "committed") {
-                            change.remove("outcome");
+                            change.shift_remove("outcome");
                         }
                         if change.get("diff_complete") == Some(&Value::Bool(true)) {
                             remove(change, &["diff_complete", "diff_bytes", "diff_format"]);
@@ -734,7 +747,7 @@ impl RoutineSuccess {
                         if let Some(receipt) =
                             change.get_mut("write_receipt").and_then(Value::as_object_mut)
                         {
-                            receipt.remove("bytes");
+                            receipt.shift_remove("bytes");
                             shorten_digest(receipt, "sha256");
                         }
                     }
@@ -759,7 +772,7 @@ impl RoutineSuccess {
             }
         }
         if printed.get("environment_id").is_some_and(|id| id == "local") {
-            printed.remove("environment_id");
+            printed.shift_remove("environment_id");
         }
     }
 }
@@ -793,7 +806,7 @@ fn project_search_metadata(result: &mut serde_json::Map<String, Value>) {
                 })
         });
     if redundant_children {
-        result.remove("child_selectors");
+        result.shift_remove("child_selectors");
     }
 }
 
@@ -808,7 +821,7 @@ fn patch_without_repeated_summary(raw: &Value) -> Option<Value> {
         && let (Some(text), Some(changes)) = (raw["text"].as_str(), raw["changes"].as_array())
         && generic_patch_summary(text, changes)
     {
-        projected.remove("text");
+        projected.shift_remove("text");
     }
     omit_first_attempt_history(&mut projected);
     // Register even when nothing can be removed: fallback display must not
@@ -896,4 +909,72 @@ fn plan_receipt(raw: &Value) -> Option<Value> {
         projected.insert("step_revisions".into(), revisions.clone());
     }
     Some(Value::Object(projected))
+}
+
+/// The multi-agent task read under any configured non-MCP namespace, under its
+/// plain name (no namespace tools), or in its rendered nested-result name.
+/// Code Mode's runtime display recipes (code-mode-runtime tool_result_to_v8)
+/// see the real ToolName, so they cover the first two; the rendered
+/// `<ns>__get_agent_task` form reaches this only from core's projection of
+/// displayed nested results (ToolName::plain of the result's tool name).
+/// MCP tools keep their own projection.
+fn is_get_agent_task(tool: &ToolName) -> bool {
+    match tool.namespace.as_deref() {
+        Some(namespace) => tool.name == "get_agent_task" && !namespace.starts_with("mcp__"),
+        None => tool.name == "get_agent_task"
+            || tool.name.strip_suffix("__get_agent_task")
+                .is_some_and(|namespace| !namespace.is_empty() && !namespace.starts_with("mcp__")),
+    }
+}
+
+/// A task read prints its assignment and that assignment's immutable capsule.
+/// Print a capsule value once when it exactly equals its assignment field; an
+/// amended or otherwise differing value stays in both. The capsule's identity,
+/// handles, manifest and every other field remain, and scripts keep the raw string.
+fn task_without_repeated_capsule_values(raw: &Value) -> Option<Value> {
+    const SHARED: [(&str, &str); 13] = [
+        ("objective", "objective"),
+        ("requirements", "acceptance_criteria"),
+        ("read_scope", "read_scope"),
+        ("write_scope", "write_scope"),
+        ("stop_condition", "stop_condition"),
+        ("dependencies", "dependencies"),
+        ("risk_hints", "risk_hints"),
+        ("contract_claims", "contract_claims"),
+        ("relation", "relation"),
+        ("architecture_contract_ref", "architecture_contract_ref"),
+        ("integration_plan", "integration_plan"),
+        ("prohibited_changes", "prohibited_changes"),
+        ("required_evidence", "required_evidence"),
+    ];
+    let assignment = raw.get("task")?.get("assignment")?.as_object()?;
+    let text = assignment.get("task_capsule")?.as_str()?;
+    let Ok(Value::Object(mut capsule)) = serde_json::from_str::<Value>(text) else {
+        return None;
+    };
+    // Only this assignment's own capsule; anything else prints unchanged.
+    if capsule.get("assignment_id").is_none_or(|id| assignment.get("assignment_id") != Some(id)) {
+        return None;
+    }
+    let mut same = serde_json::Map::new();
+    for (field, outer) in SHARED {
+        if capsule.contains_key(field) && capsule.get(field) == assignment.get(outer) {
+            capsule.shift_remove(field);
+            same.insert(field.into(), Value::from(outer));
+        }
+    }
+    if same.is_empty() {
+        return None;
+    }
+    let mut projected = raw.clone();
+    // Display only: scripts, storage and /task/assignment recovery return the
+    // capsule's JSON string, never this object's paths.
+    projected["task"]["assignment"]["task_capsule"] = serde_json::json!({
+        "display_only": "script value is the capsule JSON string",
+        "sha256": hex::encode(<sha2::Sha256 as sha2::Digest>::digest(text.as_bytes())),
+        "bytes": text.len(),
+        "same_as_assignment": same,
+        "remaining_fields": capsule,
+    });
+    (projected.to_string().len() < raw.to_string().len()).then_some(projected)
 }

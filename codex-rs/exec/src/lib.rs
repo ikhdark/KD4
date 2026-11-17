@@ -759,6 +759,20 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
         std::process::exit(1);
     }
 
+    // Bind before starting the agent so sandboxed tool activity cannot redirect
+    // the final unsandboxed write through a link, junction or rename.
+    let last_message_output = last_message_file
+        .as_deref()
+        .map(|path| {
+            codex_file_system::BoundOutput::open(path).map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to open last message file {}: {error}",
+                    path.display()
+                )
+            })
+        })
+        .transpose()?;
+
     let local_runtime_paths =
         ExecServerRuntimePaths::from_optional_path(arg0_paths.codex_self_exe.clone())?;
     let state_db = codex_core::init_state_db(&config).await;
@@ -1137,7 +1151,9 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
     }
     // Publish accepted content before fatal diagnostics start the SDK's bounded
     // failure drain, including when artifact publication uses slow storage.
-    let output_error = event_processor.print_final_output().err();
+    let output_error = event_processor
+        .print_final_output(last_message_output)
+        .err();
     if let Some(error) = shutdown_error.as_ref() {
         event_processor.process_invocation_error(error.to_string());
         error_seen = true;

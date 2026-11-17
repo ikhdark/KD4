@@ -100,7 +100,13 @@ impl ToolExecutor<ToolInvocation> for ViewImageHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(self.handle_call(invocation))
+        // Every legacy failure precedes the image-view item events; the file
+        // was only read.
+        Box::pin(async move {
+            self.handle_call(invocation)
+                .await
+                .map_err(super::read_tool_output::settled_recovery_failure)
+        })
     }
 }
 

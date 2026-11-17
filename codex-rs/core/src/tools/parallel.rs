@@ -1509,6 +1509,7 @@ impl ToolCallRuntime {
     pub(crate) async fn record_code_mode_failure(
         &self,
         cell_id: &str,
+        call_id: &str,
         tool_name: &codex_tools::ToolName,
         payload: Option<&ToolPayload>,
         failure_fingerprint: String,
@@ -1550,6 +1551,7 @@ impl ToolCallRuntime {
         }
         collector.record_code_mode_failure(
             cell_id,
+            call_id,
             &semantic_tool_name,
             payload,
             source_dependencies,

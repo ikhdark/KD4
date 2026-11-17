@@ -118,6 +118,8 @@ pub enum RouteAwareRequestError {
     Build(String),
     #[error("redirect target uses unsupported URL scheme: {0}")]
     UnsupportedRedirectScheme(String),
+    #[error("redirect target refused by the request's redirect filter")]
+    RedirectRefused,
     #[error("too many redirects")]
     TooManyRedirects,
     #[error("route-aware request timed out")]
@@ -140,7 +142,9 @@ impl RouteAwareRequestError {
             )) => "local_proxy_configuration",
             Self::Route(RouteAwareClientPoolError::BuildTask(_)) => "local_client_construction",
             Self::Build(_) => "request_validation",
-            Self::UnsupportedRedirectScheme(_) | Self::TooManyRedirects => "redirect_policy",
+            Self::UnsupportedRedirectScheme(_) | Self::RedirectRefused | Self::TooManyRedirects => {
+                "redirect_policy"
+            }
             Self::Timeout => "deadline",
             Self::Request(error) if error.is_timeout() => "deadline",
             Self::Request(error) if error.is_connect() => "connection",
@@ -154,6 +158,7 @@ impl RouteAwareRequestError {
             Self::Route(_)
             | Self::Build(_)
             | Self::UnsupportedRedirectScheme(_)
+            | Self::RedirectRefused
             | Self::TooManyRedirects
             | Self::Timeout => None,
         }
@@ -190,7 +195,10 @@ impl RouteAwareRequestError {
 pub struct RouteAwareRequestBuilder {
     pool: RouteAwareClientPool,
     request: Result<reqwest::Request, RouteAwareRequestError>,
+    redirect_filter: Option<RedirectFilter>,
 }
+
+type RedirectFilter = Arc<dyn Fn(&reqwest::Url) -> bool + Send + Sync>;
 
 impl fmt::Debug for RouteAwareRequestBuilder {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -216,7 +224,26 @@ impl RouteAwareRequestBuilder {
                 validate_request_url(&url)?;
                 Ok(reqwest::Request::new(method, url))
             });
-        Self { pool, request }
+        Self {
+            pool,
+            request,
+            redirect_filter: None,
+        }
+    }
+
+    /// Restricts the redirect targets this request may follow.
+    ///
+    /// The filter runs for every redirect hop the pool would follow, after the pool's own
+    /// `http`/`https` check and before that hop is routed or sent. A refused target fails the
+    /// request with [`RouteAwareRequestError::RedirectRefused`], so nothing (including a signed
+    /// path or query) is sent to it. Requests without a filter, and pools that do not follow
+    /// redirects, are unaffected.
+    pub fn redirect_filter<F>(mut self, allow: F) -> Self
+    where
+        F: Fn(&reqwest::Url) -> bool + Send + Sync + 'static,
+    {
+        self.redirect_filter = Some(Arc::new(allow));
+        self
     }
 
     pub fn headers(mut self, headers: HeaderMap) -> Self {
@@ -327,7 +354,7 @@ impl RouteAwareRequestBuilder {
     }
 
     pub async fn send(self) -> Result<reqwest::Response, RouteAwareRequestError> {
-        self.pool.send(self.request?).await
+        self.pool.send(self.request?, self.redirect_filter).await
     }
 }
 
@@ -535,6 +562,7 @@ impl RouteAwareClientPool {
     async fn send(
         &self,
         mut request: reqwest::Request,
+        redirect_filter: Option<RedirectFilter>,
     ) -> Result<reqwest::Response, RouteAwareRequestError> {
         let request_method = request.method().clone();
         self.client_builder
@@ -660,6 +688,12 @@ impl RouteAwareClientPool {
                 return Err(RouteAwareRequestError::UnsupportedRedirectScheme(
                     next_request_url.scheme().to_string(),
                 ));
+            }
+            if redirect_filter
+                .as_ref()
+                .is_some_and(|allow| !allow(&next_request_url))
+            {
+                return Err(RouteAwareRequestError::RedirectRefused);
             }
             if redirects >= MAX_REDIRECTS {
                 return Err(RouteAwareRequestError::TooManyRedirects);

@@ -242,6 +242,11 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
         ))
     }
 
+    fn permission_request_cwd(&self, req: &UnifiedExecRequest) -> Option<PathUri> {
+        // Hooks run on the host; a remote command cwd never replaces the host cwd.
+        (!req.turn_environment.environment.is_remote()).then(|| req.cwd.clone())
+    }
+
     fn sandbox_permissions(&self, req: &UnifiedExecRequest) -> SandboxPermissions {
         req.sandbox_permissions
     }

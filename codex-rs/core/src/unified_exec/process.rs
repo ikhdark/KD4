@@ -1383,7 +1383,10 @@ impl UnifiedExecProcess {
                     continue;
                 };
                 match event {
-                    ExecProcessEvent::OutputGap { through_seq } => {
+                    ExecProcessEvent::OutputGap {
+                        through_seq,
+                        capture_incomplete,
+                    } => {
                         let skipped = through_seq.saturating_sub(last_seq);
                         if skipped > 0 {
                             flush_aggregate_output(
@@ -1399,13 +1402,31 @@ impl UnifiedExecProcess {
                         {
                             task.mark_output_gap();
                         }
+                        // A producer capture loss occupies only its own
+                        // position; it is not receiver lag (as locally, WC05).
+                        let lagged = if capture_incomplete.is_some() {
+                            skipped.saturating_sub(1)
+                        } else {
+                            skipped
+                        };
                         for buffer in [
                             &output_buffer,
                             &completion_output_buffer,
                             &stdout_buffer,
                             &stderr_buffer,
                         ] {
-                            buffer.lock().await.record_lagged_chunks(skipped);
+                            buffer.lock().await.record_lagged_chunks(lagged);
+                        }
+                        if skipped > 0
+                            && let Some(stream) = capture_incomplete
+                        {
+                            let stream_buffer = match stream {
+                                codex_exec_server::ExecOutputStream::Stderr => &stderr_buffer,
+                                _ => &stdout_buffer,
+                            };
+                            for buffer in [&output_buffer, &completion_output_buffer, stream_buffer] {
+                                buffer.lock().await.record_incomplete_capture();
+                            }
                         }
                         last_seq = last_seq.max(through_seq);
                         output_notify.notify_waiters();

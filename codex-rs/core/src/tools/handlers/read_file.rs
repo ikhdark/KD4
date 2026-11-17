@@ -100,7 +100,7 @@ impl ToolExecutor<ToolInvocation> for ReadStatusHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(async move {
+        let observed = async move {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
             struct Args {
@@ -149,6 +149,12 @@ impl ToolExecutor<ToolInvocation> for ReadStatusHandler {
             let result =
                 history.read_status_page(&paths, Some(&environment.environment_id), &args.query);
             Ok(boxed_tool_output(JsonToolOutput::new(result)))
+        };
+        // Status pages only read recorded history; nothing is left to recover.
+        Box::pin(async move {
+            observed
+                .await
+                .map_err(super::read_tool_output::settled_recovery_failure)
         })
     }
 }
@@ -576,7 +582,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(async move {
+        let read = async move {
             let ToolPayload::Function { ref arguments } = invocation.payload else {
                 return Err(FunctionCallError::RespondToModel(
                     "read_file requires function arguments".to_string(),
@@ -1261,8 +1267,17 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                 output = output.with_sampling_request_signal(signal);
             }
             output = output.with_model_value(projected);
-            crate::tools::context::ensure_exact_model_delivery(&output, &invocation)?;
+            // Inspection receipts and read history may already be recorded for
+            // this undelivered packet; keep that failure's effects unknown.
+            crate::tools::context::ensure_exact_model_delivery(&output, &invocation)
+                .map_err(|error| FunctionCallError::structured(error.failure()))?;
             Ok(boxed_tool_output(output))
+        };
+        // Earlier failures precede any receipt or history mutation; this owner
+        // only read sources and retained its own snapshot, as `read_error` says.
+        Box::pin(async move {
+            read.await
+                .map_err(super::read_tool_output::settled_recovery_failure)
         })
     }
 }

@@ -518,6 +518,15 @@ impl AgentRegistry {
         Ok(())
     }
 
+    /// Whether a spawn under `parent_thread_id` is reserved here but not yet committed.
+    pub(crate) fn has_parent_spawn_reservation(&self, parent_thread_id: ThreadId) -> bool {
+        self.active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .parent_spawn_reservations
+            .contains_key(&parent_thread_id)
+    }
+
     fn release_parent_spawn_reservation(&self, parent_thread_id: ThreadId) {
         let mut active_agents = self
             .active_agents

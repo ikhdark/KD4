@@ -51,6 +51,19 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::sandboxing::PermissionRequestPayload;
 
+/// Converts a tool-reported execution cwd into hook stdin `cwd`. Hooks run on
+/// the host, so only a host-native absolute path can replace the host cwd;
+/// anything else keeps the turn cwd, as before.
+fn hook_tool_cwd(
+    tool_cwd: Option<codex_utils_path_uri::PathUri>,
+) -> Option<codex_utils_absolute_path::AbsolutePathBuf> {
+    let tool_cwd = tool_cwd?;
+    if tool_cwd.infer_path_convention() != Some(codex_utils_path_uri::PathConvention::native()) {
+        return None;
+    }
+    tool_cwd.to_abs_path().ok()
+}
+
 #[derive(Default)]
 pub(crate) struct HookRuntimeOutcome {
     pub should_stop: bool,
@@ -139,6 +152,7 @@ pub(crate) async fn run_pre_tool_use_hooks(
     tool_use_id: String,
     tool_name: &HookToolName,
     tool_input: &Value,
+    tool_cwd: Option<codex_utils_path_uri::PathUri>,
 ) -> PreToolUseHookResult {
     let hooks = sess.hooks();
     if !hooks.has_handler_for(HookEventName::PreToolUse) {
@@ -151,6 +165,7 @@ pub(crate) async fn run_pre_tool_use_hooks(
         turn_id: turn_context.sub_id.clone(),
         subagent: thread_spawn_subagent_hook_context(sess, turn_context),
         cwd: turn_context.cwd().clone(),
+        tool_cwd: hook_tool_cwd(tool_cwd),
         transcript_path: sess.hook_transcript_path().await,
         model: turn_context.model_info.slug.clone(),
         permission_mode: hook_permission_mode(turn_context),
@@ -208,6 +223,7 @@ pub(crate) async fn run_permission_request_hooks(
     turn_context: &Arc<TurnContext>,
     run_id_suffix: &str,
     payload: PermissionRequestPayload,
+    tool_cwd: Option<codex_utils_path_uri::PathUri>,
 ) -> Option<PermissionRequestDecision> {
     let hooks = sess.hooks();
     if !hooks.has_handler_for(HookEventName::PermissionRequest) {
@@ -218,6 +234,7 @@ pub(crate) async fn run_permission_request_hooks(
         turn_id: turn_context.sub_id.clone(),
         subagent: thread_spawn_subagent_hook_context(sess, turn_context),
         cwd: turn_context.cwd().to_path_buf(),
+        tool_cwd: hook_tool_cwd(tool_cwd),
         transcript_path: sess.hook_transcript_path().await,
         model: turn_context.model_info.slug.clone(),
         permission_mode: hook_permission_mode(turn_context),
@@ -255,12 +272,14 @@ pub(crate) async fn run_post_tool_use_hooks(
     tool_name: HookToolName,
     tool_input: Value,
     tool_response: Value,
+    tool_cwd: Option<codex_utils_path_uri::PathUri>,
 ) -> PostToolUseOutcome {
     let request = PostToolUseRequest {
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
         subagent: thread_spawn_subagent_hook_context(sess, turn_context),
         cwd: turn_context.cwd().clone(),
+        tool_cwd: hook_tool_cwd(tool_cwd),
         transcript_path: sess.hook_transcript_path().await,
         model: turn_context.model_info.slug.clone(),
         permission_mode: hook_permission_mode(turn_context),

@@ -518,6 +518,12 @@ async fn scan_rollout_root(root: &Path, archived: bool, scan: &mut RolloutScan) 
             if !file_type.is_file() || !is_rollout_file(&path) {
                 continue;
             }
+            // Readers ignore a compressed sibling while its plain `.jsonl` exists.
+            if path != codex_rollout::plain_rollout_path(&path)
+                && codex_rollout::plain_rollout_path(&path).exists()
+            {
+                continue;
+            }
             if scan.candidate_count() >= MAX_PARITY_SCAN_FILES {
                 scan.reached_scan_cap = true;
                 return;
@@ -578,6 +584,8 @@ async fn thread_id_from_rollout(path: &Path) -> RolloutThreadId {
 }
 
 fn is_rollout_file(path: &Path) -> bool {
+    // Old rollouts are compressed to `.jsonl.zst` in place; temporaries keep other extensions.
+    let path = codex_rollout::plain_rollout_path(path);
     path.extension() == Some(OsStr::new("jsonl"))
         && path
             .file_name()
@@ -593,8 +601,16 @@ fn count_or_skipped(count: usize, complete: bool) -> String {
     }
 }
 
+/// Keys a rollout by its plain `.jsonl` path: the state DB keeps that path after
+/// the compression worker replaces the file with its `.jsonl.zst` form.
 fn path_key(path: &Path) -> PathBuf {
-    normalize_for_path_comparison(path).unwrap_or_else(|_| path.to_path_buf())
+    let plain = codex_rollout::plain_rollout_path(path);
+    let mut compressed = plain.clone().into_os_string();
+    compressed.push(".zst");
+    normalize_for_path_comparison(&plain)
+        .or_else(|_| normalize_for_path_comparison(PathBuf::from(compressed)))
+        .map(|normalized| codex_rollout::plain_rollout_path(&normalized))
+        .unwrap_or(plain)
 }
 
 fn missing_rollout_paths<'a>(

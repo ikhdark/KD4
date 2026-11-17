@@ -340,6 +340,7 @@ fn wrap_windows_sandbox_exec_request_for_direct_spawn(
             &request.permission_profile,
             &native_sandbox_policy_cwd,
             use_elevated,
+            &request.env,
         )
     } else {
         resolve_windows_restricted_token_filesystem_overrides(

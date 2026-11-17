@@ -50,9 +50,9 @@ impl ListMcpResourceTemplatesHandler {
         let arguments = match &invocation.payload {
             ToolPayload::Function { arguments } => parse_arguments(arguments)?,
             _ => {
-                return Err(FunctionCallError::RespondToModel(
+                return Err(super::settled_recovery_failure(FunctionCallError::RespondToModel(
                     "list_mcp_resource_templates handler received unsupported payload".to_string(),
-                ));
+                )));
             }
         };
 

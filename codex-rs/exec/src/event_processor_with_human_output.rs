@@ -645,12 +645,15 @@ impl EventProcessor for EventProcessorWithHumanOutput {
         eprintln!("{} {message}", "ERROR:".style(self.red).style(self.bold));
     }
 
-    fn print_final_output(&mut self) -> std::io::Result<()> {
+    fn print_final_output(
+        &mut self,
+        output: Option<codex_file_system::BoundOutput>,
+    ) -> std::io::Result<()> {
         self.finish_live_line();
         let output_file_result = if self.emit_final_message_on_shutdown
-            && let Some(path) = self.last_message_path.as_deref()
+            && let (Some(path), Some(output)) = (self.last_message_path.as_deref(), output)
         {
-            handle_last_message(self.final_message.as_deref(), path)
+            handle_last_message(self.final_message.as_deref(), path, output)
         } else {
             Ok(())
         };

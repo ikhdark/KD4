@@ -703,6 +703,10 @@
           ],
           "description": "Codex extension: run the handler at most once per scope. Later matched dispatches in that scope are skipped without spawning the command."
         },
+        "trusted_content_hash": {
+          "description": "Approved plugin contents; kept separate for declaration-only clients.",
+          "type": "string"
+        },
         "trusted_hash": {
           "type": "string"
         }

@@ -114,6 +114,9 @@ pub struct SkillLoadOutcome {
     pub(crate) skill_root_by_path: Arc<HashMap<AbsolutePathBuf, AbsolutePathBuf>>,
     pub(crate) file_systems_by_skill_path: SkillFileSystemsByPath,
     pub(crate) plugin_installations: Option<crate::PluginSkillSnapshots>,
+    /// The turn's filesystem authority that discovered repository-scoped skills;
+    /// reads of those skills stay under it. Host-owned scopes are unaffected.
+    pub(crate) repository_sandbox: Option<codex_exec_server::FileSystemSandboxContext>,
     pub(crate) implicit_skills_by_scripts_dir: Arc<HashMap<AbsolutePathBuf, SkillMetadata>>,
     pub(crate) implicit_skills_by_doc_path: Arc<HashMap<AbsolutePathBuf, SkillMetadata>>,
 }
@@ -156,7 +159,16 @@ impl SkillLoadOutcome {
         let _installation_read = self.acquire_skill_read_lease(skill)?;
         let fs = self.file_system_for_skill(skill).unwrap_or_else(|| Arc::clone(&LOCAL_FS));
         let path = PathUri::from_abs_path(&skill.path_to_skills_md);
-        fs.read_file_text(&path, /*sandbox*/ None).await
+        fs.read_file_text(&path, self.sandbox_for_skill(skill)).await
+    }
+
+    pub(crate) fn sandbox_for_skill(
+        &self,
+        skill: &SkillMetadata,
+    ) -> Option<&codex_exec_server::FileSystemSandboxContext> {
+        self.repository_sandbox
+            .as_ref()
+            .filter(|_| skill.scope == SkillScope::Repo)
     }
 
     pub(crate) fn file_system_for_skill(
@@ -225,7 +237,7 @@ impl HostSkillsSnapshot {
             .unwrap_or_else(|| Arc::clone(&LOCAL_FS));
         let path = PathUri::from_abs_path(&skill.path_to_skills_md);
         let bytes = fs
-            .read_file_bounded(&path, max_bytes, /*sandbox*/ None)
+            .read_file_bounded(&path, max_bytes, self.outcome.sandbox_for_skill(skill))
             .await?
             .ok_or_else(|| {
                 io::Error::new(

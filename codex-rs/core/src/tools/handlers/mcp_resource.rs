@@ -44,6 +44,11 @@ use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use codex_protocol::protocol::McpInvocation;
 
+// Argument, selector and access refusals below are decided before any request
+// reaches an MCP server, so they settle with no effects. A failure after a
+// request may have been sent keeps unknown effects: the server's are unknown.
+use super::read_tool_output::settled_recovery_failure;
+
 const MCP_RESOURCE_CALL_CANCELLED_MESSAGE: &str = "MCP resource call cancelled";
 const MAX_PREDETERMINED_MCP_RESOURCE_POINTERS: usize = 64;
 
@@ -234,9 +239,9 @@ fn ensure_model_can_access_mcp_server(
     if model_can_access_mcp_server(turn, server) {
         Ok(())
     } else {
-        Err(FunctionCallError::RespondToModel(format!(
+        Err(settled_recovery_failure(FunctionCallError::RespondToModel(format!(
             "MCP server '{server}' is disabled by `orchestrator.mcp.enabled`"
-        )))
+        ))))
     }
 }
 
@@ -259,9 +264,9 @@ fn ensure_cursor_has_server(
     cursor: Option<&str>,
 ) -> Result<(), FunctionCallError> {
     if server.is_none() && cursor.is_some() {
-        Err(FunctionCallError::RespondToModel(
+        Err(settled_recovery_failure(FunctionCallError::RespondToModel(
             "cursor can only be used when a server is specified".to_string(),
-        ))
+        )))
     } else {
         Ok(())
     }
@@ -1035,10 +1040,11 @@ where
     };
     let start = Instant::now();
     tokio::pin!(operation);
+    // The operation is never polled here, so no request was sent.
     let result = if !delivered {
-        Err(FunctionCallError::RespondToModel(
+        Err(settled_recovery_failure(FunctionCallError::RespondToModel(
             MCP_RESOURCE_CALL_CANCELLED_MESSAGE.into(),
-        ))
+        )))
     } else {
         tokio::select! {
             biased;
@@ -1099,9 +1105,9 @@ fn normalize_optional_string(input: Option<String>) -> Option<String> {
 fn normalize_required_string(field: &str, value: String) -> Result<String, FunctionCallError> {
     match normalize_optional_string(Some(value)) {
         Some(normalized) => Ok(normalized),
-        None => Err(FunctionCallError::RespondToModel(format!(
+        None => Err(settled_recovery_failure(FunctionCallError::RespondToModel(format!(
             "{field} must be provided"
-        ))),
+        )))),
     }
 }
 
@@ -1112,9 +1118,9 @@ fn normalize_optional_selector(
     value
         .map(|value| {
             normalize_optional_string(Some(value)).ok_or_else(|| {
-                FunctionCallError::RespondToModel(format!(
+                settled_recovery_failure(FunctionCallError::RespondToModel(format!(
                     "{field} must not be blank; omit it to use the default behavior"
-                ))
+                )))
             })
         })
         .transpose()
@@ -1127,9 +1133,9 @@ fn validate_optional_opaque_selector(
     value
         .map(|value| {
             if value.trim().is_empty() {
-                Err(FunctionCallError::RespondToModel(format!(
+                Err(settled_recovery_failure(FunctionCallError::RespondToModel(format!(
                     "{field} must not be blank; omit it to use the default behavior"
-                )))
+                ))))
             } else {
                 Ok(value)
             }
@@ -1340,7 +1346,9 @@ fn parse_arguments(raw_args: &str) -> Result<Option<Value>, FunctionCallError> {
         Ok(None)
     } else {
         let value: Value = serde_json::from_str(raw_args).map_err(|err| {
-            FunctionCallError::RespondToModel(format!("failed to parse function arguments: {err}"))
+            settled_recovery_failure(FunctionCallError::RespondToModel(format!(
+                "failed to parse function arguments: {err}"
+            )))
         })?;
         if value.is_null() {
             Ok(None)
@@ -1356,11 +1364,13 @@ where
 {
     match arguments {
         Some(value) => serde_json::from_value(value).map_err(|err| {
-            FunctionCallError::RespondToModel(format!("failed to parse function arguments: {err}"))
+            settled_recovery_failure(FunctionCallError::RespondToModel(format!(
+                "failed to parse function arguments: {err}"
+            )))
         }),
-        None => Err(FunctionCallError::RespondToModel(
+        None => Err(settled_recovery_failure(FunctionCallError::RespondToModel(
             "failed to parse function arguments: expected value".to_string(),
-        )),
+        ))),
     }
 }
 

@@ -836,7 +836,20 @@ async fn run_compact_task_inner_impl(
                             "local_compaction_fit_capture"
                         );
                     }
-                    if local_compaction_input_exceeds_window(&prompt, turn_context.model_context_window()) {
+                    // The byte estimate overstates text-heavy prompts (see the
+                    // remote v2 guard); refuse only when sampling admission's
+                    // provider-calibrated estimate does not fit either. Pin
+                    // substitution above stays on the raw estimate, because a
+                    // provider overflow after dispatch has no pin fallback.
+                    if let Some(window) = turn_context.model_context_window()
+                        && local_compaction_input_exceeds_window(&prompt, Some(window))
+                        && crate::session::turn::prompt_token_estimates(
+                            sess.as_ref(), turn_context.as_ref(), &prompt,
+                        )
+                        .await
+                        .calibrated_tokens
+                            >= window
+                    {
                         sess.set_total_tokens_full(turn_context.as_ref()).await;
                         return Err(CodexErr::ContextWindowExceeded);
                     }

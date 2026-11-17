@@ -40,7 +40,15 @@ pub(crate) async fn run_mcp_tool(
         let executor = executor.context("MCP hook executor is unavailable")?;
         let event: Value = serde_json::from_str(event_json)?;
         let input = expand_object(&target.input, &event)?;
-        let timeout = Duration::from_secs(handler.timeout_sec);
+        let mut timeout = Duration::from_secs(handler.timeout_sec);
+        if let Some(trust) = &handler.plugin_trust {
+            // Verify approved plugin contents within the hook's own deadline.
+            let verify_started = Instant::now();
+            tokio::time::timeout(timeout, trust.verify())
+                .await
+                .context("hook trust verification timed out")??;
+            timeout = timeout.saturating_sub(verify_started.elapsed());
+        }
         // This shares the existing effects ledger; timing out is not rollback.
         crate::mark_command_effects_possible();
         let text = tokio::time::timeout(timeout, executor.execute(HookMcpCall {

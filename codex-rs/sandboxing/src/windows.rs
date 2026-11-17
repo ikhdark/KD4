@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -50,6 +51,7 @@ pub fn unsupported_windows_restricted_token_sandbox_reason(
             permission_profile,
             sandbox_policy_cwd,
             windows_sandbox_level == WindowsSandboxLevel::Elevated,
+            &HashMap::new(),
         )
         .err()
     } else {
@@ -174,12 +176,13 @@ pub fn resolve_windows_elevated_filesystem_overrides(
     permission_profile: &PermissionProfile,
     sandbox_policy_cwd: &AbsolutePathBuf,
     use_windows_elevated_backend: bool,
+    workload_env: &HashMap<String, String>,
 ) -> std::result::Result<Option<WindowsSandboxFilesystemOverrides>, String> {
     if sandbox != SandboxType::WindowsRestrictedToken || !use_windows_elevated_backend {
         return Ok(None);
     }
 
-    let (file_system_sandbox_policy, network_sandbox_policy) =
+    let (mut file_system_sandbox_policy, network_sandbox_policy) =
         permission_profile.to_runtime_permissions();
 
     if !permission_profile_supports_windows_restricted_token_sandbox(permission_profile) {
@@ -189,6 +192,13 @@ pub fn resolve_windows_elevated_filesystem_overrides(
             file_system_sandbox_policy.kind,
         ));
     }
+
+    // Temp authority comes from the child's TEMP/TMP, never the host's
+    // TMPDIR/TEMP, so overrides and carveouts match what the child uses.
+    codex_windows_sandbox::resolve_workload_temp_paths(
+        &mut file_system_sandbox_policy,
+        workload_env,
+    );
 
     let additional_deny_read_paths = codex_windows_sandbox::resolve_windows_deny_read_paths(
         &file_system_sandbox_policy,

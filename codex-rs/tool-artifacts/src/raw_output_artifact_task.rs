@@ -263,8 +263,10 @@ impl RawOutputArtifactTask {
     }
 
     fn ceiling_gap(&self) -> Option<super::CommandLogCeilingGap> {
+        // The count is exact only for a gap that follows a full retained prefix.
         self.ceiling_omitted.map(|omitted_bytes| super::CommandLogCeilingGap {
-            omitted_bytes, other_loss: self.incomplete,
+            omitted_bytes,
+            other_loss: self.incomplete || self.bytes < super::MAX_COMMAND_LOG_BYTES,
         })
     }
 
@@ -354,6 +356,9 @@ impl Drop for RawOutputArtifactTask {
             // Preserve an explicitly incomplete prefix even when the owner is
             // cancelled. No cancellation path publishes a complete transcript.
             if let Some(writer) = self.writer.as_mut() { let _ = writer.flush(); }
+            // Producer bytes after this drop are unknown, so a ceiling gap
+            // recorded here is a lower bound, never an exact total.
+            self.incomplete = true;
             let status = self.status(false);
             if self.handle.is_some()
                 && let Ok(bytes) = serde_json::to_vec(&status)
@@ -521,6 +526,15 @@ pub async fn read_command_log(
         }
         let status: serde_json::Value = serde_json::from_slice(&status)
             .map_err(|error| super::ReadToolOutputError::Io(error.to_string()))?;
+        // A log that stopped at its ceiling ends mid-stream; every read says so.
+        let ceiling = status["ceiling"].as_object().map(|gap| {
+            let omitted = gap.get("omitted_bytes").and_then(serde_json::Value::as_u64).unwrap_or(0);
+            let exact = gap.get("other_loss") == Some(&serde_json::Value::Bool(false));
+            (omitted, format!(
+                "capture stopped at the per-command log ceiling; {}{omitted} later producer bytes were not captured",
+                if exact { "" } else { "at least " },
+            ), gap.get("limit_bytes").and_then(serde_json::Value::as_u64))
+        });
         let mut remaining = max_bytes;
         let mut results = Vec::new();
         // Selector-local errors must not discard independent retained evidence.
@@ -535,7 +549,7 @@ pub async fn read_command_log(
         let mut search_snapshot = None;
         for selector in &selectors {
             if matches!(selector, ToolOutputSelector::Tail { .. }) {
-                let selected = match super::tail_window_limit(selector, remaining) {
+                let mut selected = match super::tail_window_limit(selector, remaining) {
                     Err(message) => super::invalid_selector_result(selector.clone(), message),
                     Ok(_) if remaining == 0 => super::ToolOutputSelectorResult::state(
                         selector.clone(), super::ToolOutputSelectorStatus::AggregateOmitted,
@@ -557,6 +571,14 @@ pub async fn read_command_log(
                         super::tail_selector_result(selector.clone(), &window, length, remaining)
                     }
                 };
+                if let Some((_, note, _)) = &ceiling
+                    && selected.status == super::ToolOutputSelectorStatus::Ok
+                    && selected.message.is_none()
+                {
+                    selected.message = Some(format!(
+                        "This tail ends the retained prefix, not the command's output: {note}."
+                    ));
+                }
                 remaining = remaining.saturating_sub(super::recovery_source_charge(&selected) as usize);
                 results.push(serde_json::to_value(selected)
                     .map_err(|error| super::ReadToolOutputError::Io(error.to_string()))?);
@@ -567,9 +589,16 @@ pub async fn read_command_log(
                     super::ARTIFACT_REGEX_MAX_SEARCH_BYTES
                 } else { super::MAX_RAW_OUTPUT_ARTIFACT_BYTES };
                 let selected = if metadata.len() > limit as u64 {
-                    super::invalid_selector_result(selector.clone(), format!(
-                        "search is limited to {limit} retained bytes; use exact byte/line selections of this artifact, never rerun its producer"
-                    ))
+                    super::invalid_selector_result(selector.clone(), match &ceiling {
+                        // The ceiling hint owns what a narrower rerun may do.
+                        Some(_) => format!(
+                            "search is limited to {limit} retained bytes; use exact byte/line selections of this artifact's retained prefix. {}",
+                            super::COMMAND_LOG_CEILING_RECOVERY_HINT
+                        ),
+                        None => format!(
+                            "search is limited to {limit} retained bytes; use exact byte/line selections of this artifact, never rerun its producer"
+                        ),
+                    })
                 } else {
                     if search_snapshot.is_none() {
                         let (file, _identity) = open_command_log(&path)
@@ -773,8 +802,21 @@ pub async fn read_command_log(
             results.push(item);
         }
         results.sort_by_key(|result| result["canonical_range"]["start"].as_u64().unwrap_or(u64::MAX));
+        // With other loss recorded the omitted count is a lower bound; tail
+        // results already say so, give every other delivered result the same.
+        if let Some((_, note, _)) = &ceiling
+            && status["ceiling"]["other_loss"] != false
+        {
+            for result in &mut results {
+                if result["status"] == "ok" && result["message"].is_null() {
+                    result["message"] = format!(
+                        "This log is the retained prefix of the command's output: {note}; any unavailable_ranges end is a lower bound."
+                    ).into();
+                }
+            }
+        }
         if let Some(identity) = identity { retain_command_log_index(identity, line_index); }
-        Ok(Some(serde_json::json!({
+        let mut response = serde_json::json!({
             "artifact_id":artifact_id,
             "canonical_sha256":status["sha256"],
             "canonical_bytes":metadata.len(),
@@ -784,7 +826,20 @@ pub async fn read_command_log(
             "retained_bytes":metadata.len(),
             "retained_artifact_complete":status["complete"] == true && status["bytes"].as_u64() == Some(metadata.len()),
             "results":results,
-        })))
+        });
+        // Bytes the sink received directly after a full retained prefix and did
+        // not store; with other loss recorded this is a lower bound. These are
+        // producer-stream offsets past canonical_bytes (the retained length),
+        // unlike snapshot ranges, which lie within [0, canonical_bytes).
+        if let Some((omitted, _, limit)) = ceiling
+            && omitted > 0
+            && limit == Some(metadata.len())
+        {
+            response["unavailable_ranges"] = serde_json::json!([
+                {"start": metadata.len(), "end": metadata.len().saturating_add(omitted)}
+            ]);
+        }
+        Ok(Some(response))
     }).await.map_err(|error| super::ReadToolOutputError::Io(error.to_string()))?
 }
 

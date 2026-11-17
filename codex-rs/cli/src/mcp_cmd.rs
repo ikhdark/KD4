@@ -248,7 +248,7 @@ async fn perform_oauth_login_retry_without_scopes(
     {
         Ok(()) => Ok(()),
         Err(err) if should_retry_without_scopes(resolved_scopes, &err) => {
-            println!("OAuth provider rejected discovered scopes. Retrying without scopes…");
+            out_println!("OAuth provider rejected discovered scopes. Retrying without scopes…")?;
             perform_oauth_login(
                 codex_home,
                 name,
@@ -375,11 +375,11 @@ async fn run_add(config: &Config, add_args: AddArgs) -> Result<()> {
         .await
         .with_context(|| format!("failed to write MCP servers to {}", codex_home.display()))?;
 
-    println!("Added global MCP server '{name}'.");
+    out_println!("Added global MCP server '{name}'.")?;
 
     match oauth_login_support(&transport).await {
         McpOAuthLoginSupport::Supported(oauth_config) => {
-            println!("Detected OAuth support. Starting OAuth flow…");
+            out_println!("Detected OAuth support. Starting OAuth flow…")?;
             let resolved_scopes = resolve_oauth_scopes(
                 /*explicit_scopes*/ None,
                 /*configured_scopes*/ None,
@@ -400,12 +400,12 @@ async fn run_add(config: &Config, add_args: AddArgs) -> Result<()> {
                 config.mcp_oauth_callback_url.as_deref(),
             )
             .await?;
-            println!("Successfully logged in.");
+            out_println!("Successfully logged in.")?;
         }
         McpOAuthLoginSupport::Unsupported => {}
-        McpOAuthLoginSupport::Unknown(_) => println!(
+        McpOAuthLoginSupport::Unknown(_) => out_println!(
             "MCP server may or may not require login. Run `codex mcp login {name}` to login."
-        ),
+        )?,
     }
 
     Ok(())
@@ -434,9 +434,9 @@ async fn run_remove(config: &Config, remove_args: RemoveArgs) -> Result<()> {
     }
 
     if removed {
-        println!("Removed global MCP server '{name}'.");
+        out_println!("Removed global MCP server '{name}'.")?;
     } else {
-        println!("No MCP server named '{name}' found.");
+        out_println!("No MCP server named '{name}' found.")?;
     }
 
     Ok(())
@@ -488,7 +488,7 @@ async fn run_login(config: &Config, login_args: LoginArgs) -> Result<()> {
         config.mcp_oauth_callback_url.as_deref(),
     )
     .await?;
-    println!("Successfully logged in to MCP server '{name}'.");
+    out_println!("Successfully logged in to MCP server '{name}'.")?;
     Ok(())
 }
 
@@ -516,8 +516,8 @@ async fn run_logout(config: &Config, logout_args: LogoutArgs) -> Result<()> {
         config.mcp_oauth_credentials_store_mode,
         config.auth_keyring_backend_kind(),
     ) {
-        Ok(true) => println!("Removed OAuth credentials for '{name}'."),
-        Ok(false) => println!("No OAuth credentials stored for '{name}'."),
+        Ok(true) => out_println!("Removed OAuth credentials for '{name}'.")?,
+        Ok(false) => out_println!("No OAuth credentials stored for '{name}'.")?,
         Err(err) => return Err(anyhow!("failed to delete OAuth credentials: {err}")),
     }
 
@@ -608,12 +608,12 @@ async fn run_list(config: &Config, list_args: ListArgs) -> Result<()> {
             })
             .collect();
         let output = serde_json::to_string_pretty(&json_entries)?;
-        println!("{output}");
+        out_println!("{output}")?;
         return Ok(());
     }
 
     if entries.is_empty() {
-        println!("No MCP servers configured yet. Try `codex mcp add my-tool -- my-command`.");
+        out_println!("No MCP servers configured yet. Try `codex mcp add my-tool -- my-command`.")?;
         return Ok(());
     }
 
@@ -696,7 +696,7 @@ async fn run_list(config: &Config, list_args: ListArgs) -> Result<()> {
             }
         }
 
-        println!(
+        out_println!(
             "{name:<name_w$}  {command:<cmd_w$}  {args:<args_w$}  {env:<env_w$}  {cwd:<cwd_w$}  {status:<status_w$}  {auth:<auth_w$}",
             name = "Name",
             command = "Command",
@@ -712,10 +712,10 @@ async fn run_list(config: &Config, list_args: ListArgs) -> Result<()> {
             cwd_w = widths[4],
             status_w = widths[5],
             auth_w = widths[6],
-        );
+        )?;
 
         for row in &stdio_rows {
-            println!(
+            out_println!(
                 "{name:<name_w$}  {command:<cmd_w$}  {args:<args_w$}  {env:<env_w$}  {cwd:<cwd_w$}  {status:<status_w$}  {auth:<auth_w$}",
                 name = row[0].as_str(),
                 command = row[1].as_str(),
@@ -731,12 +731,12 @@ async fn run_list(config: &Config, list_args: ListArgs) -> Result<()> {
                 cwd_w = widths[4],
                 status_w = widths[5],
                 auth_w = widths[6],
-            );
+            )?;
         }
     }
 
     if !stdio_rows.is_empty() && !http_rows.is_empty() {
-        println!();
+        out_println!()?;
     }
 
     if !http_rows.is_empty() {
@@ -753,7 +753,7 @@ async fn run_list(config: &Config, list_args: ListArgs) -> Result<()> {
             }
         }
 
-        println!(
+        out_println!(
             "{name:<name_w$}  {url:<url_w$}  {token:<token_w$}  {status:<status_w$}  {auth:<auth_w$}",
             name = "Name",
             url = "Url",
@@ -765,10 +765,10 @@ async fn run_list(config: &Config, list_args: ListArgs) -> Result<()> {
             token_w = widths[2],
             status_w = widths[3],
             auth_w = widths[4],
-        );
+        )?;
 
         for row in &http_rows {
-            println!(
+            out_println!(
                 "{name:<name_w$}  {url:<url_w$}  {token:<token_w$}  {status:<status_w$}  {auth:<auth_w$}",
                 name = row[0].as_str(),
                 url = row[1].as_str(),
@@ -780,7 +780,7 @@ async fn run_list(config: &Config, list_args: ListArgs) -> Result<()> {
                 token_w = widths[2],
                 status_w = widths[3],
                 auth_w = widths[4],
-            );
+            )?;
         }
     }
 
@@ -844,21 +844,21 @@ async fn run_get(config: &Config, get_args: GetArgs) -> Result<()> {
                 .tool_timeout_sec
                 .map(|timeout| timeout.as_secs_f64()),
         }))?;
-        println!("{output}");
+        out_println!("{output}")?;
         return Ok(());
     }
 
     if !server.enabled {
         if let Some(reason) = server.disabled_reason.as_ref() {
-            println!("{name} (disabled: {reason})", name = get_args.name);
+            out_println!("{name} (disabled: {reason})", name = get_args.name)?;
         } else {
-            println!("{name} (disabled)", name = get_args.name);
+            out_println!("{name} (disabled)", name = get_args.name)?;
         }
         return Ok(());
     }
 
-    println!("{}", get_args.name);
-    println!("  enabled: {}", server.enabled);
+    out_println!("{}", get_args.name)?;
+    out_println!("  enabled: {}", server.enabled)?;
     let format_tool_list = |tools: &Option<Vec<String>>| -> String {
         match tools {
             Some(list) if list.is_empty() => "[]".to_string(),
@@ -868,11 +868,11 @@ async fn run_get(config: &Config, get_args: GetArgs) -> Result<()> {
     };
     if server.enabled_tools.is_some() {
         let enabled_tools_display = format_tool_list(&server.enabled_tools);
-        println!("  enabled_tools: {enabled_tools_display}");
+        out_println!("  enabled_tools: {enabled_tools_display}")?;
     }
     if server.disabled_tools.is_some() {
         let disabled_tools_display = format_tool_list(&server.disabled_tools);
-        println!("  disabled_tools: {disabled_tools_display}");
+        out_println!("  disabled_tools: {disabled_tools_display}")?;
     }
     match &server.transport {
         McpServerTransportConfig::Stdio {
@@ -882,22 +882,22 @@ async fn run_get(config: &Config, get_args: GetArgs) -> Result<()> {
             env_vars,
             cwd,
         } => {
-            println!("  transport: stdio");
-            println!("  command: {command}");
+            out_println!("  transport: stdio")?;
+            out_println!("  command: {command}")?;
             let args_display = if args.is_empty() {
                 "-".to_string()
             } else {
                 args.join(" ")
             };
-            println!("  args: {args_display}");
+            out_println!("  args: {args_display}")?;
             let cwd_display = cwd
                 .as_ref()
                 .map(ToString::to_string)
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| "-".to_string());
-            println!("  cwd: {cwd_display}");
+            out_println!("  cwd: {cwd_display}")?;
             let env_display = format_env_display(env.as_ref(), env_vars);
-            println!("  env: {env_display}");
+            out_println!("  env: {env_display}")?;
         }
         McpServerTransportConfig::StreamableHttp {
             url,
@@ -905,10 +905,10 @@ async fn run_get(config: &Config, get_args: GetArgs) -> Result<()> {
             http_headers,
             env_http_headers,
         } => {
-            println!("  transport: streamable_http");
-            println!("  url: {url}");
+            out_println!("  transport: streamable_http")?;
+            out_println!("  url: {url}")?;
             let bearer_token_display = bearer_token_env_var.as_deref().unwrap_or("-");
-            println!("  bearer_token_env_var: {bearer_token_display}");
+            out_println!("  bearer_token_env_var: {bearer_token_display}")?;
             let headers_display = match http_headers {
                 Some(map) if !map.is_empty() => {
                     let mut pairs: Vec<_> = map.iter().collect();
@@ -921,7 +921,7 @@ async fn run_get(config: &Config, get_args: GetArgs) -> Result<()> {
                 }
                 _ => "-".to_string(),
             };
-            println!("  http_headers: {headers_display}");
+            out_println!("  http_headers: {headers_display}")?;
             let env_headers_display = match env_http_headers {
                 Some(map) if !map.is_empty() => {
                     let mut pairs: Vec<_> = map.iter().collect();
@@ -934,14 +934,14 @@ async fn run_get(config: &Config, get_args: GetArgs) -> Result<()> {
                 }
                 _ => "-".to_string(),
             };
-            println!("  env_http_headers: {env_headers_display}");
+            out_println!("  env_http_headers: {env_headers_display}")?;
         }
     }
     if let Some(timeout) = server.startup_timeout_sec {
-        println!("  startup_timeout_sec: {}", timeout.as_secs_f64());
+        out_println!("  startup_timeout_sec: {}", timeout.as_secs_f64())?;
     }
     if let Some(timeout) = server.tool_timeout_sec {
-        println!("  tool_timeout_sec: {}", timeout.as_secs_f64());
+        out_println!("  tool_timeout_sec: {}", timeout.as_secs_f64())?;
     }
     if let Some(approval_mode) = server.default_tools_approval_mode {
         let approval_mode = match approval_mode {
@@ -950,9 +950,9 @@ async fn run_get(config: &Config, get_args: GetArgs) -> Result<()> {
             AppToolApproval::Writes => "writes",
             AppToolApproval::Approve => "approve",
         };
-        println!("  default_tools_approval_mode: {approval_mode}");
+        out_println!("  default_tools_approval_mode: {approval_mode}")?;
     }
-    println!("  remove: codex mcp remove {}", get_args.name);
+    out_println!("  remove: codex mcp remove {}", get_args.name)?;
 
     Ok(())
 }

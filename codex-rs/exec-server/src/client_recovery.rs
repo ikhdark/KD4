@@ -392,6 +392,7 @@ impl SessionState {
             if seq > ordered.last_published_seq.saturating_add(1) {
                 self.events.publish(ExecProcessEvent::OutputGap {
                     through_seq: seq - 1,
+                    capture_incomplete: None,
                 });
                 ordered.last_published_seq = seq - 1;
             }
@@ -403,6 +404,7 @@ impl SessionState {
         if ordered.last_published_seq < target {
             self.events.publish(ExecProcessEvent::OutputGap {
                 through_seq: target,
+                capture_incomplete: None,
             });
             ordered.last_published_seq = target;
         }

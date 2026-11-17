@@ -1,6 +1,7 @@
 use std::io;
 
 use codex_exec_server::ExecutorFileSystem;
+use codex_exec_server::FileSystemSandboxContext;
 use codex_protocol::protocol::Product;
 use codex_utils_path_uri::PathUri;
 use futures::StreamExt;
@@ -65,17 +66,18 @@ impl ParsedEnvironmentSkill {
     async fn load(
         file_system: &dyn ExecutorFileSystem,
         skill: &DiscoveredSkill,
+        sandbox: Option<&FileSystemSandboxContext>,
     ) -> Result<Self, String> {
         let (contents, discovered_metadata) = match &skill.metadata {
             SkillMetadataDiscovery::Present(metadata_path) => {
                 let (contents, metadata) = tokio::join!(
-                    read_skill_contents(file_system, &skill.path),
-                    read_skill_metadata(file_system, metadata_path),
+                    read_skill_contents(file_system, &skill.path, sandbox),
+                    read_skill_metadata(file_system, metadata_path, sandbox),
                 );
                 (contents?, metadata)
             }
             SkillMetadataDiscovery::Absent | SkillMetadataDiscovery::Probe(_) => (
-                read_skill_contents(file_system, &skill.path).await?,
+                read_skill_contents(file_system, &skill.path, sandbox).await?,
                 (None, None, Vec::new()),
             ),
         };
@@ -90,7 +92,7 @@ impl ParsedEnvironmentSkill {
                 discovered_metadata
             }
             SkillMetadataDiscovery::Probe(metadata_path) => {
-                probe_skill_metadata(file_system, metadata_path).await
+                probe_skill_metadata(file_system, metadata_path, sandbox).await
             }
         };
 
@@ -113,6 +115,9 @@ pub struct EnvironmentSkillLoadOutcome {
 }
 
 /// Discovers skills without converting environment-owned paths to host paths.
+///
+/// `sandbox` is the caller's current filesystem authority for this environment. Every
+/// discovery walk, probe and read runs under it; `None` keeps direct executor access.
 #[tracing::instrument(
     name = "skills.environment.load",
     level = "info",
@@ -123,6 +128,7 @@ pub async fn load_environment_skills_from_root(
     file_system: &dyn ExecutorFileSystem,
     root: &PathUri,
     restriction_product: Option<Product>,
+    sandbox: Option<&FileSystemSandboxContext>,
 ) -> EnvironmentSkillLoadOutcome {
     let mut outcome = EnvironmentSkillLoadOutcome::default();
     let discovery = discover_skills(
@@ -134,6 +140,7 @@ pub async fn load_environment_skills_from_root(
             directory_symlinks: DirectorySymlinkPolicy::Follow,
             hidden_directories: HiddenDirectoryPolicy::Include,
         },
+        sandbox,
     )
     .await;
     tracing::Span::current().record("skill_count", discovery.skills.len());
@@ -153,6 +160,7 @@ pub async fn load_environment_skills_from_root(
         &skill_paths,
         discovery.plugin_roots,
         discovery.namespace_roots,
+        sandbox,
     );
 
     // Remote executors can multiplex these independent per-skill reads, so polling a bounded
@@ -163,7 +171,7 @@ pub async fn load_environment_skills_from_root(
             async move {
                 (
                     path,
-                    ParsedEnvironmentSkill::load(file_system, &skill).await,
+                    ParsedEnvironmentSkill::load(file_system, &skill, sandbox).await,
                 )
             }
         })
@@ -212,17 +220,19 @@ pub async fn load_environment_skills_from_root(
 async fn read_skill_contents(
     file_system: &dyn ExecutorFileSystem,
     skill_path: &PathUri,
+    sandbox: Option<&FileSystemSandboxContext>,
 ) -> Result<String, String> {
-    super::read_skill_frontmatter(file_system, skill_path)
+    super::read_skill_frontmatter(file_system, skill_path, sandbox)
         .await.map_err(|err| format!("failed to read file: {err}"))
 }
 
 async fn probe_skill_metadata(
     file_system: &dyn ExecutorFileSystem,
     metadata_path: &PathUri,
+    sandbox: Option<&FileSystemSandboxContext>,
 ) -> (Option<SkillDependencies>, Option<SkillPolicy>, Vec<String>) {
     match file_system
-        .get_metadata(metadata_path, /*sandbox*/ None)
+        .get_metadata(metadata_path, sandbox)
         .await
     {
         Ok(metadata) if metadata.is_file => {}
@@ -238,15 +248,16 @@ async fn probe_skill_metadata(
             );
         }
     }
-    read_skill_metadata(file_system, metadata_path).await
+    read_skill_metadata(file_system, metadata_path, sandbox).await
 }
 
 async fn read_skill_metadata(
     file_system: &dyn ExecutorFileSystem,
     metadata_path: &PathUri,
+    sandbox: Option<&FileSystemSandboxContext>,
 ) -> (Option<SkillDependencies>, Option<SkillPolicy>, Vec<String>) {
     let contents = match file_system
-        .read_file_text(metadata_path, /*sandbox*/ None)
+        .read_file_text(metadata_path, sandbox)
         .await
     {
         Ok(contents) => contents,

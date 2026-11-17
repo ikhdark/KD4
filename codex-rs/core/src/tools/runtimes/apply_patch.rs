@@ -108,17 +108,61 @@ impl ApplyPatchRuntime {
         self.failure.as_ref()
     }
 
-    async fn validate_assignment(ctx: &ToolCtx, req: &ApplyPatchRequest) -> Result<(), ToolError> {
+    /// A write the assignment does not authorize is a capability refusal on every
+    /// route. Shell-intercepted patches reach this owner without the router gate,
+    /// so record it for the terminal assessment and report the router's envelope
+    /// (no-effects `PermissionDenied`, no retry receipt) instead of a patch failure.
+    fn capability_denied(&mut self, ctx: &ToolCtx, reason: String) -> ToolError {
+        self.refused(ctx, None, reason)
+    }
+
+    /// One refused endpoint of an assignment that may otherwise patch: the same
+    /// refusal, recorded with its path so the terminal gap names what was refused.
+    fn endpoint_denied(&mut self, ctx: &ToolCtx, endpoint: &str, reason: String) -> ToolError {
+        self.refused(ctx, Some(endpoint), reason)
+    }
+
+    fn refused(&mut self, ctx: &ToolCtx, endpoint: Option<&str>, reason: String) -> ToolError {
+        use crate::agent::task_capabilities::{CapabilityDenied, CapabilityRefusals, TypedToolClass};
+        let refusals = ctx.turn.extension_data.get_or_init(CapabilityRefusals::default);
+        match endpoint {
+            Some(endpoint) => refusals.record_target("apply_patch", TypedToolClass::StructuredEdit, endpoint),
+            None => refusals.record("apply_patch", TypedToolClass::StructuredEdit),
+        }
+        let failure = CapabilityDenied::new("apply_patch", reason).tool_failure();
+        let message = failure.message.clone();
+        self.failure = Some(failure);
+        ToolError::Rejected(message)
+    }
+
+    /// The assignment-wide refusal, if any, for a patch that has not reached this
+    /// runtime. A shell-relayed patch passes the router as a shell call, so its
+    /// handler asks here before safety assessment and approval, as the router's
+    /// gate does for the apply_patch tool. That gate cannot see the selected
+    /// environment, so the tool's own handler asks too once it is resolved.
+    /// Recorded like every capability refusal.
+    pub(crate) async fn assignment_refusal(ctx: &ToolCtx, environment: &TurnEnvironment)
+        -> Option<codex_protocol::tool_failure::ToolFailure>
+    {
+        let mut runtime = Self::new();
+        runtime.write_authority(ctx, environment).await.err()?;
+        runtime.failure
+    }
+
+    /// Whether this turn's assignment may patch source at all. `Ok(None)` is a turn
+    /// no typed assignment governs; a bound turn returns the authorization its
+    /// per-endpoint checks need.
+    async fn write_authority(&mut self, ctx: &ToolCtx, environment: &TurnEnvironment)
+        -> Result<Option<codex_agent_task_store::AgentTaskAuthorization>, ToolError>
+    {
         let coordinator = ctx.session.services.agent_control.task_coordinator();
         let Some(binding) = coordinator.binding_for_turn(&ctx.turn) else {
             if matches!(&ctx.turn.session_source, codex_protocol::protocol::SessionSource::SubAgent(_)) {
-                return Err(ToolError::Rejected("apply_patch: unbound subagents are read-only".into()));
+                return Err(self.capability_denied(ctx,
+                    "unbound subagents are read-only; admit an explicit typed writable assignment".into()));
             }
-            return Ok(());
+            return Ok(None);
         };
-        if req.turn_environment.environment.is_remote() {
-            return Err(ToolError::Rejected("apply_patch: typed source contracts require the bound local repository".into()));
-        }
         let authorization = coordinator.get_agent_task_authorization(binding.assignment_id).await
             .map_err(|error| ToolError::Rejected(format!("apply_patch: typed assignment unavailable: {error}")))?;
         if authorization.current_attempt.attempt_id != binding.attempt_id
@@ -128,32 +172,72 @@ impl ApplyPatchRuntime {
         }
         let assignment = &authorization.assignment;
         let amendment = authorization.current_attempt.amendment.as_ref();
-        codex_agent_task_store::require_write_contract(assignment, amendment)
-            .and_then(|()| codex_agent_task_store::dispatch_manifest(assignment, amendment).map(|_| ()))
-            .map_err(|error| ToolError::Rejected(format!("apply_patch: {error}")))?;
+        if let Err(error) = codex_agent_task_store::require_write_contract(assignment, amendment) {
+            return Err(self.capability_denied(ctx, error.to_string()));
+        }
+        // Read-only attempts intentionally carry no source baseline; report the
+        // authority gap rather than a missing baseline (shell-intercepted patches
+        // reach this owner without the router's StructuredEdit check).
+        if assignment.write_scope.is_empty() {
+            return Err(self.capability_denied(ctx,
+                "message-only/read-only assignments cannot write source".into()));
+        }
+        if let Err(error) = codex_agent_task_store::dispatch_manifest(assignment, amendment) {
+            return Err(self.capability_denied(ctx, error.to_string()));
+        }
+        // A writable contract is bound to its local repository, so no retry can
+        // patch a remote environment. Checked last: a read-only assignment is
+        // refused for its own reason above, whatever its environment. Recorded
+        // against that environment: the assignment may still patch locally.
+        if environment.environment.is_remote() {
+            let target = format!("remote environment {}", environment.environment_id);
+            return Err(self.refused(ctx, Some(&target),
+                "typed source contracts require the bound local repository".into()));
+        }
+        Ok(Some(authorization))
+    }
+
+    async fn validate_assignment(&mut self, ctx: &ToolCtx, req: &ApplyPatchRequest) -> Result<(), ToolError> {
+        let Some(authorization) = self.write_authority(ctx, &req.turn_environment).await? else {
+            return Ok(());
+        };
+        let assignment = &authorization.assignment;
+        let amendment = authorization.current_attempt.amendment.as_ref();
         let root = std::path::Path::new(&authorization.repo_root);
         for (path, change) in req.action.changes() {
             let absolute = path.to_abs_path().map_err(|error| ToolError::Rejected(error.to_string()))?;
-            let relative = codex_agent_task_store::normalize_absolute_source_path(root, &absolute)
-                .map_err(|error| ToolError::Rejected(format!("apply_patch: {error}")))?;
+            // An endpoint outside the assigned repository is an authority refusal;
+            // filesystem errors while resolving it remain ordinary failures.
+            let relative = match codex_agent_task_store::normalize_absolute_source_path(root, &absolute) {
+                Ok(relative) => relative,
+                Err(error @ codex_agent_task_store::StoreError::InvalidScope(_)) =>
+                    return Err(self.endpoint_denied(ctx, &absolute.display().to_string(), error.to_string())),
+                Err(error) => return Err(ToolError::Rejected(format!("apply_patch: {error}"))),
+            };
             use codex_agent_task_store::SourceWriteOperation as Op;
             let operation = match change {
                 codex_apply_patch::ApplyPatchFileChange::Add { .. } => Op::Create,
                 codex_apply_patch::ApplyPatchFileChange::Delete { .. } => Op::Delete,
                 codex_apply_patch::ApplyPatchFileChange::Update { .. } => Op::Update,
             };
-            codex_agent_task_store::authorize_source_write(assignment, amendment, &relative, operation)
-                .map_err(|error| ToolError::Rejected(format!("apply_patch: {error}")))?;
+            if let Err(error) = codex_agent_task_store::authorize_source_write(assignment, amendment, &relative, operation) {
+                return Err(self.endpoint_denied(ctx, &relative, error.to_string()));
+            }
             if let codex_apply_patch::ApplyPatchFileChange::Update { move_path: Some(destination), .. } = change {
                 let absolute = destination.to_abs_path().map_err(|error| ToolError::Rejected(error.to_string()))?;
-                let destination = codex_agent_task_store::normalize_absolute_source_path(root, &absolute)
-                    .map_err(|error| ToolError::Rejected(format!("apply_patch: {error}")))?;
+                let destination = match codex_agent_task_store::normalize_absolute_source_path(root, &absolute) {
+                    Ok(destination) => destination,
+                    Err(error @ codex_agent_task_store::StoreError::InvalidScope(_)) =>
+                        return Err(self.endpoint_denied(ctx, &absolute.display().to_string(), error.to_string())),
+                    Err(error) => return Err(ToolError::Rejected(format!("apply_patch: {error}"))),
+                };
                 let destination_operation = if absolute.exists() { Op::Update } else { Op::Create };
                 for (path, operation) in [(&relative, Op::Move), (&relative, Op::Delete),
                     (&destination, Op::Move), (&destination, destination_operation)]
                 {
-                    codex_agent_task_store::authorize_source_write(assignment, amendment, path, operation)
-                        .map_err(|error| ToolError::Rejected(format!("apply_patch: {error}")))?;
+                    if let Err(error) = codex_agent_task_store::authorize_source_write(assignment, amendment, path, operation) {
+                        return Err(self.endpoint_denied(ctx, path, error.to_string()));
+                    }
                 }
             }
         }
@@ -323,7 +407,7 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
                     ) => permit.map_err(ToolError::Denied)?,
                 });
             }
-            Self::validate_assignment(ctx, req).await?;
+            self.validate_assignment(ctx, req).await?;
             let started_at = Instant::now();
             let fs = req.turn_environment.environment.get_filesystem();
             let sandbox = Self::file_system_sandbox_context_for_attempt(req, attempt);

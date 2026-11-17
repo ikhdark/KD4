@@ -348,6 +348,8 @@ pub use resolved_permissions::ResolvedWindowsSandboxPermissions;
 
 pub use resolved_permissions::WindowsSandboxTokenMode;
 
+pub use resolved_permissions::resolve_workload_temp_paths;
+
 pub use resolved_permissions::token_mode_for_permission_profile;
 
 pub use resolved_permissions::validate_windows_read_policy;

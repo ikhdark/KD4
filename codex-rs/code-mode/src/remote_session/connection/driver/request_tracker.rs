@@ -21,9 +21,19 @@ pub(super) enum CancellationAction {
     },
 }
 
+struct ControlDeadline {
+    at: tokio::time::Instant,
+    budget: std::time::Duration,
+    extensions: u32,
+    // Backend stall observed since this window was armed at `armed_at`; a
+    // stall before it existed is not evidence for this window.
+    armed_at: tokio::time::Instant,
+    stalled: std::time::Duration,
+}
+
 pub(super) struct RequestTracker {
     pending: HashMap<RequestId, PendingRequest>,
-    control_deadlines: HashMap<RequestId, tokio::time::Instant>,
+    control_deadlines: HashMap<RequestId, ControlDeadline>,
     unclaimed_executes: HashMap<RequestId, UnclaimedExecute>,
     initial_responses: HashMap<RequestId, InitialResponse>,
     deferred_waits: VecDeque<DeferredWait>,
@@ -81,8 +91,17 @@ impl RequestTracker {
             _ => None,
         };
         if let Some(timeout) = timeout {
-            self.control_deadlines
-                .insert(id, tokio::time::Instant::now() + timeout);
+            let armed_at = tokio::time::Instant::now();
+            self.control_deadlines.insert(
+                id,
+                ControlDeadline {
+                    at: armed_at + timeout,
+                    budget: timeout,
+                    extensions: 0,
+                    armed_at,
+                    stalled: std::time::Duration::ZERO,
+                },
+            );
         }
         let replaced = self.pending.insert(id, pending);
         debug_assert!(replaced.is_none());
@@ -101,7 +120,54 @@ impl RequestTracker {
     }
 
     pub(super) fn next_control_deadline(&self) -> Option<tokio::time::Instant> {
-        self.control_deadlines.values().copied().min()
+        self.control_deadlines.values().map(|deadline| deadline.at).min()
+    }
+
+    /// Charges a backend stall measured up to `now` to every armed control
+    /// window, clipped to the part of it that window existed for.
+    pub(super) fn note_control_stall(
+        &mut self,
+        stalled: std::time::Duration,
+        now: tokio::time::Instant,
+    ) {
+        if stalled.is_zero() {
+            return;
+        }
+        for deadline in self.control_deadlines.values_mut() {
+            let charged = stalled.min(now.saturating_duration_since(deadline.armed_at));
+            deadline.stalled = deadline.stalled.saturating_add(charged);
+        }
+    }
+
+    /// Re-arms every control deadline expired at `now` for a full budget when
+    /// its own window saw at least `BACKEND_STALL_EVIDENCE` of backend stall.
+    /// Returns the largest re-armed stall (zero when none had expired, e.g.
+    /// it was acknowledged meanwhile), or `None` when an expired window has no
+    /// stall evidence or no re-arm left.
+    pub(super) fn rearm_expired_control_deadlines(
+        &mut self,
+        now: tokio::time::Instant,
+    ) -> Option<std::time::Duration> {
+        let expired: Vec<&mut ControlDeadline> = self
+            .control_deadlines
+            .values_mut()
+            .filter(|deadline| deadline.at <= now)
+            .collect();
+        if expired.iter().any(|deadline| {
+            deadline.stalled < super::super::BACKEND_STALL_EVIDENCE
+                || deadline.extensions >= super::super::MAX_BACKEND_STALL_EXTENSIONS
+        }) {
+            return None;
+        }
+        let mut largest = std::time::Duration::ZERO;
+        for deadline in expired {
+            largest = largest.max(deadline.stalled);
+            deadline.extensions += 1;
+            deadline.stalled = std::time::Duration::ZERO;
+            deadline.armed_at = now;
+            deadline.at = now + deadline.budget;
+        }
+        Some(largest)
     }
 
     pub(super) fn insert_initial_response(&mut self, id: RequestId, response: InitialResponse) {

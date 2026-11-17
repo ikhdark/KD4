@@ -1264,6 +1264,7 @@ async fn warm_plugins_and_skills_for_session_init(
     plugins_manager: Arc<PluginsManager>,
     skills_service: Arc<SkillsService>,
     turn_environments: &TurnEnvironmentSnapshot,
+    repository_sandbox: Option<codex_file_system::FileSystemSandboxContext>,
 ) -> Vec<SkillError> {
     let fs = turn_environments.primary_filesystem();
     let plugins_input = config.plugins_config_input();
@@ -1273,7 +1274,7 @@ async fn warm_plugins_and_skills_for_session_init(
     let skills_input = skills_load_input_from_config(config.as_ref(), effective_skill_roots)
         .with_plugin_skill_snapshots(plugin_skill_snapshots);
     skills_service
-        .snapshot_for_config(&skills_input, fs)
+        .snapshot_for_config(&skills_input, fs, repository_sandbox.as_ref())
         .await
         .outcome()
         .errors
@@ -1705,6 +1706,8 @@ impl Session {
             }
             phases.mark("coordination");
             let mut post_session_configured_events = Vec::<Event>::new();
+            // Warnings about this thread's own durable state belong in its rollout.
+            let mut thread_state_warning_events = Vec::<Event>::new();
 
             for message in &config.startup_warnings {
                 post_session_configured_events.push(Event {
@@ -1862,11 +1865,23 @@ impl Session {
             let agents_md_manager = Arc::new(
                 AgentsMdManager::new(user_instructions).with_thread_id(thread_id.to_string()),
             );
+            // Warm under the repository-skill authority the first turn will use.
+            let repository_skill_sandbox = resolved_environments.primary().map(|environment| {
+                TurnContext::file_system_sandbox_context_for_profile(
+                    &session_configuration.permission_profile(),
+                    /*additional_permissions*/ None,
+                    environment.cwd(),
+                    &config.effective_workspace_roots(),
+                    session_configuration.windows_sandbox_level,
+                    config.permissions.windows_sandbox_private_desktop,
+                )
+            });
             let plugin_skill_warmup = warm_plugins_and_skills_for_session_init(
                 Arc::clone(&config),
                 Arc::clone(&plugins_manager),
                 Arc::clone(&skills_service),
                 &resolved_environments,
+                repository_skill_sandbox,
             )
             .instrument(info_span!(
                 "session_init.plugin_skill_warmup",
@@ -1895,13 +1910,22 @@ impl Session {
                 .history
                 .set_pressure_reasoning_retirement(config.pressure_reasoning_retirement);
             if let Some(tool_history) = initial_tool_history {
+                // Only a change this load made (checkpointed prefix, quarantined
+                // ledger) is recorded once; a source every load reports again
+                // (unsupported, unreadable, unretired) is delivered live only.
+                let one_shot = tool_history.warning_is_one_shot();
                 let (tool_history, ledger_warning) = tool_history.into_state_and_warning();
                 if let Some(message) = ledger_warning {
                     tracing::warn!("{message}");
-                    post_session_configured_events.push(Event {
+                    let event = Event {
                         id: INITIAL_SUBMIT_ID.to_owned(),
                         msg: EventMsg::Warning(WarningEvent { message }),
-                    });
+                    };
+                    if one_shot {
+                        thread_state_warning_events.push(event);
+                    } else {
+                        post_session_configured_events.push(event);
+                    }
                 }
                 state.set_tool_history_state(tool_history);
             }
@@ -2188,10 +2212,16 @@ impl Session {
             // empty thread into a persisted rollout.
             sess.send_event_raw_without_materializing_rollout(session_configured)
                 .await;
-            // Startup, unknown-feature and unstable-feature warnings describe this process's
-            // configuration, not the thread. Deliver them live only: persisting them into a
-            // resumed rollout rewrote idle completed threads (new last event and mtime) on
-            // every reload, while new threads never persisted them.
+            // A completed-tool history ledger this load checkpointed or quarantined is a
+            // one-time change to this thread, so it keeps the existing persist-in-place path.
+            // Ledger states that every load reports again are delivered live only below.
+            for event in thread_state_warning_events {
+                sess.send_event_raw_without_materializing_rollout(event).await;
+            }
+            // Startup, unknown-feature, unstable-feature, plugin and hook warnings describe this
+            // process's configuration, not the thread. Deliver them live only: persisting them
+            // into a resumed rollout rewrote idle completed threads (new last event and mtime)
+            // on every reload, while new threads never persisted them.
             for event in post_session_configured_events {
                 sess.deliver_event_raw(event).await;
             }

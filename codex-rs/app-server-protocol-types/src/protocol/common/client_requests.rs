@@ -90,6 +90,16 @@ macro_rules! serialization_scope_expr {
     ($actual_params:ident, global_shared_read($key:literal)) => {
         Some(ClientRequestSerializationScope::GlobalSharedRead($key))
     };
+    // A read that also requests a mutation (`bool` or `Option<bool>` flag) keeps
+    // exclusive access; otherwise it shares the key with other reads and still
+    // queues FIFO against writers.
+    ($actual_params:ident, global_shared_read_unless($key:literal, $params:ident . $field:ident)) => {
+        if Option::<bool>::from($actual_params.$field).unwrap_or(false) {
+            Some(ClientRequestSerializationScope::Global($key))
+        } else {
+            Some(ClientRequestSerializationScope::GlobalSharedRead($key))
+        }
+    };
     ($actual_params:ident, thread_id($params:ident . $field:ident)) => {
         Some(ClientRequestSerializationScope::Thread {
             thread_id: $actual_params.$field.clone(),
@@ -759,7 +769,7 @@ client_request_definitions! {
     },
     HooksList => "hooks/list" {
         params: v2::HooksListParams,
-        serialization: global("config"),
+        serialization: global_shared_read("config"),
         response: v2::HooksListResponse,
     },
     MarketplaceAdd => "marketplace/add" {
@@ -794,7 +804,7 @@ client_request_definitions! {
     },
     PluginSkillRead => "plugin/skill/read" {
         params: v2::PluginSkillReadParams,
-        serialization: global("config"),
+        serialization: global_shared_read("config"),
         response: v2::PluginSkillReadResponse,
     },
     PluginShareSave => "plugin/share/save" {
@@ -809,7 +819,7 @@ client_request_definitions! {
     },
     PluginShareList => "plugin/share/list" {
         params: v2::PluginShareListParams,
-        serialization: global("config"),
+        serialization: global_shared_read("config"),
         response: v2::PluginShareListResponse,
     },
     PluginShareCheckout => "plugin/share/checkout" {
@@ -946,7 +956,7 @@ client_request_definitions! {
     },
     ExperimentalFeatureList => "experimentalFeature/list" {
         params: v2::ExperimentalFeatureListParams,
-        serialization: global("config"),
+        serialization: global_shared_read("config"),
         response: v2::ExperimentalFeatureListResponse,
     },
     PermissionProfileList => "permissionProfile/list" {
@@ -1060,7 +1070,7 @@ client_request_definitions! {
     },
     WindowsSandboxReadiness => "windowsSandbox/readiness" {
         params: #[ts(optional, type = "null | Record<string, never>")] #[schemars(default, schema_with = "crate::schema_support::no_params_schema")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
-        serialization: global("config"),
+        serialization: global_shared_read("config"),
         response: v2::WindowsSandboxReadinessResponse,
     },
     WindowsSandboxGrantReadRoot => "windowsSandbox/grantReadRoot" {
@@ -1185,7 +1195,7 @@ client_request_definitions! {
     },
     ExternalAgentConfigDetect => "externalAgentConfig/detect" {
         params: v2::ExternalAgentConfigDetectParams,
-        serialization: global("config"),
+        serialization: global_shared_read("config"),
         response: v2::ExternalAgentConfigDetectResponse,
     },
     ExternalAgentConfigImport => "externalAgentConfig/import" {
@@ -1213,13 +1223,13 @@ client_request_definitions! {
 
     ConfigRequirementsRead => "configRequirements/read" {
         params: #[ts(optional, type = "null | Record<string, never>")] #[schemars(default, schema_with = "crate::schema_support::no_params_schema")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
-        serialization: global("config"),
+        serialization: global_shared_read("config"),
         response: v2::ConfigRequirementsReadResponse,
     },
 
     GetAccount => "account/read" {
         params: v2::GetAccountParams,
-        serialization: global("account-auth"),
+        serialization: global_shared_read_unless("account-auth", params.refresh_token),
         response: v2::GetAccountResponse,
     },
 
@@ -1237,7 +1247,7 @@ client_request_definitions! {
     /// DEPRECATED in favor of GetAccount
     GetAuthStatus => "getAuthStatus" {
         params: v1::GetAuthStatusParams,
-        serialization: global("account-auth"),
+        serialization: global_shared_read_unless("account-auth", params.refresh_token),
         response: v1::GetAuthStatusResponse,
     },
     // Legacy fuzzy search cancellation is intentionally concurrent: clients reuse a

@@ -303,6 +303,11 @@ impl ConfigManager {
                     ),
                 },
             )?;
+            restore_redacted_otel_headers(&mut user_config, &user_layer.config).map_err(
+                |message| {
+                    ConfigManagerError::write(ConfigWriteErrorCode::ConfigValidationError, message)
+                },
+            )?;
 
             let updated_value = value_at_semantic_path(&user_config, &segments).cloned();
             if original_value != updated_value {
@@ -338,6 +343,42 @@ impl ConfigManager {
                 semantic_segments.push("enabled".to_string());
             }
             parsed_segments.push(semantic_segments);
+        }
+
+        // hooks/list returns an opaque declaration/content approval value for plugin
+        // hooks. Split it on persistence so declaration-only readers still recognize
+        // the declaration approval and the content approval is kept separately.
+        if let Some(states) = user_config
+            .get_mut("hooks")
+            .and_then(|hooks| hooks.get_mut("state"))
+            .and_then(TomlValue::as_table_mut)
+        {
+            for (key, state) in states {
+                let Some(state) = state.as_table_mut() else {
+                    continue;
+                };
+                let Some((declaration, content)) = state
+                    .get("trusted_hash")
+                    .and_then(TomlValue::as_str)
+                    .and_then(|hash| hash.split_once('/'))
+                    .map(|(declaration, content)| (declaration.to_owned(), content.to_owned()))
+                else {
+                    continue;
+                };
+                for (field, hash) in [
+                    ("trusted_hash", declaration),
+                    ("trusted_content_hash", content),
+                ] {
+                    let value = TomlValue::String(hash);
+                    config_edits.push(ConfigEdit::SetPath {
+                        segments: vec!["hooks".into(), "state".into(), key.clone(), field.into()],
+                        value: toml_value_to_item(&value).map_err(|err| {
+                            ConfigManagerError::anyhow("failed to build config edits", err)
+                        })?,
+                    });
+                    state.insert(field.to_string(), value);
+                }
+            }
         }
 
         // Plain decoding additionally rejects relative AbsolutePathBuf values;
@@ -855,10 +896,51 @@ fn redact_otel_exporter_headers(otel: &mut JsonValue) {
                 continue;
             };
             for value in headers.values_mut() {
-                *value = JsonValue::String("[REDACTED]".to_string());
+                *value = JsonValue::String(OTEL_HEADER_PLACEHOLDER.to_string());
             }
         }
     }
+}
+
+const OTEL_HEADER_PLACEHOLDER: &str = "[REDACTED]";
+
+/// A client that writes back a redacted read projection must not replace a
+/// stored exporter credential with the placeholder: keep the stored user value,
+/// and reject a placeholder that has no stored value to stand for.
+fn restore_redacted_otel_headers(config: &mut TomlValue, stored: &TomlValue) -> Result<(), String> {
+    let Some(otel) = config.get_mut("otel").and_then(TomlValue::as_table_mut) else {
+        return Ok(());
+    };
+    for field in ["exporter", "trace_exporter", "metrics_exporter"] {
+        let Some(exporter) = otel.get_mut(field).and_then(TomlValue::as_table_mut) else {
+            continue;
+        };
+        for (kind, settings) in exporter.iter_mut() {
+            let Some(headers) = settings.get_mut("headers").and_then(TomlValue::as_table_mut)
+            else {
+                continue;
+            };
+            for (name, value) in headers.iter_mut() {
+                if value.as_str() != Some(OTEL_HEADER_PLACEHOLDER) {
+                    continue;
+                }
+                let stored_value = stored
+                    .get("otel")
+                    .and_then(|otel| otel.get(field))
+                    .and_then(|exporter| exporter.get(kind.as_str()))
+                    .and_then(|settings| settings.get("headers"))
+                    .and_then(|headers| headers.get(name.as_str()));
+                let Some(stored_value) = stored_value else {
+                    return Err(format!(
+                        "otel.{field}.{kind}.headers.{name} is the redaction placeholder \
+                         {OTEL_HEADER_PLACEHOLDER}; send the header value or omit the header"
+                    ));
+                };
+                *value = stored_value.clone();
+            }
+        }
+    }
+    Ok(())
 }
 
 fn first_overridden_edit(

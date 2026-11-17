@@ -56,6 +56,13 @@ const HOST_RESPONSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const OPEN_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 const TERMINATE_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_SESSION_TIMEOUT: Duration = Duration::from_secs(15);
+// Host-responsiveness budgets count time this backend could observe the host.
+// Scheduler lateness and the blocking pool (which Windows child pipes share)
+// reveal backend stalls; that much stall within a window re-arms it, a bounded
+// number of times, instead of retiring a host that may already have answered.
+const BACKEND_STALL_TICK: Duration = Duration::from_millis(250);
+const BACKEND_STALL_EVIDENCE: Duration = Duration::from_secs(1);
+const MAX_BACKEND_STALL_EXTENSIONS: u32 = 5;
 
 pub(super) struct Connection {
     observation: codex_utils_pty::process_observation::ObservedProcess,
@@ -277,9 +284,10 @@ impl Connection {
                 None => Err("code-mode host exited during handshake".to_string()),
             }
         };
-        let handshake_result = match tokio::time::timeout(HOST_HANDSHAKE_TIMEOUT, handshake).await {
-            Ok(result) => result,
-            Err(_) => {
+        let handshake = within_host_budget("negotiate", HOST_HANDSHAKE_TIMEOUT, handshake);
+        let handshake_result = match handshake.await {
+            Some(result) => result,
+            None => {
                 kill_and_reap(&mut child, &managed).await;
                 return Err("timed out negotiating with the code-mode host".to_string());
             }
@@ -497,7 +505,7 @@ impl Connection {
             armed: false,
         };
         let mut submitted = false;
-        let result = tokio::time::timeout(timeout, async {
+        let result = within_host_budget(operation, timeout, async {
             self.send(command).await?;
             submitted = true;
             // No await separates command acceptance from cleanup ownership.
@@ -508,11 +516,11 @@ impl Connection {
         .await;
         accepted.armed = false;
         match result {
-            Ok(result) => result,
-            Err(_) if !submitted => Err(format!(
+            Some(result) => result,
+            None if !submitted => Err(format!(
                 "timed out submitting code-mode request to {operation}; no command was accepted"
             )),
-            Err(_) => {
+            None => {
                 let reason = format!(
                     "timed out waiting for code-mode host to {operation}; effects are uncertain; closing the unresponsive host connection"
                 );
@@ -610,6 +618,74 @@ impl ConnectionSupervisor {
             kill_and_reap(&mut self.child, &self.managed).await;
         }
     }
+}
+
+/// Runs `future` within a host-responsiveness `budget`, returning `None` when
+/// the budget expires. A window in which this backend itself stalled for at
+/// least `BACKEND_STALL_EVIDENCE` (late scheduler ticks, or a blocking-pool
+/// probe that cannot start) proves nothing about the host, so it is re-armed,
+/// at most `MAX_BACKEND_STALL_EXTENSIONS` times.
+async fn within_host_budget<F: std::future::Future>(
+    operation: &str,
+    budget: Duration,
+    future: F,
+) -> Option<F::Output> {
+    tokio::pin!(future);
+    let deadline = tokio::time::sleep(budget);
+    tokio::pin!(deadline);
+    let mut ticks = tokio::time::interval(BACKEND_STALL_TICK);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut observed = tokio::time::Instant::now();
+    let mut stalled = Duration::ZERO;
+    let mut extensions = 0;
+    loop {
+        tokio::select! {
+            biased;
+            output = &mut future => return Some(output),
+            _ = ticks.tick() => note_backend_gap(&mut observed, &mut stalled),
+            () = &mut deadline => {
+                note_backend_gap(&mut observed, &mut stalled);
+                // Windows child pipe reads and writes run on the blocking pool.
+                let probe_started = tokio::time::Instant::now();
+                let probe = tokio::time::timeout(
+                    BACKEND_STALL_EVIDENCE,
+                    tokio::task::spawn_blocking(|| ()),
+                );
+                tokio::select! {
+                    biased;
+                    output = &mut future => return Some(output),
+                    _ = probe => {}
+                }
+                let probe_wait = probe_started.elapsed();
+                if probe_wait > BACKEND_STALL_TICK {
+                    stalled += probe_wait;
+                }
+                observed = tokio::time::Instant::now();
+                if stalled < BACKEND_STALL_EVIDENCE || extensions >= MAX_BACKEND_STALL_EXTENSIONS {
+                    return None;
+                }
+                extensions += 1;
+                warn!(
+                    operation,
+                    extensions,
+                    stalled = ?stalled,
+                    "code-mode backend stalled during the host response window; re-arming it"
+                );
+                stalled = Duration::ZERO;
+                deadline.as_mut().reset(observed + budget);
+            }
+        }
+    }
+}
+
+/// Adds the part of a gap between observations that exceeds two ticks.
+fn note_backend_gap(observed: &mut tokio::time::Instant, stalled: &mut Duration) {
+    let now = tokio::time::Instant::now();
+    let gap = now.saturating_duration_since(*observed);
+    if gap > 2 * BACKEND_STALL_TICK {
+        *stalled += gap - BACKEND_STALL_TICK;
+    }
+    *observed = now;
 }
 
 async fn drain_host_responses(

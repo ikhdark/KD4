@@ -64,11 +64,11 @@ async fn run_elevated(cmd: SandboxSetupCommand) -> anyhow::Result<()> {
             )
         })?;
 
-    println!(
+    out_println!(
         "Windows elevated sandbox setup completed for {} at {}.",
         identity.real_user,
         identity.codex_home.display()
-    );
+    )?;
     Ok(())
 }
 

@@ -113,6 +113,22 @@ impl ToolFailure {
         }
     }
 
+    /// A handler's own refusal of arguments its decoder accepted, decided
+    /// before it started anything. `kind` names the refusing check. The marker
+    /// tells a direct-call dispatcher that this reason is not a schema
+    /// rejection to re-explain.
+    pub fn handler_refusal(code: ToolFailureCode, message: impl Into<String>, kind: &str) -> Self {
+        let mut failure = Self::no_effects(code, message);
+        failure.details = Some(serde_json::json!({"handler_refusal": kind}));
+        failure
+    }
+
+    pub fn is_handler_refusal(&self) -> bool {
+        self.details
+            .as_ref()
+            .is_some_and(|details| details.get("handler_refusal").is_some())
+    }
+
     /// Only an actual owner result establishes invocation completion. This is
     /// neither process-exit evidence nor proof that external effects are known.
     pub fn with_completed_execution(mut self) -> Self {

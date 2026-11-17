@@ -29,6 +29,33 @@ use codex_utils_cli::SharedCliOptions;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Like `println!`, but returns the write error instead of panicking. A reader
+/// such as `head` closing the pipe early is not a failure (see `write_plugin_list`).
+macro_rules! out_println {
+    () => {
+        $crate::write_stdout(format_args!("\n"))
+    };
+    ($($arg:tt)*) => {
+        $crate::write_stdout(format_args!("{}\n", format_args!($($arg)*)))
+    };
+}
+
+/// Like `print!`, with the same closed-pipe handling as `out_println!`.
+macro_rules! out_print {
+    ($($arg:tt)*) => {
+        $crate::write_stdout(format_args!($($arg)*))
+    };
+}
+
+fn write_stdout(args: std::fmt::Arguments<'_>) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout().lock();
+    match stdout.write_fmt(args).and_then(|()| stdout.flush()) {
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        result => result,
+    }
+}
+
 mod app_cmd;
 mod desktop_app;
 mod doctor;
@@ -1097,7 +1124,7 @@ async fn cli_main(
                 rows.sort_unstable_by_key(|(name, _, _)| *name);
 
                 for (name, stage, enabled) in rows {
-                    println!("{name:<name_width$}  {stage:<stage_width$}  {enabled}");
+                    out_println!("{name:<name_width$}  {stage:<stage_width$}  {enabled}")?;
                 }
             }
             FeaturesSubcommand::Enable(FeatureSetArgs { feature }) => {
@@ -1324,7 +1351,7 @@ async fn enable_feature_in_config(
         .set_feature_enabled(feature, /*enabled*/ true)
         .apply()
         .await?;
-    println!("Enabled feature `{feature}` in config.toml.");
+    out_println!("Enabled feature `{feature}` in config.toml.")?;
     maybe_print_under_development_feature_warning(&codex_home, feature, overrides).await;
     Ok(())
 }
@@ -1336,7 +1363,7 @@ async fn disable_feature_in_config(feature: &str) -> anyhow::Result<()> {
         .set_feature_enabled(feature, /*enabled*/ false)
         .apply()
         .await?;
-    println!("Disabled feature `{feature}` in config.toml.");
+    out_println!("Disabled feature `{feature}` in config.toml.")?;
     Ok(())
 }
 
@@ -1497,7 +1524,7 @@ async fn run_debug_prompt_input_command(
         user_instructions_provider,
     )
     .await?;
-    println!("{}", serde_json::to_string_pretty(&prompt_input)?);
+    out_println!("{}", serde_json::to_string_pretty(&prompt_input)?)?;
 
     Ok(())
 }
@@ -1548,7 +1575,7 @@ async fn run_debug_models_command(
     };
 
     serde_json::to_writer(std::io::stdout(), &catalog)?;
-    println!();
+    out_println!()?;
     Ok(())
 }
 

@@ -53,6 +53,7 @@ pub(super) async fn discover_skills(
     file_system: &dyn ExecutorFileSystem,
     root: &PathUri,
     options: SkillDiscoveryOptions,
+    sandbox: Option<&codex_exec_server::FileSystemSandboxContext>,
 ) -> SkillDiscovery {
     let empty_discovery = || SkillDiscovery {
         skills: Vec::new(),
@@ -80,7 +81,7 @@ pub(super) async fn discover_skills(
                 filters: Default::default(),
                 apply_gitignore: false,
             },
-            /*sandbox*/ None,
+            sandbox,
         )
         .await
     {

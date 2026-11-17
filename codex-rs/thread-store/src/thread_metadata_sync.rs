@@ -228,7 +228,9 @@ impl ThreadMetadataSync {
                 continue;
             }
             if matches!(item, RolloutItem::TurnContext(_)
-                | RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(_)))
+                | RolloutItem::EventMsg(
+                    EventMsg::ThreadSettingsApplied(_) | EventMsg::TurnStarted(_)
+                ))
                 || matches!(item, RolloutItem::SessionMeta(meta_line) if meta_line.meta.id == self.thread_id)
             {
                 let previous_settings = self.settings_reducer.settings().clone();

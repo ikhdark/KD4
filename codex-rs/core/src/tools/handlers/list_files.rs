@@ -114,7 +114,7 @@ impl ToolExecutor<ToolInvocation> for ListFilesHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(async move {
+        let listed = async move {
             let ToolPayload::Function { ref arguments } = invocation.payload else {
                 return Err(FunctionCallError::RespondToModel(
                     "list_files requires function arguments".into(),
@@ -309,6 +309,12 @@ impl ToolExecutor<ToolInvocation> for ListFilesHandler {
             Ok(boxed_tool_output(
                 JsonToolOutput::new(value).with_sampling_request_signal(evidence),
             ))
+        };
+        // As for the walk failure above, this owner only reads the filesystem.
+        Box::pin(async move {
+            listed
+                .await
+                .map_err(super::read_tool_output::settled_recovery_failure)
         })
     }
 }

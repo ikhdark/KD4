@@ -70,7 +70,7 @@ impl ToolExecutor<ToolInvocation> for CanonicalPathsHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(async move {
+        let inspected = async move {
             let error = |message: String| FunctionCallError::RespondToModel(message);
             let ToolPayload::Function { ref arguments } = invocation.payload else {
                 return Err(error("canonical_paths requires function arguments".into()));
@@ -152,6 +152,13 @@ impl ToolExecutor<ToolInvocation> for CanonicalPathsHandler {
             }));
             crate::tools::context::ensure_exact_model_delivery(&output, &invocation)?;
             Ok(boxed_tool_output(output))
+        };
+        // Canonicalization lookups only inspect paths; a legacy failure leaves
+        // no effects to recover.
+        Box::pin(async move {
+            inspected
+                .await
+                .map_err(super::read_tool_output::settled_recovery_failure)
         })
     }
 }

@@ -49,6 +49,23 @@ struct HookHandlerSource<'a> {
     hook_states: &'a HashMap<String, HookStateToml>,
     env: HashMap<String, String>,
     plugin_id: Option<String>,
+    /// Installed plugin bundle whose contents bind this source's hook approvals.
+    plugin: Option<PluginTrustSource>,
+}
+
+struct PluginTrustSource {
+    root: AbsolutePathBuf,
+    /// Current bundle fingerprint; computed only for listing. Runtime discovery
+    /// defers it to each execution.
+    content_hash: Option<Result<String, String>>,
+    legacy_path: Option<AbsolutePathBuf>,
+}
+
+/// Listing reports current plugin contents; runtime discovery verifies them per execution.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiscoveryMode {
+    Runtime,
+    Listing,
 }
 
 #[derive(Clone, Copy)]
@@ -68,6 +85,7 @@ pub(crate) fn discover_handlers(
     plugin_hook_sources: Vec<PluginHookSource>,
     plugin_hook_load_warnings: Vec<String>,
     bypass_hook_trust: bool,
+    mode: DiscoveryMode,
 ) -> DiscoveryResult {
     let mut handlers = Vec::new();
     let mut hook_entries = Vec::new();
@@ -112,6 +130,7 @@ pub(crate) fn discover_handlers(
                 hook_states: &hook_states,
                 env: HashMap::new(),
                 plugin_id: None,
+                plugin: None,
             };
             if !policy.allows(&policy_source) {
                 continue;
@@ -151,6 +170,7 @@ pub(crate) fn discover_handlers(
                         hook_states: &hook_states,
                         env: HashMap::new(),
                         plugin_id: None,
+                        plugin: None,
                     },
                     hook_events,
                     policy,
@@ -167,6 +187,8 @@ pub(crate) fn discover_handlers(
         plugin_hook_sources,
         &hook_states,
         policy,
+        config_layer_stack,
+        mode,
     );
 
     let once_per = hook_entries
@@ -218,6 +240,7 @@ fn append_managed_requirement_handlers(
             hook_states,
             env: HashMap::new(),
             plugin_id: None,
+            plugin: None,
         },
         managed_hooks.get().hooks.clone(),
         policy,
@@ -232,7 +255,14 @@ fn append_plugin_hook_sources(
     plugin_hook_sources: Vec<PluginHookSource>,
     hook_states: &HashMap<String, HookStateToml>,
     policy: HookDiscoveryPolicy,
+    config_layer_stack: Option<&ConfigLayerStack>,
+    mode: DiscoveryMode,
 ) {
+    if policy.allow_managed_hooks_only {
+        return;
+    }
+    // Listing inspects current contents; runtime discovery defers hashing until execution.
+    let mut content_hashes: HashMap<AbsolutePathBuf, Result<String, String>> = HashMap::new();
     for source in plugin_hook_sources {
         let PluginHookSource {
             plugin_root,
@@ -252,6 +282,22 @@ fn append_plugin_hook_sources(
         // For OOTB compat with existing plugins that use this env var.
         env.insert("CLAUDE_PLUGIN_DATA".to_string(), plugin_data_root_value);
         let plugin_id = plugin_id.as_key();
+        let content_hash = (mode == DiscoveryMode::Listing).then(|| {
+            content_hashes
+                .entry(plugin_root.clone())
+                .or_insert_with(|| {
+                    super::plugin_fingerprint::plugin_content_hash(&plugin_root, &|| false)
+                        .map_err(|err| err.to_string())
+                })
+                .clone()
+        });
+        let plugin = PluginTrustSource {
+            legacy_path: config_layer_stack.and_then(|stack| {
+                super::plugin_trust::legacy_trust_path(stack, plugin_id.as_str())
+            }),
+            root: plugin_root,
+            content_hash,
+        };
         append_hook_events(
             handlers,
             hook_entries,
@@ -269,6 +315,7 @@ fn append_plugin_hook_sources(
                 hook_states,
                 env,
                 plugin_id: Some(plugin_id),
+                plugin: Some(plugin),
             },
             hooks,
             policy,
@@ -563,18 +610,40 @@ fn append_matcher_groups(
                     continue;
                 }
             };
-            let current_hash = command_hook_hash(event_name, matcher, normalized_handler);
+            let plugin_content_hash = match source
+                .plugin
+                .as_ref()
+                .and_then(|plugin| plugin.content_hash.as_ref())
+            {
+                Some(Ok(hash)) => Some(hash.as_str()),
+                Some(Err(err)) if !source.bypass_hook_trust => {
+                    warnings.push(format!(
+                        "skipping plugin hook in {}: failed to fingerprint plugin contents: {err}",
+                        source.path.display()
+                    ));
+                    continue;
+                }
+                Some(Err(_)) | None => None,
+            };
+            let declaration_hash = command_hook_hash(event_name, matcher, normalized_handler);
+            // Listing binds a plugin hook's approval value to its bundle contents. The
+            // config writer persists the declaration and content hashes separately.
+            let current_hash = plugin_content_hash.map_or_else(
+                || declaration_hash.clone(),
+                |hash| format!("{declaration_hash}/{hash}"),
+            );
             // A legacy trusted hash identifies the original handler even
             // after it moves. A bare positional disablement cannot do so;
             // keep unresolved hooks paused until the user saves v2 state.
             let legacy_state = legacy_states
                 .iter()
                 .copied()
-                .filter(|state| state.trusted_hash.as_deref() == Some(&current_hash))
+                .filter(|state| state.trusted_hash.as_deref() == Some(&declaration_hash))
                 .min_by_key(|state| state.enabled != Some(false));
             let unresolved_legacy_state = HookStateToml {
                 enabled: Some(false),
                 trusted_hash: None,
+                trusted_content_hash: None,
                 once_per: None,
             };
             let mut state = source.hook_states.get(&key).or(legacy_state);
@@ -591,8 +660,40 @@ fn append_matcher_groups(
             }
             let enabled = hook_enabled(source.is_managed, state);
             let trusted_hash = hook_trusted_hash(source.is_managed, state);
-            let trust_status =
-                hook_trust_status(source.is_managed, &current_hash, trusted_hash);
+            let plugin_trust = if (!source.bypass_hook_trust || plugin_content_hash.is_some())
+                && let Some(plugin) = source.plugin.as_ref()
+                && let Some(trusted_hash) = trusted_hash
+            {
+                Some(super::plugin_trust::PluginHookTrust {
+                    root: plugin.root.clone(),
+                    declaration_hash: declaration_hash.clone(),
+                    trusted_hash: trusted_hash.to_owned(),
+                    trusted_content_hash: state
+                        .and_then(|state| state.trusted_content_hash.clone()),
+                    legacy_path: plugin.legacy_path.clone(),
+                })
+            } else {
+                None
+            };
+            let trust_status = if let Some(content_hash) = plugin_content_hash
+                && let Some(trust) = plugin_trust.as_ref()
+            {
+                match trust.matches_hash(content_hash) {
+                    Ok(true) => HookTrustStatus::Trusted,
+                    Ok(false) => HookTrustStatus::Modified,
+                    Err(err) => {
+                        warnings.push(format!(
+                            "skipping plugin hook in {}: failed to migrate hook trust: {err}",
+                            source.path.display()
+                        ));
+                        continue;
+                    }
+                }
+            } else {
+                // Runtime plugin hooks still require a matching declaration here;
+                // their contents are verified before each execution.
+                hook_trust_status(source.is_managed, &declaration_hash, trusted_hash)
+            };
             hook_entries.push(HookListEntry {
                 key,
                 event_name,
@@ -628,6 +729,7 @@ fn append_matcher_groups(
                     source: source.source,
                     display_order: *display_order,
                     env: source.env.clone(),
+                    plugin_trust,
                 });
             }
             *display_order += 1;

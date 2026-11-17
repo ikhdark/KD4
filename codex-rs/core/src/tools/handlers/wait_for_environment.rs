@@ -95,7 +95,8 @@ impl ToolExecutor<ToolInvocation> for WaitForEnvironmentHandler {
                     )));
                 }
             };
-            let args: WaitForEnvironmentArgs = parse_arguments(&arguments)?;
+            let args: WaitForEnvironmentArgs = parse_arguments(&arguments)
+                .map_err(super::read_tool_output::settled_recovery_failure)?;
             let environment_id = resolve_environment_id(
                 args.environment_id,
                 step_context
@@ -103,7 +104,9 @@ impl ToolExecutor<ToolInvocation> for WaitForEnvironmentHandler {
                     .starting
                     .iter()
                     .map(|environment| environment.selection.environment_id.as_str()),
-            )?;
+            )
+            // Selecting nothing waited on or changed anything: a settled failure.
+            .map_err(super::read_tool_output::settled_recovery_failure)?;
             if let Err(error) = super::wait_for_tool_environment(
                 &step_context.environments,
                 Some(&environment_id),

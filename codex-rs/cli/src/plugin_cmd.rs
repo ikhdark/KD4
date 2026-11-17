@@ -151,19 +151,19 @@ pub async fn run_plugin_add(
 
     if json {
         let output = JsonPluginAddOutput::from_outcome(outcome);
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        out_println!("{}", serde_json::to_string_pretty(&output)?)?;
         return Ok(());
     }
 
-    println!(
+    out_println!(
         "Added plugin `{}` from marketplace `{}`.",
         outcome.plugin_id.plugin_name(),
         outcome.plugin_id.marketplace_name()
-    );
-    println!(
+    )?;
+    out_println!(
         "Installed plugin root: {}",
         outcome.installed_path.as_path().display()
-    );
+    )?;
 
     Ok(())
 }
@@ -541,14 +541,14 @@ pub async fn run_plugin_remove(
         .await?;
     if json {
         let output = JsonPluginRemoveOutput::from_selection(selection);
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        out_println!("{}", serde_json::to_string_pretty(&output)?)?;
         return Ok(());
     }
 
-    println!(
+    out_println!(
         "Removed plugin `{}` from marketplace `{}`.",
         selection.plugin_name, selection.marketplace_name
-    );
+    )?;
 
     Ok(())
 }

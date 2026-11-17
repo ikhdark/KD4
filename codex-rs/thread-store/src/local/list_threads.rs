@@ -262,18 +262,9 @@ async fn list_state_threads_for_storage(
     params: &ListThreadsParams,
     cursor: Option<&codex_rollout::Cursor>,
 ) -> ThreadStoreResult<SelectedRolloutThreads> {
-    if params
-        .cwd_filters
-        .as_deref()
-        .is_some_and(<[std::path::PathBuf]>::is_empty)
-    {
-        return Ok(SelectedRolloutThreads {
-            page: codex_rollout::ThreadsPage::default(),
-            storage_path: ThreadListStoragePath::StateDb,
-            state_metadata: HashMap::new(),
-        });
-    }
-
+    // An empty cwd filter still queries the required state DB (codex-state
+    // matches no rows for it), so an unavailable DB is reported as an error
+    // rather than as an apparently exhausted listing.
     let state_page = codex_rollout::state_integration::list_threads_db(
         state_db.as_deref(),
         config.codex_home.as_path(),

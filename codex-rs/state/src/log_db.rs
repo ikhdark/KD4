@@ -63,6 +63,9 @@ pub fn default_filter() -> Targets {
         .with_targets(SQLX_LOG_TARGETS.map(|target| (format!("{target}::"), LevelFilter::OFF)))
         .with_target("codex_http_client::transport", LevelFilter::OFF)
         .with_target("hyper_util", LevelFilter::WARN)
+        // Per-frame HTTP/2 traces would fill the per-process row budget and
+        // evict every other row; h2's protocol anomalies are WARN.
+        .with_target("h2", LevelFilter::WARN)
         .with_target("log", LevelFilter::OFF)
         .with_target("codex_otel.log_only", LevelFilter::OFF)
         .with_target("codex_otel.trace_safe", LevelFilter::OFF)

@@ -160,7 +160,7 @@ fn audit_everyone_writable(
             Err(err) => {
                 *incomplete = true;
                 debug_log(
-                    &format!("AUDIT: unable to inspect ACL: {} ({err})", path.display()),
+                    &format!("AUDIT: unable to inspect ACL: {} ({err:#})", path.display()),
                     logs_base_dir,
                 );
                 false
@@ -335,7 +335,7 @@ pub fn apply_world_writable_scan_and_denies_for_permissions(
         logs_base_dir,
     ) {
         log_note(
-            &format!("AUDIT: failed to apply capability deny ACEs: {err}"),
+            &format!("AUDIT: failed to apply capability deny ACEs: {err:#}"),
             logs_base_dir,
         );
         return Err(err);

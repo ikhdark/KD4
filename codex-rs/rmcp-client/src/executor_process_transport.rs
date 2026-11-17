@@ -267,7 +267,7 @@ impl ExecutorProcessTransport {
                 Err(error) => Err(error),
             };
             match received {
-                Ok(ExecProcessEvent::OutputGap { through_seq }) => {
+                Ok(ExecProcessEvent::OutputGap { through_seq, .. }) => {
                     // A JSON-RPC byte stream cannot safely resume through a
                     // missing frame. Report transport loss, not process death.
                     warn!(
