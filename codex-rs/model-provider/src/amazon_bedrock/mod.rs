@@ -33,7 +33,7 @@ use crate::provider::ProviderAccountState;
 use crate::provider::ProviderCapabilities;
 use crate::provider::ResolvedModelProviderClientSetup;
 pub(crate) use catalog::static_model_catalog;
-use catalog::with_default_only_service_tier;
+use catalog::with_supported_service_tiers;
 use runtime_catalog::static_runtime_model_catalog;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -251,7 +251,7 @@ impl ModelProvider for AmazonBedrockModelProvider {
         config_model_catalog: Option<ModelsResponse>,
     ) -> SharedModelsManager {
         let manager = match config_model_catalog {
-            Some(catalog) => StaticModelsManager::new(None, with_default_only_service_tier(catalog)),
+            Some(catalog) => StaticModelsManager::new(None, with_supported_service_tiers(catalog)),
             None => StaticModelsManager::new(
                 None,
                 match self.endpoint {

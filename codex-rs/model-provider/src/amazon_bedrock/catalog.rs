@@ -2,11 +2,14 @@ use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_5_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_LUNA_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_TERRA_MODEL_ID;
+use codex_model_provider_info::AMAZON_BEDROCK_GPT_6_2_ASTRA_MODEL_ID;
+use codex_model_provider_info::AMAZON_BEDROCK_GPT_6_2_SOL_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_GPT_6_ASTRA_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_GPT_6_LUNA_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_GPT_6_SOL_MODEL_ID;
 use codex_models_manager::bundled_models;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ModelServiceTier;
 use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -66,28 +69,56 @@ pub(crate) fn static_model_catalog() -> ModelsResponse {
                 "GPT-5.5",
                 /*priority*/ 6,
             ),
+            bedrock_model(
+                bundled_openai_model(bundled, "gpt-6.2-sol"),
+                AMAZON_BEDROCK_GPT_6_2_SOL_MODEL_ID,
+                "GPT-6.2 Sol",
+                /*priority*/ 7,
+            ),
+            bedrock_model(
+                bundled_openai_model(bundled, "gpt-6.2-astra"),
+                AMAZON_BEDROCK_GPT_6_2_ASTRA_MODEL_ID,
+                "GPT-6.2 Astra",
+                /*priority*/ 8,
+            ),
         ],
     };
     for model in &mut catalog.models {
         // Constructors already normalized these selected owned models.
-        clear_service_tiers(model);
+        normalize_service_tiers(model, /*bundled*/ true);
     }
     catalog
 }
 
-pub(crate) fn with_default_only_service_tier(mut catalog: ModelsResponse) -> ModelsResponse {
+pub(crate) fn with_supported_service_tiers(mut catalog: ModelsResponse) -> ModelsResponse {
     for model in &mut catalog.models {
         normalize_bedrock_model(model);
-        clear_service_tiers(model);
+        normalize_service_tiers(model, /*bundled*/ false);
     }
     catalog
 }
 
-fn clear_service_tiers(model: &mut ModelInfo) {
-    // Amazon Bedrock currently only supports the implicit "default" tier for GPT models.
+fn normalize_service_tiers(model: &mut ModelInfo, bundled: bool) {
+    // Never inherit OpenAI-only priority routing or select a premium tier by default.
     model.additional_speed_tiers.clear();
-    model.service_tiers.clear();
     model.default_service_tier = None;
+    let supports_ultrafast = matches!(
+        model.slug.as_str(),
+        AMAZON_BEDROCK_GPT_6_2_ASTRA_MODEL_ID
+            | "global.openai.gpt-6.2-astra"
+            | "us.openai.gpt-6.2-astra"
+    );
+    // Explicit catalogs may restrict tiers and own the labels they advertise.
+    model
+        .service_tiers
+        .retain(|tier| supports_ultrafast && tier.id == "ultrafast");
+    if bundled && supports_ultrafast && model.service_tiers.is_empty() {
+        model.service_tiers.push(ModelServiceTier {
+            id: "ultrafast".to_string(),
+            name: "Ultrafast".to_string(),
+            description: "The fastest available responses for latency-sensitive work.".to_string(),
+        });
+    }
 }
 
 fn bedrock_model(

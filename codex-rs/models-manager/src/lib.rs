@@ -55,8 +55,9 @@ pub fn bundled_models_response() -> Result<ModelsResponse, serde_json::Error> {
 // version. The /models endpoint filters individual models by client_version:
 // 0.0.0 omits Sol 6/Luna 6, and 0.158.0 omits Sol 6.1. Inference rejects those
 // models for a 0.0.0 client identity the same way. Use the baseline verified
-// against rust-v0.159.1 without changing executable versions.
-const SOURCE_BUILD_MODELS_CLIENT_VERSION: &str = "0.159.1";
+// against rust-v0.159.1, raised to the catalog's 0.166.0 minimum for Sol/Astra
+// 6.2 without changing executable versions.
+const SOURCE_BUILD_MODELS_CLIENT_VERSION: &str = "0.166.0";
 
 /// Whole client version used consistently for model discovery and cache eligibility.
 /// Source builds use the supported catalog baseline instead of the 0.0.0 placeholder.
