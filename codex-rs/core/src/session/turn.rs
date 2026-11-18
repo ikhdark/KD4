@@ -719,7 +719,8 @@ pub(crate) fn run_turn(
                     }
                 }
             });
-            if let Some(repair_revision) = missing_answer_terminal_repair_revision.take()
+            let repair_revision = missing_answer_terminal_repair_revision.take();
+            if let Some(repair_revision) = repair_revision.as_deref()
                 && repair_revision != request_baselines.relevant_state_fingerprint()
             {
                 // New input/effects reopen ordinary work, rather than carrying a
@@ -744,9 +745,13 @@ pub(crate) fn run_turn(
             );
             let generation_budget_admission =
                 logical_generation_budget.admit(generation_request.terminal_completion_only);
+            let mut request_before_forced_terminal = None;
             let budget_forced_terminal = match generation_budget_admission {
                 LogicalGenerationAdmission::Regular => None,
                 LogicalGenerationAdmission::Terminal { forced } => {
+                    if forced {
+                        request_before_forced_terminal = Some(generation_request.clone());
+                    }
                     generation_request = generation_request.require_terminal_completion();
                     forced.then_some(if subagent_context_budget_reached {
                         ForcedTerminalReason::SubagentContextBudget
@@ -1288,7 +1293,7 @@ pub(crate) fn run_turn(
                         // Routine retirement is the exact, recoverable operation that
                         // proactive retirement performs uncounted; only pressure it
                         // cannot absorb spends a spawned agent's compaction budget.
-                        if relief == ContextPressureRelief::Compaction {
+                        if relief.counts_as_context_pressure_event() {
                             subagent_context_budget_reached |= observe_context_pressure_event(
                                 &turn_context.session_source,
                                 &mut context_pressure_events,
@@ -1817,7 +1822,8 @@ pub(crate) fn run_turn(
                 }
                 Err(CodexErr::ContextWindowExceeded)
                     if turn_context.post_tool_stop_reason.get().is_none()
-                        && unsampled_overflow_relief != Some(ContextPressureRelief::Compaction)
+                        && !unsampled_overflow_relief
+                            .is_some_and(ContextPressureRelief::counts_as_context_pressure_event)
                         && (admission_refusal.is_some()
                             || !provider_overflow_recovery_attempted) =>
                 {
@@ -1889,13 +1895,22 @@ pub(crate) fn run_turn(
                         }
                     };
                     unsampled_overflow_relief = Some(relief);
-                    pending_generation_request = None;
-                    // The refused request is retried; after routine retirement it keeps
-                    // its own continuation cause rather than a compaction label.
+                    if admission_refusal.is_some() {
+                        // No request reached the provider. Preserve the intended
+                        // purpose and tool fence; let admission reapply any forced
+                        // terminal boundary whose allowance we just refunded.
+                        pending_generation_request =
+                            Some(request_before_forced_terminal.unwrap_or(generation_request));
+                        missing_answer_terminal_repair_revision = repair_revision;
+                    } else {
+                        pending_generation_request = None;
+                    }
+                    // Turn timing restores the refused cause after exact retirement.
+                    // Only an applied summary creates a compaction continuation.
                     if relief == ContextPressureRelief::Compaction {
                         pending_continuation_cause = Some(ContinuationCause::Compaction);
                     }
-                    if relief == ContextPressureRelief::Compaction {
+                    if relief.counts_as_context_pressure_event() {
                         subagent_context_budget_reached |= observe_context_pressure_event(
                             &turn_context.session_source,
                             &mut context_pressure_events,
@@ -4651,9 +4666,17 @@ enum ContextPressureRelief {
     /// generations: the operation proactive retirement performs before the
     /// limit, which a spawned agent's compaction budget does not count.
     RoutineRetirement,
-    /// Summarized or replaced history, or retired past the kept generations
-    /// after a summary failed.
+    /// Retired past the kept generations after a summary failed. This spends
+    /// the worker's context budget but does not apply a summary or replacement.
+    FallbackRetirement,
+    /// Summarized or replaced history.
     Compaction,
+}
+
+impl ContextPressureRelief {
+    fn counts_as_context_pressure_event(self) -> bool {
+        self != Self::RoutineRetirement
+    }
 }
 
 /// Content-free observations attached to existing turn timing; no new queues or policy.
@@ -5089,7 +5112,7 @@ fn run_auto_compact<'a>(
                         }),
                     )
                     .await;
-                    return Ok(ContextPressureRelief::Compaction);
+                    return Ok(ContextPressureRelief::FallbackRetirement);
                 }
                 if !crate::compact_model_fallback::should_retry_with_local_compaction(&remote_error)
                 {

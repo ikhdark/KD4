@@ -285,11 +285,12 @@ async fn send_client_management_request_once(
         ClientManagementRequest::Revoke { url } => client.delete((*url).clone()),
     };
     request_state.admit_request()?;
-    let response = request
+    let request = request
         .timeout(REMOTE_CONTROL_CLIENT_MANAGEMENT_TIMEOUT)
-        .headers(auth_headers)
-        .send()
-        .await
+        .headers(auth_headers);
+    let response = auth
+        .dispatch_request(request.send())
+        .await?
         .map_err(|err| io::Error::other(format!("failed to {action}: {err}")))?;
     let headers = response.headers().clone();
     let status = response.status();

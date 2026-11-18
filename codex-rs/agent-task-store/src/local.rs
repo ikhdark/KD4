@@ -2813,7 +2813,7 @@ LIMIT 1
                 // An inaccessible lease is assignment-local like an inaccessible
                 // sidecar: settle nothing without it, as for a busy lease.
                 Err(StoreError::Io(error)) => {
-                    tracing::warn!(path = %lease_path.display(), capsule = %path.display(), %error, "task capsule lease unavailable; capsule left unsettled and its assignment remains unavailable");
+                    tracing::warn!(path = %lease_path.display(), capsule = %path.display(), %error, "task capsule lease unavailable; capsule left unsettled");
                     continue;
                 }
                 Err(error) => return Err(error),

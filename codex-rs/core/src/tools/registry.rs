@@ -525,17 +525,21 @@ impl AnyToolResult {
     }
 
     pub(crate) fn response(&self) -> ResponseInputItem {
-        let response = if let Some(projection) = self.model_projection.as_ref() {
+        let response = self.response_before_operation_history();
+        let notice = self.operation_history.as_ref()
+            .map(|history| serde_json::json!({"operation_history": history}).to_string());
+        with_operation_history_notice(response, notice.as_deref())
+    }
+
+    pub(crate) fn response_before_operation_history(&self) -> ResponseInputItem {
+        if let Some(projection) = self.model_projection.as_ref() {
             with_model_delivery_notice(
                 projection.response(),
                 self.result.model_delivery_notice(),
             )
         } else {
             self.result.to_response_item(&self.call_id, &self.payload)
-        };
-        let notice = self.operation_history.as_ref()
-            .map(|history| serde_json::json!({"operation_history": history}).to_string());
-        with_operation_history_notice(response, notice.as_deref())
+        }
     }
 
     /// Register the final text only after both it and the producer's original
@@ -1665,7 +1669,9 @@ impl ToolRegistry {
     ) -> Result<AnyToolResult, FunctionCallError> {
         let session = Arc::clone(&invocation.session);
         let mut attempt = self.capture_operation_attempt(&invocation).await;
-        let mut result = self.dispatch_with_operation_attempt(invocation, dispatch_state, &mut attempt).await;
+        let mut result = self.dispatch_with_operation_attempt(
+            invocation, Arc::clone(&dispatch_state), &mut attempt,
+        ).await;
         // This is a reused recovery receipt, not a new execution/failure. Do
         // not overwrite the unresolved owner attempt with the preflight refusal.
         if attempt.recovery_deferred {
@@ -1673,24 +1679,29 @@ impl ToolRegistry {
         }
         crate::tools::operation_history::settle(&mut attempt, &result);
         let advisory = session.record_operation_attempt(attempt).await;
+        let owner_failure = match &result {
+            Ok(output) => output.result.tool_failure(),
+            Err(error) => Some(error.failure()),
+        };
         match &mut result {
             Ok(output) => {
                 if output.outcome_for_logging() != ToolOutputOutcome::Success
                     || advisory["previous_unsuccessful_attempt_count"].as_u64().is_some_and(|count| count > 0) {
-                    output.operation_history = Some(advisory);
+                    output.operation_history = Some(advisory.clone());
                 }
             }
             Err(FunctionCallError::Structured(failure)) => {
-                crate::tools::operation_history::annotate_failure(failure, advisory);
+                crate::tools::operation_history::annotate_failure(failure, advisory.clone());
             }
             Err(error @ FunctionCallError::RespondToModel(_)) => {
                 let mut failure = error.failure();
-                crate::tools::operation_history::annotate_failure(&mut failure, advisory);
+                crate::tools::operation_history::annotate_failure(&mut failure, advisory.clone());
                 *error = FunctionCallError::structured(failure);
             }
             // Preserve terminal/refusal variants and their existing control flow.
             Err(_) => {}
         }
+        dispatch_state.record_settlement(advisory, owner_failure, result.is_err());
         result
     }
 
@@ -2022,10 +2033,12 @@ impl ToolRegistry {
         let retry_memory = invocation.session.operation_attempt_advisory(attempt).await;
         if let Some(failure) = attempt.recovery_preflight(&retry_memory) {
             let error = FunctionCallError::structured(failure);
-            notify_tool_finish_if_unclaimed(
+            let accounted = notify_tool_finish_if_unclaimed(
                 &invocation, dispatch_state.as_ref(), &error,
                 ToolCallOutcome::Failed { handler_executed: false },
-            ).await?;
+            ).await;
+            let error = accounted.err().unwrap_or(error);
+            dispatch_state.record_settlement(retry_memory, Some(error.failure()), true);
             return Err(error);
         }
         if retry_memory["unchanged_unsuccessful_attempt_count"].as_u64().is_some_and(|count| count > 0) {

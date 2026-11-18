@@ -3467,7 +3467,9 @@ impl ThreadRequestProcessor {
         app_server_client_version: Option<String>,
         supports_openai_form_elicitation: bool,
     ) -> Result<(), JSONRPCErrorError> {
-        for attempt in 1..=MAX_THREAD_RESUME_CONFIG_ATTEMPTS {
+        let mut config_attempt = 1;
+        let mut retried_after_parent = false;
+        loop {
             let result = self
                 .thread_resume_attempt(
                     request_id.clone(),
@@ -3480,17 +3482,34 @@ impl ThreadRequestProcessor {
             match result {
                 Err(error)
                     if is_config_generation_changed(&error)
-                        && attempt < MAX_THREAD_RESUME_CONFIG_ATTEMPTS =>
+                        && config_attempt < MAX_THREAD_RESUME_CONFIG_ATTEMPTS =>
                 {
                     // Retry only before admission or after confirmed rollback.
                     // Each attempt reloads history and config with the original
                     // overrides; never retry a policy denial or an accepted resume.
-                    warn!(attempt, "configuration changed during thread/resume; retrying admission");
+                    warn!(attempt = config_attempt, "configuration changed during thread/resume; retrying admission");
+                    config_attempt += 1;
+                }
+                Err(error) if !retried_after_parent && params.history.is_none() => {
+                    let Some(parent_id) = resume_parent_dependency(&error) else {
+                        return Err(error);
+                    };
+                    if self.thread_manager.get_thread(parent_id).await.is_err() {
+                        // The child failed before publication. Its attempt has
+                        // released all permits, so the parent can finish even
+                        // across a queued metadata mutation.
+                        self.thread_list_state_permit
+                            .wait_for_existing_resume(&parent_id.to_string())
+                            .await;
+                        if self.thread_manager.get_thread(parent_id).await.is_err() {
+                            return Err(error);
+                        }
+                    }
+                    retried_after_parent = true;
                 }
                 result => return result,
             }
         }
-        unreachable!("resume attempts always return on the final attempt")
     }
 
     async fn thread_resume_attempt(
@@ -3972,6 +3991,16 @@ impl ThreadRequestProcessor {
                     .map_err(|error| {
                         internal_error(format!("resume finalization failed: {error}"))
                     })?;
+            }
+            Err(err @ CodexErr::ResumeParentNotLoaded(parent_id)) => {
+                let mut error = thread_invalid_request(
+                    format!("error resuming thread: {err}"),
+                    ThreadErrorReason::ParentNotLoaded,
+                );
+                if let Some(serde_json::Value::Object(data)) = error.data.as_mut() {
+                    data.insert("parentThreadId".to_string(), serde_json::json!(parent_id));
+                }
+                return Err(error);
             }
             Err(err) => {
                 let error = internal_error(format!("error resuming thread: {err}"));
@@ -5470,6 +5499,15 @@ fn thread_store_resume_read_error(err: ThreadStoreError) -> JSONRPCErrorError {
         }
         err => internal_error(format!("failed to read thread: {err}")),
     }
+}
+
+fn resume_parent_dependency(error: &JSONRPCErrorError) -> Option<ThreadId> {
+    let data = error.data.as_ref()?;
+    let classified: ThreadErrorData = serde_json::from_value(data.clone()).ok()?;
+    if classified.reason != ThreadErrorReason::ParentNotLoaded {
+        return None;
+    }
+    ThreadId::from_string(data.get("parentThreadId")?.as_str()?).ok()
 }
 
 fn thread_list_history_load_error(

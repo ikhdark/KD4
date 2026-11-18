@@ -29,6 +29,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
+use tokio::sync::Notify;
 use toml::Value as TomlValue;
 use tracing::instrument;
 use tracing::warn;
@@ -97,6 +98,14 @@ impl OverridePathNode {
     }
 }
 
+#[derive(Clone)]
+struct CloudConfigLoader {
+    bundle: CloudConfigBundleLoader,
+    // An embedder can supply a bootstrap loader owned by another auth manager.
+    // Keep it for startup, but do not use it for a later runtime identity.
+    supplied_at_startup: bool,
+}
+
 /// Shared app-server entry point for loading effective Codex configuration.
 #[derive(Clone)]
 pub struct ConfigManager {
@@ -108,7 +117,7 @@ pub struct ConfigManager {
     runtime_feature_enablement: Arc<RwLock<BTreeMap<String, bool>>>,
     loader_overrides: LoaderOverrides,
     strict_config: bool,
-    cloud_config_bundle: Arc<RwLock<CloudConfigBundleLoader>>,
+    cloud_config_bundle: Arc<RwLock<CloudConfigLoader>>,
     arg0_paths: Arg0DispatchPaths,
     thread_config_loader: Arc<RwLock<Arc<dyn ThreadConfigLoader>>>,
     load_cache: Arc<RwLock<ConfigLoadCache>>,
@@ -117,6 +126,7 @@ pub struct ConfigManager {
     // refreshes. Acquire before capturing any per-thread configuration.
     runtime_refresh_lock: Arc<tokio::sync::Mutex<()>>,
     remote_control_handle: Arc<RwLock<Option<RemoteControlHandle>>>,
+    requirements_sync_retry: Arc<Notify>,
 }
 
 impl ConfigManager {
@@ -135,13 +145,17 @@ impl ConfigManager {
             runtime_feature_enablement: Arc::new(RwLock::new(BTreeMap::new())),
             loader_overrides,
             strict_config,
-            cloud_config_bundle: Arc::new(RwLock::new(cloud_config_bundle)),
+            cloud_config_bundle: Arc::new(RwLock::new(CloudConfigLoader {
+                bundle: cloud_config_bundle,
+                supplied_at_startup: true,
+            })),
             arg0_paths,
             thread_config_loader: Arc::new(RwLock::new(thread_config_loader)),
             load_cache: Arc::new(RwLock::new(ConfigLoadCache::default())),
             load_generation: Arc::new(AtomicU64::new(0)),
             runtime_refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             remote_control_handle: Arc::new(RwLock::new(None)),
+            requirements_sync_retry: Arc::new(Notify::new()),
         }
     }
 
@@ -162,6 +176,10 @@ impl ConfigManager {
     }
 
     fn current_cloud_config_bundle(&self) -> CloudConfigBundleLoader {
+        self.current_cloud_config_loader().bundle
+    }
+
+    fn current_cloud_config_loader(&self) -> CloudConfigLoader {
         self.cloud_config_bundle
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -224,18 +242,16 @@ impl ConfigManager {
         chatgpt_base_url: String,
         http_client_factory: codex_http_client::HttpClientFactory,
     ) {
-        let loader = cloud_config_bundle_loader(
-            auth_manager,
-            chatgpt_base_url,
-            self.codex_home.clone(),
-            http_client_factory,
-        );
         let mut guard = self
             .cloud_config_bundle
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = std::mem::replace(&mut *guard, loader);
-        self.invalidate_load_cache_locked();
+        let previous = self.install_cloud_config_bundle_loader(
+            &mut guard,
+            auth_manager,
+            chatgpt_base_url,
+            http_client_factory,
+        );
         drop(guard);
         // Loader-owned values may have destructors; never run them while a
         // publication lock is held or before the new value invalidates the cache.
@@ -268,47 +284,65 @@ impl ConfigManager {
         )
     }
 
-    async fn sync_default_client_residency_requirement(&self) {
+    async fn sync_default_client_residency_requirement(&self) -> bool {
         let generation = self.policy_generation();
-        let policy_target = self
+        let policy_handle = self
             .remote_control_handle
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-            .and_then(|handle| handle.policy_auth_epoch().ok().map(|epoch| (handle, epoch)));
+            .clone();
+        let policy_target = match policy_handle {
+            Some(handle) => match handle.policy_auth_epoch() {
+                Ok(epoch) => Some((handle, epoch)),
+                Err(_) => return false,
+            },
+            None => None,
+        };
         match self.load_latest_config(/*fallback_cwd*/ None).await {
             Ok(config) => {
-                let _ = self.with_current_policy(generation, || {
-                    set_default_client_residency_requirement(config.enforce_residency.value());
-                });
+                if self
+                    .with_current_policy(generation, || {
+                        set_default_client_residency_requirement(config.enforce_residency.value());
+                    })
+                    .is_err()
+                {
+                    return false;
+                }
                 if let Some((handle, epoch)) = policy_target {
                     // update_policy owns its auth-epoch fence. Hold only the
                     // configuration publication fence here, avoiding recursive
                     // acquisition of the auth lock inside publish_if_current.
-                    let _policy = self.cloud_config_bundle.read()
+                    let _policy = self
+                        .cloud_config_bundle
+                        .read()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if self.policy_generation() == generation {
-                        let denied = config
-                            .config_layer_stack
-                            .requirements()
-                            .allow_remote_control
-                            .as_ref()
-                            .is_some_and(|requirement| !requirement.value);
-                        handle.update_policy(
-                            epoch,
-                            if denied {
-                                RemoteControlPolicy::DisabledByRequirements
-                            } else {
-                                RemoteControlPolicy::Allowed
-                            },
-                        );
+                    if self.policy_generation() != generation {
+                        return false;
                     }
+                    let denied = config
+                        .config_layer_stack
+                        .requirements()
+                        .allow_remote_control
+                        .as_ref()
+                        .is_some_and(|requirement| !requirement.value);
+                    return handle.update_policy(
+                        epoch,
+                        if denied {
+                            RemoteControlPolicy::DisabledByRequirements
+                        } else {
+                            RemoteControlPolicy::Allowed
+                        },
+                    );
                 }
+                true
             }
-            Err(err) => warn!(
-                error = %err,
-                "failed to sync default client residency requirement after auth refresh"
-            ),
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "failed to sync default client residency requirement after auth refresh"
+                );
+                false
+            }
         }
     }
 
@@ -339,32 +373,65 @@ impl ConfigManager {
         auth_manager: Arc<AuthManager>,
         chatgpt_base_url: String,
         http_client_factory: codex_http_client::HttpClientFactory,
+        startup_identity_changed: bool,
     ) -> bool {
-        if self.current_cloud_config_bundle().validate_current().is_ok() {
+        let needs_rebind = |loader: &CloudConfigLoader| {
+            if loader.supplied_at_startup {
+                startup_identity_changed
+            } else {
+                loader.bundle.validate_current().is_err()
+            }
+        };
+        if !needs_rebind(&self.current_cloud_config_loader()) {
             return false;
         }
         let mut guard = self
             .cloud_config_bundle
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if guard.validate_current().is_ok() {
+        if !needs_rebind(&guard) {
             return false;
         }
         // Built only once the replacement is certain: constructing a loader
         // spawns its first bundle fetch. Construction itself awaits nothing.
-        let loader = cloud_config_bundle_loader(
+        let previous = self.install_cloud_config_bundle_loader(
+            &mut guard,
             auth_manager,
             chatgpt_base_url,
-            self.codex_home.clone(),
             http_client_factory,
         );
-        let previous = std::mem::replace(&mut *guard, loader);
-        self.invalidate_load_cache_locked();
         drop(guard);
         // As in `replace_cloud_config_bundle_loader`: run loader destructors
         // only after the publication lock is released.
         drop(previous);
         true
+    }
+
+    // Cloud-config publication acquires the loader lock before the auth lock.
+    // Build and install the new loader in that same order, so an older loader
+    // cannot overwrite a newer one merely because it was delayed before locking.
+    fn install_cloud_config_bundle_loader(
+        &self,
+        slot: &mut CloudConfigLoader,
+        auth_manager: Arc<AuthManager>,
+        chatgpt_base_url: String,
+        http_client_factory: codex_http_client::HttpClientFactory,
+    ) -> CloudConfigLoader {
+        let bundle = cloud_config_bundle_loader(
+            auth_manager,
+            chatgpt_base_url,
+            self.codex_home.clone(),
+            http_client_factory,
+        );
+        let previous = std::mem::replace(
+            slot,
+            CloudConfigLoader {
+                bundle,
+                supplied_at_startup: false,
+            },
+        );
+        self.invalidate_load_cache_locked();
+        previous
     }
 
     pub(crate) fn with_current_policy<T>(
@@ -380,6 +447,7 @@ impl ConfigManager {
             return Err(std::io::Error::other(ConfigGenerationChanged));
         }
         loader
+            .bundle
             .publish_if_current(publish)
             .map_err(std::io::Error::other)
     }
@@ -395,7 +463,9 @@ impl ConfigManager {
             chatgpt_base_url,
             http_client_factory,
         );
-        self.sync_default_client_residency_requirement().await;
+        if !self.sync_default_client_residency_requirement().await {
+            self.requirements_sync_retry.notify_one();
+        }
     }
 
     /// Re-checks managed requirements whenever the current login completes a missing account
@@ -407,47 +477,56 @@ impl ConfigManager {
     /// (another process replaced the store, a policy denial or a persistent load failure logged
     /// out, or a failed load recovered): it retires the cloud-config loader, so this task also
     /// rebinds a retired loader and re-checks requirements for the identity that replaced it.
-    pub async fn recheck_requirements_after_identity_completion(
+    pub fn recheck_requirements_after_identity_completion(
         self,
         auth_manager: Arc<AuthManager>,
         chatgpt_base_url: String,
         http_client_factory: codex_http_client::HttpClientFactory,
         shutdown: tokio_util::sync::CancellationToken,
-    ) {
+    ) -> impl std::future::Future<Output = ()> + Send {
+        // Capture both before spawning, not on the first poll: the embedded
+        // processor may publish an auth change as soon as it starts.
         let mut auth_changes = auth_manager.auth_change_receiver();
-        let mut retry_delay = Duration::from_secs(1);
-        loop {
-            if self.rebind_retired_cloud_config_bundle_loader(
-                Arc::clone(&auth_manager),
-                chatgpt_base_url.clone(),
-                http_client_factory.clone(),
-            ) {
+        let startup_epoch = auth_manager
+            .with_policy_identity(|identity| identity.current_epoch)
+            .ok();
+        async move {
+            let mut retry_delay = Duration::from_secs(1);
+            let mut requirements_sync_pending = false;
+            while !shutdown.is_cancelled() {
+                let startup_identity_changed = auth_manager
+                    .with_policy_identity(|identity| identity.current_epoch)
+                    .is_ok_and(|epoch| Some(epoch) != startup_epoch);
+                requirements_sync_pending |= self.rebind_retired_cloud_config_bundle_loader(
+                    Arc::clone(&auth_manager),
+                    chatgpt_base_url.clone(),
+                    http_client_factory.clone(),
+                    startup_identity_changed,
+                );
+                if requirements_sync_pending || self.remote_control_policy_recheck_pending() {
+                    requirements_sync_pending = !tokio::select! {
+                        biased;
+                        () = shutdown.cancelled() => return,
+                        published = self.sync_default_client_residency_requirement() => published,
+                    };
+                }
+                let pending =
+                    requirements_sync_pending || self.remote_control_policy_recheck_pending();
+                if !pending {
+                    retry_delay = Duration::from_secs(1);
+                }
                 tokio::select! {
                     () = shutdown.cancelled() => return,
-                    () = self.sync_default_client_residency_requirement() => {}
-                }
-            } else if self.remote_control_policy_recheck_pending() {
-                tokio::select! {
-                    () = shutdown.cancelled() => return,
-                    () = self.complete_auth_transition(
-                        Arc::clone(&auth_manager),
-                        chatgpt_base_url.clone(),
-                        http_client_factory.clone(),
-                    ) => {}
-                }
-            }
-            let pending = self.remote_control_policy_recheck_pending();
-            if !pending {
-                retry_delay = Duration::from_secs(1);
-            }
-            tokio::select! {
-                () = shutdown.cancelled() => return,
-                () = tokio::time::sleep(retry_delay), if pending => {
-                    retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
-                }
-                changed = auth_changes.changed() => {
-                    if changed.is_err() {
-                        return;
+                    () = self.requirements_sync_retry.notified() => {
+                        requirements_sync_pending = true;
+                    }
+                    () = tokio::time::sleep(retry_delay), if pending => {
+                        retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
+                    }
+                    changed = auth_changes.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
                     }
                 }
             }

@@ -142,6 +142,30 @@ impl ToolEffectRecovery {
 pub(crate) struct ToolDispatchState {
     state: AtomicU8,
     handler_started: AtomicBool,
+    settlement: OnceLock<ToolDispatchSettlement>,
+}
+
+/// Registry-owned evidence for one dispatch. Displayed tool results may carry
+/// a copy of this advice, but cannot publish or replace it.
+#[derive(Debug)]
+pub(crate) struct ToolDispatchSettlement {
+    operation_history: JsonValue,
+    failure: Option<codex_protocol::tool_failure::ToolFailure>,
+    returned_error: bool,
+}
+
+impl ToolDispatchSettlement {
+    pub(crate) fn operation_history(&self, call_id: &str) -> Option<&JsonValue> {
+        let instance = self
+            .operation_history
+            .pointer("/instance/call_id")
+            .and_then(JsonValue::as_str);
+        (instance == Some(call_id)).then_some(&self.operation_history)
+    }
+
+    pub(crate) fn failure(&self) -> Option<&codex_protocol::tool_failure::ToolFailure> {
+        self.failure.as_ref()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -167,7 +191,38 @@ impl ToolDispatchState {
         Self {
             state: AtomicU8::new(ToolDispatchPhase::WaitingForAdmission as u8),
             handler_started: AtomicBool::new(false),
+            settlement: OnceLock::new(),
         }
+    }
+
+    pub(crate) fn record_settlement(
+        &self,
+        operation_history: JsonValue,
+        failure: Option<codex_protocol::tool_failure::ToolFailure>,
+        returned_error: bool,
+    ) {
+        let inserted = self.settlement.set(ToolDispatchSettlement {
+            operation_history,
+            failure,
+            returned_error,
+        });
+        debug_assert!(inserted.is_ok(), "dispatch settled more than once");
+    }
+
+    pub(crate) fn result_settlement(&self) -> Option<&ToolDispatchSettlement> {
+        self.settlement(false)
+    }
+
+    pub(crate) fn error_settlement(&self) -> Option<&ToolDispatchSettlement> {
+        self.settlement(true)
+    }
+
+    fn settlement(&self, returned_error: bool) -> Option<&ToolDispatchSettlement> {
+        // The cancellation supervisor can deliver a different result, even if
+        // its cleanup retained the original registry outcome.
+        self.settlement
+            .get()
+            .filter(|settlement| !self.is_aborted() && settlement.returned_error == returned_error)
     }
 
     pub(crate) fn try_admit(&self) -> bool {
@@ -1492,7 +1547,10 @@ impl ToolOutput for AbortedToolOutput {
     }
 
     fn sampling_request_signal(&self) -> Option<JsonValue> {
-        Some(serde_json::json!({ "outcome": "recoverable_cancellation" }))
+        Some(serde_json::json!({
+            "outcome": "recoverable_cancellation",
+            "tool_failure": self.failure(),
+        }))
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {

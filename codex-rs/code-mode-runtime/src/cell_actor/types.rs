@@ -133,8 +133,8 @@ impl CellHandle {
         })
     }
 
-    pub(crate) fn terminate(&self) -> CellEventFuture {
-        let event = self.state.request_termination();
+    pub(crate) fn terminate(&self, cause: CancellationCause) -> CellEventFuture {
+        let event = self.state.request_termination(cause);
         let state = Arc::clone(&self.state);
         Box::pin(async move {
             let event = event.await?;
@@ -231,7 +231,7 @@ impl CellState {
         accepting_phase && !self.cancellation_token.is_cancelled()
     }
 
-    pub(crate) fn request_termination(&self) -> CellEventFuture {
+    pub(crate) fn request_termination(&self, cause: CancellationCause) -> CellEventFuture {
         let mut phase = self
             .phase
             .lock()
@@ -240,7 +240,9 @@ impl CellState {
             CellPhase::Running => {
                 let (response_tx, response_rx) = oneshot::channel();
                 *phase = CellPhase::Terminating { response_tx };
-                self.tool_cancellation.cancel_with(CancellationCause::RuntimeShutdown);
+                // Record the winning origin before waking callbacks. An earlier
+                // call-local deadline remains authoritative in its child token.
+                self.tool_cancellation.cancel_with(cause);
                 response_event(response_rx)
             }
             CellPhase::Terminating { response_tx } => {

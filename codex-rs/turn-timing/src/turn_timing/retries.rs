@@ -141,13 +141,16 @@ impl RetryDecisionLedger {
         self.pending.is_some()
     }
 
-    /// A pending decision that may belong to `generation_index`; an unscoped
-    /// decision may belong to any generation.
-    pub fn has_pending_for(&self, generation_index: u32) -> bool {
-        self.pending.as_ref().is_some_and(|decision| {
-            decision.generation_index.is_none()
-                || decision.generation_index == Some(generation_index)
-        })
+    /// Close only the abandoned generation's plan, preserving its original
+    /// relation. An unscoped startup plan is still eligible for the next dispatch.
+    pub fn finish_undispatched_generation(&mut self, now_ns: u128, generation_index: u32) {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|decision| decision.generation_index == Some(generation_index))
+        {
+            self.finish(now_ns, None);
+        }
     }
 
     pub fn is_fallback_for(&self, generation_index: Option<u32>) -> bool {
@@ -230,13 +233,22 @@ impl RetryDecisionLedger {
     }
 
     pub fn measurement_snapshot(&self, origin_ns: Option<u128>) -> serde_json::Value {
-        let rows = self.history.iter().chain(self.pending.iter()).filter_map(|decision| {
-            let origin = origin_ns?;
-            let mut row = serde_json::to_value(decision).ok()?;
-            row["start_time"] = serde_json::json!(decision.started_ns.checked_sub(origin)? as f64 / 1e9);
-            row["end_time"] = serde_json::json!(decision.ended_ns.and_then(|end| end.checked_sub(origin)).map(|end| end as f64 / 1e9));
-            Some(row)
-        }).collect::<Vec<_>>();
+        let rows = self
+            .history
+            .iter()
+            .chain(self.pending.iter())
+            .filter_map(|decision| {
+                let origin = origin_ns?;
+                let mut row = serde_json::to_value(decision).ok()?;
+                // Startup prewarm can plan a retry before the turn that executes it.
+                // Keep its original bounds; clip only the turn-local projection.
+                let turn_time = |ns: u128| ns.saturating_sub(origin) as f64 / 1e9;
+                row["starts_before_turn"] = serde_json::json!(decision.started_ns < origin);
+                row["start_time"] = serde_json::json!(turn_time(decision.started_ns));
+                row["end_time"] = serde_json::json!(decision.ended_ns.map(turn_time));
+                Some(row)
+            })
+            .collect::<Vec<_>>();
         serde_json::json!({"actualCount":self.actual_decisions, "dropped":self.dropped_decisions,
             "complete":self.dropped_decisions == 0 && rows.len() as u64 == self.actual_decisions, "rows":rows})
     }

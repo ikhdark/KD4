@@ -27,6 +27,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use tracing::warn;
 
 /// Core-facing handle to the SQLite-backed state runtime.
@@ -519,14 +520,119 @@ pub async fn reconcile_rollout(
         )
         .await;
     }
+    reconcile_rollout_from_file(
+        ctx,
+        rollout_path,
+        default_provider,
+        archived_only,
+        /*populate_cache*/ false,
+        &mut None,
+    )
+    .await
+}
+
+/// Numeric, opt-in detail for one search reconciliation. The caller supplies
+/// the authoritative thread ID from its existing rollout identity check.
+pub struct SearchReconciliationObservation {
+    started: Instant,
+    phase_started: Instant,
+    phases_us: [u64; 6],
+    step: usize,
+    cache_hit: bool,
+    metadata_id: Option<ThreadId>,
+    elapsed_us: u64,
+}
+
+impl SearchReconciliationObservation {
+    fn new() -> Self {
+        let started = Instant::now();
+        Self {
+            started,
+            phase_started: started,
+            phases_us: [0; 6],
+            step: 1,
+            cache_hit: false,
+            metadata_id: None,
+            elapsed_us: 0,
+        }
+    }
+
+    fn end_phase(&mut self) {
+        let now = Instant::now();
+        if let Some(phase) = self.phases_us.get_mut(self.step - 1) {
+            *phase = now.duration_since(self.phase_started).as_micros() as u64;
+        }
+        self.phase_started = now;
+        self.elapsed_us = now.duration_since(self.started).as_micros() as u64;
+    }
+
+    fn advance(observation: &mut Option<Self>) {
+        if let Some(observation) = observation {
+            observation.end_phase();
+            observation.step += 1;
+        }
+    }
+
+    pub fn emit(self, success: bool, thread_id: Option<ThreadId>) {
+        let [authority_us, extraction_us, projection_us, state_reconcile_us,
+            location_repair_us, parent_edge_us] = self.phases_us;
+        let thread_id = thread_id
+            .filter(|id| self.metadata_id == Some(*id))
+            .map(tracing::field::display);
+        tracing::trace!(target: "codex_storage_search_phases",
+            stage = "rollout_reconcile", success, thread_id,
+            reconcile_step = self.step as u64, cache_hit = self.cache_hit,
+            authority_us, extraction_us, projection_us, state_reconcile_us,
+            location_repair_us, parent_edge_us, elapsed_us = self.elapsed_us);
+    }
+}
+
+pub async fn reconcile_search_rollout(
+    ctx: &codex_state::StateRuntime,
+    rollout_path: &Path,
+    default_provider: &str,
+    archived: bool,
+    observe: bool,
+) -> (bool, Option<SearchReconciliationObservation>) {
+    let mut observation = observe.then(SearchReconciliationObservation::new);
+    let succeeded = reconcile_rollout_from_file(
+        ctx,
+        rollout_path,
+        default_provider,
+        Some(archived),
+        /*populate_cache*/ true,
+        &mut observation,
+    )
+    .await;
+    if let Some(observation) = observation.as_mut() {
+        observation.end_phase();
+    }
+    (succeeded, observation)
+}
+
+async fn reconcile_rollout_from_file(
+    ctx: &codex_state::StateRuntime,
+    rollout_path: &Path,
+    default_provider: &str,
+    archived_only: Option<bool>,
+    populate_cache: bool,
+    observation: &mut Option<SearchReconciliationObservation>,
+) -> bool {
     let (Ok(expected), Ok(source_version)) = (
         metadata::expected_thread_metadata_for_rollout(ctx, rollout_path).await,
         metadata::rollout_source_version(rollout_path).await,
     ) else {
         return false;
     };
-    let outcome =
-        match metadata::extract_metadata_from_rollout(rollout_path, default_provider).await {
+    SearchReconciliationObservation::advance(observation);
+    let (outcome, cache_hit) =
+        match metadata::extract_metadata_from_rollout_with_cache_status(
+            rollout_path,
+            default_provider,
+            populate_cache,
+        )
+        .await
+        {
             Ok(outcome) => outcome,
             Err(err) => {
                 warn!(
@@ -536,6 +642,11 @@ pub async fn reconcile_rollout(
                 return false;
             }
         };
+    if let Some(observation) = observation.as_mut() {
+        observation.cache_hit = cache_hit;
+        observation.metadata_id = Some(outcome.metadata.id);
+    }
+    SearchReconciliationObservation::advance(observation);
     let parent_thread_id = outcome.parent_thread_id;
     let mut metadata = outcome.metadata;
     metadata.cwd = normalize_cwd_for_state_db(&metadata.cwd);
@@ -552,6 +663,7 @@ pub async fn reconcile_rollout(
         }
         Some(true) | None => {}
     }
+    SearchReconciliationObservation::advance(observation);
     if let Err(err) = ctx
         .reconcile_thread_metadata(&metadata, expected.as_ref(), &source_version)
         .await
@@ -562,6 +674,7 @@ pub async fn reconcile_rollout(
         );
         return false;
     }
+    SearchReconciliationObservation::advance(observation);
     if let Err(error) = ctx
         .patch_existing_thread_metadata(metadata.id, |current| {
             if !rollout_path.exists() && !rollout_path.with_extension("jsonl.zst").exists() {
@@ -581,6 +694,7 @@ pub async fn reconcile_rollout(
         warn!(%error, "rollout location reconciliation remains pending");
         return false;
     }
+    SearchReconciliationObservation::advance(observation);
     if let Some(parent_thread_id) = parent_thread_id
         && let Err(err) = ctx
             .infer_thread_spawn_edge_if_absent(parent_thread_id, metadata.id)
@@ -592,6 +706,7 @@ pub async fn reconcile_rollout(
         );
         return false;
     }
+    SearchReconciliationObservation::advance(observation);
     true
 }
 

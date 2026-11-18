@@ -228,6 +228,8 @@ fn prepare_connection(
     );
     let state = if matches!(origin, ConnectionOrigin::Stdio) {
         state.with_stdio_delivery()
+    } else if matches!(origin, ConnectionOrigin::RemoteControl) {
+        state.with_remote_preview()
     } else {
         state
     };

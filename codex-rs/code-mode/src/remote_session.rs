@@ -8,6 +8,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use codex_code_mode_protocol::CancellationCause;
 use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::CodeModeSession;
 use codex_code_mode_protocol::CodeModeSessionDelegate;
@@ -454,6 +455,14 @@ impl ProcessOwnedCodeModeSession {
     }
 
     pub async fn terminate(&self, cell_id: CellId) -> Result<WaitOutcome, String> {
+        self.terminate_with_interrupt_cause(cell_id, None).await
+    }
+
+    async fn terminate_with_interrupt_cause(
+        &self,
+        cell_id: CellId,
+        interrupt_cause: Option<CancellationCause>,
+    ) -> Result<WaitOutcome, String> {
         let binding = self.connection().await?;
         let key = (binding.remote.generation, cell_id.clone());
         let inner = Arc::clone(&self.inner);
@@ -462,7 +471,10 @@ impl ProcessOwnedCodeModeSession {
         // caller's own bound. Keep it in session custody until that deadline
         // settles it; a caller that stops waiting only stops observing.
         tokio::spawn(async move {
-            let result = binding.connection.terminate(binding.remote, cell_id).await;
+            let result = binding
+                .connection
+                .terminate(binding.remote, cell_id, interrupt_cause)
+                .await;
             if result.is_ok() {
                 inner
                     .pending_waits
@@ -833,6 +845,16 @@ impl CodeModeSession for ProcessOwnedCodeModeSession {
 
     fn terminate<'a>(&'a self, cell_id: CellId) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
         Box::pin(ProcessOwnedCodeModeSession::terminate(self, cell_id))
+    }
+
+    fn terminate_with_interrupt_cause(
+        &self,
+        cell_id: CellId,
+        interrupt_cause: Option<CancellationCause>,
+    ) -> CodeModeSessionResultFuture<'_, WaitOutcome> {
+        Box::pin(ProcessOwnedCodeModeSession::terminate_with_interrupt_cause(
+            self, cell_id, interrupt_cause,
+        ))
     }
 
     fn shutdown<'a>(&'a self) -> CodeModeSessionResultFuture<'a, ()> {

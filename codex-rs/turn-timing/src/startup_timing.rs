@@ -31,6 +31,26 @@ impl StartupPhaseLog {
         );
         self.last = now;
     }
+
+    /// Times one branch of a parallel join without moving the sequential mark.
+    pub async fn observe_branch<F: std::future::Future>(
+        &self,
+        branch: &'static str,
+        future: F,
+    ) -> F::Output {
+        let started = tracing::enabled!(target: "codex_startup_phase", tracing::Level::DEBUG)
+            .then(Instant::now);
+        let result = future.await;
+        if let Some(started) = started {
+            tracing::debug!(
+                target: "codex_startup_phase",
+                scope = self.scope,
+                branch,
+                elapsed_us = started.elapsed().as_micros() as u64,
+            );
+        }
+        result
+    }
 }
 const MAX_STARTUP_LIFECYCLE_EVENTS: u32 = 128;
 

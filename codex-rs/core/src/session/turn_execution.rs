@@ -28,6 +28,7 @@ use sha2::Digest;
 use sha2::Sha256;
 
 use crate::tool_history::SourceDependencyV1;
+use crate::tools::context::ToolDispatchSettlement;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::turn_timing::TurnTimingState;
 use crate::validation::ValidationClassification;
@@ -262,7 +263,7 @@ impl SamplingToolOutcome {
             source_artifact_id: signal
                 .and_then(|signal| signal["source_artifact_id"].as_str())
                 .map(str::to_string),
-            failure_fingerprint: sampling_failure_fingerprint(signal),
+            failure_fingerprint: None,
             failure_recovery: signal.and_then(failure_recovery_from_value),
             failure_is_terminal: sampling_failure_is_terminal(signal),
             failure_diagnosis_reused: false,
@@ -621,6 +622,7 @@ pub(crate) struct CodeModeToolResult<'a> {
     pub(crate) outcome_context: ToolOutputOutcomeContext,
     pub(crate) signal: Option<&'a Value>,
     pub(crate) result: &'a Value,
+    pub(crate) settlement: Option<&'a ToolDispatchSettlement>,
     pub(crate) canonical_artifact_required: bool,
 }
 
@@ -1024,6 +1026,7 @@ impl SamplingRequestSignalCollector {
             outcome_context,
             signal,
             result,
+            settlement,
             canonical_artifact_required,
         } = result;
         let ordinal = self.next_ordinal.fetch_add(1, Ordering::Relaxed);
@@ -1034,22 +1037,17 @@ impl SamplingRequestSignalCollector {
             structured_action_identity_from_canonical(tool_name, payload, &canonical);
         if outcome.is_failure_evidence() {
             outcome.validation_failure_excerpt = validation_failure_excerpt(result);
-            outcome.failure_recovery = failure_recovery_from_value(result);
-            let envelope = failure_envelope_for_call(result, call_id);
-            let own = outcome.failure_fingerprint.take().unwrap_or_else(|| {
-                code_mode_result_failure_fingerprint(
-                    envelope.unwrap_or(&Value::Null),
-                    call_id.unwrap_or(cell_id),
-                    ordinal,
-                )
+            outcome.failure_recovery = dispatch_failure_value(settlement, None).or(outcome.failure_recovery);
+            let own = dispatch_failure_fingerprint(settlement, call_id).unwrap_or_else(|| {
+                format!("code_mode.unclassified_instance.{}.{ordinal}", call_id.unwrap_or(cell_id))
             });
             let content = outcome
                 .source_evidence
                 .clone()
-                .unwrap_or_else(|| failure_content_without_history(result));
+                .unwrap_or_else(|| result.clone());
             let (fingerprint, repeated) = self.settle_failure_identity(
                 call_id,
-                envelope,
+                settlement,
                 own,
                 structured_action.as_ref().map(|action| (action, &content)),
             );
@@ -1163,8 +1161,9 @@ impl SamplingRequestSignalCollector {
         tool_name: &ToolName,
         payload: Option<&ToolPayload>,
         source_dependencies: Option<BTreeSet<SourceDependencyV1>>,
-        failure_fingerprint: String,
+        settlement: Option<&ToolDispatchSettlement>,
         failure_message: &str,
+        failure: Option<&codex_protocol::tool_failure::ToolFailure>,
     ) {
         let ordinal = self.next_ordinal.fetch_add(1, Ordering::Relaxed);
         let mut outcome =
@@ -1175,19 +1174,18 @@ impl SamplingRequestSignalCollector {
             .and_then(|(payload, canonical)| {
                 structured_action_identity_from_canonical(tool_name, payload, canonical)
             });
-        let envelope = failure_envelope_from_text(failure_message);
-        let envelope = envelope
-            .as_ref()
-            .and_then(|envelope| failure_envelope_for_call(envelope, Some(call_id)));
-        let content = text_failure_content(failure_message, envelope, call_id);
+        let failure_fingerprint = dispatch_failure_fingerprint(settlement, Some(call_id))
+            .unwrap_or_else(|| format!("code_mode.unclassified_instance.{call_id}"));
+        let owner_failure = dispatch_failure_value(settlement, failure);
+        let content = owner_failure.clone().unwrap_or_else(|| Value::String(failure_message.to_string()));
         let (failure_fingerprint, repeated) = self.settle_failure_identity(
             Some(call_id),
-            envelope,
+            settlement,
             failure_fingerprint,
             structured_action.as_ref().map(|action| (action, &content)),
         );
         outcome.failure_fingerprint = Some(failure_fingerprint);
-        outcome.failure_recovery = Some(failure_recovery_from_text(failure_message));
+        outcome.failure_recovery = Some(owner_failure.unwrap_or_else(|| unstructured_failure_recovery(failure_message)));
         outcome.failure_repeats_unchanged_attempt = repeated;
         outcome.nested_in_code_mode = true;
         outcome.code_mode_cell_id = Some(cell_id.to_string());
@@ -1314,17 +1312,18 @@ impl SamplingRequestSignalCollector {
     /// the predecessor it repeats. A failure without an owner signature also
     /// repeats an earlier one with the same action and failure content against
     /// the same observed request state (`failure`: action and content). Every
-    /// other failure keeps `own`. `envelope` must already be bound to `call_id`.
+    /// other failure keeps `own`. Only the registry's settlement can supply
+    /// attempt history; producer content is compared as diagnostic data.
     fn settle_failure_identity(
         &self,
         call_id: Option<&str>,
-        envelope: Option<&Value>,
+        settlement: Option<&ToolDispatchSettlement>,
         own: String,
         failure: Option<(&StructuredActionIdentity, &Value)>,
     ) -> (String, bool) {
         let previous = call_id
-            .zip(envelope)
-            .and_then(|(call_id, envelope)| unchanged_failure_repeat_of(envelope, call_id));
+            .zip(settlement)
+            .and_then(|(call_id, settlement)| unchanged_failure_repeat_of(settlement, call_id));
         let content_key = failure
             .filter(|_| is_unclassified_failure_instance(&own))
             .and_then(|(action, content)| {
@@ -1377,8 +1376,8 @@ impl SamplingRequestSignalCollector {
     }
 
     /// Request ordinals restart at zero, so they alone do not identify an instance.
-    fn direct_failure_instance(&self, envelope: Option<&Value>, ordinal: u64) -> String {
-        match envelope.and_then(failure_history_call_id) {
+    fn direct_failure_instance(&self, call_id: Option<&str>, ordinal: u64) -> String {
+        match call_id {
             Some(call_id) => format!("direct_tool.unclassified_instance.{call_id}"),
             None => format!(
                 "direct_tool.unclassified_instance.{}.{ordinal}",
@@ -1387,29 +1386,30 @@ impl SamplingRequestSignalCollector {
         }
     }
 
-    pub(crate) fn record_failure(&self, ordinal: u64, failure: &str, failure_is_terminal: bool) {
+    pub(crate) fn record_failure(
+        &self,
+        ordinal: u64,
+        failure: &str,
+        failure_is_terminal: bool,
+        settlement: Option<&ToolDispatchSettlement>,
+        owner_failure: Option<&codex_protocol::tool_failure::ToolFailure>,
+    ) {
         let mut outcome =
             SamplingToolOutcome::plain(ordinal, SamplingToolOutcomeKind::Failure, None);
         let (call_id, action) = self.registered_call(ordinal);
-        let envelope = failure_envelope_from_text(failure);
-        let envelope = envelope
-            .as_ref()
-            .and_then(|envelope| failure_envelope_for_call(envelope, call_id.as_deref()));
-        let own = envelope
-            .and_then(value_failure_signature)
-            .unwrap_or_else(|| self.direct_failure_instance(envelope, ordinal));
-        let content = call_id
-            .as_deref()
-            .map(|call_id| text_failure_content(failure, envelope, call_id));
+        let own = dispatch_failure_fingerprint(settlement, call_id.as_deref())
+            .unwrap_or_else(|| self.direct_failure_instance(call_id.as_deref(), ordinal));
+        let owner_failure = dispatch_failure_value(settlement, owner_failure);
+        let content = owner_failure.clone().unwrap_or_else(|| Value::String(failure.to_string()));
         let (fingerprint, repeated) = self.settle_failure_identity(
             call_id.as_deref(),
-            envelope,
+            settlement,
             own,
-            action.as_ref().zip(content.as_ref()),
+            action.as_ref().map(|action| (action, &content)),
         );
         outcome.failure_fingerprint = Some(fingerprint);
         outcome.failure_is_terminal = failure_is_terminal;
-        outcome.failure_recovery = Some(failure_recovery_from_text(failure));
+        outcome.failure_recovery = Some(owner_failure.unwrap_or_else(|| unstructured_failure_recovery(failure)));
         outcome.failure_repeats_unchanged_attempt = repeated;
         let mut state = self
             .state
@@ -1436,6 +1436,7 @@ impl SamplingRequestSignalCollector {
         signal: Option<Value>,
         response: &ResponseInputItem,
         canonical_artifact_required: bool,
+        settlement: Option<&ToolDispatchSettlement>,
     ) {
         if signal.as_ref().is_some_and(|signal| signal["validation_policy_refusal"] == true) {
             // Policy denial did not execute. It is neither a failed check nor
@@ -1459,26 +1460,19 @@ impl SamplingRequestSignalCollector {
                 .ok()
                 .and_then(|value| validation_failure_excerpt(&value))
                 .or_else(|| Some(bounded_validation_detail(&text)));
-            outcome.failure_recovery = Some(failure_recovery_from_text(&text));
+            outcome.failure_recovery = dispatch_failure_value(settlement, None)
+                .or(outcome.failure_recovery)
+                .or_else(|| Some(unstructured_failure_recovery(&text)));
         }
         if outcome.is_failure_evidence() {
-            // Owner JSON carries its history inline; other text results carry
-            // the registry's appended settlement notice.
             let call_id = response_call_id(response);
-            let envelope = response_failure_envelope(response);
-            let envelope = envelope
-                .as_ref()
-                .and_then(|envelope| failure_envelope_for_call(envelope, call_id));
-            let own = outcome.failure_fingerprint.take()
-                .or_else(|| envelope.and_then(value_failure_signature))
-                .unwrap_or_else(|| self.direct_failure_instance(envelope, ordinal));
-            let content = outcome.source_evidence.clone().or_else(|| {
-                call_id.and_then(|call_id| response_failure_content(response, call_id))
-            });
+            let own = dispatch_failure_fingerprint(settlement, call_id)
+                .unwrap_or_else(|| self.direct_failure_instance(call_id, ordinal));
+            let content = outcome.source_evidence.clone().or_else(|| response_failure_content(response));
             let action = self.registered_call(ordinal).1;
             let (fingerprint, repeated) = self.settle_failure_identity(
                 call_id,
-                envelope,
+                settlement,
                 own,
                 action.as_ref().zip(content.as_ref()),
             );
@@ -1993,10 +1987,6 @@ fn sampling_source_evidence(signal: Option<&Value>) -> Option<Value> {
         .cloned()
 }
 
-fn sampling_failure_fingerprint(signal: Option<&Value>) -> Option<String> {
-    signal.and_then(value_failure_signature)
-}
-
 fn sampling_failure_is_terminal(signal: Option<&Value>) -> bool {
     signal.is_some_and(value_failure_is_terminal)
 }
@@ -2011,14 +2001,12 @@ fn failure_recovery_from_value(value: &Value) -> Option<Value> {
     serde_json::to_value(failure).ok()
 }
 
-fn failure_recovery_from_text(text: &str) -> Value {
-    serde_json::from_str::<Value>(text).ok()
-        .and_then(|value| failure_recovery_from_value(&value))
-        .unwrap_or_else(|| serde_json::json!({
-            "blocker": bounded_validation_detail(text),
-            "supported_alternative": null,
-            "recovery_evidence": "owner supplied no structured recovery; inspect the retained diagnostic",
-        }))
+fn unstructured_failure_recovery(text: &str) -> Value {
+    serde_json::json!({
+        "blocker": bounded_validation_detail(text),
+        "supported_alternative": null,
+        "recovery_evidence": "owner supplied no structured recovery; inspect the retained diagnostic",
+    })
 }
 
 struct CanonicalToolAction {
@@ -2254,50 +2242,23 @@ fn value_failure_is_terminal(value: &Value) -> bool {
             == Some(false)
 }
 
-fn value_failure_signature(value: &Value) -> Option<String> {
-    value.pointer("/operation_history/instance/fingerprint")
-        .or_else(|| value.pointer("/tool_failure/details/operation_history/instance/fingerprint"))
+fn dispatch_failure_fingerprint(
+    settlement: Option<&ToolDispatchSettlement>,
+    call_id: Option<&str>,
+) -> Option<String> {
+    settlement?
+        .operation_history(call_id?)?
+        .pointer("/instance/fingerprint")
         .and_then(Value::as_str)
         .filter(|fingerprint| !fingerprint.is_empty())
         .map(str::to_owned)
 }
 
-/// The registry's settled attempt history: a thrown failure carries it in its
-/// typed failure details, a settled result with a failed outcome at top level.
-fn failure_operation_history(envelope: &Value) -> Option<&Value> {
-    envelope
-        .pointer("/tool_failure/details/operation_history")
-        .or_else(|| envelope.get("operation_history"))
-        .filter(|history| history.is_object())
-}
-
-fn failure_history_call_id(envelope: &Value) -> Option<&str> {
-    failure_operation_history(envelope)?
-        .pointer("/instance/call_id")
-        .and_then(Value::as_str)
-        .filter(|call_id| !call_id.is_empty())
-}
-
-/// Attempt history describes only the call it was settled for. History found
-/// in tool-controlled content (a JSON body, a printed nested result) that
-/// names another call, or any history when the call is unknown, is not host
-/// metadata for this failure.
-fn failure_envelope_for_call<'a>(envelope: &'a Value, call_id: Option<&str>) -> Option<&'a Value> {
-    if failure_operation_history(envelope).is_none()
-        || call_id.is_some_and(|call_id| failure_history_call_id(envelope) == Some(call_id))
-    {
-        Some(envelope)
-    } else {
-        None
-    }
-}
-
-/// The registry's appended settlement notice for exactly this call.
-fn settlement_notice_for_call(notice: &str, call_id: &str) -> bool {
-    serde_json::from_str::<Value>(notice).is_ok_and(|notice| {
-        notice.get("operation_history").is_some()
-            && failure_history_call_id(&notice) == Some(call_id)
-    })
+fn dispatch_failure_value(
+    settlement: Option<&ToolDispatchSettlement>,
+    typed_fallback: Option<&codex_protocol::tool_failure::ToolFailure>,
+) -> Option<Value> {
+    serde_json::to_value(settlement.and_then(ToolDispatchSettlement::failure).or(typed_fallback)?).ok()
 }
 
 /// Fallback identities given to failures without an owner failure signature
@@ -2312,39 +2273,6 @@ fn is_unclassified_failure_instance(fingerprint: &str) -> bool {
     .any(|prefix| fingerprint.starts_with(prefix))
 }
 
-/// A failure's own content, without the host's per-attempt history.
-fn failure_content_without_history(value: &Value) -> Value {
-    let mut value = value.clone();
-    if let Some(object) = value.as_object_mut() {
-        object.remove("operation_history");
-        if let Some(details) = object
-            .get_mut("tool_failure")
-            .and_then(|failure| failure.get_mut("details"))
-            .and_then(Value::as_object_mut)
-        {
-            details.remove("operation_history");
-        }
-    }
-    value
-}
-
-/// Failure text without this call's settlement notice; owner JSON (whole or
-/// after a carrier prefix) without its history.
-fn text_failure_content(text: &str, envelope: Option<&Value>, call_id: &str) -> Value {
-    if let Some((body, notice)) = text.rsplit_once("\n\nHost settlement: ")
-        && settlement_notice_for_call(notice, call_id)
-    {
-        return Value::String(body.to_string());
-    }
-    match (envelope, text.find('{')) {
-        (Some(envelope), Some(start)) => serde_json::json!([
-            &text[..start],
-            failure_content_without_history(envelope),
-        ]),
-        _ => Value::String(text.to_string()),
-    }
-}
-
 fn response_call_id(response: &ResponseInputItem) -> Option<&str> {
     match response {
         ResponseInputItem::FunctionCallOutput { call_id, .. }
@@ -2355,40 +2283,23 @@ fn response_call_id(response: &ResponseInputItem) -> Option<&str> {
     }
 }
 
-/// A failed result's own content, without this call's settlement notice or
-/// inline history, which differ on every attempt.
-fn response_failure_content(response: &ResponseInputItem, call_id: &str) -> Option<Value> {
+/// Compare producer content as data, before the registry adds display advice.
+fn response_failure_content(response: &ResponseInputItem) -> Option<Value> {
     match response {
         ResponseInputItem::FunctionCallOutput { output, .. }
         | ResponseInputItem::CustomToolCallOutput { output, .. } => match &output.body {
-            codex_protocol::models::FunctionCallOutputBody::Text(text) => {
-                Some(match serde_json::from_str::<Value>(text) {
-                    Ok(value) if value.is_object() => failure_content_without_history(&value),
-                    _ => text_failure_content(text, None, call_id),
-                })
-            }
+            codex_protocol::models::FunctionCallOutputBody::Text(text) => Some(
+                serde_json::from_str::<Value>(text)
+                    .ok()
+                    .filter(Value::is_object)
+                    .unwrap_or_else(|| Value::String(text.clone())),
+            ),
             codex_protocol::models::FunctionCallOutputBody::ContentItems(items) => {
-                let items = items
-                    .iter()
-                    .filter(|item| !matches!(item,
-                        codex_protocol::models::FunctionCallOutputContentItem::InputText { text }
-                            if settlement_notice_for_call(text, call_id)))
-                    .collect::<Vec<_>>();
                 serde_json::to_value(items).ok()
             }
         },
         ResponseInputItem::McpToolCallOutput { output, .. } => {
-            let content = output
-                .content
-                .iter()
-                .filter(|item| {
-                    !item
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .is_some_and(|text| settlement_notice_for_call(text, call_id))
-                })
-                .collect::<Vec<_>>();
-            serde_json::to_value((content, &output.structured_content, &output.is_error)).ok()
+            serde_json::to_value((&output.content, &output.structured_content, &output.is_error)).ok()
         }
         ResponseInputItem::ToolSearchOutput { .. } | ResponseInputItem::Message { .. } => None,
     }
@@ -2403,16 +2314,16 @@ fn response_failure_content(response: &ResponseInputItem, call_id: &str) -> Opti
 /// so it cannot prove them; the caller compares their content instead.
 /// Similar diagnostics never qualify, and the history's coarse-failure
 /// fingerprint policy is unchanged.
-pub(crate) fn unchanged_failure_repeat_of<'a>(envelope: &'a Value, call_id: &str) -> Option<&'a str> {
-    let history = failure_operation_history(envelope)?;
+fn unchanged_failure_repeat_of<'a>(
+    settlement: &'a ToolDispatchSettlement,
+    call_id: &str,
+) -> Option<&'a str> {
+    let history = settlement.operation_history(call_id)?;
     let instance = history.get("instance")?;
-    if instance.get("call_id").and_then(Value::as_str) != Some(call_id) {
-        return None;
-    }
     let previous = history.get("last_unsuccessful_attempt")?;
     let owner = previous.get("owner_failure").filter(|owner| !owner.is_null());
     let count = |key: &str| history.get(key).and_then(Value::as_u64);
-    let identical = match (envelope.get("tool_failure"), owner) {
+    let identical = match (dispatch_failure_value(Some(settlement), None), owner) {
         (Some(failure), Some(owner)) => ["code", "message"]
             .iter()
             .all(|key| failure.get(*key).is_some() && failure.get(*key) == owner.get(*key))
@@ -2433,56 +2344,6 @@ pub(crate) fn unchanged_failure_repeat_of<'a>(envelope: &'a Value, call_id: &str
         && previous["strategy"] == instance["strategy"]
         && previous["failure_code"] == instance["failure_code"];
     repeated.then(|| previous["call_id"].as_str()).flatten()
-}
-
-/// A failure's owner JSON: the whole text, the registry's appended settlement
-/// notice, or JSON after a carrier prefix (for example `fatal:`).
-fn failure_envelope_from_text(text: &str) -> Option<Value> {
-    serde_json::from_str::<Value>(text)
-        .ok()
-        .filter(Value::is_object)
-        .or_else(|| {
-            text.rsplit_once("\n\nHost settlement: ")
-                .and_then(|(_, notice)| serde_json::from_str::<Value>(notice).ok())
-                .filter(|notice| notice.get("operation_history").is_some())
-        })
-        .or_else(|| {
-            text.find('{')
-                .and_then(|start| serde_json::from_str::<Value>(&text[start..]).ok())
-                .filter(Value::is_object)
-        })
-}
-
-fn response_failure_envelope(response: &ResponseInputItem) -> Option<Value> {
-    if let ResponseInputItem::FunctionCallOutput { output, call_id }
-    | ResponseInputItem::CustomToolCallOutput { output, call_id, .. } = response
-        && let codex_protocol::models::FunctionCallOutputBody::ContentItems(items) = &output.body
-    {
-        // Content-item results carry the settlement notice as their last text
-        // item; printed results of other calls are not this call's notice.
-        return items.iter().rev().find_map(|item| match item {
-            codex_protocol::models::FunctionCallOutputContentItem::InputText { text } => {
-                serde_json::from_str::<Value>(text).ok().filter(|value| {
-                    value.get("operation_history").is_some()
-                        && failure_history_call_id(value) == Some(call_id.as_str())
-                })
-            }
-            _ => None,
-        });
-    }
-    response_output_text(response).and_then(|text| failure_envelope_from_text(&text))
-}
-
-fn code_mode_result_failure_fingerprint(
-    result: &Value,
-    instance: &str,
-    ordinal: u64,
-) -> String {
-    if let Some(fingerprint) = value_failure_signature(result) {
-        return fingerprint;
-    }
-    // Similar diagnostics are not evidence of one underlying cause.
-    format!("code_mode.unclassified_instance.{instance}.{ordinal}")
 }
 
 fn canonical_response_body(response: &ResponseInputItem) -> Option<Value> {

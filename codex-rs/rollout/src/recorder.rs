@@ -1354,11 +1354,14 @@ impl RolloutRecorder {
         if enroll_dependencies {
             reader.enroll_payload_dependencies();
         }
-        while let Some(line) = reader.next_line().await? {
-            if line.trim().is_empty() {
+        use crate::payload_artifact::HydratedRecord;
+        while let Some(record) = reader.next_record(enroll_dependencies).await? {
+            if matches!(&record, HydratedRecord::Text(line) if line.trim().is_empty()) {
                 continue;
             }
-            if exclude_context_replay && crate::payload_artifact::is_context_replay_reference(&line) {
+            if exclude_context_replay && matches!(&record, HydratedRecord::Text(line)
+                if crate::payload_artifact::is_context_replay_reference(line))
+            {
                 decoder.note_undecoded_record();
                 continue;
             }
@@ -1367,18 +1370,26 @@ impl RolloutRecorder {
             // sequence and move the decoder/string rather than cloning them.
             const BLOCKING_DECODE_THRESHOLD_BYTES: usize = 256 * 1024;
             let terminated = reader.last_line_terminated();
-            let decoded = if line.len() >= BLOCKING_DECODE_THRESHOLD_BYTES {
+            let decoded = if let HydratedRecord::Text(line) = &record
+                && line.len() < BLOCKING_DECODE_THRESHOLD_BYTES
+            {
+                decoder.decode(line, terminated)
+            } else {
                 let (returned_decoder, result) = tokio::task::spawn_blocking(move || {
                     let mut decoder = decoder;
-                    let result = decoder.decode(&line, terminated);
+                    let result = match record {
+                        HydratedRecord::Text(line) => decoder.decode(&line, terminated),
+                        HydratedRecord::Parsed(value) => {
+                            decoder.begin_record();
+                            decoder.decode_value(value)
+                        }
+                    };
                     (decoder, result)
                 })
                 .await
                 .map_err(|error| IoError::other(format!("rollout decode task failed: {error}")))?;
                 decoder = returned_decoder;
                 result
-            } else {
-                decoder.decode(&line, terminated)
             };
             if let Some(item) = decoded? {
                 visit(item, decoder.record_number);
@@ -1576,8 +1587,7 @@ impl RolloutRecordDecoder {
         terminated: bool,
     ) -> std::io::Result<Option<RolloutItem>> {
         self.begin_record();
-        let record_number = self.record_number;
-        let mut v: Value = match serde_json::from_str(line) {
+        let v: Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(e) => {
                 warn!("failed to parse line as JSON: {line:?}, error: {e}");
@@ -1586,6 +1596,11 @@ impl RolloutRecordDecoder {
                 return Ok(None);
             }
         };
+        self.decode_value(v)
+    }
+
+    fn decode_value(&mut self, mut v: Value) -> std::io::Result<Option<RolloutItem>> {
+        let record_number = self.record_number;
         let is_v0 = match v.get("format_version") {
             None => true,
             Some(Value::Number(version)) => version.as_u64() == Some(0),

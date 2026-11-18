@@ -22,6 +22,7 @@ use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolExecutor;
 use codex_protocol::protocol::DeterministicContinuationClass;
 use codex_protocol::protocol::DeterministicContinuationHostAction;
+use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
@@ -327,13 +328,29 @@ pub(super) async fn terminate_interrupted_cell(
     // would otherwise replace the host and its stored values for every thread.
     let session = Arc::clone(&exec.session);
     let detached_cell_id = cell_id.clone();
+    // A cancelled wait is not itself a user interrupt. The turn records its
+    // abort reason before waking this handler; only that recorded origin can
+    // request typed interruption of the cell.
+    let interrupt_cause = exec
+        .turn
+        .cancellation_cause
+        .get()
+        .filter(|cause| {
+            matches!(
+                cause,
+                codex_code_mode::CancellationCause::TurnAborted {
+                    reason: TurnAbortReason::Interrupted,
+                }
+            )
+        })
+        .cloned();
     let mut termination = tokio::spawn(async move {
         tokio::time::timeout(
             DETACHED_TERMINATION_OBSERVATION_LIMIT,
             session
                 .services
                 .code_mode_service
-                .terminate(detached_cell_id),
+                .terminate_with_interrupt_cause(detached_cell_id, interrupt_cause),
         )
         .await
         .unwrap_or_else(|_| Err("code-mode cell termination observation expired".to_string()))

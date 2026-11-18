@@ -967,13 +967,17 @@ impl PreparedAuthLogout {
         self.stores.first().and_then(|(_, auth)| auth.as_ref())
     }
 
-    fn retire(self) -> std::io::Result<(bool, bool)> {
+    fn managed_lifecycle(&self) -> Option<String> {
+        self.stores.first().and_then(|(storage, _)| storage.lifecycle_id())
+    }
+
+    fn retire(&self) -> std::io::Result<(bool, bool)> {
         let started = tracing::enabled!(target: "codex_login::desktop_benchmark", tracing::Level::DEBUG)
             .then(Instant::now);
         let storage_count = self.stores.len();
         let mut removed = false;
         let mut changed = false;
-        for (storage, auth) in self.stores {
+        for (storage, auth) in &self.stores {
             match storage.delete_if_lifecycle_unchanged(auth.as_ref()) {
                 Ok(value) => removed |= value,
                 // Replacement logins, even with identical credentials, belong
@@ -1818,6 +1822,12 @@ impl AuthDotJson {
 #[derive(Clone)]
 struct CachedAuth {
     auth: Option<CodexAuth>,
+    // Load state and cached identity share one publication lock.
+    load_error: Option<AuthLoadFailure>,
+    load_publications: u64,
+    last_load_retirement: u64,
+    // A failed deletion can leave a revoked login readable in this process.
+    retired_managed_lifecycles: Vec<String>,
     policy_epoch: u64,
     /// First policy epoch of the current authenticated identity. Later epochs up to
     /// `policy_epoch` only completed a missing account id within the same login lifecycle.
@@ -2178,7 +2188,7 @@ impl UnauthorizedRecovery {
 const AUTH_LOAD_ANCHOR_GRACE: Duration = Duration::from_secs(10);
 
 /// A recorded credential load failure. Dispatch fails closed while one exists.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct AuthLoadFailure {
     /// Last load attempt; gates the next retry from `auth()`.
     attempted_at: Instant,
@@ -2202,10 +2212,6 @@ struct AuthLoadFailure {
 pub struct AuthManager {
     codex_home: PathBuf,
     inner: RwLock<CachedAuth>,
-    load_error: RwLock<Option<AuthLoadFailure>>,
-    /// Successful load publications; written only under `load_error`, so a
-    /// failed load can tell whether a later load already published.
-    load_publications: AtomicU64,
     auth_change_tx: watch::Sender<u64>,
     enable_codex_api_key_env: bool,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
@@ -2339,13 +2345,15 @@ impl AuthManager {
             codex_home,
             inner: RwLock::new(CachedAuth {
                 auth: managed_auth,
+                load_error,
+                load_publications: 0,
+                last_load_retirement: 0,
+                retired_managed_lifecycles: Vec::new(),
                 policy_epoch: 0,
                 identity_epoch: 0,
                 permanent_refresh_failure: None,
             }),
             auth_change_tx,
-            load_error: RwLock::new(load_error),
-            load_publications: AtomicU64::new(0),
             enable_codex_api_key_env,
             auth_credentials_store_mode,
             keyring_backend_kind,
@@ -2375,13 +2383,15 @@ impl AuthManager {
             codex_home: PathBuf::from("non-existent"),
             inner: RwLock::new(CachedAuth {
                 auth: None,
+                load_error: None,
+                load_publications: 0,
+                last_load_retirement: 0,
+                retired_managed_lifecycles: Vec::new(),
                 policy_epoch: 0,
                 identity_epoch: 0,
                 permanent_refresh_failure: None,
             }),
             auth_change_tx,
-            load_error: RwLock::new(None),
-            load_publications: AtomicU64::new(0),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
             keyring_backend_kind: AuthKeyringBackendKind::default(),
@@ -2456,6 +2466,31 @@ impl AuthManager {
         Ok(publish())
     }
 
+    /// Linearize credential use, rather than identity-only work, against load
+    /// failure and policy publication. The callback must be synchronous and
+    /// must not re-enter this manager or perform blocking work.
+    pub fn with_usable_auth<T>(
+        &self,
+        epoch: u64,
+        use_auth: impl FnOnce(&CodexAuth, u64, bool) -> T,
+    ) -> std::io::Result<T> {
+        let cached = self.inner.read()
+            .map_err(|_| std::io::Error::other("auth lock is poisoned"))?;
+        if cached.policy_epoch != epoch {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "authentication changed before credential use",
+            ));
+        }
+        Self::check_cached_auth_load(&cached)?;
+        let auth = cached.auth.as_ref().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "no credentials are available")
+        })?;
+        let revision = *self.auth_change_tx.borrow();
+        let refresh_failed = cached.permanent_refresh_failure.is_some();
+        Ok(use_auth(auth, revision, refresh_failed))
+    }
+
     /// Linearize a synchronous policy rebind against identity transitions.
     /// The callback must not re-enter this manager or perform blocking work.
     pub fn with_policy_identity<T>(
@@ -2509,18 +2544,18 @@ impl AuthManager {
         }
 
         let retry_load = self
-            .load_error
+            .inner
             .read()
             .ok()
-            .and_then(|error| {
-                error
+            .and_then(|cached| {
+                cached.load_error
                     .as_ref()
                     .map(|failure| failure.attempted_at.elapsed() >= Duration::from_secs(1))
             })
             .unwrap_or(false);
         if retry_load {
-            let admitted = self.load_error.write().ok().is_some_and(|mut error| {
-                if let Some(failure) = error.as_mut()
+            let admitted = self.inner.write().ok().is_some_and(|mut cached| {
+                if let Some(failure) = cached.load_error.as_mut()
                     && failure.attempted_at.elapsed() >= Duration::from_secs(1)
                 {
                     failure.attempted_at = Instant::now();
@@ -2623,27 +2658,44 @@ impl AuthManager {
     /// A transient load failure keeps the cached identity (see `record_load_failure`).
     pub async fn reload(&self) -> bool {
         tracing::info!("Reloading auth");
-        self.reload_with(/*keep_anchor*/ true).await
+        self.reload_with(/*keep_anchor*/ true).await.is_ok_and(|(changed, _)| changed)
     }
 
-    /// Reload after stored credentials were retired. A read or parse failure
-    /// here must not keep the retired identity as an anchor, so it publishes as
-    /// a logout, as it did before `reload()` anchored such failures.
-    async fn reload_after_logout(&self) -> bool {
-        tracing::info!("Reloading auth after logout");
-        self.reload_with(/*keep_anchor*/ false).await
+    /// Reload after an explicit login publishes new credentials or a logout
+    /// retires stored credentials. A failed load, including a busy store, must
+    /// not keep the previous identity as an anchor.
+    pub async fn reload_after_identity_transition(&self) -> std::io::Result<Option<AuthMode>> {
+        tracing::info!("Reloading auth after explicit identity transition");
+        self.reload_with(/*keep_anchor*/ false).await.map(|(_, mode)| mode)
     }
 
-    async fn reload_with(&self, keep_anchor: bool) -> bool {
-        let Some((generation, source)) = self.external_auth_snapshot() else {
-            return false;
-        };
-        let started = self.load_publications.load(Ordering::Acquire);
+    async fn reload_with(&self, keep_anchor: bool) -> std::io::Result<(bool, Option<AuthMode>)> {
+        let (generation, source) = self.external_auth_snapshot()
+            .ok_or_else(|| std::io::Error::other("external auth lock is poisoned"))?;
+        let started = self.start_load_publication(&generation, keep_anchor)?;
         let new_auth = self.load_auth(source.as_ref()).await;
-        self.with_current_external_auth(&generation, || {
-            self.publish_auth_load(new_auth, started, keep_anchor)
-        })
-        .unwrap_or(false)
+        self.with_current_external_auth(&generation, || match new_auth {
+            Ok(auth) => {
+                let mode = auth.as_ref().map(CodexAuth::api_auth_mode);
+                match self.publish_loaded_auth(auth, started) {
+                    Ok((changed, _)) => Ok((changed, mode)),
+                    Err(err) => {
+                        if !keep_anchor {
+                            self.record_load_failure(&err, started, keep_anchor);
+                        }
+                        Err(err)
+                    }
+                }
+            }
+            Err(err) => {
+                let changed = self.record_load_failure(&err, started, keep_anchor);
+                if keep_anchor {
+                    Ok((changed, None))
+                } else {
+                    Err(err)
+                }
+            }
+        })?
     }
 
     /// Retries a failed credential load from `auth()`. Same publication rules
@@ -2653,22 +2705,31 @@ impl AuthManager {
         let Some((generation, source)) = self.external_auth_snapshot() else {
             return;
         };
-        let started = self.load_publications.load(Ordering::Acquire);
+        let Ok(started) = self.load_publication_revision() else {
+            return;
+        };
         let new_auth = self.load_auth(source.as_ref()).await;
-        let _ = self.with_current_external_auth(&generation, || {
-            let succeeded = new_auth.is_ok();
-            let changed = self.publish_auth_load(new_auth, started, /*keep_anchor*/ true);
-            if succeeded {
-                tracing::info!("Reloaded auth after failed load, changed: {changed}");
+        let _ = self.with_current_external_auth(&generation, || match new_auth {
+            Ok(auth) => {
+                if let Ok((changed, _)) = self.publish_loaded_auth(auth, started) {
+                    tracing::info!("Reloaded auth after failed load, changed: {changed}");
+                }
+            }
+            Err(err) => {
+                self.record_load_failure(&err, started, /*keep_anchor*/ true);
             }
         });
     }
 
     /// Distinguishes missing credentials from an unavailable or malformed store.
     pub fn check_auth_load(&self) -> std::io::Result<()> {
-        if let Ok(error) = self.load_error.read()
-            && let Some(failure) = error.as_ref()
-        {
+        let cached = self.inner.read()
+            .map_err(|_| std::io::Error::other("auth lock is poisoned"))?;
+        Self::check_cached_auth_load(&cached)
+    }
+
+    fn check_cached_auth_load(cached: &CachedAuth) -> std::io::Result<()> {
+        if let Some(failure) = cached.load_error.as_ref() {
             return Err(std::io::Error::new(
                 failure.kind,
                 format!("credentials unavailable: {}", failure.message),
@@ -2677,24 +2738,78 @@ impl AuthManager {
         Ok(())
     }
 
-    /// Publishes a load started after `started` successful publications.
-    /// Returns whether the cached auth value changed.
-    fn publish_auth_load(
-        &self,
-        result: std::io::Result<Option<CodexAuth>>,
-        started: u64,
-        keep_anchor: bool,
-    ) -> bool {
-        match result {
-            Ok(auth) => {
-                if let Ok(mut current) = self.load_error.write() {
-                    *current = None;
-                    self.load_publications.fetch_add(1, Ordering::AcqRel);
-                }
-                self.set_cached_auth(auth)
-            }
-            Err(err) => self.record_load_failure(&err, started, keep_anchor),
+    fn load_publication_revision(&self) -> std::io::Result<u64> {
+        self.inner
+            .read()
+            .map(|cached| cached.load_publications)
+            .map_err(|_| std::io::Error::other("auth lock is poisoned"))
+    }
+
+    fn start_load_publication(&self, generation: &Arc<()>, keep_anchor: bool) -> std::io::Result<u64> {
+        if keep_anchor {
+            return self.load_publication_revision();
         }
+        // The explicit transition already replaced or retired the store's old
+        // identity. Fence reloads that read that predecessor before this point.
+        self.with_current_external_auth(generation, || {
+            let mut cached = self.inner.write()
+                .map_err(|_| std::io::Error::other("auth lock is poisoned"))?;
+            Self::advance_load_retirement(&mut cached);
+            cached.load_error = Some(AuthLoadFailure {
+                attempted_at: Instant::now(),
+                since: None,
+                kind: std::io::ErrorKind::WouldBlock,
+                message: "authentication transition is publishing credentials".into(),
+            });
+            Ok(cached.load_publications)
+        })?
+    }
+
+    fn advance_load_retirement(cached: &mut CachedAuth) {
+        cached.load_publications += 1;
+        cached.last_load_retirement = cached.load_publications;
+    }
+
+    /// Publishes success and clears its load error in the same critical
+    /// section. A superseded load must not undo an explicit identity transition
+    /// or a logout published by the load recorder. The second result tracks
+    /// refresh changes.
+    fn publish_loaded_auth(
+        &self,
+        auth: Option<CodexAuth>,
+        started: u64,
+    ) -> std::io::Result<(bool, bool)> {
+        let mut cached = self.inner.write()
+            .map_err(|_| std::io::Error::other("auth lock is poisoned"))?;
+        Self::check_load_publication(&cached, started)?;
+        if auth.as_ref().and_then(CodexAuth::lifecycle_id).is_some_and(|lifecycle| {
+            cached.retired_managed_lifecycles.contains(&lifecycle)
+        }) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "retired credentials remain in storage",
+            ));
+        }
+        Ok(self.publish_auth_locked(&mut cached, auth))
+    }
+
+    fn check_load_publication(cached: &CachedAuth, started: u64) -> std::io::Result<()> {
+        if started < cached.last_load_retirement {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "authentication was retired while credentials were loading",
+            ));
+        }
+        Ok(())
+    }
+
+    fn publish_auth_locked(&self, cached: &mut CachedAuth, auth: Option<CodexAuth>) -> (bool, bool) {
+        cached.load_error = None;
+        cached.load_publications += 1;
+        if auth.is_none() {
+            cached.last_load_retirement = cached.load_publications;
+        }
+        self.set_cached_auth_locked(cached, auth)
     }
 
     /// Records a failed credential load and keeps dispatch fail-closed. A read
@@ -2703,42 +2818,38 @@ impl AuthManager {
     /// not move the policy epoch. A policy denial, a run of read or parse
     /// failures older than `AUTH_LOAD_ANCHOR_GRACE`, or `keep_anchor == false`
     /// publishes a logout. A busy lifecycle transaction never read the store:
-    /// it always keeps the anchor and does not count towards that run. A
-    /// failure from a load that a later successful load already superseded is
-    /// dropped, except a policy denial, which always publishes. Returns whether
-    /// the cached auth value changed.
+    /// it keeps the anchor during implicit reloads and does not count towards
+    /// that run. A policy denial takes precedence over an overlapping success,
+    /// but even a denial cannot cross an identity retirement fence.
+    /// Returns whether cached auth changed.
     fn record_load_failure(&self, err: &std::io::Error, started: u64, keep_anchor: bool) -> bool {
         let policy_denied = is_auth_policy_denial(err);
         let busy = err.kind() == std::io::ErrorKind::WouldBlock;
-        let log_out = match self.load_error.write() {
-            Ok(mut current) => {
-                if !policy_denied && self.load_publications.load(Ordering::Acquire) != started {
-                    return false;
-                }
-                let now = Instant::now();
-                let run_start = current.as_ref().and_then(|failure| failure.since);
-                let since = if busy { run_start } else { Some(run_start.unwrap_or(now)) };
-                *current = Some(AuthLoadFailure {
-                    attempted_at: now,
-                    since,
-                    kind: err.kind(),
-                    message: err.to_string(),
-                });
-                !busy
-                    && (!keep_anchor
-                        || policy_denied
-                        || since.is_some_and(|since| {
-                            now.duration_since(since) >= AUTH_LOAD_ANCHOR_GRACE
-                        }))
-            }
-            // Without the failure record dispatch cannot fail closed on an
-            // anchor, so publish the logout this failure produced before anchoring.
-            Err(_) => !busy,
+        let Ok(mut cached) = self.inner.write() else {
+            return false;
         };
-        if !log_out {
+        if started < cached.last_load_retirement
+            || (!policy_denied && cached.load_publications != started)
+        {
             return false;
         }
-        let changed = self.set_cached_auth(None);
+        let now = Instant::now();
+        let run_start = cached.load_error.as_ref().and_then(|failure| failure.since);
+        let since = if busy { run_start } else { Some(run_start.unwrap_or(now)) };
+        cached.load_error = Some(AuthLoadFailure {
+            attempted_at: now,
+            since,
+            kind: err.kind(),
+            message: err.to_string(),
+        });
+        if keep_anchor
+            && !policy_denied
+            && (busy || since.is_none_or(|since| now.duration_since(since) < AUTH_LOAD_ANCHOR_GRACE))
+        {
+            return false;
+        }
+        Self::advance_load_retirement(&mut cached);
+        let (changed, _) = self.set_cached_auth_locked(&mut cached, None);
         if changed && policy_denied {
             tracing::info!("Stored credentials are denied by login policy; logged out");
         } else if changed && keep_anchor {
@@ -2762,7 +2873,7 @@ impl AuthManager {
         let Some((generation, source)) = self.external_auth_snapshot() else {
             return Ok(ReloadOutcome::Skipped);
         };
-        let started = self.load_publications.load(Ordering::Acquire);
+        let started = self.load_publication_revision()?;
         let new_auth = match self.load_auth(source.as_ref()).await {
             Ok(auth) => auth,
             Err(err) => {
@@ -2788,16 +2899,13 @@ impl AuthManager {
 
         tracing::info!("Reloading auth for account {expected_account_id}");
         self.with_current_external_auth(&generation, || {
-            let cached_before_reload = self.auth_cached();
-            let auth_changed =
-                !Self::auths_equal_for_refresh(cached_before_reload.as_ref(), new_auth.as_ref());
-            self.publish_auth_load(Ok(new_auth), started, /*keep_anchor*/ true);
-            if auth_changed {
+            let (_, refresh_changed) = self.publish_loaded_auth(new_auth, started)?;
+            Ok(if refresh_changed {
                 ReloadOutcome::ReloadedChanged
             } else {
                 ReloadOutcome::ReloadedNoChange
-            }
-        })
+            })
+        })?
     }
 
     fn auths_equal_for_refresh(a: Option<&CodexAuth>, b: Option<&CodexAuth>) -> bool {
@@ -2912,69 +3020,83 @@ impl AuthManager {
     }
 
     fn set_cached_auth(&self, new_auth: Option<CodexAuth>) -> bool {
-        if let Ok(mut guard) = self.inner.write() {
-            let previous = guard.auth.as_ref();
-            let changed = !AuthManager::auths_equal(previous, new_auth.as_ref());
-            let auth_changed_for_refresh =
-                !Self::auths_equal_for_refresh(previous, new_auth.as_ref());
-            let policy_scope = |auth: &CodexAuth| {
-                (
-                    auth.api_auth_mode(),
-                    auth.get_chatgpt_user_id(),
-                    auth.get_account_id(),
-                    auth.account_plan_type(),
-                    auth.uses_codex_backend(),
-                    auth.lifecycle_id(),
-                )
-            };
-            let previous_scope = previous.map(policy_scope);
-            let next_scope = new_auth.as_ref().map(policy_scope);
-            // Headers expose no verified account/lifecycle identity. Any changed
-            // header projection is a new authority, not a proven token rotation.
-            let headers_changed = auth_changed_for_refresh
-                && (matches!(previous, Some(CodexAuth::Headers(_)))
-                    || matches!(new_auth.as_ref(), Some(CodexAuth::Headers(_))));
-            let policy_changed = previous_scope != next_scope || headers_changed;
-            // A missing account id that becomes known within the same stored login lifecycle
-            // completes the current identity. Any other scope change starts a new identity.
-            let completes_identity = match (previous_scope, next_scope) {
-                (
-                    Some((mode, user_id, None, plan, codex_backend, Some(lifecycle))),
-                    Some((
-                        next_mode,
-                        next_user_id,
-                        Some(_),
-                        next_plan,
-                        next_codex_backend,
-                        Some(next_lifecycle),
-                    )),
-                ) => {
-                    mode == next_mode
-                        && user_id == next_user_id
-                        && plan == next_plan
-                        && codex_backend == next_codex_backend
-                        && lifecycle == next_lifecycle
-                }
-                _ => false,
-            };
-            if policy_changed {
-                guard.policy_epoch += 1;
-                if !completes_identity {
-                    guard.identity_epoch = guard.policy_epoch;
-                }
+        self.inner
+            .write()
+            .ok()
+            .is_some_and(|mut cached| self.publish_auth_locked(&mut cached, new_auth).0)
+    }
+
+    fn set_cached_auth_locked(
+        &self,
+        guard: &mut CachedAuth,
+        new_auth: Option<CodexAuth>,
+    ) -> (bool, bool) {
+        let previous = guard.auth.as_ref();
+        let changed = !AuthManager::auths_equal(previous, new_auth.as_ref());
+        let auth_changed_for_refresh =
+            !Self::auths_equal_for_refresh(previous, new_auth.as_ref());
+        let policy_scope = |auth: &CodexAuth| {
+            (
+                auth.api_auth_mode(),
+                auth.get_chatgpt_user_id(),
+                auth.get_account_id(),
+                auth.account_plan_type(),
+                auth.uses_codex_backend(),
+                auth.lifecycle_id(),
+            )
+        };
+        let previous_scope = previous.map(policy_scope);
+        let next_scope = new_auth.as_ref().map(policy_scope);
+        // Headers expose no verified account/lifecycle identity. Any changed
+        // header projection is a new authority, not a proven token rotation.
+        let headers_changed = auth_changed_for_refresh
+            && (matches!(previous, Some(CodexAuth::Headers(_)))
+                || matches!(new_auth.as_ref(), Some(CodexAuth::Headers(_))));
+        // Unscoped static credentials have no separate local login id.
+        let unscoped_credential_changed = auth_changed_for_refresh && matches!(
+            new_auth.as_ref(),
+            Some(CodexAuth::ApiKey(_) | CodexAuth::PersonalAccessToken(_) | CodexAuth::BedrockApiKey(_))
+        );
+        let policy_changed =
+            previous_scope != next_scope || headers_changed || unscoped_credential_changed;
+        // A missing account id that becomes known within the same stored login lifecycle
+        // completes the current identity. Any other scope change starts a new identity.
+        let completes_identity = match (previous_scope, next_scope) {
+            (
+                Some((mode, user_id, None, plan, codex_backend, Some(lifecycle))),
+                Some((
+                    next_mode,
+                    next_user_id,
+                    Some(_),
+                    next_plan,
+                    next_codex_backend,
+                    Some(next_lifecycle),
+                )),
+            ) => {
+                mode == next_mode
+                    && user_id == next_user_id
+                    && plan == next_plan
+                    && codex_backend == next_codex_backend
+                    && lifecycle == next_lifecycle
             }
-            if auth_changed_for_refresh {
-                guard.permanent_refresh_failure = None;
+            _ => false,
+        };
+        if policy_changed {
+            guard.policy_epoch += 1;
+            if !completes_identity {
+                guard.identity_epoch = guard.policy_epoch;
+                guard.last_load_retirement = guard.load_publications;
             }
-            tracing::info!("Reloaded auth, changed: {changed}");
-            guard.auth = new_auth;
-            if auth_changed_for_refresh || policy_changed {
-                self.auth_change_tx.send_modify(|revision| *revision += 1);
-            }
-            changed
-        } else {
-            false
         }
+        if auth_changed_for_refresh {
+            guard.permanent_refresh_failure = None;
+        }
+        tracing::info!("Reloaded auth, changed: {changed}");
+        guard.auth = new_auth;
+        if auth_changed_for_refresh || policy_changed {
+            self.auth_change_tx.send_modify(|revision| *revision += 1);
+        }
+        (changed, auth_changed_for_refresh)
     }
 
     pub async fn set_external_auth(
@@ -3005,7 +3127,7 @@ impl AuthManager {
         source_slot.generation = Arc::new(());
         let generation = Arc::clone(&source_slot.generation);
         drop(source_slot);
-        self.commit_external_auth(auth, &external_auth_source, &generation)
+        self.commit_external_auth(auth, &external_auth_source, &generation, None)
     }
 
     /// Installs an external auth source selected from process configuration at startup.
@@ -3038,7 +3160,7 @@ impl AuthManager {
         source.generation = Arc::new(());
         let generation = Arc::clone(&source.generation);
         drop(source);
-        self.commit_external_auth(auth, &external_auth_source, &generation)
+        self.commit_external_auth(auth, &external_auth_source, &generation, None)
     }
 
     /// Clears only auth installed through the runtime API. Configured auth is immutable.
@@ -3096,6 +3218,8 @@ impl AuthManager {
             .map_err(|_| std::io::Error::other("auth lock is poisoned"))?;
         *restrictions = (method, workspaces);
         source.generation = Arc::new(());
+        Self::advance_load_retirement(&mut cached);
+        cached.load_error = None;
         cached.auth = None;
         cached.permanent_refresh_failure = None;
         cached.policy_epoch += 1;
@@ -3493,17 +3617,28 @@ impl AuthManager {
             self.auth_credentials_store_mode,
             self.keyring_backend_kind,
         )?;
-        let (generation, _) = self
+        let (generation, source) = self
             .external_auth_snapshot()
             .ok_or_else(|| std::io::Error::other("external auth lock is poisoned"))?;
-        let auth_dot_json = self
-            .auth_cached()
-            .and_then(|auth| auth.get_current_auth_json());
-        if let Err(err) = revoke_auth_tokens(auth_dot_json.as_ref(), &self.auth_route_config).await
+        let retiring_lifecycle = snapshot.managed_lifecycle();
+        if source.is_none()
+            && let Err(err) = revoke_auth_tokens(snapshot.managed_auth(), &self.auth_route_config).await
         {
             tracing::warn!("failed to revoke auth tokens during logout: {err}");
         }
-        let (removed, _) = snapshot.retire()?;
+        let (removed, _) = match snapshot.retire() {
+            Ok(result) => result,
+            Err(err) => {
+                if source.is_none()
+                    && snapshot.managed_auth().is_some_and(|auth| auth.resolved_mode() == AuthMode::Chatgpt)
+                {
+                    // The backend may have advanced its revision before reporting a failed
+                    // delete. Neither incarnation of the retiring login may publish again.
+                    self.fence_failed_retirement([retiring_lifecycle, snapshot.managed_lifecycle()]);
+                }
+                return Err(err);
+            }
+        };
         let removed_external = with_ephemeral_auth_entry(&self.codex_home, |entry| {
             let mut state = self
                 .external_auth
@@ -3532,8 +3667,34 @@ impl AuthManager {
         // Reload rather than clearing the current cache: another process may
         // have replaced storage, or this manager may have a newer external source.
         // A failed load must not keep the revoked identity as an anchor.
-        self.reload_after_logout().await;
+        // The storage retirement already succeeded. A read failure remains
+        // observable through load state without changing the logout result.
+        let _ = self.reload_after_identity_transition().await;
         Ok(removed || removed_external)
+    }
+
+    fn fence_failed_retirement(&self, lifecycles: [Option<String>; 2]) {
+        let Ok(mut cached) = self.inner.write() else {
+            return;
+        };
+        let current = cached.auth.as_ref().and_then(CodexAuth::lifecycle_id);
+        let mut retires_current = false;
+        for lifecycle in lifecycles.into_iter().flatten() {
+            retires_current |= current.as_ref() == Some(&lifecycle);
+            if !cached.retired_managed_lifecycles.contains(&lifecycle) {
+                cached.retired_managed_lifecycles.push(lifecycle);
+            }
+        }
+        if retires_current {
+            Self::advance_load_retirement(&mut cached);
+            cached.load_error = Some(AuthLoadFailure {
+                attempted_at: Instant::now(),
+                since: None,
+                kind: std::io::ErrorKind::PermissionDenied,
+                message: "credential retirement did not finish; log in again".into(),
+            });
+            self.set_cached_auth_locked(&mut cached, None);
+        }
     }
 
     fn ensure_logout_allowed(&self) -> std::io::Result<()> {
@@ -3595,10 +3756,12 @@ impl AuthManager {
             )));
         };
         let external_auth = source.provider();
-        let previous_account_id = self
-            .auth_cached()
-            .as_ref()
-            .and_then(CodexAuth::get_account_id);
+        let (started, previous_account_id) = {
+            let cached = self.inner.read().map_err(|_| {
+                RefreshTokenError::Transient(std::io::Error::other("auth lock is poisoned"))
+            })?;
+            (cached.load_publications, cached.auth.as_ref().and_then(CodexAuth::get_account_id))
+        };
         let context = ExternalAuthRefreshContext {
             reason,
             previous_account_id: previous_account_id.clone(),
@@ -3616,7 +3779,7 @@ impl AuthManager {
                 "authentication account changed during external refresh; log in explicitly",
             ));
         }
-        self.commit_external_auth(refreshed, &source, &generation)?;
+        self.commit_external_auth(refreshed, &source, &generation, Some(started))?;
         Ok(())
     }
 
@@ -3625,6 +3788,7 @@ impl AuthManager {
         auth: CodexAuth,
         source: &ExternalAuthSource,
         generation: &Arc<()>,
+        started: Option<u64>,
     ) -> Result<(), RefreshTokenError> {
         if source.is_runtime() && auth.is_external_chatgpt_tokens() {
             let auth_dot_json = auth.get_current_auth_json().ok_or_else(|| {
@@ -3637,15 +3801,36 @@ impl AuthManager {
             // Lock order is ephemeral store -> source -> cache. Canonicalization and the
             // store-lock wait happen before the source lock, so clearing a source stays cheap.
             return with_ephemeral_auth_entry(&self.codex_home, |entry| {
-                self.with_current_external_auth(generation, || {
+                self.publish_external_auth(auth, generation, started, || {
                     entry.insert_entry(auth_dot_json);
-                    self.set_cached_auth(Some(auth));
                 })
             }).map_err(RefreshTokenError::Transient);
         }
+        self.publish_external_auth(auth, generation, started, || {})
+            .map_err(RefreshTokenError::Transient)
+    }
+
+    fn publish_external_auth(
+        &self,
+        auth: CodexAuth,
+        generation: &Arc<()>,
+        started: Option<u64>,
+        publish_mirror: impl FnOnce(),
+    ) -> std::io::Result<()> {
         self.with_current_external_auth(generation, || {
-            self.set_cached_auth(Some(auth));
-        }).map_err(RefreshTokenError::Transient)
+            let mut cached = self.inner.write()
+                .map_err(|_| std::io::Error::other("auth lock is poisoned"))?;
+            if let Some(started) = started {
+                Self::check_load_publication(&cached, started)?;
+            } else {
+                // Installing a new source is authoritative even if its
+                // provider resolves to the same account.
+                Self::advance_load_retirement(&mut cached);
+            }
+            publish_mirror();
+            self.publish_auth_locked(&mut cached, Some(auth));
+            Ok(())
+        })?
     }
 
     fn validate_external_auth(

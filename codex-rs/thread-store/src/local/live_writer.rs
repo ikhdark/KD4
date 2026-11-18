@@ -7,6 +7,8 @@ use codex_protocol::protocol::RolloutItem;
 use codex_rollout::RolloutConfig;
 use codex_rollout::RolloutRecorder;
 use codex_rollout::RolloutRecorderParams;
+use tracing::Instrument;
+use tracing::debug_span;
 use tracing::warn;
 
 use super::LocalThreadStore;
@@ -146,7 +148,10 @@ async fn resume_thread_owned(
     params: ResumeThreadParams,
 ) -> ThreadStoreResult<Arc<Vec<RolloutItem>>> {
     store.ensure_live_recorder_absent(params.thread_id).await?;
-    let lease = store.acquire_writer_lease(params.thread_id, false).await?;
+    let lease = store
+        .acquire_writer_lease(params.thread_id, false)
+        .instrument(debug_span!("resume_writer.lease"))
+        .await?;
     let cwd = params
         .metadata
         .cwd
@@ -154,25 +159,29 @@ async fn resume_thread_owned(
         .ok_or_else(|| ThreadStoreError::InvalidRequest {
             message: "local thread store requires a cwd".to_string(),
         })?;
-    let thread = if let Some(rollout_path) = params.rollout_path {
-        super::read_thread::read_thread_by_rollout_path(
-            store,
-            rollout_path,
-            params.include_archived,
-            false,
-        )
-        .await?
-    } else {
-        super::read_thread::read_thread(
-            store,
-            ReadThreadParams {
-                thread_id: params.thread_id,
-                include_archived: params.include_archived,
-                include_history: false,
-            },
-        )
-        .await?
-    };
+    let thread = async {
+        if let Some(rollout_path) = params.rollout_path {
+            super::read_thread::read_thread_by_rollout_path(
+                store,
+                rollout_path,
+                params.include_archived,
+                false,
+            )
+            .await
+        } else {
+            super::read_thread::read_thread(
+                store,
+                ReadThreadParams {
+                    thread_id: params.thread_id,
+                    include_archived: params.include_archived,
+                    include_history: false,
+                },
+            )
+            .await
+        }
+    }
+    .instrument(debug_span!("resume_writer.authoritative_thread"))
+    .await?;
     if thread.thread_id != params.thread_id {
         return Err(ThreadStoreError::InvalidRequest {
             message: "resume rollout belongs to a different thread".to_string(),
@@ -214,6 +223,7 @@ async fn resume_thread_owned(
                 None,
                 lease,
             )
+            .instrument(debug_span!("resume_writer.open"))
             .await
             .map_err(thread_store_io_error)?;
             (recorder, history)
@@ -225,13 +235,16 @@ async fn resume_thread_owned(
                 params.thread_id,
                 Some(lease),
             )
+            .instrument(debug_span!("resume_writer.open_and_load"))
             .await
             .map_err(thread_store_io_error)?;
             validate_history(&history)?;
             (recorder, Arc::new(history))
         }
     };
-    repair_resume_discovery_metadata(store, params.thread_id, recorder.rollout_path()).await;
+    repair_resume_discovery_metadata(store, params.thread_id, recorder.rollout_path())
+        .instrument(debug_span!("resume_writer.discovery_repair"))
+        .await;
     store
         .insert_live_recorder(params.thread_id, recorder, history_mode)
         .await?;

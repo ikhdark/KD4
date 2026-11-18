@@ -344,6 +344,9 @@ pub enum RemotePluginCatalogError {
         source: RouteAwareRequestError,
     },
 
+    #[error("workspace plugin upload request failed: {category}")]
+    SignedUploadRequest { category: &'static str },
+
     #[error("failed to read remote plugin catalog response from {url}: {source}")]
     Body {
         url: String,
@@ -437,7 +440,7 @@ impl RemotePluginCatalogError {
             Self::AuthRequired => "remote_catalog_auth_required",
             Self::UnsupportedAuthMode => "remote_catalog_unsupported_auth_mode",
             Self::AuthToken(_) => "remote_catalog_auth_token",
-            Self::Request { .. } => "remote_catalog_request",
+            Self::Request { .. } | Self::SignedUploadRequest { .. } => "remote_catalog_request",
             Self::Body { .. } => "remote_catalog_body",
             Self::InventoryTimeout => "remote_catalog_timeout",
             Self::UnexpectedStatus { .. } => "remote_catalog_unexpected_status",
@@ -475,7 +478,7 @@ impl RemotePluginCatalogError {
             Self::UnexpectedStatus { status, .. } if *status == http::StatusCode::NOT_FOUND => {
                 PluginRemoteErrorReason::NotFound
             }
-            Self::Request { .. } | Self::Body { .. } | Self::InventoryTimeout => {
+            Self::Request { .. } | Self::SignedUploadRequest { .. } | Self::Body { .. } | Self::InventoryTimeout => {
                 PluginRemoteErrorReason::Transient
             }
             Self::UnexpectedStatus { status, .. }

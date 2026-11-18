@@ -686,6 +686,16 @@ impl ThreadQueueRequestProcessor {
         params: ThreadQueueListParams,
     ) -> Result<ThreadQueueListResponse, JSONRPCErrorError> {
         let id = parse_thread_id_for_request(&params.thread_id)?;
+        // A committed snapshot without a pending start is read-only. It need
+        // not wait behind another process's queue writer or open a lock file.
+        {
+            let queue = self.load(id).await?;
+            if queue.pending_start.is_none() {
+                return queue.page(&params);
+            }
+        }
+        // Recovery can change the revision. Re-read under the write lock
+        // instead of using the pending state observed outside it.
         let admission = self.lock(id).await?;
         let processor = self.clone();
         // Recovery can commit too. Keep durable state, capability bookkeeping

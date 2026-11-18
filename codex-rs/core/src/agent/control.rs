@@ -688,35 +688,22 @@ impl AgentControl {
         let queue = (!communication.trigger_turn)
             .then(|| self.state.input_queue_for_delivery(agent_id))
             .flatten();
-        // Publish the sending turn's validation scope before the receiver can
-        // observe the follow-up: admission of the turn it starts reads it.
-        if communication.trigger_turn
-            && let Some(scope) = context.followup_validation_scope()
-            && let Some(id) = communication.id.as_ref()
-            && let Ok(receiver) = state.get_thread(agent_id).await
-        {
-            receiver
-                .codex
-                .session
-                .input_queue
-                .record_mail_validation_origin(id.clone(), scope.clone())
-                .await;
-        }
         let result = if let Some(queue) = queue {
             state
                 .enqueue_queue_only_communication(agent_id, &queue, communication)
                 .await
         } else {
+            let receiver = state.get_thread(agent_id).await?;
+            let validation_origin = (communication.trigger_turn && communication.id.is_some())
+                .then(|| context.followup_validation_scope().cloned())
+                .flatten();
+            let submitted = receiver
+                .submit_mailbox_communication(communication, execution_guard, validation_origin)
+                .await;
             self.handle_thread_request_result(
                 agent_id,
                 state,
-                state
-                    .send_op_with_execution_guard(
-                        agent_id,
-                        Op::InterAgentCommunication { communication },
-                        execution_guard,
-                    )
-                    .await,
+                Ok((receiver, submitted)),
             )
             .await
         };

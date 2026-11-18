@@ -25,6 +25,7 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AdditionalContextEntry;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::Event;
+use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
@@ -366,6 +367,7 @@ impl CodexThread {
             trace,
             /*client_user_message_id*/ None,
             execution_guard,
+            /*validation_origin*/ None,
         )
         .await
     }
@@ -378,8 +380,14 @@ impl CodexThread {
     ) -> CodexResult<String> {
         debug_assert!(matches!(op, Op::UserInput { .. }));
         let execution_guard = self.reserve_execution_guard(&op).await?;
-        self.submit_op_with_execution_guard(op, trace, client_user_message_id, execution_guard)
-            .await
+        self.submit_op_with_execution_guard(
+            op,
+            trace,
+            client_user_message_id,
+            execution_guard,
+            /*validation_origin*/ None,
+        )
+        .await
     }
 
     /// Reserves the public turn ID with the same canonical generator used by
@@ -631,8 +639,10 @@ impl CodexThread {
     /// Use sparingly: this is intended to be removed soon.
     pub async fn submit_with_id(&self, sub: Submission) -> CodexResult<()> {
         let execution_guard = self.reserve_execution_guard(&sub.op).await?;
-        self.submit_submission_with_execution_guard(sub, execution_guard)
-            .await
+        self.submit_submission_with_execution_guard(
+            sub, execution_guard, /*validation_origin*/ None,
+        )
+        .await
     }
 
     /// Request cancellation of only the identified turn, leaving any newer turn untouched.
@@ -658,6 +668,23 @@ impl CodexThread {
             /*trace*/ None,
             /*client_user_message_id*/ None,
             execution_guard,
+            /*validation_origin*/ None,
+        )
+        .await
+    }
+
+    pub(crate) async fn submit_mailbox_communication(
+        &self,
+        communication: InterAgentCommunication,
+        execution_guard: Option<AgentExecutionGuard>,
+        validation_origin: Option<(String, String)>,
+    ) -> CodexResult<String> {
+        self.submit_op_with_execution_guard(
+            Op::InterAgentCommunication { communication },
+            /*trace*/ None,
+            /*client_user_message_id*/ None,
+            execution_guard,
+            validation_origin,
         )
         .await
     }
@@ -680,6 +707,7 @@ impl CodexThread {
         trace: Option<W3cTraceContext>,
         client_user_message_id: Option<String>,
         execution_guard: Option<AgentExecutionGuard>,
+        validation_origin: Option<(String, String)>,
     ) -> CodexResult<String> {
         let id = self.codex.reserve_turn_id();
         self.submit_submission_with_execution_guard(
@@ -690,6 +718,7 @@ impl CodexThread {
                 trace,
             },
             execution_guard,
+            validation_origin,
         )
         .await?;
         Ok(id)
@@ -703,6 +732,7 @@ impl CodexThread {
         &self,
         sub: Submission,
         execution_guard: Option<AgentExecutionGuard>,
+        validation_origin: Option<(String, String)>,
     ) -> CodexResult<()> {
         // Keep idle selection out until the receiver owns the pending input.
         // Capacity is reserved by the caller before taking this pin.
@@ -717,7 +747,10 @@ impl CodexThread {
                 &sub.id,
                 execution_guard,
             )?;
-        let admission = self.codex.enqueue_submission(sub).await?;
+        let admission = self
+            .codex
+            .enqueue_submission(sub, validation_origin)
+            .await?;
         // Once queued, cancellation of the sender must not revoke capacity
         // reserved for the receiver's pending operation.
         registration.commit();

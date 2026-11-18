@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use codex_code_mode_protocol::CancellationCause;
 use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::CodeModeSessionDelegate;
 use codex_code_mode_protocol::ExecuteRequest;
@@ -65,8 +66,9 @@ impl ConnectionDriver {
             DriverCommand::Terminate {
                 session,
                 cell_id,
+                interrupt_cause,
                 response_tx,
-            } => self.terminate(session, cell_id, response_tx),
+            } => self.terminate(session, cell_id, interrupt_cause, response_tx),
             DriverCommand::ShutdownSession {
                 session,
                 response_tx,
@@ -315,6 +317,7 @@ impl ConnectionDriver {
         &mut self,
         session: RemoteSession,
         cell_id: CellId,
+        interrupt_cause: Option<CancellationCause>,
         response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
     ) -> bool {
         if let Err(err) = self.sessions.require_ready(&session) {
@@ -333,6 +336,7 @@ impl ConnectionDriver {
             HostRequest::Terminate {
                 session_id: session.id.clone(),
                 cell_id,
+                interrupt_cause,
             },
             PendingRequest::Terminate {
                 session,

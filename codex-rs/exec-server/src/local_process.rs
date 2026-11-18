@@ -37,7 +37,9 @@ use crate::protocol::ExecExitedNotification;
 use crate::protocol::ExecOutputStream;
 use crate::protocol::ExecParams;
 use crate::protocol::ExecResponse;
+use crate::protocol::ProcessCaptureGap;
 use crate::protocol::ProcessOutputChunk;
+use crate::protocol::ProcessOutputGap;
 use crate::protocol::ProcessSignal;
 use crate::protocol::ReadParams;
 use crate::protocol::ReadResponse;
@@ -90,6 +92,7 @@ struct RunningProcess {
     output: VecDeque<RetainedOutputChunk>,
     retained_bytes: usize,
     last_evicted_seq: u64,
+    capture_gaps: Vec<ProcessCaptureGap>,
     next_seq: u64,
     exit_seq: Option<u64>,
     exit_code: Option<i32>,
@@ -531,6 +534,7 @@ impl LocalProcess {
                     output: VecDeque::new(),
                     retained_bytes: 0,
                     last_evicted_seq: 0,
+                    capture_gaps: Vec::new(),
                     next_seq: 1,
                     exit_seq: None,
                     exit_code: None,
@@ -661,6 +665,15 @@ impl LocalProcess {
                 if params.max_bytes.is_none() {
                     next_seq = process.next_seq;
                 }
+                let capture_incomplete = process
+                    .capture_gaps
+                    .iter()
+                    .copied()
+                    .filter(|gap| gap.seq > after_seq && gap.seq < next_seq)
+                    .collect::<Vec<_>>();
+                let through_seq = capture_incomplete
+                    .last()
+                    .map_or(process.last_evicted_seq, |gap| gap.seq.max(process.last_evicted_seq));
                 (
                     ReadResponse {
                         chunks: Vec::new(),
@@ -669,12 +682,13 @@ impl LocalProcess {
                         exit_code: process.exit_code,
                         closed: process.closed,
                         failure: process.failure.clone(),
-                        output_gap: (after_seq < process.last_evicted_seq).then_some(
-                            crate::protocol::ProcessOutputGap {
-                                through_seq: process.last_evicted_seq,
-                                exit_seq: process.exit_seq,
-                            },
-                        ),
+                        output_gap: (after_seq < through_seq).then_some(ProcessOutputGap {
+                            through_seq,
+                            exit_seq: process.exit_seq,
+                            evicted_through_seq: (!capture_incomplete.is_empty())
+                                .then_some(process.last_evicted_seq),
+                            capture_incomplete,
+                        }),
                         sandbox_denied: process.sandbox_denied,
                     },
                     // Register before releasing the state lock: notify_waiters does
@@ -1265,9 +1279,10 @@ async fn finish_output_stream(process_id: ProcessId, stream: ExecOutputStream, i
             // bytes were received. Reuse the existing live/read gap contract.
             let through_seq = process.next_seq;
             process.next_seq += 1;
-            process.last_evicted_seq = through_seq;
-            // Name the stream, so consumers report capture loss rather than
-            // receiver lag. The read/replay gap contract stays reason-free.
+            // At most one position per stream. Retain it independently so
+            // reconnect/lag recovery neither discards earlier retained bytes
+            // nor mistakes missing producer EOF for an evicted prefix.
+            process.capture_gaps.push(ProcessCaptureGap { seq: through_seq, stream });
             process.events.publish(ExecProcessEvent::OutputGap {
                 through_seq,
                 capture_incomplete: Some(stream),
@@ -1415,27 +1430,13 @@ async fn forward_process_notifications(
                         .collect::<Vec<_>>();
                     let notification_gap = retained.iter().map(|chunk| chunk.seq.saturating_sub(1))
                         .min().unwrap_or(0).max(process.last_evicted_seq);
-                    let mut replay = Vec::new();
-                    // A retained exit can be the sequence immediately before
-                    // the replay suffix. Do not advance the gap cursor over it:
-                    // the normal duplicate fence would then discard the exit.
-                    if let (Some(seq), Some(_)) = (process.exit_seq, process.exit_code)
-                        && seq > last_seq && seq <= notification_gap
-                    {
-                        let through_seq = seq.saturating_sub(1);
-                        if through_seq > last_seq {
-                            replay.push((through_seq, ExecProcessEvent::OutputGap {
-                                through_seq,
-                                capture_incomplete: None,
-                            }));
-                        }
-                    }
-                    if notification_gap > last_seq && process.exit_seq != Some(notification_gap) {
-                        replay.push((notification_gap, ExecProcessEvent::OutputGap {
-                            through_seq: notification_gap,
-                            capture_incomplete: None,
-                        }));
-                    }
+                    let mut replay = process.capture_gaps.iter()
+                        .filter(|gap| gap.seq > last_seq)
+                        .map(|gap| (gap.seq, ExecProcessEvent::OutputGap {
+                            through_seq: gap.seq,
+                            capture_incomplete: Some(gap.stream),
+                        }))
+                        .collect::<Vec<_>>();
                     if let (Some(seq), Some(exit_code)) = (process.exit_seq, process.exit_code)
                         && seq > last_seq
                     {
@@ -1457,7 +1458,25 @@ async fn forward_process_notifications(
                     let mut replay = replay.into_iter().map(|(seq, event)| (seq, Arc::new(event))).collect::<Vec<_>>();
                     replay.extend(retained.into_iter().map(|chunk| (chunk.seq, chunk.event)));
                     replay.sort_by_key(|(seq, _)| *seq);
-                    pending.extend(replay.into_iter().map(|(_, event)| event));
+                    // Emit missing intervals without crossing known events.
+                    // In particular the cursor must not skip a retained exit
+                    // or a capture-loss position when earlier bytes were evicted.
+                    let mut cursor = last_seq;
+                    for (seq, event) in replay {
+                        let through_seq = notification_gap.min(seq.saturating_sub(1));
+                        if through_seq > cursor {
+                            pending.push_back(Arc::new(ExecProcessEvent::OutputGap {
+                                through_seq, capture_incomplete: None,
+                            }));
+                        }
+                        pending.push_back(event);
+                        cursor = cursor.max(seq);
+                    }
+                    if notification_gap > cursor {
+                        pending.push_back(Arc::new(ExecProcessEvent::OutputGap {
+                            through_seq: notification_gap, capture_incomplete: None,
+                        }));
+                    }
                     continue;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,

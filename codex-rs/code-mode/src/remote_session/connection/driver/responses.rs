@@ -387,6 +387,7 @@ impl ConnectionDriver {
             HostRequest::Terminate {
                 session_id: session.id.clone(),
                 cell_id: cell_id.clone(),
+                interrupt_cause: None,
             },
             PendingRequest::Terminate {
                 session,

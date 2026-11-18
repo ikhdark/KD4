@@ -1252,8 +1252,15 @@ impl ToolSearchHandler {
                     ))
                 })
                 .collect::<String>();
+            // Eager native tools are outside this deferred index. Give a
+            // conditional call hint without implying the tool is available.
+            let guidance = if key.source.is_none() && key.query == "read_file" {
+                "If `read_file` is in your tool list, call it directly; this search does not load it."
+            } else {
+                "Use plain-language capability terms to search for alternatives."
+            };
             return Err(FunctionCallError::RespondToModel(format!(
-                "No deferred tool by these exact names exists in the current inventory: {}. Use plain-language capability terms to search for alternatives.{grouped}",
+                "No deferred tool by these exact names exists in the current inventory: {}. {guidance}{grouped}",
                 missing_names
                     .iter()
                     .map(String::as_str)

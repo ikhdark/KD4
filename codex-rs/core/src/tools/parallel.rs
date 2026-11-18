@@ -35,6 +35,7 @@ use crate::tools::context::RequiredToolTerminal;
 use crate::tools::context::RequiredToolTerminalCause;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolDispatchAbort;
+use crate::tools::context::ToolDispatchSettlement;
 use crate::tools::context::ToolDispatchState;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -49,11 +50,13 @@ use crate::tools::tool_dispatch_trace::ToolDispatchTiming;
 use crate::tools::tool_dispatch_trace::scope_tool_dispatch_timing;
 use crate::turn_timing::ToolCallTimingLineage;
 use crate::turn_timing::TurnTimingState;
+use codex_code_mode::CancellationCause;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::ToolLifecycleBoundary;
+use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnTimingToolCallSource;
 use codex_tools::ToolOutputOutcome;
 use codex_tools::ToolOutputOutcomeContext;
@@ -262,6 +265,15 @@ impl Drop for ModelToolGateTimingGuard {
             turn_timing_state.record_model_tool_gate_released();
         }
     }
+}
+
+pub(super) fn is_ordinary_turn_interruption(cause: Option<CancellationCause>) -> bool {
+    matches!(
+        cause,
+        Some(CancellationCause::TurnAborted {
+            reason: TurnAbortReason::Interrupted,
+        })
+    )
 }
 
 fn tool_dispatch_outcome_label(result: &Result<AnyToolResult, FunctionCallError>) -> &'static str {
@@ -1323,6 +1335,8 @@ impl ToolCallRuntime {
                 registration.ordinal,
                 &format!("argument-parse:{message}"),
                 false,
+                None,
+                None,
             );
         }
     }
@@ -1540,8 +1554,9 @@ impl ToolCallRuntime {
         call_id: &str,
         tool_name: &codex_tools::ToolName,
         payload: Option<&ToolPayload>,
-        failure_fingerprint: String,
+        settlement: Option<&ToolDispatchSettlement>,
         failure_message: &str,
+        failure: Option<&codex_protocol::tool_failure::ToolFailure>,
     ) {
         let Some(collector) = &self.sampling_request_signals else {
             return;
@@ -1583,8 +1598,9 @@ impl ToolCallRuntime {
             &semantic_tool_name,
             payload,
             source_dependencies,
-            failure_fingerprint,
+            settlement,
             failure_message,
+            failure,
         );
     }
 
@@ -1968,6 +1984,10 @@ impl ToolCallRuntime {
                         crate::tools::registry::model_delivery_unavailable_receipt(&error_call.call_id)
                     });
                     response.reconcile_settled_history_candidate(&self.session).await;
+                    let producer_response = (signal_collector.is_some()
+                        && signal_ordinal.is_some()
+                        && response.operation_history.is_some())
+                    .then(|| response.response_before_operation_history());
                     let response = response.into_response();
                     evidence_timing.record_output_projection(projection_started.elapsed());
                     // Code-mode carriers capture their baseline after the handler.
@@ -2056,8 +2076,9 @@ impl ToolCallRuntime {
                             ordinal,
                             outcome_context,
                             signal,
-                            &response,
+                            producer_response.as_ref().unwrap_or(&response),
                             canonical_artifact_required,
+                            dispatch_state.result_settlement(),
                         );
                     }
                     Ok(ToolCallCompletion {
@@ -2069,7 +2090,9 @@ impl ToolCallRuntime {
                 }
                 Err(FunctionCallError::Fatal(message)) => {
                     if let (Some(collector), Some(ordinal)) = (&signal_collector, signal_ordinal) {
-                        collector.record_failure(ordinal, &format!("fatal:{message}"), true);
+                        collector.record_failure(
+                            ordinal, &format!("fatal:{message}"), true, None, None,
+                        );
                     }
                     Err(CodexErr::Fatal(message))
                 }
@@ -2081,10 +2104,13 @@ impl ToolCallRuntime {
                         false
                     };
                     if let (Some(collector), Some(ordinal)) = (&signal_collector, signal_ordinal) {
+                        let owner_failure = other.failure();
                         collector.record_failure(
                             ordinal,
-                            &other.model_message(),
+                            &owner_failure.model_message(),
                             terminal_cause.is_some(),
+                            dispatch_state.error_settlement(),
+                            Some(&owner_failure),
                         );
                     }
                     let failure_detail = Self::search_failure_detail(&error_call, &other);
@@ -2532,10 +2558,12 @@ impl ToolCallRuntime {
                         .source_dependencies
                         .is_empty();
                 if tracks_workspace {
-                    timing.record_boundary(ToolLifecycleBoundary::DiffTrackerWaitStart);
                     // Like the gates: an uncontended acquisition is not
                     // contention, even when Tokio's coop budget defers lock().
-                    let mut guard = if let Ok(guard) = tracker.try_lock() {
+                    let immediate = tracker.try_lock();
+                    let waits = immediate.is_err();
+                    timing.record_boundary_with_live_gate(ToolLifecycleBoundary::DiffTrackerWaitStart, waits);
+                    let mut guard = if let Ok(guard) = immediate {
                         guard
                     } else {
                         crate::tools::tool_dispatch_trace::observe_resource_wait(
@@ -2551,9 +2579,10 @@ impl ToolCallRuntime {
                         guard.record_read_only_command_call(&evidence_call.call_id);
                     }
                     drop(guard);
-                    timing.record_boundary(ToolLifecycleBoundary::DiffTrackerWaitEnd);
+                    timing.record_boundary_with_live_gate(ToolLifecycleBoundary::DiffTrackerWaitEnd, waits);
                 }
-                timing.record_boundary(ToolLifecycleBoundary::WorkspaceGateWaitStart);
+                let enters_workspace_gate = hook_lease.is_none() && !workspace_admission.bypass_outer_gate;
+                timing.record_boundary_with_live_gate(ToolLifecycleBoundary::WorkspaceGateWaitStart, enters_workspace_gate);
                 let mut gate_guard = if let Some(lease) = &hook_lease {
                     Some(WorkspaceGateGuard::HookExclusive {
                         _guard: Arc::clone(lease),
@@ -2639,7 +2668,7 @@ impl ToolCallRuntime {
                         },
                     )
                 };
-                timing.record_boundary(ToolLifecycleBoundary::WorkspaceGateWaitEnd);
+                timing.record_boundary_with_live_gate(ToolLifecycleBoundary::WorkspaceGateWaitEnd, enters_workspace_gate);
                 if admission_cancellation_token.is_cancelled()
                     || !admit_code_mode_user_intent(
                         &session,
@@ -2687,9 +2716,11 @@ impl ToolCallRuntime {
                             // The repository lease must precede baseline work. A queued
                             // call must neither spend Git/disk resources nor carry an
                             // observation made before its execution boundary.
-                            timing.record_boundary(ToolLifecycleBoundary::EvidenceTrackerWaitStart);
+                            let immediate = evidence_tracker.try_lock();
+                            let waits = immediate.is_err();
+                            timing.record_boundary_with_live_gate(ToolLifecycleBoundary::EvidenceTrackerWaitStart, waits);
                             let admitted_mutation_revision =
-                                if let Ok(guard) = evidence_tracker.try_lock() {
+                                if let Ok(guard) = immediate {
                                     guard.current_mutation_revision()
                                 } else {
                                     crate::tools::tool_dispatch_trace::observe_resource_wait(
@@ -2702,7 +2733,7 @@ impl ToolCallRuntime {
                                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
                                     Some(admitted_mutation_revision);
                             }
-                            timing.record_boundary(ToolLifecycleBoundary::EvidenceTrackerWaitEnd);
+                            timing.record_boundary_with_live_gate(ToolLifecycleBoundary::EvidenceTrackerWaitEnd, waits);
                             let evidence_capture_started = Instant::now();
                             let baseline = WorkspaceEvidenceBaseline;
                             let capture_duration = evidence_capture_started.elapsed();
@@ -2904,6 +2935,8 @@ impl ToolCallRuntime {
                                 return Self::joined_tool_result(dispatch_handle.await, &dispatch_state).await;
                             }
                         };
+                        let interrupted =
+                            is_ordinary_turn_interruption(abort_source.cancellation_cause());
                         let mut cancellation_recovery: Option<serde_json::Value>;
                         let secs = started.elapsed().as_secs_f32();
                         abort_dispatch_span.record("aborted", true);
@@ -2993,6 +3026,11 @@ impl ToolCallRuntime {
                             abort_source,
                         )
                         .await;
+                        // Only the abort owner, not a failed tool result or a
+                        // late enclosing turn terminal, can mark this outcome.
+                        if interrupted {
+                            cancellation_timing.record_outcome("interrupted");
+                        }
                         Ok(response)
                     }
                 },

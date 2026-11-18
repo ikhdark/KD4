@@ -492,22 +492,26 @@ fn validation_mode_for_new_user_turn(
 
 /// Queues an inter-agent message, then lets the shared pending-work scheduler
 /// decide whether an idle session should start a regular turn.
-pub async fn inter_agent_communication(
+async fn inter_agent_communication(
     sess: &Arc<Session>,
     sub_id: String,
     communication: InterAgentCommunication,
-    admission: Option<tokio::sync::oneshot::Sender<CodexResult<()>>>,
+    admission: Option<super::MailboxAdmission>,
 ) {
     let trigger_turn = communication.trigger_turn;
+    let (ack, validation_origin) = match admission {
+        Some(admission) => (Some(admission.ack), admission.validation_origin),
+        None => (None, None),
+    };
     let result = sess
         .input_queue
-        .enqueue_mailbox_communication(communication)
+        .enqueue_mailbox_communication_with_origin(communication, validation_origin)
         .await;
     let accepted = matches!(&result, Ok(true));
     // Acknowledge queue admission before scheduling a turn, which can itself
     // communicate with other agents. Senders must not wait for turn startup.
-    if let Some(admission) = admission {
-        let _ = admission.send(result.map(|_| ()));
+    if let Some(ack) = ack {
+        let _ = ack.send(result.map(|_| ()));
     }
     if !accepted {
         return;

@@ -77,3 +77,10 @@ This is not a copy of every phase record: provider request IDs, service-tier
 receipts and server-publication events still require their corresponding
 telemetry. Missing fields, evicted attempts and summaries marked `complete: false`
 retain their availability and partial-stream qualifications.
+
+The admitted completion can report `provider_observations.reasoning_input` in
+that same attempt summary. `effective_context` describes the provider-reported
+reasoning context. `transformations` contains at most 128 item IDs, actions,
+reasons and types; no reasoning content is recorded. `reported` with an empty
+list differs from `unavailable`, `malformed`, or `truncated`. A reported
+removal is evidence of withholding, not a measure of what the model relied on.

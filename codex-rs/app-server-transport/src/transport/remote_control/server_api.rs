@@ -239,15 +239,16 @@ where
 {
     let auth_headers = auth.request_headers()?;
     request_state.admit_request()?;
-    let response = client
+    let request = client
         .post(url)
         .timeout(timeout)
         .headers(auth_headers)
         .header(REMOTE_CONTROL_INSTALLATION_ID_HEADER, installation_id)
         .header("user-agent", remote_control_user_agent())
-        .json(request)
-        .send()
-        .await
+        .json(request);
+    let response = auth
+        .dispatch_request(request.send())
+        .await?
         .map_err(|err| {
             let timed_out = err.is_timeout();
             RemoteControlServerRequestError::io_error(

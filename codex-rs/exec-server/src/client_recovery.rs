@@ -68,10 +68,10 @@ pub fn replay_process_events(
     }
     // The response is already transport-bounded. This private log must not evict
     // small events merely because the ordinary subscriber replay holds only 256.
-    // Recovered events are the chunks plus exit, close and trigger; each may be
-    // preceded by one declared gap, and one gap may trail them.
+    // Recovered events are the chunks plus exit, close, trigger and up to two
+    // producer capture losses; each may be preceded by one eviction gap.
     let mut state = SessionState::with_event_log(false, crate::process::ExecProcessEventLog::new(
-        response.chunks.len().saturating_mul(2).saturating_add(7),
+        response.chunks.len().saturating_mul(2).saturating_add(11),
         usize::MAX,
     ));
     {
@@ -305,7 +305,19 @@ impl SessionState {
             .output_gap
             .as_ref()
             .ok_or_else(|| recovery_gap_error(target))?;
+        let evicted_through_seq = gap.evicted_through_seq.unwrap_or(gap.through_seq);
         if gap.through_seq > target
+            || evicted_through_seq > gap.through_seq
+            || gap.capture_incomplete.len() > 2
+            || gap.evicted_through_seq.is_some() == gap.capture_incomplete.is_empty()
+            || gap.capture_incomplete.windows(2).any(|pair| pair[0].seq >= pair[1].seq)
+            || gap.capture_incomplete.last().is_some_and(|capture| {
+                evicted_through_seq.max(capture.seq) != gap.through_seq
+            })
+            || gap.capture_incomplete.iter().any(|capture| {
+                capture.seq == 0 || Some(capture.seq) == gap.exit_seq
+                    || (response.closed && capture.seq == target)
+            })
             || response.exited != gap.exit_seq.is_some()
             || gap
                 .exit_seq
@@ -335,6 +347,14 @@ impl SessionState {
         let mut recovered = std::collections::BTreeMap::new();
         for chunk in response.chunks {
             recovered.insert(chunk.seq, ExecProcessEvent::Output(chunk));
+        }
+        for capture in &gap.capture_incomplete {
+            if recovered.insert(capture.seq, ExecProcessEvent::OutputGap {
+                through_seq: capture.seq,
+                capture_incomplete: Some(capture.stream),
+            }).is_some() {
+                return Err(recovery_gap_error(target));
+            }
         }
         if let Some(seq) = gap.exit_seq {
             recovered.insert(
@@ -370,12 +390,12 @@ impl SessionState {
             .copied()
             .filter(|seq| *seq > last_published_seq)
         {
-            if seq > cursor.saturating_add(1) && seq - 1 > gap.through_seq {
+            if seq > cursor.saturating_add(1) && seq - 1 > evicted_through_seq {
                 return Err(recovery_gap_error(target));
             }
             cursor = seq;
         }
-        if cursor < target && target > gap.through_seq {
+        if cursor < target && target > evicted_through_seq {
             return Err(recovery_gap_error(target));
         }
         ordered.pending.retain(|seq, _| *seq > target);

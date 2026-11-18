@@ -563,6 +563,7 @@
         enclosing = false,
         context_lines = 3,
         max_hydrated_files = 8,
+        preferred_paths = [],
         count_only = false,
         overlapping = false,
       } = {},
@@ -626,6 +627,9 @@
       integer(max_per_file, 1, 1000, "max_per_file");
       integer(context_lines, 0, 20, "context_lines");
       integer(max_hydrated_files, 1, 32, "max_hydrated_files");
+      if (!Array.isArray(preferred_paths) || preferred_paths.length > 32 ||
+          preferred_paths.some(path => typeof path !== "string" || !path.trim()))
+        throw new TypeError("preferred_paths must be an array of at most 32 nonempty search-result paths");
       hydrate ||= enclosing;
       lines ||= hydrate;
       const jsonSearch = lines || multi || count_only || overlapping;
@@ -1044,7 +1048,15 @@
         const encoder = new TextEncoder();
         // Serial reads add no detached tasks or new scheduler/lock lifetime.
         // A failed file never discards successful search/read siblings.
-        for (const entry of sorted) {
+        const rank = new Map();
+        for (const path of preferred_paths) {
+          const key = normalizePath(path.replaceAll("\\", "/"));
+          if (!rank.has(key)) rank.set(key, rank.size);
+        }
+        const priority = entry => rank.get(entry.path?.replaceAll("\\", "/")) ?? rank.size;
+        const order = rank.size ? [...sorted].sort((left, right) =>
+          priority(left) - priority(right)) : sorted;
+        for (const entry of order) {
           const hits = hydrationHits.get(entry) ?? [];
           const reasons = [];
           let truncated = false;

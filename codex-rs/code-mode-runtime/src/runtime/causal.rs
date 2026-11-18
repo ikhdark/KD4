@@ -1,20 +1,58 @@
 //! Bounded async provenance, not a scheduler or an interpretation of JS source.
-//! Private promise IDs retain no promise/value handles. Promise.all/allSettled/
-//! race/any over arrays of intrinsic promises or plain values join through the
-//! members V8 actually settled; other aggregate shapes and retention loss stay
-//! unknown rather than inventing fork edges. Timestamps never create an edge.
+//! Private promise IDs and weak settlement probes do not retain JS results.
+//! The intrinsic aggregate algorithms run on the original arguments. Only
+//! proven member reactions can supply aggregate edges; unsupported shapes
+//! and retention loss stay unknown. Timestamps never create an edge.
 use std::collections::{BTreeMap, BTreeSet};
 use super::RuntimeState;
 
 const LIMIT: usize = 8192;
 const AGGREGATE_MEMBERS: u32 = 1024;
 const AGGREGATE_DEPTH: usize = 16;
+const WALK_STEPS: usize = LIMIT;
+const MAX_PREDECESSORS: usize = 128;
 
-/// Members observed by the private aggregate wrapper. `None` is a plain value
-/// (no dependency); an unsupported member makes the whole aggregate unknown.
-struct Aggregate {
-    join_all: bool,
-    members: Option<Vec<Option<usize>>>,
+#[derive(Clone, Copy)]
+enum AggregateKind {
+    All,
+    AllSettled,
+    Race,
+    Any,
+}
+
+enum Aggregate {
+    Unknown,
+    Pending {
+        kind: AggregateKind,
+        // Exact reaction promise IDs bound during builtin registration.
+        // A primitive has a reaction but no tool dependency.
+        reactions: BTreeMap<usize, Option<usize>>,
+        probe: Option<v8::Weak<v8::Promise>>,
+    },
+    Consumed(Vec<usize>),
+}
+
+struct Settlement {
+    aggregate: usize,
+    reaction: usize,
+    probe: v8::Weak<v8::Promise>,
+}
+
+struct Reaction {
+    previous: Option<usize>,
+    settlements: Vec<Settlement>,
+}
+
+struct Walk {
+    remaining: usize,
+    memo: BTreeMap<(usize, usize), Option<Vec<String>>>,
+}
+
+impl Walk {
+    fn step(&mut self) -> Option<()> {
+        self.remaining = self.remaining.checked_sub(1)?;
+        Some(())
+    }
 }
 
 #[derive(Default)]
@@ -23,10 +61,6 @@ struct Promise {
     tool: Option<String>,
     helper: Option<String>,
     aggregate: Option<Aggregate>,
-    /// Order of this promise's first V8 resolve/reject hook.
-    settled: Option<u64>,
-    /// Reaction whose job was running when the first resolve hook fired.
-    resolved_by: Option<usize>,
 }
 
 #[derive(Default)]
@@ -34,9 +68,8 @@ pub(super) struct Capture {
     key: Option<v8::Global<v8::Private>>,
     promises: Vec<Promise>,
     current: Option<usize>,
-    stack: Vec<Option<usize>>,
+    stack: Vec<Reaction>,
     received: u64,
-    resolves: u64,
     dropped: bool,
     graph_deps: BTreeMap<String, Vec<String>>,
     graph_calls: BTreeMap<String, Vec<String>>,
@@ -101,58 +134,79 @@ impl Capture {
         // Before any tool result arrives there cannot be a result-consumption
         // dependency on another nested tool. All such calls form root forks.
         if self.received == 0 { return Some(Vec::new()); }
-        self.walk(self.current, 0)
+        self.walk(self.current, 0, &mut Walk { remaining: WALK_STEPS, memo: BTreeMap::new() })
     }
 
-    fn walk(&self, start: Option<usize>, depth: usize) -> Option<Vec<String>> {
+    fn walk(&self, start: Option<usize>, depth: usize, walk: &mut Walk) -> Option<Vec<String>> {
         let mut next = start;
-        let mut seen = BTreeSet::new();
-        while let Some(id) = next {
-            if !seen.insert(id) { return None; }
-            let row = self.promises.get(id)?;
-            if let Some(tool) = &row.tool { return Some(vec![tool.clone()]); }
-            if let Some(helper) = &row.helper { return self.helper_join(helper); }
-            if let Some(aggregate) = &row.aggregate { return self.aggregate_join(row, aggregate, depth); }
-            next = row.parent;
-        }
-        None
-    }
-
-    /// all/allSettled consume every member only when each member settled before
-    /// the aggregate. Otherwise (early all rejection, race, any) the aggregate
-    /// was settled inside exactly one member's reaction; that member is the
-    /// consumed result. A settling context outside the members stays unknown.
-    fn aggregate_join(&self, row: &Promise, aggregate: &Aggregate, depth: usize) -> Option<Vec<String>> {
-        if depth >= AGGREGATE_DEPTH { return None; }
-        let members = aggregate.members.as_ref()?;
-        let resolved = row.settled?;
-        if members.is_empty() { return Some(Vec::new()); }
-        let all_before = members.iter().flatten().all(|member| self.promises.get(*member)
-            .and_then(|member| member.settled).is_some_and(|settled| settled < resolved));
-        if aggregate.join_all && all_before {
-            let mut result = BTreeSet::new();
-            for member in members.iter().flatten() {
-                result.extend(self.walk(Some(*member), depth + 1)?);
+        let mut path = Vec::new();
+        let result = loop {
+            walk.step()?;
+            let Some(id) = next else { break None; };
+            let key = (id, depth);
+            if let Some(result) = walk.memo.get(&key) { break result.clone(); }
+            // The same key reached while still visiting it is a cycle.
+            walk.memo.insert(key, None);
+            path.push(key);
+            let Some(row) = self.promises.get(id) else { break None; };
+            if let Some(tool) = &row.tool { break Some(vec![tool.clone()]); }
+            if let Some(helper) = &row.helper { break self.helper_join(helper); }
+            if let Some(aggregate) = &row.aggregate {
+                break self.aggregate_join(aggregate, depth, walk);
             }
-            return (result.len() <= 128).then(|| result.into_iter().collect());
+            next = row.parent;
+        };
+        for key in path {
+            walk.memo.insert(key, result.clone());
         }
-        let mut next = row.resolved_by;
-        let mut seen = BTreeSet::new();
-        while let Some(id) = next {
-            if !seen.insert(id) { return None; }
-            if members.contains(&Some(id)) { return self.walk(Some(id), depth + 1); }
-            next = self.promises.get(id)?.parent;
-        }
-        None
+        result
     }
 
-    fn resolved(&mut self, id: Option<usize>) {
-        let current = self.current;
-        let Some(row) = id.and_then(|id| self.promises.get_mut(id)) else { return; };
-        if row.settled.is_some() { return; }
-        self.resolves = self.resolves.saturating_add(1);
-        row.settled = Some(self.resolves);
-        row.resolved_by = current;
+    fn aggregate_join(&self, aggregate: &Aggregate, depth: usize, walk: &mut Walk) -> Option<Vec<String>> {
+        if depth >= AGGREGATE_DEPTH { return None; }
+        let Aggregate::Consumed(members) = aggregate else { return None; };
+        let mut result = BTreeSet::new();
+        for &member in members {
+            walk.step()?;
+            result.extend(self.walk(Some(member), depth + 1, walk)?);
+            if result.len() > MAX_PREDECESSORS { return None; }
+        }
+        Some(result.into_iter().collect())
+    }
+
+    fn resolving(&mut self, aggregate: Option<usize>) {
+        let Some(aggregate) = aggregate else { return; };
+        let Some(row) = self.promises.get_mut(aggregate) else { return; };
+        let Some(Aggregate::Pending { reactions, probe, .. }) = row.aggregate.as_mut() else { return; };
+        let (Some(frame), Some(reaction), Some(probe)) =
+            (self.stack.last_mut(), self.current, probe.take())
+        else {
+            // A second Resolve in the same job can be an abrupt thenable
+            // lookup, not the rejection arm of the combinator.
+            row.aggregate = Some(Aggregate::Unknown);
+            return;
+        };
+        if reactions.contains_key(&reaction) {
+            frame.settlements.push(Settlement { aggregate, reaction, probe });
+        } else {
+            row.aggregate = Some(Aggregate::Unknown);
+        }
+    }
+
+    fn settled(&mut self, token: Settlement, state: Option<v8::PromiseState>) {
+        use v8::PromiseState::{Fulfilled, Rejected};
+        use AggregateKind::{All, AllSettled, Any, Race};
+        let Some(row) = self.promises.get_mut(token.aggregate) else { return; };
+        let Some(Aggregate::Pending { kind, reactions, .. }) = row.aggregate.as_ref() else { return; };
+        row.aggregate = Some(match (kind, state) {
+            (All | AllSettled, Some(Fulfilled)) | (Any, Some(Rejected)) =>
+                Aggregate::Consumed(reactions.values().flatten().copied().collect()),
+            (All, Some(Rejected)) | (Any, Some(Fulfilled)) | (Race, Some(Fulfilled | Rejected)) =>
+                Aggregate::Consumed(reactions[&token.reaction].into_iter().collect()),
+            // Resolve ran, but the promise was not observably settled in
+            // that exact reaction. Do not assign thenable adoption by guess.
+            _ => Aggregate::Unknown,
+        });
     }
 }
 
@@ -197,19 +251,28 @@ pub(super) unsafe extern "C" fn promise_hook(
             let id = identity(scope, promise);
             if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
                 if state.causal.stack.len() >= LIMIT { state.causal.dropped = true; return; }
-                state.causal.stack.push(state.causal.current);
+                state.causal.stack.push(Reaction { previous: state.causal.current, settlements: Vec::new() });
                 state.causal.current = id;
             }
         }
         v8::PromiseHookType::After => {
-            if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
-                state.causal.current = state.causal.stack.pop().flatten();
+            if let Some(frame) = scope.get_slot_mut::<RuntimeState>().and_then(|state| {
+                let frame = state.causal.stack.pop()?;
+                state.causal.current = frame.previous;
+                Some(frame)
+            }) {
+                for probe in frame.settlements {
+                    let outcome = probe.probe.to_local(scope).map(|promise| promise.state());
+                    if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
+                        state.causal.settled(probe, outcome);
+                    }
+                }
             }
         }
         v8::PromiseHookType::Resolve => {
             // Fires before the state change, for resolve and reject alike.
             let id = identity(scope, promise);
-            if let Some(state) = scope.get_slot_mut::<RuntimeState>() { state.causal.resolved(id); }
+            if let Some(state) = scope.get_slot_mut::<RuntimeState>() { state.causal.resolving(id); }
         }
     }
 }
@@ -260,36 +323,201 @@ pub(super) fn bind_helper(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<'_,
     }
 }
 
-/// Membership reported by the private wrapper around the intrinsic Promise
-/// statics after the original builtin returned. Reads only V8 type checks,
-/// prototypes and own-property presence; never a getter or user property.
-/// Members are intrinsic promises without an own `then`, or primitives.
+/// Inspect an own descriptor field without reading the target property. This
+/// must only be used on ordinary objects (callers exclude user proxies).
+fn descriptor_field<'s>(
+    scope: &mut v8::PinScope<'s, '_>, object: v8::Local<'s, v8::Object>,
+    key: v8::Local<'s, v8::Name>, field: &str,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let descriptor = v8::Local::<v8::Object>::try_from(object.get_own_property_descriptor(scope, key)?).ok()?;
+    let field = v8::String::new(scope, field)?;
+    if descriptor.has_own_property(scope, field.into()) != Some(true) { return None; }
+    descriptor.get(scope, field.into())
+}
+
+fn descriptor_matches<'s>(
+    scope: &mut v8::PinScope<'s, '_>, object: v8::Local<'s, v8::Object>,
+    key: v8::Local<'s, v8::Name>, field: &str, expected: v8::Local<'s, v8::Value>,
+) -> bool {
+    descriptor_field(scope, object, key, field).is_some_and(|value| value.strict_equals(expected))
+}
+
+/// Bootstrap invoked once from promise_aggregates.js. The proxy traps only
+/// calls; properties, descriptors and constructability come from the builtin.
+/// Keeping the apply trap native avoids JS wrapper frames and forwards the
+/// engine-provided raw receiver (including undefined and primitive receivers).
 pub(super) fn aggregate(
-    scope: &mut v8::PinScope<'_, '_>, join_all: bool,
-    result: v8::Local<'_, v8::Value>, members: v8::Local<'_, v8::Value>,
+    scope: &mut v8::PinScope<'_, '_>, _bootstrap: bool,
+    constructor: v8::Local<'_, v8::Value>, prototypes: v8::Local<'_, v8::Value>,
 ) {
-    let Ok(result) = v8::Local::<v8::Promise>::try_from(result) else { return; };
-    let Some(index) = identity(scope, result) else { return; };
-    let prototype = result.get_prototype(scope);
-    let then = v8::String::new(scope, "then");
-    let rows = v8::Local::<v8::Array>::try_from(members).ok()
-        .filter(|members| members.length() <= AGGREGATE_MEMBERS)
-        .zip(prototype).zip(then).and_then(|((members, prototype), then)| {
-            let mut rows = Vec::new();
-            for position in 0..members.length() {
-                let member = members.get_index(scope, position)?;
-                if !member.is_object() { rows.push(None); continue; }
-                let promise = v8::Local::<v8::Promise>::try_from(member).ok()?;
-                let intrinsic = promise.get_prototype(scope)
-                    .is_some_and(|value| value.strict_equals(prototype))
-                    && promise.has_own_property(scope, then.into()) == Some(false);
-                if !intrinsic { return None; }
-                rows.push(Some(identity(scope, promise)?));
-            }
-            Some(rows)
-        });
+    let _ = install_aggregates(scope, constructor, prototypes);
+}
+
+fn install_aggregates<'s>(
+    scope: &mut v8::PinScope<'s, '_>, constructor: v8::Local<'_, v8::Value>,
+    prototypes: v8::Local<'_, v8::Value>,
+) -> Option<()> {
+    let constructor = v8::Local::new(scope, v8::Local::<v8::Object>::try_from(constructor).ok()?);
+    let prototypes = v8::Local::<v8::Array>::try_from(prototypes).ok()?;
+    let array = v8::Local::<v8::Object>::try_from(prototypes.get_index(scope, 0)?).ok()?;
+    let array_iterator = v8::Local::<v8::Object>::try_from(prototypes.get_index(scope, 1)?).ok()?;
+    let species_key = v8::Local::<v8::Name>::try_from(prototypes.get_index(scope, 2)?).ok()?;
+    let prototype_key = v8::String::new(scope, "prototype")?;
+    let resolve_key = v8::String::new(scope, "resolve")?;
+    let then_key = v8::String::new(scope, "then")?;
+    let next_key = v8::String::new(scope, "next")?;
+    let iterator_key = v8::Symbol::get_iterator(scope);
+    let prototype = v8::Local::<v8::Object>::try_from(
+        descriptor_field(scope, constructor, prototype_key.into(), "value")?
+    ).ok()?;
+    let resolve = descriptor_field(scope, constructor, resolve_key.into(), "value")?;
+    let then = descriptor_field(scope, prototype, then_key.into(), "value")?;
+    let iterator = descriptor_field(scope, array, iterator_key.into(), "value")?;
+    let next = descriptor_field(scope, array_iterator, next_key.into(), "value")?;
+    let species = descriptor_field(scope, constructor, species_key, "get")?;
+    let intrinsics = v8::Array::new_with_elements(scope, &[
+        constructor.into(), prototype.into(), resolve, then, array.into(),
+        array_iterator.into(), iterator, next, species_key.into(), species,
+    ]);
+    let apply = v8::String::new(scope, "apply")?;
+    for (kind, name) in ["all", "allSettled", "race", "any"].into_iter().enumerate() {
+        let key = v8::String::new(scope, name)?;
+        let original = v8::Local::<v8::Object>::try_from(
+            descriptor_field(scope, constructor, key.into(), "value")?
+        ).ok()?;
+        let mode = v8::Integer::new_from_unsigned(scope, kind as u32);
+        let data = v8::Array::new_with_elements(scope, &[mode.into(), intrinsics.into()]);
+        let trap = v8::Function::builder(apply_aggregate).data(data.into()).build(scope)?;
+        let handler = v8::Object::new(scope);
+        let null = v8::null(scope);
+        if handler.set_prototype(scope, null.into()) != Some(true)
+            || handler.create_data_property(scope, apply.into(), trap.into()) != Some(true)
+        { return None; }
+        let proxy = v8::Proxy::new(scope, original, handler)?;
+        if constructor.define_own_property(scope, key.into(), proxy.into(), v8::PropertyAttribute::DONT_ENUM)
+            != Some(true) { return None; }
+    }
+    Some(())
+}
+
+fn aggregate_members<'s>(
+    scope: &mut v8::PinScope<'s, '_>, intrinsics: v8::Local<'s, v8::Array>,
+    input: v8::Local<'s, v8::Value>,
+) -> Option<Vec<Option<usize>>> {
+    if input.is_proxy() { return None; }
+    let input = v8::Local::<v8::Array>::try_from(input).ok()?;
+    if input.length() > AGGREGATE_MEMBERS { return None; }
+    let constructor = v8::Local::<v8::Object>::try_from(intrinsics.get_index(scope, 0)?).ok()?;
+    let prototype = v8::Local::<v8::Object>::try_from(intrinsics.get_index(scope, 1)?).ok()?;
+    let expected_resolve = intrinsics.get_index(scope, 2)?;
+    let expected_then = intrinsics.get_index(scope, 3)?;
+    let array = v8::Local::<v8::Object>::try_from(intrinsics.get_index(scope, 4)?).ok()?;
+    let array_iterator = v8::Local::<v8::Object>::try_from(intrinsics.get_index(scope, 5)?).ok()?;
+    let expected_iterator = intrinsics.get_index(scope, 6)?;
+    let expected_next = intrinsics.get_index(scope, 7)?;
+    let species_key = v8::Local::<v8::Name>::try_from(intrinsics.get_index(scope, 8)?).ok()?;
+    let expected_species = intrinsics.get_index(scope, 9)?;
+    let resolve = v8::String::new(scope, "resolve")?;
+    let then = v8::String::new(scope, "then")?;
+    let ctor = v8::String::new(scope, "constructor")?;
+    let iterator = v8::Symbol::get_iterator(scope);
+    let next = v8::String::new(scope, "next")?;
+    if !input.get_prototype(scope)?.strict_equals(array.into())
+        || input.has_own_property(scope, iterator.into()) != Some(false)
+        || !descriptor_matches(scope, array, iterator.into(), "value", expected_iterator)
+        || !descriptor_matches(scope, array_iterator, next.into(), "value", expected_next)
+        || !descriptor_matches(scope, constructor, resolve.into(), "value", expected_resolve)
+        || !descriptor_matches(scope, constructor, species_key, "get", expected_species)
+        || !descriptor_matches(scope, prototype, then.into(), "value", expected_then)
+        || !descriptor_matches(scope, prototype, ctor.into(), "value", constructor.into())
+    { return None; }
+
+    let mut members = Vec::with_capacity(input.length() as usize);
+    for index in 0..input.length() {
+        let key = v8::Integer::new_from_unsigned(scope, index).to_string(scope)?;
+        // No array hole, inherited index, or accessor is read here. The actual
+        // builtin still receives the original iterable on the unknown path.
+        let member = descriptor_field(scope, input.into(), key.into(), "value")?;
+        if !member.is_object() { members.push(None); continue; }
+        let promise = v8::Local::<v8::Promise>::try_from(member).ok()?;
+        if !promise.get_prototype(scope)?.strict_equals(prototype.into())
+            || promise.has_own_property(scope, then.into()) != Some(false)
+            || promise.has_own_property(scope, ctor.into()) != Some(false)
+        { return None; }
+        members.push(Some(identity(scope, promise)?));
+    }
+    Some(members)
+}
+
+fn bound_reactions(
+    capture: &Capture, first: usize, members: Vec<Option<usize>>,
+) -> Option<BTreeMap<usize, Option<usize>>> {
+    if capture.dropped { return None; }
+    // Intrinsic then makes exactly one child promise per actual member. Its
+    // Init hook reports the reaction parent, including primitive normalization.
+    let mut children = capture.promises.get(first..)?.iter().enumerate()
+        .filter_map(|(offset, row)| row.parent.map(|parent| (first + offset, parent)));
+    let mut reactions = BTreeMap::new();
+    for member in members {
+        let (child, parent) = children.next()?;
+        if member.map_or_else(|| !(first..child).contains(&parent), |id| id != parent) {
+            return None;
+        }
+        reactions.insert(child, member);
+    }
+    children.next().is_none().then_some(reactions)
+}
+
+fn apply_aggregate(
+    scope: &mut v8::PinScope<'_, '_>, args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue<v8::Value>,
+) {
+    let Ok(original) = v8::Local::<v8::Function>::try_from(args.get(0)) else { return; };
+    let this = args.get(1);
+    // Proxy apply supplies this private dense arguments array, not the iterable.
+    let Ok(argv) = v8::Local::<v8::Array>::try_from(args.get(2)) else { return; };
+    let argument = if argv.length() == 0 { None } else { argv.get_index(scope, 0) };
+    let data = v8::Local::<v8::Array>::try_from(args.data()).ok();
+    let mode = data.and_then(|data| data.get_index(scope, 0))
+        .and_then(|mode| v8::Local::<v8::Uint32>::try_from(mode).ok());
+    let kind = mode.and_then(|mode| match mode.value() {
+        0 => Some(AggregateKind::All),
+        1 => Some(AggregateKind::AllSettled),
+        2 => Some(AggregateKind::Race),
+        3 => Some(AggregateKind::Any),
+        _ => None,
+    });
+    let intrinsics = data.and_then(|data| data.get_index(scope, 1))
+        .and_then(|value| v8::Local::<v8::Array>::try_from(value).ok());
+    let intrinsic_receiver = intrinsics.and_then(|data| data.get_index(scope, 0))
+        .is_some_and(|constructor| this.strict_equals(constructor));
+    let captured = if intrinsic_receiver {
+        intrinsics.zip(argument)
+            .and_then(|(intrinsics, input)| aggregate_members(scope, intrinsics, input))
+            .zip(scope.get_slot::<RuntimeState>().map(|state| state.causal.promises.len()))
+    } else { None };
+
+    // The statics have one input parameter. Any surplus arguments are ignored
+    // by the original builtin regardless of receiver.
+    let Some(result) = original.call(scope, this, argument.as_slice()) else { return; };
+    retval.set(result);
+
+    if !intrinsic_receiver { return; }
+    let Ok(promise) = v8::Local::<v8::Promise>::try_from(result) else { return; };
+    let Some(id) = identity(scope, promise) else { return; };
+    let reactions = captured.and_then(|(members, first)| {
+        if id < first { return None; }
+        bound_reactions(&scope.get_slot::<RuntimeState>()?.causal, first, members)
+    });
+    let aggregate = match (kind, reactions, promise.state()) {
+        (Some(_), Some(reactions), v8::PromiseState::Fulfilled | v8::PromiseState::Rejected)
+            if reactions.is_empty() => Aggregate::Consumed(Vec::new()),
+        (Some(kind), Some(reactions), v8::PromiseState::Pending) if !reactions.is_empty() =>
+            Aggregate::Pending { kind, reactions, probe: Some(v8::Weak::new(scope, promise)) },
+        _ => Aggregate::Unknown,
+    };
     if let Some(row) = scope.get_slot_mut::<RuntimeState>()
-        .and_then(|state| state.causal.promises.get_mut(index)) {
-        row.aggregate = Some(Aggregate { join_all, members: rows });
+        .and_then(|state| state.causal.promises.get_mut(id)) {
+        row.aggregate = Some(aggregate);
     }
 }

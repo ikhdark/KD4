@@ -67,6 +67,9 @@ struct WsStream {
 
 const WEBSOCKET_INGRESS_CAPACITY: usize = 1600;
 const WEBSOCKET_INGRESS_MAX_QUEUED_BYTES: usize = 64 * 1024 * 1024;
+const WEBSOCKET_DISPATCH_ADMISSION_TIMEOUT: Duration = Duration::from_secs(15);
+const WEBSOCKET_REQUEST_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+const WEBSOCKET_CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const WEBSOCKET_INGRESS_OVERFLOW_MESSAGE: &str =
     "responses websocket ingress queue exceeded its bounded capacity";
 
@@ -293,7 +296,12 @@ impl WsStream {
                         };
                         match message {
                             Ok(Message::Ping(payload)) => {
-                                if let Err(err) = inner.send(Message::Pong(payload)).await {
+                                let result = tokio::time::timeout(
+                                    WEBSOCKET_CONTROL_WRITE_TIMEOUT, inner.send(Message::Pong(payload)),
+                                ).await.unwrap_or_else(|_| Err(WsError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut, "websocket pong write timed out",
+                                ))));
+                                if let Err(err) = result {
                                     if let Some(tx_failure) = tx_failure.take() {
                                         let _ = tx_failure.send(err);
                                     }
@@ -339,10 +347,11 @@ impl WsStream {
 
     async fn send(&self, message: Message, idle_timeout: Duration) -> Result<(), ApiError> {
         let dispatch_guard = codex_http_client::bind_dispatch_guard(None);
-        let deadline = Instant::now() + idle_timeout;
+        let admission_timeout = idle_timeout.min(WEBSOCKET_DISPATCH_ADMISSION_TIMEOUT);
+        let write_timeout = idle_timeout.min(WEBSOCKET_REQUEST_WRITE_TIMEOUT);
         // Reserve before transferring the non-idempotent command. Failure here
         // proves no dispatch; after transfer, even a lost acknowledgement is unknown.
-        let permit = tokio::time::timeout_at(deadline, self.tx_command.reserve())
+        let permit = tokio::time::timeout(admission_timeout, self.tx_command.reserve())
             .await
             .map_err(|_| ApiError::Retryable {
                 message: "timeout waiting for websocket send queue before dispatch".into(),
@@ -355,7 +364,7 @@ impl WsStream {
             dispatch_guard,
             receipt: WsSendReceipt { tx_result: Some(tx_result), dispatch_started: false },
         });
-        let reason = match tokio::time::timeout_at(deadline, rx_result).await {
+        let reason = match tokio::time::timeout(write_timeout, rx_result).await {
             Ok(Ok(Ok(()))) => return Ok(()),
             Ok(Ok(Err(WsSendError::NotSent | WsSendError::Socket(WsError::Protocol(ProtocolError::SendAfterClosing))))) => {
                 return Err(websocket_closed_before_dispatch());
@@ -365,8 +374,8 @@ impl WsStream {
             Ok(Ok(Err(WsSendError::OutcomeUnknown))) => "websocket write was interrupted".into(),
             Ok(Err(_)) => "websocket send acknowledgement was lost".into(),
             Err(_) => format!(
-                "idle timeout sending websocket request after {}ms",
-                idle_timeout.as_millis(),
+                "websocket request write timed out after {}ms",
+                write_timeout.as_millis(),
             ),
         };
         Err(ApiError::ProviderFailure {
@@ -625,7 +634,7 @@ impl ResponsesWebsocketConnection {
                 let mut guard = tokio::select! {
                     biased;
                     _ = tx_event.closed() => return,
-                    guard = tokio::time::timeout(idle_timeout, stream.lock()) => {
+                    guard = tokio::time::timeout(idle_timeout.min(WEBSOCKET_DISPATCH_ADMISSION_TIMEOUT), stream.lock()) => {
                         match guard {
                             Ok(guard) => guard,
                             Err(_) => {

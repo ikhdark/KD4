@@ -536,11 +536,17 @@ pub struct Codex {
 
 pub(crate) type SessionLoopTermination = Shared<BoxFuture<'static, Result<(), &'static str>>>;
 
-/// Internal acknowledgement stays out of the public submission protocol.
+/// Receiver-owned admission metadata stays out of the public submission protocol.
+#[derive(Debug)]
+pub(crate) struct MailboxAdmission {
+    ack: oneshot::Sender<CodexResult<()>>,
+    validation_origin: Option<(String, String)>,
+}
+
 #[derive(Debug)]
 pub(crate) struct QueuedSubmission {
     pub(crate) submission: Submission,
-    pub(crate) mailbox_admission: Option<oneshot::Sender<CodexResult<()>>>,
+    pub(crate) mailbox_admission: Option<MailboxAdmission>,
     // Held through forwarding, deferred preparation, and dispatch. Dropping any
     // cancelled or rejected submission releases its admission automatically.
     pub(crate) preparation_permit: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -977,7 +983,11 @@ impl Codex {
     /// Use sparingly: prefer `submit()` so Codex is responsible for generating
     /// unique IDs for each submission.
     pub async fn submit_with_id(&self, sub: Submission) -> CodexResult<()> {
-        Self::await_mailbox_admission(self.enqueue_submission(sub).await?).await
+        Self::await_mailbox_admission(
+            self.enqueue_submission(sub, /*validation_origin*/ None)
+                .await?,
+        )
+        .await
     }
 
     /// A one-shot caller must observe rejection before waiting for a terminal
@@ -1012,7 +1022,7 @@ impl Codex {
                 .services
                 .agent_control
                 .register_execution_permit(self.session.thread_id, &turn_id, execution_guard)?;
-            let admission = self.enqueue_submission(sub).await?;
+            let admission = self.enqueue_submission(sub, /*validation_origin*/ None).await?;
             registration.commit();
             Self::await_mailbox_admission(admission).await
         }
@@ -1061,6 +1071,7 @@ impl Codex {
     pub(crate) async fn enqueue_submission(
         &self,
         mut sub: Submission,
+        validation_origin: Option<(String, String)>,
     ) -> CodexResult<Option<oneshot::Receiver<CodexResult<()>>>> {
         if self.rx_event.is_closed() {
             // Required stream failure is fatal to this runtime. Closing intake
@@ -1085,7 +1096,13 @@ impl Codex {
         let (mailbox_admission, admission_rx) =
             if matches!(&sub.op, Op::InterAgentCommunication { .. }) {
                 let (tx, rx) = oneshot::channel();
-                (Some(tx), Some(rx))
+                (
+                    Some(MailboxAdmission {
+                        ack: tx,
+                        validation_origin,
+                    }),
+                    Some(rx),
+                )
             } else {
                 (None, None)
             };

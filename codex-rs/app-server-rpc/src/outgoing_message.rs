@@ -1605,7 +1605,11 @@ impl OutgoingMessageSender {
                 return false;
             }
         };
-        let mut outgoing_response = OutgoingResponse { id, result };
+        let mut outgoing_response = OutgoingResponse {
+            id,
+            result,
+            retryable_history_page: false,
+        };
         if let Some(error) = self
             .response_delivery_error(request_id.connection_id, &mut outgoing_response)
             .await
@@ -1697,6 +1701,7 @@ impl OutgoingMessageSender {
     ) {
         let connection_id = request_id.connection_id;
         let request_id_for_analytics = request_id.request_id.clone();
+        let retryable_history_page = matches!(&response, ClientResponsePayload::ThreadTurnsList(_));
         let serialized_response = response
             .into_jsonrpc_parts_and_payload(request_id.request_id.clone())
             .map(|(id, result, response)| {
@@ -1726,7 +1731,11 @@ impl OutgoingMessageSender {
 
         match serialized_response {
             Ok((id, result)) => {
-                let outgoing_message = OutgoingMessage::Response(OutgoingResponse { id, result });
+                let outgoing_message = OutgoingMessage::Response(OutgoingResponse {
+                    id,
+                    result,
+                    retryable_history_page,
+                });
                 self.send_outgoing_message_to_connection(
                     request_context,
                     connection_id,

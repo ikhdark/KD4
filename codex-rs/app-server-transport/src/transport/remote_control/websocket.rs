@@ -132,8 +132,23 @@ struct ScheduledServerFrame {
 // removed from the channel before it reaches replay, including its encoder.
 struct ServerEventReceiver {
     receiver: mpsc::Receiver<super::QueuedServerEnvelope>,
+    status: mpsc::Receiver<super::QueuedServerEnvelope>,
     queued: Option<super::QueuedServerEnvelope>,
     encoding: Option<PendingServerEncoding>,
+}
+
+impl ServerEventReceiver {
+    fn try_recv(&mut self) -> Result<super::QueuedServerEnvelope, mpsc::error::TryRecvError> {
+        self.status.try_recv().or_else(|_| self.receiver.try_recv())
+    }
+
+    async fn recv(&mut self) -> Option<super::QueuedServerEnvelope> {
+        tokio::select! {
+            biased;
+            status = self.status.recv(), if !self.status.is_closed() || !self.status.is_empty() => status,
+            event = self.receiver.recv() => event,
+        }
+    }
 }
 
 struct PendingServerEncoding {
@@ -775,8 +790,10 @@ impl RemoteControlWebsocket {
     ) -> Self {
         let shutdown_token = shutdown_token.child_token();
         let (server_event_tx, server_event_rx) = mpsc::channel(super::CHANNEL_CAPACITY);
+        let (server_status_tx, server_status_rx) = mpsc::channel(super::STATUS_REPLAY_SLOTS);
         let client_tracker = ClientTracker::new(
             server_event_tx,
+            server_status_tx,
             channels.transport_event_tx,
             &shutdown_token,
         );
@@ -810,7 +827,7 @@ impl RemoteControlWebsocket {
                 encoding_admission: Arc::new(Semaphore::new(1)),
             })),
             server_event_rx: Arc::new(Mutex::new(ServerEventReceiver {
-                receiver: server_event_rx, queued: None, encoding: None,
+                receiver: server_event_rx, status: server_status_rx, queued: None, encoding: None,
             })),
             used_rx,
             desired_state_tx,
@@ -1382,7 +1399,7 @@ impl RemoteControlWebsocket {
             let mut queued = self.server_event_rx.lock().await;
             queued.queued = None;
             queued.encoding = None;
-            while queued.receiver.try_recv().is_ok() {}
+            while queued.try_recv().is_ok() {}
         }
         let mut state = self.state.lock().await;
         state.outbound_buffer.buffer_by_stream.clear();
@@ -1492,7 +1509,7 @@ impl RemoteControlWebsocket {
             // admit more original envelopes after the replay capacity is consumed.
             for _ in 0..REMOTE_CONTROL_REPLAY_BATCH_MESSAGES {
                 state.lock().await.outbound_buffer.reap_retired();
-                match server_event_rx.receiver.try_recv() {
+                match server_event_rx.try_recv() {
                     Ok(envelope) => {
                         server_event_rx.queued = Some(envelope);
                         pending.enqueue(&state, &mut server_event_rx, &mut ping_interval, &mut websocket_writer, &shutdown_token).await?;
@@ -1519,7 +1536,7 @@ impl RemoteControlWebsocket {
                     changed.map_err(|_| io::Error::new(ErrorKind::UnexpectedEof, "outbound buffer usage channel closed"))?;
                     continue;
                 }
-                envelope = server_event_rx.receiver.recv() => {
+                envelope = server_event_rx.recv() => {
                     let envelope = envelope.ok_or_else(|| io::Error::new(ErrorKind::UnexpectedEof, "server event channel closed"))?;
                     server_event_rx.queued = Some(envelope);
                     pending.enqueue(&state, &mut server_event_rx, &mut ping_interval, &mut websocket_writer, &shutdown_token).await?;

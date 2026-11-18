@@ -11,8 +11,6 @@ use std::io;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -284,10 +282,12 @@ impl HttpClientFactory {
         if let Some(cache) = SYSTEM_PROXY_CACHE.get() {
             let key = system_proxy_cache_key(&proxy_resolution_url(request_url));
             let mut cache = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            // Fence an older in-flight PAC lookup from republishing its result
-            // after this invalidation. Epoch publication shares the cache lock.
-            SYSTEM_PROXY_CACHE_GENERATION.fetch_add(1, Ordering::AcqRel);
-            cache.remove(&key);
+            cache.entries.remove(&key);
+            // The resolution lock allows at most one publisher. Fence it only
+            // when this is the authority that was invalidated.
+            if cache.publisher == Some(key) {
+                cache.publisher = None;
+            }
         }
     }
 
@@ -347,12 +347,21 @@ fn route_from_system_decision(
     decision: SystemProxyDecision,
 ) -> OutboundProxyRoute {
     match decision {
-        SystemProxyDecision::Direct => OutboundProxyRoute::Direct,
+        SystemProxyDecision::Direct => {
+            tracing::debug!(system_proxy_decision = "direct", "selected outbound proxy route");
+            OutboundProxyRoute::Direct
+        }
         SystemProxyDecision::Proxy { url } => OutboundProxyRoute::Proxy {
             url,
             no_proxy: None,
         },
-        SystemProxyDecision::Unavailable { .. } => resolve_env_proxy_route(env_proxy_kind),
+        SystemProxyDecision::Unavailable { failure } => {
+            let route = resolve_env_proxy_route(env_proxy_kind);
+            let fallback = if matches!(route, OutboundProxyRoute::Direct) { "direct" } else { "environment" };
+            tracing::debug!(system_proxy_decision = "unavailable", proxy_resolution_failure = %failure,
+                proxy_fallback = fallback, "selected outbound proxy route");
+            route
+        }
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         SystemProxyDecision::Fallback { routes } => OutboundProxyRoute::Fallback { routes },
     }
@@ -545,7 +554,7 @@ enum SystemProxyDecision {
 }
 
 fn resolve_system_proxy(request_url: &str, origin: &RequestOrigin) -> SystemProxyDecision {
-    let cache = SYSTEM_PROXY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache = SYSTEM_PROXY_CACHE.get_or_init(Default::default);
     let cache_key = system_proxy_cache_key(request_url);
     {
         // Entries are self-contained; interrupted eviction or insertion leaves the
@@ -554,7 +563,7 @@ fn resolve_system_proxy(request_url: &str, origin: &RequestOrigin) -> SystemProx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(decision) =
-            cached_system_proxy_decision_from_cache(&mut cache, &cache_key, Instant::now())
+            cached_system_proxy_decision_from_cache(&mut cache.entries, &cache_key, Instant::now())
         {
             return decision;
         }
@@ -570,11 +579,11 @@ fn resolve_system_proxy(request_url: &str, origin: &RequestOrigin) -> SystemProx
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(decision) =
-        cached_system_proxy_decision_from_cache(&mut decisions, &cache_key, Instant::now())
+        cached_system_proxy_decision_from_cache(&mut decisions.entries, &cache_key, Instant::now())
     {
         return decision;
     }
-    let generation = SYSTEM_PROXY_CACHE_GENERATION.load(Ordering::Acquire);
+    decisions.publisher = Some(cache_key);
     drop(decisions);
 
     // PAC/WPAD can take seconds. Do not hold the cache lock across platform I/O:
@@ -583,8 +592,8 @@ fn resolve_system_proxy(request_url: &str, origin: &RequestOrigin) -> SystemProx
     let mut cache = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if generation == SYSTEM_PROXY_CACHE_GENERATION.load(Ordering::Acquire) {
-        insert_system_proxy_cache_entry(&mut cache, &cache_key, decision.clone(), Instant::now());
+    if cache.publisher.take() == Some(cache_key) {
+        insert_system_proxy_cache_entry(&mut cache.entries, &cache_key, decision.clone(), Instant::now());
     }
     decision
 }
@@ -613,23 +622,26 @@ fn resolve_platform_system_proxy(
 struct CachedSystemProxyDecision {
     decision: SystemProxyDecision,
     expires_at: Instant,
-    generation: u64,
 }
 
-static SYSTEM_PROXY_CACHE: OnceLock<Mutex<HashMap<[u8; 32], CachedSystemProxyDecision>>> =
-    OnceLock::new();
+#[derive(Default)]
+struct SystemProxyCache {
+    entries: HashMap<[u8; 32], CachedSystemProxyDecision>,
+    publisher: Option<[u8; 32]>,
+}
+
+static SYSTEM_PROXY_CACHE: OnceLock<Mutex<SystemProxyCache>> = OnceLock::new();
 static SYSTEM_PROXY_RESOLUTION_LOCK: Mutex<()> = Mutex::new(());
-static SYSTEM_PROXY_CACHE_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn cached_system_proxy_decision(request_url: &str) -> Option<SystemProxyDecision> {
-    let cache = SYSTEM_PROXY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache = SYSTEM_PROXY_CACHE.get_or_init(Default::default);
     let key = system_proxy_cache_key(request_url);
     // Only bounded in-memory work holds this lock. Waiting for a short cache mutation
     // avoids turning a warm hit into a miss queued behind a slow platform lookup.
     let mut cache = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    cached_system_proxy_decision_from_cache(&mut cache, &key, Instant::now())
+    cached_system_proxy_decision_from_cache(&mut cache.entries, &key, Instant::now())
 }
 
 fn cached_system_proxy_decision_from_cache(
@@ -638,9 +650,7 @@ fn cached_system_proxy_decision_from_cache(
     now: Instant,
 ) -> Option<SystemProxyDecision> {
     let cached = cache.get(cache_key)?;
-    if cached.expires_at > now
-        && cached.generation == SYSTEM_PROXY_CACHE_GENERATION.load(Ordering::Acquire)
-    {
+    if cached.expires_at > now {
         return Some(cached.decision.clone());
     }
     cache.remove(cache_key);
@@ -662,8 +672,7 @@ fn insert_system_proxy_cache_entry(
         SystemProxyDecision::Unavailable { .. } => SYSTEM_PROXY_UNAVAILABLE_CACHE_TTL,
     };
 
-    let generation = SYSTEM_PROXY_CACHE_GENERATION.load(Ordering::Acquire);
-    cache.retain(|_, cached| cached.expires_at > now && cached.generation == generation);
+    cache.retain(|_, cached| cached.expires_at > now);
     if cache.len() >= SYSTEM_PROXY_CACHE_MAX_ENTRIES
         && !cache.contains_key(cache_key)
         && let Some(cache_key_to_evict) = cache
@@ -678,7 +687,6 @@ fn insert_system_proxy_cache_entry(
         CachedSystemProxyDecision {
             decision,
             expires_at: now + ttl,
-            generation,
         },
     );
 }

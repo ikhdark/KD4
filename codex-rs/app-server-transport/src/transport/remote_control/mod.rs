@@ -4,6 +4,8 @@ mod clients;
 mod desired_state;
 mod enroll;
 mod preview;
+pub use preview::REMOTE_PREVIEW_FIELD_BYTES;
+pub use preview::preview_remote_notification;
 mod protocol;
 mod segment;
 mod server_api;
@@ -128,6 +130,8 @@ pub(super) struct ReplayCredit {
 }
 
 const REPLAY_BYTE_BUDGET: usize = 512 * 1024 * 1024;
+const STATUS_REPLAY_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+const STATUS_REPLAY_SLOTS: usize = 16;
 
 // Default-off observations of the actual disable owner, not public send clocks.
 // Full digests bind the private workload's request/account identities without
@@ -171,6 +175,13 @@ fn replay_byte_cost(message_bytes: usize, client: &ClientId, stream: &StreamId) 
         client.0.len().checked_add(stream.0.len())?.checked_mul(6)?
             .checked_add(4096)?.checked_mul(segment::REMOTE_CONTROL_SEGMENT_COUNT_MAX)?)?;
     (bytes <= REPLAY_BYTE_BUDGET / 2).then(|| u32::try_from(bytes).ok()).flatten()
+}
+
+fn status_replay_byte_cost(client: &ClientId, stream: &StreamId) -> Option<u32> {
+    // Pong has no application body or segmentation; only the two escaped
+    // routing identifiers and fixed envelope overhead are retained.
+    let bytes = client.0.len().checked_add(stream.0.len())?.checked_mul(6)?.checked_add(256)?;
+    (bytes <= STATUS_REPLAY_BYTE_BUDGET).then(|| u32::try_from(bytes).ok()).flatten()
 }
 
 #[derive(Clone)]
@@ -457,37 +468,35 @@ impl RemoteControlHandle {
     /// decision, so a late result cannot override a newer one. A decision computed before the
     /// current identity completed its account id cannot admit remote control until one for the
     /// current epoch replaces it, but a denial still disables remote control at once.
-    pub fn update_policy(&self, epoch: u64, policy: RemoteControlPolicy) {
-        let _ = self.auth_manager.with_policy_identity(|identity| {
-            if !identity.includes(epoch) {
-                return;
-            }
-            let recorded = self.policy.send_if_modified(|decision| {
-                let superseded = decision
-                    .1
-                    .is_some_and(|decided| identity.includes(decided) && decided > epoch);
-                if !superseded {
-                    *decision = (policy, Some(epoch));
-                }
-                !superseded
-            });
-            if recorded && policy != RemoteControlPolicy::Allowed {
-                self.transition_disabled();
-            }
-        });
-    }
-
-    /// Whether the managed-requirements decision predates an account-id completion of the current
-    /// identity within its login lifecycle. Until `update_policy` records a decision for the
-    /// current epoch, remote control rejects requests and contacts no backend, so the embedder
-    /// must re-check its requirements for the completed account.
-    pub fn policy_recheck_pending(&self) -> bool {
+    /// Returns whether the requirements decision was recorded for the current epoch.
+    pub fn update_policy(&self, epoch: u64, policy: RemoteControlPolicy) -> bool {
         self.auth_manager
             .with_policy_identity(|identity| {
-                let decision = *self.policy.borrow();
-                policy_decided_for_identity(decision, identity)
-                    && decision.1 != Some(identity.current_epoch)
+                if !identity.includes(epoch) {
+                    return false;
+                }
+                let recorded = self.policy.send_if_modified(|decision| {
+                    let superseded = decision
+                        .1
+                        .is_some_and(|decided| identity.includes(decided) && decided > epoch);
+                    if !superseded {
+                        *decision = (policy, Some(epoch));
+                    }
+                    !superseded
+                });
+                if recorded && policy != RemoteControlPolicy::Allowed {
+                    self.transition_disabled();
+                }
+                recorded && identity.current_epoch == epoch
             })
+            .unwrap_or(false)
+    }
+
+    /// Whether the current auth epoch still needs a managed-requirements decision.
+    /// Until that decision is recorded, the existing admission fence rejects remote use.
+    pub fn policy_recheck_pending(&self) -> bool {
+        self.auth_manager
+            .with_policy_identity(|identity| self.policy.borrow().1 != Some(identity.current_epoch))
             .unwrap_or(false)
     }
 

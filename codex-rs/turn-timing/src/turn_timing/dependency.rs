@@ -38,7 +38,11 @@ fn request_end(timing: &TurnTiming, request: &codex_protocol::protocol::TurnTimi
     if matches.len() != 1 { return None; }
     let row = matches[0];
     if row["basis"] != "sampling_future_scope_exit" || row["providerCompleted"] != false
-        || row["dispatchMs"].as_u64() != request.dispatch_ms { return None; }
+        || row["dispatchMs"].as_u64() != request.dispatch_ms
+        || !row["physicalAttemptIds"].as_array().is_some_and(|ids| ids.iter()
+            .map(serde_json::Value::as_str)
+            .eq(request.physical_attempt_ids.iter().map(|id| Some(id.as_str()))))
+    { return None; }
     row["ownerEndMs"].as_u64()
 }
 
@@ -52,6 +56,70 @@ struct Lane {
     joins: Vec<String>,
     /// The end is the tool owner's typed cessation, not a delivery/release.
     owner_end: bool,
+}
+
+struct Attempt<'a> {
+    start: u64,
+    end: u64,
+    request: &'a str,
+    owner_end: bool,
+}
+
+// Build per-attempt dispatch markers and exact work spans within a retried
+// generation. A retry gap is a causal handoff, not model work. Timestamp
+// rounding can put a whole attempt at one cut (including the final cut).
+fn retry_segments(
+    nodes: &mut BTreeMap<String, Node>, id: &str, lane: &Lane,
+    attempts: &[Attempt<'_>], mut previous: String,
+) -> String {
+    let mut cuts = lane.cuts.iter().copied().peekable();
+    let mut dispatches = attempts.iter().enumerate().peekable();
+    let mut current = &attempts[0];
+    let mut segments = 0;
+    let mut push_work = |nodes: &mut BTreeMap<String, Node>, previous: String,
+                         start, end, attempt: &Attempt<'_>| {
+        let key = if segments == 0 { id.to_owned() } else { format!("{id}:segment-{segments}") };
+        segments += 1;
+        let mut work = node(key.clone(), Kind::Model, start, end, vec![previous]);
+        work.sampling_request_id = Some(attempt.request.to_owned());
+        if attempt.owner_end {
+            work.evidence_ref = Some(format!("requestOwnerClosures:{}", attempt.request));
+        }
+        nodes.insert(key.clone(), work);
+        key
+    };
+    while let Some(at) = cuts.next() {
+        while let Some((index, attempt)) = dispatches.next_if(|(_, attempt)| attempt.start == at) {
+            current = attempt;
+            if index != 0 {
+                let key = format!("{id}:attempt-{index}:dispatch");
+                let mut dispatch = node(key.clone(), Kind::Boundary, at, at, vec![previous]);
+                dispatch.sampling_request_id = Some(attempt.request.to_owned());
+                nodes.insert(key.clone(), dispatch);
+                previous = key;
+            }
+            if current.start == current.end {
+                previous = push_work(nodes, previous, at, at, current);
+            }
+        }
+        if let Some(&end) = cuts.peek() {
+            let anchor = format!("{id}:at-{end}");
+            if at < current.end {
+                previous = push_work(nodes, previous, at, end, current);
+            } else {
+                // Keep :at-{end} an instantaneous release; gap time belongs to
+                // a separate boundary span rather than the release itself.
+                let gap = format!("{id}:retry-handoff-{at}");
+                nodes.insert(gap.clone(), node(gap.clone(), Kind::Boundary,
+                    at, end, vec![previous]));
+                previous = gap;
+            }
+            nodes.insert(anchor.clone(), node(anchor.clone(), Kind::Boundary,
+                end, end, vec![previous]));
+            previous = anchor;
+        }
+    }
+    previous
 }
 
 impl Lane {
@@ -74,6 +142,18 @@ fn delivered_release_ms(timing: &TurnTiming, call: &codex_protocol::protocol::Tu
 // delivery/release boundary has an exact typed cessation. It never replaces a
 // recorded delivery or release, and it is not tool success or output delivery.
 fn tool_owner_end(timing: &TurnTiming, call: &codex_protocol::protocol::TurnTimingToolCall) -> Option<u64> {
+    let outcome = call.outcome.as_deref()?;
+    let typed_owner_cut = match call.source {
+        TurnTimingToolCallSource::Direct => matches!(outcome, "cancelled" | "interrupted"),
+        // Code Mode cancellation can also come from a deadline or the
+        // transport. Only the explicit interrupted dispatch permits a cut.
+        TurnTimingToolCallSource::CodeMode => outcome == "interrupted",
+    };
+    if !typed_owner_cut
+        || call.delivered_at_ms.is_some() || call.output_model_visible_at_ms.is_some()
+    {
+        return None;
+    }
     let packet = timing.measurement_evidence.as_ref()?.get("toolOwnerClosures")?;
     if packet["complete"] != true || packet["schemaVersion"] != 1 { return None; }
     let rows = packet["rows"].as_array()?;
@@ -83,12 +163,9 @@ fn tool_owner_end(timing: &TurnTiming, call: &codex_protocol::protocol::TurnTimi
     if matches.len() != 1 { return None; }
     let row = matches[0];
     if row["basis"] != "tool_dispatch_owner_exit" || row["deliveredAtOwnerExit"] != false
-        || row["acceptedMs"].as_u64() != call.accepted_at_ms { return None; }
+        || row["acceptedMs"].as_u64() != call.accepted_at_ms
+        || row["outcome"].as_str() != Some(outcome) { return None; }
     row["ownerEndMs"].as_u64()
-}
-
-fn release_ms(timing: &TurnTiming, call: &codex_protocol::protocol::TurnTimingToolCall) -> Option<u64> {
-    delivered_release_ms(timing, call).or_else(|| tool_owner_end(timing, call))
 }
 
 pub(super) fn snapshot(timing: &TurnTiming) -> Option<TurnTimingDependencyGraph> {
@@ -123,33 +200,28 @@ pub(super) fn snapshot(timing: &TurnTiming) -> Option<TurnTimingDependencyGraph>
         reasons.insert("incomplete_tool_inventory");
     }
     let mut lanes = BTreeMap::new();
-    // Physical attempt dispatches per retried generation lane, with each
-    // attempt's sampling identity and whether the provider never completed it.
-    let mut attempt_starts = BTreeMap::<String, Vec<(u64, Option<String>, bool)>>::new();
+    let mut retry_attempts = BTreeMap::<String, Vec<Attempt<'_>>>::new();
     for (index, (generation, attempts)) in generations.iter().enumerate() {
         let id = format!("generation-{generation}");
-        let starts = attempts.iter().map(|attempt| ns(attempt.dispatch_ms)).collect::<Option<Vec<_>>>();
-        let end = attempts.last().and_then(|last| ns(request_end(timing, last)));
-        let (Some(starts), Some(end)) = (starts, end) else {
+        let spans = attempts.iter().map(|attempt| Some((
+            ns(attempt.dispatch_ms)?, ns(request_end(timing, attempt))?
+        ))).collect::<Option<Vec<_>>>();
+        let Some(spans) = spans else {
             reasons.insert("missing_request_endpoint");
             continue;
         };
-        if attempts.iter().any(|attempt| attempt.sampling_request_id.is_none()) {
+        if attempts.iter().any(|attempt| attempt.sampling_request_id.as_deref().is_none_or(str::is_empty)) {
             reasons.insert("missing_request_identity");
         }
-        // A superseded attempt ended no later than its successor's dispatch;
-        // without its own endpoint, that dispatch bounds it. Overlap is invalid.
-        for (position, attempt) in attempts.iter().enumerate().take(attempts.len() - 1) {
-            let next = starts[position + 1];
-            if next < starts[position]
-                || ns(request_end(timing, attempt)).is_some_and(|ended| ended > next)
-            {
-                reasons.insert("ambiguous_or_invalid_request_span");
-            }
+        if spans.iter().any(|&(start, end)| start > end || end > timeline.duration_ns)
+            || spans.windows(2).any(|pair| pair[0].1 > pair[1].0)
+        {
+            reasons.insert("ambiguous_or_invalid_request_span");
+            continue;
         }
-        let start = starts[0];
-        let mut cuts = BTreeSet::from([start, end]);
-        cuts.extend(starts.iter().copied().filter(|at| *at <= end));
+        let start = spans[0].0;
+        let end = spans[spans.len() - 1].1;
+        let cuts = spans.iter().flat_map(|&(start, end)| [start, end]).collect();
         let row = Lane {
             kind: Kind::Model, start, end, request: attempts[0].sampling_request_id.clone(),
             cuts,
@@ -157,16 +229,21 @@ pub(super) fn snapshot(timing: &TurnTiming) -> Option<TurnTimingDependencyGraph>
             joins: Vec::new(), owner_end: false,
         };
         if attempts.len() > 1 {
-            attempt_starts.insert(id.clone(), starts.iter().copied().zip(attempts.iter())
-                .map(|(at, attempt)| (at, attempt.sampling_request_id.clone(), attempt.completed_ms.is_none()))
-                .collect());
+            let physical = spans.into_iter().zip(attempts).map(|((start, end), attempt)| Some(Attempt {
+                start, end, request: attempt.sampling_request_id.as_deref()?,
+                owner_end: attempt.completed_ms.is_none(),
+            })).collect::<Option<Vec<_>>>();
+            let Some(physical) = physical else { continue; };
+            retry_attempts.insert(id.clone(), physical);
         }
-        if start > end || end > timeline.duration_ns || lanes.insert(id, row).is_some() {
+        if lanes.insert(id, row).is_some() {
             reasons.insert("ambiguous_or_invalid_request_span");
         }
     }
     for call in &timing.tool_calls {
-        let (Some(start), Some(end)) = (ns(call.accepted_at_ms), ns(release_ms(timing, call))) else {
+        let release = delivered_release_ms(timing, call);
+        let endpoint = release.or_else(|| tool_owner_end(timing, call));
+        let (Some(start), Some(end)) = (ns(call.accepted_at_ms), ns(endpoint)) else {
             reasons.insert("missing_tool_endpoint");
             continue;
         };
@@ -178,7 +255,7 @@ pub(super) fn snapshot(timing: &TurnTiming) -> Option<TurnTimingDependencyGraph>
         if lanes.insert(id, Lane {
             kind: Kind::Tool, start, end, request: None,
             cuts: BTreeSet::from([start, end]), prerequisites: Vec::new(), joins: Vec::new(),
-            owner_end: delivered_release_ms(timing, call).is_none(),
+            owner_end: release.is_none(),
         }).is_some() { reasons.insert("ambiguous_tool_identity"); }
     }
 
@@ -200,11 +277,12 @@ pub(super) fn snapshot(timing: &TurnTiming) -> Option<TurnTimingDependencyGraph>
             let Some(predecessors) = predecessors else {
                 reasons.insert("nested_async_dependencies_not_recorded"); continue;
             };
+            let child_lane = lanes.get(&call.execution_id.0);
             let parents = timing.tool_calls.iter().filter(|parent|
                 parent.source == TurnTimingToolCallSource::Direct
                 && Some(parent.call_id.as_str()) == call.parent_call_id.as_deref()
-                && parent.accepted_at_ms.zip(call.accepted_at_ms).is_some_and(|(a, b)| a <= b)
-                && release_ms(timing, call).zip(release_ms(timing, parent)).is_some_and(|(a, b)| a <= b))
+                && child_lane.zip(lanes.get(&parent.execution_id.0))
+                    .is_some_and(|(child, outer)| outer.start <= child.start && child.end <= outer.end))
                 .collect::<Vec<_>>();
             if parents.len() != 1 { reasons.insert("nested_parent_execution_ambiguous_or_outside_envelope"); continue; }
             dependencies.push(codex_protocol::timing::TurnTimingDependencyEdge {
@@ -242,7 +320,21 @@ pub(super) fn snapshot(timing: &TurnTiming) -> Option<TurnTimingDependencyGraph>
                     emitted.insert(dependent.clone());
                     point
                 }
-                "consumes_tool_result" | "continues_generation" | "nested_consumes_tool_result" => {
+                "consumes_tool_result" | "nested_consumes_tool_result" => {
+                    // Owner cessation can close a work envelope, not release a
+                    // result to the continuation. The consumer stays incomplete.
+                    let input = lanes.get(prerequisite).filter(|lane| lane.kind == Kind::Tool && !lane.owner_end);
+                    input.zip(lanes.get(dependent)).and_then(|(input, consumer)| {
+                        if input.end > consumer.start {
+                            // A cell can resume on a local deadline before the
+                            // native result is released by the core adapter.
+                            reasons.insert("dependency_precedes_prerequisite_completion");
+                            return None;
+                        }
+                        Some(format!("{prerequisite}:end"))
+                    })
+                }
+                "continues_generation" => {
                     lanes.get(prerequisite).map(|_| format!("{prerequisite}:end"))
                 }
                 _ => continue,
@@ -277,40 +369,34 @@ pub(super) fn snapshot(timing: &TurnTiming) -> Option<TurnTimingDependencyGraph>
             lane.start, lane.start, lane.prerequisites.clone());
         dispatch.sampling_request_id = lane.request.clone();
         nodes.insert(previous.clone(), dispatch);
-        let cuts = lane.cuts.iter().copied().collect::<Vec<_>>();
-        // Even a zero-duration request has one identified model segment.
-        let spans = if cuts.len() == 1 { vec![(cuts[0], cuts[0])] }
-            else { cuts.windows(2).map(|pair| (pair[0], pair[1])).collect() };
-        for (index, (start, end)) in spans.into_iter().enumerate() {
-            let segment = if index == 0 { id.clone() } else { format!("{id}:segment-{index}") };
-            let mut work = node(segment.clone(), lane.kind, start, end, vec![previous.clone()]);
-            work.sampling_request_id = lane.request.clone();
-            if let Some(attempts) = attempt_starts.get(id) {
-                // A retried generation's segment belongs to the attempt dispatched
-                // last at or before it; only the final attempt can end by an owner
-                // closure, superseded attempts end at their successor's dispatch.
-                let current = attempts.iter().rposition(|(at, ..)| *at <= start).unwrap_or(0);
-                let (_, request, open) = &attempts[current];
-                work.sampling_request_id = request.clone();
-                if current + 1 == attempts.len() && *open {
-                    work.evidence_ref = request.as_ref().map(|id| format!("requestOwnerClosures:{id}"));
+        if let Some(attempts) = retry_attempts.get(id) {
+            previous = retry_segments(&mut nodes, id, lane, attempts, previous);
+        } else {
+            let cuts = lane.cuts.iter().copied().collect::<Vec<_>>();
+            // Even a zero-duration request has one identified model segment.
+            let spans = if cuts.len() == 1 { vec![(cuts[0], cuts[0])] }
+                else { cuts.windows(2).map(|pair| (pair[0], pair[1])).collect() };
+            for (index, (start, end)) in spans.into_iter().enumerate() {
+                let segment = if index == 0 { id.clone() } else { format!("{id}:segment-{index}") };
+                let mut work = node(segment.clone(), lane.kind, start, end, vec![previous.clone()]);
+                work.sampling_request_id = lane.request.clone();
+                if lane.kind == Kind::Model && timing.model_requests.iter().any(|request|
+                    request.sampling_request_id == lane.request && request.completed_ms.is_none()) {
+                    work.evidence_ref = lane.request.as_ref().map(|id| format!("requestOwnerClosures:{id}"));
                 }
-            } else if lane.kind == Kind::Model && timing.model_requests.iter().any(|request|
-                request.sampling_request_id == lane.request && request.completed_ms.is_none()) {
-                work.evidence_ref = lane.request.as_ref().map(|id| format!("requestOwnerClosures:{id}"));
-            }
-            if lane.kind == Kind::Tool && lane.owner_end {
-                work.evidence_ref = Some(format!("toolOwnerClosures:{id}"));
-            }
-            nodes.insert(segment.clone(), work);
-            let boundary = format!("{id}:at-{end}");
-            if boundary == previous {
-                // A zero-length lane must not introduce a boundary/self cycle.
-                previous = segment;
-            } else {
-                nodes.insert(boundary.clone(), node(boundary.clone(), Kind::Boundary,
-                    end, end, vec![segment]));
-                previous = boundary;
+                if lane.kind == Kind::Tool && lane.owner_end {
+                    work.evidence_ref = Some(format!("toolOwnerClosures:{id}"));
+                }
+                nodes.insert(segment.clone(), work);
+                let boundary = format!("{id}:at-{end}");
+                if boundary == previous {
+                    // A zero-length lane must not introduce a boundary/self cycle.
+                    previous = segment;
+                } else {
+                    nodes.insert(boundary.clone(), node(boundary.clone(), Kind::Boundary,
+                        end, end, vec![segment]));
+                    previous = boundary;
+                }
             }
         }
         let mut deps = vec![previous];
@@ -371,7 +457,7 @@ pub(super) fn snapshot(timing: &TurnTiming) -> Option<TurnTimingDependencyGraph>
         .and_then(|evidence| evidence["dependencyNodes"].as_array()) {
         for annotation in rows {
             let Some(id) = annotation["id"].as_str() else { continue; };
-            if lanes.get(id).is_some_and(|lane| lane.cuts.len() <= 2)
+            if !retry_attempts.contains_key(id) && lanes.get(id).is_some_and(|lane| lane.cuts.len() <= 2)
                 && let Some(row) = nodes.get_mut(id) {
                 row.repeat_of = annotation["repeatOf"].as_str().map(str::to_owned);
                 row.work_identity = annotation["workIdentity"].as_str().map(str::to_owned);

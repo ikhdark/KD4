@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -12,6 +13,9 @@ use std::time::Duration;
 const MANAGED_ROOT_WARNING_THRESHOLD: usize = 384;
 const MANAGED_ROOT_LIMIT: usize = 512;
 const MANAGED_ROOT_RECLAIM_TIMEOUT: Duration = Duration::from_secs(5);
+const ADMISSION_OBSERVATION_TARGET: &str = "codex_managed_root_admission";
+const ADMISSION_EVENT_LIMIT: usize = 256;
+const ADMISSION_CENSUS_LIMIT: usize = 4;
 
 /// Upper bound for synchronous Windows process operations moved off Tokio's
 /// async worker threads.
@@ -28,6 +32,196 @@ static NEXT_MANAGED_ROOT_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_RECLAIMER_ID: AtomicU64 = AtomicU64::new(1);
 static ADMISSION_RECLAIMERS: OnceLock<Mutex<Vec<(u64, AdmissionReclaimer)>>> = OnceLock::new();
 static ADMISSION_RECLAIM_PERMIT: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RootCustody {
+    Preparing,
+    Reserved,
+    #[cfg(windows)]
+    Attaching,
+    #[cfg(windows)]
+    Contained,
+    #[cfg(windows)]
+    RootExited,
+    #[cfg(windows)]
+    ReplayControlCloned,
+    #[cfg(windows)]
+    CleanupWait,
+    #[cfg(windows)]
+    CleanupReconciliation,
+}
+
+struct AdmissionObserver {
+    sample_at: usize,
+    roots: BTreeMap<u64, RootCustody>,
+    sequence: usize,
+    samples: usize,
+    rejections: usize,
+}
+
+fn admission_observer() -> Option<&'static Mutex<AdmissionObserver>> {
+    static OBSERVER: OnceLock<Option<Mutex<AdmissionObserver>>> = OnceLock::new();
+    OBSERVER
+        .get_or_init(|| {
+            // Only changes the diagnostic sampling threshold, never admission.
+            let sample_at = std::env::var("CODEX_MANAGED_ROOT_OBSERVE_AT")
+                .ok()?
+                .parse()
+                .ok()?;
+            (1..=MANAGED_ROOT_LIMIT).contains(&sample_at).then(|| {
+                Mutex::new(AdmissionObserver {
+                    sample_at,
+                    roots: BTreeMap::new(),
+                    sequence: 0,
+                    samples: 0,
+                    rejections: 0,
+                })
+            })
+        })
+        .as_ref()
+}
+
+struct AdmissionObservation {
+    sequence: usize,
+    event: &'static str,
+    lifecycle_id: Option<u64>,
+    reclaim_id: Option<u64>,
+    count: usize,
+    census: Option<Vec<(u64, RootCustody)>>,
+    emit_event: bool,
+}
+
+impl AdmissionObserver {
+    fn record(
+        &mut self,
+        event: &'static str,
+        lifecycle_id: Option<u64>,
+        reclaim_id: Option<u64>,
+        census: bool,
+    ) -> AdmissionObservation {
+        self.sequence = self.sequence.saturating_add(1);
+        AdmissionObservation {
+            sequence: self.sequence,
+            event,
+            lifecycle_id,
+            reclaim_id,
+            count: MANAGED_ROOT_COUNT.load(Ordering::Acquire),
+            census: census.then(|| self.roots.iter().map(|(&id, &state)| (id, state)).collect()),
+            emit_event: self.sequence <= ADMISSION_EVENT_LIMIT,
+        }
+    }
+}
+
+impl AdmissionObservation {
+    fn emit(self) {
+        // Never format or dispatch a log while holding the census lock.
+        if self.emit_event || self.census.is_some() {
+            log::debug!(
+                target: ADMISSION_OBSERVATION_TARGET,
+                "managed_root_admission seq={} event={} lifecycle_id={:?} reclaim_id={:?} count={} limit={MANAGED_ROOT_LIMIT} census={:?}",
+                self.sequence,
+                self.event,
+                self.lifecycle_id,
+                self.reclaim_id,
+                self.count,
+                self.census,
+            );
+        }
+    }
+}
+
+/// A charge starts before native containment setup, and unwinds with the same
+/// identity on both setup failure and normal/cancelled cleanup.
+struct AdmissionReservation {
+    id: u64,
+}
+
+impl AdmissionReservation {
+    fn acquire(reclaim_id: Option<u64>) -> io::Result<Self> {
+        // When observing, serialize the count mutation and census bookkeeping
+        // together. The unobserved hot path keeps the existing atomic gate.
+        let mut observer = admission_observer()
+            .map(|observer| observer.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        let mut current = MANAGED_ROOT_COUNT.load(Ordering::Acquire);
+        loop {
+            if current >= MANAGED_ROOT_LIMIT {
+                let observation = observer.as_mut().map(|observer| {
+                    let census = observer.rejections < ADMISSION_CENSUS_LIMIT;
+                    if census {
+                        observer.rejections += 1;
+                    }
+                    observer.record("at_limit", None, reclaim_id, census)
+                });
+                drop(observer);
+                if let Some(observation) = observation {
+                    observation.emit();
+                }
+                return Err(io::Error::other(AdmissionCapacityExhausted));
+            }
+            match MANAGED_ROOT_COUNT.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+
+        let id = NEXT_MANAGED_ROOT_ID.fetch_add(1, Ordering::Relaxed);
+        let count = current + 1;
+        let observation = observer.as_mut().map(|observer| {
+            observer.roots.insert(id, RootCustody::Preparing);
+            let census = count >= observer.sample_at && observer.samples < ADMISSION_CENSUS_LIMIT;
+            if census {
+                observer.samples += 1;
+            }
+            observer.record("reserved", Some(id), reclaim_id, census)
+        });
+        drop(observer);
+        if let Some(observation) = observation {
+            observation.emit();
+        }
+        if count == MANAGED_ROOT_WARNING_THRESHOLD {
+            log::warn!(
+                "managed root process count reached warning threshold ({count}/{MANAGED_ROOT_LIMIT})"
+            );
+        }
+        Ok(Self { id })
+    }
+
+    fn observe(&self, stage: RootCustody, event: &'static str) {
+        if let Some(observer) = admission_observer() {
+            let mut observer = observer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if observer.roots.insert(self.id, stage) != Some(stage) {
+                let observation = observer.record(event, Some(self.id), None, false);
+                drop(observer);
+                observation.emit();
+            }
+        }
+    }
+}
+
+impl Drop for AdmissionReservation {
+    fn drop(&mut self) {
+        let mut observer = admission_observer()
+            .map(|observer| observer.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        let remaining = MANAGED_ROOT_COUNT.fetch_sub(1, Ordering::AcqRel) - 1;
+        let observation = observer.as_mut().map(|observer| {
+            observer.roots.remove(&self.id);
+            observer.record("released", Some(self.id), None, false)
+        });
+        drop(observer);
+        if let Some(observation) = observation {
+            observation.emit();
+        }
+        log::debug!(
+            "released managed root process lifecycle_id={} remaining={remaining}",
+            self.id
+        );
+    }
+}
 
 pub type ManagedRootReclaimFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 pub type ManagedRootReclaimHook = Arc<dyn Fn() -> ManagedRootReclaimFuture + Send + Sync>;
@@ -78,7 +272,7 @@ fn admission_reclaimers() -> &'static Mutex<Vec<(u64, AdmissionReclaimer)>> {
 /// Keep this value alive until the root has been reaped. On Windows its Job
 /// Object also owns every descendant in the tree.
 pub struct ManagedRootProcess {
-    id: u64,
+    admission: AdmissionReservation,
     #[cfg(windows)]
     job: Arc<crate::win::JobObject>,
 }
@@ -117,45 +311,23 @@ fn reclaimable_reservation(
 impl ManagedRootProcess {
     /// Reserve one of the process-wide managed-root slots before spawning.
     pub fn reserve() -> io::Result<Self> {
-        let mut current = MANAGED_ROOT_COUNT.load(Ordering::Acquire);
-        loop {
-            if current >= MANAGED_ROOT_LIMIT {
-                return Err(io::Error::other(AdmissionCapacityExhausted));
-            }
-            match MANAGED_ROOT_COUNT.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(observed) => current = observed,
-            }
-        }
+        Self::reserve_inner(None)
+    }
 
-        let count = current + 1;
-        if count == MANAGED_ROOT_WARNING_THRESHOLD {
-            log::warn!(
-                "managed root process count reached warning threshold ({count}/{MANAGED_ROOT_LIMIT})"
-            );
-        }
-
+    fn reserve_inner(reclaim_id: Option<u64>) -> io::Result<Self> {
+        let admission = AdmissionReservation::acquire(reclaim_id)?;
         #[cfg(windows)]
-        let job = match crate::win::JobObject::create().and_then(|job| {
+        let job = {
+            let job = crate::win::JobObject::create()?;
             // Every managed launch promises cancellation of the contained
             // workload, including pipes and the direct core execution path.
             job.require_descendant_containment()?;
-            Ok(job)
-        }) {
-            Ok(job) => job,
-            Err(error) => {
-                MANAGED_ROOT_COUNT.fetch_sub(1, Ordering::AcqRel);
-                return Err(error);
-            }
+            job
         };
 
+        admission.observe(RootCustody::Reserved, "ready");
         Ok(Self {
-            id: NEXT_MANAGED_ROOT_ID.fetch_add(1, Ordering::Relaxed),
+            admission,
             #[cfg(windows)]
             job: Arc::new(job),
         })
@@ -167,22 +339,38 @@ impl ManagedRootProcess {
         Self::reserve_with_reclaim_timeout(MANAGED_ROOT_RECLAIM_TIMEOUT).await
     }
 
-    async fn reserve_on_worker() -> io::Result<Self> {
+    async fn reserve_on_worker(reclaim_id: Option<u64>) -> io::Result<Self> {
         #[cfg(windows)]
         {
-            run_windows_process_operation(WINDOWS_PROCESS_OPERATION_TIMEOUT, Self::reserve).await
+            run_windows_process_operation(WINDOWS_PROCESS_OPERATION_TIMEOUT, move || {
+                Self::reserve_inner(reclaim_id)
+            })
+            .await
         }
         #[cfg(not(windows))]
         {
-            Self::reserve()
+            Self::reserve_inner(reclaim_id)
         }
     }
 
     async fn reserve_with_reclaim_timeout(reclaim_timeout: Duration) -> io::Result<Self> {
-        if let Some(root) = reclaimable_reservation(Self::reserve_on_worker().await)? {
+        static NEXT_RECLAIM_REQUEST: AtomicU64 = AtomicU64::new(1);
+        let reclaim_id = admission_observer()
+            .map(|_| NEXT_RECLAIM_REQUEST.fetch_add(1, Ordering::Relaxed));
+        if let Some(root) = reclaimable_reservation(Self::reserve_on_worker(reclaim_id).await)? {
             return Ok(root);
         }
 
+        let observe_reclaim = |event| {
+            if let Some(observer) = admission_observer() {
+                let observation = observer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .record(event, None, reclaim_id, false);
+                observation.emit();
+            }
+        };
+        observe_reclaim("reclaim_started");
         let reclaim = async {
             let _reclaim = ADMISSION_RECLAIM_PERMIT
                 .get_or_init(|| tokio::sync::Semaphore::new(1))
@@ -191,7 +379,7 @@ impl ManagedRootProcess {
                 .map_err(|error| {
                     io::Error::other(format!("admission reclaimer closed: {error}"))
                 })?;
-            if let Some(root) = reclaimable_reservation(Self::reserve_on_worker().await)? {
+            if let Some(root) = reclaimable_reservation(Self::reserve_on_worker(reclaim_id).await)? {
                 return Ok(root);
             }
 
@@ -209,20 +397,20 @@ impl ManagedRootProcess {
             for reclaimer in &reclaimers {
                 (reclaimer.retire_zero_lease_mcp_generations)().await;
             }
-            if let Some(root) = reclaimable_reservation(Self::reserve_on_worker().await)? {
+            if let Some(root) = reclaimable_reservation(Self::reserve_on_worker(reclaim_id).await)? {
                 return Ok(root);
             }
             for reclaimer in reclaimers {
                 (reclaimer.evict_one_eligible_task)().await;
-                if let Some(root) = reclaimable_reservation(Self::reserve_on_worker().await)? {
+                if let Some(root) = reclaimable_reservation(Self::reserve_on_worker(reclaim_id).await)? {
                     return Ok(root);
                 }
             }
 
-            Self::reserve_on_worker().await
+            Self::reserve_on_worker(reclaim_id).await
         };
 
-        tokio::time::timeout(reclaim_timeout, reclaim)
+        let result = tokio::time::timeout(reclaim_timeout, reclaim)
             .await
             .map_err(|_| {
                 io::Error::new(
@@ -232,11 +420,20 @@ impl ManagedRootProcess {
                         reclaim_timeout.as_millis()
                     ),
                 )
-            })?
+            });
+        observe_reclaim(match &result {
+            Ok(Ok(_)) => "reclaim_admitted",
+            Ok(Err(error)) if error.get_ref().is_some_and(
+                <dyn std::error::Error + Send + Sync>::is::<AdmissionCapacityExhausted>,
+            ) => "reclaim_rejected",
+            Ok(Err(_)) => "reclaim_failed",
+            Err(_) => "reclaim_timed_out",
+        });
+        result?
     }
 
     pub fn id(&self) -> u64 {
-        self.id
+        self.admission.id
     }
 
 
@@ -258,6 +455,7 @@ impl ManagedRootProcess {
         use winapi::um::winnt::PROCESS_SET_QUOTA;
         use winapi::um::winnt::PROCESS_TERMINATE;
 
+        self.admission.observe(RootCustody::Attaching, "attach_started");
         // SAFETY: OpenProcess takes only scalar arguments; a successful non-null result is a
         // new owned process handle.
         let access = PROCESS_SET_QUOTA | PROCESS_TERMINATE;
@@ -275,6 +473,7 @@ impl ManagedRootProcess {
         // handle returned by OpenProcess.
         let process = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
         self.job.assign_process(raw.cast())?;
+        self.admission.observe(RootCustody::Contained, "contained");
         Ok(process)
     }
 
@@ -309,7 +508,9 @@ impl ManagedRootProcess {
 
     #[cfg(windows)]
     pub(crate) fn replay_job(&self) -> Arc<crate::JobObject> {
-        Arc::clone(&self.job)
+        let job = Arc::clone(&self.job);
+        self.admission.observe(RootCustody::ReplayControlCloned, "replay_control_cloned");
+        job
     }
 
     /// Terminate and reap a child whose containment setup failed.
@@ -341,6 +542,7 @@ impl ManagedRootProcess {
         mut child: tokio::process::Child,
         always_terminate_root: bool,
     ) -> impl Future<Output = io::Result<()>> {
+        self.admission.observe(RootCustody::CleanupWait, "cleanup_wait");
         // Spawn before returning the future: dropping an unpolled caller must
         // not discard the cleanup owner or release admission before reaping.
         let runtime = tokio::runtime::Handle::current();
@@ -375,10 +577,12 @@ impl ManagedRootProcess {
                         }
                     }
                 }
+                self.admission.observe(RootCustody::RootExited, "root_exited");
                 // Reaping the root cannot settle a failed tree termination.
                 // Reuse the runtime-independent reconciler: an indefinitely
                 // failing job must not pin Tokio's blocking pool at shutdown.
                 if let Some(error) = job_error {
+                    self.admission.observe(RootCustody::CleanupReconciliation, "cleanup_reconciliation");
                     crate::process::retain_terminator(Box::new(self));
                     return Err(error);
                 }
@@ -401,6 +605,8 @@ impl ManagedRootProcess {
 
     #[cfg(windows)]
     pub fn preserve_descendants(&self) -> io::Result<()> {
+        // Callers take this path only after obtaining the root's exit status.
+        self.admission.observe(RootCustody::RootExited, "root_exited");
         self.job.preserve_descendants()
     }
 }
@@ -569,13 +775,4 @@ fn resume_process_threads(pid: u32) -> io::Result<()> {
     Ok(())
 }
 
-impl Drop for ManagedRootProcess {
-    fn drop(&mut self) {
-        let remaining = MANAGED_ROOT_COUNT.fetch_sub(1, Ordering::AcqRel) - 1;
-        log::debug!(
-            "released managed root process lifecycle_id={} remaining={remaining}",
-            self.id
-        );
-    }
-}
 

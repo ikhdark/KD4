@@ -106,9 +106,9 @@ struct MailboxState {
     seen_communication_id_order: VecDeque<codex_protocol::ResponseItemId>,
     // Retain revision watermarks after consumption, not just while mail is queued.
     progress_revisions: indexmap::IndexMap<(codex_protocol::AgentPath, codex_protocol::AgentPath, String, String), u64>,
-    // Root validation turn each identified follow-up was sent under, recorded
-    // by the sending host before submission. Keyed by mail identity so it
-    // follows the mail through recovery; dropped at history acknowledgment.
+    // Host validation scope bound to an identified follow-up at first mailbox
+    // acceptance. It follows the mail through in-memory recovery and is
+    // dropped at history acknowledgment.
     validation_origins: HashMap<codex_protocol::ResponseItemId, (String, String)>,
 }
 
@@ -281,6 +281,15 @@ impl InputQueue {
         &self,
         communication: InterAgentCommunication,
     ) -> Result<bool, codex_protocol::error::CodexErr> {
+        self.enqueue_mailbox_communication_with_origin(communication, /*validation_origin*/ None)
+            .await
+    }
+
+    pub(super) async fn enqueue_mailbox_communication_with_origin(
+        &self,
+        communication: InterAgentCommunication,
+        validation_origin: Option<(String, String)>,
+    ) -> Result<bool, codex_protocol::error::CodexErr> {
         if let Some(progress) = &communication.progress
             && (communication.trigger_turn || communication.id.is_none()
                 || progress.task_id.trim_start().is_empty() || progress.attempt_id.trim_start().is_empty()
@@ -366,6 +375,17 @@ impl InputQueue {
         if let Some(id) = communication.id.as_ref() {
             mailbox.seen_communication_ids.insert(id.clone(), true);
             mailbox.seen_communication_id_order.push_back(id.clone());
+            // Deduplication and all rejection checks happened before either
+            // mail or its provenance could become visible.
+            if communication.trigger_turn
+                && let Some(scope) = validation_origin
+                && mailbox.validation_origins.len() < self.max_seen_mailbox_communication_ids
+            {
+                mailbox
+                    .validation_origins
+                    .entry(id.clone())
+                    .or_insert(scope);
+            }
             compact_seen_mailbox_ids(&mut mailbox, self.max_seen_mailbox_communication_ids);
         }
         let trigger_turn = communication.trigger_turn;
@@ -387,7 +407,12 @@ impl InputQueue {
     ) {
         let mut mailbox = self.mailbox.lock().await;
         for id in ids {
-            if mailbox.seen_communication_ids.insert(id.clone(), false).is_none() {
+            // A retained queue can still own delivery; seeding only supplies
+            // missing identities and must not release their dedup fence.
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                mailbox.seen_communication_ids.entry(id.clone())
+            {
+                entry.insert(false);
                 mailbox.seen_communication_id_order.push_back(id);
                 compact_seen_mailbox_ids(&mut mailbox, self.max_seen_mailbox_communication_ids);
             }
@@ -411,32 +436,6 @@ impl InputQueue {
             mailbox.validation_origins.remove(id);
         }
         compact_seen_mailbox_ids(&mut mailbox, self.max_seen_mailbox_communication_ids);
-    }
-
-    /// Records the validation scope a turn-starting follow-up was sent under.
-    /// The sender calls this before submitting the mail, so admission of the
-    /// turn that mail starts always observes it. A full index keeps only mail
-    /// still awaiting acknowledgment and otherwise leaves the mail unstamped.
-    pub(crate) async fn record_mail_validation_origin(
-        &self,
-        id: codex_protocol::ResponseItemId,
-        scope: (String, String),
-    ) {
-        let mut mailbox = self.mailbox.lock().await;
-        if mailbox.validation_origins.len() >= self.max_seen_mailbox_communication_ids
-            && !mailbox.validation_origins.contains_key(&id)
-        {
-            let MailboxState {
-                validation_origins,
-                seen_communication_ids,
-                ..
-            } = &mut *mailbox;
-            validation_origins.retain(|id, _| seen_communication_ids.get(id) == Some(&true));
-            if validation_origins.len() >= self.max_seen_mailbox_communication_ids {
-                return;
-            }
-        }
-        mailbox.validation_origins.insert(id, scope);
     }
 
     /// Validation scopes of the queued mail that would start the next turn,

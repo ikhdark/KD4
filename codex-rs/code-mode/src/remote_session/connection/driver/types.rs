@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use codex_code_mode_protocol::CancellationCause;
 use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::CodeModeSessionDelegate;
 use codex_code_mode_protocol::ExecuteRequest;
@@ -50,6 +51,7 @@ pub(in crate::remote_session::connection) enum DriverCommand {
     Terminate {
         session: RemoteSession,
         cell_id: CellId,
+        interrupt_cause: Option<CancellationCause>,
         response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
     },
     ShutdownSession {

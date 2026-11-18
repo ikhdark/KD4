@@ -26,6 +26,8 @@ use crate::session::step_context::StepContext;
 use crate::session::turn_execution::PendingOwnerDrainedContinuation;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::parallel::ToolCallRuntime;
+use crate::tools::parallel::is_ordinary_turn_interruption;
+use crate::turn_timing::TurnTimingState;
 
 const MAX_PENDING_CONTINUATIONS_PER_CELL: usize = 64;
 const MAX_QUEUED_DISPATCHES: usize = 128;
@@ -338,12 +340,12 @@ impl CodeModeDispatchBroker {
                             .await;
                             if !ready {
                                 observation.outcome = "gate_cancelled";
-                                let _ = response_tx.send(Err(nested_tool_failure(
+                                let _ = response_tx.send((Err(nested_tool_failure(
                                     &cell_id,
                                     ToolFailureCode::Cancelled,
                                     "code mode nested tool call cancelled",
                                     /*admitted*/ false,
-                                )));
+                                )), None));
                                 return;
                             }
                             let scope_matches = cells
@@ -355,12 +357,12 @@ impl CodeModeDispatchBroker {
                             if !scope_matches {
                                 observation.phase = "environment_gate";
                                 observation.outcome = "scope_refused";
-                                let _ = response_tx.send(Err(nested_tool_failure(
+                                let _ = response_tx.send((Err(nested_tool_failure(
                                     &cell_id,
                                     ToolFailureCode::StaleInput,
                                     "code mode cell environment selection changed; start a new cell for the current scope",
                                     /*admitted*/ false,
-                                )));
+                                )), None));
                                 return;
                             }
                             let child_started_at = Instant::now();
@@ -382,28 +384,36 @@ impl CodeModeDispatchBroker {
                                 .get(&cell_id)
                                 .map(|cell| cell.user_intent_epoch)
                                 .unwrap_or(u64::MAX);
-                            let invocation = invoke_with_user_intent(
-                                &host.exec.session.input_queue,
-                                &cell_id,
-                                authoring_epoch,
-                                host.invoke_tool(invocation, cancellation.clone(), authoring_epoch),
-                            );
-                            tokio::pin!(invocation);
-                            let response = tokio::select! {
-                                biased;
-                                response = &mut invocation => response,
-                                _ = cancellation_token.cancelled() => {
-                                    // Keep polling the same owner future so
-                                    // ToolCallRuntime can finish bounded
-                                    // process/runtime cleanup before this
-                                    // dispatch task releases its handles.
-                                    let _ = invocation.await;
-                                    Err(nested_tool_failure(
-                                        &cell_id,
-                                        ToolFailureCode::Cancelled,
-                                        "code mode nested tool call cancelled",
-                                        /*admitted*/ true,
-                                    ))
+                            let mut release_on_handoff = false;
+                            let response = {
+                                let invocation = invoke_with_user_intent(
+                                    &host.exec.session.input_queue,
+                                    &cell_id,
+                                    authoring_epoch,
+                                    host.invoke_tool(
+                                        invocation,
+                                        cancellation,
+                                        authoring_epoch,
+                                        &mut release_on_handoff,
+                                    ),
+                                );
+                                tokio::pin!(invocation);
+                                tokio::select! {
+                                    biased;
+                                    response = &mut invocation => response,
+                                    _ = cancellation_token.cancelled() => {
+                                        // Keep polling the same owner future so
+                                        // ToolCallRuntime can finish bounded
+                                        // process/runtime cleanup before this
+                                        // dispatch task releases its handles.
+                                        let _ = invocation.await;
+                                        Err(nested_tool_failure(
+                                            &cell_id,
+                                            ToolFailureCode::Cancelled,
+                                            "code mode nested tool call cancelled",
+                                            /*admitted*/ true,
+                                        ))
+                                    }
                                 }
                             };
                             let child_completed_at = Instant::now();
@@ -426,9 +436,11 @@ impl CodeModeDispatchBroker {
                                 "code mode nested tool child ended"
                             );
                             let delivery_started_at = Instant::now();
-                            let response_delivered = response_tx.send(response).is_ok();
-                            observation.phase = "response_enqueue";
+                            let timing = release_on_handoff
+                                .then(|| Arc::clone(&host.exec.turn.turn_timing_state));
+                            let response_delivered = response_tx.send((response, timing)).is_ok();
                             let delivered_at = Instant::now();
+                            observation.phase = "response_enqueue";
                             info!(
                                 event.name = "codex.code_mode_nested_tool",
                                 turn_id = %host.exec.turn.sub_id,
@@ -612,6 +624,7 @@ impl CodeModeSessionDelegate for CodeModeDispatchBroker {
     ) -> ToolInvocationFuture<'a> {
         Box::pin(async move {
             let cell_id = invocation.cell_id.clone();
+            let runtime_call_id = invocation.runtime_tool_call_id.clone();
             let failure = |code, message: &str, admitted: bool| {
                 nested_tool_failure(&cell_id, code, message, admitted)
             };
@@ -634,11 +647,17 @@ impl CodeModeSessionDelegate for CodeModeDispatchBroker {
             tokio::select! {
                 // The worker drops a cancelled message, so its receive error
                 // can be ready together with the cancellation branch.
-                response = response_rx => response.map_err(|_| if cancellation_token.is_cancelled() {
-                    failure(ToolFailureCode::Cancelled, "code mode nested tool call cancelled", true)
-                } else {
-                    failure(ToolFailureCode::UncertainEffects, "code mode nested tool dispatcher stopped", true)
-                })?,
+                response = response_rx => {
+                    let (response, release_on_handoff) = response.map_err(|_| if cancellation_token.is_cancelled() {
+                        failure(ToolFailureCode::Cancelled, "code mode nested tool call cancelled", true)
+                    } else {
+                        failure(ToolFailureCode::UncertainEffects, "code mode nested tool dispatcher stopped", true)
+                    })?;
+                    if let Some(timing) = release_on_handoff {
+                        timing.record_nested_result_release(cell_id.as_str(), &runtime_call_id);
+                    }
+                    response
+                },
                 _ = cancellation_token.cancelled() => {
                     Err(failure(ToolFailureCode::Cancelled, "code mode nested tool call cancelled", true))
                 }
@@ -686,12 +705,14 @@ impl CodeModeSessionDelegate for CodeModeDispatchBroker {
     }
 }
 
+type NestedDispatchReply = (Result<JsonValue, String>, Option<Arc<TurnTimingState>>);
+
 enum DispatchMessage {
     InvokeTool {
         invocation: CodeModeNestedToolCall,
         cancellation: NestedCancellation,
         enqueued_at: Instant,
-        response_tx: oneshot::Sender<Result<JsonValue, String>>,
+        response_tx: oneshot::Sender<NestedDispatchReply>,
     },
     Notify {
         call_id: String,
@@ -754,6 +775,7 @@ impl CoreTurnHost {
         invocation: CodeModeNestedToolCall,
         cancellation: NestedCancellation,
         authoring_epoch: u64,
+        release_on_handoff: &mut bool,
     ) -> Result<JsonValue, String> {
         let tool_runtime = self
             .tool_runtime
@@ -761,20 +783,37 @@ impl CoreTurnHost {
             .with_code_mode_user_intent(invocation.cell_id.as_str(), authoring_epoch);
         let mut paused = self.exec.session.subscribe_elicitation_pause_state();
         let timeout_cancellation = cancellation.clone();
+        let cell = invocation.cell_id.clone();
+        let runtime_call = invocation.runtime_tool_call_id.clone();
         let call = call_nested_tool(self.exec.clone(), tool_runtime, invocation, cancellation);
         tokio::pin!(call);
-        loop {
+        let result = loop {
             timeout_cancellation.set_timeout_paused(*paused.borrow_and_update());
             tokio::select! {
                 biased;
                 changed = paused.changed() => {
                     if changed.is_err() {
-                        return call.await.map_err(|error| error.model_message());
+                        break call.await;
                     }
                 }
-                result = &mut call => return result.map_err(|error| error.model_message()),
+                result = &mut call => break result,
             }
+        };
+        if timeout_cancellation.is_cancelled()
+            && is_ordinary_turn_interruption(timeout_cancellation.cause())
+        {
+            // An interrupted adapter can finish solely to settle owned work.
+            // Only the broker knows if that response was actually handed off.
+            *release_on_handoff = true;
+        } else {
+            // Preserve the adapter endpoint for other settlements, including
+            // runtime deadlines whose own response does not use this channel.
+            self.exec.turn.turn_timing_state.record_nested_result_release(
+                cell.as_str(),
+                &runtime_call,
+            );
         }
+        result.map_err(|error| error.model_message())
     }
 
     async fn notify(&self, call_id: String, cell_id: CellId, text: String) -> Result<(), String> {

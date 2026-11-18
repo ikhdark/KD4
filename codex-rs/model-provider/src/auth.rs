@@ -366,7 +366,7 @@ struct ManagedDispatchGuard {
 impl codex_http_client::RequestDispatchGuard for ManagedDispatchGuard {
     fn admit(&self, dispatch: &mut dyn FnMut()) -> Result<(), String> {
         self.manager
-            .with_policy_auth_epoch(self.epoch, dispatch)
+            .with_usable_auth(self.epoch, |_, _, _| dispatch())
             .map_err(|error| error.to_string())
     }
 }
@@ -389,17 +389,17 @@ impl AuthManagerAuthProvider {
         &self,
         apply: impl FnOnce(&dyn AuthProvider, u64) -> Result<T, AuthError>,
     ) -> Result<T, AuthError> {
-        let (epoch, auth) = self.current_scope_auth()?;
-        let auth = auth.ok_or_else(|| {
-            AuthError::Build("managed authentication is no longer available".into())
-        })?;
-        let projection = self
-            .projection
-            .clone()
-            .unwrap_or_else(|| auth_provider_from_auth(&auth));
-        let revision = self.auth_manager.auth_revision_for_snapshot(&auth).unwrap_or(u64::MAX);
         self.auth_manager
-            .with_policy_auth_epoch(epoch, || apply(projection.as_ref(), revision))
+            .with_usable_auth(self.expected_epoch, |auth, revision, _| {
+                if ProviderAccountScope::from_auth(Some(auth)) != self.expected_scope {
+                    return Err(AuthError::Build("authentication account scope changed or lifecycle invalidated; rebuild request state".into()));
+                }
+                let projection = self
+                    .projection
+                    .clone()
+                    .unwrap_or_else(|| auth_provider_from_auth(auth));
+                apply(projection.as_ref(), revision)
+            })
             .map_err(|err| AuthError::Build(err.to_string()))?
     }
 }
@@ -442,9 +442,7 @@ impl AuthProvider for AuthManagerAuthProvider {
     fn try_add_auth_headers(&self, headers: &mut HeaderMap) -> Result<(), AuthError> {
         self.with_projection(|projection, revision| {
             projection.try_add_auth_headers(headers)?;
-            // The projected snapshot may already have been replaced while the
-            // request was being prepared. Its rejection must not rotate the new
-            // credentials. MAX is an unmatched/stale revision, not fresh auth.
+            // A later rotation must not be refreshed for this request's rejection.
             self.last_request_auth_revision.store(revision, Ordering::Release);
             Ok(())
         })

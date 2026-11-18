@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use tokio::io::AsyncBufReadExt;
 
+use crate::payload_artifact::HydratedRecord;
+
 const COMPRESSED_SUFFIX: &str = ".zst";
 const COMPRESSED_READER_CHANNEL_CAPACITY: usize = 64;
 const MAX_OPEN_RETRIES: usize = 3;
@@ -802,6 +804,17 @@ impl RolloutLineReader {
 
     /// Reads the next JSONL record from the rollout.
     pub async fn next_line(&mut self) -> io::Result<Option<String>> {
+        match self.next_record(false).await? {
+            Some(HydratedRecord::Text(line)) => Ok(Some(line)),
+            None => Ok(None),
+            Some(HydratedRecord::Parsed(_)) => unreachable!("text-only rollout reader"),
+        }
+    }
+
+    pub(crate) async fn next_record(
+        &mut self,
+        decode_value: bool,
+    ) -> io::Result<Option<HydratedRecord>> {
         let line = match &mut self.inner {
             RolloutLineReaderInner::Plain(reader) => {
                 let mut line = Vec::new();
@@ -827,14 +840,14 @@ impl RolloutLineReader {
         self.last_line_terminated = terminated;
         if let Some(revision) = self.source_revision.as_mut() { revision.push(&line, terminated); }
         if self.source_only || !crate::payload_artifact::may_be_reference(&line) {
-            return Ok(Some(line));
+            return Ok(Some(HydratedRecord::Text(line)));
         }
         if self.exclude_context_replay
             && crate::payload_artifact::is_context_replay_reference(&line)
         {
             // Return the small reference for the operational decoder to account
             // for its record slot without opening or retaining the diagnostic blob.
-            return Ok(Some(line));
+            return Ok(Some(HydratedRecord::Text(line)));
         }
         let path = self.path.clone();
         let enroll = self.enroll_payloads;
@@ -844,11 +857,7 @@ impl RolloutLineReader {
             let version = capture_versions
                 .then(|| crate::payload_artifact::named_payload_version(&path, &line))
                 .flatten();
-            let result = if enroll {
-                crate::payload_artifact::hydrate_line_with_enrollment(&path, line, true)
-            } else {
-                crate::payload_artifact::hydrate_line(&path, line)
-            };
+            let result = crate::payload_artifact::hydrate_record(&path, line, enroll, decode_value);
             drop(payload_sync_owner);
             (version, result)
         })
@@ -866,7 +875,7 @@ impl RolloutLineReader {
                 tracing::warn!(path = %self.path.display(), %error, "skipping unreadable rollout payload");
                 // Keep the record slot, like torn UTF-8/JSON: consumers continue
                 // and the recorder counts the malformed record.
-                Ok(Some("invalid rollout payload record".to_owned()))
+                Ok(Some(HydratedRecord::Text("invalid rollout payload record".to_owned())))
             }
         }
     }

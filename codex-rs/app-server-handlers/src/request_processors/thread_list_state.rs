@@ -98,4 +98,20 @@ impl ThreadListState {
             _thread: thread,
         }
     }
+
+    /// Observe an existing resume without creating a new admission or
+    /// retaining any child/publication permit while waiting.
+    pub(super) async fn wait_for_existing_resume(&self, identity: &str) {
+        let gate = self
+            .resumes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(identity)
+            .and_then(Weak::upgrade);
+        if let Some(gate) = gate {
+            let started = wait_start();
+            let _parent = gate.lock_owned().await;
+            record_wait("resume_parent", started);
+        }
+    }
 }

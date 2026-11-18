@@ -247,6 +247,7 @@ where
     )?;
     let supported_capabilities = CapabilitySet::try_new([
         catalog_capability, state_capability, receipt_capability, causal_capability,
+        codex_code_mode_protocol::host::Capability::new(HostRequest::INTERRUPT_CAUSE_CAPABILITY)?,
         codex_code_mode_protocol::host::Capability::new(
             codex_code_mode_protocol::host::TIMEOUT_PAUSE_CAPABILITY,
         )?,
@@ -512,13 +513,15 @@ impl HostState {
             HostRequest::Terminate {
                 session_id,
                 cell_id,
+                interrupt_cause,
             } => {
                 let result = match self.session(&session_id) {
-                    Ok(session) => session.terminate(cell_id.into()).await.map(|outcome| {
-                        HostResponse::WaitCompleted {
+                    Ok(session) => session
+                        .terminate_with_interrupt_cause(cell_id.into(), interrupt_cause)
+                        .await
+                        .map(|outcome| HostResponse::WaitCompleted {
                             outcome: outcome.into(),
-                        }
-                    }),
+                        }),
                     Err(err) => Err(err),
                 };
                 self.respond(request_id, result);

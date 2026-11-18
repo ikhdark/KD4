@@ -217,6 +217,8 @@ struct ProviderObservations {
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_diagnostics: Option<serde_json::Value>,
     prompt_cache_diagnostics_invalid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_input: Option<serde_json::Value>,
     /// First server-reported timing report for this attempt (`responsesapi.websocket_timing`).
     /// Present only when the provider sent one (runtime metrics requested); never client-derived.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -364,6 +366,7 @@ impl ModelAttemptClock {
         });
         evidence.invalid |= observation.invalid_source_fields || now_us == u64::MAX;
         if observation.phase == "completed" {
+            evidence.reasoning_input = observation.reasoning_input;
             evidence.prompt_cache_diagnostics_invalid |= observation.prompt_cache_diagnostics_invalid;
             if let Some(diagnostics) = observation.prompt_cache_diagnostics {
                 evidence.prompt_cache_diagnostics_invalid |= evidence.prompt_cache_diagnostics

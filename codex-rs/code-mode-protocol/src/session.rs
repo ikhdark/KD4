@@ -9,6 +9,7 @@ use serde_json::Value as JsonValue;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+use crate::CancellationCause;
 use crate::CodeModeNestedToolCall;
 use crate::ExecuteRequest;
 use crate::NestedCancellation;
@@ -156,6 +157,13 @@ pub trait CodeModeSession: Send + Sync {
 
     /// Requests termination; dropping this future is not confirmation of cleanup.
     fn terminate<'a>(&'a self, cell_id: CellId) -> CodeModeSessionResultFuture<'a, WaitOutcome>;
+
+    /// Requests termination with the caller's turn-interrupt cause, if known.
+    fn terminate_with_interrupt_cause(
+        &self,
+        cell_id: CellId,
+        interrupt_cause: Option<CancellationCause>,
+    ) -> CodeModeSessionResultFuture<'_, WaitOutcome>;
 
     /// Shuts down session-owned work. Await this when relinquishing ownership;
     /// dropping the future alone does not establish that cleanup has finished.

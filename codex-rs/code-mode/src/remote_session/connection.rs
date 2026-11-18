@@ -5,6 +5,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use codex_code_mode_protocol::CancellationCause;
 use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::CodeModeSessionDelegate;
 use codex_code_mode_protocol::ExecuteRequest;
@@ -17,6 +18,7 @@ use codex_code_mode_protocol::host::ClientToHost;
 use codex_code_mode_protocol::host::EncodedFrame;
 use codex_code_mode_protocol::host::FramedReader;
 use codex_code_mode_protocol::host::FramedWriter;
+use codex_code_mode_protocol::host::HostRequest;
 use codex_code_mode_protocol::host::HostToClient;
 use codex_code_mode_protocol::host::MAX_IN_FLIGHT_REQUESTS;
 use codex_code_mode_protocol::host::MAX_PENDING_DELEGATE_REQUESTS;
@@ -66,6 +68,7 @@ const MAX_BACKEND_STALL_EXTENSIONS: u32 = 5;
 
 pub(super) struct Connection {
     observation: codex_utils_pty::process_observation::ObservedProcess,
+    interrupt_cause_supported: bool,
     command_tx: mpsc::Sender<DriverCommand>,
     execute_claim_tx: mpsc::UnboundedSender<RequestId>,
     alive: Arc<AtomicBool>,
@@ -235,6 +238,9 @@ impl Connection {
                 codex_code_mode_protocol::host::RECEIPT_RECOVERY_CAPABILITY,
             )
             .map_err(|error| error.to_string())?;
+            let interrupt_capability =
+                codex_code_mode_protocol::host::Capability::new(HostRequest::INTERRUPT_CAUSE_CAPABILITY)
+                    .map_err(|error| error.to_string())?;
             let hello = ClientHello::new(
                 // Timeout pause is optional so older matched hosts remain usable.
                 SupportedProtocolVersions::try_new([ProtocolVersion::V1])
@@ -244,6 +250,7 @@ impl Connection {
                     catalog_capability.clone(),
                     state_capability.clone(),
                     receipt_capability.clone(),
+                    interrupt_capability.clone(),
                     codex_code_mode_protocol::host::Capability::new(
                         codex_code_mode_protocol::host::TIMEOUT_PAUSE_CAPABILITY,
                     ).map_err(|error| error.to_string())?,
@@ -273,6 +280,7 @@ impl Connection {
                         hello.capabilities().contains(&codex_code_mode_protocol::host::Capability::new(
                             codex_code_mode_protocol::host::TIMEOUT_PAUSE_CAPABILITY,
                         ).map_err(|error| error.to_string())?),
+                        hello.capabilities().contains(&interrupt_capability),
                     ))
                 }
                 Some(HostToClient::HandshakeRejected { reason }) => {
@@ -292,14 +300,19 @@ impl Connection {
                 return Err("timed out negotiating with the code-mode host".to_string());
             }
         };
-        let (tool_catalog_references, named_state_snapshots, receipt_recovery, timeout_pause) =
-            match handshake_result {
-                Ok(enabled) => enabled,
-                Err(err) => {
-                    kill_and_reap(&mut child, &managed).await;
-                    return Err(err);
-                }
-            };
+        let (
+            tool_catalog_references,
+            named_state_snapshots,
+            receipt_recovery,
+            timeout_pause,
+            interrupt_cause_supported,
+        ) = match handshake_result {
+            Ok(enabled) => enabled,
+            Err(err) => {
+                kill_and_reap(&mut child, &managed).await;
+                return Err(err);
+            }
+        };
 
         tracing::debug!(?host_process_id, stage = "handshake_ready",
             "code-mode host lifecycle");
@@ -353,6 +366,7 @@ impl Connection {
 
         Ok(Self {
             observation,
+            interrupt_cause_supported,
             command_tx,
             execute_claim_tx,
             alive,
@@ -459,6 +473,7 @@ impl Connection {
         &self,
         session: RemoteSession,
         cell_id: CellId,
+        interrupt_cause: Option<CancellationCause>,
     ) -> Result<WaitOutcome, String> {
         let (response_tx, response_rx) = oneshot::channel();
         self.control_request(
@@ -467,6 +482,7 @@ impl Connection {
             DriverCommand::Terminate {
                 session,
                 cell_id,
+                interrupt_cause: interrupt_cause.filter(|_| self.interrupt_cause_supported),
                 response_tx,
             },
             response_rx,

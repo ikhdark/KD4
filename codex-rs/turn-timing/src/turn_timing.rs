@@ -2456,7 +2456,7 @@ impl TurnTimingState {
         state.advance(sample.time.monotonic_ns);
         // Undo an undispatched previous generation before the counters below
         // (and the Initial-reason test) read or change state.
-        state.release_undispatched_generation();
+        state.release_undispatched_generation(sample.time.monotonic_ns);
         let truncation_count_before = state.counters.truncation_induced_continuation_count;
         let recovery_count_before = state.counters.attributable_recovery_generation_count;
         // Without a new cause, a replacement for an undone generation keeps the
@@ -2499,7 +2499,13 @@ impl TurnTimingState {
             }
             _ => TurnTimingGenerationReason::Other,
         };
-        state.start_generation(reason, purpose, disposition, relevant_state_fingerprint);
+        state.start_generation(
+            sample.time.monotonic_ns,
+            reason,
+            purpose,
+            disposition,
+            relevant_state_fingerprint,
+        );
         if let Some(undo) = state.undispatched_generation.as_mut() {
             undo.truncation_induced_continuation_count = truncation_count_before;
             undo.attributable_recovery_generation_count = recovery_count_before;
@@ -2543,6 +2549,7 @@ impl TurnTimingState {
         let sample = self.clock.sample();
         state.advance(sample.time.monotonic_ns);
         state.start_generation(
+            sample.time.monotonic_ns,
             TurnTimingGenerationReason::Compaction,
             Some(purpose),
             TurnTimingGenerationDisposition::DecisionBearing,
@@ -4146,7 +4153,8 @@ impl TurnTimingState {
     pub fn begin_model_request_wait(self: &Arc<Self>) -> TurnTimingGuard {
         {
             let mut state = self.state();
-            state.advance(self.clock.sample().time.monotonic_ns);
+            let now_ns = self.clock.sample().time.monotonic_ns;
+            state.advance(now_ns);
             // Ordinary requests start collecting at history preparation. Retry
             // and compaction attempts may enter directly at this boundary.
             state
@@ -4154,6 +4162,7 @@ impl TurnTimingState {
                 .get_or_insert_with(Default::default);
             if state.current_generation_index.is_none() {
                 state.start_generation(
+                    now_ns,
                     TurnTimingGenerationReason::Other,
                     Some(TurnTimingGenerationPurpose::InitialReasoning),
                     TurnTimingGenerationDisposition::DecisionBearing,
@@ -4963,12 +4972,13 @@ impl TurnTimingStateInner {
 
     fn start_generation(
         &mut self,
+        now_ns: u128,
         reason: TurnTimingGenerationReason,
         purpose: Option<TurnTimingGenerationPurpose>,
         disposition: TurnTimingGenerationDisposition,
         relevant_state_fingerprint: Option<String>,
     ) {
-        self.release_undispatched_generation();
+        self.release_undispatched_generation(now_ns);
         let undo = UndispatchedGeneration {
             index: self.counters.logical_generation_count,
             generations_by_reason: self.counters.generations_by_reason.clone(),
@@ -5092,13 +5102,11 @@ impl TurnTimingStateInner {
     }
 
     /// Undo the current generation's start when it never recorded a model
-    /// request. Its index is then reused by the next generation. A generation
-    /// with a request row (any attempt kind) or a pending retry decision that
-    /// may belong to it is kept; an earlier generation's pending decision does
-    /// not keep it. The legacy continuation profile is not undone: it counts
-    /// the continuation decision, which did happen. The consumed cause is kept
-    /// for the replacement.
-    fn release_undispatched_generation(&mut self) {
+    /// request. Before its index is reused, close its pending retry as not
+    /// executed so a replacement cannot inherit it. A generation with a
+    /// request row (any attempt kind) is kept. The legacy profile still counts
+    /// the continuation decision, and the consumed cause is kept for the replacement.
+    fn release_undispatched_generation(&mut self, now_ns: u128) {
         let Some(undo) = self.undispatched_generation.take() else {
             return;
         };
@@ -5109,10 +5117,11 @@ impl TurnTimingStateInner {
                 .model_requests
                 .last()
                 .is_some_and(|request| request.generation_index == undo.index)
-            || self.retry_decisions.has_pending_for(undo.index)
         {
             return;
         }
+        self.retry_decisions
+            .finish_undispatched_generation(now_ns, undo.index);
         // A compaction generation consumes no cause; keep one already released.
         self.undispatched_continuation_cause = undo
             .continuation_cause
@@ -5562,7 +5571,7 @@ impl TurnTimingStateInner {
         }
         self.advance(sample.time.monotonic_ns);
         // A turn ending before its last generation dispatched did not run it.
-        self.release_undispatched_generation();
+        self.release_undispatched_generation(sample.time.monotonic_ns);
         let started_sample = self.started_sample;
         let inclusive_duration_ns = started_sample
             .map(|started| {

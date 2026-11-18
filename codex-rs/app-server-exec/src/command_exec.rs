@@ -995,10 +995,19 @@ fn spawn_process_output(
             let capacity_ready = Arc::clone(&capacity_changed).notified_owned();
             tokio::pin!(capacity_ready);
             capacity_ready.as_mut().enable();
-            if *stdio_timeout_rx.borrow() {
-                reached_eof = output_rx.is_closed() && output_rx.is_empty();
-                drain_timed_out = !reached_eof;
-                break;
+            if !drain_timed_out
+                && *stdio_timeout_rx.borrow()
+                && (!output_rx.is_closed() || !output_rx.is_empty())
+            {
+                // Stop new admission at the deadline, but retain the finite
+                // queued suffix through the same byte-cap and delivery path.
+                drain_timed_out = true;
+                output_rx.close();
+                tracing::debug!(
+                    ?stream,
+                    queued_chunks = output_rx.len(),
+                    "command/exec output drain deadline"
+                );
             }
             if stream_output && (delivered_prefix < buffer.len() || pending_cap_signal)
                 && let (Some(relay), Some(process_id)) = (delivery_relay.as_ref(), process_id.as_ref())
@@ -1037,13 +1046,10 @@ fn spawn_process_output(
                 _ = &mut capacity_ready, if stream_output && (delivered_prefix < buffer.len() || pending_cap_signal) => continue,
                 chunk = output_rx.recv() => match chunk {
                     Some(chunk) => chunk,
-                    None => { reached_eof = true; break; },
+                    None => { reached_eof = !drain_timed_out; break; },
                 },
-                _ = stdio_timeout_rx.wait_for(|&v| v) => {
-                    reached_eof = output_rx.is_closed() && output_rx.is_empty();
-                    drain_timed_out = !reached_eof;
-                    break;
-                },
+                _ = stdio_timeout_rx.wait_for(|&v| v),
+                    if !drain_timed_out && (!output_rx.is_closed() || !output_rx.is_empty()) => continue,
             };
             // Once excess is observed, drain a bounded batch without copying
             // bytes the cap can never retain. Equality alone is not truncation.

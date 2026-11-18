@@ -480,6 +480,8 @@ struct ResponseEnvelope {
     completed_at: Option<Value>,
     service_tier: Option<Value>,
     prompt_cache_diagnostics: Option<Value>,
+    input_transformations: Option<Value>,
+    reasoning: Option<Value>,
     model: Option<Value>,
     usage: Option<Value>,
     end_turn: Option<Value>,
@@ -487,6 +489,47 @@ struct ResponseEnvelope {
     incomplete_details: Option<Value>,
     output: Option<Value>,
     headers: Option<Value>,
+}
+
+fn reasoning_input_observation(response: &ResponseEnvelope) -> Value {
+    const MAX_TRANSFORMATIONS: usize = 128;
+    let label = |value: &Value, limit: usize| {
+        value.as_str().is_some_and(|value| {
+            !value.is_empty() && value.len() <= limit && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+            })
+        })
+    };
+    let context = match response.reasoning.as_ref() {
+        Some(reasoning) if !reasoning.is_object() => serde_json::json!({"status":"malformed"}),
+        Some(reasoning) if reasoning.get("context").is_some_and(|value| label(value, 64)) =>
+            serde_json::json!({"status":"reported","value":reasoning["context"]}),
+        Some(reasoning) if reasoning.get("context").is_some_and(|value| !value.is_null()) =>
+            serde_json::json!({"status":"malformed"}),
+        _ => serde_json::json!({"status":"unavailable"}),
+    };
+    let transformations = match response.input_transformations.as_ref() {
+        None => serde_json::json!({"status":"unavailable"}),
+        Some(Value::Array(rows)) => {
+            let mut observations = Vec::new();
+            for row in rows.iter().take(MAX_TRANSFORMATIONS) {
+                if !label(&row["id"], 256) || !label(&row["action"], 64)
+                    || !label(&row["reason"], 64) || !label(&row["type"], 64)
+                {
+                    return serde_json::json!({
+                        "effective_context":context,"transformations":{"status":"malformed"}
+                    });
+                }
+                observations.push(serde_json::json!({
+                    "id":row["id"],"action":row["action"],"reason":row["reason"],"type":row["type"]
+                }));
+            }
+            let status = if rows.len() > MAX_TRANSFORMATIONS { "truncated" } else { "reported" };
+            serde_json::json!({"status":status,"items":observations})
+        }
+        Some(_) => serde_json::json!({"status":"malformed"}),
+    };
+    serde_json::json!({"effective_context":context,"transformations":transformations})
 }
 
 fn is_known_event(kind: &str) -> bool {
@@ -876,6 +919,9 @@ impl ResponsesStreamEvent<'_> {
             prompt_cache_diagnostics_invalid: raw_diagnostics.is_some()
                 && prompt_cache_diagnostics.is_none(),
             prompt_cache_diagnostics,
+            reasoning_input: response
+                .filter(|_| phase == "completed" && response_id.is_some())
+                .map(reasoning_input_observation),
             safety_buffering,
             output_token_receipts: token_receipts,
             token_receipts_complete: false,

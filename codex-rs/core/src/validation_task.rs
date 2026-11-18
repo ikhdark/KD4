@@ -29,11 +29,35 @@ impl codex_tools::ToolOutput for CompilationEvidenceOutput {
     }
 }
 
+pub(crate) struct ValidationPolicyRefusalOutput(crate::tools::context::FunctionToolOutput);
+
+impl codex_tools::ToolOutput for ValidationPolicyRefusalOutput {
+    fn log_preview(&self) -> String { self.0.log_preview() }
+    fn success_for_logging(&self) -> bool { false }
+    fn sampling_request_signal(&self) -> Option<serde_json::Value> {
+        self.0.sampling_request_signal()
+    }
+    fn projection_metadata(&self) -> Option<codex_tools::ToolOutputProjectionMetadata> {
+        self.0.projection_metadata()
+    }
+    fn to_response_item(&self, call_id: &str, payload: &codex_tools::ToolPayload)
+        -> codex_protocol::models::ResponseInputItem
+    { self.0.to_response_item(call_id, payload) }
+    fn code_mode_result(&self, _: &codex_tools::ToolPayload) -> serde_json::Value {
+        use codex_protocol::tool_failure::{ToolFailure, ToolFailureCode};
+        let signal = serde_json::Value::Object(self.0.essential_inline.clone());
+        let reason = signal["reason"].as_str().unwrap_or("Validation policy refused execution.");
+        let mut failure = ToolFailure::no_effects(ToolFailureCode::PermissionDenied, reason);
+        failure.details = Some(signal);
+        serde_json::json!({ "tool_failure": failure })
+    }
+}
+
 /// A policy refusal is not an execution failure or a busy validation lane.
 pub(crate) fn policy_refusal(
     turn: &TurnContext,
     reason: impl Into<String>,
-) -> crate::tools::context::FunctionToolOutput {
+) -> ValidationPolicyRefusalOutput {
     let signal = serde_json::json!({
         "validation_policy_refusal": true,
         "mode": turn.validation_mode,
@@ -45,14 +69,14 @@ pub(crate) fn policy_refusal(
         signal.to_string(), Some(false),
     ).with_sampling_request_signal(signal.clone());
     output.essential_inline = signal.as_object().cloned().unwrap_or_default();
-    output
+    ValidationPolicyRefusalOutput(output)
 }
 
 pub(crate) fn mode_refusal(
     turn: &TurnContext,
     classification: codex_command_analysis::validation::ValidationPolicyClassification,
     declared: bool,
-) -> Option<crate::tools::context::FunctionToolOutput> {
+) -> Option<ValidationPolicyRefusalOutput> {
     use codex_command_analysis::validation::ValidationPolicyClassification as Class;
     use codex_protocol::validation::ValidationMode;
     if classification == Class::ReadOnly { return None; }

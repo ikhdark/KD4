@@ -748,15 +748,21 @@ fn read_payload(directory: &Path, sha256: &str, bytes: u64) -> io::Result<Vec<u8
 }
 
 pub(crate) fn hydrate_line(path: &Path, line: String) -> io::Result<String> {
-    hydrate_line_with_enrollment(path, line, false)
+    hydrate_line_with_limit(path, line, false, u64::MAX)
 }
 
-pub(crate) fn hydrate_line_with_enrollment(
+pub(crate) enum HydratedRecord {
+    Text(String),
+    Parsed(serde_json::Value),
+}
+
+pub(crate) fn hydrate_record(
     path: &Path,
     line: String,
     enroll: bool,
-) -> io::Result<String> {
-    hydrate_line_with_limit(path, line, enroll, u64::MAX)
+    decode_value: bool,
+) -> io::Result<HydratedRecord> {
+    hydrate_record_with_limit(path, line, enroll, decode_value, u64::MAX)
 }
 
 pub(crate) fn hydrate_line_bounded(
@@ -773,15 +779,28 @@ fn hydrate_line_with_limit(
     enroll: bool,
     max_bytes: u64,
 ) -> io::Result<String> {
-    if !may_be_reference(&line) {
-        return Ok(line);
+    match hydrate_record_with_limit(path, line, enroll, false, max_bytes)? {
+        HydratedRecord::Text(line) => Ok(line),
+        HydratedRecord::Parsed(_) => unreachable!("text-only hydration"),
     }
-    let reference: serde_json::Value = match serde_json::from_str(&line) {
+}
+
+fn hydrate_record_with_limit(
+    path: &Path,
+    line: String,
+    enroll: bool,
+    decode_value: bool,
+    max_bytes: u64,
+) -> io::Result<HydratedRecord> {
+    if !may_be_reference(&line) {
+        return Ok(HydratedRecord::Text(line));
+    }
+    let mut reference: serde_json::Value = match serde_json::from_str(&line) {
         Ok(value) => value,
-        Err(_) => return Ok(line), // Preserve the existing torn-line handling.
+        Err(_) => return Ok(HydratedRecord::Text(line)), // Preserve torn-line handling.
     };
     if reference["type"] != KIND {
-        return Ok(line);
+        return Ok(HydratedRecord::Text(line));
     }
     let sha256 = reference["payload"]["sha256"]
         .as_str()
@@ -798,6 +817,25 @@ fn hydrate_line_with_limit(
     // snapshot here only to serialize it for the canonical decoder duplicates
     // its entire object tree on every history read and cold resume.
     let payload = read_payload(&root(path), sha256, bytes)?;
+    if decode_value
+        && let Ok(serde_json::Value::Object(mut item)) = serde_json::from_slice(&payload)
+        && item.len() == 2
+        && item.contains_key("payload")
+        && item.contains_key("type")
+    {
+        let item_type = item.get("type").unwrap_or(&serde_json::Value::Null);
+        check_payload_type(item_type, &reference["payload"]["item_type"])?;
+        if enroll {
+            enroll_payload_for_sync(path, sha256);
+        }
+        // Same precedence as text hydration: record metadata belongs to
+        // the reference, which can share one body across multiple records.
+        item.insert("timestamp".to_owned(), reference["timestamp"].take());
+        item.insert("format_version".to_owned(), reference["format_version"].take());
+        return Ok(HydratedRecord::Parsed(serde_json::Value::Object(item)));
+    }
+    // For noncanonical bodies keep text hydration's normalization and error
+    // classification (including serde_json's reserved first-key handling).
     let mut item: std::collections::BTreeMap<String, &serde_json::value::RawValue> =
         serde_json::from_slice(&payload)?;
     let item_type: serde_json::Value = item
@@ -805,29 +843,43 @@ fn hydrate_line_with_limit(
         .map(|value| serde_json::from_str(value.get()))
         .transpose()?
         .unwrap_or(serde_json::Value::Null);
-    if item_type != reference["payload"]["item_type"] || item_type == KIND {
-        return Err(io::Error::other("rollout payload type mismatch"));
-    }
+    check_payload_type(&item_type, &reference["payload"]["item_type"])?;
     if enroll {
-        let mut pending = pending_sync()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pending.sequence = pending.sequence.saturating_add(1);
-        let sequence = pending.sequence;
-        // A cold reader observes `.jsonl.zst`, but the writer's durable barrier
-        // syncs dependencies keyed by the materialized plain rollout path.
-        pending.paths.insert(
-            (
-                crate::compression::plain_rollout_path(path),
-                root(path).join(format!("{sha256}.json")),
-            ),
-            sequence,
-        );
+        enroll_payload_for_sync(path, sha256);
     }
     let timestamp = serde_json::value::to_raw_value(&reference["timestamp"])?;
     let format_version = serde_json::value::to_raw_value(&reference["format_version"])?;
     item.insert("timestamp".to_owned(), &timestamp);
     item.insert("format_version".to_owned(), &format_version);
-    serde_json::to_string(&item).map_err(io::Error::other)
+    serde_json::to_string(&item)
+        .map(HydratedRecord::Text)
+        .map_err(io::Error::other)
+}
+
+fn check_payload_type(
+    item_type: &serde_json::Value,
+    expected: &serde_json::Value,
+) -> io::Result<()> {
+    if item_type != expected || item_type == KIND {
+        return Err(io::Error::other("rollout payload type mismatch"));
+    }
+    Ok(())
+}
+
+fn enroll_payload_for_sync(path: &Path, sha256: &str) {
+    let mut pending = pending_sync()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    pending.sequence = pending.sequence.saturating_add(1);
+    let sequence = pending.sequence;
+    // A cold reader observes `.jsonl.zst`, but the writer's durable barrier
+    // syncs dependencies keyed by the materialized plain rollout path.
+    pending.paths.insert(
+        (
+            crate::compression::plain_rollout_path(path),
+            root(path).join(format!("{sha256}.json")),
+        ),
+        sequence,
+    );
 }
 

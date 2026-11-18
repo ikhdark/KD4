@@ -149,6 +149,7 @@ const __codex_paginate_search = (search) => {
       lines: true, max_per_file: options.max_per_file ?? 10,
       force_fresh: true, hydrate: options.hydrate ?? false, enclosing: options.enclosing ?? false,
       context_lines: options.context_lines ?? 3, max_hydrated_files: options.max_hydrated_files ?? 8,
+      preferred_paths: options.preferred_paths,
       count_only: false, overlapping: options.overlapping ?? false,
     }, page_size: options.page_size }));
     const opts = request.options;

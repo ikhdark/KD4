@@ -44,14 +44,38 @@ struct ClientState {
     status_tx: watch::Sender<PongStatus>,
 }
 
+#[derive(Clone)]
+struct OutboundLane {
+    sender: mpsc::Sender<QueuedServerEnvelope>,
+    slots: Arc<tokio::sync::Semaphore>,
+    bytes: Arc<tokio::sync::Semaphore>,
+}
+
+impl OutboundLane {
+    fn new(sender: mpsc::Sender<QueuedServerEnvelope>, bytes: usize) -> Self {
+        Self {
+            slots: Arc::new(tokio::sync::Semaphore::new(sender.max_capacity())),
+            bytes: Arc::new(tokio::sync::Semaphore::new(bytes)),
+            sender,
+        }
+    }
+
+    async fn acquire_credit(
+        &self, stream: tokio::sync::OwnedSemaphorePermit, cost: u32,
+    ) -> Option<Arc<super::ReplayCredit>> {
+        let bytes = Arc::clone(&self.bytes).acquire_many_owned(cost).await.ok()?;
+        let global = Arc::clone(&self.slots).acquire_owned().await.ok()?;
+        Some(Arc::new(super::ReplayCredit { _stream: Some(stream), _global: global, _bytes: bytes }))
+    }
+}
+
 pub(crate) struct ClientTracker {
     clients: HashMap<(ClientId, StreamId), ClientState>,
     legacy_stream_ids: HashMap<ClientId, StreamId>,
     join_set: JoinSet<(ClientId, StreamId, ConnectionId)>,
     cleanup: Vec<JoinHandle<Result<(), Stopped>>>,
-    server_event_tx: mpsc::Sender<QueuedServerEnvelope>,
-    replay_slots: Arc<tokio::sync::Semaphore>,
-    replay_bytes: Arc<tokio::sync::Semaphore>,
+    data_lane: OutboundLane,
+    status_lane: OutboundLane,
     unknown_replay: Arc<tokio::sync::Semaphore>,
     transport_event_tx: mpsc::Sender<TransportEvent>,
     // Unlike the child below, this is not cancelled by tracker-only shutdown.
@@ -62,6 +86,7 @@ pub(crate) struct ClientTracker {
 impl ClientTracker {
     pub(crate) fn new(
         server_event_tx: mpsc::Sender<QueuedServerEnvelope>,
+        server_status_tx: mpsc::Sender<QueuedServerEnvelope>,
         transport_event_tx: mpsc::Sender<TransportEvent>,
         shutdown_token: &CancellationToken,
     ) -> Self {
@@ -70,9 +95,8 @@ impl ClientTracker {
             legacy_stream_ids: HashMap::new(),
             join_set: JoinSet::new(),
             cleanup: Vec::new(),
-            server_event_tx,
-            replay_slots: Arc::new(tokio::sync::Semaphore::new(super::CHANNEL_CAPACITY)),
-            replay_bytes: Arc::new(tokio::sync::Semaphore::new(super::REPLAY_BYTE_BUDGET)),
+            data_lane: OutboundLane::new(server_event_tx, super::REPLAY_BYTE_BUDGET),
+            status_lane: OutboundLane::new(server_status_tx, super::STATUS_REPLAY_BYTE_BUDGET),
             unknown_replay: Arc::new(tokio::sync::Semaphore::new(1)),
             transport_event_tx,
             transport_shutdown_token: shutdown_token.clone(),
@@ -270,9 +294,8 @@ impl ClientTracker {
                     client_id.clone(),
                     stream_id.clone(),
                     connection_id,
-                    self.server_event_tx.clone(),
-                    Arc::clone(&self.replay_slots),
-                    Arc::clone(&self.replay_bytes),
+                    self.data_lane.clone(),
+                    self.status_lane.clone(),
                     writer_rx,
                     status_rx,
                     disconnect_token.clone(),
@@ -331,9 +354,9 @@ impl ClientTracker {
                 // reader from handling ACKs that free outbound capacity.
                 let Some(cost) = super::replay_byte_cost(256, &client_id, &stream_id) else { return Ok(()) };
                 let Ok(unknown) = Arc::clone(&self.unknown_replay).try_acquire_owned() else { return Ok(()) };
-                let Ok(slot) = Arc::clone(&self.replay_slots).try_acquire_owned() else { return Ok(()) };
-                let Ok(bytes) = Arc::clone(&self.replay_bytes).try_acquire_many_owned(cost) else { return Ok(()) };
-                let _ = self.server_event_tx.try_send(QueuedServerEnvelope {
+                let Ok(slot) = Arc::clone(&self.data_lane.slots).try_acquire_owned() else { return Ok(()) };
+                let Ok(bytes) = Arc::clone(&self.data_lane.bytes).try_acquire_many_owned(cost) else { return Ok(()) };
+                let _ = self.data_lane.sender.try_send(QueuedServerEnvelope {
                     event: ServerEvent::Pong {
                         status: PongStatus::Unknown,
                     },
@@ -353,90 +376,71 @@ impl ClientTracker {
         client_id: ClientId,
         stream_id: StreamId,
         connection_id: ConnectionId,
-        server_event_tx: mpsc::Sender<QueuedServerEnvelope>,
-        replay_slots: Arc<tokio::sync::Semaphore>,
-        replay_bytes: Arc<tokio::sync::Semaphore>,
+        data_lane: OutboundLane,
+        status_lane: OutboundLane,
         mut writer_rx: mpsc::Receiver<QueuedOutgoingMessage>,
         mut status_rx: watch::Receiver<PongStatus>,
         disconnect_token: CancellationToken,
     ) -> (ClientId, StreamId, ConnectionId) {
-        // Preserve REL-02's one unacknowledged data envelope per stream, but
-        // let liveness replies progress while that data awaits its ACK. Status
-        // has its own one-envelope cap and still consumes global/byte credits.
-        let stream_slot = Arc::new(tokio::sync::Semaphore::new(1));
-        let status_slot = Arc::new(tokio::sync::Semaphore::new(1));
-        loop {
-            let (event, write_complete_tx, message_bytes, stream_credit) = tokio::select! {
-                _ = disconnect_token.cancelled() => {
+        // Preserve the one-envelope replay window per stream. A data envelope
+        // waiting for global capacity must not prevent polling the status slot.
+        let data = async {
+            let stream_slot = Arc::new(tokio::sync::Semaphore::new(1));
+            while let Ok(permit) = Arc::clone(&stream_slot).acquire_owned().await {
+                let Some(mut queued_message) = writer_rx.recv().await else { break };
+                let bytes = match queued_message.encoded_json.as_ref() {
+                    Some(encoded) => encoded.streamed_len.unwrap_or(encoded.bytes.len()),
+                    None => match queued_message.prepare_stdio_json(0) {
+                        Ok(bytes) => bytes,
+                        Err(_) => break,
+                    },
+                };
+                if let Some(observation) = super::protocol::DeliveryObservation::new(&client_id, &stream_id, 0, None) {
+                    let mut facts = super::protocol::response_observation(&queued_message.message);
+                    facts["connection_id"] = connection_id.0.into();
+                    observation.record("mobile_response_dequeued", facts);
+                }
+                let Some(cost) = super::replay_byte_cost(bytes, &client_id, &stream_id) else {
+                    disconnect_token.cancel();
                     break;
-                }
-                queued_message = async {
-                    let permit = Arc::clone(&stream_slot).acquire_owned().await.ok()?;
-                    writer_rx.recv().await.map(|message| (permit, message))
-                } => {
-                    let Some((permit, mut queued_message)) = queued_message else {
-                        break;
-                    };
-                     // This is the Remote connection's owned copy, after fanout.
-                     // Never reuse an encoding prepared before the display preview.
-                     if matches!(&queued_message.message, crate::outgoing_message::OutgoingMessage::AppServerNotification(_)) {
-                         super::preview::outgoing(&mut queued_message.message);
-                         queued_message.encoded_json = None;
-                     }
-                    let bytes = match queued_message.encoded_json.as_ref() {
-                        Some(encoded) => encoded.streamed_len.unwrap_or(encoded.bytes.len()),
-                        None => match queued_message.prepare_stdio_json(0) { Ok(bytes) => bytes, Err(_) => break },
-                    };
-                    if let Some(observation) = super::protocol::DeliveryObservation::new(&client_id, &stream_id, 0, None) {
-                        let mut facts = super::protocol::response_observation(&queued_message.message);
-                        facts["connection_id"] = connection_id.0.into();
-                        observation.record("mobile_response_dequeued", facts);
-                    }
-                    let event = ServerEvent::ServerMessage {
-                        message: Box::new(queued_message.message),
-                    };
-                    (event, queued_message.write_complete_tx, bytes, permit)
-                }
-                status = async {
-                    let permit = Arc::clone(&status_slot).acquire_owned().await.ok()?;
-                    status_rx.changed().await.ok()?;
-                    Some((permit, status_rx.borrow_and_update().clone()))
-                } => {
-                    let Some((permit, status)) = status else {
-                        break;
-                    };
-                    let event = ServerEvent::Pong { status };
-                    (event, None, 256, permit)
-                }
-            };
-            let Some(cost) = super::replay_byte_cost(message_bytes, &client_id, &stream_id) else {
-                disconnect_token.cancel();
-                break;
-            };
-            let credit = tokio::select! {
-                _ = disconnect_token.cancelled() => break,
-                permit = async {
-                    let bytes = Arc::clone(&replay_bytes).acquire_many_owned(cost).await.ok()?;
-                    let global = Arc::clone(&replay_slots).acquire_owned().await.ok()?;
-                    Some(Arc::new(super::ReplayCredit { _stream: Some(stream_credit), _global: global, _bytes: bytes }))
-                } => match permit { Some(permit) => permit, None => break },
-            };
-            let send_result = tokio::select! {
-                _ = disconnect_token.cancelled() => {
-                    break;
-                }
-                send_result = server_event_tx.send(QueuedServerEnvelope {
-                    event,
+                };
+                let Some(replay_credit) = data_lane.acquire_credit(permit, cost).await else { break };
+                if data_lane.sender.send(QueuedServerEnvelope {
+                    event: ServerEvent::ServerMessage { message: Box::new(queued_message.message) },
                     client_id: client_id.clone(),
                     stream_id: stream_id.clone(),
-                    write_complete_tx,
+                    write_complete_tx: queued_message.write_complete_tx,
                     delivery_failure: Some(disconnect_token.clone()),
-                    replay_credit: credit,
-                }) => send_result,
-            };
-            if send_result.is_err() {
-                break;
+                    replay_credit,
+                }).await.is_err() {
+                    break;
+                }
             }
+        };
+        let status = async {
+            let stream_slot = Arc::new(tokio::sync::Semaphore::new(1));
+            while let Ok(permit) = Arc::clone(&stream_slot).acquire_owned().await {
+                if status_rx.changed().await.is_err() { break; }
+                let status = status_rx.borrow_and_update().clone();
+                let Some(cost) = super::status_replay_byte_cost(&client_id, &stream_id) else { continue };
+                let Some(replay_credit) = status_lane.acquire_credit(permit, cost).await else { break };
+                if status_lane.sender.send(QueuedServerEnvelope {
+                    event: ServerEvent::Pong { status },
+                    client_id: client_id.clone(),
+                    stream_id: stream_id.clone(),
+                    write_complete_tx: None,
+                    delivery_failure: Some(disconnect_token.clone()),
+                    replay_credit,
+                }).await.is_err() {
+                    break;
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = disconnect_token.cancelled() => {}
+            _ = status => {}
+            _ = data => {}
         }
         (client_id, stream_id, connection_id)
     }

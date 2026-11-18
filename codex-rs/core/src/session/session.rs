@@ -84,6 +84,7 @@ impl ToolHistoryPersistenceCommand {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ToolHistoryPersistenceEnqueueError {
+    ReadOnly,
     SequenceOverflow,
     WorkerClosed,
 }
@@ -91,6 +92,9 @@ pub(super) enum ToolHistoryPersistenceEnqueueError {
 impl std::fmt::Display for ToolHistoryPersistenceEnqueueError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ReadOnly => {
+                formatter.write_str("completed-tool history is read-only for this session")
+            }
             Self::SequenceOverflow => {
                 formatter.write_str("tool-history persistence sequence overflowed")
             }
@@ -141,6 +145,7 @@ impl std::error::Error for ToolHistoryPersistenceError {}
 impl From<ToolHistoryPersistenceEnqueueError> for ToolHistoryPersistenceError {
     fn from(error: ToolHistoryPersistenceEnqueueError) -> Self {
         match error {
+            ToolHistoryPersistenceEnqueueError::ReadOnly => Self::Persistence(error.to_string()),
             ToolHistoryPersistenceEnqueueError::SequenceOverflow => Self::SequenceOverflow,
             ToolHistoryPersistenceEnqueueError::WorkerClosed => Self::WorkerClosed,
         }
@@ -169,6 +174,7 @@ impl Drop for ToolHistoryPersistenceWorker {
 
 #[derive(Clone)]
 pub(super) struct ToolHistoryPersistenceQueue {
+    read_only: bool,
     state: Arc<tokio::sync::Mutex<ToolHistoryPersistenceState>>,
     wake_tx: mpsc::Sender<()>,
     progress: watch::Receiver<ToolHistoryPersistenceProgress>,
@@ -228,6 +234,7 @@ impl ToolHistoryPersistenceQueue {
         thread_id: ThreadId,
         initial_state: crate::tool_history::ToolHistoryState,
         owner: Option<Arc<SessionStorageOwnership>>,
+        read_only: bool,
     ) -> Self {
         let state = Arc::new(tokio::sync::Mutex::new(
             ToolHistoryPersistenceState::default(),
@@ -458,6 +465,7 @@ impl ToolHistoryPersistenceQueue {
             }
         });
         Self {
+            read_only,
             state,
             wake_tx,
             progress,
@@ -481,6 +489,7 @@ impl ToolHistoryPersistenceQueue {
                     || self.wake_tx.is_closed()
                 {
                     return ToolHistoryPersistenceWriter {
+                        read_only: self.read_only,
                         state,
                         wake_tx: &self.wake_tx,
                         progress_tx: &self.progress_tx,
@@ -496,6 +505,7 @@ impl ToolHistoryPersistenceQueue {
             };
             if stopped {
                 return ToolHistoryPersistenceWriter {
+                    read_only: self.read_only,
                     state: self.state.lock().await,
                     wake_tx: &self.wake_tx,
                     progress_tx: &self.progress_tx,
@@ -522,6 +532,10 @@ impl ToolHistoryPersistenceQueue {
     }
 
     pub(super) async fn checkpoint(&self) -> Result<(), ToolHistoryPersistenceError> {
+        // A read-only queue cannot have accepted mutations to flush.
+        if self.read_only {
+            return Ok(());
+        }
         let target_sequence = self.writer().await.enqueue_command(
             ToolHistoryPersistenceCommand::Checkpoint,
             "completed-tool history checkpoint",
@@ -583,6 +597,7 @@ impl ToolHistoryPersistenceQueue {
 /// Acquired before changing session history so publishing its matching queue
 /// entry needs no await and cannot be separated from that change by cancellation.
 pub(super) struct ToolHistoryPersistenceWriter<'a> {
+    read_only: bool,
     state: tokio::sync::MutexGuard<'a, ToolHistoryPersistenceState>,
     wake_tx: &'a mpsc::Sender<()>,
     progress_tx: &'a watch::Sender<ToolHistoryPersistenceProgress>,
@@ -636,6 +651,9 @@ impl<'queue> ToolHistoryPersistenceWriter<'queue> {
         command: ToolHistoryPersistenceCommand,
         description: &'static str,
     ) -> Result<u64, ToolHistoryPersistenceEnqueueError> {
+        if self.read_only {
+            return Err(ToolHistoryPersistenceEnqueueError::ReadOnly);
+        }
         if self.wake_tx.is_closed() {
             return Err(ToolHistoryPersistenceEnqueueError::WorkerClosed);
         }
@@ -1465,9 +1483,11 @@ impl Session {
         // independent of target persistence: acquire the existing writer lease
         // first, retaining its initialization guard through history installation.
         let persistence_and_history_fut = async {
-            let persistence = thread_persistence_fut.await;
+            let persistence = phases
+                .observe_branch("thread_persistence", thread_persistence_fut)
+                .await;
             let history = if persistence.is_ok() {
-                tool_history_fut.await
+                phases.observe_branch("tool_history", tool_history_fut).await
             } else {
                 None
             };
@@ -1481,10 +1501,13 @@ impl Session {
             (),
         ) = tokio::join!(
             persistence_and_history_fut,
-            state_db_fut,
-            auth_and_mcp_fut,
-            validate_config_lock_if_configured(&session_configuration),
-            local_shell_fut,
+            phases.observe_branch("state_db", state_db_fut),
+            phases.observe_branch("auth_and_mcp", auth_and_mcp_fut),
+            phases.observe_branch(
+                "config_lock",
+                validate_config_lock_if_configured(&session_configuration),
+            ),
+            phases.observe_branch("local_shell", local_shell_fut),
         );
         phases.mark("persistence_state_auth_mcp");
 
@@ -1753,13 +1776,22 @@ impl Session {
             state
                 .history
                 .set_pressure_reasoning_retirement(config.pressure_reasoning_retirement);
+            let mut tool_history_read_only = false;
             if let Some(tool_history) = initial_tool_history {
                 // Only a change this load made (checkpointed prefix, quarantined
                 // ledger) is recorded once; a source every load reports again
                 // (unsupported, unreadable, unretired) is delivered live only.
                 let one_shot = tool_history.warning_is_one_shot();
                 let (tool_history, ledger_warning) = tool_history.into_state_and_warning();
-                if let Some(message) = ledger_warning {
+                if let Some(mut message) = ledger_warning {
+                    // A recurring warning means the unreadable, unsupported or
+                    // unretired source is still in place. Never write a partial
+                    // mirror over it, even if access changes during the session.
+                    // A fork writes to its own ledger, not the warned-about parent.
+                    tool_history_read_only = !one_shot && tool_history_fork_source.is_none();
+                    if tool_history_read_only {
+                        message.push_str(". Completed-tool history is read-only for this session.");
+                    }
                     tracing::warn!("{message}");
                     let event = Event {
                         id: INITIAL_SUBMIT_ID.to_owned(),
@@ -1957,6 +1989,7 @@ impl Session {
                 thread_id,
                 state.tool_history_state(),
                 Some(Arc::clone(&storage_ownership)),
+                tool_history_read_only,
             );
             let sess = Arc::new(Session {
                 thread_id,
@@ -2139,7 +2172,10 @@ impl Session {
                 sess.record_initial_history_with_facts(initial_history, startup_rollout_facts),
             )
             .await?;
-            if config.completed_tool_history_projection && restores_initial_tool_history {
+            if config.completed_tool_history_projection
+                && restores_initial_tool_history
+                && !tool_history_read_only
+            {
                 sess.finalize_initial_tool_history_state(
                     config.codex_home.as_path(),
                     tool_history_fork_source,

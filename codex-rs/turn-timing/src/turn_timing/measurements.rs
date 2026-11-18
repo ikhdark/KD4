@@ -220,6 +220,15 @@ impl Capture {
         }
         if let Some(decisions) = retries.get("rows").and_then(Value::as_array) {
             for decision in decisions {
+                // Total backoff is durable on the decision, but without wait
+                // boundaries we cannot split a nonzero pre-turn decision's wait.
+                let backoff_ns = if decision["starts_before_turn"] == true
+                    && decision["actual_backoff_ns"].as_u64() != Some(0)
+                {
+                    Value::Null
+                } else {
+                    decision["actual_backoff_ns"].clone()
+                };
                 let target = decision["executed_physical_attempt_id"].as_str();
                 let matching = target.and_then(|target| events.iter_mut()
                     .find(|event| event["event_id"].as_str() == Some(format!("retry:{target}").as_str())));
@@ -227,7 +236,7 @@ impl Capture {
                     event["start_time"] = decision["start_time"].clone();
                     event["recovery_reason"] = decision["trigger"].clone();
                     event["setup_end_time"] = decision["end_time"].clone();
-                    event["backoff_ns"] = decision["actual_backoff_ns"].clone();
+                    event["backoff_ns"] = backoff_ns;
                 } else {
                     events.push(json!({
                         "event_id":format!("retry-decision:{}", decision["decision_id"]),
@@ -235,7 +244,7 @@ impl Capture {
                         "start_time":decision["start_time"], "end_time":decision["end_time"],
                         "outcome":if decision["phase"] == "not_executed" { Some("no_progress") } else { None },
                         "evidence_ref":format!("native:retry-decision:{}", decision["decision_id"]),
-                        "backoff_ns":decision["actual_backoff_ns"]
+                        "backoff_ns":backoff_ns
                     }));
                 }
             }

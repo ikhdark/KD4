@@ -1,12 +1,14 @@
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;
-use codex_api::SharedAuthProvider;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::UnauthorizedRecovery;
+use std::future::Future;
+use std::future::poll_fn;
 use std::io;
 use std::io::ErrorKind;
 use std::sync::Arc;
+use std::task::Poll;
 use tokio::sync::watch;
 use tracing::info;
 use tracing::warn;
@@ -16,15 +18,58 @@ pub(super) const REMOTE_CONTROL_ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
 pub(super) const REMOTE_CONTROL_AUTH_ATTEMPTS: usize = 3;
 
 pub(super) struct RemoteControlConnectionAuth {
-    pub(super) auth_provider: SharedAuthProvider,
     pub(super) account_id: String,
     auth: CodexAuth,
+    manager: Arc<AuthManager>,
+    epoch: u64,
+    revision: u64,
 }
 
 impl RemoteControlConnectionAuth {
     pub(super) fn request_headers(&self) -> io::Result<HeaderMap> {
+        self.with_current_auth(
+            "remote control credentials changed before request preparation",
+            |current| self.build_request_headers(current),
+        )
+    }
+
+    pub(super) async fn dispatch_request<F: Future>(&self, send: F) -> io::Result<F::Output> {
+        let mut send = std::pin::pin!(send);
+        let mut first_poll = true;
+        poll_fn(|context| {
+            if std::mem::take(&mut first_poll) {
+                // Admit the exact auth revision that supplied the headers. Only the first
+                // poll runs under the auth guard; a pending response must not block logout.
+                match self.with_current_auth(
+                    "remote control credentials changed before request dispatch",
+                    |_| Ok(send.as_mut().poll(context)),
+                ) {
+                    Ok(result) => result.map(Ok),
+                    Err(error) => Poll::Ready(Err(error)),
+                }
+            } else {
+                send.as_mut().poll(context).map(Ok)
+            }
+        })
+        .await
+    }
+
+    fn with_current_auth<T>(
+        &self,
+        revision_error: &'static str,
+        use_auth: impl FnOnce(&CodexAuth) -> io::Result<T>,
+    ) -> io::Result<T> {
+        self.manager.with_usable_auth(self.epoch, |current, revision, _| {
+            if revision != self.revision {
+                return Err(io::Error::new(ErrorKind::WouldBlock, revision_error));
+            }
+            use_auth(current)
+        })?
+    }
+
+    fn build_request_headers(&self, auth: &CodexAuth) -> io::Result<HeaderMap> {
         let mut headers = HeaderMap::new();
-        self.auth_provider
+        codex_model_provider::auth_provider_from_auth(auth)
             .try_add_auth_headers(&mut headers)
             .map_err(|error| {
                 let kind = match &error {
@@ -80,16 +125,30 @@ pub(super) async fn load_remote_control_auth(
         ));
     }
 
-    Ok(RemoteControlConnectionAuth {
-        auth_provider: codex_model_provider::auth_provider_from_auth(&auth),
-        account_id: auth.get_account_id().ok_or_else(|| {
-            io::Error::new(
+    let (epoch, _) = auth_manager.policy_auth_snapshot()?;
+    let revision = auth_manager.auth_revision_for_snapshot(&auth).ok_or_else(|| {
+        io::Error::new(ErrorKind::WouldBlock, "remote control credentials changed while loading")
+    })?;
+    auth_manager.with_usable_auth(epoch, |_, current_revision, _| {
+        if revision != current_revision {
+            return Err(io::Error::new(
                 ErrorKind::WouldBlock,
-                "remote control enrollment is waiting for a ChatGPT account id",
-            )
-        })?,
-        auth,
-    })
+                "remote control credentials changed while loading",
+            ));
+        }
+        Ok(RemoteControlConnectionAuth {
+            account_id: auth.get_account_id().ok_or_else(|| {
+                io::Error::new(
+                    ErrorKind::WouldBlock,
+                    "remote control enrollment is waiting for a ChatGPT account id",
+                )
+            })?,
+            auth,
+            manager: Arc::clone(auth_manager),
+            epoch,
+            revision,
+        })
+    })?
 }
 
 pub(super) async fn recover_remote_control_auth(

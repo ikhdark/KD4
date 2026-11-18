@@ -71,6 +71,8 @@ pub enum OpenAiFileError {
         #[source]
         source: RouteAwareRequestError,
     },
+    #[error("signed file upload request failed: {category}")]
+    SignedUploadRequest { category: &'static str },
     #[error("OpenAI file request to {url} failed with status {status}: {body}")]
     UnexpectedStatus {
         url: String,
@@ -296,11 +298,13 @@ async fn upload_openai_file_contents_with_pool(
     let upload_result: Result<UploadedOpenAiFile, OpenAiFileError> = async {
         let upload_timeout = openai_file_upload_timeout(file_size_bytes);
         let upload_deadline = Instant::now() + upload_timeout;
-        let request = http_clients
+        let blob_request = |timeout| http_clients
             .request(Method::PUT, &create_payload.upload_url)
-            .timeout(upload_timeout)
+            .redirect_filter(|_| false)
+            .timeout(timeout)
             .header("x-ms-blob-type", "BlockBlob")
             .header(CONTENT_LENGTH, file_size_bytes);
+        let request = blob_request(upload_timeout);
         let (mut request, replayable_contents) = match contents {
             OpenAiFileContents::Stream(contents) => (request.body_stream(contents), None),
             OpenAiFileContents::Replayable(contents) => {
@@ -315,24 +319,24 @@ async fn upload_openai_file_contents_with_pool(
             )
             .await;
             let (error, retryable, server_advice) = match response {
-                Ok(response) => {
+                Ok(mut response) => {
                     let status = response.status();
                     let server_advice = blob_upload_retry_after(response.headers());
-                    let body = response.text().await.unwrap_or_default();
+                    while let Ok(Some(_)) = response.chunk().await {}
                     if status.is_success() {
                         break;
                     }
                     (OpenAiFileError::UnexpectedStatus {
-                        url: diagnostic_url(&create_payload.upload_url),
+                        url: "signed file upload URL".to_owned(),
                         status,
-                        body,
+                        body: "response body omitted".to_owned(),
                     }, matches!(status, StatusCode::BAD_GATEWAY
                         | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT), server_advice)
                 }
                 Err(source) => {
                     let retryable = source.is_timeout() || source.is_connect()
                         || source.is_body() || source.is_request();
-                    (request_error(&create_payload.upload_url, source), retryable, None)
+                    (OpenAiFileError::SignedUploadRequest { category: source.safe_category() }, retryable, None)
                 }
             };
             let retry_at = server_advice.map(codex_http_client::RetryAfter::deadline)
@@ -345,12 +349,7 @@ async fn upload_openai_file_contents_with_pool(
             {
                 tokio::time::sleep_until(retry_at).await;
                 if let Some(remaining) = upload_deadline.checked_duration_since(Instant::now()) {
-                    request = http_clients
-                        .request(Method::PUT, &create_payload.upload_url)
-                        .timeout(remaining)
-                        .header("x-ms-blob-type", "BlockBlob")
-                        .header(CONTENT_LENGTH, file_size_bytes)
-                        .body(contents.clone());
+                    request = blob_request(remaining).body(contents.clone());
                     retries += 1;
                     continue;
                 }

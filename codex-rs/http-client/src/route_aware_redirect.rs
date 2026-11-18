@@ -7,8 +7,8 @@
 //! for the new URL without giving [`crate::RouteAwareClientPool`] an opportunity to resolve the
 //! redirect destination.
 //!
-//! The pool therefore disables reqwest redirects for `RespectSystemProxy`, observes each redirect
-//! response, and uses these helpers to construct the next request before resolving its route. The
+//! The pool disables reqwest redirects on every route. When following is enabled it observes each
+//! redirect response and uses these helpers to construct the next request before resolving its route. The
 //! helpers preserve the relevant reqwest method/body behavior while applying stricter
 //! origin-sensitive credential and `Referer` rules at the boundary between requests.
 

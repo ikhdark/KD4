@@ -4,6 +4,10 @@ use crate::outgoing_message::OutgoingWriteReceipt;
 use codex_app_server_protocol_types::ExperimentalApi;
 use codex_app_server_protocol_types::ServerRequest;
 use codex_app_server_protocol_types::JSONRPCRequest;
+use codex_app_server_protocol_types::OverloadReason;
+use codex_app_server_protocol_types::RequestId;
+use codex_app_server_protocol_types::overloaded_error;
+use codex_app_server_transport::OutgoingError;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -178,6 +182,7 @@ pub(crate) struct OutboundConnectionState {
     transport_shutdown: CancellationToken,
     is_stdio: bool,
     is_in_process: bool,
+    remote_preview: bool,
     stdio_delivery: Option<StdioDelivery>,
 }
 
@@ -201,20 +206,68 @@ const STDIO_COALESCED_TEXT_BYTES: usize = 64 * 1024;
 const STDIO_STAGED_MESSAGE_BYTES: usize = 1024;
 
 impl StdioDelivery {
-    fn try_send(&mut self, message: QueuedOutgoingMessage) -> bool {
+    fn try_send(
+        &mut self,
+        connection_id: ConnectionId,
+        is_stdio: bool,
+        remote_preview: bool,
+        mut message: QueuedOutgoingMessage,
+    ) -> bool {
         // Charge typed payload before staging, not after dequeue. Legal large
         // frames use a separate single-frame allowance through physical flush;
         // ordinary following frames still have their bounded byte budget.
-        let size = codex_app_server_transport::serialized_request_bytes_up_to(
+        let mut size = codex_app_server_transport::serialized_request_bytes_up_to(
             &message.message, STDIO_DELIVERY_BYTES,
         );
-        let oversized = size > STDIO_DELIVERY_BYTES;
-        let credit = if oversized {
-            Arc::clone(&self.oversized_frames).try_acquire_owned()
+        let oversized_credit = if size > STDIO_DELIVERY_BYTES {
+            match Arc::clone(&self.oversized_frames).try_acquire_owned() {
+                Ok(credit) => Some(credit),
+                Err(error) => {
+                    warn_stdio_rejected_frame(
+                        connection_id, &message.message, size, "oversized_frame_credit",
+                    );
+                    let OutgoingMessage::Response(response) = message.message else {
+                        return false;
+                    };
+                    if !is_stdio
+                        || !matches!(error, tokio::sync::TryAcquireError::NoPermits)
+                        || !response.retryable_history_page
+                        || message.write_complete_tx.is_some()
+                    {
+                        return false;
+                    }
+                    // Keep the admitted frame and its physical-flush credit.
+                    // Discard only the unadmitted read-only value; the caller
+                    // gets an ordinary, same-ID retryable error in wire order.
+                    message = QueuedOutgoingMessage::new(OutgoingMessage::Error(OutgoingError {
+                        id: response.id,
+                        error: overloaded_error(
+                            OverloadReason::TransportEgress,
+                            "Another large response is being delivered; retry the history page.",
+                        ),
+                    }));
+                    size = codex_app_server_transport::serialized_request_bytes_up_to(
+                        &message.message, STDIO_DELIVERY_BYTES,
+                    );
+                    // Even the error is bounded; a client ID can be large.
+                    if size > STDIO_DELIVERY_BYTES {
+                        return false;
+                    }
+                    None
+                }
+            }
         } else {
-            Arc::clone(&self.bytes).try_acquire_many_owned(size.max(1) as u32)
+            None
         };
-        let Ok(mut credit) = credit else { return false; };
+        let oversized = oversized_credit.is_some();
+        let credit = match oversized_credit {
+            Some(credit) => Ok(credit),
+            None => Arc::clone(&self.bytes).try_acquire_many_owned(size.max(1) as u32),
+        };
+        let Ok(mut credit) = credit else {
+            warn_stdio_rejected_frame(connection_id, &message.message, size, "payload_byte_credit");
+            return false;
+        };
         // mpsc does not expose a mutable queued tail. The handoff node permits
         // adjacent text to append only until the existing consumer takes it.
         // No lock survives encoding, a capacity wait or a physical write.
@@ -222,7 +275,7 @@ impl StdioDelivery {
             let Ok(mut queued) = tail.lock() else { return false; };
             if let Some(queued) = queued.as_mut()
                 && !oversized && !queued.oversized
-                && coalesce_stdio_text(&mut queued.message, &message)
+                && coalesce_stdio_text(&mut queued.message, &message, remote_preview)
             {
                 queued.credit.merge(credit);
                 return true;
@@ -233,7 +286,10 @@ impl StdioDelivery {
         if !oversized && size < STDIO_STAGED_MESSAGE_BYTES {
             let Ok(overhead) = Arc::clone(&self.bytes).try_acquire_many_owned(
                 (STDIO_STAGED_MESSAGE_BYTES - size.max(1)) as u32,
-            ) else { return false; };
+            ) else {
+                warn_stdio_rejected_frame(connection_id, &message.message, size, "node_byte_credit");
+                return false;
+            };
             credit.merge(overhead);
         }
         let queued = Arc::new(Mutex::new(Some(StdioStagedMessage { message, credit, oversized })));
@@ -245,7 +301,34 @@ impl StdioDelivery {
     }
 }
 
-fn coalesce_stdio_text(left: &mut QueuedOutgoingMessage, right: &QueuedOutgoingMessage) -> bool {
+fn warn_stdio_rejected_frame(
+    connection_id: ConnectionId,
+    message: &OutgoingMessage,
+    size_probe: usize,
+    reason: &'static str,
+) {
+    let (message_kind, request_id) = match message {
+        OutgoingMessage::Response(response) => ("response", Some(&response.id)),
+        OutgoingMessage::Error(error) => ("error", Some(&error.id)),
+        OutgoingMessage::Request(_) => ("request", None),
+        OutgoingMessage::AppServerNotification(_) => ("notification", None),
+    };
+    let request_id = request_id.filter(|id| match id {
+        RequestId::Integer(_) => true,
+        RequestId::String(id) => id.len() <= 128 && id.bytes().all(|byte| byte.is_ascii_graphic()),
+    });
+    warn!(
+        ?connection_id,
+        message_kind,
+        ?request_id,
+        measured_bytes = ?(size_probe != usize::MAX).then_some(size_probe),
+        size_probe_limit = STDIO_DELIVERY_BYTES,
+        reason,
+        "stdio staging credit refused outgoing frame"
+    );
+}
+
+fn coalesce_stdio_text(left: &mut QueuedOutgoingMessage, right: &QueuedOutgoingMessage, remote_preview: bool) -> bool {
     // Receipts and all non-text/lifecycle messages remain exact wire boundaries.
     // Canonical publication and output recovery remain with upstream owners.
     if left.write_complete_tx.is_some() || right.write_complete_tx.is_some()
@@ -272,12 +355,17 @@ fn coalesce_stdio_text(left: &mut QueuedOutgoingMessage, right: &QueuedOutgoingM
     }
     use codex_app_server_protocol_types::ServerNotification;
     match (left, right) {
-        (ServerNotification::AgentMessageDelta(a), ServerNotification::AgentMessageDelta(b)) => append!(a, b),
+        (ServerNotification::AgentMessageDelta(a), ServerNotification::AgentMessageDelta(b))
+            if a.source_occurrence.is_none() && b.source_occurrence.is_none()
+                && a.replayed == b.replayed => append!(a, b),
         (ServerNotification::PlanDelta(a), ServerNotification::PlanDelta(b)) => append!(a, b),
         (ServerNotification::ReasoningSummaryTextDelta(a), ServerNotification::ReasoningSummaryTextDelta(b)) => append!(a, b, summary_index),
         (ServerNotification::ReasoningTextDelta(a), ServerNotification::ReasoningTextDelta(b)) => append!(a, b, content_index),
         (ServerNotification::CommandExecutionOutputDelta(a), ServerNotification::CommandExecutionOutputDelta(b))
-            if a.stream == b.stream && a.decoding_lossy == b.decoding_lossy => append!(a, b),
+            if a.stream == b.stream && a.decoding_lossy == b.decoding_lossy
+                && (!remote_preview || b.delta.len() <=
+                    codex_app_server_transport::REMOTE_PREVIEW_FIELD_BYTES.saturating_sub(a.delta.len())) =>
+                append!(a, b),
         _ => false,
     }
 }
@@ -301,12 +389,18 @@ impl OutboundConnectionState {
             transport_shutdown,
             is_stdio,
             is_in_process: false,
+            remote_preview: false,
             stdio_delivery: None,
         }
     }
 
     pub(crate) fn with_stdio_delivery(mut self) -> Self {
         self.is_stdio = true;
+        self
+    }
+
+    pub(crate) fn with_remote_preview(mut self) -> Self {
+        self.remote_preview = true;
         self
     }
 
@@ -398,7 +492,7 @@ async fn send_message_to_connection(
     if connection_state.is_disconnected() {
         return disconnect_connection(connections, connection_id);
     }
-    let message = filter_outgoing_message_for_connection(connection_state, message);
+    let mut message = filter_outgoing_message_for_connection(connection_state, message);
     if !notification_prechecked && should_skip_notification_for_connection(connection_state, &message) {
         if let Some(receipt) = write_complete_tx
             && let Some(filtered) = receipt.filtered
@@ -408,6 +502,9 @@ async fn send_message_to_connection(
         return false;
     }
 
+    if connection_state.remote_preview {
+        codex_app_server_transport::preview_remote_notification(&mut message);
+    }
     let writer = connection_state.writer.clone();
     let queued_message = QueuedOutgoingMessage {
         message,
@@ -442,6 +539,7 @@ async fn send_message_to_connection(
             let drained_bytes = Arc::clone(&bytes);
             let drained_oversized = Arc::clone(&oversized_frames);
             let shutdown = shutdown.clone();
+            let encode_limit = if connection_state.remote_preview { 0 } else { STDIO_DELIVERY_BYTES };
             delivery_tasks.spawn(async move {
                 loop {
                     let next = tokio::select! {
@@ -460,7 +558,9 @@ async fn send_message_to_connection(
                         shutdown.cancel();
                         break;
                     };
-                    let encoded_bytes = match message.prepare_stdio_json(STDIO_DELIVERY_BYTES) {
+                    // Remote needs the wire length and credit, not an extra
+                    // encoded copy before its own envelope encoder.
+                    let encoded_bytes = match message.prepare_stdio_json(encode_limit) {
                         Ok(encoded_bytes) => encoded_bytes,
                         Err(error) => {
                             warn!(?connection_id, %error, "failed to encode bounded stdio output");
@@ -509,7 +609,7 @@ async fn send_message_to_connection(
             });
             StdioDelivery { sender, tail: Weak::new(), bytes, oversized_frames }
         });
-        let sent = delivery.try_send(queued_message);
+        let sent = delivery.try_send(connection_id, connection_state.is_stdio, connection_state.remote_preview, queued_message);
         if sent {
             return false;
         }

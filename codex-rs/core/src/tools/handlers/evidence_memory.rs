@@ -2,7 +2,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use codex_file_system::{ExecutorFileSystem, FileSystemSandboxContext, FindUpErrorPolicy};
+use codex_file_system::{ExecutorFileSystem, FileMetadata, FileSystemSandboxContext, FindUpErrorPolicy};
 use codex_protocol::models::{ContentItem, ResponseItem};
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
@@ -18,6 +18,63 @@ const INDEX_BYTES: usize = 256 * 1024;
 const HISTORY_BYTES: usize = 512 * 1024;
 const NOTICE_BYTES: usize = 4096;
 const TURN_BYTES: usize = 8192;
+const EVIDENCE_RECHECK: Duration = Duration::from_secs(5);
+const LEDGER_NOTICE_INTRO: &str = "Recorded KDR verification ledger, not fresh source reconciliation. Before selecting work, locate the KDR checkout and run `.\\kdr.cmd fix-ledger status --repo REPO --unresolved` from it in PowerShell (bare `kdr` is not assumed on PATH); from another directory invoke the discovered absolute kdr.cmd path with `&`. On Unix use `sh ./kdr.sh` from KDR with the same arguments; it reconciles relevant drift without running behavioral checks. Work on task-relevant unresolved findings. Preserve verified fixes unless relevant changes or new behavioral evidence invalidate their proof. Overlap warnings never refuse edits, lock sessions or restrict normal writes. Only affected proof needs KDR reverification; closure requires passing KDR evidence for the declared contract. Missing coverage is unknown.\n";
+
+fn bounded_ledger_snapshot(repositories: &[Value], budget: usize) -> Option<String> {
+    let full = json!({"repositories": repositories}).to_string();
+    if full.len() <= budget {
+        return Some(full);
+    }
+
+    // Reserve the recovery locators and counts before spending bytes on details.
+    // An unusually long locator must not suppress the other repositories.
+    let mut notice = json!({"repositories": [], "repositories_omitted": repositories.len()});
+    let mut included = Vec::new();
+    for repository in repositories {
+        let mut envelope = repository.clone();
+        if let Some(entries) = repository["unresolved"].as_array() {
+            let omitted = repository["unresolved_omitted"].as_u64().unwrap_or(0);
+            envelope["unresolved"] = json!([]);
+            envelope["unresolved_omitted"] = json!(omitted + entries.len() as u64);
+        }
+        if let Some(gaps) = envelope.as_object_mut()?.remove("evidence_gaps")
+            && !gaps.as_array().is_some_and(Vec::is_empty)
+        {
+            envelope["evidence_gaps_omitted"] =
+                gaps.as_array().map_or(Value::Null, |rows| json!(rows.len()));
+        }
+
+        notice["repositories"].as_array_mut()?.push(envelope);
+        notice["repositories_omitted"] = json!(repositories.len() - included.len() - 1);
+        if notice.to_string().len() <= budget {
+            included.push(repository);
+        } else {
+            notice["repositories"].as_array_mut()?.pop();
+            notice["repositories_omitted"] = json!(repositories.len() - included.len());
+        }
+    }
+
+    for (index, repository) in included.into_iter().enumerate() {
+        let Some(entries) = repository["unresolved"].as_array() else { continue; };
+        for entry in entries {
+            if entry.to_string().len() > budget {
+                continue;
+            }
+            let envelope = &mut notice["repositories"][index];
+            let previous = envelope["unresolved_omitted"].as_u64()?;
+            envelope["unresolved"].as_array_mut()?.push(entry.clone());
+            envelope["unresolved_omitted"] = json!(previous - 1);
+            if notice.to_string().len() > budget {
+                let envelope = &mut notice["repositories"][index];
+                envelope["unresolved"].as_array_mut()?.pop();
+                envelope["unresolved_omitted"] = json!(previous);
+            }
+        }
+    }
+    let bounded = notice.to_string();
+    (bounded.len() <= budget).then_some(bounded)
+}
 
 /// A recorded work queue, not a fresh behavioral pass or a source-write gate.
 /// Captured through the same world-state owner on new turns and resumes.
@@ -43,7 +100,9 @@ pub(crate) async fn ledger_context(step: &crate::session::step_context::StepCont
             let Some((view, _)) = read_json(fs.as_ref(), &path, INDEX_BYTES, &sandbox).await else {
                 repositories.push(json!({"ledger":path.to_string(),"coverage":"unavailable"})); continue;
             };
-            let fixes = view["fixes"].as_array()?;
+            let Some(fixes) = view["fixes"].as_array() else {
+                repositories.push(json!({"ledger":path.to_string(),"coverage":"unavailable"})); continue;
+            };
             let unresolved: Vec<Value> = fixes.iter().filter(|f| f["status"] != "verified_closed" && f["status"] != "superseded")
                 .take(8).map(|f| json!({"id":f["id"],"status":f["status"],"missing_conditions":f["missing_conditions"]})).collect();
             repositories.push(json!({"ledger":path.to_string(),"revision":view["revision"],
@@ -53,12 +112,11 @@ pub(crate) async fn ledger_context(step: &crate::session::step_context::StepCont
                 "evidence_gaps":view["evidence_gaps"]}));
         }
         if repositories.is_empty() { return None; }
-        let snapshot = json!({"repositories":repositories});
-        let body = format!("Recorded KDR verification ledger, not fresh source reconciliation. Before selecting work, locate the KDR checkout and run `.\\kdr.cmd fix-ledger status --repo REPO --unresolved` from it in PowerShell (bare `kdr` is not assumed on PATH); from another directory invoke the discovered absolute kdr.cmd path with `&`. On Unix use `sh ./kdr.sh` from KDR with the same arguments; it reconciles relevant drift without running behavioral checks. Work on task-relevant unresolved findings. Preserve verified fixes unless relevant changes or new behavioral evidence invalidate their proof. Overlap warnings never refuse edits, lock sessions or restrict normal writes. Only affected proof needs KDR reverification; closure requires passing KDR evidence for the declared contract. Missing coverage is unknown.\n{snapshot}");
-        if body.len() > NOTICE_BYTES { return None; }
+        let snapshot = bounded_ledger_snapshot(&repositories, NOTICE_BYTES - LEDGER_NOTICE_INTRO.len())?;
+        let body = format!("{LEDGER_NOTICE_INTRO}{snapshot}");
         // Recording freshness is not a changed work queue. Keep it in the
         // delivered notice, but do not replay instructions solely for a refresh.
-        let mut identity = snapshot;
+        let mut identity = json!({"repositories":repositories});
         for repository in identity["repositories"].as_array_mut()? {
             repository.as_object_mut()?.remove("recorded_at_ns");
         }
@@ -141,13 +199,33 @@ struct Memory {
     path: PathUri,
     hash: String,
     history: Option<Value>,
-    history_loaded: bool,
+    unavailable: Vec<&'static str>,
+}
+
+#[derive(Default)]
+struct RootMemory {
+    index: EvidenceFile,
+    ledger: EvidenceFile,
+    history: EvidenceFile,
+    view: Option<Memory>,
+    revision: u64,
+    needs_rebuild: bool,
+}
+
+#[derive(Default)]
+struct EvidenceFile {
+    stamp: Option<(PathUri, FileMetadata)>,
+    checked: Option<Instant>,
+    last_good: Option<(Value, String)>,
+    last_path: Option<PathUri>,
+    available: bool,
+    unavailable: bool,
 }
 
 #[derive(Default)]
 struct State {
     directories: HashMap<String, Option<PathUri>>,
-    roots: HashMap<String, Option<Memory>>,
+    roots: HashMap<String, RootMemory>,
     shown: HashSet<String>,
     reservation_notices: HashMap<String, String>,
     bytes: usize,
@@ -340,6 +418,81 @@ async fn read_json(
     Some((value, hex::encode(Sha256::digest(&bytes))))
 }
 
+impl EvidenceFile {
+    fn current(&self) -> Option<&(Value, String)> {
+        self.available.then_some(self.last_good.as_ref()).flatten()
+    }
+
+    async fn refresh(
+        &mut self,
+        fs: &dyn ExecutorFileSystem,
+        paths: &[PathUri],
+        limit: usize,
+        sandbox: &FileSystemSandboxContext,
+        validate: impl Fn(&Value) -> bool,
+        ignore_recording_time: bool,
+        expected: bool,
+    ) -> bool {
+        let mut stamp = None;
+        let mut inaccessible = false;
+        for path in paths {
+            match fs.get_metadata(path, Some(sandbox)).await {
+                Ok(metadata) if metadata.is_file => {
+                    stamp = Some((path.clone(), metadata));
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => { inaccessible = true; self.last_path = Some(path.clone()); break; }
+            }
+        }
+        // The filesystem stamp is a cheap hint, not a content identity. Recheck
+        // periodically even when size and millisecond timestamps are unchanged.
+        if !inaccessible && self.stamp == stamp
+            && self.checked.is_some_and(|checked| checked.elapsed() < EVIDENCE_RECHECK)
+        {
+            return false;
+        }
+        let same_path = self.stamp.as_ref().map(|(path, _)| path)
+            == stamp.as_ref().map(|(path, _)| path);
+        let was_available = self.available;
+        let was_unavailable = self.unavailable;
+        // Read before publishing any new observation; the caller may cancel
+        // the whole optional lookup at its deadline.
+        let fresh = if let Some((path, _)) = &stamp {
+            tracing::trace!(path = %path, "refreshing bounded evidence owner");
+            read_json(fs, path, limit, sandbox).await
+        } else { None };
+        let mut changed = false;
+        self.available = false;
+        self.unavailable = inaccessible || (stamp.is_none() && !paths.is_empty()
+            && (expected || self.last_good.is_some()));
+        if let Some((path, _)) = &stamp {
+            self.last_path = Some(path.clone());
+            match fresh {
+                Some((mut value, hash)) if validate(&value) => {
+                    if ignore_recording_time {
+                        // Store the semantic input; a new recording timestamp
+                        // alone does not change the work queue or its notices.
+                        if let Some(view) = value.as_object_mut() {
+                            view.remove("recorded_at_ns");
+                        }
+                    }
+                    if !same_path || !self.last_good.as_ref().is_some_and(|(old, _)| old == &value) {
+                        self.last_good = Some((value, hash));
+                        changed = true;
+                    }
+                    self.available = true;
+                }
+                _ => self.unavailable = true,
+            }
+        }
+        self.stamp = stamp;
+        self.checked = Some(Instant::now());
+        changed || self.available != was_available || self.unavailable != was_unavailable
+    }
+}
+
 async fn lookup(
     state: &mut State,
     fs: &dyn ExecutorFileSystem,
@@ -361,23 +514,25 @@ async fn lookup(
     }
     let root = state.directories.get(&key)?.as_ref()?.clone();
     let root_key = root.to_string();
-    if !state.roots.contains_key(&root_key) {
-        if state.roots.len() >= 8 { return None; }
-        let candidates = [root.join(".local/evidence/fixes/index.json").ok()?,
-            root.join(".codex/fix-evidence/index.json").ok()?];
-        let ledger_paths = [root.join(".local/evidence/fixes/ledger-view.json").ok()?,
-            root.join(".codex/fix-evidence/ledger-view.json").ok()?];
-        let ledger_path = fs.first_regular_file(&ledger_paths, Some(sandbox)).await.ok().flatten();
-        let index_path = fs.first_regular_file(&candidates, Some(sandbox)).await.ok().flatten();
-        let path = index_path.clone().or_else(|| ledger_path.clone())?;
-        let mut loaded = match index_path {
-            Some(index_path) => read_json(fs, &index_path, INDEX_BYTES, sandbox).await,
-            None => Some((json!({"schema_version":1,"fixes":[]}), String::new())),
-        };
-        if let Some(ledger_path) = ledger_path
-            && let Some((view, view_hash)) = read_json(fs, &ledger_path, INDEX_BYTES, sandbox).await
-            && let Some((index, hash)) = loaded.as_mut()
-        {
+    if state.roots.len() >= 8 && !state.roots.contains_key(&root_key) { return None; }
+    let root_memory = state.roots.entry(root_key.clone()).or_default();
+    let index_paths = [root.join(".local/evidence/fixes/index.json").ok()?,
+        root.join(".codex/fix-evidence/index.json").ok()?];
+    let ledger_paths = [root.join(".local/evidence/fixes/ledger-view.json").ok()?,
+        root.join(".codex/fix-evidence/ledger-view.json").ok()?];
+    root_memory.needs_rebuild |= root_memory.index.refresh(fs, &index_paths, INDEX_BYTES, sandbox,
+        |v| v["schema_version"] == 1 && v["fixes"].is_array(), false, false).await;
+    root_memory.needs_rebuild |= root_memory.ledger.refresh(fs, &ledger_paths, INDEX_BYTES, sandbox,
+        |v| v["fixes"].is_array(), true, false).await;
+    let history_path = root_memory.index.current()
+        .and_then(|(index, _)| index["benchmark_advisories"].as_str())
+        .and_then(|link| root_memory.index.last_path.as_ref()?.parent()?.join(link).ok());
+    root_memory.needs_rebuild |= root_memory.history.refresh(fs, history_path.as_slice(), HISTORY_BYTES, sandbox,
+        |v| v["schema_version"] == 1, false, true).await;
+    if root_memory.needs_rebuild {
+        let (mut index, mut hash) = root_memory.index.current().cloned()
+            .unwrap_or_else(|| (json!({"schema_version":1,"fixes":[]}), String::new()));
+        if let Some((view, view_hash)) = root_memory.ledger.current() {
             for fix in view["fixes"].as_array().into_iter().flatten() {
                 if fix["status"] == "superseded" {
                     if let Some(fixes) = index["fixes"].as_array_mut() { fixes.retain(|row| row["id"] != fix["id"]); }
@@ -436,22 +591,28 @@ async fn lookup(
                     } else { fixes.push(incoming); }
                 }
             }
-            *hash = hex::encode(Sha256::digest(format!("{hash}:{view_hash}").as_bytes()));
+            hash = hex::encode(Sha256::digest(format!("{hash}:{view_hash}").as_bytes()));
         }
-        let loaded = loaded
-            .filter(|(v, _)| v["schema_version"] == 1 && v["fixes"].is_array())
-            .map(|(index, hash)| Memory { index, path, hash,
-                history: None, history_loaded: false });
-        state.roots.insert(root_key.clone(), loaded);
+        let unavailable = [
+            ("index", root_memory.index.unavailable),
+            ("ledger", root_memory.ledger.unavailable),
+            ("history", root_memory.history.unavailable),
+        ].into_iter().filter_map(|(name, missing)| missing.then_some(name)).collect();
+        root_memory.view = root_memory.index.last_path.as_ref().or(root_memory.ledger.last_path.as_ref())
+            .map(|path| Memory { index, path: path.clone(), hash, unavailable,
+                history:root_memory.history.current().map(|(value, _)| value.clone()) });
+        root_memory.revision = root_memory.revision.saturating_add(1);
+        root_memory.needs_rebuild = false;
     }
+    let memory = root_memory.view.as_ref()?;
+    let evidence_revision = root_memory.revision;
     let root_native = root.to_abs_path().ok()?;
     let native = change.map_or(path, |c| &c.path).to_abs_path().ok()?;
     let relative = native.as_path().strip_prefix(root_native.as_path()).ok()?
         .to_str()?.replace('\\', "/");
     let revision = change.map(|c| hex::encode(Sha256::digest(format!("{}\0{}\0{}", c.before_path, c.before, c.after).as_bytes()))).unwrap_or_default();
-    let path_reservation = format!("{root_key}:path:{relative}:{}:{revision}",symbol.unwrap_or(""));
+    let path_reservation = format!("{root_key}:path:{evidence_revision}:{relative}:{}:{revision}",symbol.unwrap_or(""));
     if state.shown.contains(&path_reservation) { return None; }
-    let memory = state.roots.get_mut(&root_key)?.as_mut()?;
     let deadline = Instant::now() + Duration::from_millis(15);
     let behavior = change.map(|c| BehaviorChange {
         change:c, before_path:c.before_path.to_abs_path().ok().and_then(|p|
@@ -475,29 +636,20 @@ async fn lookup(
         matches.retain(|fix| !constraints(fix, &relative, symbol, behavior.as_ref()).is_empty());
     }
     let unmodeled_path_matches = matching_fixes - matches.len();
-    if !memory.history_loaded {
-        memory.history_loaded = true;
-        if let Some(link) = memory.index["benchmark_advisories"].as_str()
-            && let Some(parent) = memory.path.parent()
-            && let Ok(target) = parent.join(link)
-        {
-            memory.history = read_json(fs, &target, HISTORY_BYTES, sandbox).await
-                .map(|(value, _)| value).filter(|v| v["schema_version"] == 1);
-        }
-    }
     // Deferred owners need not be registered fixes. Keep this read-only
     // context separate from preservation constraints and patch assessments.
     let source_key = native.as_path().to_str()?.replace('\\', "/");
     let source_key = if cfg!(windows) { source_key.trim_start_matches("//?/").to_ascii_lowercase() } else { source_key };
     let deferred: Vec<Value> = if change.is_none() {
         memory.history.as_ref().and_then(|h| h["deferred_findings"]["by_source_path"][&source_key].as_array())
-            .into_iter().flatten().filter(|r| r["status"] == "deferred_unfinished")
+            .into_iter().flatten().filter(|r| r["status"] == "deferred_unfinished"
+                && matches!(r["current_status"].as_str(), Some("open" | "blocked")))
             .map(|r| json!({"id":bounded(&r["id"],120),"audit":bounded(&r["audit"],160),
                 "status":"deferred_unfinished","path":r["path"],"sha256":r["sha256"],
                 "scope":bounded(&r["scope"],160),"reason":bounded(&r["reason"],240),
                 "next_action":bounded(&r["next_action"],240)})).collect()
     } else { Vec::new() };
-    if matches.is_empty() && deferred.is_empty() { return None; }
+    if matches.is_empty() && deferred.is_empty() && memory.unavailable.is_empty() { return None; }
     let priority = |fix: &Value| {
         if !fix["ledger_status"].is_null() { return -2; }
         if !constraints(fix, &relative, symbol, behavior.as_ref()).is_empty() { return -1; }
@@ -518,7 +670,7 @@ async fn lookup(
     let mut reservations = Vec::new();
     for fix in &matches {
         let Some(id) = fix["id"].as_str().filter(|id| id.len() <= 240) else { continue; };
-        let reservation = format!("{root_key}:{}:{id}:{relative}:{}:{revision}", memory.hash, symbol.unwrap_or(""));
+        let reservation = format!("{root_key}:{evidence_revision}:{}:{id}:{relative}:{}:{revision}", memory.hash, symbol.unwrap_or(""));
         if state.shown.contains(&reservation) { continue; }
         let selected_constraints = constraints(fix, &relative, symbol, behavior.as_ref());
         let selected_ids: HashSet<&str> = selected_constraints.iter().filter_map(|c| c["id"].as_str()).collect();
@@ -595,13 +747,16 @@ async fn lookup(
             fixes.pop(); reservations.pop(); continue;
         }
     }
-    if fixes.is_empty() && deferred.is_empty() { return None; }
+    if fixes.is_empty() && deferred.is_empty() && memory.unavailable.is_empty() { return None; }
     let mut payload = json!({"schema_version":1, "source_path":relative,
         "index":memory.path.to_string(), "index_sha256":memory.hash,
         "history":memory.history.as_ref().map(|h| &h["history"]),
         "fixes":fixes, "matching_fixes":matching_fixes,
         "unmodeled_path_matches":unmodeled_path_matches,
         "phase":if change.is_some() { "committed_change" } else { "source_read" }});
+    if !memory.unavailable.is_empty() {
+        payload["unavailable_evidence_owners"] = json!(memory.unavailable);
+    }
     // The source read already delivered history context. Patch diagnostics
     // spend their shared bound on the changed constraint and its reproduction.
     if change.is_some() { payload.as_object_mut()?.remove("history"); }
@@ -617,7 +772,7 @@ async fn lookup(
             }
         }
         if payload["deferred_findings"]["entries"].as_array()?.is_empty() {
-            if fixes.is_empty() { return None; }
+            if fixes.is_empty() && memory.unavailable.is_empty() { return None; }
             payload.as_object_mut()?.remove("deferred_findings");
         }
     }
@@ -861,11 +1016,12 @@ pub(super) async fn before_patch(invocation: &ToolInvocation, raw: Option<&str>)
         let payload = &notice["payload"];
         result["index"] = payload["index"].clone();
         result["index_sha256"] = payload["index_sha256"].clone();
-        let memory = state.roots.values().flatten().find(|memory|
-            payload["index_sha256"].as_str() == Some(memory.hash.as_str())
-                && payload["index"].as_str() == Some(memory.path.to_string().as_str()));
-        let Some(memory) = memory else { return; };
-        let Some(directory) = memory.path.parent() else { return; };
+        // Resolve against the delivered advisory, not the current root view:
+        // that older observation stays attributable after a refresh.
+        let Some(directory) = payload["index"].as_str()
+            .and_then(|uri| PathUri::parse(uri).ok())
+            .and_then(|path| path.parent())
+        else { return; };
         for row in result["assessments"].as_array_mut().into_iter().flatten() {
             let fix = row["fix"].clone();
             row["advisory_fix_observed"] = json!(payload["fixes"].as_array().into_iter().flatten()

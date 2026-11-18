@@ -208,9 +208,17 @@ pub enum HostRequest {
     Terminate {
         session_id: SessionId,
         cell_id: WireCellId,
+        /// Only an ordinary turn interrupt is forwarded. Legacy requests omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interrupt_cause: Option<CancellationCause>,
     },
     #[serde(rename = "session/shutdown")]
     ShutdownSession { session_id: SessionId },
+}
+
+impl HostRequest {
+    /// Older hosts reject unknown request fields, so negotiate before sending the cause.
+    pub const INTERRUPT_CAUSE_CAPABILITY: &str = "cell-interrupt-cause-v1";
 }
 
 #[derive(Debug, Deserialize, PartialEq, Serialize)]

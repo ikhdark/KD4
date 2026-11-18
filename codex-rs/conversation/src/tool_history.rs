@@ -2992,29 +2992,60 @@ impl ToolHistoryState {
         if coverage.bytes != bytes || coverage.sha256 != sha256 {
             return None;
         }
-        let mut ranges = coverage.source_inspection_selectors
-            .iter()
-            .filter_map(|selector| {
+        let exact_ranges = |coverage: &RecoveredArtifactCoverage| {
+            coverage.source_inspection_selectors.iter().filter_map(|selector| {
                 if selector["kind"] != "bytes" {
                     return None;
                 }
                 let start = selector["start"].as_u64()?;
                 let end = selector["end"].as_u64()?;
                 (start <= end && end <= bytes).then_some((start, end))
-            })
-            .collect::<Vec<_>>();
+            }).collect::<Vec<_>>()
+        };
+        let mut ranges = exact_ranges(coverage);
         if ranges.is_empty() {
             return None;
         }
-        ranges.sort_unstable();
-        let mut covered = 0;
-        for (start, end) in ranges {
-            if start > covered {
-                return None;
+        let covers_source = |ranges: &mut [(u64, u64)]| {
+            ranges.sort_unstable();
+            let mut covered = 0;
+            for &(start, end) in ranges.iter() {
+                if start > covered {
+                    break;
+                }
+                covered = covered.max(end);
             }
-            covered = covered.max(end);
+            covered == bytes
+        };
+        if covers_source(&mut ranges) {
+            return Some((call_id.clone(), source.clone()));
         }
-        (covered == bytes).then(|| (call_id.clone(), source.clone()))
+        // Independent reads have distinct immutable artifact IDs. Aggregate
+        // only exact delivered ranges under the same opened source identity
+        // (including assignment attempt, workspace, path and environment)
+        // and original-byte hash. Keep the completing artifact's call as the
+        // receipt owner; the handler still checks the current file at issuance.
+        for (other_id, other_coverage) in &self.recovered_artifacts {
+            if other_id == artifact_id
+                || other_coverage.bytes != bytes
+                || other_coverage.sha256 != sha256
+            {
+                continue;
+            }
+            let Some(ArtifactOrigin(other_call, other_bytes, other_hash, Some(other_source))) =
+                self.internal_artifact_origins.get(other_id)
+            else {
+                continue;
+            };
+            if *other_bytes == bytes && other_hash == sha256 && other_source == source
+                && self.artifact_call_ids.get(other_id) == Some(other_call)
+                && self.workspace_evidence.get(other_call)
+                    .is_none_or(|evidence| evidence.source_dependencies_current)
+            {
+                ranges.extend(exact_ranges(other_coverage));
+            }
+        }
+        covers_source(&mut ranges).then(|| (call_id.clone(), source.clone()))
     }
 
     // A code-mode carrier records no dependencies of its own; its workspace

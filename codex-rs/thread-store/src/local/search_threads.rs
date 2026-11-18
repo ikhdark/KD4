@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::time::Instant;
 
 use codex_install_context::InstallContext;
 use codex_protocol::ThreadId;
@@ -34,6 +35,63 @@ struct ThreadSearchItem {
 pub(super) async fn search_threads(
     store: &LocalThreadStore,
     params: SearchThreadsParams,
+) -> ThreadStoreResult<ThreadSearchPage> {
+    let mut observation =
+        tracing::enabled!(target: "codex_storage_search_phases", tracing::Level::TRACE)
+            .then(SearchObservation::new);
+    let result = search_threads_inner(store, params, &mut observation).await;
+    if let Some(observation) = observation {
+        observation.emit(&result);
+    }
+    result
+}
+
+struct SearchObservation {
+    started: Instant,
+    phase_started: Option<Instant>,
+    phases_us: [u64; 4],
+    matched_rollouts: u64,
+    reconciled_rollouts: u64,
+}
+
+impl SearchObservation {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            phase_started: None,
+            phases_us: [0; 4],
+            matched_rollouts: 0,
+            reconciled_rollouts: 0,
+        }
+    }
+
+    fn advance(observation: &mut Option<Self>, completed_phase: Option<usize>) {
+        if let Some(observation) = observation {
+            let now = Instant::now();
+            if let Some(index) = completed_phase
+                && let Some(started) = observation.phase_started
+            {
+                observation.phases_us[index] = now.duration_since(started).as_micros() as u64;
+            }
+            observation.phase_started = Some(now);
+        }
+    }
+
+    fn emit(self, result: &ThreadStoreResult<ThreadSearchPage>) {
+        let [content_search_us, reconciliation_us, selection_us, hydration_us] = self.phases_us;
+        tracing::trace!(target: "codex_storage_search_phases",
+            stage = "local_thread_search", success = result.is_ok(),
+            elapsed_us = self.started.elapsed().as_micros() as u64,
+            content_search_us, reconciliation_us, selection_us, hydration_us,
+            matched_rollouts = self.matched_rollouts, reconciled_rollouts = self.reconciled_rollouts,
+            selected_rows = result.as_ref().map_or(0, |page| page.items.len()) as u64);
+    }
+}
+
+async fn search_threads_inner(
+    store: &LocalThreadStore,
+    params: SearchThreadsParams,
+    observation: &mut Option<SearchObservation>,
 ) -> ThreadStoreResult<ThreadSearchPage> {
     if params.page_size == 0 {
         return Err(ThreadStoreError::InvalidRequest {
@@ -76,6 +134,7 @@ pub(super) async fn search_threads(
     let query = RolloutSearchQuery::new(search_term).map_err(|err| ThreadStoreError::Internal {
         message: format!("failed to prepare rollout search: {err}"),
     })?;
+    SearchObservation::advance(observation, /*completed_phase*/ None);
     let mut matching_rollouts = query
         .search_matches(
             rg_command.as_path(),
@@ -86,6 +145,10 @@ pub(super) async fn search_threads(
         .map_err(|err| ThreadStoreError::Internal {
             message: format!("failed to search rollout contents: {err}"),
         })?;
+    SearchObservation::advance(observation, Some(0));
+    if let Some(observation) = observation.as_mut() {
+        observation.matched_rollouts = matching_rollouts.len() as u64;
+    }
     if matching_rollouts.is_empty() {
         return Ok(ThreadSearchPage {
             items: Vec::new(),
@@ -133,16 +196,21 @@ pub(super) async fn search_threads(
         // These paths were already discovered by content search. Missing or
         // stale index rows must not silently exclude canonical matches.
         for (path, snippet) in &matching_rollouts {
-            if !codex_rollout::state_integration::reconcile_rollout(
-                Some(runtime),
+            if let Some(observation) = observation.as_mut() {
+                observation.reconciled_rollouts += 1;
+            }
+            let (reconciled, row_observation) = codex_rollout::state_integration::reconcile_search_rollout(
+                runtime,
                 path,
                 &store.config.default_model_provider_id,
-                None,
-                &[],
-                Some(params.archived),
+                params.archived,
+                observation.is_some(),
             )
-            .await
-            {
+            .await;
+            if !reconciled {
+                if let Some(row_observation) = row_observation {
+                    row_observation.emit(false, /*thread_id*/ None);
+                }
                 return Err(ThreadStoreError::Internal {
                     message: format!(
                         "search index reconciliation is incomplete for {}; retry after storage recovers",
@@ -150,9 +218,11 @@ pub(super) async fn search_threads(
                     ),
                 });
             }
-            let id = codex_rollout::verified_rollout_thread_id(path)
-                .await
-                .map_err(|error| ThreadStoreError::Internal {
+            let identity = codex_rollout::verified_rollout_thread_id(path).await;
+            if let Some(row_observation) = row_observation {
+                row_observation.emit(true, identity.as_ref().ok().copied());
+            }
+            let id = identity.map_err(|error| ThreadStoreError::Internal {
                     message: error.to_string(),
                 })?;
             let row = runtime
@@ -189,6 +259,7 @@ pub(super) async fn search_threads(
             }
         }
     }
+    SearchObservation::advance(observation, Some(1));
     let mut matching_items = Vec::new();
     let mut page_cursor = cursor;
     let scan_page_size = params.page_size.saturating_mul(8).clamp(256, 2048);
@@ -276,6 +347,7 @@ pub(super) async fn search_threads(
     .as_ref()
     .map(|cursor| encode_rollout_cursor(storage_path, cursor))
     .transpose()?;
+    SearchObservation::advance(observation, Some(2));
 
     let (names, resolved_title_ids) =
         thread_item_titles(matching_items.iter().map(|item| &item.item));
@@ -302,6 +374,7 @@ pub(super) async fn search_threads(
         });
     }
     set_thread_search_result_names(store, &mut items, names, resolved_title_ids).await?;
+    SearchObservation::advance(observation, Some(3));
 
     Ok(ThreadSearchPage { items, next_cursor })
 }

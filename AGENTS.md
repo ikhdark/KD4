@@ -1,7 +1,7 @@
-# KD4 and KDR
+# KDA, KD4 and KDR
 
-Keep this file identical in both checkouts. It owns shared agent policy; linked
-guides own commands, inventories and area-specific contracts.
+Keep this file identical in all three checkouts. It owns shared agent policy;
+linked guides own commands, inventories and area-specific contracts.
 
 ## Start with the owner
 
@@ -10,12 +10,13 @@ every guide or run a blanket scan as a routine prerequisite.
 
 | Task | Entry point |
 | --- | --- |
+| KDA development, builds and scan-and-fix workflow | [KDA overview](../KDA/README.md), [development](../KDA/README.md#development), [scan contract](../KDA/src/scan.md) |
 | KD4 runtime, source navigation and development | [KD4 overview](../KD4/README.md) |
 | KDR scanner, diagnostics and verification | [KDR documentation](../KDR/docs/README.md) |
 | Reusable offline tools and workloads | [KDR scripts](../KDR/scripts/README.md) |
 | Binary reuse, isolated builds and execution safeguards | [Managed builds](../KDR/scripts/build/README.md) |
-| Audit cases, live findings and closure | [Audit library](../KDR/audits/README.md) |
-| Benchmark evidence and reusable infrastructure | [Benchmark library](../KDR/benchmarks/README.md) |
+| Audit cases, live findings and closure | [KDR audit library](../KDR/audits/README.md), [KDA audit library](../KDA/audits/README.md) |
+| Benchmark evidence and reusable infrastructure | [KDR benchmark library](../KDR/benchmarks/README.md), [KDA benchmark library](../KDA/benchmarks/README.md) |
 | Implementation intent, changes, method and verification | [Implementation library](../KDR/implementation/README.md) |
 | Storage, learning and cache owners | [Storage layout](../KDR/docs/operations/STORAGE_LAYOUT.md) |
 | Documentation and file organization | [Documentation workflow](../KDR/docs/operations/DOCUMENTATION_WORKFLOW.md) |
@@ -169,8 +170,9 @@ work. Leave the Windows Store installation untouched.
   authorization. Strong matched evidence may suffice for lower-consequence fixes.
 - Follow the active validation mode and permissions. Inspect selected runners
   and delegated workloads; names and documented commands grant no exception.
-  Both checkouts are test-free: never create or restore tests, and run tests
+  KD4 and KDR are test-free: never create or restore tests, and run tests
   only where the active validation mode explicitly authorizes existing ones.
+  KDA follows its [test-free development workflow](../KDA/README.md#authorized-development-checks).
   Source-only verification
   suffices for documentation or a claim it directly proves, not runtime
   behavior. A restriction changes the method, not the obligation: verify with
@@ -193,8 +195,8 @@ work. Leave the Windows Store installation untouched.
 
 ## Prior fixes and learning
 
-Use the README-linked diagnostic/storage guides; keep KD4's registry separate
-from KDR's. Before consequential behavioral edits, inspect relevant prior fixes
+Use the README-linked diagnostic/storage guides; keep KDA's, KD4's and KDR's
+registries separate. Before consequential behavioral edits, inspect relevant prior fixes
 and benchmark history. State preserve/modify/reject decisions with fix IDs and
 an evidence-backed rationale using existing patch assessment metadata when
 available, otherwise briefly before editing. Weigh correctness, retained benefits,
@@ -217,8 +219,9 @@ Use one owned session and the predefined reusable clone described in
 [frontend measurement](../KDR/docs/operations/FRONTEND_MEASUREMENT.md), not fresh
 profiles or repeated onboarding discovery. Initialize its private
 `home/config.toml` as a byte-for-byte copy of
-`C:\Users\kuh\Desktop\LOCAL-KD\config.toml`, then apply the clone's standing
-`gpt-6.1-terra` / `high` override; thereafter preserve that config, other
+`C:\Users\kuh\Desktop\LOCAL-KD\config.toml`. The intended clone selection is
+GPT-6 Luna with Light reasoning. Confirm availability in the clone's model
+picker; do not substitute another model. Preserve the private config, other
 explicit overrides, the initialized profile and backend home.
 
 Before launch verify the complete application snapshot against the real frontend
@@ -229,6 +232,11 @@ screens recur, change the method, not the profile. Startup success is not proof
 of downstream behavior. Preserve the live installation, credentials and active chats.
 
 ## Reporting and organization
+
+The KDR audit and benchmark paths below apply to KD4 and KDR. KDA follows
+the same case lifecycle in its own [audit library](../KDA/audits/README.md)
+and retains run evidence in its [benchmark library](../KDA/benchmarks/README.md).
+All three use the shared KDR implementation library.
 
 - The audit case folder is the status. Unfinished work lives in
   `KDR/audits/active-cases/<frontend|backend>/<task>/` (mixed UI/backend

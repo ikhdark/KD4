@@ -862,6 +862,11 @@ fn collect_spawn_process_output(
                 // admitted. Closing also releases a reader blocked on its send.
                 drain_timed_out = true;
                 output_rx.close();
+                tracing::debug!(
+                    ?stream,
+                    queued_chunks = output_rx.len(),
+                    "process/spawn output drain deadline"
+                );
             }
             let mut chunk = tokio::select! {
                 permit = &mut capacity, if stream_output && response_processed

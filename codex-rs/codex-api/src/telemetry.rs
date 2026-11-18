@@ -72,6 +72,8 @@ pub struct ProviderObservation {
     /// Bounded provider-reported comparison outcome, never inferred from usage.
     pub prompt_cache_diagnostics: Option<serde_json::Value>,
     pub prompt_cache_diagnostics_invalid: bool,
+    /// Bounded input eligibility observation from an admitted terminal response.
+    pub reasoning_input: Option<serde_json::Value>,
     /// Bounded server-reported timing (`server_timing` phase only); never client-measured.
     pub server_timing: Option<serde_json::Value>,
     pub server_timing_invalid: bool,

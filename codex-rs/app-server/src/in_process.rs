@@ -656,6 +656,18 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
             args.arg0_paths.clone(),
             args.thread_config_loader,
         );
+        let requirements_shutdown = delivery_failure.child_token();
+        let _requirements_lifetime = requirements_shutdown.clone().drop_guard();
+        let mut requirements_handle = tokio::spawn(
+            config_manager
+                .clone()
+                .recheck_requirements_after_identity_completion(
+                    Arc::clone(&auth_manager),
+                    args.config.chatgpt_base_url.clone(),
+                    args.config.http_client_factory(),
+                    requirements_shutdown,
+                ),
+        );
         let (processor_tx, mut processor_rx) = mpsc::channel::<ProcessorCommand>(
             channel_capacity.saturating_add(CONTROL_REQUEST_CAPACITY),
         );
@@ -1006,10 +1018,18 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
             cleanup_deadline,
         )
         .await;
+        let requirements_result = finish_in_process_task(
+            "requirements",
+            &mut requirements_handle,
+            None,
+            cleanup_deadline,
+        )
+        .await;
         for (owner, result) in [
             ("notification", &notification_result),
             ("processor", &processor_result),
             ("outbound", &outbound_result),
+            ("requirements", &requirements_result),
         ] {
             if let Err(error) = result {
                 warn!(owner, %error, "in-process worker shutdown failed");
@@ -1018,7 +1038,8 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
         // Cleanup all peers before returning the first failure.
         let shutdown_result = notification_result
             .and(processor_result)
-            .and(outbound_result);
+            .and(outbound_result)
+            .and(requirements_result);
 
         if let Some(done_tx) = shutdown_ack {
             let _ = done_tx.send(

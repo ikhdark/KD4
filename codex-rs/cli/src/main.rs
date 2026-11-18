@@ -49,8 +49,15 @@ macro_rules! out_print {
 
 fn write_stdout(args: std::fmt::Arguments<'_>) -> std::io::Result<()> {
     use std::io::Write as _;
+    write_stdout_with(|stdout| stdout.write_fmt(args))
+}
+
+fn write_stdout_with(
+    write: impl FnOnce(&mut std::io::StdoutLock<'_>) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
     let mut stdout = std::io::stdout().lock();
-    match stdout.write_fmt(args).and_then(|()| stdout.flush()) {
+    match write(&mut stdout).and_then(|()| stdout.flush()) {
         Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
         result => result,
     }
@@ -1027,7 +1034,7 @@ async fn cli_main(
             run_logout(logout_cli.config_overrides).await;
         }
         Some(Subcommand::Completion(completion_cli)) => {
-            print_completion(completion_cli);
+            print_completion(completion_cli)?;
         }
         Some(Subcommand::Doctor(doctor_cli)) => {
             doctor::run_doctor(
@@ -1570,8 +1577,11 @@ async fn run_debug_models_command(
             .await?
     };
 
-    serde_json::to_writer(std::io::stdout(), &catalog)?;
-    out_println!()?;
+    use std::io::Write as _;
+    write_stdout_with(|stdout| {
+        serde_json::to_writer(&mut *stdout, &catalog)?;
+        stdout.write_all(b"\n")
+    })?;
     Ok(())
 }
 
@@ -1708,10 +1718,15 @@ fn app_server_subcommand_name(subcommand: Option<&AppServerSubcommand>) -> &'sta
     }
 }
 
-fn print_completion(cmd: CompletionCommand) {
+fn print_completion(cmd: CompletionCommand) -> std::io::Result<()> {
+    use std::io::Write as _;
     let mut app = MultitoolCli::command();
     let name = "codex";
-    generate(cmd.shell, &mut app, name, &mut std::io::stdout());
+    // clap_complete's generators assume an infallible sink. Keep generation
+    // separate from actual stdout I/O so a closed reader cannot panic.
+    let mut script = Vec::new();
+    generate(cmd.shell, &mut app, name, &mut script);
+    write_stdout_with(|stdout| stdout.write_all(&script))
 }
 
 

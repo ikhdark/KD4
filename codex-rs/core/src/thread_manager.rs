@@ -2054,6 +2054,11 @@ impl ThreadManagerState {
             // The spawn path retains only thread IDs, so look up the live
             // runtime again here to inherit its user instructions.
             Some(thread_id) => self.get_thread(thread_id).await.map_err(|error| {
+                if matches!(initial_history, InitialHistory::Resumed(_))
+                    && matches!(error, CodexErr::ThreadNotFound(_))
+                {
+                    return CodexErr::ResumeParentNotLoaded(thread_id);
+                }
                 CodexErr::InvalidRequest(format!(
                     "child instruction recovery is blocked: parent {thread_id} must be loaded before resuming its child ({error})"
                 ))

@@ -1722,6 +1722,8 @@ impl Session {
                 token_usage: turn_token_usage.clone(),
             });
         let cleared_active_turn = self.publish_terminal_outcome(finalization, event).await;
+        // Mail accepted after input recovery may have hit the terminal fence on
+        // its own wake attempt. Recheck triggering mail after releasing that fence.
         if cleared_active_turn
             && finalization
                 .outcome
@@ -1729,7 +1731,8 @@ impl Session {
             && (abort_reason == Some(TurnAbortReason::Interrupted)
                 || required_tool_terminal.is_some()
                 || defer_pending_input
-                || finalization.restart_for_pending_input)
+                || finalization.restart_for_pending_input
+                || self.input_queue.has_trigger_turn_mailbox_items().await)
         {
             self.maybe_start_turn_for_pending_work().await;
         }
@@ -1933,7 +1936,9 @@ impl Session {
             && finalization
                 .outcome
                 .allows_pending_input_restart(finalization.published_terminal_event.as_ref())
-            && (finalization.restart_for_pending_input || restart_for_terminal_outcome)
+            && (finalization.restart_for_pending_input
+                || restart_for_terminal_outcome
+                || self.input_queue.has_trigger_turn_mailbox_items().await)
         {
             self.maybe_start_turn_for_pending_work().await;
         }

@@ -55,6 +55,7 @@ pub enum ThreadErrorReason {
     NotLoaded,
     NotMaterialized,
     EphemeralTurnsUnavailable,
+    ParentNotLoaded,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]

@@ -99,6 +99,8 @@ pub enum CodexErr {
     ContextWindowExceeded,
     #[error("no thread with id: {0}")]
     ThreadNotFound(ThreadId),
+    #[error("child instruction recovery is blocked: parent {0} must be loaded before resuming its child (no thread with id: {0})")]
+    ResumeParentNotLoaded(ThreadId),
     #[error("agent thread limit reached")]
     AgentLimitReached { max_threads: usize },
     #[error("session configured event was not the first event in the stream")]
@@ -284,6 +286,7 @@ impl CodexErr {
             | CodexErr::RetryLimit(_)
             | CodexErr::ContextWindowExceeded
             | CodexErr::ThreadNotFound(_)
+            | CodexErr::ResumeParentNotLoaded(_)
             | CodexErr::AgentLimitReached { .. }
             | CodexErr::Spawn
             | CodexErr::SessionConfiguredNotFirstEvent
@@ -351,6 +354,7 @@ impl CodexErr {
             | CodexErr::InvalidRequest(_)
             | CodexErr::InvalidImageRequest()
             | CodexErr::ThreadNotFound(_)
+            | CodexErr::ResumeParentNotLoaded(_)
             | CodexErr::AgentLimitReached { .. } => CodexErrorInfo::BadRequest,
             CodexErr::Sandbox(_) => CodexErrorInfo::SandboxError,
             _ => CodexErrorInfo::Other,

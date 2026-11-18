@@ -56,6 +56,9 @@ impl OutgoingMessage {
 pub struct OutgoingResponse {
     pub id: RequestId,
     pub result: Result,
+    /// The producer is a read-only history page, safe to request again.
+    #[serde(skip)]
+    pub retryable_history_page: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

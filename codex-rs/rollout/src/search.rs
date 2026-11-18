@@ -4,6 +4,7 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::Instant;
 
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::TurnItem;
@@ -55,7 +56,16 @@ impl RolloutSearchQuery {
         codex_home: &Path,
         archived: bool,
     ) -> io::Result<RolloutSearchMatches> {
-        search_rollout_matches_with_query(rg_command, codex_home, archived, self).await
+        let mut observation =
+            tracing::enabled!(target: "codex_storage_search_phases", tracing::Level::TRACE)
+                .then(ContentSearchObservation::new);
+        let result =
+            search_rollout_matches_with_query(rg_command, codex_home, archived, self, &mut observation)
+                .await;
+        if let Some(observation) = observation {
+            observation.emit(&result);
+        }
+        result
     }
 
     pub async fn first_content_match_snippet(&self, path: &Path) -> io::Result<Option<String>> {
@@ -90,11 +100,49 @@ pub async fn search_rollout_matches(
         .await
 }
 
+struct ContentSearchObservation {
+    started: Instant,
+    payload_search_us: u64,
+    plain_search_us: u64,
+    payload_hydration_us: u64,
+    compressed_scan_us: u64,
+    fallback_scan_us: u64,
+    hydration_candidates: u64,
+    fallback_used: bool,
+}
+
+impl ContentSearchObservation {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            payload_search_us: 0,
+            plain_search_us: 0,
+            payload_hydration_us: 0,
+            compressed_scan_us: 0,
+            fallback_scan_us: 0,
+            hydration_candidates: 0,
+            fallback_used: false,
+        }
+    }
+
+    fn emit(self, result: &io::Result<RolloutSearchMatches>) {
+        tracing::trace!(target: "codex_storage_search_phases",
+            stage = "rollout_content_search", success = result.is_ok(),
+            elapsed_us = self.started.elapsed().as_micros() as u64,
+            payload_search_us = self.payload_search_us, plain_search_us = self.plain_search_us,
+            payload_hydration_us = self.payload_hydration_us,
+            compressed_scan_us = self.compressed_scan_us, fallback_scan_us = self.fallback_scan_us,
+            hydration_candidates = self.hydration_candidates, fallback_used = self.fallback_used,
+            matched_rollouts = result.as_ref().map_or(0, HashMap::len) as u64);
+    }
+}
+
 async fn search_rollout_matches_with_query(
     rg_command: &Path,
     codex_home: &Path,
     archived: bool,
     query: &RolloutSearchQuery,
+    observation: &mut Option<ContentSearchObservation>,
 ) -> io::Result<RolloutSearchMatches> {
     let home = std::path::absolute(codex_home)?;
     let root = home.join(if archived {
@@ -106,25 +154,33 @@ async fn search_rollout_matches_with_query(
     // carries the base instructions), and ripgrep cannot see the body behind
     // it. Search the retained bodies first so only references to matching
     // bodies become hydration candidates, rather than every rollout.
-    let Some(payload_patterns) = matching_payload_patterns(
+    let started = observation.is_some().then(Instant::now);
+    let payload_patterns = matching_payload_patterns(
         rg_command,
         &home.join(super::payload_artifact::PAYLOAD_DIRECTORY),
         &query.json_search_term,
     )
-    .await?
-    else {
-        return scan_rollout_matches(root.as_path(), query, /*compressed_only*/ false).await;
+    .await;
+    if let (Some(observation), Some(started)) = (observation.as_mut(), started) {
+        observation.payload_search_us = started.elapsed().as_micros() as u64;
+    }
+    let Some(payload_patterns) = payload_patterns? else {
+        return scan_fallback_matches(root.as_path(), query, observation).await;
     };
-    let Some(plain_matches) = ripgrep_rollout_paths(
+    let started = observation.is_some().then(Instant::now);
+    let plain_matches = ripgrep_rollout_paths(
         rg_command,
         root.as_path(),
         &query.json_search_term,
         &payload_patterns,
         &query.text_matcher,
     )
-    .await?
-    else {
-        return scan_rollout_matches(root.as_path(), query, /*compressed_only*/ false).await;
+    .await;
+    if let (Some(observation), Some(started)) = (observation.as_mut(), started) {
+        observation.plain_search_us = started.elapsed().as_micros() as u64;
+    }
+    let Some(plain_matches) = plain_matches? else {
+        return scan_fallback_matches(root.as_path(), query, observation).await;
     };
     let mut matches = HashMap::new();
     for (path, snippet) in plain_matches {
@@ -134,16 +190,41 @@ async fn search_rollout_matches_with_query(
         }
         // A payload reference is only a candidate. Search its canonical hydrated lines
         // after ripgrep has exited, so storage cannot block draining the child pipes.
-        let (matched, snippet) =
-            inspect_rollout_match(&path, &query.json_matcher, &query.text_matcher).await?;
+        let started = observation.is_some().then(Instant::now);
+        let inspected = inspect_rollout_match(&path, &query.json_matcher, &query.text_matcher).await;
+        if let (Some(observation), Some(started)) = (observation.as_mut(), started) {
+            observation.payload_hydration_us += started.elapsed().as_micros() as u64;
+            observation.hydration_candidates += 1;
+        }
+        let (matched, snippet) = inspected?;
         if matched {
             insert_rollout_match(&mut matches, path, snippet);
         }
     }
-    for (path, snippet) in scan_rollout_matches(root.as_path(), query, /*compressed_only*/ true).await? {
+    let started = observation.is_some().then(Instant::now);
+    let compressed_matches =
+        scan_rollout_matches(root.as_path(), query, /*compressed_only*/ true).await;
+    if let (Some(observation), Some(started)) = (observation.as_mut(), started) {
+        observation.compressed_scan_us = started.elapsed().as_micros() as u64;
+    }
+    for (path, snippet) in compressed_matches? {
         insert_rollout_match(&mut matches, path, snippet);
     }
     Ok(matches)
+}
+
+async fn scan_fallback_matches(
+    root: &Path,
+    query: &RolloutSearchQuery,
+    observation: &mut Option<ContentSearchObservation>,
+) -> io::Result<RolloutSearchMatches> {
+    let started = observation.is_some().then(Instant::now);
+    let matches = scan_rollout_matches(root, query, /*compressed_only*/ false).await;
+    if let (Some(observation), Some(started)) = (observation.as_mut(), started) {
+        observation.fallback_used = true;
+        observation.fallback_scan_us = started.elapsed().as_micros() as u64;
+    }
+    matches
 }
 
 /// Above this many matching bodies, every payload reference stays a candidate

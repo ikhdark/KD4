@@ -148,9 +148,12 @@ result release, not the outer cell's later model delivery. Commands still do not
 claim exact external filesystem/network input state from argv equivalence.
 
 Owned `read_files` branches and their recovery continuations carry bounded
-fork/join provenance without replacing Promise builtins or changing admission.
-Awaiting the helper joins all recorded branches, including rejected ones. Raw
-unsupported aggregates remain explicitly unknown. `requestOwnerClosures` can
+fork/join provenance without changing admission. Code Mode installs forwarding
+proxies for `Promise.all`, `allSettled`, `race` and `any`: V8 runs the original
+algorithm on the caller's arguments; reflection on a proxy can differ from
+reflection on the original builtin. Awaiting the helper joins all recorded
+branches, including rejected ones. Raw aggregates contribute edges only for
+proven member reactions; unsupported cases remain unknown. `requestOwnerClosures` can
 close a dependency lane when a sampling scope stops without provider completion;
 its evidence reference and KDR endpoint basis preserve that distinction.
 

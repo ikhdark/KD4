@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use codex_code_mode_protocol::CancellationCause;
 use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::CodeModeNestedToolCall;
 use codex_code_mode_protocol::CodeModeSession;
@@ -21,6 +22,7 @@ use codex_code_mode_protocol::RuntimeResponse;
 use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::WaitOutcome;
 use codex_code_mode_protocol::WaitRequest;
+use codex_protocol::protocol::TurnAbortReason;
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
@@ -179,7 +181,27 @@ impl InProcessCodeModeSession {
     }
 
     pub async fn terminate(&self, cell_id: CellId) -> Result<WaitOutcome, String> {
-        match self.runtime.terminate(&runtime_cell_id(&cell_id)).await {
+        self.terminate_with_interrupt_cause(cell_id, None).await
+    }
+
+    pub async fn terminate_with_interrupt_cause(
+        &self,
+        cell_id: CellId,
+        interrupt_cause: Option<CancellationCause>,
+    ) -> Result<WaitOutcome, String> {
+        let cause = match interrupt_cause {
+            Some(
+                cause @ CancellationCause::TurnAborted {
+                    reason: TurnAbortReason::Interrupted,
+                },
+            ) => cause,
+            _ => CancellationCause::RuntimeShutdown,
+        };
+        match self
+            .runtime
+            .terminate(&runtime_cell_id(&cell_id), cause)
+            .await
+        {
             Ok(event) => Ok(WaitOutcome::LiveCell(runtime_response(&cell_id, event)?)),
             Err(runtime::Error::MissingCell(_) | runtime::Error::ClosedCell(_)) => {
                 Ok(WaitOutcome::MissingCell(missing_cell_response(cell_id)))
@@ -226,6 +248,16 @@ impl CodeModeSession for InProcessCodeModeSession {
 
     fn terminate<'a>(&'a self, cell_id: CellId) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
         Box::pin(InProcessCodeModeSession::terminate(self, cell_id))
+    }
+
+    fn terminate_with_interrupt_cause(
+        &self,
+        cell_id: CellId,
+        interrupt_cause: Option<CancellationCause>,
+    ) -> CodeModeSessionResultFuture<'_, WaitOutcome> {
+        Box::pin(InProcessCodeModeSession::terminate_with_interrupt_cause(
+            self, cell_id, interrupt_cause,
+        ))
     }
 
     fn shutdown<'a>(&'a self) -> CodeModeSessionResultFuture<'a, ()> {

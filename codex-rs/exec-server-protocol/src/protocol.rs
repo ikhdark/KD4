@@ -402,6 +402,20 @@ pub struct ProcessOutputGap {
     pub through_seq: u64,
     /// Authoritative exit position, including when output around it was evicted.
     pub exit_seq: Option<u64>,
+    /// The eviction watermark when the legacy throughSeq also covers producer
+    /// capture losses. Zero means no eviction occurred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evicted_through_seq: Option<u64>,
+    /// Producer capture losses are single positions, not discarded prefixes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capture_incomplete: Vec<ProcessCaptureGap>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessCaptureGap {
+    pub seq: u64,
+    pub stream: ExecOutputStream,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

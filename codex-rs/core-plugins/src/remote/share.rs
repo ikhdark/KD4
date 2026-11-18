@@ -345,7 +345,7 @@ pub async fn delete_remote_plugin_share(
     )?;
     let client = &config.http_clients;
     let request = authenticated_request(client.delete(&url), auth);
-    send_and_expect_status(request, &url, &[StatusCode::NO_CONTENT]).await?;
+    send_and_expect_status(request, Some(&url), &[StatusCode::NO_CONTENT]).await?;
     let home = codex_home.to_path_buf();
     let remote_id = remote_plugin_id.to_string();
     let mapping_result = tokio::task::spawn_blocking(move || {
@@ -489,6 +489,7 @@ async fn put_workspace_plugin_upload(
 ) -> Result<(), RemotePluginCatalogError> {
     let request = client
         .request(Method::PUT, upload_url)
+        .redirect_filter(|_| false)
         .headers(default_headers())
         .timeout(REMOTE_PLUGIN_CATALOG_TIMEOUT)
         .header("x-ms-blob-type", "BlockBlob")
@@ -496,7 +497,7 @@ async fn put_workspace_plugin_upload(
         .body(archive_bytes);
     send_and_expect_status(
         request,
-        "workspace plugin upload URL",
+        None,
         &[StatusCode::OK, StatusCode::CREATED],
     ).await
 }
@@ -539,23 +540,26 @@ fn archive_plugin_for_upload(plugin_path: &Path) -> Result<Vec<u8>, RemotePlugin
 
 async fn send_and_expect_status(
     request: RouteAwareRequestBuilder,
-    url_for_error: &str,
+    // None denotes a signed workspace upload, never an API diagnostic URL.
+    api_url: Option<&str>,
     expected_statuses: &[StatusCode],
 ) -> Result<(), RemotePluginCatalogError> {
     let mut response = request
         .send()
         .await
-        .map_err(|source| RemotePluginCatalogError::Request {
-            url: url_for_error.to_string(),
-            source,
+        .map_err(|source| match api_url {
+            Some(url) => RemotePluginCatalogError::Request { url: url.to_owned(), source },
+            None => RemotePluginCatalogError::SignedUploadRequest { category: source.safe_category() },
         })?;
     let status = response.status();
     if !expected_statuses.contains(&status) {
-        let body = codex_http_client::collect_error_body(response.bytes_stream())
-            .await
-            .unwrap_or_default();
+        let body = if api_url.is_some() {
+            codex_http_client::collect_error_body(response.bytes_stream()).await.unwrap_or_default()
+        } else {
+            "response body omitted".to_owned()
+        };
         return Err(RemotePluginCatalogError::UnexpectedStatus {
-            url: url_for_error.to_string(),
+            url: api_url.unwrap_or("workspace plugin upload URL").to_owned(),
             status,
             body,
         });

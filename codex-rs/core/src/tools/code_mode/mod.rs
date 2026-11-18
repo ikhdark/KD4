@@ -550,6 +550,17 @@ impl CodeModeService {
         self.session().await?.terminate(cell_id).await
     }
 
+    async fn terminate_with_interrupt_cause(
+        &self,
+        cell_id: CellId,
+        interrupt_cause: Option<codex_code_mode::CancellationCause>,
+    ) -> Result<codex_code_mode::WaitOutcome, String> {
+        self.session()
+            .await?
+            .terminate_with_interrupt_cause(cell_id, interrupt_cause)
+            .await
+    }
+
     pub(crate) async fn shutdown(&self) -> Result<(), String> {
         self.shutting_down.store(true, Ordering::Release);
         // Join any initialization already in progress without initializing an unused service.
@@ -3151,23 +3162,6 @@ fn code_mode_text_content(items: &[FunctionCallOutputContentItem]) -> String {
         .join("\n")
 }
 
-async fn call_nested_tool(
-    exec: ExecContext,
-    tool_runtime: ToolCallRuntime,
-    invocation: CodeModeNestedToolCall,
-    cancellation: NestedCancellation,
-) -> Result<JsonValue, FunctionCallError> {
-    let cell = invocation.cell_id.to_string();
-    let call = invocation.runtime_tool_call_id.clone();
-    let timing = Arc::clone(&exec.turn.turn_timing_state);
-    let result = call_nested_tool_inner(exec, tool_runtime, invocation, cancellation).await;
-    // This is the core adapter's release, not model relay delivery or a claim
-    // that the remote JS promise has already resumed. A cancelled future never
-    // reaches this boundary and stays censored.
-    timing.record_nested_result_release(&cell, &call);
-    result
-}
-
 fn retain_failed_dispatch_result(
     exec: &ExecContext,
     cell_id: &CellId,
@@ -3236,7 +3230,7 @@ fn retain_failed_dispatch_result(
     Some(retention.boxed())
 }
 
-async fn call_nested_tool_inner(
+async fn call_nested_tool(
     exec: ExecContext,
     tool_runtime: ToolCallRuntime,
     invocation: CodeModeNestedToolCall,
@@ -3322,16 +3316,15 @@ async fn call_nested_tool_inner(
                 }
             }
             let (retained_output, output_truncated, _) = bounded_failed_nested_text(&error);
-            let (failure_fingerprint, failure_identity) =
-                nested_failure_evidence(&nested_call_id, &error);
             tool_runtime
                 .record_code_mode_failure(
                     cell_id.as_str(),
                     &nested_call_id,
                     &tool_name,
                     None,
-                    failure_fingerprint,
+                    None,
                     &error,
+                    None,
                 )
                 .await;
             exec.session
@@ -3346,7 +3339,7 @@ async fn call_nested_tool_inner(
                         command_state: None,
                         output_fingerprints: Vec::new(),
                         printed_read_projection: None,
-                        failure_identity,
+                        failure_identity: None,
                         ordinal: packet_ordinal,
                         call_id: nested_call_id,
                         parent_call_id: parent_tool_call_id,
@@ -3372,8 +3365,9 @@ async fn call_nested_tool_inner(
                 &nested_call_id,
                 &tool_name,
                 Some(&payload),
-                nested_failure_evidence(&nested_call_id, &message).0,
+                None,
                 &message,
+                None,
             )
             .await;
         exec.session
@@ -3425,17 +3419,18 @@ async fn call_nested_tool_inner(
             cancellation_token,
             Some(Arc::clone(&admitted_revision)),
             None,
-            dispatch_state,
+            Arc::clone(&dispatch_state),
         )
         .await;
     let mut result = match result {
         Ok(result) => result,
         Err(error) => {
-            let message = error.model_message();
+            let owner_failure = error.failure();
+            let message = owner_failure.model_message();
             // No post-hook payload was returned on this path. Name the
             // attempted payload as such instead of asserting it executed.
             let failure_result = serde_json::json!({
-                "tool_failure": error.failure(), "payload_authority": "requested",
+                "tool_failure": owner_failure, "payload_authority": "requested",
             });
             let retention = retain_failed_dispatch_result(&exec, &cell_id, packet_ordinal, &nested_call_id,
                 &tool_name, failure_result.clone(), &message);
@@ -3460,8 +3455,7 @@ async fn call_nested_tool_inner(
                 }
             }
             let (retained_output, output_truncated, _) = bounded_failed_nested_text(&message);
-            let (failure_fingerprint, failure_identity) =
-                nested_failure_evidence(&nested_call_id, &message);
+            let failure_identity = nested_failure_delivery_identity(&error, message.len());
             let terminal_cause = required_tool_error_terminal_cause(&error);
             // The attempted payload is authoritative when no pre-tool hook
             // could replace it. Retain that action for repeated-failure
@@ -3475,8 +3469,9 @@ async fn call_nested_tool_inner(
                     &nested_call_id,
                     &tool_name,
                     failure_payload,
-                    failure_fingerprint,
+                    dispatch_state.error_settlement(),
                     &message,
+                    Some(&owner_failure),
                 )
                 .await;
             exec.session
@@ -3592,6 +3587,8 @@ async fn call_nested_tool_inner(
     }
     // Registry history is not part of the producer's canonical artifact.
     // Compare the delivered producer value before adding this wrapper.
+    let producer_result =
+        (operation_history.is_some() && result_value.is_object()).then(|| result_value.clone());
     if let Some(history) = operation_history
         && let Some(fields) = result_value.as_object_mut()
     {
@@ -3894,7 +3891,8 @@ async fn call_nested_tool_inner(
             source_dependencies,
             outcome_context,
             signal: signal.as_ref(),
-            result: &result_value,
+            result: producer_result.as_ref().unwrap_or(&result_value),
+            settlement: dispatch_state.result_settlement(),
             canonical_artifact_required,
         },
         &receipts,
@@ -4435,44 +4433,18 @@ fn command_state_session(state: &JsonValue) -> Option<&JsonValue> {
         .or_else(|| state.get("session_id").filter(|value| !value.is_null()))
 }
 
-fn nested_failure_evidence(instance: &str, error: &str) -> (String, Option<JsonValue>) {
-    if let Some(json_start) = error.find('{')
-        && let Ok(mut value) = serde_json::from_str::<JsonValue>(&error[json_start..])
+/// Preserve the display identity of a large typed error without reading
+/// settlement or recovery data back from its formatted message.
+fn nested_failure_delivery_identity(error: &FunctionCallError, rendered_bytes: usize) -> Option<JsonValue> {
+    if rendered_bytes <= MAX_RETAINED_NESTED_RESULT_BYTES
+        || rendered_bytes > MAX_RETAINED_FAILURE_IDENTITY_BYTES
     {
-        // Host history describes only this nested call; history embedded in
-        // a tool's own error text for another call is not its settlement.
-        let own_history = value
-            .pointer("/tool_failure/details/operation_history/instance/call_id")
-            .and_then(JsonValue::as_str)
-            == Some(instance);
-        let fingerprint = value
-            .pointer("/tool_failure/details/operation_history/instance/fingerprint")
-            .filter(|_| own_history)
-            .and_then(JsonValue::as_str)
-            .filter(|fingerprint| !fingerprint.is_empty())
-            .map(str::to_owned)
-            .or_else(|| {
-                // A proven identical repeat keeps its predecessor's instance
-                // identity so the repeated-cycle owner can see it. Nested
-                // failures never arm dispatch suppression; similar ones stay distinct.
-                crate::session::turn_execution::unchanged_failure_repeat_of(&value, instance)
-                    .map(|previous| format!("code_mode.unclassified_instance.{previous}"))
-            })
-            .unwrap_or_else(|| format!("code_mode.unclassified_instance.{instance}"));
-        let native_envelope = json_start == 0
-            && error.len() > MAX_RETAINED_NESTED_RESULT_BYTES
-            && error.len() <= MAX_RETAINED_FAILURE_IDENTITY_BYTES
-            && value.as_object().is_some_and(|object|
-                object.len() == 1 && object.contains_key("tool_failure"));
-        if native_envelope {
-            if let Some(object) = value.as_object_mut() {
-                codex_code_mode::omit_first_failure_history(object);
-            }
-            return (fingerprint, Some(value));
-        }
-        return (fingerprint, None);
+        return None;
     }
-    (format!("code_mode.unclassified_instance.{instance}"), None)
+    let mut object = serde_json::Map::new();
+    object.insert("tool_failure".to_string(), serde_json::to_value(error.failure()).ok()?);
+    codex_code_mode::omit_first_failure_history(&mut object);
+    Some(JsonValue::Object(object))
 }
 
 fn build_nested_tool_payload(

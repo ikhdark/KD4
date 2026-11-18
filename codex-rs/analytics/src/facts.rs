@@ -237,7 +237,9 @@ impl From<&CodexErr> for CodexErrKind {
             CodexErr::UnexpectedStatus(_) | CodexErr::RegionRestricted(_) => {
                 CodexErrKind::UnexpectedStatus
             }
-            CodexErr::InvalidRequest(_) => CodexErrKind::InvalidRequest,
+            CodexErr::InvalidRequest(_) | CodexErr::ResumeParentNotLoaded(_) => {
+                CodexErrKind::InvalidRequest
+            }
             CodexErr::FinalResponseValidation(_) => CodexErrKind::FinalResponseValidation,
             CodexErr::InvalidImageRequest() => CodexErrKind::InvalidImageRequest,
             CodexErr::UsageLimitReached(_) => CodexErrKind::UsageLimitReached,

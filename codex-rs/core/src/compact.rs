@@ -825,31 +825,34 @@ async fn run_compact_task_inner_impl(
                         pinned_input.extend(prompt.input.iter().skip(source_input_len).cloned());
                         prompt.input = pinned_input.into();
                     }
+                    // Formatting can shrink the raw request, and a matching sampling
+                    // prefix can also contribute provider calibration. Keep the raw
+                    // pin substitution above: a provider overflow has no pin fallback.
+                    let window = turn_context.model_context_window();
+                    let admission = if local_compaction_input_exceeds_window(&prompt, window) {
+                        Some(crate::session::turn::prompt_token_estimates(
+                            sess.as_ref(), turn_context.as_ref(), &prompt,
+                        ).await)
+                    } else {
+                        None
+                    };
+                    let refused = admission.as_ref().zip(window)
+                        .is_some_and(|(estimates, window)| estimates.calibrated_tokens >= window);
                     if fit_capture {
                         tracing::info!(
                             unformatted_budget = ?unformatted_budget,
                             complete_budget = ?complete_budget,
                             dispatch_budget = prompt.budget_tokens_for_input(&prompt.input),
-                            context_window = ?turn_context.model_context_window(),
+                            context_window = ?window,
+                            admission_local_tokens = ?admission.as_ref().map(|estimates| estimates.local_tokens),
+                            calibrated_tokens = ?admission.as_ref().map(|estimates| estimates.calibrated_tokens),
+                            refused,
                             pins_used = pin_source.is_none(),
                             repair = retried_invalid_summary,
                             "local_compaction_fit_capture"
                         );
                     }
-                    // The byte estimate overstates text-heavy prompts (see the
-                    // remote v2 guard); refuse only when sampling admission's
-                    // provider-calibrated estimate does not fit either. Pin
-                    // substitution above stays on the raw estimate, because a
-                    // provider overflow after dispatch has no pin fallback.
-                    if let Some(window) = turn_context.model_context_window()
-                        && local_compaction_input_exceeds_window(&prompt, Some(window))
-                        && crate::session::turn::prompt_token_estimates(
-                            sess.as_ref(), turn_context.as_ref(), &prompt,
-                        )
-                        .await
-                        .calibrated_tokens
-                            >= window
-                    {
+                    if refused {
                         sess.set_total_tokens_full(turn_context.as_ref()).await;
                         return Err(CodexErr::ContextWindowExceeded);
                     }
@@ -1096,12 +1099,20 @@ async fn run_compact_task_inner_impl(
 /// stay out so the summary does not absorb them. Current stable context keeps
 /// its source order, as sampling sends it: regrouping it ahead of history
 /// rewrote the request from its first item and forfeited the session's cached
-/// prompt prefix.
+/// prompt prefix. Pressure-retirement audit records stay in canonical history;
+/// the summarizer sees the actual outputs (or their recovery pins) instead.
 fn local_compaction_prompt_items(turn_input: &[ResponseItem]) -> Vec<ResponseItem> {
     strip_compaction_startup_envelopes(
         turn_input
             .iter()
             .filter(|item| {
+                if let ResponseItem::Message { role, content, .. } = item
+                    && role == "developer"
+                    && let [ContentItem::InputText { text }] = content.as_slice()
+                    && crate::tool_history::is_pressure_retirement_checkpoint_text(text)
+                {
+                    return false;
+                }
                 !matches!(item, ResponseItem::Message { role, .. } if role == "system")
                     || !crate::stable_context::is_trusted_selected_skill_item(item)
             })

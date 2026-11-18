@@ -21,7 +21,9 @@ use tracing::warn;
 /// plenty for an interactive CLI.
 pub const CHANNEL_CAPACITY: usize = 128;
 pub const CONTROL_INGRESS_RESERVE: usize = 64;
-pub const INGRESS_CAPACITY: usize = CHANNEL_CAPACITY + CONTROL_INGRESS_RESERVE;
+const REJECTION_INGRESS_RESERVE: usize = 64;
+pub const INGRESS_CAPACITY: usize =
+    CHANNEL_CAPACITY + REJECTION_INGRESS_RESERVE + CONTROL_INGRESS_RESERVE;
 
 /// Serialize the capacity check and reservation for cooperating producers.
 /// Ordinary senders must never transiently borrow a protected control cell.
@@ -59,6 +61,7 @@ mod unix_socket;
 mod websocket;
 
 pub use remote_control::REMOTE_CONTROL_DISABLED_ENV_VAR;
+pub use remote_control::REMOTE_PREVIEW_FIELD_BYTES;
 pub use remote_control::RemoteControlDisabledByRequirements;
 pub use remote_control::RemoteControlEnableError;
 pub use remote_control::RemoteControlHandle;
@@ -66,6 +69,7 @@ pub use remote_control::RemoteControlPolicy;
 pub use remote_control::RemoteControlStartConfig;
 pub use remote_control::RemoteControlStartupMode;
 pub use remote_control::RemoteControlUnavailable;
+pub use remote_control::preview_remote_notification;
 pub use remote_control::remote_control_response_size_error;
 pub use remote_control::remote_control_user_agent;
 pub use remote_control::start_remote_control;
@@ -297,10 +301,23 @@ async fn enqueue_incoming_message_with_admission(
             ..
         })) => {
             // The RPC owner must claim the ID, including collisions with live
-            // requests. Rejection work is bounded by reserved event cells.
-            match transport_event_tx.try_send(TransportEvent::RequestRejected {
-                connection_id, request_id: request.id,
-            }) {
+            // requests. Rejection bookkeeping can use its own reserve but
+            // must not consume cells reserved for actual control messages.
+            if serialized_request_bytes_up_to(&request.id, 64 * 1024) > 64 * 1024 {
+                warn!(?connection_id, "closing connection: overload response ID exceeds the ingress rejection bound");
+                return (false, false);
+            }
+            let reserve = if transport_event_tx.max_capacity() >= INGRESS_CAPACITY {
+                CONTROL_INGRESS_RESERVE
+            } else {
+                0
+            };
+            match try_send_with_control_reserve(
+                transport_event_tx,
+                TransportEvent::RequestRejected { connection_id, request_id: request.id },
+                false,
+                reserve,
+            ) {
                 Ok(()) => (true, false),
                 Err(mpsc::error::TrySendError::Closed(_)) => (false, false),
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -364,7 +381,7 @@ fn ingress_message_is_control(message: &JSONRPCMessage) -> bool {
 
 fn ingress_reserve(sender: &mpsc::Sender<TransportEvent>) -> usize {
     if sender.max_capacity() >= INGRESS_CAPACITY {
-        CONTROL_INGRESS_RESERVE
+        REJECTION_INGRESS_RESERVE + CONTROL_INGRESS_RESERVE
     } else {
         0
     }

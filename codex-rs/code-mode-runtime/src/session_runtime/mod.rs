@@ -13,6 +13,7 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use codex_code_mode_protocol::CancellationCause;
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 use tokio::sync::OwnedSemaphorePermit;
@@ -373,13 +374,17 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         })
     }
 
-    pub(crate) async fn terminate(&self, cell_id: &CellId) -> Result<CellEvent, Error> {
+    pub(crate) async fn terminate(
+        &self,
+        cell_id: &CellId,
+        cause: CancellationCause,
+    ) -> Result<CellEvent, Error> {
         let handle = self.inner.cells.lock().await.get(cell_id).cloned();
         let Some(handle) = handle else {
             return self.cached_terminal_event(cell_id).await;
         };
         handle
-            .terminate()
+            .terminate(cause)
             .await
             .map_err(|error| actor_error(cell_id, error))
     }

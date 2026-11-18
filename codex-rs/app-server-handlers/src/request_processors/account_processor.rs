@@ -496,7 +496,9 @@ impl AccountRequestProcessor {
             .await
             .map_err(|err| internal_error(format!("api key persistence task failed: {err}")))?
             .map_err(|err| internal_error(format!("failed to save api key: {err}")))?;
-            processor.auth_manager.reload().await;
+            Self::publish_saved_login(&processor.auth_manager, AuthMode::ApiKey)
+                .await
+                .map_err(internal_error)?;
             processor.config_manager
                 .complete_auth_transition(
                     processor.auth_manager.clone(),
@@ -933,6 +935,18 @@ impl AccountRequestProcessor {
         permit.send(ServerNotification::AccountUpdated(self.current_account_updated_notification()));
     }
 
+    async fn publish_saved_login(
+        auth_manager: &AuthManager,
+        expected_mode: AuthMode,
+    ) -> Result<(), String> {
+        let published = auth_manager.reload_after_identity_transition().await
+            .map_err(|err| format!("failed to publish saved login: {err}"))?;
+        if published.map(AuthMode::from) != Some(expected_mode) {
+            return Err("saved login did not become the active authentication method".into());
+        }
+        Ok(())
+    }
+
     // Login completion must carry both the transport dependencies and the
     // complete outcome payload into the detached notification task.
     #[allow(clippy::too_many_arguments)]
@@ -947,18 +961,23 @@ impl AccountRequestProcessor {
         success: bool,
         error_msg: Option<String>,
     ) {
-        let payload_v2 = AccountLoginCompletedNotification {
-            login_id: Some(login_id.to_string()),
-            success,
-            error: error_msg,
-        };
-
         let mut guard = active_login.lock().await;
         let is_current = guard.as_ref().map(ActiveLogin::login_id) == Some(login_id);
-        let publish_account_updated = success && is_current;
+        let (success, error_msg) = if success {
+            if !is_current {
+                (false, Some("login was superseded before publication".into()))
+            } else {
+                match Self::publish_saved_login(&thread_manager.auth_manager(), AuthMode::Chatgpt).await {
+                    Ok(()) => (true, None),
+                    Err(error) => (false, Some(error)),
+                }
+            }
+        } else {
+            (false, error_msg)
+        };
+        let publish_account_updated = success;
         if publish_account_updated {
             let auth_manager = thread_manager.auth_manager();
-            auth_manager.reload().await;
             config_manager
                 .complete_auth_transition(
                     auth_manager.clone(),
@@ -979,6 +998,11 @@ impl AccountRequestProcessor {
             guard.take();
         }
         drop(guard);
+        let payload_v2 = AccountLoginCompletedNotification {
+            login_id: Some(login_id.to_string()),
+            success,
+            error: error_msg,
+        };
         outgoing
             .send_server_notification(ServerNotification::AccountLoginCompleted(payload_v2))
             .await;
@@ -1086,22 +1110,18 @@ impl AccountRequestProcessor {
         } else {
             match auth {
                 Some(auth) => {
-                    let permanent_refresh_failure =
-                        self.auth_manager.refresh_failure_for_auth(&auth).is_some();
                     let auth_mode = AuthMode::from(auth.api_auth_mode());
                     let (reported_auth_method, token_opt) = if matches!(
                         auth,
                         CodexAuth::Headers(_)
                             | CodexAuth::AgentIdentity(_)
                             | CodexAuth::PersonalAccessToken(_)
-                    ) || include_token
-                        && permanent_refresh_failure
-                    {
+                    ) {
                         // This response cannot represent the metadata needed to reuse these
                         // credentials.
                         (Some(auth_mode), None)
                     } else {
-                        match auth.get_token() {
+                        let project = |auth: &CodexAuth| match auth.get_token() {
                             Ok(token) if !token.is_empty() => {
                                 let tok = if include_token { Some(token) } else { None };
                                 (Some(auth_mode), tok)
@@ -1111,6 +1131,20 @@ impl AccountRequestProcessor {
                                 tracing::warn!("failed to get token for auth status: {err}");
                                 (None, None)
                             }
+                        };
+                        if include_token {
+                            // A cached identity is still reportable during a load
+                            // failure, but exporting a credential requires a live
+                            // publication under the same auth lock.
+                            self.auth_manager.with_usable_auth(auth_epoch, |current, _, refresh_failed| {
+                                if refresh_failed {
+                                    (Some(auth_mode), None)
+                                } else {
+                                    project(current)
+                                }
+                            }).unwrap_or((Some(auth_mode), None))
+                        } else {
+                            project(&auth)
                         }
                     };
                     GetAuthStatusResponse {

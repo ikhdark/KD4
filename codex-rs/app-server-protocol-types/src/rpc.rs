@@ -16,6 +16,7 @@ pub const OVERLOADED_ERROR_CODE: i64 = -32001;
 #[ts(rename_all = "camelCase")]
 pub enum OverloadReason {
     TransportIngress,
+    TransportEgress,
     SerializedRequestQueue,
     InProcessRequestQueue,
     InProcessServerRequestQueue,

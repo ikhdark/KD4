@@ -5,12 +5,12 @@ use codex_app_server_protocol_types::ServerNotification;
 use codex_app_server_protocol_types::ThreadItem;
 use serde_json::Value;
 
-const TEXT_BYTES: usize = 8 * 1024;
+pub const REMOTE_PREVIEW_FIELD_BYTES: usize = 8 * 1024;
 const RESPONSE_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const NOTICE_TEXT_BYTES: usize = 64 * 1024;
 
 fn text(value: &mut String, budget: &mut usize) {
-    let limit = TEXT_BYTES.min(*budget);
+    let limit = REMOTE_PREVIEW_FIELD_BYTES.min(*budget);
     if value.len() <= limit {
         *budget -= value.len();
         return;
@@ -25,6 +25,7 @@ fn text(value: &mut String, budget: &mut usize) {
     value.push_str(&format!(
         "\n[Phone preview: {omitted} bytes omitted; full output remains in Desktop and saved history.]"
     ));
+    value.shrink_to_fit();
     *budget = budget.saturating_sub(value.len());
 }
 
@@ -129,7 +130,8 @@ fn typed_item(value: &mut ThreadItem, budget: &mut usize) {
     }
 }
 
-pub(super) fn outgoing(message: &mut OutgoingMessage) {
+/// Compact a remote connection's own display notification before staging.
+pub fn preview_remote_notification(message: &mut OutgoingMessage) {
     let OutgoingMessage::AppServerNotification(notification) = message else {
         return;
     };

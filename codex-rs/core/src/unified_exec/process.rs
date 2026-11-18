@@ -1330,6 +1330,10 @@ impl UnifiedExecProcess {
                     ExecProcessEvent::Exited { seq, .. } | ExecProcessEvent::Closed { seq, .. } => {
                         Some(*seq)
                     }
+                    ExecProcessEvent::OutputGap {
+                        through_seq,
+                        capture_incomplete: Some(_),
+                    } => Some(*through_seq),
                     ExecProcessEvent::Failed(_) => None,
                     ExecProcessEvent::OutputGap { .. } => None,
                 });
@@ -1382,12 +1386,14 @@ impl UnifiedExecProcess {
                         capture_incomplete,
                     } => {
                         let skipped = through_seq.saturating_sub(last_seq);
+                        // A producer capture loss occupies its own position; it is not receiver lag.
+                        let lagged = skipped.saturating_sub(u64::from(capture_incomplete.is_some()));
                         if skipped > 0 {
                             flush_aggregate_output(
                                 &output_buffer,
                                 &completion_output_buffer,
                                 &mut decoder,
-                                Some(skipped),
+                                (lagged > 0).then_some(lagged),
                             )
                             .await;
                         }
@@ -1396,13 +1402,6 @@ impl UnifiedExecProcess {
                         {
                             task.mark_output_gap();
                         }
-                        // A producer capture loss occupies only its own
-                        // position; it is not receiver lag (as locally, WC05).
-                        let lagged = if capture_incomplete.is_some() {
-                            skipped.saturating_sub(1)
-                        } else {
-                            skipped
-                        };
                         for buffer in [
                             &output_buffer,
                             &completion_output_buffer,
@@ -1485,6 +1484,12 @@ impl UnifiedExecProcess {
                         state_tx.send_modify(|state| *state = state.failed(message));
                         break;
                     }
+                }
+            }
+            // Without a terminal Closed event, neither stream's EOF is confirmed.
+            if !capture_closed {
+                for buffer in [&output_buffer, &completion_output_buffer, &stdout_buffer, &stderr_buffer] {
+                    buffer.lock().await.record_incomplete_capture();
                 }
             }
             flush_aggregate_output(

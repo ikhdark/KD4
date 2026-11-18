@@ -2398,22 +2398,31 @@ impl PluginRequestProcessor {
         if committed {
             self.analytics_events_client
                 .track_plugin_uninstalled(plugin_telemetry);
-            self.auth_manager.with_policy_identity(|identity| {
-                if identity.current_epoch != auth_epoch { return; }
-            if plugins_manager.clear_remote_installed_plugins_cache() {
+            let cache_changed = self
+                .auth_manager
+                .with_policy_identity(|identity| {
+                    if identity.current_epoch != auth_epoch {
+                        return false;
+                    }
+                    let cache_changed = plugins_manager.clear_remote_installed_plugins_cache();
+                    plugins_manager.maybe_start_remote_installed_plugins_cache_refresh_after_mutation(
+                        &config.plugins_config_input(),
+                        auth.clone(),
+                        Some(self.effective_plugins_changed_callback()),
+                    );
+                    plugins_manager.maybe_start_remote_installed_plugin_bundle_sync(
+                        &config.plugins_config_input(),
+                        auth.clone(),
+                        Some(self.effective_plugins_changed_callback()),
+                    );
+                    cache_changed
+                })
+                .map_err(|error| internal_error(error.to_string()))?;
+            // Config publication takes its loader lock before entering the auth
+            // fence. Invalidate only after releasing the auth guard above.
+            if cache_changed {
                 self.on_effective_plugins_changed();
             }
-            plugins_manager.maybe_start_remote_installed_plugins_cache_refresh_after_mutation(
-                &config.plugins_config_input(),
-                auth.clone(),
-                Some(self.effective_plugins_changed_callback()),
-            );
-            plugins_manager.maybe_start_remote_installed_plugin_bundle_sync(
-                &config.plugins_config_input(),
-                auth.clone(),
-                Some(self.effective_plugins_changed_callback()),
-            );
-            }).map_err(|error| internal_error(error.to_string()))?;
         }
 
         match uninstall_result {

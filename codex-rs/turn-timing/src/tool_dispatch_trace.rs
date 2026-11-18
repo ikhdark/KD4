@@ -197,6 +197,16 @@ impl ToolDispatchTiming {
     }
 
     pub fn record_boundary(&self, boundary: ToolLifecycleBoundary) -> bool {
+        self.record_boundary_with_live_gate(boundary, true)
+    }
+
+    /// Record both edges even for bypassed or uncontended acquisitions, without
+    /// publishing a user-facing waiting phase for work that did not wait.
+    pub fn record_boundary_with_live_gate(
+        &self,
+        boundary: ToolLifecycleBoundary,
+        publish_live_gate: bool,
+    ) -> bool {
         let turn_timing = &self.turn_timing;
         let mut events = self
             .lifecycle_events
@@ -212,7 +222,7 @@ impl ToolDispatchTiming {
             retry_count: self.retry_count.load(Ordering::Acquire),
             reentry_count: self.reentry_count.load(Ordering::Acquire),
         });
-        if let Some((gate, entering)) = live_gate_boundary(boundary) {
+        if publish_live_gate && let Some((gate, entering)) = live_gate_boundary(boundary) {
             turn_timing.adjust_live_gate(gate, entering);
         }
         true

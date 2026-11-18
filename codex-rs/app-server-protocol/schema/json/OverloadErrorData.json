@@ -4,6 +4,7 @@
     "OverloadReason": {
       "enum": [
         "transportIngress",
+        "transportEgress",
         "serializedRequestQueue",
         "inProcessRequestQueue",
         "inProcessServerRequestQueue",

@@ -28,6 +28,7 @@ use futures::StreamExt;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::fs::File;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -117,7 +118,11 @@ pub async fn extract_metadata_from_rollout(
     rollout_path: &Path,
     default_provider: &str,
 ) -> anyhow::Result<ExtractionOutcome> {
-    extract_metadata_from_rollout_with_cache_status(rollout_path, default_provider)
+    extract_metadata_from_rollout_with_cache_status(
+        rollout_path,
+        default_provider,
+        /*populate_cache*/ false,
+    )
         .await
         .map(|(outcome, _cache_hit)| outcome)
 }
@@ -167,6 +172,7 @@ pub(crate) async fn expected_thread_metadata_for_rollout(
 pub(crate) async fn extract_metadata_from_rollout_with_cache_status(
     rollout_path: &Path,
     default_provider: &str,
+    populate_cache: bool,
 ) -> anyhow::Result<(ExtractionOutcome, bool)> {
     if let Some(outcome) = cached_extraction_outcome(rollout_path, default_provider).await {
         return Ok((outcome, true));
@@ -174,7 +180,7 @@ pub(crate) async fn extract_metadata_from_rollout_with_cache_status(
     let scan = tokio::task::spawn_blocking({
         let rollout_path = rollout_path.to_path_buf();
         let default_provider = default_provider.to_string();
-        move || scan_rollout_metadata(&rollout_path, &default_provider)
+        move || scan_rollout_metadata(&rollout_path, &default_provider, populate_cache)
     })
     .await
     .map_err(std::io::Error::other)??;
@@ -182,7 +188,8 @@ pub(crate) async fn extract_metadata_from_rollout_with_cache_status(
         accumulator,
         parse_errors,
         unresolved_payloads,
-        ..
+        cache_key,
+        payload_versions,
     } = scan;
     let mut outcome = accumulator
         .finish(rollout_path, default_provider, parse_errors)
@@ -197,6 +204,15 @@ pub(crate) async fn extract_metadata_from_rollout_with_cache_status(
             }
         })?;
     outcome.unresolved_payloads = unresolved_payloads;
+    if let Some(key) = cache_key {
+        cache_extraction_outcome(
+            ExtractionCacheGuard { key: Some(key) },
+            outcome.clone(),
+            /*summary*/ None,
+            payload_versions,
+        )
+        .await;
+    }
     Ok((outcome, false))
 }
 
@@ -208,6 +224,8 @@ struct RolloutMetadataScan {
     accumulator: RolloutMetadataAccumulator,
     parse_errors: usize,
     unresolved_payloads: usize,
+    cache_key: Option<ExtractionCacheKey>,
+    payload_versions: Vec<PayloadDependencyVersion>,
 }
 
 /// True only for a rollout of the expected filename identity that yields no
@@ -234,7 +252,7 @@ pub async fn has_unavailable_session_meta(
     }
     let path = rollout_path.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let scan = scan_rollout_metadata(&path, "")?;
+        let scan = scan_rollout_metadata(&path, "", /*populate_cache*/ false)?;
         Ok(!scan.accumulator.saw_first_session_meta)
     }).await.map_err(std::io::Error::other)?
 }
@@ -250,11 +268,19 @@ pub async fn has_unavailable_session_meta(
 fn scan_rollout_metadata(
     rollout_path: &Path,
     default_provider: &str,
+    populate_cache: bool,
 ) -> std::io::Result<RolloutMetadataScan> {
     use std::io::BufRead;
     use std::io::Read;
 
     let (physical, file) = compression::open_rollout_file_with_retry(rollout_path)?;
+    // Stamp the exact file being decoded, not a second open of its pathname.
+    let cache_key = populate_cache
+        .then(|| {
+            ExtractionCacheKey::from_file(rollout_path, physical.clone(), default_provider, &file)
+        })
+        .flatten();
+    let mut payload_versions = HashMap::new();
     let input: Box<dyn Read + Send> = if physical
         .extension()
         .is_some_and(|extension| extension == "zst")
@@ -284,6 +310,13 @@ fn scan_rollout_metadata(
         }
         let text = compression::decode_rollout_line(std::mem::take(&mut raw));
         let line = if crate::payload_artifact::may_be_reference(&text) {
+            if cache_key.is_some()
+                && let Some(version) = crate::payload_artifact::named_payload_version(&physical, &text)
+            {
+                // Repeated references share one dependency; keep the earliest
+                // observation so a repair during the scan cannot certify it.
+                payload_versions.entry(version.path.clone()).or_insert(version);
+            }
             match crate::payload_artifact::hydrate_line(&physical, text) {
                 Ok(line) => line,
                 Err(error) => {
@@ -312,6 +345,8 @@ fn scan_rollout_metadata(
         accumulator,
         parse_errors: decoder.parse_errors(),
         unresolved_payloads,
+        cache_key,
+        payload_versions: payload_versions.into_values().collect(),
     })
 }
 
@@ -459,9 +494,64 @@ fn is_repairable_payload_gap(error: &anyhow::Error) -> bool {
 struct ExtractionCacheKey {
     path: PathBuf,
     physical_path: PathBuf,
+    physical_identity: (u64, u64),
+    created: Option<SystemTime>,
+    #[cfg(unix)]
+    changed: (i64, i64),
     len: u64,
-    modified: Option<SystemTime>,
+    modified: SystemTime,
     default_provider: String,
+}
+
+impl ExtractionCacheKey {
+    fn from_file(
+        rollout_path: &Path,
+        physical_path: PathBuf,
+        default_provider: &str,
+        file: &File,
+    ) -> Option<Self> {
+        let metadata = file.metadata().ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        #[cfg(unix)]
+        let physical_identity = (metadata.dev(), metadata.ino());
+        #[cfg(windows)]
+        let physical_identity = {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION;
+            use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle;
+            let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+            // SAFETY: the live file owns the handle; success initializes info.
+            if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), info.as_mut_ptr()) }
+                == 0
+            {
+                return None;
+            }
+            let info = unsafe { info.assume_init() };
+            (
+                u64::from(info.dwVolumeSerialNumber),
+                (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+            )
+        };
+        #[cfg(not(any(unix, windows)))]
+        let physical_identity = return None;
+        // An unchanged pathname, length and mtime do not identify its contents:
+        // an atomic replacement can preserve all three.
+        Some(Self {
+            path: rollout_path.to_path_buf(),
+            physical_path,
+            physical_identity,
+            created: metadata.created().ok(),
+            #[cfg(unix)]
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+            len: metadata.len(),
+            modified: metadata.modified().ok()?,
+            default_provider: default_provider.to_string(),
+        })
+    }
 }
 
 #[derive(Default)]
@@ -498,15 +588,15 @@ async fn extraction_cache_key(
     rollout_path: &Path,
     default_provider: &str,
 ) -> Option<ExtractionCacheKey> {
-    let physical_path = compression::existing_rollout_path(rollout_path).await?;
-    let metadata = tokio::fs::metadata(&physical_path).await.ok()?;
-    Some(ExtractionCacheKey {
-        path: rollout_path.to_path_buf(),
-        physical_path,
-        len: metadata.len(),
-        modified: Some(metadata.modified().ok()?),
-        default_provider: default_provider.to_string(),
+    let rollout_path = rollout_path.to_path_buf();
+    let default_provider = default_provider.to_string();
+    tokio::task::spawn_blocking(move || {
+        let physical_path = compression::existing_rollout_path_blocking(&rollout_path)?;
+        let file = File::open(&physical_path).ok()?;
+        ExtractionCacheKey::from_file(&rollout_path, physical_path, &default_provider, &file)
     })
+    .await
+    .ok()?
 }
 
 pub(crate) struct ExtractionCacheGuard {
@@ -531,19 +621,24 @@ pub(crate) async fn cache_extraction_outcome(
     let Some(key) = guard.key else {
         return;
     };
+    // Sidecars are independent inputs. Check the streaming reader's pre-read
+    // receipts without holding the cache mutex across filesystem work.
+    let payloads_unchanged = payload_versions.is_empty()
+        || crate::payload_artifact::payload_versions_match(&payload_versions).await;
     let Some(current_key) = extraction_cache_key(&key.path, &key.default_provider).await else {
         return;
     };
     if current_key != key {
         return;
     }
-    // Sidecars are independent inputs. Check the streaming reader's pre-read
-    // receipts without holding the cache mutex across filesystem work.
-    let payloads_unchanged = payload_versions.is_empty()
-        || crate::payload_artifact::payload_versions_match(&payload_versions).await;
     let mut cache = extraction_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A metadata-only extraction doesn't own the richer head summary. Preserve
+    // a concurrently admitted summary (and its independently checked receipts).
+    if summary.is_none() && cache.entries.get(&key).is_some_and(|entry| entry.summary.is_some()) {
+        return;
+    }
     cache.entries.retain(|candidate, _| {
         candidate.path != key.path || candidate.default_provider != key.default_provider
     });
