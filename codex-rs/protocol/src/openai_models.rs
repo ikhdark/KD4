@@ -247,7 +247,10 @@ pub struct ModelPreset {
     /// whether this model is supported in the api
     pub supported_in_api: bool,
     /// Input modalities accepted when composing user turns for this preset.
-    #[serde(default = "default_input_modalities")]
+    #[serde(
+        default = "default_input_modalities",
+        deserialize_with = "deserialize_input_modalities"
+    )]
     pub input_modalities: Vec<InputModality>,
 }
 
@@ -329,6 +332,20 @@ where
         return Ok(None);
     };
     Ok(serde_json::from_value(serde_json::Value::String(value)).ok())
+}
+
+fn deserialize_input_modalities<'de, D>(deserializer: D) -> Result<Vec<InputModality>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    // Providers may advertise modalities this client cannot compose yet. Keep
+    // supported capabilities without rejecting the entire model catalog or
+    // claiming support for the unknown ones. Non-string entries remain invalid.
+    let values = Vec::<String>::deserialize(deserializer)?;
+    Ok(values
+        .into_iter()
+        .filter_map(|value| serde_json::from_value(serde_json::Value::String(value)).ok())
+        .collect())
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, TS, JsonSchema)]
@@ -434,7 +451,10 @@ pub struct ModelInfo {
     pub effective_context_window_percent: i64,
     pub experimental_supported_tools: Vec<String>,
     /// Input modalities accepted by the backend for this model.
-    #[serde(default = "default_input_modalities")]
+    #[serde(
+        default = "default_input_modalities",
+        deserialize_with = "deserialize_input_modalities"
+    )]
     pub input_modalities: Vec<InputModality>,
     /// Internal-only marker set by core when a model slug resolved to fallback metadata.
     #[serde(default, skip_serializing, skip_deserializing)]
