@@ -126,6 +126,7 @@ pub(crate) struct SamplingRequestBaselines {
     attributed_mutation_revision: u64,
     unproven_command_revision: u64,
     plan_revision: u64,
+    plan_progress_revision: Option<String>,
     input_revision: u64,
     instruction_revision: u64,
     tool_exposure_revision: u64,
@@ -3067,7 +3068,8 @@ impl TurnExecutionControl {
         let progressed = !progress.is_empty()
             || agent_delivery_progress
             || process_progress
-            || self.plan_revision != baselines.plan_revision
+            || self.plan.as_ref().map(|plan| plan.progress_revision.as_str())
+                != baselines.plan_progress_revision.as_deref()
             || self.input_revision != baselines.input_revision
             || settled.tool_exposure_revision != baselines.tool_exposure_revision
             || settled.attributed_mutation_revision != baselines.attributed_mutation_revision;
@@ -3285,6 +3287,7 @@ impl TurnExecutionControl {
             attributed_mutation_revision: mutation_revision,
             unproven_command_revision: 0,
             plan_revision: self.plan_revision,
+            plan_progress_revision: self.plan.as_ref().map(|plan| plan.progress_revision.clone()),
             input_revision: self.input_revision,
             instruction_revision: self.instruction_revision,
             tool_exposure_revision,

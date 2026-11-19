@@ -953,7 +953,7 @@ impl OutgoingMessageSender {
         }
     }
 
-    pub async fn connection_closed(&self, connection_id: ConnectionId) {
+    pub async fn retire_connection_callbacks(&self, connection_id: ConnectionId) {
         let orphaned_entries = {
             // Registration and replay use the same active -> callbacks lock order.
             // Removing the connection while holding the active lock prevents a
@@ -984,14 +984,6 @@ impl OutgoingMessageSender {
                 .filter_map(|request_id| request_id_to_callback.remove(&request_id))
                 .collect::<Vec<_>>()
         };
-        {
-            let mut request_contexts = self.request_contexts.lock().await;
-            request_contexts.retain(|request_id, _| request_id.connection_id != connection_id);
-        }
-        self.component_notification_cache
-            .lock()
-            .await
-            .remove_connection(connection_id);
         for entry in orphaned_entries {
             let request_id = entry.request.id().clone();
             self.analytics_events_client
@@ -1002,6 +994,18 @@ impl OutgoingMessageSender {
                 warn!("could not notify callback for {request_id:?} due to: {err:?}");
             }
         }
+    }
+
+    /// Reclaim request metadata after the closed peer's handlers have drained.
+    pub async fn finish_connection_closed(&self, connection_id: ConnectionId) {
+        {
+            let mut request_contexts = self.request_contexts.lock().await;
+            request_contexts.retain(|request_id, _| request_id.connection_id != connection_id);
+        }
+        self.component_notification_cache
+            .lock()
+            .await
+            .remove_connection(connection_id);
         self.analytics_events_client
             .track_connection_closed(connection_id.0);
     }

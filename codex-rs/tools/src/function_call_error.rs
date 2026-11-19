@@ -14,8 +14,8 @@ pub enum FunctionCallError {
     /// distinction from execution failure structured through relay.
     #[error("{0}")]
     DeniedToModel(String),
-    /// The runtime has established that the turn cannot proceed, for example
-    /// because its assignment was revoked. Unlike call-local denial, this is terminal.
+    /// A required operation was refused before it started, for example because
+    /// its assignment was revoked. Unlike call-local denial, this is terminal.
     #[error("{0}")]
     RequiredOperationBlocked(String),
     #[error("Fatal error: {0}")]
@@ -36,7 +36,7 @@ impl FunctionCallError {
                 ToolFailure::new(ToolFailureCode::PermissionDenied, message)
             }
             Self::RequiredOperationBlocked(message) => {
-                ToolFailure::new(ToolFailureCode::RequiredOperationBlocked, message)
+                ToolFailure::no_effects(ToolFailureCode::RequiredOperationBlocked, message)
             }
             Self::Fatal(message) => ToolFailure::new(ToolFailureCode::UncertainEffects, message),
         }

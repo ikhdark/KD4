@@ -1682,6 +1682,7 @@ impl AgentControl {
             };
             let notification = async {
                 let mut protected_host_summary = None;
+                let mut handoff = None;
                 if let (Some(child_agent_path), Some(binding)) =
                     (child_agent_path.as_ref(), watched_binding.as_ref())
                 {
@@ -1731,11 +1732,14 @@ impl AgentControl {
                                 }
                                 protected_host_summary =
                                     crate::agent::status::completion_diagnostics_from_task(&task);
-                                if let Some(durable_status) = agent_status_from_task(
-                                    &task,
-                                    Some((binding.attempt_id, &status)),
-                                ) {
+                                if let Some((durable_status, durable_handoff)) =
+                                    crate::agent::status::agent_status_and_handoff_from_task(
+                                        &task,
+                                        Some((binding.attempt_id, &status)),
+                                    )
+                                {
                                     status = durable_status;
+                                    handoff = durable_handoff;
                                 }
                             }
                             Err(error) => warn!(
@@ -1789,6 +1793,7 @@ impl AgentControl {
                         child_agent_path,
                         child_thread_id,
                         &status,
+                        handoff,
                         receipt.as_deref(),
                         protected_host_summary.as_deref(),
                     ).await;

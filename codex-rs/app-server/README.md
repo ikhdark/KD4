@@ -36,6 +36,17 @@ by `mcpServer/oauthLogin/completed`. Match attempts by this ID rather than serve
 name or arrival order; overlapping attempts can finish out of order. Older peers
 and automatic plugin logins may omit it. Existing server/thread fields remain.
 
+## Mobile RPC boundaries
+
+Experimental RPC capability is per logical connection. Remote-control
+temporary failures use error `-32002` with `data.reason`, `retryable: true`
+and an optional RFC 3339 `retryAt`. An authoritative managed denial is not a
+temporary service cooldown. `fs/watch` capacity failures use `-32003` with the
+limiting scope; unwatch releases capacity. File reads still require an absolute
+path in the selected host environment, not a phone-side display label. A
+filtered `thread/list` page may be empty with a continuation: keep reading
+until `nextCursor` is null.
+
 ## Opt-in mobile folder/Git discovery diagnostics
 
 After separately publishing the backend, enable the existing runtime journal in

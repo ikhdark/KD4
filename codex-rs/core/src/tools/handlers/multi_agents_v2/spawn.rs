@@ -21,6 +21,7 @@ use codex_agent_task_store::AssignmentDraft;
 use codex_agent_task_store::AssignmentId;
 use codex_agent_task_store::AssignmentRelation;
 use codex_agent_task_store::Attempt;
+use codex_agent_task_store::DependencyAdmission;
 use codex_agent_task_store::IntegrationPlan;
 use codex_agent_task_store::LocalAgentTaskStore;
 use codex_agent_task_store::RelevantHandle;
@@ -46,6 +47,7 @@ use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Default)]
@@ -154,8 +156,11 @@ async fn handle_spawn_agent(
         .join(&args.task_name)
         .map_err(|error| pre_effect_refusal("spawn_agent_task_name", error))?;
     args.validate_generic()?;
-    // Writable work requires a typed contract; prose never grants write authority.
-    let typed_role = AgentRole::Worker;
+    // A typed role selects a store contract, not a runtime configuration profile.
+    // Preserve the existing Worker default and the separate message-only draft.
+    let typed_role = args.assignment.as_ref()
+        .and_then(|assignment| assignment.role)
+        .unwrap_or(AgentRole::Worker);
     let fork_mode = args.fork_mode(turn.config.multi_agent_v2.allow_full_history_forks)?;
     // History forks do not attach a capsule, but still need the task's explicit
     // file/symbol pointers. They are hints, not authority beyond the task scopes.
@@ -330,7 +335,7 @@ async fn handle_spawn_agent(
     config.cwd = admission_cwd.clone();
     worker_startup_preflight(&session, &turn, &config, &primary, &cancellation_token).await?;
 
-    // Durable task metadata retains the historical generic Worker tag.
+    // Preserve the legacy message spawn tag; typed calls carry their requested role.
     let durable_role_name = agent_role_metric_label(typed_role);
     let spawn_source = thread_spawn_source(
         session.thread_id,
@@ -354,12 +359,17 @@ async fn handle_spawn_agent(
         1,
         &[("outcome", "attempted"), ("role", typed_role_metric)],
     );
-    let prepared_typed_spawn = match session
-        .services
-        .agent_control
-        .prepare_typed_spawn(&config, spawn_source.clone(), Some(session.thread_id))
-        .await
-    {
+    let reservation = {
+        let mut observation = SpawnReservationObservation::new(&turn, &call_id);
+        let result = session
+            .services
+            .agent_control
+            .prepare_typed_spawn(&config, spawn_source.clone(), Some(session.thread_id))
+            .await;
+        observation.outcome = if result.is_ok() { "reserved" } else { "rejected" };
+        result
+    };
+    let prepared_typed_spawn = match reservation {
         Ok(prepared) => {
             turn.session_telemetry.counter(
                 "codex.multi_agent.typed_spawn_lifecycle",
@@ -538,8 +548,11 @@ async fn handle_spawn_agent(
                     return Err(typed_task_store_error(error));
                 }
             };
-        assignment.task_capsule = Some(canonical_capsule.clone());
-        let task_capsule = matches!(fork_mode, SpawnAgentForkMode::TaskCapsule).then_some(canonical_capsule);
+        let task_capsule = matches!(fork_mode, SpawnAgentForkMode::TaskCapsule).then(|| {
+            capsule_with_launch_pins(&canonical_capsule, &admitted.dependency_admissions)
+                .unwrap_or_else(|| canonical_capsule.clone())
+        });
+        assignment.task_capsule = Some(canonical_capsule);
         (assignment, attempt, task_capsule)
     };
     if typed_task.0.admission_origin == AssignmentAdmissionOrigin::Typed {
@@ -550,6 +563,9 @@ async fn handle_spawn_agent(
             instructions.push_str("\n\n");
         }
         instructions.push_str(TYPED_RECEIPT_LIFECYCLE);
+        if !typed_task.0.dependencies.is_empty() {
+            instructions.push_str(TYPED_DEPENDENCY_RECEIPTS);
+        }
     }
     let options = SpawnAgentOptions {
         fork_parent_spawn_call_id: Some(call_id.clone()),
@@ -581,7 +597,7 @@ async fn handle_spawn_agent(
     effective_capabilities = worker_startup_preflight(
         &session, &turn, &config, &launch_environment, &cancellation_token,
     ).await.map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
-    if let Some(canonical_payload) = typed_task
+    if let Some(launch_payload) = typed_task
         .2.as_ref()
     {
         let prepared = consumed_typed_spawn.take().ok_or_else(|| {
@@ -597,7 +613,7 @@ async fn handle_spawn_agent(
                     .agent_control
                     .spawn_agent_with_prepared_typed_task_capsule(
                         config,
-                        canonical_payload.clone(),
+                        launch_payload.clone(),
                         spawn_source,
                         options,
                         prepared,
@@ -785,6 +801,38 @@ struct TypedSpawnReservationMetric {
     retained: bool,
 }
 
+struct SpawnReservationObservation<'a> {
+    turn: &'a crate::TurnContext,
+    call_id: &'a str,
+    started: Option<Instant>,
+    outcome: &'static str,
+}
+
+impl<'a> SpawnReservationObservation<'a> {
+    fn new(turn: &'a crate::TurnContext, call_id: &'a str) -> Self {
+        Self {
+            turn,
+            call_id,
+            started: codex_protocol::timing::observations::enabled().then(Instant::now),
+            outcome: "future_dropped",
+        }
+    }
+}
+
+impl Drop for SpawnReservationObservation<'_> {
+    fn drop(&mut self) {
+        let Some(started) = self.started else { return };
+        self.turn.turn_timing_state.observe_runtime(
+            "agent_spawn_reservation",
+            self.call_id,
+            serde_json::json!({
+                "elapsed_ns": u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                "outcome": self.outcome,
+            }),
+        );
+    }
+}
+
 impl TypedSpawnReservationMetric {
     fn new(session_telemetry: SessionTelemetry, role: &'static str) -> Self {
         Self {
@@ -930,7 +978,7 @@ impl SpawnAgentArgs {
         if self.agent_type.is_some() {
             return Err(pre_effect_refusal(
                 "spawn_agent_agent_type",
-                "spawn_agent: specialized roles are no longer supported; use an explicit typed assignment for writable work or message for read-only work",
+                "spawn_agent: agent_type configuration profiles are not supported; use assignment.role to select a typed task contract",
             ));
         }
         Ok(())
@@ -995,6 +1043,7 @@ impl SpawnAgentArgs {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TypedAssignmentArgs {
+    role: Option<AgentRole>,
     objective: String,
     acceptance_criteria: Vec<AcceptanceCriterion>,
     read_scope: Vec<RepoScope>,
@@ -1146,6 +1195,39 @@ async fn construct_and_attach_task_capsule(
     Ok(canonical_payload)
 }
 
+/// Enrich only the child launch context. Do not change the immutable V1
+/// contract or reject a previously admissible capsule to fit optional hints.
+fn capsule_with_launch_pins(
+    canonical: &str,
+    admissions: &[DependencyAdmission],
+) -> Option<String> {
+    #[derive(serde::Serialize)]
+    struct ReceiptPin<'a> {
+        assignment_id: AssignmentId,
+        attempt_id: codex_agent_task_store::AttemptId,
+        receipt_sha256: &'a str,
+    }
+
+    if admissions.is_empty() {
+        return None;
+    }
+    let pins = admissions
+        .iter()
+        .map(|admission| ReceiptPin {
+            assignment_id: admission.assignment_id,
+            attempt_id: admission.attempt_id,
+            receipt_sha256: &admission.receipt_sha256,
+        })
+        .collect::<Vec<_>>();
+    let pins = serde_json::to_string(&pins).ok()?;
+    let prefix = canonical.strip_suffix('}')?;
+    let launch_payload = format!(r#"{prefix},"dependency_receipt_pins":{pins}}}"#);
+    let rendered = TaskCapsuleFragment::new(launch_payload.clone()).render();
+    ModelContextBudget::default()
+        .try_take(&rendered)
+        .then_some(launch_payload)
+}
+
 /// Normalize relevant handles exactly as a TaskCapsule launch attaches them:
 /// covered by the assignment scopes, regular files only, and unique under the
 /// store's canonical path identity rather than independent case folding.
@@ -1244,6 +1326,7 @@ async fn normalize_relevant_handles(
 }
 
 const TYPED_RECEIPT_LIFECYCLE: &str = "This is an explicit typed assignment. Before acting on a follow-up, use get_agent_task with your own assignment_id to recover the current attempt and effective contract; the immutable bootstrap may describe an earlier attempt. Otherwise use get_agent_task only when contract details or captured validation call IDs are missing from the current context. Before your final response, call submit_agent_receipt with the actual outcome and available evidence; report missing validation honestly. A final response alone does not seal this typed assignment. Your read_scope names primary inputs and overlap identity, not a read restriction: read and search any other relevant, permitted file; write_scope and prohibited_changes limit changes.";
+const TYPED_DEPENDENCY_RECEIPTS: &str = "\n\nUse dependency_receipt_pins to fetch the admitted prerequisite receipts by assignment_id and attempt_id. If the pins are absent or you are resuming, use get_agent_task with your own assignment_id and read task.dependency_admissions; do not substitute a prerequisite's latest attempt. These pins are historical, not current authorization.";
 
 fn typed_assignment_message(
     assignment: &Assignment,

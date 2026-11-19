@@ -1,5 +1,6 @@
 use crate::outgoing_message::OutgoingMessage;
 use codex_app_server_protocol_types::JSONRPCMessage;
+use codex_app_server_protocol_types::RequestId;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -135,15 +136,20 @@ impl DeliveryObservation {
     }
 }
 
+/// v1 is a digest of the serialized, typed JSON-RPC ID, including string quotes.
+pub fn rpc_request_key_v1(id: &RequestId) -> String {
+    let bytes = serde_json::to_vec(id).unwrap_or_default();
+    Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 pub(super) fn response_observation(message: &OutgoingMessage) -> serde_json::Value {
     let (id, error_code) = match message {
         OutgoingMessage::Response(response) => (&response.id, None),
         OutgoingMessage::Error(error) => (&error.id, Some(error.error.code)),
         _ => return serde_json::json!({"message_kind":"other"}),
     };
-    let key = serde_json::to_vec(id).ok().map(|bytes| Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect::<String>());
     serde_json::json!({"message_kind":if error_code.is_some() { "error" } else { "response" },
-        "request_key_sha256":key, "error_code":error_code})
+        "request_key_sha256":rpc_request_key_v1(id), "request_key_version":1, "error_code":error_code})
 }
 
 impl StreamId {
@@ -173,6 +179,8 @@ pub enum ClientEvent {
         segment_id: Option<usize>,
     },
     Ping,
+    /// Close the addressed logical stream. A missing stream ID only addresses
+    /// the legacy stream, if one exists for this client.
     ClientClosed,
 }
 

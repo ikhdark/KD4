@@ -71,7 +71,24 @@ pub(crate) fn agent_status_from_task(
     task: &AgentTask,
     observed_status: Option<(codex_agent_task_store::AttemptId, &AgentStatus)>,
 ) -> Option<AgentStatus> {
-    let mut status = agent_status_from_task_inner(task, observed_status)?;
+    agent_status_and_handoff_from_task(task, observed_status).map(|(status, _)| status)
+}
+
+/// Needs intervention, not a failure of the worker's turn. Keep the legacy
+/// AgentStatus projection for wire clients; the completion envelope has the
+/// authoritative disposition from the same attempt as the projected report.
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AgentHandoff {
+    NeedsMain,
+    Blocked,
+}
+
+pub(crate) fn agent_status_and_handoff_from_task(
+    task: &AgentTask,
+    observed_status: Option<(codex_agent_task_store::AttemptId, &AgentStatus)>,
+) -> Option<(AgentStatus, Option<AgentHandoff>)> {
+    let (mut status, mut handoff) = agent_status_from_task_inner(task, observed_status)?;
     let current_observation =
         observed_status.filter(|(attempt, _)| *attempt == task.current_attempt.attempt_id);
     let cause = match current_observation {
@@ -93,6 +110,7 @@ pub(crate) fn agent_status_from_task(
             .and_then(|code| serde_json::from_value(serde_json::Value::String(code.clone())).ok()),
     };
     if let Some(stop_cause) = cause {
+        handoff = None;
         let last_agent_message = match status {
             AgentStatus::Completed(message)
             | AgentStatus::Stopped {
@@ -111,7 +129,7 @@ pub(crate) fn agent_status_from_task(
             stop_cause,
         };
     }
-    Some(status)
+    Some((status, handoff))
 }
 
 /// Only the newest terminal origin and its delivery recovery apply. A later
@@ -186,7 +204,7 @@ fn without_host_observation<'a>(message: &'a str, summary: Option<&str>) -> &'a 
 fn agent_status_from_task_inner(
     task: &AgentTask,
     observed_status: Option<(codex_agent_task_store::AttemptId, &AgentStatus)>,
-) -> Option<AgentStatus> {
+) -> Option<(AgentStatus, Option<AgentHandoff>)> {
     let receipt = task.receipt.as_ref()?;
     if receipt.attempt_id != task.current_attempt.attempt_id {
         return None;
@@ -200,7 +218,10 @@ fn agent_status_from_task_inner(
     );
     let needs_main = task.current_attempt.state == codex_agent_task_store::AttemptState::NeedsMain;
     if receipt.status == AgentStatusClaim::Completed && needs_main {
-        return Some(AgentStatus::Errored(format!("Agent needs main: {receipt_summary}")));
+        return Some((
+            AgentStatus::Errored(format!("Agent needs main: {receipt_summary}")),
+            Some(AgentHandoff::NeedsMain),
+        ));
     }
     let observed_status = observed_status
         .filter(|(attempt_id, _)| {
@@ -215,7 +236,7 @@ fn agent_status_from_task_inner(
             Some(AgentStatus::Errored(_) | AgentStatus::Shutdown | AgentStatus::Interrupted)
         )
     {
-        return observed_status.cloned();
+        return observed_status.cloned().map(|status| (status, None));
     }
     // Keep the already-produced report instead of making the parent wake a sealed
     // worker to reconstruct it. The attempt check above still excludes stale text,
@@ -248,14 +269,22 @@ fn agent_status_from_task_inner(
             {
                 *message = without_host_observation(message.as_str(), host_observation).to_string();
             }
-            status
+            status.map(|status| (status, None))
         }
-        AgentStatusClaim::Completed => Some(AgentStatus::Completed(Some(reported_message.to_string()))),
-        AgentStatusClaim::NeedsMain | AgentStatusClaim::Blocked => {
-            Some(receipt_error_status(receipt, receipt_summary))
-        }
+        AgentStatusClaim::Completed => Some((
+            AgentStatus::Completed(Some(reported_message.to_string())),
+            None,
+        )),
+        AgentStatusClaim::NeedsMain => Some((
+            receipt_error_status(receipt, receipt_summary),
+            Some(AgentHandoff::NeedsMain),
+        )),
+        AgentStatusClaim::Blocked => Some((
+            receipt_error_status(receipt, receipt_summary),
+            Some(AgentHandoff::Blocked),
+        )),
         AgentStatusClaim::Failed | AgentStatusClaim::Violated | AgentStatusClaim::Abandoned => {
-            Some(receipt_error_status(receipt, receipt_summary))
+            Some((receipt_error_status(receipt, receipt_summary), None))
         }
     }
 }

@@ -155,8 +155,8 @@ pub enum SortDirection {
 #[ts(export_to = "v2/")]
 pub struct ThreadListResponse {
     pub data: Vec<Thread>,
-    /// Opaque cursor to pass to the next call to continue after the last item.
-    /// if None, there are no more items to return.
+    /// Opaque cursor to continue the listing. Follow a non-null cursor even
+    /// when a filtered page is short or empty; null means the listing is exhausted.
     pub next_cursor: Option<String>,
     /// Opaque cursor to pass as `cursor` when reversing `sortDirection`.
     /// This is only populated when the page contains at least one thread.

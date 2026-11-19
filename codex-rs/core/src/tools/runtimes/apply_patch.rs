@@ -392,6 +392,7 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
                 Err(failure) => {
                     let (error, delta) = failure.into_parts();
                     self.failure = Some(patch_failure(&error));
+                    self.revision_guard_mismatch = error.is_revision_guard_mismatch();
                     // Preflight reports conflicts in order, so the first typed
                     // mismatch is the one a retry must correct first.
                     match &error {
@@ -403,9 +404,6 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
                             ..
                         } => {
                             self.patch_mismatch = mismatches.first().cloned();
-                        }
-                        codex_apply_patch::ApplyPatchError::RevisionGuardMismatch(_) => {
-                            self.revision_guard_mismatch = true;
                         }
                         _ => {}
                     }
@@ -484,7 +482,7 @@ pub(crate) fn patch_failure(error: &codex_apply_patch::ApplyPatchError) -> codex
     };
     let code = match error {
         ApplyPatchError::ParseError(_) => ToolFailureCode::InvalidSyntax,
-        ApplyPatchError::RevisionGuardMismatch(_) => ToolFailureCode::StaleInput,
+        _ if error.is_revision_guard_mismatch() => ToolFailureCode::StaleInput,
         ApplyPatchError::PatchContextMismatch(mismatch) => mismatch_code(mismatch.kind),
         ApplyPatchError::MultiplePatchConflicts { mismatches, .. } => mismatches.first()
             .map(|mismatch| mismatch_code(mismatch.kind)).unwrap_or(ToolFailureCode::InvalidInput),
@@ -538,6 +536,14 @@ pub(crate) fn patch_failure(error: &codex_apply_patch::ApplyPatchError) -> codex
         // The owner already bounds each available source excerpt; preserve its
         // expected/current identities on shell interception as well as direct calls.
         failure.details = Some(serde_json::json!({"revision_guard_diagnostic": diagnostic}));
+    }
+    if let ApplyPatchError::MultiplePatchConflicts {
+        report,
+        revision_guard_mismatch: true,
+        ..
+    } = error {
+        failure.details.get_or_insert_with(|| serde_json::json!({}))["revision_guard_diagnostic"] =
+            serde_json::Value::String(report.clone());
     }
     if let ApplyPatchError::ComputeReplacements(diagnostic) = error {
         failure.details = Some(serde_json::json!({"owner_diagnostic": diagnostic}));

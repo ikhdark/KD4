@@ -1,5 +1,6 @@
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
+use crate::error_code::REMOTE_CONTROL_TEMPORARY_ERROR_CODE;
 use crate::transport::RemoteControlEnableError;
 use crate::transport::RemoteControlHandle;
 use crate::transport::RemoteControlUnavailable;
@@ -135,6 +136,9 @@ fn map_unavailable(err: RemoteControlUnavailable) -> JSONRPCErrorError {
 }
 
 fn map_update_error(err: io::Error) -> JSONRPCErrorError {
+    if let Some(error) = temporary_remote_control_error(&err) {
+        return error;
+    }
     if matches!(
         err.kind(),
         io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
@@ -146,6 +150,9 @@ fn map_update_error(err: io::Error) -> JSONRPCErrorError {
 }
 
 fn map_pairing_start_error(err: io::Error) -> JSONRPCErrorError {
+    if let Some(error) = temporary_remote_control_error(&err) {
+        return error;
+    }
     if err.kind() == io::ErrorKind::InvalidInput {
         invalid_request(err.to_string())
     } else {
@@ -168,12 +175,27 @@ fn validate_pairing_status_params(
 }
 
 fn map_client_management_error(err: io::Error) -> JSONRPCErrorError {
+    if let Some(error) = temporary_remote_control_error(&err) {
+        return error;
+    }
     match err.kind() {
         io::ErrorKind::InvalidInput
         | io::ErrorKind::NotFound
-        | io::ErrorKind::PermissionDenied
-        | io::ErrorKind::WouldBlock => invalid_request(err.to_string()),
+        | io::ErrorKind::PermissionDenied => invalid_request(err.to_string()),
         _ => internal_error(err.to_string()),
     }
+}
+
+fn temporary_remote_control_error(err: &io::Error) -> Option<JSONRPCErrorError> {
+    let (reason, retry_at) = codex_app_server_transport::remote_control_retry_details(err)?;
+    let mut data = serde_json::json!({"reason": reason, "retryable": true});
+    if let Some(retry_at) = retry_at {
+        data["retryAt"] = retry_at.into();
+    }
+    Some(JSONRPCErrorError {
+        code: REMOTE_CONTROL_TEMPORARY_ERROR_CODE,
+        message: "remote control operation is temporarily unavailable".into(),
+        data: Some(data),
+    })
 }
 

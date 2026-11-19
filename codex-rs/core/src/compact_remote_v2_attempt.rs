@@ -11,6 +11,7 @@ use crate::compact::CompactionAnalyticsDetails;
 use crate::compact_remote::trim_function_call_history_to_fit_context_window_for_prompt;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
+use crate::responses_retry::ResponsesRecoveryWait;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn::build_projected_prompt;
@@ -45,6 +46,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
     client_session: Option<&mut ModelClientSession>,
     compaction_metadata: CompactionTurnMetadata,
     analytics_details: &mut CompactionAnalyticsDetails,
+    recovery_wait: &mut ResponsesRecoveryWait,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<RemoteCompactV2Attempt> {
     let turn_context = &step_context.turn;
@@ -210,6 +212,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
         client_session,
         &prompt,
         &responses_metadata,
+        recovery_wait,
         cancellation_token,
     )
     .await;

@@ -1,4 +1,3 @@
-use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 
 
@@ -43,7 +42,6 @@ pub(crate) struct InitializeRequestProcessor {
     config_manager: crate::config_manager::ConfigManager,
     config_warnings: Arc<Vec<ConfigWarningNotification>>,
     rpc_transport: AppServerRpcTransport,
-    experimental_api_mode: Arc<Mutex<Option<bool>>>,
 }
 
 impl InitializeRequestProcessor {
@@ -62,7 +60,6 @@ impl InitializeRequestProcessor {
             config_manager,
             config_warnings: Arc::new(config_warnings),
             rpc_transport,
-            experimental_api_mode: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -131,34 +128,18 @@ impl InitializeRequestProcessor {
         self.outgoing
             .set_connection_file_change_effects(connection_id, file_change_effects)
             .await;
+        if session
+            .initialize(InitializedConnectionSessionState {
+                experimental_api_enabled,
+                opted_out_notification_methods: opt_out_notification_methods.into_iter().collect(),
+                app_server_client_name: name.clone(),
+                client_version: version,
+                request_attestation,
+                supports_openai_form_elicitation,
+            })
+            .is_err()
         {
-            let mut experimental_api_mode = self
-                .experimental_api_mode
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(selected) = *experimental_api_mode
-                && selected != experimental_api_enabled
-            {
-                return Err(invalid_request(format!(
-                    "experimental_api must match the first initialized connection (expected {selected})"
-                )));
-            }
-            if session
-                .initialize(InitializedConnectionSessionState {
-                    experimental_api_enabled,
-                    opted_out_notification_methods: opt_out_notification_methods
-                        .into_iter()
-                        .collect(),
-                    app_server_client_name: name.clone(),
-                    client_version: version,
-                    request_attestation,
-                    supports_openai_form_elicitation,
-                })
-                .is_err()
-            {
-                return Err(invalid_request("Already initialized"));
-            }
-            experimental_api_mode.get_or_insert(experimental_api_enabled);
+            return Err(invalid_request("Already initialized"));
         }
 
         if mutates_global_identity {

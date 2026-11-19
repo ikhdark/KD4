@@ -266,7 +266,7 @@
     value: (() => {
       const implementation = async function read_files(
       paths,
-      { concurrency = 4, full = false, revision, source_hashes, environment_id } = {},
+      { concurrency = 4, full = false, revision, source_hashes, refresh_hashes, environment_id } = {},
       helper,
     ) {
       // Strings deliberately exclude ambiguous selector merges and environment
@@ -305,6 +305,21 @@
           expected.set(path, hash.toLowerCase());
         }
       }
+      const refresh = new Map();
+      if (refresh_hashes !== undefined) {
+        if (revision !== undefined || source_hashes !== undefined)
+          throw new TypeError("refresh_hashes cannot combine with revision or source_hashes");
+        if (!refresh_hashes || typeof refresh_hashes !== "object" || Array.isArray(refresh_hashes))
+          throw new TypeError("refresh_hashes must map requested paths to prior source hashes");
+        for (const path of unique) {
+          const prior = ownDescriptor(refresh_hashes, path);
+          if (!prior) continue;
+          const hash = prior.value;
+          if (typeof hash !== "string" || !/^[0-9a-f]{64}$/i.test(hash))
+            throw new TypeError(`invalid refresh_hashes identity: ${path}; use the full prior SHA-256`);
+          refresh.set(path, hash.toLowerCase());
+        }
+      }
       // Bound aggregate full-recovery data to 8 MiB, in addition to the normal
       // per-call payload cap. Oversize results retain their initial receipt.
       let remainingBytes = 8 * 1024 * 1024;
@@ -337,7 +352,10 @@
         });
       const settled = await Promise.allSettled(
         unique.map(async (path, branch) => {
-          const initial = await schedule(() => read({ path, revision, environment_id }), branch);
+          const prior = refresh.get(path);
+          const initial = await schedule(() => read({
+            path, revision, environment_id, ...(prior === undefined ? {} : { if_source_hash: prior }),
+          }), branch);
           const evidence = {
             initial,
             pages: [],
@@ -355,6 +373,16 @@
           // can still read it; every printed row would otherwise repeat it.
           if (revision === undefined && !expected.size)
             Object.defineProperty(evidence, "consistency", {enumerable: false});
+          if (prior !== undefined && initial.unchanged === true) {
+            // This is a freshness observation, not newly acquired content.
+            // Only the caller can establish prior full coverage and matching scope.
+            if (initial.source_sha256 !== prior || initial.file_complete !== false ||
+                initial.retained_bytes !== 0 || initial.artifact_id ||
+                !Array.isArray(initial.results) || initial.results.length !== 0)
+              fail("invalid unchanged read receipt", evidence);
+            evidence.unchanged = true;
+            return evidence;
+          }
           if (revision !== undefined) {
             evidence.consistency.revision = revision.toLowerCase();
             if (initial.git_source?.commit_oid !== revision.toLowerCase() ||

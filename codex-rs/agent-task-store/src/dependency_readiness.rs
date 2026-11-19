@@ -169,6 +169,7 @@ pub struct DependencySubscription {
     store: LocalAgentTaskStore,
     assignment_id: AssignmentId,
     attempt_id: AttemptId,
+    observes_live_source: bool,
     waiter: DurableWakeWaiter,
     shutdown: watch::Receiver<bool>,
 }
@@ -187,6 +188,7 @@ impl LocalAgentTaskStore {
         let waiter = self.durable_wake_poller.register(&assignment.root_session_id, true);
         Ok(DependencySubscription {
             store: self.clone(), assignment_id, attempt_id, waiter,
+            observes_live_source: false,
             shutdown: self.durable_wake_poller.shutdown.subscribe(),
         })
     }
@@ -210,7 +212,10 @@ impl DependencySubscription {
             "SELECT revision FROM root_task_state_revision WHERE root_session_id = ?",
         ).bind(&assignment.root_session_id).fetch_one(&mut *transaction).await?;
         let captured = load_dependency_admissions_tx(&mut transaction, self.assignment_id).await?;
-        let blockers = dependency_authority_blockers_tx(&mut transaction, &assignment, &captured).await?;
+        self.observes_live_source = false;
+        let blockers = observe_dependency_authority_tx(
+            &mut transaction, &assignment, &captured, &mut self.observes_live_source,
+        ).await?;
         transaction.rollback().await?;
         let cursor = hash_bytes(serde_json::to_vec(&(self.assignment_id, self.attempt_id, &blockers))?.as_slice());
         Ok(DependencyReadiness {
@@ -227,11 +232,15 @@ impl DependencySubscription {
             if after_cursor != Some(state.cursor.as_str()) {
                 return Ok(state);
             }
+            tracing::trace!(target: "codex_storage_runtime", stage = "dependency_wait_parked",
+                assignment_id = %self.assignment_id, observes_live_source = self.observes_live_source);
             tokio::select! {
                 changed = self.waiter.wake_rx.changed() => {
                     changed.map_err(|_| StoreError::from(sqlx::Error::PoolClosed))?;
                 }
                 _ = self.shutdown.changed() => return Err(sqlx::Error::PoolClosed.into()),
+                // Filesystem-only drift and restoration do not commit a task revision.
+                _ = tokio::time::sleep(EXTERNAL_WAKE_RECHECK_INTERVAL), if self.observes_live_source => {},
             }
         }
     }

@@ -88,6 +88,9 @@ pub struct TransportTiming {
     pub response_headers: Option<std::time::Duration>,
     pub proxy_resolution: Option<std::time::Duration>,
     pub client_pool_selection: Option<std::time::Duration>,
+    /// The routed connect failed before sending the initial HTTP request.
+    /// A failed connection after a redirect does not establish this.
+    pub initial_request_not_sent: bool,
 }
 
 /// Captures send-to-headers latency from the concrete transport, excluding auth,

@@ -1214,6 +1214,7 @@ async fn run_websocket_response_stream(
         ResponsesEventInterpreter::new(&metadata, turn_state).with_connection_history(history);
     let mut progress_deadline = tokio::time::Instant::now() + idle_timeout;
     let mut received_text = false;
+    let mut response_accepted = false;
     loop {
         if tokio::time::Instant::now() >= progress_deadline {
             return Err(ApiError::Stream(
@@ -1280,6 +1281,15 @@ async fn run_websocket_response_stream(
                             ),
                         ));
                     }
+                    Err(ResponsesEventError::Api(ApiError::WebsocketRejected { reason, .. }))
+                        if response_accepted =>
+                    {
+                        // A late or inconsistent rejection cannot prove the
+                        // generation was never accepted; don't grant a free replay.
+                        return Err(ApiError::invalid_response(format!(
+                            "websocket rejected an already accepted response: {reason:?}"
+                        )));
+                    }
                     Err(ResponsesEventError::Api(error)) => return Err(error),
                 };
                 let mut completed = false;
@@ -1288,6 +1298,7 @@ async fn run_websocket_response_stream(
                         telemetry.on_response_event();
                     }
                     let advances = event.advances_model_response();
+                    response_accepted |= advances || matches!(event, ResponseEvent::Created);
                     let is_completed = matches!(event, ResponseEvent::Completed { .. });
                     let delivery_start = Instant::now();
                     tx_event.send(Ok(event)).await?;

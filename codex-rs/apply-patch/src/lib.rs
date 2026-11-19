@@ -88,6 +88,7 @@ pub enum ApplyPatchError {
     MultiplePatchConflicts {
         report: String,
         mismatches: Vec<PatchContextMismatch>,
+        revision_guard_mismatch: bool,
     },
     /// A patch chunk did not match, with bounded context from the exact source
     /// snapshot observed by the confined patch runtime when safely available.
@@ -108,6 +109,18 @@ pub enum ApplyPatchError {
         patch_environment_id: String,
         selected_environment_id: String,
     },
+}
+
+impl ApplyPatchError {
+    /// A retry of the retained patch cannot succeed without reconciling its source revision.
+    pub fn is_revision_guard_mismatch(&self) -> bool {
+        match self {
+            Self::RevisionGuardMismatch(_) => true,
+            Self::MultiplePatchConflicts { revision_guard_mismatch, .. } => *revision_guard_mismatch,
+            Self::PatchContextMismatch(mismatch) => mismatch.kind == PatchContextMismatchKind::StaleRange,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -1551,10 +1564,17 @@ pub(crate) async fn preflight_hunks(
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            if mismatches.is_empty() {
+            let revision_guard_mismatch = failures
+                .iter()
+                .any(ApplyPatchError::is_revision_guard_mismatch);
+            if mismatches.is_empty() && !revision_guard_mismatch {
                 Err(ApplyPatchError::ComputeReplacements(report))
             } else {
-                Err(ApplyPatchError::MultiplePatchConflicts { report, mismatches })
+                Err(ApplyPatchError::MultiplePatchConflicts {
+                    report,
+                    mismatches,
+                    revision_guard_mismatch,
+                })
             }
         }
     }
@@ -2045,11 +2065,7 @@ fn new_contents_from_prepared(
     }
 
     if chunks.iter().any(json_edit::is_json_chunk) {
-        return json_edit::apply(original_contents, chunks, source.newline).map_err(|error| {
-            ApplyPatchError::ComputeReplacements(format!(
-                "{}: {error}", path.inferred_native_path_string(),
-            ))
-        }).map_err(explain_rejection);
+        return json_edit::apply(path, original_contents, chunks, source.newline).map_err(explain_rejection);
     }
 
     if chunks.iter().any(|chunk| chunk.change_context.as_deref()

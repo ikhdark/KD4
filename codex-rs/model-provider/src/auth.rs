@@ -253,6 +253,8 @@ impl AgentIdentitySessionFallback {
 pub struct ResolvedProviderAuth {
     pub auth: SharedAuthProvider,
     pub agent_identity_telemetry: Option<AgentIdentityTelemetry>,
+    /// Authority lifecycle captured by this exact request auth wrapper.
+    pub policy_epoch: Option<u64>,
 }
 
 impl ResolvedProviderAuth {
@@ -260,6 +262,7 @@ impl ResolvedProviderAuth {
         Self {
             auth,
             agent_identity_telemetry: None,
+            policy_epoch: None,
         }
     }
 
@@ -268,6 +271,7 @@ impl ResolvedProviderAuth {
         Self {
             auth: Arc::new(AgentIdentityAuthProvider { auth }),
             agent_identity_telemetry: Some(agent_identity_telemetry),
+            policy_epoch: None,
         }
     }
 }
@@ -548,6 +552,7 @@ pub(crate) async fn resolve_provider_auth_for_scope(
             projection,
             last_request_auth_revision: AtomicU64::new(u64::MAX),
         });
+        resolved.policy_epoch = Some(expected_epoch);
     }
     Ok(resolved)
 }

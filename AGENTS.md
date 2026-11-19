@@ -126,6 +126,23 @@ work. Leave the Windows Store installation untouched.
   without regressions in required behavior. Consider correctness, performance,
   usability and maintenance cost as relevant; retain evidence and tradeoffs.
   An inconclusive comparison is not evidence of improvement.
+- Before choosing an A/B prototype, map every requested behavior and required
+  regression case to a matched scenario and a direct observation. Benchmark the
+  proposed mechanism through the path it is meant to change, not a weaker
+  substitute. Keep proxy and partial results scoped to what they exercised. If
+  a required scenario is missing, correct the prototype or workload and run the
+  missing comparison in the same task unless genuinely blocked. A negative
+  result rules out only the measured candidate; carry an applicable result
+  through the original request and any authorized implementation and verification.
+- For executable-obligation proposals, exercise the real stopping decision:
+  observe permitted ready work execute and advance the obligation, an owned
+  operation resume without relaunch, and a failed diagnostic enter bounded
+  recovery rather than repeat unchanged retries or final-answer deferrals.
+  For truly blocked work, verify the exact missing prerequisite is reported after
+  independent work, with no futile retries. Preserve normal completion when no
+  work remains. Compare premature handoffs, extra user prompts needed to resume
+  obtainable work, and time spent after a genuine blocker is established.
+  Warning text, task labels and request counts alone do not prove these outcomes.
 - Use KDR proactively when existing diagnostics, benchmarks or saved evidence
   materially help. Discover the relevant capability; reuse source-matched
   analysis, hashes and completed evidence instead of duplicating work. KDR is

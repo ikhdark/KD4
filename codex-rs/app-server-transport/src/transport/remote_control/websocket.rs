@@ -96,6 +96,8 @@ struct BufferedServerEnvelope {
     seq_id: u64,
     segment_id: Option<usize>,
     payload: tungstenite::Utf8Bytes,
+    buffered_at: std::time::Instant,
+    completion: Option<WriteCompletion>,
     delivery_failure: Option<CancellationToken>,
     replay_credit: Arc<super::ReplayCredit>,
     observation: Option<super::protocol::DeliveryObservation>,
@@ -104,7 +106,7 @@ struct BufferedServerEnvelope {
 impl BufferedServerEnvelope {
 
 
-    fn from_payload(encoded: EncodedServerPayload, delivery_failure: Option<CancellationToken>, replay_credit: Arc<super::ReplayCredit>) -> Self {
+    fn from_payload(encoded: EncodedServerPayload, completion: Option<WriteCompletion>, delivery_failure: Option<CancellationToken>, replay_credit: Arc<super::ReplayCredit>) -> Self {
         let observation = super::protocol::DeliveryObservation::new(&encoded.client_id, &encoded.stream_id, encoded.seq_id, encoded.segment_id);
         Self {
             client_id: encoded.client_id,
@@ -112,6 +114,8 @@ impl BufferedServerEnvelope {
             seq_id: encoded.seq_id,
             segment_id: encoded.segment_id,
             payload: encoded.payload.into(),
+            buffered_at: std::time::Instant::now(),
+            completion,
             delivery_failure,
             replay_credit,
             observation,
@@ -119,10 +123,14 @@ impl BufferedServerEnvelope {
     }
 }
 
+// Only the last frame owns the receipt. Replay and the current physical writer
+// may both hold it; the first successful flush consumes the sender exactly once.
+type WriteCompletion = Arc<std::sync::Mutex<Option<oneshot::Sender<std::time::Instant>>>>;
 
 struct ScheduledServerFrame {
     payload: tungstenite::Utf8Bytes,
-    completion: Option<oneshot::Sender<std::time::Instant>>,
+    buffered_at: std::time::Instant,
+    completion: Option<WriteCompletion>,
     delivery_failure: Option<CancellationToken>,
     _replay_credit: Arc<super::ReplayCredit>,
     observation: Option<super::protocol::DeliveryObservation>,
@@ -175,12 +183,18 @@ struct ServerWriterQueue {
 impl ServerWriterQueue {
     fn is_empty(&self) -> bool { self.ready.is_empty() }
 
-    fn push(&mut self, key: (ClientId, StreamId), payload: tungstenite::Utf8Bytes,
-        completion: Option<oneshot::Sender<std::time::Instant>>, delivery_failure: Option<CancellationToken>, replay_credit: Arc<super::ReplayCredit>,
-        observation: Option<super::protocol::DeliveryObservation>) {
+    fn push(&mut self, frame: &BufferedServerEnvelope) {
+        let key = (frame.client_id.clone(), frame.stream_id.clone());
         let stream = self.streams.entry(key.clone()).or_default();
         if stream.is_empty() { self.ready.push_back(key); }
-        stream.push_back(ScheduledServerFrame { payload, completion, delivery_failure, _replay_credit: replay_credit, observation });
+        stream.push_back(ScheduledServerFrame {
+            payload: frame.payload.clone(),
+            buffered_at: frame.buffered_at,
+            completion: frame.completion.clone(),
+            delivery_failure: frame.delivery_failure.clone(),
+            _replay_credit: Arc::clone(&frame.replay_credit),
+            observation: frame.observation.clone(),
+        });
     }
 
     fn pop(&mut self) -> Option<ScheduledServerFrame> {
@@ -242,6 +256,7 @@ impl ServerWriterQueue {
             });
         }
         let Some(encoding) = receiver.encoding.as_mut() else { return Ok(None) };
+        let can_flush = !self.is_empty();
         while encoding.encoded.is_none() {
             tokio::select! {
                 biased;
@@ -253,6 +268,9 @@ impl ServerWriterQueue {
                     // Retain even a completed result before the replay lock await.
                     encoding.encoded = Some(result.map_err(io::Error::other).and_then(|result| result));
                 }
+                // A later, unrelated encode must not hold already-buffered
+                // frames. This same encoder stays in shared custody.
+                () = std::future::ready(()), if can_flush => return Ok(None),
             }
         }
         let mut state = state.lock().await;
@@ -274,12 +292,14 @@ impl ServerWriterQueue {
         }
         let count = encoded.len();
         for (index, encoded) in encoded.into_iter().enumerate() {
-            let buffered = BufferedServerEnvelope::from_payload(encoded, encoding.delivery_failure.clone(), Arc::clone(&encoding.replay_credit));
+            let completion = if index + 1 == count {
+                encoding.completion.take().map(|sender| Arc::new(std::sync::Mutex::new(Some(sender))))
+            } else { None };
+            let buffered = BufferedServerEnvelope::from_payload(encoded, completion, encoding.delivery_failure.clone(), Arc::clone(&encoding.replay_credit));
             if let Some(observation) = &buffered.observation {
                 observation.record("mobile_transport_buffered", serde_json::json!({"frame_count":count}));
             }
-            self.push(key.clone(), buffered.payload.clone(),
-                if index + 1 == count { encoding.completion.take() } else { None }, buffered.delivery_failure.clone(), Arc::clone(&buffered.replay_credit), buffered.observation.clone());
+            self.push(&buffered);
             state.outbound_buffer.insert_encoded(buffered);
         }
         state.next_seq_id_by_stream.insert(key.clone(), seq_id.saturating_add(1));
@@ -300,6 +320,28 @@ async fn writer_operation(
             result.map_err(|_| io::Error::new(ErrorKind::TimedOut, "remote control websocket write stalled"))?
                 .map_err(io::Error::other)
         }
+    }
+}
+
+fn observe_socket(generation: Option<uuid::Uuid>, kind: &str, mut facts: serde_json::Value) {
+    if let Some(generation) = generation {
+        facts["socket_generation"] = generation.to_string().into();
+        let _ = codex_protocol::timing::observations::record(kind, "", "", "", facts);
+    }
+}
+
+fn websocket_error_class(error: &tungstenite::Error) -> &'static str {
+    match error {
+        tungstenite::Error::Io(_) => "io",
+        tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => "closed",
+        tungstenite::Error::Tls(_) => "tls",
+        tungstenite::Error::Capacity(_) => "capacity",
+        tungstenite::Error::Protocol(_) => "protocol",
+        tungstenite::Error::WriteBufferFull(_) => "write_buffer_full",
+        tungstenite::Error::Utf8(_) => "utf8",
+        tungstenite::Error::Http(_) => "http",
+        tungstenite::Error::HttpFormat(_) => "http_format",
+        _ => "other",
     }
 }
 
@@ -481,6 +523,16 @@ async fn run_client_ingress(
         };
         let (envelope, completion, committed) = work;
         let key = (envelope.client_id.clone(), envelope.stream_id.clone());
+        if matches!(&envelope.event, ClientEvent::ClientClosed)
+            && key.1.is_none()
+            && let Some(stream) = tracker.legacy_stream_id(&key.0)
+        {
+            // Only the ordered tracker can resolve a streamless legacy close.
+            // Its assigned ID may have ACK activity from outbound frames.
+            let mut state = state.lock().await;
+            state.client_segment_reassembler.invalidate_stream(&key.0, stream);
+            state.invalidate_client_message_stream(&key.0, stream);
+        }
         let result = tracker.handle_message(envelope).await
             .map(|()| tracker.contains_client_stream(&key.0, key.1.as_ref()));
         let failed = result.is_err();
@@ -555,10 +607,6 @@ impl WebsocketState {
         self.last_ack_activity_by_stream.remove(&(client_id.clone(), stream_id.clone()));
     }
 
-    fn invalidate_client_message_client(&mut self, client_id: &ClientId) {
-        self.last_ack_activity_by_stream.retain(|(client, _), _| client != client_id);
-    }
-
     fn client_message_key(
         client_envelope: &ClientEnvelope,
     ) -> Option<((ClientId, Option<StreamId>), u64)> {
@@ -629,7 +677,7 @@ struct RemoteControlEnrollmentAuthContext<'a, 'b> {
 }
 
 enum ConnectOutcome {
-    Connected(Box<WebSocketConnection>),
+    Connected(Box<WebSocketConnection>, Option<uuid::Uuid>),
     Disabled,
     Shutdown,
 }
@@ -908,11 +956,11 @@ impl RemoteControlWebsocket {
                 "starting app-server remote control websocket connection cycle"
             );
             let shutdown_token = self.shutdown_token.child_token();
-            let websocket_connection = match self
+            let (websocket_connection, socket_generation) = match self
                 .connect(&shutdown_token, app_server_client_name.as_deref())
                 .await
             {
-                ConnectOutcome::Connected(websocket_connection) => *websocket_connection,
+                ConnectOutcome::Connected(websocket_connection, generation) => (*websocket_connection, generation),
                 ConnectOutcome::Disabled => {
                     self.retire_transport().await;
                     self.status_publisher
@@ -923,7 +971,7 @@ impl RemoteControlWebsocket {
             };
 
             let connection_end_reason = self
-                .run_connection(websocket_connection, shutdown_token)
+                .run_connection(websocket_connection, shutdown_token, socket_generation)
                 .await;
             let status = self.status_publisher.status();
             info!(
@@ -936,7 +984,7 @@ impl RemoteControlWebsocket {
                 desired_state = ?*self.desired_state_rx.borrow(),
                 "app-server remote control websocket connection cycle ended"
             );
-            if !self.wait_to_reconnect_after(connection_end_reason).await {
+            if !self.wait_to_reconnect_after(connection_end_reason, socket_generation).await {
                 break;
             }
         }
@@ -954,6 +1002,7 @@ impl RemoteControlWebsocket {
     async fn wait_to_reconnect_after(
         &mut self,
         connection_end_reason: ConnectionEndReason,
+        socket_generation: Option<uuid::Uuid>,
     ) -> bool {
         let Some(reconnect_delay) = reconnect_delay_after_connection_end(
             connection_end_reason,
@@ -961,6 +1010,14 @@ impl RemoteControlWebsocket {
         ) else {
             return true;
         };
+        observe_socket(
+            socket_generation,
+            "mobile_socket_reconnect_scheduled",
+            serde_json::json!({
+                "reason": format!("{connection_end_reason:?}"),
+                "retry_delay_ms": u64::try_from(reconnect_delay.as_millis()).ok(),
+            }),
+        );
         warn!(
             remote_control_url = %self.remote_control_url,
             installation_id = %self.installation_id,
@@ -1203,6 +1260,8 @@ impl RemoteControlWebsocket {
                 auth_change_rx: &mut self.auth_change_rx,
             };
             let mut disabled_rx = self.desired_state_rx.clone();
+            let socket_generation = codex_protocol::timing::observations::enabled().then(uuid::Uuid::now_v7);
+            observe_socket(socket_generation, "mobile_socket_connect_attempt", serde_json::json!({}));
             let connect_result = tokio::select! {
                 _ = shutdown_token.cancelled() => return ConnectOutcome::Shutdown,
                 changed = disabled_rx.wait_for(|state| !state.is_enabled()) => {
@@ -1219,6 +1278,7 @@ impl RemoteControlWebsocket {
                         &self.current_enrollment,
                         connect_options,
                         &self.status_publisher,
+                        socket_generation,
                     )
                     .await
                 } => connect_result,
@@ -1249,13 +1309,16 @@ impl RemoteControlWebsocket {
                         response_headers = %format_headers(response.headers()),
                         "connected to app-server remote control websocket"
                     );
-                    return ConnectOutcome::Connected(Box::new(websocket_connection));
+                    observe_socket(socket_generation, "mobile_socket_connected", serde_json::json!({}));
+                    return ConnectOutcome::Connected(Box::new(websocket_connection), socket_generation);
                 }
                 Err(err) => {
                     if !self.desired_state_rx.borrow().is_enabled() {
                         return ConnectOutcome::Disabled;
                     }
                     if take_repaired_retry(&err, &mut repaired_retry_available) {
+                        observe_socket(socket_generation, "mobile_socket_connect_failed",
+                            serde_json::json!({"io_error_kind":format!("{:?}", err.kind()), "retry_delay_ms":0}));
                         continue;
                     }
                     let reconnect_delay = if let Some(deadline) = self.current_enrollment.retry_after() {
@@ -1290,6 +1353,8 @@ impl RemoteControlWebsocket {
                         );
                         reconnect_delay
                     };
+                    observe_socket(socket_generation, "mobile_socket_connect_failed",
+                        serde_json::json!({"io_error_kind":format!("{:?}", err.kind()), "retry_delay_ms":u64::try_from(reconnect_delay.as_millis()).ok()}));
                     tokio::select! {
                         _ = shutdown_token.cancelled() => return ConnectOutcome::Shutdown,
                         changed = self.desired_state_rx.wait_for(|state| !state.is_enabled()) => {
@@ -1321,6 +1386,7 @@ impl RemoteControlWebsocket {
         &mut self,
         websocket_connection: WebSocketConnection,
         shutdown_token: CancellationToken,
+        socket_generation: Option<uuid::Uuid>,
     ) -> ConnectionEndReason {
         let connected_at = tokio::time::Instant::now();
         let (websocket_writer, websocket_reader) = websocket_connection.split();
@@ -1333,6 +1399,7 @@ impl RemoteControlWebsocket {
             websocket_writer,
             REMOTE_CONTROL_WEBSOCKET_PING_INTERVAL,
             shutdown_token.clone(),
+            socket_generation,
         ));
         join_set.spawn(Self::run_websocket_reader(
             self.client_tracker.clone(),
@@ -1340,6 +1407,7 @@ impl RemoteControlWebsocket {
             websocket_reader,
             REMOTE_CONTROL_WEBSOCKET_PONG_TIMEOUT,
             shutdown_token.clone(),
+            socket_generation,
         ));
 
         let mut desired_state_rx = self.desired_state_rx.clone();
@@ -1380,6 +1448,8 @@ impl RemoteControlWebsocket {
 
         Self::join_connection_workers(&mut join_set, REMOTE_CONTROL_CONNECTION_SHUTDOWN_TIMEOUT)
             .await;
+        observe_socket(socket_generation, "mobile_socket_ended",
+            serde_json::json!({"reason":format!("{connection_end_reason:?}")}));
         if matches!(
             connection_end_reason,
             ConnectionEndReason::AuthChanged | ConnectionEndReason::Disabled
@@ -1445,6 +1515,7 @@ impl RemoteControlWebsocket {
         >,
         ping_interval: std::time::Duration,
         shutdown_token: CancellationToken,
+        socket_generation: Option<uuid::Uuid>,
     ) {
         let result = Self::run_server_writer_inner(
             state,
@@ -1453,9 +1524,13 @@ impl RemoteControlWebsocket {
             websocket_writer,
             ping_interval,
             shutdown_token,
+            socket_generation,
         )
         .await;
         if let Err(err) = result {
+            observe_socket(socket_generation, "mobile_socket_writer_failed",
+                serde_json::json!({"io_error_kind":format!("{:?}", err.kind()),
+                    "websocket_error_class":err.get_ref().and_then(|e| e.downcast_ref::<tungstenite::Error>()).map(websocket_error_class)}));
             warn!(io_error_kind = ?err.kind(), "remote control websocket writer disconnected, err: {err}");
         } else {
             warn!("remote control websocket writer was stopped");
@@ -1474,20 +1549,14 @@ impl RemoteControlWebsocket {
         + Unpin,
         ping_interval: std::time::Duration,
         shutdown_token: CancellationToken,
+        socket_generation: Option<uuid::Uuid>,
     ) -> io::Result<()> {
         let mut pending = ServerWriterQueue::default();
         {
             let state = state.lock().await;
-            for ((client_id, stream_id), envelopes) in &state.outbound_buffer.buffer_by_stream {
+            for envelopes in state.outbound_buffer.buffer_by_stream.values() {
                 for envelope in envelopes {
-                    pending.push(
-                        (client_id.clone(), stream_id.clone()),
-                        envelope.payload.clone(),
-                        None,
-                        envelope.delivery_failure.clone(),
-                        Arc::clone(&envelope.replay_credit),
-                        envelope.observation.clone(),
-                    );
+                    pending.push(envelope);
                 }
             }
         }
@@ -1496,11 +1565,6 @@ impl RemoteControlWebsocket {
             tokio::time::interval_at(tokio::time::Instant::now() + ping_interval, ping_interval);
         ping_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut server_event_rx = server_event_rx.lock().await;
-        // Finish the same retained encoder before admitting newer output.
-        if server_event_rx.queued.is_some() || server_event_rx.encoding.is_some() {
-            pending.enqueue(&state, &mut server_event_rx, &mut ping_interval, &mut websocket_writer, &shutdown_token).await?;
-            if shutdown_token.is_cancelled() { return Ok(()); }
-        }
         // One additional logical envelope may compete with a saturated replay
         // backlog. Its existing per-envelope frame/byte bounds still apply;
         // another cannot enter until this envelope is ACKed or capacity returns.
@@ -1509,17 +1573,22 @@ impl RemoteControlWebsocket {
             // admit more original envelopes after the replay capacity is consumed.
             for _ in 0..REMOTE_CONTROL_REPLAY_BATCH_MESSAGES {
                 state.lock().await.outbound_buffer.reap_retired();
-                match server_event_rx.try_recv() {
-                    Ok(envelope) => {
-                        server_event_rx.queued = Some(envelope);
-                        pending.enqueue(&state, &mut server_event_rx, &mut ping_interval, &mut websocket_writer, &shutdown_token).await?;
-                        if shutdown_token.is_cancelled() { return Ok(()); }
+                // Finish the retained encoder before dequeuing newer logical
+                // output. It can be pending across multiple flush batches.
+                if server_event_rx.queued.is_none() && server_event_rx.encoding.is_none() {
+                    match server_event_rx.try_recv() {
+                        Ok(envelope) => server_event_rx.queued = Some(envelope),
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) if pending.is_empty() => {
+                            return Err(io::Error::new(ErrorKind::UnexpectedEof, "server event channel closed"));
+                        }
+                        Err(mpsc::error::TryRecvError::Disconnected) => break,
                     }
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) if pending.is_empty() => {
-                        return Err(io::Error::new(ErrorKind::UnexpectedEof, "server event channel closed"));
-                    }
-                    Err(mpsc::error::TryRecvError::Disconnected) => break,
+                }
+                pending.enqueue(&state, &mut server_event_rx, &mut ping_interval, &mut websocket_writer, &shutdown_token).await?;
+                if shutdown_token.is_cancelled() { return Ok(()); }
+                if server_event_rx.encoding.is_some() {
+                    break;
                 }
             }
 
@@ -1564,23 +1633,32 @@ impl RemoteControlWebsocket {
                 if frame.delivery_failure.as_ref().is_some_and(CancellationToken::is_cancelled) { continue; }
                 batch_messages += 1;
                 batch_bytes += frame.payload.len();
+                let feed_started = frame.observation.as_ref().map(|_| std::time::Instant::now());
                 writer_operation(&shutdown_token, websocket_writer.feed(tungstenite::Message::Text(frame.payload))).await?;
                 if shutdown_token.is_cancelled() { return Ok(()); }
                 if let Some(observation) = frame.observation {
-                    flushed_observations.push(observation);
+                    flushed_observations.push((observation, frame.buffered_at, feed_started.and_then(|at| u64::try_from(at.elapsed().as_nanos()).ok())));
                 }
                 if let Some(completion) = frame.completion {
                     completions.push((completion, frame.delivery_failure));
                 }
             }
+            let flush_started = (!flushed_observations.is_empty()).then(std::time::Instant::now);
             writer_operation(&shutdown_token, websocket_writer.flush()).await?;
             if shutdown_token.is_cancelled() { return Ok(()); }
-            for observation in flushed_observations {
-                observation.record("mobile_transport_flushed", serde_json::json!({"boundary":"relay_socket_flush_not_phone_receipt"}));
+            let flush_wait_ns = flush_started.and_then(|at| u64::try_from(at.elapsed().as_nanos()).ok());
+            for (observation, buffered_at, feed_wait_ns) in flushed_observations {
+                observation.record("mobile_transport_flushed", serde_json::json!({
+                    "boundary":"relay_socket_flush_not_phone_receipt", "socket_generation":socket_generation,
+                    "feed_wait_ns":feed_wait_ns, "flush_wait_ns":flush_wait_ns,
+                    "buffer_age_ns":u64::try_from(buffered_at.elapsed().as_nanos()).ok(),
+                }));
             }
             for (completion, failure) in completions {
-                if !failure.as_ref().is_some_and(CancellationToken::is_cancelled) {
-                    let _ = completion.send(std::time::Instant::now());
+                if !failure.as_ref().is_some_and(CancellationToken::is_cancelled)
+                    && let Some(sender) = completion.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+                {
+                    let _ = sender.send(std::time::Instant::now());
                 }
             }
             if heartbeat_due {
@@ -1595,6 +1673,7 @@ impl RemoteControlWebsocket {
         websocket_reader: SplitStream<WebSocketConnection>,
         pong_timeout: std::time::Duration,
         shutdown_token: CancellationToken,
+        socket_generation: Option<uuid::Uuid>,
     ) {
         let result = Self::run_websocket_reader_inner(
             client_tracker,
@@ -1602,9 +1681,13 @@ impl RemoteControlWebsocket {
             websocket_reader,
             pong_timeout,
             shutdown_token,
+            socket_generation,
         )
         .await;
         if let Err(err) = result {
+            observe_socket(socket_generation, "mobile_socket_reader_failed",
+                serde_json::json!({"io_error_kind":format!("{:?}", err.kind()),
+                    "websocket_error_class":err.get_ref().and_then(|e| e.downcast_ref::<tungstenite::Error>()).map(websocket_error_class)}));
             warn!(io_error_kind = ?err.kind(), "remote control websocket reader disconnected, err: {err}");
         } else {
             warn!("remote control websocket reader was stopped");
@@ -1617,6 +1700,7 @@ impl RemoteControlWebsocket {
         mut websocket_reader: SplitStream<WebSocketConnection>,
         pong_timeout: std::time::Duration,
         shutdown_token: CancellationToken,
+        socket_generation: Option<uuid::Uuid>,
     ) -> io::Result<()> {
         let (ingress_tx, ingress_rx) = mpsc::channel(crate::transport::INGRESS_CAPACITY);
         let mut ingress_worker = AbortOnDropHandle::new(tokio::spawn(run_client_ingress(
@@ -1701,17 +1785,21 @@ impl RemoteControlWebsocket {
                     warn!("dropping unsupported binary remote-control websocket message");
                     continue;
                 }
-                Ok(tungstenite::Message::Close(_)) => {
+                Ok(tungstenite::Message::Close(frame)) => {
+                    observe_socket(socket_generation, "mobile_socket_peer_close",
+                        serde_json::json!({"close_code":frame.map(|frame| u16::from(frame.code))}));
                     return Err(io::Error::new(
                         ErrorKind::ConnectionAborted,
                         "websocket disconnected",
                     ));
                 }
                 Err(err) => {
-                    return Err(io::Error::new(
-                        ErrorKind::InvalidData,
-                        format!("failed to read from websocket: {err}"),
-                    ));
+                    let kind = match &err {
+                        tungstenite::Error::Io(error) => error.kind(),
+                        tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => ErrorKind::ConnectionAborted,
+                        _ => ErrorKind::InvalidData,
+                    };
+                    return Err(io::Error::new(kind, err));
                 }
             };
 
@@ -1724,21 +1812,18 @@ impl RemoteControlWebsocket {
             if client_message_key.as_ref().is_some_and(|key| in_flight_chunks.contains_key(key)) {
                 continue;
             }
-            if matches!(&client_envelope.event, ClientEvent::ClientClosed) {
+            if matches!(&client_envelope.event, ClientEvent::ClientClosed)
+                && let Some(stream_id) = client_envelope.stream_id.as_ref()
+            {
                 // This boundary is in wire order, not admission-completion order:
                 // later chunks can already be assembling while close delivery waits.
+                // A legacy close cannot name any of these explicit stream prefixes.
                 let client_id = &client_envelope.client_id;
-                let stream_id = client_envelope.stream_id.as_ref();
                 let mut state = state.lock().await;
-                if let Some(stream_id) = stream_id {
-                    state.client_segment_reassembler.invalidate_stream(client_id, stream_id);
-                    state.invalidate_client_message_stream(client_id, stream_id);
-                } else {
-                    state.client_segment_reassembler.invalidate_client(client_id);
-                    state.invalidate_client_message_client(client_id);
-                }
+                state.client_segment_reassembler.invalidate_stream(client_id, stream_id);
+                state.invalidate_client_message_stream(client_id, stream_id);
                 in_flight_chunks.retain(|((client, stream), _), _| {
-                    client != client_id || stream_id.is_some_and(|closed| stream.as_ref() != Some(closed))
+                    client != client_id || stream.as_ref() != Some(stream_id)
                 });
             }
             let observation = state.lock().await.observe_client_message(client_envelope, wire_size_bytes);
@@ -1760,6 +1845,14 @@ impl RemoteControlWebsocket {
                         }
                     };
                     ClientEnvelope { event: ClientEvent::ClientMessage { message }, ..*envelope }
+                }
+                ClientSegmentObservation::RestartRequired(envelope) => {
+                    // No complete JSON-RPC ID is available. Expose the typed
+                    // recovery boundary without sending an invented wire reply
+                    // or committing the incomplete message's cursor.
+                    observe_socket(socket_generation, "mobile_segment_restart_required",
+                        serde_json::json!({"reason":"missingSegmentPrefix", "seq_id":envelope.seq_id}));
+                    continue;
                 }
                 ClientSegmentObservation::Pending | ClientSegmentObservation::Dropped => continue,
             };
@@ -1927,6 +2020,7 @@ pub(super) async fn connect_remote_control_websocket(
     current_enrollment: &CurrentRemoteControlEnrollment,
     connect_options: RemoteControlConnectOptions<'_>,
     status_publisher: &RemoteControlStatusPublisher,
+    socket_generation: Option<uuid::Uuid>,
 ) -> io::Result<(
     WebSocketConnection,
     tungstenite::http::Response<()>,
@@ -2003,6 +2097,21 @@ pub(super) async fn connect_remote_control_websocket(
             Ok((websocket_stream, response.map(|_| ()), enrollment))
         }
         Err(err) => {
+            observe_socket(
+                socket_generation,
+                "mobile_socket_handshake_failed",
+                serde_json::json!({
+                    "websocket_error_class": websocket_error_class(&err),
+                    "http_status": match &err {
+                        tungstenite::Error::Http(response) => Some(response.status().as_u16()),
+                        _ => None,
+                    },
+                    "io_error_kind": match &err {
+                        tungstenite::Error::Io(error) => Some(format!("{:?}", error.kind())),
+                        _ => None,
+                    },
+                }),
+            );
             if let tungstenite::Error::Http(response) = &err {
                 current_enrollment.record_retry_after(response.status(), response.headers());
             }

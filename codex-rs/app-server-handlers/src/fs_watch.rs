@@ -1,5 +1,7 @@
 use crate::connection_rpc_gate::ConnectionRpcGate;
+use crate::error_code::FS_WATCH_CAPACITY_ERROR_CODE;
 use crate::error_code::internal_error;
+use crate::error_code::invalid_params;
 use crate::error_code::invalid_request;
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingMessageSender;
@@ -30,6 +32,11 @@ use tracing::warn;
 const FS_CHANGED_NOTIFICATION_DEBOUNCE: Duration = Duration::from_millis(200);
 const FS_WATCH_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 const FS_WATCH_INITIALIZATION_COOLDOWN: Duration = Duration::from_secs(1);
+// Both pending and live watches count. Bound retained metadata as well as tasks.
+const FS_WATCHES_PER_CONNECTION: usize = 128;
+const FS_WATCHES_PER_SERVER: usize = 1024;
+const FS_WATCH_ID_MAX_BYTES: usize = 1024;
+const FS_WATCH_PATH_MAX_BYTES: usize = 128 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct FsWatchManager {
@@ -149,6 +156,11 @@ impl FsWatchManager {
         rpc_gate: &ConnectionRpcGate,
     ) -> Result<FsWatchResponse, JSONRPCErrorError> {
         let watch_id = params.watch_id;
+        if watch_id.len() > FS_WATCH_ID_MAX_BYTES
+            || params.path.as_os_str().len() > FS_WATCH_PATH_MAX_BYTES
+        {
+            return Err(invalid_params("filesystem watch ID or path exceeds its size limit"));
+        }
         let watch_key = WatchKey {
             connection_id,
             watch_id: watch_id.clone(),
@@ -158,19 +170,41 @@ impl FsWatchManager {
         let reservation_id = {
             let mut state = self.state.lock().await;
             let reservation_id = state.next_reservation_id;
-            let reservation =
-                rpc_gate.try_commit(|| match state.entries.entry(watch_key.clone()) {
+            let reservation = rpc_gate.try_commit(|| {
+                let limit = if state.entries.len() >= FS_WATCHES_PER_SERVER {
+                    Some("server")
+                } else if state.entries.keys()
+                    .filter(|key| key.connection_id == connection_id)
+                    .count() >= FS_WATCHES_PER_CONNECTION
+                {
+                    Some("connection")
+                } else {
+                    None
+                };
+                match state.entries.entry(watch_key.clone()) {
                     Entry::Occupied(_) => Err(invalid_request(format!(
                         "watchId already exists: {watch_id}"
                     ))),
                     Entry::Vacant(entry) => {
+                        if let Some(scope) = limit {
+                            return Err(JSONRPCErrorError {
+                                code: FS_WATCH_CAPACITY_ERROR_CODE,
+                                message: "filesystem watch capacity reached; unwatch an existing subscription before retrying".into(),
+                                data: Some(serde_json::json!({
+                                    "reason": "fsWatchCapacity",
+                                    "scope": scope,
+                                    "retryable": false,
+                                })),
+                            });
+                        }
                         entry.insert(WatchEntry::Pending {
                             reservation_id,
                             cancellation: cancellation.clone(),
                         });
                         Ok(reservation_id)
                     }
-                });
+                }
+            });
             match reservation {
                 None => return Err(invalid_request("connection is closed")),
                 Some(Err(err)) => return Err(err),

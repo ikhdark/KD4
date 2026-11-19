@@ -85,6 +85,9 @@ pub(crate) struct ValidationTurnContext {
     pub(crate) budget: Arc<codex_command_analysis::command_preflight::FullSuiteBudget>,
 }
 
+/// This turn's bound attempt has sealed an authored receipt in the task store.
+pub(crate) struct AuthoredReceiptSealed;
+
 /// Shared typed-task persistence and identity index for one root agent tree.
 ///
 /// The coordinator is cloned with [`super::AgentControl`], so every child resolves the same

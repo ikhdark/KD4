@@ -47,18 +47,37 @@ pub(crate) enum ResponsesStreamRequest {
     RemoteCompactionV2,
 }
 
+/// The interactive wait fence belongs to the operation, not an individual
+/// stream loop. Compaction can change models or formats within one operation.
+#[derive(Debug, Default)]
+pub(crate) struct ResponsesRecoveryWait(Option<tokio::time::Instant>);
+
+impl ResponsesRecoveryWait {
+    fn interactive_deadline(
+        &mut self,
+        session_source: &SessionSource,
+    ) -> Option<tokio::time::Instant> {
+        if !is_interactive_recovery(session_source) {
+            return None;
+        }
+        Some(*self.0.get_or_insert_with(|| {
+            tokio::time::Instant::now() + INTERACTIVE_RETRY_WAIT_BUDGET
+        }))
+    }
+}
+
 /// Retry bookkeeping for one Responses stream loop.
 ///
 /// `retries` tracks the bounded generation replay budget. Pre-dispatch connection
 /// failures are tracked separately; interactive recovery shares one wait budget.
 #[derive(Debug)]
-pub(crate) struct ResponsesStreamRetryState {
+pub(crate) struct ResponsesStreamRetryState<'a> {
     configured_retries: Option<u64>,
     attempts_started: u64,
     retries: u64,
     connection_retries: u64,
     connection_retry_delay: Duration,
-    wait_deadline: Option<tokio::time::Instant>,
+    recovery_wait: &'a mut ResponsesRecoveryWait,
     account_wait_started: bool,
     /// Whether this request already spent its one WebSocket reconnect on a
     /// close that invited another connection. It also consumes `retries`:
@@ -67,25 +86,19 @@ pub(crate) struct ResponsesStreamRetryState {
     repaired_explicit_rejection: bool,
 }
 
-impl Default for ResponsesStreamRetryState {
-    fn default() -> Self {
+impl<'a> ResponsesStreamRetryState<'a> {
+    pub(crate) fn new(max_retries: u64, recovery_wait: &'a mut ResponsesRecoveryWait) -> Self {
         Self {
-            configured_retries: None,
+            configured_retries: Some(max_retries),
             attempts_started: 0,
             retries: 0,
             connection_retries: 0,
             connection_retry_delay: INITIAL_CONNECTION_RETRY_DELAY,
-            wait_deadline: None,
+            recovery_wait,
             account_wait_started: false,
             reconnected_after_close: false,
             repaired_explicit_rejection: false,
         }
-    }
-}
-
-impl ResponsesStreamRetryState {
-    pub(crate) fn new(max_retries: u64) -> Self {
-        Self { configured_retries: Some(max_retries), ..Self::default() }
     }
 
     pub(crate) fn begin_attempt(&mut self, turn: &TurnContext, request: ResponsesStreamRequest) {
@@ -103,8 +116,8 @@ impl ResponsesStreamRetryState {
             serde_json::json!({"kind": "unlimited", "remaining_ms": null})
         } else {
             serde_json::json!({"kind": "finite", "limit_ms": INTERACTIVE_RETRY_WAIT_BUDGET.as_millis(),
-                "state": if self.wait_deadline.is_some() { "running" } else { "not_started" },
-                "remaining_ms": self.wait_deadline.map(|deadline|
+                "state": if self.recovery_wait.0.is_some() { "running" } else { "not_started" },
+                "remaining_ms": self.recovery_wait.0.map(|deadline|
                     deadline.saturating_duration_since(tokio::time::Instant::now()).as_millis())})
         };
         serde_json::json!({
@@ -142,12 +155,7 @@ impl ResponsesStreamRetryState {
         &mut self,
         session_source: &SessionSource,
     ) -> Option<tokio::time::Instant> {
-        if !is_interactive_recovery(session_source) {
-            return None;
-        }
-        Some(*self.wait_deadline.get_or_insert_with(|| {
-            tokio::time::Instant::now() + INTERACTIVE_RETRY_WAIT_BUDGET
-        }))
+        self.recovery_wait.interactive_deadline(session_source)
     }
 
     /// Check before another attempt, without starting a timer for the initial request.
@@ -158,7 +166,7 @@ impl ResponsesStreamRetryState {
         if cancellation_token.is_cancelled() {
             return Err(CodexErr::TurnAborted);
         }
-        check_retry_wait_budget(tokio::time::Instant::now(), self.wait_deadline, false)
+        check_retry_wait_budget(tokio::time::Instant::now(), self.recovery_wait.0, false)
     }
 }
 
@@ -166,7 +174,7 @@ impl ResponsesStreamRetryState {
 /// retry the request loop.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_retryable_response_stream_error(
-    retry_state: &mut ResponsesStreamRetryState,
+    retry_state: &mut ResponsesStreamRetryState<'_>,
     max_retries: u64,
     err: CodexErr,
     client_session: &mut ModelClientSession,
@@ -439,7 +447,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
 /// ordinary fallback path. A close code that rejects the request (policy,
 /// protocol, payload) is never reconnected, since a new socket would only repeat
 /// the rejection.
-fn should_reconnect_after_close(err: &CodexErr, state: &ResponsesStreamRetryState) -> bool {
+fn should_reconnect_after_close(err: &CodexErr, state: &ResponsesStreamRetryState<'_>) -> bool {
     !state.reconnected_after_close
         && matches!(err, CodexErr::ResponseStreamFailed(failed) if failed.reconnectable_close)
 }
@@ -499,7 +507,7 @@ pub(crate) enum AccountChangeWait<'a> {
 /// fast for their callers.
 pub(crate) async fn wait_for_account_change(
     reason: AccountChangeWait<'_>,
-    retry_state: &mut ResponsesStreamRetryState,
+    retry_state: &mut ResponsesStreamRetryState<'_>,
     sess: &Session,
     turn_context: &TurnContext,
     cancellation_token: &CancellationToken,
@@ -715,13 +723,16 @@ pub(crate) async fn wait_for_response_retry_after(
     error: &CodexErr,
     sess: &Session,
     turn_context: &TurnContext,
+    recovery_wait: &mut ResponsesRecoveryWait,
     cancellation_token: &CancellationToken,
 ) -> Result<(), CodexErr> {
+    if cancellation_token.is_cancelled() {
+        return Err(CodexErr::TurnAborted);
+    }
+    let wait_deadline = recovery_wait.interactive_deadline(&turn_context.session_source);
     let Some(advice) = error.retry_after() else {
-        return Ok(());
+        return check_retry_wait_budget(tokio::time::Instant::now(), wait_deadline, false);
     };
-    let mut retry_state = ResponsesStreamRetryState::default();
-    let wait_deadline = retry_state.interactive_wait_deadline(&turn_context.session_source);
     wait_for_response_retry_deadline(
         advice.deadline(),
         wait_deadline,

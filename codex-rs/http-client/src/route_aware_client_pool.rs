@@ -658,6 +658,11 @@ impl RouteAwareClientPool {
                     } else {
                         client.log_error(&request_method, &request_url, &error);
                     }
+                    if redirects == 0 && error.is_connect() {
+                        crate::transport::record_timing(|timing| {
+                            timing.initial_request_not_sent = true;
+                        });
+                    }
                     return Err(error.into());
                 }
             };

@@ -559,11 +559,25 @@ impl LocalAgentTaskStore {
         };
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         ensure_task_workspace_tx(&mut transaction, &repository).await?;
+        let judged_targets = judged_dependency_targets(&assignment);
+        for &target in judged_targets {
+            // The evaluation handoff can only expose a same-root result.
+            let target = load_assignment_tx(&mut transaction, target).await?;
+            if target.root_session_id != assignment.root_session_id {
+                transaction.rollback().await?;
+                return Err(StoreError::RootSessionMismatch {
+                    expected: assignment.root_session_id.clone(),
+                    requested: target.root_session_id,
+                });
+            }
+        }
         let dependency_admissions = match validate_dependencies_tx(
             &mut transaction,
             assignment.assignment_id,
             Some(&assignment.repository_id),
             &assignment.dependencies,
+            judged_targets,
+            &mut false,
         )
         .await
         {
@@ -693,6 +707,7 @@ impl LocalAgentTaskStore {
         Ok(AdmittedAssignment {
             assignment,
             attempt,
+            dependency_admissions,
             overlaps,
             integration_plan,
         })
@@ -985,7 +1000,7 @@ impl LocalAgentTaskStore {
         let dependency_blockers = dependency_authority_blockers_tx(
             &mut transaction, &assignment, &dependency_admissions,
         ).await?;
-        let criterion_assessments = source_inspection::assess_with_calls_tx(
+        let (criterion_assessments, _) = source_inspection::assess_with_calls_tx(
             &mut transaction, &assignment, &current_attempt,
             receipt.as_ref().map_or(&[], |receipt| receipt.criterion_results.as_slice()),
             receipt.as_ref().map_or(&[], |receipt| receipt.validation_call_ids.as_slice()), false,
@@ -1499,10 +1514,13 @@ LIMIT 1
                 return Err(StoreError::ValidationCallImmutable(call.call_id));
             }
             let assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
-            if !matches!(
-                assignment.role,
-                AgentRole::Worker | AgentRole::Verifier | AgentRole::Integrator
-            ) {
+            // Native read proof is a completed acquisition, not authorization to run commands.
+            if !completed_inspection
+                && !matches!(
+                    assignment.role,
+                    AgentRole::Worker | AgentRole::Verifier | AgentRole::Integrator
+                )
+            {
                 return Err(StoreError::InvalidAssignment(format!(
                     "{:?} assignments are not authorized to run validation",
                     assignment.role
@@ -4607,17 +4625,22 @@ async fn validate_dependencies_tx(
     candidate_id: AssignmentId,
     repository_id: Option<&str>,
     dependencies: &[AssignmentId],
+    judged_targets: &[AssignmentId],
+    observes_live_source: &mut bool,
 ) -> StoreResult<Vec<crate::DependencyAdmission>> {
     // Reuse adjacency for a single-prerequisite closure, never authority.
     // Multi-prerequisite roots retain the original per-direct-check lifetime.
     let mut cached_dependencies = (dependencies.len() == 1).then(HashMap::new);
     let admitted = validate_direct_dependencies_tx(
-        transaction, candidate_id, repository_id, dependencies, &[], cached_dependencies.as_mut(),
+        transaction, candidate_id, repository_id, dependencies, judged_targets, cached_dependencies.as_mut(),
+        observes_live_source,
     ).await?;
     // Follow prerequisite provenance iteratively: a sealed intermediate result
     // cannot hide a superseded input. One database snapshot, no recursive tasks
     // or cross-transaction freshness cache; shared DAG nodes are visited once.
-    let mut pending = dependencies.to_vec();
+    // A judgment edge exposes the artifact, not acceptance of its inputs.
+    let mut pending = dependencies.iter().copied()
+        .filter(|dependency| !judged_targets.contains(dependency)).collect::<Vec<_>>();
     let mut visited = HashSet::new();
     while let Some(dependency_id) = pending.pop() {
         if !visited.insert(dependency_id) {
@@ -4628,6 +4651,7 @@ async fn validate_dependencies_tx(
         let current = validate_direct_dependencies_tx(
             transaction, dependency_id, Some(&dependency.repository_id), &dependency.dependencies,
             judged_targets, cached_dependencies.as_mut(),
+            observes_live_source,
         ).await?;
         let captured = load_dependency_admissions_tx(transaction, dependency_id).await?;
         let blockers = compare_dependency_admissions(&dependency.dependencies, &captured, &current);
@@ -4689,6 +4713,15 @@ async fn dependency_authority_blockers_tx(
     assignment: &Assignment,
     captured: &[crate::DependencyAdmission],
 ) -> StoreResult<Vec<DependencyBlocker>> {
+    observe_dependency_authority_tx(transaction, assignment, captured, &mut false).await
+}
+
+async fn observe_dependency_authority_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    assignment: &Assignment,
+    captured: &[crate::DependencyAdmission],
+    observes_live_source: &mut bool,
+) -> StoreResult<Vec<DependencyBlocker>> {
     // A review/verification target is an immutable object being judged, not
     // an accepted input. Its own negative verdict must not prevent the judge
     // from sealing a report. A new target attempt still invalidates that pin.
@@ -4696,7 +4729,8 @@ async fn dependency_authority_blockers_tx(
     let prerequisites = assignment.dependencies.iter().copied()
         .filter(|dependency| !judged_targets.contains(dependency)).collect::<Vec<_>>();
     match validate_dependencies_tx(
-        transaction, assignment.assignment_id, Some(&assignment.repository_id), &prerequisites,
+        transaction, assignment.assignment_id, Some(&assignment.repository_id), &prerequisites, &[],
+        observes_live_source,
     ).await {
         Ok(mut current) => {
             let mut blockers = Vec::new();
@@ -4732,6 +4766,7 @@ async fn validate_direct_dependencies_tx(
     dependencies: &[AssignmentId],
     judged_targets: &[AssignmentId],
     cached_dependencies: Option<&mut HashMap<AssignmentId, Vec<AssignmentId>>>,
+    observes_live_source: &mut bool,
 ) -> StoreResult<Vec<crate::DependencyAdmission>> {
     let mut blockers = Vec::new();
     let mut admitted = Vec::new();
@@ -4824,10 +4859,11 @@ async fn validate_direct_dependencies_tx(
             });
             continue;
         }
-        let assessments = source_inspection::assess_tx(
+        let (assessments, observed) = source_inspection::assess_tx_with_freshness(
             transaction, &dependency_assignment, &dependency_attempt,
             &receipt.criterion_results, &receipt.validation_call_ids, false,
         ).await?;
+        *observes_live_source |= observed;
         if let Some(assessment) = assessments.iter().find(|assessment| !assessment.satisfied) {
             blockers.push(DependencyBlocker {
                 assignment_id: *dependency, state: DependencyState::Blocked,
@@ -5427,63 +5463,57 @@ async fn selective_admission_tx(
             overlaps.benign_read_overlap_count =
                 overlaps.benign_read_overlap_count.saturating_add(1);
         }
-        let scope_overlap = existing.read_scope.iter().chain(&existing.write_scope).any(|existing_scope| {
-            assignment.read_scope.iter().enumerate().any(|(index, scope)|
-                scopes_overlap_observed(existing_scope, scope, scope_case.read(index)))
-                || assignment.write_scope.iter().enumerate().any(|(index, scope)|
-                    scopes_overlap_observed(existing_scope, scope, scope_case.write(index)))
+        // Only a candidate that writes can conflict with a writer. A read-only
+        // candidate's read overlap is measured but does not produce a warning.
+        if existing.write_scope.is_empty() || assignment.write_scope.is_empty() {
+            continue;
+        }
+        let intersecting_scopes = existing.write_scope.iter().find_map(|existing_scope| {
+            assignment
+                .write_scope
+                .iter()
+                .enumerate()
+                .find(|(index, scope)| {
+                    scopes_overlap_observed(existing_scope, scope, scope_case.write(*index))
+                })
+                .map(|(_, scope)| (existing_scope, scope))
         });
-        let amendment: Option<crate::AttemptAmendment> = row
-            .get::<Option<String>, _>("amendment_json")
-            .map(|value| decode(&value)).transpose()?.flatten();
-        let contract = existing.effective_contract(amendment.as_ref());
-        let candidate = assignment.effective_contract(None);
-        let normalized = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-        let objective_matches = normalized(&contract.objective) == normalized(&candidate.objective);
-        let deliverable_overlap = contract.acceptance_criteria.iter().any(|left|
-            candidate.acceptance_criteria.iter().any(|right| normalized(&left.text) == normalized(&right.text)))
-            || existing.required_evidence.iter().any(|left|
-                assignment.required_evidence.iter().any(|right| normalized(left) == normalized(right)));
-        let contract_overlap = existing.contract_claims.iter().any(|claim| assignment.contract_claims.contains(claim));
-        if objective_matches || deliverable_overlap || contract_overlap || scope_overlap {
-            let independent = assignment.independent_verification || existing.independent_verification
-                || [assignment.relation.as_ref(), existing.relation.as_ref()].into_iter().flatten()
-                    .any(|relation| matches!(relation.kind, crate::RelationKind::Review | crate::RelationKind::Verification));
+        let contract_overlap = existing.contract_claims.iter()
+            .any(|claim| assignment.contract_claims.contains(claim));
+        if intersecting_scopes.is_some() || contract_overlap {
+            conflicting_writer_count = conflicting_writer_count.saturating_add(1);
+        }
+        // Relative paths can still require integration across linked worktrees,
+        // but they are not competing live writes to the same checkout.
+        if let Some((existing_scope, requested_scope)) = intersecting_scopes
+            && existing.workspace_id == assignment.workspace_id
+        {
+            let amendment: Option<crate::AttemptAmendment> = row
+                .get::<Option<String>, _>("amendment_json")
+                .map(|value| decode(&value)).transpose()?.flatten();
+            let contract = existing.effective_contract(amendment.as_ref());
+            let candidate = assignment.effective_contract(None);
+            let normalized = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+            let objective_matches = normalized(&contract.objective) == normalized(&candidate.objective);
+            let deliverable_overlap = contract.acceptance_criteria.iter().any(|left|
+                candidate.acceptance_criteria.iter().any(|right| normalized(&left.text) == normalized(&right.text)))
+                || existing.required_evidence.iter().any(|left|
+                    assignment.required_evidence.iter().any(|right| normalized(left) == normalized(right)));
             overlaps.warnings.push(crate::TaskOverlapWarning {
                 assignment_id: existing.assignment_id,
                 attempt_id: AttemptId::parse(&row.get::<String, _>("attempt_id"))?,
                 task_name: row.get("task_name"),
                 agent_path: row.get("agent_path"),
                 thread_id: row.get("thread_id"),
-                kind: if independent { crate::TaskOverlapKind::IndependentVerification }
-                    else if objective_matches && deliverable_overlap || contract_overlap {
-                        crate::TaskOverlapKind::PotentialDuplicate
-                    } else { crate::TaskOverlapKind::RelatedWork },
-                objective_matches, deliverable_overlap, contract_overlap, scope_overlap,
+                kind: crate::TaskOverlapKind::WriteScopeConflict,
+                objective_matches,
+                deliverable_overlap,
+                contract_overlap,
+                scope_overlap: true,
+                existing_write_scope: existing_scope.clone(),
+                requested_write_scope: requested_scope.clone(),
+                next_action: "Run in sequence, split the declared write scopes, or have the root integrate the changes.",
             });
-        }
-        // Only a candidate that writes can conflict with a writer. A read-only
-        // candidate's contract claims stay advisory, like its read overlap.
-        if existing.write_scope.is_empty() || assignment.write_scope.is_empty() {
-            continue;
-        }
-        let write_scope_overlaps = existing.write_scope.iter().any(|existing_scope| {
-            assignment
-                .write_scope
-                .iter()
-                .enumerate()
-                .any(|(index, scope)| {
-                    scopes_overlap_observed(existing_scope, scope, scope_case.write(index))
-                })
-        });
-        let contract_overlaps = existing.contract_claims.iter().any(|existing_contract| {
-            assignment
-                .contract_claims
-                .iter()
-                .any(|contract| contract == existing_contract)
-        });
-        if write_scope_overlaps || contract_overlaps {
-            conflicting_writer_count = conflicting_writer_count.saturating_add(1);
         }
     }
 

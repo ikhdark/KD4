@@ -16,6 +16,7 @@ use crate::hook_runtime::run_post_compact_hook_gate;
 use crate::hook_runtime::run_pre_compact_hook_gate;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CompactionTurnMetadata;
+use crate::responses_retry::ResponsesRecoveryWait;
 use crate::responses_retry::ResponsesStreamRequest;
 use crate::responses_retry::ResponsesStreamRetryState;
 use crate::responses_retry::handle_retryable_response_stream_error;
@@ -86,6 +87,7 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
     reason: CompactionReason,
     phase: CompactionPhase,
     emit_error_event: bool,
+    recovery_wait: &mut ResponsesRecoveryWait,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let compaction_metadata = CompactionTurnMetadata::new(
@@ -102,6 +104,7 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
         initial_context_injection,
         compaction_metadata,
         emit_error_event,
+        recovery_wait,
         cancellation_token,
     )
     .await
@@ -131,6 +134,7 @@ pub(crate) async fn run_remote_compact_task(
     );
     let world_state = Arc::new(sess.build_world_state_for_step(step_context.as_ref()).await);
     let initial_context_injection = InitialContextInjection::AtStart(world_state);
+    let mut recovery_wait = ResponsesRecoveryWait::default();
     let result = run_remote_compact_task_inner(
         &sess,
         &step_context,
@@ -141,6 +145,7 @@ pub(crate) async fn run_remote_compact_task(
         // A recoverable rejection must not mark a continuing manual turn failed.
         /*emit_error_event*/
         false,
+        &mut recovery_wait,
         cancellation_token,
     )
     .await;
@@ -163,6 +168,7 @@ pub(crate) async fn run_remote_compact_task(
         &error,
         sess.as_ref(),
         turn_context.as_ref(),
+        &mut recovery_wait,
         cancellation_token,
     )
     .await?;
@@ -197,6 +203,7 @@ pub(crate) async fn run_remote_compact_task(
         turn_context,
         input,
         initial_context_injection,
+        &mut recovery_wait,
         cancellation_token,
     )
     .await
@@ -213,6 +220,7 @@ async fn run_remote_compact_task_inner(
     initial_context_injection: InitialContextInjection,
     compaction_metadata: CompactionTurnMetadata,
     emit_error_event: bool,
+    recovery_wait: &mut ResponsesRecoveryWait,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
@@ -258,6 +266,7 @@ async fn run_remote_compact_task_inner(
         compaction_metadata,
         &mut analytics_details,
         &mut context_compaction_item,
+        recovery_wait,
         cancellation_token,
     )
     .await;
@@ -304,6 +313,7 @@ async fn run_remote_compact_task_inner_impl(
     compaction_metadata: CompactionTurnMetadata,
     analytics_details: &mut CompactionAnalyticsDetails,
     compaction_item: &mut ContextCompactionItem,
+    recovery_wait: &mut ResponsesRecoveryWait,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
@@ -316,6 +326,7 @@ async fn run_remote_compact_task_inner_impl(
         client_session.as_deref_mut(),
         compaction_metadata,
         analytics_details,
+        recovery_wait,
         cancellation_token,
     )
     .await;
@@ -332,6 +343,7 @@ async fn run_remote_compact_task_inner_impl(
                 &error,
                 sess.as_ref(),
                 turn_context.as_ref(),
+                recovery_wait,
                 cancellation_token,
             )
             .await?;
@@ -343,6 +355,7 @@ async fn run_remote_compact_task_inner_impl(
                 client_session.as_deref_mut(),
                 compaction_metadata,
                 analytics_details,
+                recovery_wait,
                 cancellation_token,
             )
             .await;
@@ -442,6 +455,7 @@ async fn run_remote_compaction_request_v2(
     client_session: &mut ModelClientSession,
     prompt: &Prompt,
     responses_metadata: &CodexResponsesMetadata,
+    recovery_wait: &mut ResponsesRecoveryWait,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<RemoteCompactionV2Output> {
     client_session.set_turn_timing(Arc::clone(&turn_context.turn_timing_state));
@@ -451,7 +465,7 @@ async fn run_remote_compaction_request_v2(
         .info()
         .stream_max_retries()
         .min(MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES);
-    let mut retry_state = ResponsesStreamRetryState::new(max_retries);
+    let mut retry_state = ResponsesStreamRetryState::new(max_retries, recovery_wait);
     turn_context.turn_timing_state.begin_compaction_generation();
     loop {
         retry_state.check_retry_budget(cancellation_token)?;

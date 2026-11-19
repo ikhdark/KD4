@@ -53,11 +53,23 @@ pub(super) async fn assess_tx(
     cited_call_ids: &[String],
     allow_uncited: bool,
 ) -> StoreResult<Vec<CriterionAssessment>> {
+    assess_tx_with_freshness(transaction, assignment, attempt, results, cited_call_ids, allow_uncited)
+        .await.map(|(assessments, _)| assessments)
+}
+
+pub(super) async fn assess_tx_with_freshness(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    assignment: &Assignment,
+    attempt: &Attempt,
+    results: &[CriterionResult],
+    cited_call_ids: &[String],
+    allow_uncited: bool,
+) -> StoreResult<(Vec<CriterionAssessment>, bool)> {
     if !effective_criteria(assignment, attempt.amendment.as_ref()).iter()
         .any(|criterion| criterion.evidence_policy.as_ref()
             .is_some_and(|policy| policy.kind != CriterionEvidenceRequirement::ReportOnly))
     {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     }
     let calls = sqlx::query_scalar::<_, String>(
         "SELECT body_json FROM validation_calls WHERE attempt_id = ? ORDER BY julianday(json_extract(recorded_at, '$')), call_id",
@@ -77,12 +89,12 @@ pub(super) async fn assess_with_calls_tx(
     cited_call_ids: &[String],
     allow_uncited: bool,
     calls: &[ValidationCall],
-) -> StoreResult<Vec<CriterionAssessment>> {
+) -> StoreResult<(Vec<CriterionAssessment>, bool)> {
     let criteria = effective_criteria(assignment, attempt.amendment.as_ref()).iter()
         .filter(|criterion| criterion.evidence_policy.as_ref()
             .is_some_and(|policy| policy.kind != CriterionEvidenceRequirement::ReportOnly))
         .collect::<Vec<_>>();
-    if criteria.is_empty() { return Ok(Vec::new()); }
+    if criteria.is_empty() { return Ok((Vec::new(), false)); }
     let root = if criteria.iter().any(|criterion| criterion.evidence_policy.as_ref()
         .is_some_and(|policy| policy.kind == CriterionEvidenceRequirement::SourceInspection)) {
         sqlx::query_scalar::<_, String>(
@@ -90,6 +102,7 @@ pub(super) async fn assess_with_calls_tx(
         ).bind(assignment.assignment_id.to_string()).fetch_optional(&mut **transaction).await?
     } else { None };
     let mut fingerprints = BTreeMap::new();
+    let mut observes_live_source = false;
     let mut assessments = Vec::with_capacity(criteria.len());
     for criterion in criteria {
         let policy = criterion.evidence_policy.as_ref().ok_or_else(||
@@ -166,7 +179,10 @@ pub(super) async fn assess_with_calls_tx(
             } else {
                 if !fingerprints.contains_key(&inspection.path) {
                     let fingerprint = match &root {
-                        Some(root) => current_fingerprint(PathBuf::from(root), inspection.path.clone()).await,
+                        Some(root) => {
+                            observes_live_source = true;
+                            current_fingerprint(PathBuf::from(root), inspection.path.clone()).await
+                        }
                         None => None,
                     };
                     fingerprints.insert(inspection.path.clone(), fingerprint);
@@ -191,7 +207,7 @@ pub(super) async fn assess_with_calls_tx(
         };
         assessments.push(CriterionAssessment { criterion_id: criterion.id.clone(), satisfied, reason });
     }
-    Ok(assessments)
+    Ok((assessments, observes_live_source))
 }
 
 /// First unmet citation condition, so a rejected receipt names its correction.

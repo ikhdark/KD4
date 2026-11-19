@@ -904,10 +904,7 @@ impl ApplyPatchHandler {
                     }));
                     // A receipt replays the submitted revision guards, so only a
                     // fresh reconciled patch can recover from a stale guard.
-                    let guard_mismatch = matches!(
-                        parse_error,
-                        codex_apply_patch::ApplyPatchError::RevisionGuardMismatch(_)
-                    );
+                    let guard_mismatch = parse_error.is_revision_guard_mismatch();
                     let retry = (!guard_mismatch).then(|| {
                         session.services.retained_patches.lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)

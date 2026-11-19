@@ -10,9 +10,11 @@ use serde_json::value::RawValue;
 use sha2::Digest;
 use sha2::Sha256;
 
+use crate::ApplyPatchError;
 use crate::SourceHashRef;
 use crate::UpdateFileChunk;
 use crate::UpdateLineKind;
+use codex_utils_path_uri::PathUri;
 
 // Match the whole-source read_file snapshot limit and bound lexical-tree memory.
 const MAX_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
@@ -25,25 +27,36 @@ pub(crate) fn is_json_chunk(chunk: &UpdateFileChunk) -> bool {
 }
 
 pub(crate) fn apply(
+    path: &PathUri,
     source: &str,
     chunks: &[UpdateFileChunk],
     newline: &str,
-) -> Result<String, String> {
+) -> Result<String, ApplyPatchError> {
+    let invalid = |message: String| {
+        ApplyPatchError::ComputeReplacements(format!(
+            "{}: {message}", path.inferred_native_path_string(),
+        ))
+    };
     let [chunk] = chunks else {
-        return Err("use exactly one codex-json chunk; do not mix JSON and textual chunks".into());
+        return Err(invalid("use exactly one codex-json chunk; do not mix JSON and textual chunks".into()));
     };
     let hash = chunk
         .change_context
         .as_deref()
         .and_then(|context| context.strip_prefix("codex-json sha256:"))
-        .ok_or_else(|| format!("expected @@ codex-json {}", SourceHashRef::FORM))?;
-    let hash = SourceHashRef::parse(hash).map_err(|error| format!("codex-json: {error}"))?;
+        .ok_or_else(|| invalid(format!("expected @@ codex-json {}", SourceHashRef::FORM)))?;
+    let hash = SourceHashRef::parse(hash).map_err(|error| invalid(format!("codex-json: {error}")))?;
     let current = hex::encode(Sha256::digest(source.as_bytes()));
     if !hash.matches(&current) {
-        return Err(format!(
-            "codex-json source hash changed (current sha256:{current}); re-read and reconcile before editing"
-        ));
+        return Err(ApplyPatchError::RevisionGuardMismatch(format!(
+            "{}: codex-json source hash changed (current sha256:{current}); re-read and reconcile before editing",
+            path.inferred_native_path_string(),
+        )));
     }
+    apply_operations(source, chunk, newline).map_err(invalid)
+}
+
+fn apply_operations(source: &str, chunk: &UpdateFileChunk, newline: &str) -> Result<String, String> {
     if !chunk.old_lines.is_empty()
         || chunk.is_end_of_file
         || chunk.new_lines.is_empty()

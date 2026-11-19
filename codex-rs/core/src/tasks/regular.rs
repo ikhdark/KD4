@@ -64,12 +64,14 @@ impl SessionTask for RegularTask {
             let mut next_input = input;
             let mut logical_generation_budget = LogicalGenerationBudget::default();
             loop {
+                let mut final_response_client_session = None;
                 let turn_result = Box::pin(run_turn(
                     Arc::clone(&sess),
                     Arc::clone(&ctx),
                     Arc::clone(&turn_extension_data),
                     next_input,
                     None,
+                    &mut final_response_client_session,
                     &mut logical_generation_budget,
                     cancellation_token.child_token(),
                 ))
@@ -113,6 +115,12 @@ impl SessionTask for RegularTask {
                             },
                         )
                         .await?;
+                    }
+                    if let Some(client_session) = final_response_client_session.as_mut()
+                        && !cancellation_token.is_cancelled()
+                        && ctx.terminal_error.lock().await.is_none()
+                    {
+                        client_session.mark_accepted_websocket_ancestry();
                     }
                     return Ok(turn_result);
                 }

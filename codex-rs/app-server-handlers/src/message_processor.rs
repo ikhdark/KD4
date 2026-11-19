@@ -1,6 +1,5 @@
 use crate::connection_rpc_gate::ConnectionRpcGate;
 use std::future::Future;
-use sha2::Digest;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -127,11 +126,25 @@ struct InitializedClientMetadata {
 }
 
 fn deserialize_client_request(request: JSONRPCRequest) -> Result<ClientRequest, JSONRPCErrorError> {
+    let invalid_file_target = matches!(request.method.as_str(), "fs/readFile" | "fs/readFileRange")
+        && request.params.as_ref().and_then(|params| params.get("path"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|path| !std::path::Path::new(path).is_absolute());
     ClientRequest::decode_jsonrpc(request).map_err(|error| match error {
         codex_app_server_protocol_types::ClientRequestDecodeError::UnknownMethod(_) => {
             crate::error_code::method_not_found(error.to_string())
         }
         codex_app_server_protocol_types::ClientRequestDecodeError::InvalidParams { .. } => {
+            if invalid_file_target {
+                let mut error = crate::error_code::invalid_params(
+                    "path must be absolute in the selected host environment; use the host-provided path, not its display label",
+                );
+                error.data = Some(serde_json::json!({
+                    "reason": "fsPathRequiresHostAbsolutePath",
+                    "retryable": false,
+                }));
+                return error;
+            }
             crate::error_code::invalid_params(error.to_string())
         }
     })
@@ -582,9 +595,8 @@ impl MessageProcessor {
                 if remote_observation { "mobile_rpc_received" } else { "local_rpc_received" }, "", "", &operation,
                 serde_json::json!({"schema_version":1, "connection_id":connection_id.0,
                     "method":method, "boundary":if remote_observation { "remote_control_server_ingress_not_phone_tap" } else { "local_server_ingress" },
-                    "request_key_sha256":serde_json::to_vec(&request.id).ok()
-                        .map(|bytes| sha2::Sha256::digest(bytes).iter()
-                            .map(|byte| format!("{byte:02x}")).collect::<String>()),
+                    "request_key_sha256":codex_app_server_transport::rpc_request_key_v1(&request.id),
+                    "request_key_version":1,
                     "file_path_facts":(remote_observation && request_method == "fs/readFile").then(|| {
                         let params = request.params.as_ref();
                         let path = params.and_then(|params| params.get("path"));
@@ -609,6 +621,9 @@ impl MessageProcessor {
         tracing::trace!(
             ?connection_id,
             request_id = ?request.id,
+            rpc.request_key_sha256_v1 = %codex_app_server_transport::rpc_request_key_v1(&request.id),
+            rpc.clock_id = codex_protocol::timing::process_clock_domain_id(),
+            rpc.operation_id = mobile_observation_id.as_deref().unwrap_or_default(),
             "app-server request: {request_method}"
         );
         // Reject the complete wire envelope (including trace fields) before
@@ -643,6 +658,9 @@ impl MessageProcessor {
         };
         let request_span =
             crate::app_server_tracing::request_span(&request, transport, connection_id, &session);
+        if let Some(operation) = mobile_observation_id.as_deref() {
+            request_span.record("rpc.operation_id", operation);
+        }
         let request_trace = request.trace.as_ref().map(|trace| W3cTraceContext {
             traceparent: trace.traceparent.clone(),
             tracestate: trace.tracestate.clone(),
@@ -841,6 +859,10 @@ impl MessageProcessor {
         session_state: &ConnectionSessionState,
     ) {
         session_state.rpc_gate.close().await;
+        // Retained RPCs can be waiting on a server request addressed to this
+        // peer (for example, required MCP startup). Retire that authority
+        // before waiting for those RPCs to settle.
+        self.outgoing.retire_connection_callbacks(connection_id).await;
         self.request_serialization_queues
             .cancel_for_gate(&session_state.rpc_gate)
             .await;
@@ -852,7 +874,7 @@ impl MessageProcessor {
                 "aborted connection RPCs that did not stop during shutdown grace period"
             );
         }
-        self.outgoing.connection_closed(connection_id).await;
+        self.outgoing.finish_connection_closed(connection_id).await;
         self.fs_processor.connection_closed(connection_id).await;
         self.search_processor.connection_closed(connection_id).await;
         self.command_exec_processor
@@ -1066,7 +1088,10 @@ impl MessageProcessor {
             | ClientRequest::PluginInstall { .. } | ClientRequest::PluginUninstall { .. }
             | ClientRequest::MarketplaceRemove { .. }
             | ClientRequest::ThreadStart { .. } | ClientRequest::ThreadFork { .. }
-            | ClientRequest::ThreadResume { .. } | ClientRequest::ThreadInjectItems { .. });
+            | ClientRequest::ThreadResume { .. } | ClientRequest::ThreadInjectItems { .. })
+            // Durable disable can retire this very connection before saving.
+            || matches!(&codex_request, ClientRequest::RemoteControlDisable { params, .. }
+                if !params.as_ref().is_some_and(|params| params.ephemeral));
         let processor = Arc::clone(self);
         let span = request_context.span();
         let queue_observation = request_context.mobile_observation_id().map(|operation| {

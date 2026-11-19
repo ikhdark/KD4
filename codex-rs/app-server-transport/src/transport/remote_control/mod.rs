@@ -78,6 +78,20 @@ fn remote_control_http_clients(factory: HttpClientFactory) -> RouteAwareClientPo
     create_client_pool_without_request_logging(factory, ClientRouteClass::Api)
 }
 
+pub use protocol::rpc_request_key_v1;
+
+/// Timestamp a response at a named output boundary without retaining content.
+pub fn observe_remote_response(kind: &str, connection_id: u64, message: &crate::outgoing_message::OutgoingMessage) {
+    use crate::outgoing_message::OutgoingMessage;
+    if codex_protocol::timing::observations::enabled()
+        && matches!(message, OutgoingMessage::Response(_) | OutgoingMessage::Error(_))
+    {
+        let mut facts = protocol::response_observation(message);
+        facts["connection_id"] = connection_id.into();
+        let _ = codex_protocol::timing::observations::record(kind, "", "", "", facts);
+    }
+}
+
 pub struct RemoteControlStartConfig {
     pub remote_control_url: String,
     pub installation_id: String,
@@ -89,6 +103,7 @@ pub struct RemoteControlStartConfig {
 pub enum RemoteControlPolicy {
     #[default]
     Allowed,
+    Unresolved,
     DisabledByRequirements,
 }
 
@@ -242,6 +257,33 @@ struct RemoteControlEnrollmentState {
     request_auth_manager: Arc<AuthManager>,
 }
 
+#[derive(Debug)]
+struct RemoteControlServiceDeferred(Option<time::OffsetDateTime>);
+
+impl fmt::Display for RemoteControlServiceDeferred {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(deadline) => write!(f, "remote control service deferred until {deadline}"),
+            None => f.write_str("remote control service is temporarily unavailable"),
+        }
+    }
+}
+
+impl Error for RemoteControlServiceDeferred {}
+
+/// Stable wire reason and optional RFC3339 deadline; no service body or credential data.
+pub fn remote_control_retry_details(error: &io::Error) -> Option<(&'static str, Option<String>)> {
+    let service_deadline = error.get_ref()
+        .and_then(|cause| cause.downcast_ref::<RemoteControlServiceDeferred>())
+        .map(|deferred| deferred.0)
+        .or_else(|| server_api::retryable_service_deadline(error));
+    if let Some(deadline) = service_deadline {
+        let retry_at = deadline.and_then(|at| at.format(&time::format_description::well_known::Rfc3339).ok());
+        return Some((if retry_at.is_some() { "remoteControlCooldown" } else { "remoteControlServiceUnavailable" }, retry_at));
+    }
+    (error.kind() == io::ErrorKind::WouldBlock).then_some(("remoteControlAuthPending", None))
+}
+
 impl RemoteControlEnrollmentState {
     fn new(enrollment: Option<RemoteControlEnrollment>, request_policy: watch::Receiver<RemoteControlPolicyDecision>, request_auth_manager: Arc<AuthManager>) -> Self {
         Self {
@@ -270,7 +312,7 @@ impl RemoteControlEnrollmentState {
         if let Some(deadline) = self.retry_after() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                format!("remote control request deferred until {deadline}"),
+                RemoteControlServiceDeferred(Some(deadline)),
             ));
         }
         Ok(())
@@ -505,6 +547,28 @@ impl RemoteControlHandle {
             .map_err(|err| io::Error::new(io::ErrorKind::PermissionDenied, err))
     }
 
+    fn with_current_operation_policy<T>(
+        &self,
+        epoch: u64,
+        complete: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
+        self.auth_manager.with_policy_identity(|identity| {
+            if identity.current_epoch != epoch {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "remote control policy identity changed",
+                ));
+            }
+            if !policy_admits(*self.policy.borrow(), identity) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    RemoteControlDisabledByRequirements,
+                ));
+            }
+            complete()
+        })?
+    }
+
     // No locks span I/O. Identity/denial changes retire the operation, including
     // waiters blocked on enrollment or storage, rather than admitting its late result.
     async fn run_with_policy<T>(
@@ -515,27 +579,26 @@ impl RemoteControlHandle {
         let mut desired_changes = self.desired_state_tx.subscribe();
         let mut policy_changes = self.policy.subscribe();
         let epoch = self.policy_auth_epoch()?;
-        self.ensure_remote_control_allowed_io()?;
+        self.with_current_operation_policy(epoch, || Ok(()))?;
         tokio::pin!(operation);
         loop {
             tokio::select! {
                 biased;
                 changed = auth_changes.changed() => {
-                    if changed.is_err() || self.policy_auth_epoch()? != epoch {
-                        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "remote control policy identity changed"));
+                    if changed.is_err() {
+                        return Err(io::Error::new(io::ErrorKind::WouldBlock, "remote control authentication monitor stopped"));
                     }
-                    self.ensure_remote_control_allowed_io()?;
+                    self.with_current_operation_policy(epoch, || Ok(()))?;
                 }
-                _ = desired_changes.changed() => self.ensure_remote_control_allowed_io()?,
+                _ = desired_changes.changed() => self.with_current_operation_policy(epoch, || Ok(()))?,
                 changed = policy_changes.changed() => {
                     if changed.is_err() {
                         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "remote control policy monitor stopped"));
                     }
-                    self.ensure_remote_control_allowed_io()?;
+                    self.with_current_operation_policy(epoch, || Ok(()))?;
                 }
                 result = &mut operation => {
-                    self.ensure_remote_control_allowed_io()?;
-                    return self.auth_manager.with_policy_auth_epoch(epoch, || result)?;
+                    return self.with_current_operation_policy(epoch, || result);
                 }
             }
         }
@@ -1509,10 +1572,9 @@ pub async fn start_remote_control(
 ) -> io::Result<(JoinHandle<()>, RemoteControlHandle)> {
     let http_clients = remote_control_http_clients(config.http_client_factory.clone());
     let policy = config.policy;
-    let policy_epoch = auth_manager
-        .policy_auth_snapshot()
-        .ok()
-        .map(|(epoch, _)| epoch);
+    let policy_epoch = (policy != RemoteControlPolicy::Unresolved)
+        .then(|| auth_manager.policy_auth_snapshot().ok().map(|(epoch, _)| epoch))
+        .flatten();
     let (shared_policy, websocket_policy) = watch::channel((policy, policy_epoch));
     let shared_policy = Arc::new(shared_policy);
     let monitored_policy = shared_policy.clone();
@@ -1520,8 +1582,27 @@ pub async fn start_remote_control(
     let mut policy_auth_changes = auth_manager.auth_change_receiver();
     let state_db_available = state_db.is_some();
     let requested_initial_enabled = startup_mode == RemoteControlStartupMode::EnabledEphemeral;
+    if codex_protocol::timing::observations::enabled() {
+        use codex_protocol::timing::process_monotonic_ns;
+        let build = codex_utils_build_info::BuildInfo::current();
+        let monotonic_before_ns = u64::try_from(process_monotonic_ns()).ok();
+        let unix_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .ok().and_then(|duration| u64::try_from(duration.as_nanos()).ok());
+        let monotonic_after_ns = u64::try_from(process_monotonic_ns()).ok();
+        let _ = codex_protocol::timing::observations::record(
+            "mobile_backend_epoch", "", "", "",
+            serde_json::json!({
+                "unix_ns": unix_ns, "monotonic_before_ns": monotonic_before_ns,
+                "monotonic_after_ns": monotonic_after_ns,
+                "build_version": build.version, "build_commit": build.commit,
+                "build_dirty": build.dirty, "build_profile": build.profile,
+                "startup_mode": format!("{startup_mode:?}"), "startup_policy": format!("{policy:?}"),
+                "state_db_available": state_db_available,
+            }),
+        );
+    }
     let desired_state =
-        if policy == RemoteControlPolicy::DisabledByRequirements || !state_db_available {
+        if policy != RemoteControlPolicy::Allowed || !state_db_available {
             RemoteControlDesiredState::Disabled
         } else {
             match startup_mode {

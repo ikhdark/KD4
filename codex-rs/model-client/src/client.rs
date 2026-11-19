@@ -1881,11 +1881,13 @@ struct ModelClientState {
 #[derive(Debug, Default)]
 struct PromptContextMeasurements {
     baseline: Option<PromptContextBaseline>,
-    /// Last admitted completion, independent of optional asynchronous prefix measurements.
-    latest_completed_response_id: Option<String>,
+    /// Last admitted comparison-eligible completion and its request-time authority.
+    latest_cache_comparison: Option<([u8; 32], String)>,
     latest_attempt: Option<String>,
     predecessor: Option<oneshot::Receiver<Option<PromptContextBaseline>>>,
 }
+
+type CacheComparisonCompletion = ([u8; 32], Arc<StdMutex<PromptContextMeasurements>>);
 
 impl PromptContextMeasurements {
     fn begin(&mut self, physical_attempt_id: String) -> PromptContextMeasurementDispatch {
@@ -2051,7 +2053,54 @@ struct CurrentClientSetup {
     auth: Option<CodexAuth>,
     api_provider: ApiProvider,
     api_auth: SharedAuthProvider,
+    auth_policy_epoch: Option<u64>,
     agent_identity_telemetry: Option<AgentIdentityTelemetry>,
+}
+
+impl CurrentClientSetup {
+    fn cache_comparison_scope(&self) -> Option<[u8; 32]> {
+        let auth = self.auth.as_ref()?;
+        // Only a managed resolution supplies a request-bound lifecycle. An
+        // account ID alone does not distinguish users in the same workspace.
+        let epoch = self.auth_policy_epoch?;
+        use crate::account_identity::AccountChangeIdentity;
+        let identity = AccountChangeIdentity::from_auth(auth)?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"CODEX-CACHE-COMPARISON-SCOPE-V1\0");
+        let mut field = |bytes: &[u8]| {
+            hasher.update((bytes.len() as u64).to_be_bytes());
+            hasher.update(bytes);
+        };
+        let route = self.api_provider.url_for_path(RESPONSES_ENDPOINT);
+        field(route.as_bytes());
+        field(&epoch.to_be_bytes());
+        field(&[u8::from(auth.uses_codex_backend()), u8::from(auth.is_fedramp_account())]);
+        match identity {
+            AccountChangeIdentity::Account(account) => {
+                field(b"account");
+                field(account.as_bytes());
+            }
+            AccountChangeIdentity::ApiKey(key) => {
+                field(b"api-key");
+                field(key.as_bytes());
+            }
+            AccountChangeIdentity::Headers(_) => return None,
+        }
+        // Include delegation/actor identity when present and the provider's
+        // configured transport headers (e.g. organization and project).
+        let actor = self.api_auth.connection_identity();
+        field(actor.as_deref().unwrap_or_default());
+        let mut headers: Vec<_> = self.api_provider.headers.iter().collect();
+        headers.sort_unstable_by(|(a, av), (b, bv)| {
+            (a.as_str(), av.as_bytes()).cmp(&(b.as_str(), bv.as_bytes()))
+        });
+        for (name, value) in headers {
+            field(name.as_str().as_bytes());
+            field(value.as_bytes());
+        }
+        // The fingerprint is used for in-memory comparison only.
+        Some(hasher.finalize().into())
+    }
 }
 
 pub type AttemptPreparedCallback = Arc<
@@ -2142,6 +2191,8 @@ pub struct ModelClientSession {
     client: ModelClient,
     websocket_session: WebsocketSession,
     websocket_cache_publication: Option<WebsocketCachePublicationPermit>,
+    accepted_websocket_ancestry: bool,
+    websocket_ancestry_auth_mode: Option<AuthMode>,
     pending_websocket_preconnect: Option<AbortOnDropHandle<Result<Option<WebsocketSession>>>>,
     preconnect_failure_setup: Option<Arc<StdMutex<Option<WebsocketSetupFingerprint>>>>,
     failed_websocket_setup: Option<WebsocketSetupFingerprint>,
@@ -2726,6 +2777,8 @@ impl ModelClient {
             client: self.clone(),
             websocket_session,
             websocket_cache_publication: Some(websocket_cache_publication),
+            accepted_websocket_ancestry: false,
+            websocket_ancestry_auth_mode: None,
             pending_websocket_preconnect: None,
             preconnect_failure_setup: None,
             failed_websocket_setup: None,
@@ -2753,6 +2806,8 @@ impl ModelClient {
             client: self.clone(),
             websocket_session: WebsocketSession::default(),
             websocket_cache_publication: None,
+            accepted_websocket_ancestry: false,
+            websocket_ancestry_auth_mode: None,
             pending_websocket_preconnect: None,
             preconnect_failure_setup: None,
             failed_websocket_setup: None,
@@ -2803,6 +2858,7 @@ impl ModelClient {
         &self,
         permit: WebsocketCachePublicationPermit,
         websocket_session: WebsocketSession,
+        accepted_ancestry: bool,
     ) -> bool {
         // An unfinished response still owns the socket. Its mapper cancellation
         // is asynchronous, so publishing it here can race the next turn's health
@@ -2822,7 +2878,13 @@ impl ModelClient {
         if !cache.fallback.enabled(tokio::time::Instant::now()) {
             return false;
         }
-        cache.publish_if_current(permit, websocket_session.into_transport_only())
+        let websocket_session = if accepted_ancestry {
+            websocket_session.set_connection_reused(/*connection_reused*/ false);
+            websocket_session
+        } else {
+            websocket_session.into_transport_only()
+        };
+        cache.publish_if_current(permit, websocket_session)
     }
 
     pub fn force_http_fallback(&self, session_telemetry: &SessionTelemetry) -> bool {
@@ -3152,22 +3214,6 @@ impl ModelClient {
             include.push("message.output_text.logprobs".to_string());
         }
         let prompt_cache_key = Some(self.prompt_cache_key(responses_metadata));
-        // Diagnostics are metadata-only and best effort. Leave legacy models,
-        // custom providers and Responses Lite requests byte-compatible.
-        let model_version = model_info.slug.strip_prefix("gpt-")
-            .and_then(|name| name.split('-').next())
-            .and_then(|version| {
-                let mut parts = version.split('.');
-                Some((parts.next()?.parse::<u32>().ok()?,
-                    parts.next().unwrap_or("0").parse::<u32>().ok()?))
-            });
-        let prompt_cache_options = (self.state.include_timing_metrics && is_openai
-            && !model_info.use_responses_lite && model_version.is_some_and(|version| version >= (5, 6)))
-            .then(|| self.state.prompt_context_measurements.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .latest_completed_response_id.clone())
-            .flatten()
-            .map(|comparison_response_id| codex_api::PromptCacheOptions { comparison_response_id });
         let service_tier = model_info.service_tier_for_request(service_tier);
         let request = ResponsesApiRequest {
             model: model_info.slug.clone(),
@@ -3191,11 +3237,41 @@ impl ModelClient {
             include,
             service_tier,
             prompt_cache_key,
-            prompt_cache_options,
+            prompt_cache_options: None,
             text,
             client_metadata: Some(responses_metadata.client_metadata()),
         };
         Ok(request)
+    }
+
+    /// Diagnostics are metadata only. Resolve their authority at dispatch,
+    /// not when composing a speculative or unsupported request.
+    fn attach_cache_comparison(
+        &self,
+        setup: &CurrentClientSetup,
+        model_info: &ModelInfo,
+        request: &mut ResponsesApiRequest,
+    ) -> Option<CacheComparisonCompletion> {
+        if !self.state.include_timing_metrics
+            || !self.state.provider.info().is_openai()
+            || model_info.use_responses_lite
+        {
+            return None;
+        }
+        let version = model_info.slug.strip_prefix("gpt-")?.split('-').next()?;
+        let mut parts = version.split('.');
+        let version = (parts.next()?.parse::<u32>().ok()?, parts.next().unwrap_or("0").parse().ok()?);
+        if version < (5, 6) {
+            return None;
+        }
+        let scope = setup.cache_comparison_scope()?;
+        let owner = &self.state.prompt_context_measurements;
+        request.prompt_cache_options = owner.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .latest_cache_comparison.as_ref()
+            .filter(|(previous_scope, _)| *previous_scope == scope)
+            .map(|(_, id)| codex_api::PromptCacheOptions { comparison_response_id: id.clone() });
+        Some((scope, Arc::clone(owner)))
     }
 
     fn prepare_response_items_for_request(&self, input: &mut codex_api::ResponsesInput) {
@@ -3266,6 +3342,7 @@ impl ModelClient {
             auth: setup.auth,
             api_provider: setup.api_provider,
             api_auth: setup.resolved_auth.auth,
+            auth_policy_epoch: setup.resolved_auth.policy_epoch,
             agent_identity_telemetry: setup.resolved_auth.agent_identity_telemetry,
         })
     }
@@ -3426,13 +3503,41 @@ impl Drop for ModelClientSession {
         let Some(permit) = self.websocket_cache_publication.take() else {
             return;
         };
+        let accepted_ancestry = self.accepted_websocket_ancestry
+            && self.client.state.provider.info().is_openai()
+            && matches!(
+                self.websocket_ancestry_auth_mode,
+                Some(AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens)
+            )
+            && matches!(
+                self.dispatched_account.as_ref(),
+                Some(crate::account_identity::AccountChangeIdentity::Account(_))
+            )
+            && matches!(
+                self.last_stream_transport,
+                Some(ModelAttemptTransport::ResponsesWebsocket)
+            )
+            && !self.tool_history_fail_open_pending
+            && !self.websocket_session.last_response_from_untraced_warmup
+            && self.websocket_session.setup_fingerprint.is_some()
+            && self.get_last_response().is_some_and(|response| !response.response_id.is_empty());
         let websocket_session = std::mem::take(&mut self.websocket_session);
-        self.client
-            .try_store_cached_websocket_transport(permit, websocket_session);
+        self.client.try_store_cached_websocket_transport(
+            permit,
+            websocket_session,
+            accepted_ancestry,
+        );
     }
 }
 
 impl ModelClientSession {
+    /// The turn accepted its final reply. The next turn may inherit completed
+    /// ancestry only after the normal socket, request, and exact-prefix checks.
+    /// The sticky routing token remains in this turn's session.
+    pub fn mark_accepted_websocket_ancestry(&mut self) {
+        self.accepted_websocket_ancestry = true;
+    }
+
     pub fn revoke_cache_publication(&mut self) {
         self.websocket_cache_publication = None;
     }
@@ -4568,6 +4673,8 @@ impl ModelClientSession {
                         service_tier.clone(),
                         responses_metadata,
                     )?;
+                    let cache_comparison =
+                        self.client.attach_cache_comparison(&client_setup, model_info, &mut request);
                     self.client
                         .prepare_response_items_for_request(&mut request.input);
                     // Same routing hint as the WebSocket handshake, so an HTTP request routes
@@ -4828,8 +4935,7 @@ impl ModelClientSession {
                                 Arc::clone(&self.client.state.provider),
                                 attempt,
                                 /*websocket_success*/ None,
-                                self.client.state.include_timing_metrics.then(||
-                                    Arc::clone(&self.client.state.prompt_context_measurements)),
+                                cache_comparison,
                             );
                             return Ok(stream);
                         }
@@ -4974,9 +5080,9 @@ impl ModelClientSession {
                     }
                 };
             let mut request = request;
-            if warmup {
-                request.prompt_cache_options = None;
-            }
+            let cache_comparison = if warmup { None } else {
+                self.client.attach_cache_comparison(&client_setup, model_info, &mut request)
+            };
             if let Some(clock) = attempt_clock.as_ref() {
                 clock.record_prompt_cache_comparison(request.prompt_cache_options.as_ref());
             }
@@ -4989,6 +5095,8 @@ impl ModelClientSession {
             if !warmup {
                 self.dispatched_account = client_setup.auth.as_ref()
                     .and_then(crate::account_identity::AccountChangeIdentity::from_auth);
+                self.websocket_ancestry_auth_mode =
+                    client_setup.auth.as_ref().map(CodexAuth::api_auth_mode);
             }
             let request_session_telemetry = if warmup {
                 // `generate=false` prewarm is connection setup, not an inference request.
@@ -5116,6 +5224,7 @@ impl ModelClientSession {
                 let api_provider = client_setup.api_provider.clone();
                 let fallback_effort = effort.clone();
                 let fallback_service_tier = service_tier.clone();
+                let comparison_options = request.prompt_cache_options.clone();
                 Some(Box::new(move || {
                     let mut fallback_request = client.build_responses_request_with_fallbacks(
                         &api_provider,
@@ -5128,6 +5237,7 @@ impl ModelClientSession {
                         /* use_stable_context_fallback */ true,
                         /* use_tool_history_fallback */ true,
                     )?;
+                    fallback_request.prompt_cache_options = comparison_options;
                     client.prepare_response_items_for_request(&mut fallback_request.input);
                     Ok(fallback_request)
                 }))
@@ -5174,6 +5284,7 @@ impl ModelClientSession {
                     responses_metadata,
                     /* use_stable_context_fallback */ true,
                 )?;
+                fallback_request.prompt_cache_options = request.prompt_cache_options.clone();
                 self.client
                     .prepare_response_items_for_request(&mut fallback_request.input);
                 final_payload.input = fallback_request.input.clone();
@@ -5570,8 +5681,7 @@ impl ModelClientSession {
                 Arc::clone(&self.client.state.provider),
                 attempt,
                 (!warmup).then(|| (self.client.clone(), websocket_epoch)),
-                (!warmup && self.client.state.include_timing_metrics).then(||
-                    Arc::clone(&self.client.state.prompt_context_measurements)),
+                cache_comparison,
             );
             self.websocket_session.last_response_rx = Some(last_request_rx);
             self.websocket_session.last_response = None;
@@ -6049,7 +6159,7 @@ fn map_response_stream(
     provider: SharedModelProvider,
     attempt: Option<ModelAttemptState>,
     websocket_success: Option<(ModelClient, u64)>,
-    prompt_context_measurements: Option<Arc<StdMutex<PromptContextMeasurements>>>,
+    cache_comparison: Option<CacheComparisonCompletion>,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>) {
     let codex_api::ResponseStream {
         mut rx_event,
@@ -6066,10 +6176,10 @@ fn map_response_stream(
             && !response_id.is_empty() && response_id.len() <= 256
             && response_id.bytes().all(|byte| byte.is_ascii_alphanumeric()
                 || matches!(byte, b'_' | b'-' | b'.'))
-            && let Some(owner) = prompt_context_measurements.as_ref()
+            && let Some((scope, owner)) = cache_comparison.as_ref()
         {
             owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-                .latest_completed_response_id = Some(response_id.clone());
+                .latest_cache_comparison = Some((*scope, response_id.clone()));
         }
         // Opening a stream or receiving partial output is not a successful
         // request. HTTP and connection-only warmup never clear WS failures.
@@ -6992,6 +7102,13 @@ impl RequestTelemetry for ApiTelemetry {
         self.last_attempt.store(attempt, Ordering::Relaxed);
         self.record_native_transport_phase(attempt, observation);
         let identity = self.physical_transport_identity(attempt);
+        if timing.initial_request_not_sent
+            && let Some(request_timing) = self.model_request.as_ref()
+                .and_then(|request| request.timing.as_ref())
+            && let Some(identity) = identity.as_ref()
+        {
+            request_timing.exclude_proven_unsent_model_usage(identity);
+        }
         let provider_request_id = headers
             .and_then(|headers| headers.get("x-request-id"))
             .and_then(|value| value.to_str().ok())

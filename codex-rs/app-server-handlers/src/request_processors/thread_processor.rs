@@ -197,6 +197,7 @@ use codex_tools::validate_dynamic_tools;
 
 pub(super) const THREAD_PAGE_DEFAULT_LIMIT: usize = 25;
 pub(super) const THREAD_PAGE_MAX_LIMIT: usize = 100;
+const MAX_STORAGE_PAGES_PER_LIST_RPC: usize = 16;
 const MAX_THREAD_START_CONFIG_ATTEMPTS: usize = 3;
 const MAX_THREAD_RESUME_CONFIG_ATTEMPTS: usize = 3;
 const CODEX_TUI_CLIENT_NAME: &str = "codex-tui";
@@ -5053,7 +5054,9 @@ impl ThreadRequestProcessor {
         let allowed_sources = allowed_sources_vec.as_slice();
         let store_sort_direction = thread_store_sort_direction(sort_direction);
 
-        while remaining > 0 {
+        // Selective filters can discard every storage row. Preserve the exact
+        // cursor rather than scanning the whole catalog to fill one RPC page.
+        for _ in 0..MAX_STORAGE_PAGES_PER_LIST_RPC {
             let page_size = remaining.min(THREAD_PAGE_MAX_LIMIT);
             if let Some(operation) = diagnostic_operation {
                 let _ = codex_protocol::timing::observations::record(

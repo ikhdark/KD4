@@ -292,10 +292,16 @@ impl StdioDelivery {
             };
             credit.merge(overhead);
         }
-        let queued = Arc::new(Mutex::new(Some(StdioStagedMessage { message, credit, oversized })));
-        if self.sender.try_send(Arc::clone(&queued)).is_err() {
+        let Ok(slot) = self.sender.try_reserve() else {
             return false;
+        };
+        if remote_preview {
+            codex_app_server_transport::observe_remote_response(
+                "mobile_response_staging_admitted", connection_id.0, &message.message,
+            );
         }
+        let queued = Arc::new(Mutex::new(Some(StdioStagedMessage { message, credit, oversized })));
+        slot.send(Arc::clone(&queued));
         self.tail = Arc::downgrade(&queued);
         true
     }
@@ -503,6 +509,9 @@ async fn send_message_to_connection(
     }
 
     if connection_state.remote_preview {
+        codex_app_server_transport::observe_remote_response(
+            "mobile_response_router_received", connection_id.0, &message,
+        );
         codex_app_server_transport::preview_remote_notification(&mut message);
     }
     let writer = connection_state.writer.clone();
@@ -539,7 +548,8 @@ async fn send_message_to_connection(
             let drained_bytes = Arc::clone(&bytes);
             let drained_oversized = Arc::clone(&oversized_frames);
             let shutdown = shutdown.clone();
-            let encode_limit = if connection_state.remote_preview { 0 } else { STDIO_DELIVERY_BYTES };
+            let remote = connection_state.remote_preview;
+            let encode_limit = if remote { 0 } else { STDIO_DELIVERY_BYTES };
             delivery_tasks.spawn(async move {
                 loop {
                     let next = tokio::select! {
@@ -558,6 +568,11 @@ async fn send_message_to_connection(
                         shutdown.cancel();
                         break;
                     };
+                    if remote {
+                        codex_app_server_transport::observe_remote_response(
+                            "mobile_response_staging_dequeued", connection_id.0, &message.message,
+                        );
+                    }
                     // Remote needs the wire length and credit, not an extra
                     // encoded copy before its own envelope encoder.
                     let encoded_bytes = match message.prepare_stdio_json(encode_limit) {
@@ -588,11 +603,22 @@ async fn send_message_to_connection(
                     if let Some(encoded) = &mut message.encoded_json {
                         encoded.delivery_credit = Some(credit);
                     }
+                    if remote {
+                        codex_app_server_transport::observe_remote_response(
+                            "mobile_response_writer_offered", connection_id.0, &message.message,
+                        );
+                    }
                     tokio::select! {
                         biased;
                         _ = shutdown.cancelled() => break,
-                        result = writer.send(message) => {
-                            if result.is_err() { shutdown.cancel(); break; }
+                        result = writer.reserve() => {
+                            let Ok(slot) = result else { shutdown.cancel(); break };
+                            if remote {
+                                codex_app_server_transport::observe_remote_response(
+                                    "mobile_response_writer_admitted", connection_id.0, &message.message,
+                                );
+                            }
+                            slot.send(message);
                         }
                     }
                 }
@@ -609,6 +635,11 @@ async fn send_message_to_connection(
             });
             StdioDelivery { sender, tail: Weak::new(), bytes, oversized_frames }
         });
+        if connection_state.remote_preview {
+            codex_app_server_transport::observe_remote_response(
+                "mobile_response_staging_offered", connection_id.0, &queued_message.message,
+            );
+        }
         let sent = delivery.try_send(connection_id, connection_state.is_stdio, connection_state.remote_preview, queued_message);
         if sent {
             return false;

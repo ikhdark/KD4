@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 const MANAGED_ROOT_WARNING_THRESHOLD: usize = 384;
-const MANAGED_ROOT_LIMIT: usize = 512;
+const MANAGED_ROOT_LIMIT: usize = 1024;
 const MANAGED_ROOT_RECLAIM_TIMEOUT: Duration = Duration::from_secs(5);
 const ADMISSION_OBSERVATION_TARGET: &str = "codex_managed_root_admission";
 const ADMISSION_EVENT_LIMIT: usize = 256;

@@ -1,4 +1,5 @@
 use super::REMOTE_CONTROL_INSTALLATION_ID_HEADER;
+use super::RemoteControlServiceDeferred;
 use super::auth::RemoteControlConnectionAuth;
 use super::enroll::RemoteControlEnrollment;
 use super::enroll::RemoteControlServerTokenRefreshRequirement;
@@ -142,7 +143,7 @@ pub(super) async fn refresh_remote_control_server_with_client(
     {
         return Err(io::Error::new(
             ErrorKind::WouldBlock,
-            format!("remote control server token refresh deferred until {next_refresh_at}"),
+            RemoteControlServiceDeferred(Some(next_refresh_at)),
         ));
     }
     let refresh_url = enrollment.remote_control_target.refresh_url.clone();
@@ -314,6 +315,13 @@ fn update_remote_control_server_token(
     enrollment.expires_at = Some(expires_at);
     enrollment.next_refresh_at = None;
     Ok(())
+}
+
+pub(super) fn retryable_service_deadline(error: &io::Error) -> Option<Option<OffsetDateTime>> {
+    let error = remote_control_server_request_error(error)?;
+    error.status
+        .is_some_and(|status| status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
+        .then_some(error.retry_at)
 }
 
 fn remote_control_server_request_error(

@@ -15,7 +15,8 @@ use std::time::UNIX_EPOCH;
 use crate::agent::AgentControl;
 use crate::agent::AgentStatus;
 use crate::agent::agent_status_from_event;
-use crate::agent::agent_status_from_task;
+use crate::agent::status::AgentHandoff;
+use crate::agent::status::agent_status_and_handoff_from_task;
 use crate::agent::status::is_final;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
@@ -3224,6 +3225,7 @@ impl Session {
             _ => None,
         };
         let task_coordinator = self.services.agent_control.task_coordinator();
+        let mut handoff = None;
         if let Some(binding) = turn_context
             .agent_task_binding
             .get()
@@ -3264,10 +3266,11 @@ impl Session {
                     }
                     protected_host_summary =
                         crate::agent::status::completion_diagnostics_from_task(&task);
-                    if let Some(durable_status) =
-                        agent_status_from_task(&task, Some((binding.attempt_id, &status)))
+                    if let Some((durable_status, durable_handoff)) =
+                        agent_status_and_handoff_from_task(&task, Some((binding.attempt_id, &status)))
                     {
                         status = durable_status;
+                        handoff = durable_handoff;
                         self.update_agent_status(&turn_context.sub_id, msg, status.clone());
                     }
                     task_coordinator.emit_terminal_metrics_from_snapshot(
@@ -3288,6 +3291,7 @@ impl Session {
                 *parent_thread_id,
                 child_agent_path,
                 status,
+                handoff,
                 // The clean-terminal marker only supersedes older durable observations
                 // (see `completion_diagnostics_from_task`); it is not a parent-visible fact.
                 protected_host_summary
@@ -3316,6 +3320,7 @@ impl Session {
         parent_thread_id: ThreadId,
         child_agent_path: &codex_protocol::AgentPath,
         status: AgentStatus,
+        handoff: Option<AgentHandoff>,
         protected_host_summary: Option<&str>,
     ) -> bool {
         let Some(parent_agent_path) = child_agent_path
@@ -3345,6 +3350,7 @@ impl Session {
                 child_agent_path.clone(),
                 self.thread_id,
                 &status,
+                handoff,
                 receipt.as_deref(),
                 protected_host_summary,
             ).await;

@@ -287,6 +287,9 @@ pub struct TaskOverlapWarning {
     pub deliverable_overlap: bool,
     pub contract_overlap: bool,
     pub scope_overlap: bool,
+    pub existing_write_scope: RepoScope,
+    pub requested_write_scope: RepoScope,
+    pub next_action: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -295,6 +298,7 @@ pub enum TaskOverlapKind {
     PotentialDuplicate,
     IndependentVerification,
     RelatedWork,
+    WriteScopeConflict,
 }
 
 #[doc(hidden)]
@@ -331,6 +335,7 @@ pub enum IntegrationPlan {
 pub struct AdmittedAssignment {
     pub assignment: Assignment,
     pub attempt: Attempt,
+    pub dependency_admissions: Vec<DependencyAdmission>,
     pub overlaps: AdmissionOverlapSummary,
     pub integration_plan: IntegrationPlan,
 }

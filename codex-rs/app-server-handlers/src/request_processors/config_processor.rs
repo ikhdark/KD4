@@ -177,6 +177,7 @@ impl ConfigRequestProcessor {
     pub(crate) fn handle_config_mutation(&self) {
         // Mutations may bypass ConfigManager writes; publish them to the next read.
         self.config_manager.invalidate_load_cache();
+        self.config_manager.recheck_remote_policy_after_config_mutation();
         self.thread_manager.plugins_manager().clear_cache();
         self.thread_manager.skills_service().clear_cache();
     }

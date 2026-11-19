@@ -1361,8 +1361,10 @@ struct TurnTimingStateInner {
     model_requests: Vec<ModelRequestTiming>,
     model_request_history_truncated: bool,
     accounted_model_responses: u64,
+    proven_unsent_model_requests: u64,
     // Accounting chronology must survive eviction of optional request details.
     latest_dispatched_usage_identity: Option<(String, String)>,
+    prior_dispatched_usage_identity: Option<(String, String)>,
     tool_calls: Vec<TurnTimingToolCall>,
     tool_call_timing_overflow: u32,
     detail_archive: Option<Arc<StdMutex<detail_archive::Capture>>>,
@@ -1536,7 +1538,9 @@ impl TurnTimingStateInner {
             model_requests: self.model_requests.clone(),
             model_request_history_truncated: self.model_request_history_truncated,
             accounted_model_responses: self.accounted_model_responses,
+            proven_unsent_model_requests: self.proven_unsent_model_requests,
             latest_dispatched_usage_identity: self.latest_dispatched_usage_identity.clone(),
+            prior_dispatched_usage_identity: self.prior_dispatched_usage_identity.clone(),
             tool_calls: Vec::new(),
             tool_call_timing_overflow: self.tool_call_timing_overflow,
             detail_archive: None,
@@ -4693,7 +4697,23 @@ impl TurnTimingState {
     pub fn unaccounted_model_request_count(&self) -> u64 {
         let state = self.state();
         u64::from(state.counters.model_request_count)
+            .saturating_sub(state.proven_unsent_model_requests)
             .saturating_sub(state.accounted_model_responses)
+    }
+
+    /// An HTTP attempt can enter transport timing but fail to connect before
+    /// the first request is sent. Preserve timing and retry identity; only
+    /// remove it from provider usage settlement. The synchronous result
+    /// callback precedes another attempt and only undoes its own entry once.
+    pub fn exclude_proven_unsent_model_usage(&self, identity: &codex_api::ResponseAttemptIdentity) {
+        let mut state = self.state();
+        if state.latest_dispatched_usage_identity.as_ref().is_none_or(|(request, attempt)| {
+            *request != identity.sampling_request_id || *attempt != identity.physical_attempt_id
+        }) {
+            return;
+        }
+        state.proven_unsent_model_requests = state.proven_unsent_model_requests.saturating_add(1);
+        state.latest_dispatched_usage_identity = state.prior_dispatched_usage_identity.take();
     }
 
     /// Whether the most recently dispatched physical attempt has reported usage.
@@ -4762,7 +4782,7 @@ impl TurnTimingState {
         let first_dispatch = request.dispatch_ns.is_none();
         let generation_index = request.generation_index;
         let resumed_generation_id = format!("generation-{}", request.generation_index);
-        state.latest_dispatched_usage_identity = Some((
+        state.prior_dispatched_usage_identity = state.latest_dispatched_usage_identity.replace((
             sampling_request_id.to_owned(),
             physical_attempt_id.to_owned(),
         ));

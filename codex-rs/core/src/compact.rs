@@ -35,6 +35,7 @@ use crate::hook_runtime::run_pre_compact_hook_gate;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
+use crate::responses_retry::ResponsesRecoveryWait;
 use crate::responses_retry::ResponsesStreamRequest;
 use crate::responses_retry::ResponsesStreamRetryState;
 use crate::responses_retry::handle_retryable_response_stream_error;
@@ -428,6 +429,7 @@ pub(crate) async fn run_inline_auto_compact_task(
     reason: CompactionReason,
     phase: CompactionPhase,
     emit_error_event: bool,
+    recovery_wait: &mut ResponsesRecoveryWait,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let InlineAutoCompactReuse {
@@ -457,6 +459,7 @@ pub(crate) async fn run_inline_auto_compact_task(
         reason,
         phase,
         emit_error_event,
+        recovery_wait,
         cancellation_token,
     )
     .await?;
@@ -479,11 +482,13 @@ pub(crate) async fn run_compact_task(
     sess.send_event(&turn_context, start_event).await;
     let step_context = sess.capture_step_context(Arc::clone(&turn_context)).await?;
     let world_state = Arc::new(sess.build_world_state_for_step(step_context.as_ref()).await);
+    let mut recovery_wait = ResponsesRecoveryWait::default();
     run_compact_task_with_initial_context(
         sess,
         turn_context,
         input,
         InitialContextInjection::AtStart(world_state),
+        &mut recovery_wait,
         cancellation_token,
     )
     .await
@@ -496,6 +501,7 @@ pub(crate) async fn run_compact_task_with_initial_context(
     turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
+    recovery_wait: &mut ResponsesRecoveryWait,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     run_compact_task_inner(
@@ -511,6 +517,7 @@ pub(crate) async fn run_compact_task_with_initial_context(
         CompactionReason::UserRequested,
         CompactionPhase::StandaloneTurn,
         /*emit_error_event*/ true,
+        recovery_wait,
         cancellation_token,
     )
     .await?;
@@ -529,6 +536,7 @@ async fn run_compact_task_inner(
     reason: CompactionReason,
     phase: CompactionPhase,
     emit_error_event: bool,
+    recovery_wait: &mut ResponsesRecoveryWait,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let compaction_metadata =
@@ -571,6 +579,7 @@ async fn run_compact_task_inner(
         &mut analytics_details,
         &mut compaction_item,
         emit_error_event,
+        recovery_wait,
         cancellation_token,
     ))
     .await;
@@ -616,6 +625,7 @@ async fn run_compact_task_inner_impl(
     analytics_details: &mut CompactionAnalyticsDetails,
     compaction_item: &mut TurnItem,
     emit_error_event: bool,
+    recovery_wait: &mut ResponsesRecoveryWait,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<String> {
     // Read before history is replaced so the completed item can report the
@@ -805,7 +815,7 @@ async fn run_compact_task_inner_impl(
                     prompt.input = input.into();
                 }
                 turn_context.turn_timing_state.begin_compaction_generation();
-                let mut retry_state = ResponsesStreamRetryState::new(max_retries);
+                let mut retry_state = ResponsesStreamRetryState::new(max_retries, recovery_wait);
                 let mut retried_invalid_summary = false;
                 loop {
                     retry_state.check_retry_budget(cancellation_token)?;

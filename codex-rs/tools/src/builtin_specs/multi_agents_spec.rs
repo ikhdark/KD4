@@ -28,7 +28,7 @@ pub struct SpawnAgentToolOptions {
 
 fn spawn_agent_default_guidance() -> String {
     format!(
-        "All subagents are generic and use this chat's selected subagent preferences, or `{DEFAULT_SPAWN_AGENT_MODEL}` with `{DEFAULT_SPAWN_AGENT_REASONING_EFFORT}` reasoning when none are selected. Optional `model` and `reasoning_effort` override those defaults independently. Use `message` for read-only tasks or `assignment` for writable workers; there are no role overrides. If the built-in model is unavailable, the effective model or provider default is used with a supported reasoning effort."
+        "All subagents are generic and use this chat's selected subagent preferences, or `{DEFAULT_SPAWN_AGENT_MODEL}` with `{DEFAULT_SPAWN_AGENT_REASONING_EFFORT}` reasoning when none are selected. Optional `model` and `reasoning_effort` override those defaults independently. Use `message` for read-only tasks or `assignment` for structured work; optional `assignment.role` selects a typed contract, never a model or permission override. If the built-in model is unavailable, the effective model or provider default is used with a supported reasoning effort."
     )
 }
 
@@ -374,7 +374,7 @@ fn spawn_agent_output_schema_v2(hide_agent_metadata: bool) -> Value {
             "effective_capabilities": {"type": "object", "description": "Launch-time backend/model/workspace and inherited restriction snapshot; configuration_revision binds its identity. Advisory only, never a permission grant."},
             "overlap_warnings": {
                 "type": "array",
-                "description": "Admission-time advisories, never rejection or reuse. Potential duplicates differ from declared independent verification and scope-only overlap.",
+                "description": "Advisory intersections between active and requested declared write scopes. Shared reads alone never warn. Warnings do not block admission or grant write authority.",
                 "items": {
                     "type": "object",
                     "properties": {
@@ -383,13 +383,16 @@ fn spawn_agent_output_schema_v2(hide_agent_metadata: bool) -> Value {
                         "task_name": {"type": ["string", "null"]},
                         "agent_path": {"type": ["string", "null"]},
                         "thread_id": {"type": ["string", "null"]},
-                        "kind": {"enum": ["potential_duplicate", "independent_verification", "related_work"]},
+                        "kind": {"enum": ["write_scope_conflict"]},
                         "objective_matches": {"type": "boolean"},
                         "deliverable_overlap": {"type": "boolean"},
                         "contract_overlap": {"type": "boolean"},
-                        "scope_overlap": {"type": "boolean"}
+                        "scope_overlap": {"type": "boolean"},
+                        "existing_write_scope": {"type": "object", "properties": {"path": {"type": "string"}, "recursive": {"type": "boolean"}}, "required": ["path", "recursive"], "additionalProperties": false},
+                        "requested_write_scope": {"type": "object", "properties": {"path": {"type": "string"}, "recursive": {"type": "boolean"}}, "required": ["path", "recursive"], "additionalProperties": false},
+                        "next_action": {"type": "string"}
                     },
-                    "required": ["assignment_id", "attempt_id", "task_name", "agent_path", "thread_id", "kind", "objective_matches", "deliverable_overlap", "contract_overlap", "scope_overlap"],
+                    "required": ["assignment_id", "attempt_id", "task_name", "agent_path", "thread_id", "kind", "objective_matches", "deliverable_overlap", "contract_overlap", "scope_overlap", "existing_write_scope", "requested_write_scope", "next_action"],
                     "additionalProperties": false
                 }
             }
@@ -602,7 +605,7 @@ fn spawn_agent_common_properties_v2() -> BTreeMap<String, JsonSchema> {
         ),
         (
             "independent_verification".to_string(),
-            JsonSchema::boolean(Some("Default false. Declare intentionally independent verification rather than redundant implementation. Changes advisory overlap classification only, not permissions, runtime profile or acceptance.".into())),
+            JsonSchema::boolean(Some("Default false. Record that the task is intentionally independent verification. Does not change write-conflict warnings, permissions, runtime profile, or acceptance.".into())),
         ),
         (
             "message".to_string(),
@@ -680,9 +683,31 @@ fn writable_assignment_schema() -> JsonSchema {
         ("kind".into(), JsonSchema::string_enum(vec![json!("create"), json!("delete"), json!("move")], None)),
     ]), Some(vec!["kind".into()]), Some(false.into()));
     let strings = JsonSchema::array(JsonSchema::string(None), None);
+    let relation = JsonSchema::object(BTreeMap::from([
+        ("kind".into(), JsonSchema::string_enum(vec![json!("review"), json!("verification"), json!("integration")], None)),
+        ("target_assignment_ids".into(), strings.clone()),
+    ]), Some(vec!["kind".into(), "target_assignment_ids".into()]), Some(false.into()));
+    let architecture_contract_ref = JsonSchema::object(BTreeMap::from([
+        ("architect_assignment_id".into(), JsonSchema::string(None)),
+        ("architect_attempt_id".into(), JsonSchema::string(None)),
+        ("contract_version".into(), JsonSchema::integer(None)),
+        ("contract_sha256".into(), JsonSchema::string(None)),
+    ]), Some(vec!["architect_assignment_id".into(), "architect_attempt_id".into(), "contract_version".into(), "contract_sha256".into()]), Some(false.into()));
     JsonSchema {
         description: Some("Required for writable workers, mutually exclusive with message. Declare exact write scopes, typed path/create/delete/move prohibitions, nonempty assignment-specific criteria with owned source-inspection policies, required evidence, and stop condition. Source manifests and complete observed handoff deltas are verified; missing/invalid/oversized capture rejects launch. Opaque commands, external IO and nested delegation cannot enforce this footprint; the root owns builds and integration. Historical evidence is never promoted to current correctness.".into()),
         ..JsonSchema::object(BTreeMap::from([
+            ("role".into(), JsonSchema::string_enum(
+                vec![json!("worker"), json!("explorer"), json!("architect"), json!("reviewer"), json!("verifier"), json!("integrator")],
+                Some("Default worker. Architect, explorer, reviewer and verifier require empty write_scope. Worker and integrator require nonempty write_scope. Does not replace runtime configuration or expand permissions.".into())
+            )),
+            ("relation".into(), JsonSchema {
+                description: Some("Required for reviewer (review) and verifier (verification) with exactly one same-root target whose current receipt is sealed, even if not accepted; integrator (integration) requires one or more distinct accepted targets. Every target must be a declared dependency. Omit for other roles.".into()),
+                ..relation
+            }),
+            ("architecture_contract_ref".into(), JsonSchema {
+                description: Some("Worker only. Exact sealed contract reference from a declared architect dependency. The worker assignment must match the normalized contract.".into()),
+                ..architecture_contract_ref
+            }),
             ("objective".into(), JsonSchema::string(None)),
             ("acceptance_criteria".into(), JsonSchema::array(criterion, None)),
             ("read_scope".into(), JsonSchema {
@@ -695,6 +720,17 @@ fn writable_assignment_schema() -> JsonSchema {
             ("prohibited_changes".into(), JsonSchema::array(JsonSchema::one_of(vec![paths, operations], None), Some("Typed prohibitions only, e.g. [{\"kind\":\"delete\"},{\"kind\":\"move\"}]; use [] when no extra prohibition is needed. Free-text strings are not valid write contracts.".into()))),
             ("risk_hints".into(), strings.clone()),
             ("contract_claims".into(), strings.clone()),
+            ("relevant_handles".into(), JsonSchema::array(JsonSchema::one_of(vec![
+                JsonSchema::object(BTreeMap::from([
+                    ("kind".into(), JsonSchema::string_enum(vec!["file".into()], None)),
+                    ("path".into(), JsonSchema::string(None)),
+                ]), Some(vec!["kind".into(), "path".into()]), Some(false.into())),
+                JsonSchema::object(BTreeMap::from([
+                    ("kind".into(), JsonSchema::string_enum(vec!["symbol".into()], None)),
+                    ("path".into(), JsonSchema::string(None)),
+                    ("symbol".into(), JsonSchema::string(None)),
+                ]), Some(vec!["kind".into(), "path".into(), "symbol".into()]), Some(false.into())),
+            ], None), Some("Optional repository-relative file or symbol hints within the declared task scopes. The child receives the locators and whether their paths existed at admission. Does not grant read or write authority.".into()))),
             ("dependencies".into(), strings),
         ]), Some(vec!["objective".into(), "acceptance_criteria".into(), "read_scope".into(), "write_scope".into(), "stop_condition".into(), "required_evidence".into(), "prohibited_changes".into()]), Some(false.into()))
     }

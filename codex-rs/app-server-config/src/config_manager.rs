@@ -339,7 +339,7 @@ impl ConfigManager {
             Err(err) => {
                 warn!(
                     error = %err,
-                    "failed to sync default client residency requirement after auth refresh"
+                    "failed to recheck managed app-server requirements"
                 );
                 false
             }
@@ -351,6 +351,10 @@ impl ConfigManager {
             .remote_control_handle
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+    }
+
+    pub fn recheck_remote_policy_after_config_mutation(&self) {
+        self.requirements_sync_retry.notify_one();
     }
 
     pub fn policy_generation(&self) -> u64 {

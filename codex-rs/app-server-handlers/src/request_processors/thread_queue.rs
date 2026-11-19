@@ -1088,12 +1088,31 @@ impl ThreadQueueRequestProcessor {
                 origin.client_name,
                 origin.client_version,
                 origin.supports_openai_form_elicitation,
-                turn_id,
+                turn_id.clone(),
                 cancellation,
             )
             .await;
         match result {
             Ok(response) => {
+                if response.turn.id != turn_id
+                    && let Some(pending) = queue.pending_start.as_mut()
+                {
+                    // A retained direct submission won the identity. Persist
+                    // the actual owner before reporting success so cold and
+                    // live recovery both check the original input's custody.
+                    pending.turn_id.clone_from(&response.turn.id);
+                    self.save(id, &mut queue).await?;
+                    self.recover(id, &mut queue).await?;
+                    if queue.pending_start.is_none()
+                        && !queue.accepted.iter().any(|receipt| receipt.submission.id == item.id)
+                    {
+                        let mut error = invalid_request("the original submission input could not be reconciled; the queue entry was retained");
+                        error.data = Some(serde_json::json!({
+                            "reason": "submissionOutcomeUnknown", "turnId": response.turn.id,
+                        }));
+                        return Err(error);
+                    }
+                }
                 // Keep pending_start and its input until persisted history takes
                 // custody. The input event reconciles that handoff; completion
                 // and later queue requests remain recovery paths.

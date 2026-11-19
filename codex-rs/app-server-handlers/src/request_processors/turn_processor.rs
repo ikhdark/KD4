@@ -1009,7 +1009,23 @@ impl TurnRequestProcessor {
                 turn.surfaced_result = event.surfaced_result;
             }
             Some(codex_protocol::protocol::EventMsg::TurnAborted(event)) => {
-                turn.status = TurnStatus::Interrupted;
+                turn.status = codex_app_server_protocol_projection::turn_abort_status(&event.reason);
+                if turn.status == TurnStatus::Failed {
+                    turn.error = active.as_ref().and_then(|snapshot| snapshot.error.clone());
+                    if turn.error.is_none() && thread.rollout_path().is_some() {
+                        // A cold retry may not have a listener projection. The
+                        // terminal event itself does not carry the earlier Error.
+                        match thread.load_history(/*include_archived*/ false).await {
+                            Ok(history) => {
+                                turn.error = codex_app_server_protocol_projection::build_turns_from_rollout_items_with_items_view(
+                                    &history.items, TurnItemsView::NotLoaded,
+                                ).into_iter().find(|snapshot| snapshot.id == turn_id)
+                                    .and_then(|snapshot| snapshot.error);
+                            }
+                            Err(error) => tracing::debug!(%error, %turn_id, "could not recover aborted turn error detail"),
+                        }
+                    }
+                }
                 turn.completed_at = event.completed_at;
                 turn.duration_ms = event.duration_ms;
                 turn.timing = event.timing;

@@ -50,6 +50,7 @@ pub(super) enum ClientSegmentObservation {
     Forward(Box<ClientEnvelope>),
     Reassembled(Box<ClientEnvelope>, Arc<Vec<u8>>),
     Pending,
+    RestartRequired(Box<ClientEnvelope>),
     Dropped,
 }
 
@@ -135,8 +136,10 @@ impl ClientSegmentReassembler {
             self.remove_assembly(&envelope.client_id, &stream_id);
         }
         if !self.assemblies.contains_key(&key) {
-            if segment_id != 0
-                || message_size_bytes
+            if segment_id != 0 {
+                return ClientSegmentObservation::RestartRequired(Box::new(envelope));
+            }
+            if message_size_bytes
                     > REMOTE_CONTROL_SEGMENT_ASSEMBLY_MAX_BYTES.saturating_sub(self.reserved_bytes)
             {
                 return ClientSegmentObservation::Dropped;
@@ -271,24 +274,6 @@ impl ClientSegmentReassembler {
         self.remove_assembly(client_id, stream_id);
         self.completed.retain(|(client, stream, _), raw| {
             if client == client_id && stream == stream_id {
-                self.reserved_bytes -= raw.len();
-                false
-            } else { true }
-        });
-    }
-
-    pub(super) fn invalidate_client(&mut self, client_id: &ClientId) {
-        let keys = self
-            .assemblies
-            .keys()
-            .filter(|(client, _)| client == client_id)
-            .cloned()
-            .collect::<Vec<_>>();
-        for (client, stream) in keys {
-            self.remove_assembly(&client, &stream);
-        }
-        self.completed.retain(|(client, _, _), raw| {
-            if client == client_id {
                 self.reserved_bytes -= raw.len();
                 false
             } else { true }

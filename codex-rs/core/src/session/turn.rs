@@ -97,6 +97,7 @@ use crate::plugins::build_plugin_injections;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_retry::AccountChangeWait;
+use crate::responses_retry::ResponsesRecoveryWait;
 use crate::responses_retry::ResponsesStreamRequest;
 use crate::responses_retry::ResponsesStreamRetryState;
 use crate::responses_retry::handle_retryable_response_stream_error;
@@ -314,15 +315,16 @@ async fn finish_stopped_session_start(
     }
 }
 
-pub(crate) fn run_turn(
+pub(crate) fn run_turn<'a>(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     turn_extension_data: Arc<codex_extension_api::ExtensionData>,
     input: Vec<TurnInput>,
     prewarmed_client_session: Option<ModelClientSession>,
-    logical_generation_budget: &mut LogicalGenerationBudget,
+    final_response_client_session: &'a mut Option<ModelClientSession>,
+    logical_generation_budget: &'a mut LogicalGenerationBudget,
     cancellation_token: CancellationToken,
-) -> impl std::future::Future<Output = CodexResult<TurnTaskResult>> + '_ {
+) -> impl std::future::Future<Output = CodexResult<TurnTaskResult>> + 'a {
     // Return pointer-sized storage so callers do not reserve a second copy of
     // this state machine in their own polling frames before Box::pin runs.
     Box::pin(async move {
@@ -1417,10 +1419,16 @@ pub(crate) fn run_turn(
                         }
                         // Reconcile owner-derived task debt before any effectful hook.
                         // Terminal-only repairs and explicit stops cannot reopen work.
+                        // Sealing an authored worker receipt also ends this turn's
+                        // tool authority. Report remaining debt without asking for
+                        // a plan tool call that the router will reject.
                         if kd4_runtime
                             && !generation_request.terminal_completion_only
                             && !stop_hook_active
                             && finalized_mutation_revision.is_none()
+                            && turn_context.extension_data
+                                .get::<crate::agent::task_coordinator::AuthoredReceiptSealed>()
+                                .is_none()
                             && let Some(text) = turn_execution.take_completion_reconciliation()
                             && admit_regular_follow_up(
                                 sess.as_ref(),
@@ -1949,6 +1957,13 @@ pub(crate) fn run_turn(
             }
         }
 
+        if accepted_final_message.is_some()
+            && !subagent_context_budget_reached
+            && !defer_pending_input
+            && turn_context.post_tool_stop_reason.get().is_none()
+        {
+            *final_response_client_session = Some(client_session);
+        }
         Ok(TurnTaskResult {
             stop_cause: subagent_context_budget_reached
                 .then_some(codex_protocol::protocol::TurnExecutionStopCause::SubagentContextBudget),
@@ -5066,6 +5081,7 @@ fn run_auto_compact<'a>(
             turn_context.config.compact_prompt.as_deref(),
         );
         let mut compact_locally = !remote_compaction;
+        let mut recovery_wait = ResponsesRecoveryWait::default();
         if remote_compaction {
             emit_compact_metric(
                 &sess.services.session_telemetry,
@@ -5081,6 +5097,7 @@ fn run_auto_compact<'a>(
                 reason,
                 phase,
                 /*emit_error_event*/ false,
+                &mut recovery_wait,
                 cancellation_token,
             )
             .await;
@@ -5122,6 +5139,7 @@ fn run_auto_compact<'a>(
                     &remote_error,
                     sess.as_ref(),
                     turn_context.as_ref(),
+                    &mut recovery_wait,
                     cancellation_token,
                 )
                 .await?;
@@ -5157,6 +5175,7 @@ fn run_auto_compact<'a>(
                 reason,
                 phase,
                 /*emit_error_event*/ false,
+                &mut recovery_wait,
                 cancellation_token,
             )
             .await;
@@ -5184,6 +5203,7 @@ fn run_auto_compact<'a>(
                         &previous_error,
                         sess.as_ref(),
                         turn_context.as_ref(),
+                        &mut recovery_wait,
                         cancellation_token,
                     )
                     .await?;
@@ -5200,6 +5220,7 @@ fn run_auto_compact<'a>(
                         reason,
                         phase,
                         /*emit_error_event*/ false,
+                        &mut recovery_wait,
                         cancellation_token,
                     )
                     .await;
@@ -5430,7 +5451,8 @@ fn run_sampling_request<'a>(
         drop(worker_preparation_guard);
         client_session.refresh_transport_after_cooldown();
         let max_retries = turn_context.provider.info().stream_max_retries();
-        let mut retry_state = ResponsesStreamRetryState::new(max_retries);
+        let mut recovery_wait = ResponsesRecoveryWait::default();
+        let mut retry_state = ResponsesStreamRetryState::new(max_retries, &mut recovery_wait);
         let recovery_episode_id = format!("{}:{}", generation_id.turn_id, generation_id.ordinal);
         let mut outer_attempt_ordinal = 0_u64;
         let mut outer_retry_reason = "initial";

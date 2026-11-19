@@ -161,11 +161,15 @@ impl ClientTracker {
         client_id: &ClientId,
         stream_id: Option<&StreamId>,
     ) -> bool {
-        let Some(stream_id) = stream_id.or_else(|| self.legacy_stream_ids.get(client_id)) else {
+        let Some(stream_id) = stream_id.or_else(|| self.legacy_stream_id(client_id)) else {
             return false;
         };
         self.clients
             .contains_key(&(client_id.clone(), stream_id.clone()))
+    }
+
+    pub(super) fn legacy_stream_id(&self, client_id: &ClientId) -> Option<&StreamId> {
+        self.legacy_stream_ids.get(client_id)
     }
 
     async fn drain_join_set(&mut self) {
@@ -191,14 +195,12 @@ impl ClientTracker {
             Some(stream_id) => stream_id,
             None if is_initialize => {
                 // TODO(ruslan): delete this fallback once all clients are updated to send stream_id.
-                self.legacy_stream_ids
-                    .get(&client_id)
+                self.legacy_stream_id(&client_id)
                     .cloned()
                     .unwrap_or_else(StreamId::new_random)
             }
             None => self
-                .legacy_stream_ids
-                .get(&client_id)
+                .legacy_stream_id(&client_id)
                 .cloned()
                 .unwrap_or_else(|| {
                     if matches!(&event, ClientEvent::Ping) {

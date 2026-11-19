@@ -636,8 +636,9 @@ async fn run_main_owned(
     set_default_client_residency_requirement(config.enforce_residency.value());
 
     // Defaults support configuration repair, not permission to bypass unresolved policy.
-    let remote_control_policy = if !config_resolved
-        || config
+    let remote_control_policy = if !config_resolved {
+        RemoteControlPolicy::Unresolved
+    } else if config
             .config_layer_stack
             .requirements()
             .allow_remote_control
@@ -652,11 +653,15 @@ async fn run_main_owned(
     let remote_control_explicitly_requested =
         remote_control_startup_mode == RemoteControlStartupMode::EnabledEphemeral;
     if remote_control_explicitly_requested
-        && remote_control_policy == RemoteControlPolicy::DisabledByRequirements
+        && remote_control_policy != RemoteControlPolicy::Allowed
     {
         return Err(std::io::Error::new(
             ErrorKind::InvalidInput,
-            "remote control is disabled by managed requirements",
+            if remote_control_policy == RemoteControlPolicy::Unresolved {
+                "remote-control policy could not be resolved from the startup configuration"
+            } else {
+                "remote control is disabled by managed requirements"
+            },
         ));
     }
 

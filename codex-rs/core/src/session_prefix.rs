@@ -10,6 +10,7 @@ use codex_utils_output_truncation::truncate_text;
 use sha2::Digest;
 use sha2::Sha256;
 
+use crate::agent::status::AgentHandoff;
 use crate::context::InterAgentCompletionMessage;
 use crate::context::SubagentNotification;
 
@@ -64,6 +65,7 @@ pub(crate) async fn inter_agent_completion_communication_with_diagnostics(
     sender: AgentPath,
     sender_thread_id: ThreadId,
     status: &AgentStatus,
+    handoff: Option<AgentHandoff>,
     receipt: Option<&str>,
     protected_host_summary: Option<&str>,
 ) -> Result<Option<InterAgentCommunication>, String> {
@@ -72,11 +74,15 @@ pub(crate) async fn inter_agent_completion_communication_with_diagnostics(
     }
     // Retain first, in the recipient's existing artifact namespace. A bounded
     // handoff must never be the only surviving copy of a report or surfaced result.
-    let canonical = codex_tools::CanonicalToolResult::json(serde_json::json!({
+    let mut retained = serde_json::json!({
         "sender": sender, "source_thread_id": sender_thread_id,
         "status": status, "receipt": receipt, "host_diagnostics": protected_host_summary,
         "evidence_retrieval": "For evidence IDs produced by this child, call read_tool_output with source_thread_id set to this report's source_thread_id; retain that argument on every continuation. Only an ancestor is authorized.",
-    }));
+    });
+    if let Some(handoff) = handoff {
+        retained["handoff_kind"] = serde_json::json!(handoff);
+    }
+    let canonical = codex_tools::CanonicalToolResult::json(retained);
     let artifact = crate::tools::command_output_artifact::create_tool_history_output_artifact(
         codex_home, &parent_thread_id.to_string(), &canonical,
     ).await;
@@ -94,6 +100,7 @@ pub(crate) async fn inter_agent_completion_communication_with_diagnostics(
         task_name.clone(),
         sender.clone(),
         status,
+        handoff,
         Some(receipt),
         protected_host_summary,
     ).ok_or_else(|| "terminal result has no completion envelope".to_string());
@@ -142,6 +149,7 @@ fn format_inter_agent_completion_message_with_diagnostics(
     task_name: AgentPath,
     sender: AgentPath,
     status: &AgentStatus,
+    handoff: Option<AgentHandoff>,
     receipt: Option<&str>,
     protected_host_summary: Option<&str>,
 ) -> Option<(String, bool)> {
@@ -203,6 +211,24 @@ fn format_inter_agent_completion_message_with_diagnostics(
             ..
         } => String::new(),
         AgentStatus::Errored(error) => {
+            if let Some(handoff) = handoff {
+                let heading = match handoff {
+                    AgentHandoff::NeedsMain => "Agent handback — needs main action.",
+                    AgentHandoff::Blocked => "Agent handback — blocked.",
+                };
+                let protected = match protected_host_summary.filter(|summary| !summary.is_empty()) {
+                    Some(summary) => format!("{heading}\n\n{summary}"),
+                    None => heading.to_string(),
+                };
+                return Some(format_bounded_inter_agent_completion_message(
+                    task_name,
+                    sender,
+                    without_protected_prefix(error, protected_host_summary),
+                    TYPED_COMPLETION_NEXT_ACTION,
+                    receipt,
+                    Some(&protected),
+                ));
+            }
             return Some(format_bounded_inter_agent_completion_message(
                 task_name,
                 sender,

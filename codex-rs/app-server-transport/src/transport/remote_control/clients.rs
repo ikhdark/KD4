@@ -315,6 +315,10 @@ fn ensure_success_response(
     if status.is_success() {
         return Ok(());
     }
+    if status.as_u16() == 429 || status.is_server_error() {
+        let retry_at = super::server_api::parse_retry_after(headers, time::OffsetDateTime::now_utc());
+        return Err(io::Error::other(super::RemoteControlServiceDeferred(retry_at)));
+    }
     let error_kind = match status.as_u16() {
         400 => ErrorKind::InvalidInput,
         401 | 403 => ErrorKind::PermissionDenied,

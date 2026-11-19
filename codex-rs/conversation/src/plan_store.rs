@@ -511,6 +511,8 @@ impl PlanState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanExecutionSnapshot {
     pub revision: String,
+    /// Checklist and original obligations, excluding the model's explanation.
+    pub progress_revision: String,
     pub obligations: PlanObligationSummary,
     /// Exact owner text for terminal diagnostics, including pinned obligations.
     pub requirement_texts: BTreeMap<String, String>,
@@ -945,8 +947,12 @@ impl PlanStore {
                 let requirement_texts = obligations.unresolved.iter().filter_map(|id| {
                     lineage.requirements.get(id).map(|requirement| (id.clone(), requirement.text.clone()))
                 }).collect();
+                #[expect(clippy::expect_used, reason = "checklist and lineage serialize to JSON")]
+                let progress_bytes = serde_json::to_vec(&(&plan.plan, lineage))
+                    .expect("plan progress serializes");
                 Some(PlanExecutionSnapshot {
                     revision: current.revision().to_string(),
+                    progress_revision: hex::encode(Sha256::digest(progress_bytes)),
                     obligations,
                     requirement_texts,
                     has_steps: !plan.plan.is_empty(),

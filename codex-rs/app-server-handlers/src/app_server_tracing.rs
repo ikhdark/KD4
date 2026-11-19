@@ -13,6 +13,7 @@ use crate::transport::AppServerTransport;
 use codex_app_server_protocol_types::ClientRequest;
 use codex_app_server_protocol_types::InitializeParams;
 use codex_app_server_protocol_types::JSONRPCRequest;
+use codex_app_server_protocol_types::RequestId;
 use codex_otel::set_parent_from_context;
 use codex_otel::set_parent_from_w3c_trace_context;
 use codex_otel::traceparent_context_from_env;
@@ -95,7 +96,7 @@ fn transport_name(transport: &AppServerTransport) -> &'static str {
 fn app_server_request_span_template(
     method: &str,
     transport: &'static str,
-    request_id: &impl std::fmt::Display,
+    request_id: &RequestId,
     connection_id: ConnectionId,
 ) -> Span {
     info_span!(
@@ -106,6 +107,9 @@ fn app_server_request_span_template(
         rpc.method = method,
         rpc.transport = transport,
         rpc.request_id = %request_id,
+        rpc.request_key_sha256_v1 = %codex_app_server_transport::rpc_request_key_v1(request_id),
+        rpc.clock_id = codex_protocol::timing::process_clock_domain_id(),
+        rpc.operation_id = field::Empty,
         app_server.connection_id = %connection_id,
         app_server.api_version = "v2",
         app_server.client_name = field::Empty,

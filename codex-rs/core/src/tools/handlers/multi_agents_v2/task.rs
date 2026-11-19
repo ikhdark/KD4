@@ -13,6 +13,9 @@ use codex_agent_task_store::AssignmentId;
 use codex_agent_task_store::Attempt;
 use codex_agent_task_store::AttemptAmendment;
 use codex_agent_task_store::AttemptId;
+use codex_agent_task_store::CriterionEvidenceKind;
+use codex_agent_task_store::CriterionEvidenceRef;
+use codex_agent_task_store::CriterionEvidenceRequirement;
 use codex_agent_task_store::CriterionResult;
 use codex_agent_task_store::CriterionStatus;
 use codex_agent_task_store::DEFAULT_OBSERVATION_LIMIT;
@@ -297,6 +300,8 @@ async fn handle_submit_agent_receipt(
     } else { None };
     let receipt = store.submit_agent_receipt(binding.attempt_id, draft).await
         .map_err(|error| task_store_error(SUBMIT_AGENT_RECEIPT_TOOL, error))?;
+    turn.extension_data
+        .insert(crate::agent::task_coordinator::AuthoredReceiptSealed);
     coordinator.mark_task_inactive(binding.assignment_id);
     coordinator
         .maybe_emit_terminal_metrics(binding.assignment_id, &turn.session_telemetry)
@@ -762,13 +767,48 @@ struct SubmitAgentReceiptArgs {
 
 impl SubmitAgentReceiptArgs {
     fn into_receipt_draft(self, task: &AgentTask) -> Result<ReceiptDraft, FunctionCallError> {
-        let criterion_results = self
+        let mut criterion_results = self
             .criterion_results
             .into_iter()
             .map(|criterion| criterion.into_criterion_result(task))
             .collect::<Result<Vec<_>, _>>()?;
-        // Infer only cited calls, not every call the attempt executed. Explicit lists retain
-        // their meaning and the store still validates ownership, success, epoch, and coverage.
+        if self.status == AgentStatusClaim::Completed
+            && self.validation_call_ids.is_none()
+            && criterion_results.iter().all(|result| result.evidence_ref.is_none())
+        {
+            let attempt = &task.current_attempt;
+            let criteria = task.assignment.effective_criteria(attempt.amendment.as_ref());
+            for result in &mut criterion_results {
+                if result.status != CriterionStatus::Passed {
+                    continue;
+                }
+                let Some(requirement) = criteria.iter()
+                    .find(|criterion| criterion.id == result.criterion_id)
+                    .and_then(|criterion| criterion.evidence_policy.as_ref())
+                    .filter(|policy| policy.kind == CriterionEvidenceRequirement::SourceInspection)
+                    .and_then(|policy| policy.required_evidence.as_deref())
+                else {
+                    continue;
+                };
+                let mut acquisitions = task.validation_calls.iter().filter(|call| {
+                    call.attempt_id == attempt.attempt_id
+                        && call.command_summary == requirement
+                        && call.verified_evidence_kind() == Some(CriterionEvidenceKind::SourceInspection)
+                });
+                if let (Some(call), None) = (acquisitions.next(), acquisitions.next())
+                    && let Some(evidence_epoch) = call.evidence.end_epoch
+                {
+                    result.evidence_ref = Some(CriterionEvidenceRef {
+                        call_id: call.call_id.clone(),
+                        workspace_id: task.assignment.workspace_id.clone(),
+                        evidence_epoch,
+                        kind: CriterionEvidenceKind::SourceInspection,
+                    });
+                }
+            }
+        }
+        // Include explicit or auto-bound citations, not every call the attempt executed.
+        // The store still validates ownership, success, epoch, and applicability.
         let validation_call_ids = self.validation_call_ids.unwrap_or_else(|| {
             criterion_results
                 .iter()
@@ -2012,7 +2052,7 @@ fn submit_agent_receipt_spec() -> ToolSpec {
             (
                 "evidence",
                 JsonSchema::string(Some(
-                    "Optional short explanation when the evidence needs interpretation. Reuse evidence_ref across criteria instead of repeating command results; without a reference the reported outcome remains unverified.".to_string(),
+                    "Optional short explanation when evidence needs interpretation. With no explicit evidence selection in a completed receipt, the harness can attach a unique owned source acquisition matching an inspect:path criterion. The store still validates its applicability; this does not infer execution coverage or correctness.".to_string(),
                 )),
             ),
             (

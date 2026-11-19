@@ -23,6 +23,7 @@ use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadRolledBackEvent;
+use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
@@ -39,6 +40,13 @@ use changes::ThreadHistoryChangeAccumulator;
 pub use changes::ThreadHistoryChangeSet;
 pub use changes::ThreadHistoryItemChange;
 pub use changes::ThreadHistoryTurnChange;
+
+pub fn turn_abort_status(reason: &TurnAbortReason) -> TurnStatus {
+    match reason {
+        TurnAbortReason::InternalError | TurnAbortReason::ProcessLost => TurnStatus::Failed,
+        _ => TurnStatus::Interrupted,
+    }
+}
 
 /// Convert persisted [`RolloutItem`] entries into a sequence of [`Turn`] values.
 ///
@@ -925,15 +933,7 @@ impl ThreadHistoryBuilder {
     }
 
     fn handle_turn_aborted(&mut self, payload: &TurnAbortedEvent) {
-        let abort_status = if matches!(
-            payload.reason,
-            codex_protocol::protocol::TurnAbortReason::InternalError
-                | codex_protocol::protocol::TurnAbortReason::ProcessLost
-        ) {
-            TurnStatus::Failed
-        } else {
-            TurnStatus::Interrupted
-        };
+        let abort_status = turn_abort_status(&payload.reason);
         let apply_abort = |turn: &mut PendingTurn| {
             turn.status = abort_status.clone();
             turn.completed_at = payload.completed_at;

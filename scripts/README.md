@@ -16,6 +16,8 @@ do not belong here.
 - `install/`: install and publish the CLI and Code Mode host.
 - `codex_package/`: construct and stage distributable packages.
 - `common/`: shared file locking, atomic writes and process-tree cleanup.
+- [`inference/`](inference/README.md): opt-in, loopback-only presets for a pinned
+  local llama.cpp engine. These do not change the KD4 provider or model.
 
 Run Cargo directly from `codex-rs`, or use
 `just cargo-lane <lane> cargo <command> ...` from the checkout root to reuse
