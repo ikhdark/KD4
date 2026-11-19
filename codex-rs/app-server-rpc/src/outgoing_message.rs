@@ -209,8 +209,26 @@ struct ActiveConnection {
     outstanding_bytes: Arc<tokio::sync::Semaphore>,
     initialized: Arc<AtomicBool>,
     supports_openai_form_elicitation: bool,
+    file_change_effects: bool,
     remote_control: bool,
     delivery_failure: CancellationToken,
+}
+
+/// Settled whole-file bodies carried by a completed file change, when present.
+fn completed_file_change_effects(
+    notification: &mut ServerNotification,
+) -> Option<&mut Option<codex_protocol::items::FileChangeEffects>> {
+    match notification {
+        ServerNotification::ItemCompleted(completed) => match &mut completed.item {
+            codex_app_server_protocol_types::ThreadItem::FileChange { effects, .. }
+                if effects.is_some() =>
+            {
+                Some(effects)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 impl ActiveConnection {
@@ -471,10 +489,7 @@ impl ThreadScopedOutgoingMessageSender {
         let ServerNotification::TurnCompleted(completed) = &notification else {
             if !self.connection_ids.is_empty() {
                 self.outgoing
-                    .send_server_notification_to_connections(
-                        self.connection_ids.as_slice(),
-                        notification,
-                    )
+                    .send_thread_notification(self.connection_ids.as_slice(), notification)
                     .await;
             }
             return;
@@ -577,7 +592,7 @@ impl ThreadScopedOutgoingMessageSender {
             return;
         }
         self.outgoing
-            .send_server_notification_to_connections(self.connection_ids.as_slice(), notification)
+            .send_thread_notification(self.connection_ids.as_slice(), notification)
             .await;
     }
 
@@ -823,6 +838,7 @@ impl OutgoingMessageSender {
                 outstanding_bytes: Arc::new(tokio::sync::Semaphore::new(16 * 1024 * 1024)),
                 initialized,
                 supports_openai_form_elicitation: false,
+                file_change_effects: false,
                 remote_control: matches!(
                     origin,
                     codex_app_server_transport::ConnectionOrigin::RemoteControl
@@ -840,6 +856,62 @@ impl OutgoingMessageSender {
         if let Some(connection) = self.active_connections.lock().await.get_mut(&connection_id) {
             connection.supports_openai_form_elicitation = supported;
         }
+    }
+
+    pub async fn set_connection_file_change_effects(
+        &self,
+        connection_id: ConnectionId,
+        requested: bool,
+    ) {
+        if let Some(connection) = self.active_connections.lock().await.get_mut(&connection_id) {
+            connection.file_change_effects = requested;
+        }
+    }
+
+    /// Delivers a thread notification, keeping settled file bodies for the
+    /// connections that requested them. Every completed file change otherwise
+    /// repeats whole files to clients that only render the diff.
+    async fn send_thread_notification(
+        &self,
+        connection_ids: &[ConnectionId],
+        mut notification: ServerNotification,
+    ) {
+        if completed_file_change_effects(&mut notification).is_some() {
+            let requested: Vec<ConnectionId> = {
+                let active_connections = self.active_connections.lock().await;
+                connection_ids
+                    .iter()
+                    .copied()
+                    .filter(|connection_id| {
+                        active_connections
+                            .get(connection_id)
+                            .is_some_and(|connection| connection.file_change_effects)
+                    })
+                    .collect()
+            };
+            if requested.len() != connection_ids.len() {
+                if !requested.is_empty() {
+                    self.send_server_notification_to_connections(&requested, notification.clone())
+                        .await;
+                }
+                if let Some(effects) = completed_file_change_effects(&mut notification) {
+                    *effects = None;
+                }
+                let remaining: Vec<ConnectionId> = connection_ids
+                    .iter()
+                    .copied()
+                    .filter(|connection_id| !requested.contains(connection_id))
+                    .collect();
+                // An empty target list means broadcast; never widen delivery here.
+                if !remaining.is_empty() {
+                    self.send_server_notification_to_connections(&remaining, notification)
+                        .await;
+                }
+                return;
+            }
+        }
+        self.send_server_notification_to_connections(connection_ids, notification)
+            .await;
     }
 
     pub async fn connection_is_remote_control(&self, connection_id: ConnectionId) -> bool {

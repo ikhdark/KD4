@@ -616,6 +616,9 @@ async fn send_message_to_connection(
         // Queue saturation is a local, explicit delivery failure. Durable
         // thread state remains available to surviving/reconnecting clients.
         warn!(?connection_id, "retiring stdio connection after bounded output admission failed");
+        // A stdio client that asked to reattach gets a replacement connection on
+        // the same pipes; the transport needs the reason before the cancel.
+        codex_app_server_transport::note_stdio_output_retirement(connection_id);
         disconnect_connection(connections, connection_id)
     }
 }

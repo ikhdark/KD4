@@ -3277,6 +3277,10 @@
           "description": "Opt into receiving experimental API methods and fields.",
           "type": "boolean"
         },
+        "fileChangeEffects": {
+          "description": "Opt into settled before/after file bodies (`effects`) on completed `fileChange` items. They repeat whole files and are omitted otherwise.",
+          "type": "boolean"
+        },
         "mcpServerOpenaiFormElicitation": {
           "description": "Allow downstream MCP servers to request OpenAI extended form elicitations.",
           "type": "boolean"
@@ -3294,6 +3298,10 @@
         "requestAttestation": {
           "default": false,
           "description": "Opt into `attestation/generate` requests for upstream `x-oai-attestation`.",
+          "type": "boolean"
+        },
+        "stdioReattach": {
+          "description": "Opt into a replacement connection when the server retires this stdio connection because its output backlog cannot be admitted. The server then writes one `transport/stdioConnectionRetired` notification and serves a new connection on the same pipes, which must `initialize` again. Without it the retired connection only closes. Ignored on other transports.",
           "type": "boolean"
         }
       },

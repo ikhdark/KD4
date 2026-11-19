@@ -230,9 +230,18 @@ fn parity_check_from_scan_and_rows(
     rows: Vec<ThreadStateAuditRow>,
     mut details: Vec<String>,
 ) -> DoctorCheck {
-    let rollout_by_key = scan
+    // A file may be compressed between two directory entries during the walk.
+    // Keep both physical observations for scan counts, but count an unchanged
+    // path/identity only once for parity. Distinct paths still expose duplicates.
+    let mut seen = HashSet::new();
+    let logical_files: Vec<_> = scan
         .files
         .iter()
+        .filter(|file| seen.insert((&file.key, &file.thread_id, file.archived)))
+        .collect();
+    let rollout_by_key = logical_files
+        .iter()
+        .copied()
         .map(|file| (file.key.clone(), file))
         .collect::<HashMap<_, _>>();
     let row_keys = rows
@@ -243,8 +252,8 @@ fn parity_check_from_scan_and_rows(
     for (row, key) in rows.iter().zip(&row_keys) {
         rows_by_key.entry(key.clone()).or_default().push(row);
     }
-    let missing_active = missing_rollout_paths(&scan.files, &rows_by_key, false);
-    let missing_archived = missing_rollout_paths(&scan.files, &rows_by_key, true);
+    let missing_active = missing_rollout_paths(&logical_files, &rows_by_key, false);
+    let missing_archived = missing_rollout_paths(&logical_files, &rows_by_key, true);
     let scan_complete = !scan.reached_scan_cap && scan.scan_errors.is_empty();
     let mut stale_rows = Vec::new();
     let mut unverified_rows = Vec::new();
@@ -271,7 +280,7 @@ fn parity_check_from_scan_and_rows(
             }
         }
     }
-    let duplicate_rollout_thread_ids = duplicate_rollout_thread_ids(&scan.files);
+    let duplicate_rollout_thread_ids = duplicate_rollout_thread_ids(&logical_files);
     let duplicate_db_paths = duplicate_db_paths(&rows_by_key);
     let archived_rows = rows.iter().filter(|row| row.archived).count();
     let active_rows = rows.len() - archived_rows;
@@ -614,7 +623,7 @@ fn path_key(path: &Path) -> PathBuf {
 }
 
 fn missing_rollout_paths<'a>(
-    files: &'a [RolloutAuditFile],
+    files: &[&'a RolloutAuditFile],
     rows_by_key: &HashMap<PathBuf, Vec<&ThreadStateAuditRow>>,
     archived: bool,
 ) -> Vec<&'a Path> {
@@ -635,7 +644,7 @@ fn has_matching_thread_row(
     rows.iter().any(|row| row.id == file.thread_id.as_str())
 }
 
-fn duplicate_rollout_thread_ids(files: &[RolloutAuditFile]) -> Vec<String> {
+fn duplicate_rollout_thread_ids(files: &[&RolloutAuditFile]) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut duplicates = HashSet::new();
     for thread_id in files.iter().map(|file| file.thread_id.as_str()) {

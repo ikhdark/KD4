@@ -432,19 +432,7 @@ pub(super) fn v8_value_to_json_with_limit(
         return Err(JsonConversionError::TooLarge);
     }
     let json = copy_string(&mut tc, stringified);
-    // V8 emits compact JSON with these ASCII key names unescaped. The object/comma
-    // prefix and colon distinguish keys from string contents. Reject these before
-    // serde_json (raw_value/arbitrary_precision enabled) can reinterpret them as
-    // values and bypass its normal recursion limit (upstream #52681).
-    if [
-        r#"{"$serde_json::private::RawValue":"#,
-        r#","$serde_json::private::RawValue":"#,
-        r#"{"$serde_json::private::Number":"#,
-        r#","$serde_json::private::Number":"#,
-    ]
-    .into_iter()
-    .any(|key| json.contains(key))
-    {
+    if has_reserved_json_object_key(&json) {
         return Err(JsonConversionError::Invalid(
             "failed to serialize JavaScript value: reserved JSON object key".to_string(),
         ));
@@ -454,6 +442,75 @@ pub(super) fn v8_value_to_json_with_limit(
         .map_err(|err| {
             JsonConversionError::Invalid(format!("failed to serialize JavaScript value: {err}"))
         })
+}
+
+// Keep serde_json's raw-value and arbitrary-precision implementation keys out
+// of JSON objects supplied by JavaScript, including pretty-printed helper
+// evidence. Do not classify matching text in a string value as a key.
+fn has_reserved_json_object_key(json: &str) -> bool {
+    fn reserved(key: &str) -> bool {
+        matches!(
+            key,
+            "$serde_json::private::RawValue" | "$serde_json::private::Number"
+        )
+    }
+
+    let bytes = json.as_bytes();
+    if !json.contains("$serde_json::private::") && !bytes.contains(&b'\\') {
+        return false;
+    }
+    let mut index = 0;
+    let mut previous = b' ';
+    while let Some(&byte) = bytes.get(index) {
+        if byte == b'"' {
+            let start = index;
+            let mut escaped = false;
+            index += 1;
+            while let Some(&inner) = bytes.get(index) {
+                match inner {
+                    b'"' => break,
+                    b'\\' => {
+                        escaped = true;
+                        index += 2;
+                    }
+                    _ => index += 1,
+                }
+            }
+            if index >= bytes.len() {
+                break;
+            }
+            if matches!(previous, b'{' | b',')
+                && bytes[index + 1..].iter().find(|b| !b.is_ascii_whitespace()) == Some(&b':')
+            {
+                let spelling = &json[start + 1..index];
+                if (!escaped && reserved(spelling))
+                    || (escaped
+                        && spelling.len() <= "$serde_json::private::RawValue".len() * 6
+                        && serde_json::from_str::<String>(&json[start..=index])
+                            .is_ok_and(|key| reserved(&key)))
+                {
+                    return true;
+                }
+            }
+            previous = b'"';
+        } else if !byte.is_ascii_whitespace() {
+            previous = byte;
+        }
+        index += 1;
+    }
+    false
+}
+
+pub(super) fn decode_helper_graph(json: &str) -> Option<JsonValue> {
+    // The caller may supply the start of a larger diagnostic, so qualify the
+    // first JSON value before parsing any object into serde_json::Value.
+    let raw = serde_json::Deserializer::from_str(json)
+        .into_iter::<&serde_json::value::RawValue>()
+        .next()?
+        .ok()?;
+    (!has_reserved_json_object_key(raw.get()))
+        .then(|| serde_json::from_str(raw.get()).ok())
+        .flatten()
 }
 
 pub(super) fn json_to_v8<'s>(
@@ -576,7 +633,7 @@ pub(super) fn value_to_error_text(
                     .and_then(|value| v8::Local::<v8::String>::try_from(value).ok())
                     .and_then(|json| bounded_string(&mut tc, json, remaining).ok())
                     .and_then(|json| {
-                        let value = serde_json::from_str::<JsonValue>(&json).ok()?;
+                        let value = decode_helper_graph(&json)?;
                         let nodes = value.as_object()?;
                         let rows = nodes.iter().map(|(id, node)| {
                             format!("{}:{}", serde_json::to_string(id).unwrap_or_default(), node)

@@ -177,6 +177,8 @@ pub struct RemoteAppServerConnectArgs {
     pub experimental_api: bool,
     pub mcp_server_openai_form_elicitation: bool,
     pub opt_out_notification_methods: Vec<String>,
+    /// Whether completed file changes should carry settled before/after file bodies.
+    pub file_change_effects: bool,
     /// Capacity for command/event queues and dispatched requests awaiting replies
     /// (clamped to at least one). Excess requests receive a retryable overload error.
     pub channel_capacity: usize,
@@ -189,6 +191,7 @@ impl RemoteAppServerConnectArgs {
             self.experimental_api,
             self.mcp_server_openai_form_elicitation,
             &self.opt_out_notification_methods,
+            self.file_change_effects,
         )
     }
 }

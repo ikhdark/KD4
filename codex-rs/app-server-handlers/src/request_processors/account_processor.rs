@@ -332,8 +332,11 @@ impl AccountRequestProcessor {
     pub(crate) fn clear_external_auth(&self) {
         self.auth_manager.clear_external_auth();
         let plugins_manager = self.thread_manager.plugins_manager();
-        plugins_manager.set_auth_mode(self.auth_manager.get_api_auth_mode());
-        if plugins_manager.invalidate_account_scoped_remote_plugin_caches() {
+        let auth_mode_changed =
+            plugins_manager.set_auth_mode(self.auth_manager.get_api_auth_mode());
+        let remote_plugins_changed =
+            plugins_manager.invalidate_account_scoped_remote_plugin_caches();
+        if auth_mode_changed || remote_plugins_changed {
             Self::spawn_effective_plugins_changed_task(
                 Arc::clone(&self.thread_manager),
                 self.config_manager.clone(),
@@ -358,8 +361,11 @@ impl AccountRequestProcessor {
         auth: Option<CodexAuth>,
     ) {
         let plugins_manager = thread_manager.plugins_manager();
-        plugins_manager.set_auth_mode(auth.as_ref().map(CodexAuth::api_auth_mode));
-        if plugins_manager.invalidate_account_scoped_remote_plugin_caches() {
+        let auth_mode_changed =
+            plugins_manager.set_auth_mode(auth.as_ref().map(CodexAuth::api_auth_mode));
+        let remote_plugins_changed =
+            plugins_manager.invalidate_account_scoped_remote_plugin_caches();
+        if auth_mode_changed || remote_plugins_changed {
             Self::spawn_effective_plugins_changed_task(
                 Arc::clone(thread_manager),
                 config_manager.clone(),

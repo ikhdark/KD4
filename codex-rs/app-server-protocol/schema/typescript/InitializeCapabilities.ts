@@ -19,6 +19,19 @@ requestAttestation: boolean,
  */
 mcpServerOpenaiFormElicitation?: boolean,
 /**
+ * Opt into settled before/after file bodies (`effects`) on completed
+ * `fileChange` items. They repeat whole files and are omitted otherwise.
+ */
+fileChangeEffects?: boolean,
+/**
+ * Opt into a replacement connection when the server retires this stdio
+ * connection because its output backlog cannot be admitted. The server then
+ * writes one `transport/stdioConnectionRetired` notification and serves a
+ * new connection on the same pipes, which must `initialize` again. Without
+ * it the retired connection only closes. Ignored on other transports.
+ */
+stdioReattach?: boolean,
+/**
  * Exact notification method names that should be suppressed for this
  * connection (for example `thread/started`).
  */

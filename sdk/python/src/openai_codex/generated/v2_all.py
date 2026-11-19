@@ -1834,6 +1834,13 @@ class InitializeCapabilities(BaseModel):
             description="Opt into receiving experimental API methods and fields.",
         ),
     ] = False
+    file_change_effects: Annotated[
+        bool | None,
+        Field(
+            alias="fileChangeEffects",
+            description="Opt into settled before/after file bodies (`effects`) on completed `fileChange` items. They repeat whole files and are omitted otherwise.",
+        ),
+    ] = None
     mcp_server_openai_form_elicitation: Annotated[
         bool | None,
         Field(
@@ -1855,6 +1862,13 @@ class InitializeCapabilities(BaseModel):
             description="Opt into `attestation/generate` requests for upstream `x-oai-attestation`.",
         ),
     ] = False
+    stdio_reattach: Annotated[
+        bool | None,
+        Field(
+            alias="stdioReattach",
+            description="Opt into a replacement connection when the server retires this stdio connection because its output backlog cannot be admitted. The server then writes one `transport/stdioConnectionRetired` notification and serves a new connection on the same pipes, which must `initialize` again. Without it the retired connection only closes. Ignored on other transports.",
+        ),
+    ] = None
 
 
 class InitializeParams(BaseModel):

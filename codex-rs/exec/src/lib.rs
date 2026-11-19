@@ -801,6 +801,8 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
         experimental_api: true,
         mcp_server_openai_form_elicitation: false,
         opt_out_notification_methods: json_stream_opt_out_methods(json_mode, json_progress),
+        // Only the JSON stream publishes settled file bodies to its consumer.
+        file_change_effects: json_mode,
         channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
     };
 

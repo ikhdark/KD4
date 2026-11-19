@@ -1388,6 +1388,25 @@ impl ThreadHistoryBuilder {
     fn materialize_item(&self, item: &codex_protocol::items::TurnItem) -> ThreadItem {
         use codex_protocol::items::TurnItem as CoreItem;
         if !self.omit_tool_payloads {
+            // Settled file bodies are a live delivery detail that legacy rollouts
+            // never replay. Retaining them would hold every before/after copy for
+            // the thread's lifetime and return them all from a loaded resume.
+            if let CoreItem::FileChange(file_change) = item
+                && file_change.effects.is_some()
+            {
+                return ThreadItem::from(CoreItem::FileChange(
+                    codex_protocol::items::FileChangeItem {
+                        id: file_change.id.clone(),
+                        effects: None,
+                        environment: file_change.environment.clone(),
+                        changes: file_change.changes.clone(),
+                        status: file_change.status.clone(),
+                        auto_approved: file_change.auto_approved,
+                        stdout: file_change.stdout.clone(),
+                        stderr: file_change.stderr.clone(),
+                    },
+                ));
+            }
             return ThreadItem::from(item.clone());
         }
         match item {

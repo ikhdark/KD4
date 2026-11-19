@@ -99,6 +99,7 @@ impl InitializeRequestProcessor {
         let experimental_api_enabled = capabilities.experimental_api;
         let request_attestation = capabilities.request_attestation;
         let supports_openai_form_elicitation = capabilities.mcp_server_openai_form_elicitation;
+        let file_change_effects = capabilities.file_change_effects;
         let opt_out_notification_methods = capabilities
             .opt_out_notification_methods
             .unwrap_or_default();
@@ -126,6 +127,9 @@ impl InitializeRequestProcessor {
                 connection_id,
                 supports_openai_form_elicitation,
             )
+            .await;
+        self.outgoing
+            .set_connection_file_change_effects(connection_id, file_change_effects)
             .await;
         {
             let mut experimental_api_mode = self

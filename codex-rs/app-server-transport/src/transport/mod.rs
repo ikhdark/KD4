@@ -74,6 +74,7 @@ pub use remote_control::remote_control_response_size_error;
 pub use remote_control::remote_control_user_agent;
 pub use remote_control::start_remote_control;
 pub use remote_control::take_remote_control_disabled_env;
+pub use stdio::note_stdio_output_retirement;
 pub use stdio::start_stdio_connection;
 pub use unix_socket::AppServerStartupLock;
 pub use unix_socket::acquire_app_server_startup_lock;

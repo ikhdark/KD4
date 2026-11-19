@@ -26,6 +26,7 @@ pub use transport::acquire_app_server_startup_lock;
 pub use transport::app_server_control_socket_path;
 pub use transport::app_server_startup_lock_path;
 pub use transport::auth;
+pub use transport::note_stdio_output_retirement;
 pub use transport::preview_remote_notification;
 pub use transport::prepare_control_socket_path;
 pub use transport::remote_control_response_size_error;

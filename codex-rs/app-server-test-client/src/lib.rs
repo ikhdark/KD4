@@ -1390,6 +1390,8 @@ impl CodexClient {
                             .collect(),
                     ),
                     mcp_server_openai_form_elicitation: false,
+                    file_change_effects: false,
+                    stdio_reattach: false,
                 }),
             },
         };

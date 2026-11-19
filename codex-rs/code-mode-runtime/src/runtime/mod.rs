@@ -1268,9 +1268,11 @@ fn send_result(
             // hides it only after matching this host envelope and exact size;
             // admission loss remains explicit and never authorizes replay.
             state.emit_output(FunctionCallOutputContentItem::InputText { text: evidence_text });
-            let nodes = serde_json::Deserializer::from_str(graph).into_iter::<JsonValue>()
-                .next().and_then(Result::ok);
-            let nodes = nodes.as_ref().filter(|_| graph.starts_with("{\n")).and_then(JsonValue::as_object);
+            let nodes = graph
+                .starts_with("{\n")
+                .then(|| value::decode_helper_graph(graph))
+                .flatten();
+            let nodes = nodes.as_ref().and_then(JsonValue::as_object);
             let first_node_line = diagnostic.bytes().filter(|byte| *byte == b'\n').count() + 5;
             let mut summaries = Vec::new();
             let mut summary_bytes = 2;

@@ -15,6 +15,7 @@ use std::io::Read;
 use std::io::Result as IoResult;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
@@ -22,6 +23,7 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -32,6 +34,21 @@ const STDIN_READ_AHEAD: usize = 1;
 const MAX_STDOUT_BATCH_MESSAGES: usize = 64;
 const STDOUT_BATCH_TARGET_BYTES: usize = 64 * 1024;
 const STDOUT_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Notification written on stdout between a stdio connection that the server
+/// retired for output backlog and the connection that replaces it on the same
+/// pipes. Only a client that set `capabilities.stdioReattach` receives it.
+const STDIO_CONNECTION_RETIRED_METHOD: &str = "transport/stdioConnectionRetired";
+
+// The outbound router retires a connection by cancelling a token that the
+// processor and shutdown cancel too. Only an output-backlog retirement keeps the
+// pipes for a reattaching client, so the router names that connection here
+// before it cancels.
+static OUTPUT_RETIRED_CONNECTION: AtomicU64 = AtomicU64::new(u64::MAX);
+
+pub fn note_stdio_output_retirement(connection_id: crate::outgoing_message::ConnectionId) {
+    OUTPUT_RETIRED_CONNECTION.store(connection_id.0, Ordering::Release);
+}
 
 pub async fn start_stdio_connection(
     transport_event_tx: mpsc::Sender<TransportEvent>,
@@ -268,15 +285,36 @@ async fn start_stdio_connection_with_io<W>(
     transport_event_tx: mpsc::Sender<TransportEvent>,
     stdio_handles: &mut Vec<JoinHandle<()>>,
     initialize_client_name_tx: oneshot::Sender<String>,
-    mut stdin_lines: mpsc::Receiver<IoResult<String>>,
-    mut stdout: W,
+    stdin_lines: mpsc::Receiver<IoResult<String>>,
+    stdout: W,
 ) -> IoResult<()>
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let connection = open_stdio_connection(&transport_event_tx).await?;
+    stdio_handles.push(tokio::spawn(serve_stdio_connections(
+        transport_event_tx,
+        initialize_client_name_tx,
+        stdin_lines,
+        stdout,
+        connection,
+    )));
+    Ok(())
+}
+
+struct OpenStdioConnection {
+    connection_id: crate::outgoing_message::ConnectionId,
+    cancellation: CancellationToken,
+    writer_tx_for_reader: mpsc::Sender<QueuedOutgoingMessage>,
+    writer_rx: mpsc::Receiver<QueuedOutgoingMessage>,
+}
+
+async fn open_stdio_connection(
+    transport_event_tx: &mpsc::Sender<TransportEvent>,
+) -> IoResult<OpenStdioConnection> {
     let connection_id = next_connection_id();
     let cancellation = CancellationToken::new();
-    let (writer_tx, mut writer_rx) = mpsc::channel::<QueuedOutgoingMessage>(CHANNEL_CAPACITY);
+    let (writer_tx, writer_rx) = mpsc::channel::<QueuedOutgoingMessage>(CHANNEL_CAPACITY);
     let writer_tx_for_reader = writer_tx.clone();
     transport_event_tx
         .send(TransportEvent::ConnectionOpened {
@@ -287,14 +325,161 @@ where
         })
         .await
         .map_err(|_| std::io::Error::new(ErrorKind::BrokenPipe, "processor unavailable"))?;
+    Ok(OpenStdioConnection {
+        connection_id,
+        cancellation,
+        writer_tx_for_reader,
+        writer_rx,
+    })
+}
 
-    let connection_closed = Arc::new(AtomicBool::new(false));
-    let transport_event_tx_for_reader = transport_event_tx.clone();
-    let cancellation_for_reader = cancellation.clone();
-    let connection_closed_for_reader = Arc::clone(&connection_closed);
-    stdio_handles.push(tokio::spawn(async move {
-        let mut initialize_client_name_tx = Some(initialize_client_name_tx);
+/// Close publication and reattachment state shared by the two halves of one
+/// stdio connection.
+struct StdioConnectionState {
+    closed: AtomicBool,
+    // From the admitted `initialize` request of this connection.
+    reattach_requested: AtomicBool,
+    // The peer or the processor is gone, or a frame failed; the pipes are not reused.
+    transport_ended: AtomicBool,
+}
 
+impl StdioConnectionState {
+    fn keeps_pipes(&self, connection_id: crate::outgoing_message::ConnectionId) -> bool {
+        self.reattach_requested.load(Ordering::Acquire)
+            && !self.transport_ended.load(Ordering::Acquire)
+            && OUTPUT_RETIRED_CONNECTION.load(Ordering::Acquire) == connection_id.0
+    }
+}
+
+struct StdioReaderEnd {
+    // Present when the pipes are kept for a replacement connection.
+    stdin_lines: Option<mpsc::Receiver<IoResult<String>>>,
+    initialize_client_name_tx: Option<oneshot::Sender<String>>,
+}
+
+/// Serves one connection at a time on the process's stdio. A connection that the
+/// server retired for output backlog is replaced on the same pipes when its
+/// client asked for that; every other end closes the transport as before.
+async fn serve_stdio_connections<W>(
+    transport_event_tx: mpsc::Sender<TransportEvent>,
+    initialize_client_name_tx: oneshot::Sender<String>,
+    mut stdin_lines: mpsc::Receiver<IoResult<String>>,
+    mut stdout: W,
+    mut connection: OpenStdioConnection,
+) where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let mut initialize_client_name_tx = Some(initialize_client_name_tx);
+    loop {
+        let OpenStdioConnection {
+            connection_id,
+            cancellation,
+            writer_tx_for_reader,
+            writer_rx,
+        } = connection;
+        let state = Arc::new(StdioConnectionState {
+            closed: AtomicBool::new(false),
+            reattach_requested: AtomicBool::new(false),
+            transport_ended: AtomicBool::new(false),
+        });
+        // Aborting this owner must stop both halves, as when they were tracked directly.
+        let reader = AbortOnDropHandle::new(spawn_stdio_reader(
+            stdin_lines,
+            initialize_client_name_tx,
+            transport_event_tx.clone(),
+            writer_tx_for_reader,
+            connection_id,
+            cancellation.clone(),
+            Arc::clone(&state),
+        ));
+        let writer = AbortOnDropHandle::new(spawn_stdio_writer(
+            stdout,
+            writer_rx,
+            transport_event_tx.clone(),
+            connection_id,
+            cancellation.clone(),
+            Arc::clone(&state),
+        ));
+        let (reader_end, writer_end) = tokio::join!(reader, writer);
+        let (Ok(reader_end), Ok(writer_end)) = (reader_end, writer_end) else {
+            // A half was aborted or panicked and took its pipe with it.
+            close_stdio_connection(&transport_event_tx, connection_id, &cancellation, &state.closed)
+                .await;
+            return;
+        };
+        initialize_client_name_tx = reader_end.initialize_client_name_tx;
+        let (Some(kept_stdin_lines), Some((kept_stdout, frame_interrupted))) =
+            (reader_end.stdin_lines, writer_end)
+        else {
+            close_stdio_connection(&transport_event_tx, connection_id, &cancellation, &state.closed)
+                .await;
+            return;
+        };
+        stdin_lines = kept_stdin_lines;
+        stdout = kept_stdout;
+        // Register the replacement before the retired connection closes, so a
+        // server whose only client is this one never counts zero connections.
+        let replacement = open_stdio_connection(&transport_event_tx).await;
+        close_stdio_connection(&transport_event_tx, connection_id, &cancellation, &state.closed)
+            .await;
+        let Ok(replacement) = replacement else {
+            return;
+        };
+        if let Err(err) = write_stdio_retired_notice(&mut stdout, frame_interrupted).await {
+            error!("Failed to announce the replacement stdio connection: {err}");
+            close_stdio_connection(
+                &transport_event_tx,
+                replacement.connection_id,
+                &replacement.cancellation,
+                &AtomicBool::new(false),
+            )
+            .await;
+            return;
+        }
+        info!(
+            retired = ?connection_id,
+            replacement = ?replacement.connection_id,
+            "stdio connection replaced on the same pipes after output retirement"
+        );
+        connection = replacement;
+    }
+}
+
+async fn write_stdio_retired_notice<W: AsyncWrite + Unpin>(
+    stdout: &mut W,
+    frame_interrupted: bool,
+) -> IoResult<()> {
+    // A cancelled write can still be completing on the native worker. Wait for
+    // it first, so this notice is not taken for that write's completion.
+    stdout.flush().await?;
+    let mut notice = Vec::new();
+    if frame_interrupted {
+        // End the cut frame; the client drops that malformed line.
+        notice.push(b'\n');
+    }
+    serde_json::to_writer(
+        &mut notice,
+        &serde_json::json!({
+            "method": STDIO_CONNECTION_RETIRED_METHOD,
+            "params": { "reason": "outputBacklog" },
+        }),
+    )
+    .map_err(std::io::Error::other)?;
+    notice.push(b'\n');
+    stdout.write_all(&notice).await?;
+    stdout.flush().await
+}
+
+fn spawn_stdio_reader(
+    mut stdin_lines: mpsc::Receiver<IoResult<String>>,
+    mut initialize_client_name_tx: Option<oneshot::Sender<String>>,
+    transport_event_tx_for_reader: mpsc::Sender<TransportEvent>,
+    writer_tx_for_reader: mpsc::Sender<QueuedOutgoingMessage>,
+    connection_id: crate::outgoing_message::ConnectionId,
+    cancellation_for_reader: CancellationToken,
+    state: Arc<StdioConnectionState>,
+) -> JoinHandle<StdioReaderEnd> {
+    tokio::spawn(async move {
         loop {
             let line = tokio::select! {
                 _ = cancellation_for_reader.cancelled() => break,
@@ -309,7 +494,7 @@ where
                             continue;
                         }
                     };
-                    let client_name = stdio_initialize_client_name(&message);
+                    let initialize = stdio_initialize_params(&message);
                     let (forwarded, admitted) = tokio::select! {
                         _ = cancellation_for_reader.cancelled() => break,
                         forwarded = enqueue_incoming_message_with_admission(
@@ -319,25 +504,44 @@ where
                             message,
                         ) => forwarded,
                     };
-                    if admitted && let Some(client_name) = client_name
-                        && let Some(sender) = initialize_client_name_tx.take()
-                    {
-                        let _ = sender.send(client_name);
+                    if admitted && let Some(initialize) = initialize {
+                        state.reattach_requested.store(
+                            initialize
+                                .capabilities
+                                .is_some_and(|capabilities| capabilities.stdio_reattach),
+                            Ordering::Release,
+                        );
+                        if let Some(sender) = initialize_client_name_tx.take() {
+                            let _ = sender.send(initialize.client_info.name);
+                        }
                     }
                     if !forwarded {
+                        state.transport_ended.store(true, Ordering::Release);
                         break;
                     }
                 }
                 Some(Err(err)) => {
                     error!("Failed reading stdin: {err}");
                     if err.kind() != ErrorKind::InvalidData {
+                        state.transport_ended.store(true, Ordering::Release);
                         break;
                     }
                 }
-                None => break,
+                None => {
+                    state.transport_ended.store(true, Ordering::Release);
+                    break;
+                }
             }
         }
 
+        if state.keeps_pipes(connection_id) {
+            // The owner publishes this close once the replacement is registered.
+            cancellation_for_reader.cancel();
+            return StdioReaderEnd {
+                stdin_lines: Some(stdin_lines),
+                initialize_client_name_tx,
+            };
+        }
         // Either half may win close publication. Release native input admission
         // before that publication can wait behind an already admitted message.
         drop(stdin_lines);
@@ -345,17 +549,34 @@ where
             &transport_event_tx_for_reader,
             connection_id,
             &cancellation_for_reader,
-            &connection_closed_for_reader,
+            &state.closed,
         )
         .await;
         debug!("stdin reader finished (EOF)");
-    }));
+        StdioReaderEnd {
+            stdin_lines: None,
+            initialize_client_name_tx,
+        }
+    })
+}
 
-    let cancellation_for_writer = cancellation;
-    let connection_closed_for_writer = Arc::clone(&connection_closed);
-    stdio_handles.push(tokio::spawn(async move {
+/// Returns stdout, and whether a streamed frame was cut short, when the pipes
+/// are kept for a replacement connection.
+fn spawn_stdio_writer<W>(
+    mut stdout: W,
+    mut writer_rx: mpsc::Receiver<QueuedOutgoingMessage>,
+    transport_event_tx: mpsc::Sender<TransportEvent>,
+    connection_id: crate::outgoing_message::ConnectionId,
+    cancellation_for_writer: CancellationToken,
+    state: Arc<StdioConnectionState>,
+) -> JoinHandle<Option<(W, bool)>>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
         let mut batch = Vec::new();
         let mut pending_message = None;
+        let mut frame_interrupted = false;
         'writer: loop {
             let queued_message = if pending_message.is_some() {
                 pending_message.take()
@@ -379,7 +600,11 @@ where
                 let encoded = queued_message.encoded_json.take();
                 batch = Vec::new();
                 let write_result = tokio::select! {
-                    _ = cancellation_for_writer.cancelled() => break 'writer,
+                    _ = cancellation_for_writer.cancelled() => {
+                        // Chunks of this frame may already be on the pipe.
+                        frame_interrupted = true;
+                        break 'writer;
+                    }
                     result = write_streamed_message(
                         &mut stdout,
                         queued_message.message,
@@ -388,6 +613,7 @@ where
                 };
                 if let Err(err) = write_result {
                     error!("Failed to stream outgoing message to stdout: {err}");
+                    state.transport_ended.store(true, Ordering::Release);
                     break;
                 }
                 if flush_boundary || queued_message.write_complete_tx.is_some() {
@@ -397,6 +623,7 @@ where
                     };
                     if let Err(err) = flush_result {
                         error!("Failed to flush stdout: {err}");
+                        state.transport_ended.store(true, Ordering::Release);
                         break;
                     }
                 }
@@ -462,6 +689,7 @@ where
             };
             if let Err(err) = write_result {
                 error!("Failed to write to stdout: {err}");
+                state.transport_ended.store(true, Ordering::Release);
                 break;
             }
             if flush_boundary || write_complete_tx.is_some() {
@@ -471,6 +699,7 @@ where
                 };
                 if let Err(err) = flush_result {
                     error!("Failed to flush stdout: {err}");
+                    state.transport_ended.store(true, Ordering::Release);
                     break;
                 }
             }
@@ -482,17 +711,21 @@ where
         // Release blocked router sends before close publication waits on ingress.
         // The processor may itself be waiting for that router to consume output.
         drop(writer_rx);
+        if state.keeps_pipes(connection_id) {
+            // The owner publishes this close once the replacement is registered.
+            cancellation_for_writer.cancel();
+            return Some((stdout, frame_interrupted));
+        }
         close_stdio_connection(
             &transport_event_tx,
             connection_id,
             &cancellation_for_writer,
-            &connection_closed_for_writer,
+            &state.closed,
         )
         .await;
         info!("stdout writer exited (channel closed)");
-    }));
-
-    Ok(())
+        None
+    })
 }
 
 async fn write_streamed_message<W: AsyncWrite + Unpin>(
@@ -588,14 +821,13 @@ async fn close_stdio_connection(
     }
 }
 
-fn stdio_initialize_client_name(message: &JSONRPCMessage) -> Option<String> {
+fn stdio_initialize_params(message: &JSONRPCMessage) -> Option<InitializeParams> {
     let JSONRPCMessage::Request(JSONRPCRequest { method, params, .. }) = message else {
         return None;
     };
     if method != "initialize" {
         return None;
     }
-    let params = InitializeParams::deserialize(params.as_ref()?).ok()?;
-    Some(params.client_info.name)
+    InitializeParams::deserialize(params.as_ref()?).ok()
 }
 

@@ -501,6 +501,8 @@ pub struct InProcessClientStartArgs {
     pub mcp_server_openai_form_elicitation: bool,
     /// Notification methods this client opts out of receiving.
     pub opt_out_notification_methods: Vec<String>,
+    /// Whether completed file changes should carry settled before/after file bodies.
+    pub file_change_effects: bool,
     /// Capacity for command/event channels and dispatched requests awaiting replies
     /// (clamped to at least 1). Excess requests receive a retryable overload error.
     pub channel_capacity: usize,
@@ -530,6 +532,7 @@ fn initialize_params(
     experimental_api: bool,
     mcp_server_openai_form_elicitation: bool,
     opt_out_notification_methods: &[String],
+    file_change_effects: bool,
 ) -> InitializeParams {
     InitializeParams {
         client_info: ClientInfo {
@@ -543,6 +546,8 @@ fn initialize_params(
             opt_out_notification_methods: (!opt_out_notification_methods.is_empty())
                 .then(|| opt_out_notification_methods.to_vec()),
             mcp_server_openai_form_elicitation,
+            file_change_effects,
+            stdio_reattach: false,
         }),
     }
 }
@@ -556,6 +561,7 @@ impl InProcessClientStartArgs {
             self.experimental_api,
             self.mcp_server_openai_form_elicitation,
             &self.opt_out_notification_methods,
+            self.file_change_effects,
         )
     }
 

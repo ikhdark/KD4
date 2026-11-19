@@ -123,6 +123,7 @@ async fn start(
         client_version: initialize.client_info.version.clone(),
         experimental_api: capabilities.experimental_api,
         mcp_server_openai_form_elicitation: capabilities.mcp_server_openai_form_elicitation,
+        file_change_effects: capabilities.file_change_effects,
         opt_out_notification_methods: capabilities.opt_out_notification_methods.unwrap_or_default(),
         channel_capacity: 8,
     })

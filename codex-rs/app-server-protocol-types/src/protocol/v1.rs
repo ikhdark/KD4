@@ -56,6 +56,17 @@ pub struct InitializeCapabilities {
     /// Allow downstream MCP servers to request OpenAI extended form elicitations.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mcp_server_openai_form_elicitation: bool,
+    /// Opt into settled before/after file bodies (`effects`) on completed
+    /// `fileChange` items. They repeat whole files and are omitted otherwise.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub file_change_effects: bool,
+    /// Opt into a replacement connection when the server retires this stdio
+    /// connection because its output backlog cannot be admitted. The server then
+    /// writes one `transport/stdioConnectionRetired` notification and serves a
+    /// new connection on the same pipes, which must `initialize` again. Without
+    /// it the retired connection only closes. Ignored on other transports.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stdio_reattach: bool,
     /// Exact notification method names that should be suppressed for this
     /// connection (for example `thread/started`).
     #[ts(optional = nullable)]

@@ -13,6 +13,14 @@ const APPLY_PATCH_ARG0: &str = "apply_patch";
 const MISSPELLED_APPLY_PATCH_ARG0: &str = "applypatch";
 const LOCK_FILENAME: &str = ".lock";
 const TOKIO_WORKER_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
+// Tokio performs Windows child-pipe reads on this runtime's blocking pool, so
+// each idle child pipe (stdio MCP servers, piped commands, hosts) holds one
+// pool thread for as long as its child lives. At Tokio's default of 512, about
+// 256 live children leave no thread for file or configuration work and every
+// request waits until a child writes or exits. Idle threads cost address space
+// (the stack is only reserved), not committed memory.
+#[cfg(windows)]
+const TOKIO_MAX_BLOCKING_THREADS: usize = 4096;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Arg0DispatchPaths {
@@ -209,6 +217,8 @@ fn build_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
     builder.thread_stack_size(TOKIO_WORKER_STACK_SIZE_BYTES);
+    #[cfg(windows)]
+    builder.max_blocking_threads(TOKIO_MAX_BLOCKING_THREADS);
     Ok(builder.build()?)
 }
 
