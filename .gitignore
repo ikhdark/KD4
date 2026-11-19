@@ -75,6 +75,9 @@ yarn-error.log*
 *.tgz
 *.whl
 
+# Downloaded local inference weights (presets remain trackable).
+*.gguf
+
 # ci
 .vercel/
 .netlify/
