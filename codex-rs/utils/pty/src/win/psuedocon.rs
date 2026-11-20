@@ -233,12 +233,13 @@ impl PsuedoCon {
             bail!("{msg}");
         }
 
-        crate::process_observation::observe_process_start(
+        let observation = crate::process_observation::observe_process_start(
             "unified_conpty",
             crate::process_observation::ProcessRole::RequestedRoot,
             Some(pi.dwProcessId),
             None,
         );
+        job.bind_contained_root(&observation);
         // SAFETY: Successful CreateProcessW returned this new thread handle, whose sole
         // ownership is transferred to OwnedHandle.
         let _main_thread = unsafe { OwnedHandle::from_raw_handle(pi.hThread as _) };

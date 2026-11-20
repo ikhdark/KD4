@@ -762,10 +762,11 @@ impl Drop for PendingDelegateRequest {
         if let Some(pending) = self.peer.remove_pending(id)
             && pending.dispatched
         {
-            // Dropped without reaching a cancellation origin, so there is no
-            // cause to report.
+            // An outer deadline can record its cause and then drop the future
+            // before the delegate's own cancellation branch is polled.
+            let cause = pending.cancellation.cause();
             self.peer.send_mandatory_control(
-                HostToClient::CancelDelegateRequest { id, cause: None },
+                HostToClient::CancelDelegateRequest { id, cause },
                 pending._permit,
             );
         }

@@ -115,7 +115,7 @@ pub struct UpdateFileChunk {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpdateLineKind { Context, Add, Remove }
+pub enum UpdateLineKind { Context, BareBlank, Add, Remove }
 
 // Preserve the existing logical-text equality contract. Marker provenance is
 // used by application, not by callers comparing logical parser representations.

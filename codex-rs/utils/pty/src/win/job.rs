@@ -4,6 +4,7 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::FromRawHandle;
 use std::os::windows::io::RawHandle;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use winapi::um::jobapi2::AssignProcessToJobObject;
 use winapi::um::jobapi2::CreateJobObjectW;
 use winapi::um::jobapi2::QueryInformationJobObject;
@@ -23,6 +24,7 @@ pub struct JobObject {
     // A mutex makes the state check, Job Object API call, and state update
     // atomic with respect to concurrent preserve and terminate requests.
     state: Mutex<JobState>,
+    contained_root: OnceLock<crate::process_observation::ObservedProcess>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,7 +73,14 @@ impl JobObject {
         Ok(Self {
             handle,
             state: Mutex::new(JobState::Active { allow_breakaway: true }),
+            contained_root: OnceLock::new(),
         })
+    }
+
+    /// The caller created or attached this root under no-breakaway containment
+    /// before allowing it to execute. Never bind an already-running process.
+    pub(crate) fn bind_contained_root(&self, root: &crate::process_observation::ObservedProcess) {
+        let _ = self.contained_root.set(root.clone());
     }
 
     fn set_limit_flags(handle: &OwnedHandle, flags: u32) -> io::Result<()> {
@@ -214,6 +223,9 @@ impl JobObject {
         loop {
             let active = self.active_process_count()?;
             if active == 0 {
+                if let Some(root) = self.contained_root.get() {
+                    root.contained_windows_job_emptied();
+                }
                 *self.state.lock().map_err(|_| io::Error::other("job state lock poisoned"))? = JobState::Terminated;
                 self.custody_diagnostic("shutdown_confirmed", 0);
                 return Ok(());

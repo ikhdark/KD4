@@ -206,6 +206,7 @@ struct SamplingToolOutcome {
     wraps_nested_terminal: bool,
     tests_executed: bool,
     validation_failure_excerpt: Option<String>,
+    command_log_capture_incomplete: bool,
     process_observation_progress: bool,
     validation_mutation_revision: Option<u64>,
     background_process_id: Option<u64>,
@@ -278,6 +279,8 @@ impl SamplingToolOutcome {
                 .is_some(),
             tests_executed: signal.is_some_and(|signal| signal["command_validation"]["tests"] == true),
             validation_failure_excerpt: None,
+            command_log_capture_incomplete: signal
+                .is_some_and(|signal| signal["command_log_capture_incomplete"] == true),
             process_observation_progress: signal
                 .is_some_and(|signal| signal["process_observation_progress"] == true),
             validation_mutation_revision: signal
@@ -2734,6 +2737,7 @@ pub(crate) struct TurnExecutionControl {
     successful_compilation_scopes: BTreeMap<crate::validation::CompilationCheckScope, (u64, u64)>,
     next_validation_request: AtomicU64,
     pending_validation_processes: BTreeMap<u64, PendingValidation>,
+    validation_log_capture_incomplete: bool,
     /// Consecutive tool continuations that added no progress kind, plan or
     /// input change, delivered child event or process output.
     no_progress_streak: u32,
@@ -2795,6 +2799,7 @@ impl TurnExecutionControl {
             successful_compilation_scopes: BTreeMap::new(),
             next_validation_request: AtomicU64::new(0),
             pending_validation_processes: BTreeMap::new(),
+            validation_log_capture_incomplete: false,
             no_progress_streak: 0,
             continuations_without_progress: 0,
             source_actions_since_progress: 0,
@@ -2835,6 +2840,25 @@ impl TurnExecutionControl {
         if let Some(plan) = &self.plan {
             evidence_refs.push(format!("native:plan:{}", plan.revision));
         }
+        let failed_checks: Vec<String> = self.failed_validation_checks.iter().map(|check| {
+            self.validation_check_descriptions.get(check).cloned().unwrap_or_else(|| check.clone())
+        }).collect();
+        let validation_uncertainty =
+            (!failed_checks.is_empty() || !self.pending_validation_processes.is_empty()
+                || self.validation_log_capture_incomplete).then(|| {
+                codex_protocol::protocol::TurnValidationUncertainty {
+                    version: 1,
+                    failed_checks: failed_checks.iter().take(4)
+                        .map(|check| check.chars().take(192).collect())
+                        .collect(),
+                    // The launch identity describes which validation lacks a terminal
+                    // observation. A process ID would be stale across recovery.
+                    pending_checks: self.pending_validation_processes.values().take(4)
+                        .map(|pending| format!("Validation check {} had no terminal result at settlement.", pending.check))
+                        .collect(),
+                    capture_incomplete: self.validation_log_capture_incomplete,
+                }
+            });
         let gaps = !unmet.is_empty() || !self.failed_validation_checks.is_empty();
         codex_protocol::protocol::TurnCompletionAssessment {
             task_disposition: Some(codex_protocol::protocol::TurnTaskDisposition {
@@ -2848,9 +2872,8 @@ impl TurnExecutionControl {
                 unmet_obligations: unmet, evidence_refs,
                 authority: "host_declared_plan_and_native_validation; not independent task acceptance".into(),
             }),
-            failed_checks: self.failed_validation_checks.iter().map(|check| {
-                self.validation_check_descriptions.get(check).cloned().unwrap_or_else(|| check.clone())
-            }).collect(),
+            validation_uncertainty,
+            failed_checks,
             verification_gaps: self.plan.iter().flat_map(|plan| {
                 plan.obligations.unresolved.iter().map(|id| {
                     format!(
@@ -3801,6 +3824,9 @@ impl TurnExecutionControl {
                 if let Some(check) = check.filter(|_| pending.is_some()
                     || state.validation_ordinals.contains(&outcome.ordinal))
                 {
+                    // A covering pass may settle a failed check, but it cannot
+                    // reconstruct the earlier command log in this turn.
+                    self.validation_log_capture_incomplete |= outcome.command_log_capture_incomplete;
                     let order = pending.as_ref().map(|pending| pending.execution_order)
                         .unwrap_or((collector.request_ordinal, outcome.ordinal));
                     if pending.is_none()

@@ -69,15 +69,17 @@ pub fn require_write_contract(assignment: &Assignment, amendment: Option<&Attemp
     for criterion in criteria {
         criterion.validate_evidence_binding(&assignment.required_evidence)?;
     }
+    // Reported worker runs complement owned source acquisition, never replace it.
     if criteria.is_empty() || assignment.required_evidence.is_empty()
         || criteria.iter().any(|criterion| criterion.evidence_policy.as_ref().is_none_or(|policy|
-            policy.kind != crate::CriterionEvidenceRequirement::SourceInspection
-            || policy.required_evidence.as_ref().is_none_or(|required|
-                !assignment.required_evidence.contains(required))))
+            !matches!(policy.kind, crate::CriterionEvidenceRequirement::SourceInspection
+                | crate::CriterionEvidenceRequirement::ReportOnly)))
         || assignment.required_evidence.iter().any(|required| !criteria.iter().any(|criterion|
-            criterion.evidence_policy.as_ref().and_then(|policy| policy.required_evidence.as_ref()) == Some(required)))
+            criterion.evidence_policy.as_ref().is_some_and(|policy|
+                policy.kind == crate::CriterionEvidenceRequirement::SourceInspection
+                    && policy.required_evidence.as_ref() == Some(required))))
     {
-        return Err(invalid("every writable criterion and required_evidence entry needs an explicit owned source-inspection policy; root owns execution and integration checks"));
+        return Err(invalid("every required_evidence entry needs an explicit owned source-inspection policy; additional worker-reported verification or benchmark criteria must use report_only"));
     }
     Ok(())
 }

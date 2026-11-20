@@ -1997,14 +1997,22 @@ impl TurnCompletionAssessment {
 pub struct TurnValidationUncertainty {
     pub version: u8,
     pub failed_checks: Vec<String>,
+    /// Checks with no terminal observation at settlement, not live operations.
     pub pending_checks: Vec<String>,
+    /// True only for observed capture loss; false is not proof of full capture.
     pub capture_incomplete: bool,
 }
 
 impl TurnCompletionAssessment {
     /// Bounded host observations, never acceptance or execution authority.
     pub fn bounded_summary(&self, turn_id: &str) -> Option<String> {
-        if self.failed_checks.is_empty()
+        let uncertainty = self.validation_uncertainty.as_ref().filter(|evidence| {
+            evidence.version == 1
+                && (evidence.capture_incomplete
+                    || !evidence.failed_checks.is_empty() || !evidence.pending_checks.is_empty())
+        });
+        if uncertainty.is_none()
+            && self.failed_checks.is_empty()
             && self.verification_gaps.is_empty()
             && self.advisories.is_empty()
         {
@@ -2013,10 +2021,24 @@ impl TurnCompletionAssessment {
         let mut result = format!(
             "Host completion observations for turn {turn_id} (not acceptance or test authorization). Missing attribution does not require tests; follow applicable user instructions, including intentional omission. Input attribution is not proof that changed behavior was exercised. Saved process identities are not live or callable handles."
         );
+        let mut failed_checks = self.failed_checks.as_slice();
+        let mut pending_checks = &[][..];
+        if let Some(evidence) = uncertainty {
+            result.push_str("\nNative validation uncertainty at turn settlement:");
+            if evidence.capture_incomplete {
+                result.push_str("\n- At least one validation command log capture was incomplete; this does not change the observed check exit status.");
+            }
+            // Keep legacy detail and counts when present, without listing the same failure twice.
+            if failed_checks.is_empty() {
+                failed_checks = &evidence.failed_checks;
+            }
+            pending_checks = &evidence.pending_checks;
+        }
         for (label, entries) in [
-            ("failed checks", &self.failed_checks),
-            ("verification gaps", &self.verification_gaps),
-            ("advisories", &self.advisories),
+            ("failed checks", failed_checks),
+            ("pending checks (terminal result not observed)", pending_checks),
+            ("verification gaps", self.verification_gaps.as_slice()),
+            ("advisories", self.advisories.as_slice()),
         ] {
             if entries.is_empty() {
                 continue;

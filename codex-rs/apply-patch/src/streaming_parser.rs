@@ -389,7 +389,7 @@ impl StreamingPatchParser {
                             });
                         }
                         if let Some(chunk) = chunks.last_mut() {
-                            chunk.line_kinds.push(crate::parser::UpdateLineKind::Context);
+                            chunk.line_kinds.push(crate::parser::UpdateLineKind::BareBlank);
                             chunk.old_lines.push(String::new());
                             chunk.new_lines.push(String::new());
                         }

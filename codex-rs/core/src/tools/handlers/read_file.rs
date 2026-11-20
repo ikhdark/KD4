@@ -1224,6 +1224,11 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     output[field] = value.clone();
                 }
             }
+            let ordinary_snapshot = source_inspection.is_none()
+                && projected.get("inspection_proof_error").is_none()
+                && git_source.is_none()
+                && decoded_source.is_none()
+                && !environment_id.starts_with("host-");
             if let (Some(source), Some(id)) = (source_inspection, artifact_id.as_ref())
                 && !invocation.cancellation_token.is_cancelled()
                 && source_inspection_delivery_eligible(if script_consumer { &output } else { &projected })
@@ -1252,6 +1257,12 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             if let Some(evidence) = evidence {
                 let mut signal = crate::tools::context::semantic_evidence_sampling_signal(evidence);
                 if let Some(advisory) = advisory { signal["evidence_advisory"] = advisory; }
+                if ordinary_snapshot && successful && artifact_id.is_some()
+                    && matches!(&invocation.source, ToolCallSource::Direct)
+                    && signal.get("evidence_advisory").is_none()
+                {
+                    signal["provider_exact_read_offer_eligible"] = json!(true);
+                }
                 let delivered = if script_consumer { output.value() } else { &projected };
                 if let Some(receipt) = native_read_measurement(delivered, &json!({
                     "path":delivered["path"], "environment":delivered["environment_id"],

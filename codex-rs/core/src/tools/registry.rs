@@ -41,7 +41,6 @@ use crate::tools::tool_dispatch_trace::record_history_persistence;
 use crate::tools::tool_dispatch_trace::record_output_projection;
 use crate::tools::tool_dispatch_trace::record_post_tool_hook;
 use crate::tools::tool_dispatch_trace::record_pre_tool_hook;
-use crate::turn_timing::TurnTimingState;
 use codex_config::schema::canonicalize as canonicalize_json;
 use codex_extension_api::ToolCallOutcome;
 use codex_hooks::PostToolUseOutcome;
@@ -453,23 +452,111 @@ pub(crate) struct AnyToolResult {
     pub(crate) code_mode_feedback: Vec<FunctionCallOutputContentItem>,
     pub(crate) operation_history: Option<Value>,
     pub(crate) workspace_source_invalidated: bool,
+    pub(crate) provider_read_offer_eligible: bool,
+}
+
+/// The response and artifact still settle normally. Only a matching immutable
+/// provider input may replace this exact body with the recovery-only view.
+#[derive(Debug)]
+pub(crate) struct ProviderReadOffer {
+    pub(crate) call_id: String,
+    pub(crate) execution_id: String,
+    pub(crate) full: String,
+    pub(crate) offer: String,
+    pub(crate) receipt: Value,
+    pub(crate) history: Option<Value>,
+}
+
+fn exact_read_offer(output: &ResponseInputItem, receipt: &Value) -> Option<(String, String)> {
+    let ResponseInputItem::FunctionCallOutput { output, .. } = output else {
+        return None;
+    };
+    let FunctionCallOutputBody::Text(full) = &output.body else {
+        return None;
+    };
+    let mut packet: Value = serde_json::from_str(full).ok()?;
+    let artifact_id = packet["artifact_id"].as_str()?;
+    let bytes = packet["canonical_bytes"].as_u64()?;
+    if output.success != Some(true)
+        || packet["complete"] != true
+        || packet["retained_artifact_complete"] != true
+        || packet["retained_bytes"] != bytes
+        || packet["source_sha256"] != receipt["contentSha256"]
+        || receipt["contentBytes"] != bytes
+        || ["recovery", "continuation", "delivery_note", "selector_errors",
+            "selector_bindings", "inspection_proof_error", "snapshot_error", "evidence_advisory"]
+            .iter().any(|key| packet.get(*key).is_some())
+    {
+        return None;
+    }
+    let rows = packet["results"].as_array()?;
+    if rows.is_empty() || rows.iter().any(|row| {
+        row["selector"]["kind"] != "bytes" || row["complete"] != true || row["status"] != "ok"
+        || !row["text"].is_string()
+        || row.as_object().is_none_or(|row| row.keys().any(|key| !matches!(
+            key.as_str(), "selector" | "status" | "complete" | "canonical_range" | "text" | "selector_index"
+        )))
+    }) {
+        return None;
+    }
+    let selectors = receipt["ranges"].as_array()?.iter().map(|range| {
+        let start = range[0].as_u64()?;
+        let end = range[1].as_u64()?;
+        (start < end && end <= bytes).then(|| serde_json::json!({"kind":"bytes", "start":start, "end":end}))
+    }).collect::<Option<Vec<_>>>()?;
+    if selectors.is_empty() || selectors.len() > 64 {
+        return None;
+    }
+    let recovery = serde_json::json!({
+        "tool":"read_tool_output",
+        "arguments":{"artifact_id":artifact_id, "selectors":selectors},
+        "selection_complete":false, "file_complete":false,
+    });
+    packet["complete"] = Value::Bool(false);
+    packet["file_complete"] = Value::Bool(false);
+    packet["delivered_selection_complete"] = Value::Bool(false);
+    packet["selection_status"] = serde_json::json!("partial");
+    packet["results"] = serde_json::json!([]);
+    packet["recovery"] = recovery;
+    packet["delivery_note"] = serde_json::json!(
+        "The read succeeded, but this request carried no source bytes from it. Use recovery.arguments with read_tool_output for the exact retained ranges."
+    );
+    let offer = packet.to_string();
+    (offer.len() < full.len()).then(|| (full.clone(), offer))
 }
 
 pub(crate) fn record_tool_result_measurement(
-    timing: &TurnTimingState,
+    turn: &TurnContext,
     execution_id: &str,
     call_id: &str,
     tool_name: &str,
     result: &Result<AnyToolResult, FunctionCallError>,
 ) {
     use sha2::Digest;
+    let timing = &turn.turn_timing_state;
     let name = tool_name.strip_prefix("functions.").unwrap_or(tool_name);
     if matches!(name, "read_file" | "read_tool_output" | "exec_command" | "shell_command" | "shell") {
         let signal = result.as_ref().ok().and_then(|result| result.result.sampling_request_signal());
         let history = result.as_ref().ok().and_then(|result| result.operation_history.clone());
-        timing.record_native_operation(execution_id, call_id,
-            if matches!(name, "read_file" | "read_tool_output") { "read" } else { "command" },
-            signal.as_ref().and_then(|signal| signal.get("native_read")).cloned(), history);
+        let receipt = signal.as_ref().and_then(|signal| signal.get("native_read"));
+        let staged = name == "read_file"
+            && turn.extension_data.get::<crate::session::turn::ProviderReadOffers>()
+                .zip(result.as_ref().ok())
+                .zip(receipt)
+                .is_some_and(|((offers, result), receipt)| {
+                    result.provider_read_offer_eligible && !result.workspace_source_invalidated
+                        && exact_read_offer(&result.response(), receipt).is_some_and(|(full, offer)| {
+                            offers.stage(ProviderReadOffer {
+                                call_id: call_id.to_owned(), execution_id: execution_id.to_owned(),
+                                full, offer, receipt: receipt.clone(), history: history.clone(),
+                            })
+                        })
+                });
+        if !staged {
+            timing.record_native_operation(execution_id, call_id,
+                if matches!(name, "read_file" | "read_tool_output") { "read" } else { "command" },
+                receipt.cloned(), history);
+        }
     }
     let (rendered, projection) = match result {
         Ok(result) => (serde_json::to_vec(&result.response()).ok(), result.model_projection.as_ref()),
@@ -818,13 +905,37 @@ impl AnyToolResult {
 /// the cancellation path. That path deliberately bypasses post-tool hooks and
 /// the ordinary registry finish notification, but it still owes the same
 /// projection attribution as every other accepted tool call.
-pub(crate) async fn install_synthetic_terminal_projection(
+pub(crate) async fn record_synthetic_terminal_attempt(
     invocation: &ToolInvocation,
     result: &mut AnyToolResult,
+    dispatch_state: &ToolDispatchState,
 ) {
-    if result.operation_history.is_none() && result.result.tool_failure().is_some_and(|failure|
-        matches!(failure.code, codex_protocol::tool_failure::ToolFailureCode::Cancelled
-            | codex_protocol::tool_failure::ToolFailureCode::TimedOut)) {
+    use codex_protocol::tool_failure::ToolFailureCode;
+
+    let Some(mut failure) = result.result.tool_failure().filter(|failure|
+        matches!(failure.code, ToolFailureCode::Cancelled | ToolFailureCode::TimedOut))
+    else {
+        return;
+    };
+    let cause = invocation.source.cancellation_cause();
+    if let Some(started) = dispatch_state.cancelled_nested_attempt(cause.clone()) {
+        if let Some(history) = dispatch_state.settled_history(&result.call_id) {
+            // The existing registry path already recorded a known settlement.
+            result.operation_history = Some(history.clone());
+        } else {
+            let mut attempt = started.clone();
+            // Carry the real cleanup facts and handles without implying that
+            // reaching the handler boundary established any external effects.
+            let outcome = if cause == Some(codex_code_mode::CancellationCause::NestedDeadline) {
+                failure.code = ToolFailureCode::TimedOut;
+                ToolOutputOutcome::TimedOut
+            } else {
+                result.outcome_for_logging()
+            };
+            attempt.settle_outcome(outcome, Some(failure));
+            result.operation_history = Some(invocation.session.record_operation_attempt(attempt).await);
+        }
+    } else {
         let mut attempt = crate::tools::operation_history::capture(invocation, None, None).await;
         // Cancellation may have interrupted a rewriting hook. Preserve the
         // requested parameters, but never certify them as the executed input.
@@ -832,6 +943,12 @@ pub(crate) async fn install_synthetic_terminal_projection(
         crate::tools::operation_history::settle_output(&mut attempt, result);
         result.operation_history = Some(invocation.session.record_operation_attempt(attempt).await);
     }
+}
+
+pub(crate) async fn install_synthetic_terminal_projection(
+    invocation: &ToolInvocation,
+    result: &mut AnyToolResult,
+) {
     let parsed_function_arguments = ParsedFunctionArguments::from_payload(&invocation.payload);
     let provider_visible = projection_is_provider_visible(&invocation.source);
     let phase_started = Instant::now();
@@ -1667,22 +1784,34 @@ impl ToolRegistry {
         invocation: ToolInvocation,
         dispatch_state: Arc<ToolDispatchState>,
     ) -> Result<AnyToolResult, FunctionCallError> {
-        let session = Arc::clone(&invocation.session);
         let mut attempt = self.capture_operation_attempt(&invocation).await;
         let mut result = self.dispatch_with_operation_attempt(
-            invocation, Arc::clone(&dispatch_state), &mut attempt,
+            invocation.clone(), Arc::clone(&dispatch_state), &mut attempt,
         ).await;
         // This is a reused recovery receipt, not a new execution/failure. Do
         // not overwrite the unresolved owner attempt with the preflight refusal.
         if attempt.recovery_deferred {
             return result;
         }
-        crate::tools::operation_history::settle(&mut attempt, &result);
-        let advisory = session.record_operation_attempt(attempt).await;
         let owner_failure = match &result {
             Ok(output) => output.result.tool_failure(),
             Err(error) => Some(error.failure()),
         };
+        if dispatch_state.cancelled_nested_attempt(invocation.source.cancellation_cause()).is_some() {
+            use codex_protocol::tool_failure::{ToolEffectsState, ToolExecutionState};
+            let known_settlement = result.as_ref().is_ok_and(AnyToolResult::success_for_logging)
+                || owner_failure.as_ref().is_some_and(|failure| {
+                    failure.execution_state == ToolExecutionState::Completed
+                        && failure.effects != ToolEffectsState::Unknown
+                });
+            if !known_settlement {
+                // The cancellation owner joins cleanup and records the exact
+                // timeout before admitting another exclusive dispatch.
+                return result;
+            }
+        }
+        crate::tools::operation_history::settle(&mut attempt, &result);
+        let advisory = invocation.session.record_operation_attempt(attempt).await;
         match &mut result {
             Ok(output) => {
                 if output.outcome_for_logging() != ToolOutputOutcome::Success
@@ -2060,6 +2189,7 @@ impl ToolRegistry {
 
         let invocation_for_tool = invocation.clone();
         let handler_dispatch_state = Arc::clone(&dispatch_state);
+        let handler_attempt = &*attempt;
         let log_payload = invocation.payload.log_payload();
 
         let phase_started = Instant::now();
@@ -2079,7 +2209,7 @@ impl ToolRegistry {
                     async move {
                         let result = with_parsed_function_arguments(
                             parsed_function_arguments.clone(),
-                            handle_any_tool(tool.as_ref(), invocation_for_tool, handler_dispatch_state.as_ref()),
+                            handle_any_tool(tool.as_ref(), invocation_for_tool, handler_dispatch_state.as_ref(), handler_attempt),
                         )
                         .await;
                         // Direct native calls retain their decoder's accepted
@@ -2192,6 +2322,7 @@ impl ToolRegistry {
             } else {
                 (None, false)
             };
+        let post_hook_ran = post_tool_use_outcome.is_some();
         if let (Ok(result), Some(outcome)) = (&mut result, post_tool_use_outcome) {
             let phase_started = Instant::now();
             let additional_contexts = apply_post_tool_use_outcome(result, outcome);
@@ -2362,6 +2493,11 @@ impl ToolRegistry {
                     }
                 }
                 result.install_model_projection(model_projection, rewritten_source_dependencies);
+                result.provider_read_offer_eligible = provider_visible
+                    && !hook_rewrote_input
+                    && !post_hook_ran
+                    && result.result.sampling_request_signal()
+                        .is_some_and(|signal| signal["provider_exact_read_offer_eligible"] == true);
                 // Cancellation may win while projection or its bookkeeping is
                 // pending. Its owner publishes the aborted terminal outcome.
                 if dispatch_state.is_aborted() {
@@ -2560,9 +2696,15 @@ async fn handle_any_tool(
     tool: &dyn CoreToolRuntime,
     invocation: ToolInvocation,
     dispatch_state: &ToolDispatchState,
+    attempt: &crate::tools::operation_history::OperationAttempt,
 ) -> Result<AnyToolResult, FunctionCallError> {
     if !tool.prepares_during_workspace_baseline() {
         crate::tools::parallel::wait_for_workspace_baseline().await;
+    }
+    if !dispatch_state.try_start_handler(attempt) {
+        return Err(FunctionCallError::RespondToModel(
+            "tool cancelled before handler entry".into(),
+        ));
     }
     let _tool_execution_timing_guard =
         matches!(tool.tool_execution_timing(), ToolExecutionTiming::Handler).then(|| {
@@ -2572,7 +2714,6 @@ async fn handle_any_tool(
                 .turn_timing_state
                 .begin_tool_execution()
         });
-    dispatch_state.mark_handler_started();
     invocation
         .step_context
         .turn
@@ -2604,6 +2745,7 @@ async fn handle_any_tool(
         code_mode_feedback: Vec::new(),
         operation_history: None,
         workspace_source_invalidated: false,
+        provider_read_offer_eligible: false,
     };
     Ok(result)
 }

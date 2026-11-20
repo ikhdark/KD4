@@ -748,6 +748,7 @@ async fn exec(
         }
         return Err(err.into());
     }
+    managed_root.bind_contained_root(&observation);
     if let Some(after_spawn) = after_spawn {
         after_spawn();
     }

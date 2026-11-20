@@ -299,6 +299,7 @@ async fn finish_pipe_process_setup(
             }
             return Err(error.into());
         }
+        managed.bind_contained_root(&observation);
         let process_handle = child
             .raw_handle()
             .ok_or_else(|| io::Error::other("missing child process handle"))?;

@@ -492,8 +492,9 @@ fn render_patch(hunks: &[Hunk], environment_id: Option<&str>, guards: &[FileRevi
                         let (mut old, mut new) = (0, 0);
                         for kind in &chunk.line_kinds {
                             match kind {
-                                UpdateLineKind::Context => {
-                                    append_patch_line(&mut text, " ", &chunk.old_lines[old]);
+                                UpdateLineKind::Context | UpdateLineKind::BareBlank => {
+                                    let prefix = if *kind == UpdateLineKind::BareBlank { "" } else { " " };
+                                    append_patch_line(&mut text, prefix, &chunk.old_lines[old]);
                                     old += 1;
                                     new += 1;
                                 }

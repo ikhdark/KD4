@@ -277,6 +277,38 @@ async fn handle_submit_agent_receipt(
         ))
     })?;
     let draft = args.into_receipt_draft(&task)?;
+    // Plan publication is session-local and can run outside workspace admission.
+    // Order completed admission with that owner through the durable seal; a
+    // durable plan update in flight must not be mistaken for an empty plan.
+    let plan_store = &session.services.plan_store;
+    let plan_publication = if draft.status == AgentStatusClaim::Completed {
+        let publication = tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => return Err(FunctionCallError::RespondToModel(
+                "receipt cancelled before completed admission".into(),
+            )),
+            guard = plan_store.publication_guard() => guard,
+        };
+        if let Some(plan) = plan_store.execution_snapshot().await
+            && !plan.obligations.unresolved.is_empty()
+        {
+            let mut failure = codex_protocol::tool_failure::ToolFailure::no_effects(
+                codex_protocol::tool_failure::ToolFailureCode::InvalidInput,
+                format!(
+                    "{SUBMIT_AGENT_RECEIPT_TOOL}: no receipt was sealed. The worker's current plan (revision {}) still has unresolved requirement IDs: {}.",
+                    plan.revision,
+                    plan.obligations.unresolved.join(", "),
+                ),
+            );
+            failure.safe_next_actions = vec![
+                "Continue the required work and reconcile it with update_plan before resubmitting completed. If genuinely blocked, keep the outstanding requirements open and submit a truthful blocked receipt.".into(),
+            ];
+            return Err(FunctionCallError::structured(failure));
+        }
+        Some(publication)
+    } else {
+        None
+    };
     // Same order as patch publication: workspace lease, then SQLite writer.
     // Cancellation/timeout withdraws this wait only; no other writer is interrupted.
     let _handoff_lease = if !task.assignment.write_scope.is_empty() {
@@ -303,6 +335,7 @@ async fn handle_submit_agent_receipt(
     turn.extension_data
         .insert(crate::agent::task_coordinator::AuthoredReceiptSealed);
     coordinator.mark_task_inactive(binding.assignment_id);
+    drop(plan_publication);
     coordinator
         .maybe_emit_terminal_metrics(binding.assignment_id, &turn.session_telemetry)
         .await;

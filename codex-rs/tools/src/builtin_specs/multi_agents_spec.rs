@@ -661,15 +661,17 @@ fn writable_assignment_schema() -> JsonSchema {
         min_length: Some(8),
         ..JsonSchema::string(Some("Exact owned-source obligation: inspect:<normalized repository-relative file>, for example inspect:src/lib.rs. Use the identical string in assignment.required_evidence and the criterion's evidence_policy.required_evidence; not prose, an absolute path, a directory, or a glob.".into()))
     };
-    let mut policy = criterion_evidence_policy_schema();
-    // Omission keeps the typed owner's Current default; the policy and its
-    // exact evidence binding remain mandatory for every writable criterion.
-    policy.required = Some(vec!["kind".into(), "required_evidence".into()]);
-    if let Some(properties) = &mut policy.properties {
-        properties.insert("kind".into(), JsonSchema::string_enum(vec![json!("source_inspection")],
-            Some("Writable workers require owned source evidence; root owns execution/integration checks.".into())));
-        properties.insert("required_evidence".into(), inspection.clone());
-    }
+    let source_policy = JsonSchema::object(BTreeMap::from([
+        ("kind".into(), JsonSchema::string_enum(vec![json!("source_inspection")], None)),
+        ("required_evidence".into(), inspection.clone()),
+        ("freshness".into(), JsonSchema::string_enum(vec![json!("current"), json!("historical")],
+            Some("Defaults to current; current source acquisition is rehashed.".into()))),
+    ]), Some(vec!["kind".into(), "required_evidence".into()]), Some(false.into()));
+    let report_policy = JsonSchema::object(BTreeMap::from([
+        ("kind".into(), JsonSchema::string_enum(vec![json!("report_only")], None)),
+    ]), Some(vec!["kind".into()]), Some(false.into()));
+    let policy = JsonSchema::one_of(vec![source_policy, report_policy], Some(
+        "Use source_inspection for required native source evidence, and report_only for additional worker-run builds, benchmarks or verification. Reported runs are not host-certified source or execution evidence.".into()));
     let criterion = JsonSchema::object(BTreeMap::from([
         ("id".into(), JsonSchema::string(None)),
         ("text".into(), JsonSchema::string(None)),
@@ -694,7 +696,7 @@ fn writable_assignment_schema() -> JsonSchema {
         ("contract_sha256".into(), JsonSchema::string(None)),
     ]), Some(vec!["architect_assignment_id".into(), "architect_attempt_id".into(), "contract_version".into(), "contract_sha256".into()]), Some(false.into()));
     JsonSchema {
-        description: Some("Required for writable workers, mutually exclusive with message. Declare exact write scopes, typed path/create/delete/move prohibitions, nonempty assignment-specific criteria with owned source-inspection policies, required evidence, and stop condition. Source manifests and complete observed handoff deltas are verified; missing/invalid/oversized capture rejects launch. Opaque commands, external IO and nested delegation cannot enforce this footprint; the root owns builds and integration. Historical evidence is never promoted to current correctness.".into()),
+        description: Some("Required for writable workers, mutually exclusive with message. Declare exact write scopes, typed path/create/delete/move prohibitions, nonempty assignment-specific criteria with owned source-inspection policies, required evidence, and stop condition. Source manifests and complete observed handoff deltas are verified; missing/invalid/oversized capture rejects launch. Opaque commands, external IO and nested delegation cannot enforce this footprint. Workers can run permitted builds, benchmarks and verification within their assignment; collect results with additional report_only criteria. Root owns integration and acceptance. Historical evidence is never promoted to current correctness.".into()),
         ..JsonSchema::object(BTreeMap::from([
             ("role".into(), JsonSchema::string_enum(
                 vec![json!("worker"), json!("explorer"), json!("architect"), json!("reviewer"), json!("verifier"), json!("integrator")],
@@ -716,7 +718,7 @@ fn writable_assignment_schema() -> JsonSchema {
             }),
             ("write_scope".into(), scopes),
             ("stop_condition".into(), JsonSchema::string(None)),
-            ("required_evidence".into(), JsonSchema::array(inspection, Some("Every entry must have a matching criterion with an owned source-inspection policy; root owns execution/integration evidence.".into()))),
+            ("required_evidence".into(), JsonSchema::array(inspection, Some("Nonempty for writable assignments. Every entry must have a matching source_inspection criterion. Additional report_only criteria do not bind entries.".into()))),
             ("prohibited_changes".into(), JsonSchema::array(JsonSchema::one_of(vec![paths, operations], None), Some("Typed prohibitions only, e.g. [{\"kind\":\"delete\"},{\"kind\":\"move\"}]; use [] when no extra prohibition is needed. Free-text strings are not valid write contracts.".into()))),
             ("risk_hints".into(), strings.clone()),
             ("contract_claims".into(), strings.clone()),
@@ -755,7 +757,7 @@ The spawned agent receives a durable task binding.
 Only call this tool for a concrete, bounded subtask that can run independently alongside useful local work; otherwise continue locally.
 Apply the base instructions for audit/review scope, verification, validation, and completion, and applicable assignment restrictions.
 Fit assignments to actual worker context, reserving reasoning/evidence/reporting space; partition by cohesive subsystems and execution paths, not just file size.
-The read-only `message` must include task type, scope, exclusions, detection criteria, user restrictions, evidence and stop condition. Writable work requires `assignment` with explicit write scopes, typed prohibitions and criterion-specific source evidence policies. Never infer write authority from natural-language messages. Native source acquisition is not semantic acceptance; workers can independently verify with permitted commands, while root owns integration.
+The read-only `message` must include task type, scope, exclusions, detection criteria, user restrictions, evidence and stop condition. Writable work requires `assignment` with explicit write scopes, typed prohibitions and criterion-specific source evidence policies. Never infer write authority from natural-language messages. Assign worker-run builds, benchmarks and verification as additional `report_only` criteria; ask for raw evidence and exact inputs. Native source acquisition is not semantic acceptance; root owns integration and acceptance.
 Launch authorized independent assignments in the same batch, not a serial spawn loop. In exec, use bounded Promise.allSettled and retain every success and failure; failed siblings do not justify respawning successes.
 Sequence only real dependencies or shared-resource conflicts. Integrate completions with the next substantive step/final, not an acknowledgment-only model round.
 It can message its children and peers, but cannot message ancestors. Its final answer and terminal outcome are delivered to its parent automatically when it finishes.

@@ -1221,6 +1221,7 @@
       let incarnation;
       const reject = (message, evidence, code = "failed", cause) => {
         const error = new Error(message);
+        registerCommandEvidence(evidence);
         error.evidence = evidence;
         const inherited = cause?.tool_failure ?? current?.tool_failure;
         const handles = [...(inherited?.live_operations ?? [])];

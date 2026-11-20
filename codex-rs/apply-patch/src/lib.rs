@@ -2122,7 +2122,7 @@ fn chunk_edit_operations(chunk: &UpdateFileChunk, pattern: &[String]) -> Result<
     let mut operations = Vec::new();
     for kind in chunk.line_kinds.iter().copied().chain(std::iter::once(UpdateLineKind::Context)) {
         match kind {
-            UpdateLineKind::Context => {
+            UpdateLineKind::Context | UpdateLineKind::BareBlank => {
                 if let Some((old_index, new_index)) = group.take() {
                     let (old_len, new_len) = (old - old_index, new - new_index);
                     if old > pattern.len() || new > chunk.new_lines.len() {
@@ -2155,18 +2155,80 @@ fn compute_replacements_with_hash(
     chunks: &[UpdateFileChunk],
     source_hash: &std::cell::OnceCell<String>,
 ) -> std::result::Result<Vec<(usize, usize, Vec<String>)>, ApplyPatchError> {
-    let matcher = ChunkMatcher {
-        original_lines,
-        original_contents,
-        path_uri,
-        path,
-        hunk_ordinal,
-        chunks,
-        source_hash,
+    let attempt = |chunks: &[UpdateFileChunk]| -> std::result::Result<
+        Vec<(usize, usize, Vec<String>)>,
+        ApplyPatchError,
+    > {
+        let matcher = ChunkMatcher {
+            original_lines,
+            original_contents,
+            path_uri,
+            path,
+            hunk_ordinal,
+            chunks,
+            source_hash,
+        };
+        let mut cursor = ChunkCursor::default();
+        matcher.match_from(0, &mut cursor, Pass::Primary)?;
+        Ok(cursor.into_sorted_replacements())
     };
-    let mut cursor = ChunkCursor::default();
-    matcher.match_from(0, &mut cursor, Pass::Primary)?;
-    Ok(cursor.into_sorted_replacements())
+    let strict = attempt(chunks);
+    if let Err(error) = &strict
+        && let Some(terminal) = trailing_blank_as_end_of_file(original_lines, chunks, error)
+        && let Ok(replacements) = attempt(&terminal)
+    {
+        return Ok(replacements);
+    }
+    // A failed end-of-file reading reports the strict mismatch unchanged.
+    strict
+}
+
+/// A bare blank line before the next patch marker parses as blank context.
+/// When that line is the only reason the hunk's last chunk has no site, read
+/// it as `*** End of File`: the remaining lines must then end at the last
+/// source line and have no other site anywhere in the file, so no location is
+/// guessed. Blank context that has a source line to match stays a
+/// precondition, as do removed blank lines.
+fn trailing_blank_as_end_of_file(
+    original_lines: &[String],
+    chunks: &[UpdateFileChunk],
+    error: &ApplyPatchError,
+) -> Option<Vec<UpdateFileChunk>> {
+    let ApplyPatchError::PatchContextMismatch(mismatch) = error else {
+        return None;
+    };
+    let (last, earlier) = chunks.split_last()?;
+    if mismatch.kind != PatchContextMismatchKind::ExpectedLinesNotFound
+        || mismatch.chunk_ordinal != chunks.len()
+        || last.is_end_of_file
+        || last.line_kinds.last() != Some(&parser::UpdateLineKind::BareBlank)
+        || !last.old_lines.last().is_some_and(String::is_empty)
+        || !last.new_lines.last().is_some_and(String::is_empty)
+        || last
+            .change_context
+            .as_deref()
+            .is_some_and(|context| context.starts_with("codex-"))
+    {
+        return None;
+    }
+    let mut terminal = last.clone();
+    terminal.old_lines.pop();
+    terminal.new_lines.pop();
+    terminal.line_kinds.pop();
+    // Without text left to locate, the blank line is the whole precondition.
+    if terminal.old_lines.iter().all(|line| line.trim().is_empty()) {
+        return None;
+    }
+    // The same text earlier in the file leaves the intended site unknown.
+    if seek_sequence::candidate_starts_at_any_tier(original_lines, &terminal.old_lines, 2).len()
+        != 1
+    {
+        return None;
+    }
+    terminal.is_end_of_file = true;
+    let mut chunks = earlier.to_vec();
+    chunks.push(terminal);
+    Some(chunks)
 }
 
 /// Candidate sites tried when an unanchored search is ambiguous. Each costs one
@@ -3177,6 +3239,8 @@ enum RegionCloseness {
     AlreadyApplied { start: usize, end: usize },
     /// Current lines `start..end` hold the expected code formatted differently.
     Rewrapped { start: usize, end: usize },
+    /// Current lines `start..end` hold the expected text; only blank lines differ.
+    BlankLines { start: usize, end: usize },
     /// The line most similar to an expected line, ahead of every other line.
     Similar { line: usize },
 }
@@ -3200,6 +3264,14 @@ impl RegionCloseness {
             ),
             Self::Rewrapped { start, end } => format!(
                 " (current lines {}-{end} hold the same code formatted differently; copy them exactly)",
+                start + 1
+            ),
+            Self::BlankLines { start, end } if end - start == 1 => format!(
+                " (current line {} holds the expected text; only blank lines differ. A blank patch line is context that must exist in the source: remove it or copy the source's blank lines exactly)",
+                start + 1
+            ),
+            Self::BlankLines { start, end } => format!(
+                " (current lines {}-{end} hold the expected text; only blank lines differ. A blank patch line is context that must exist in the source: remove it or copy the source's blank lines exactly)",
                 start + 1
             ),
             Self::Similar { line } => format!(
@@ -3228,7 +3300,20 @@ fn bounded_patch_mismatch_region(
         return region(start, end, RegionCloseness::AlreadyApplied { start, end });
     }
     if let Some((start, end)) = rewrapped_region(original_lines, expected) {
-        return region(start, end, RegionCloseness::Rewrapped { start, end });
+        // Identical text lines are not reformatted code; name the blank lines.
+        let text = |lines: &[String]| {
+            lines
+                .iter()
+                .filter(|line| !line.trim().is_empty())
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let closeness = if text(&original_lines[start..end]) == text(expected) {
+            RegionCloseness::BlankLines { start, end }
+        } else {
+            RegionCloseness::Rewrapped { start, end }
+        };
+        return region(start, end, closeness);
     }
     if let Some(excerpt) = bounded_patch_mismatch_excerpt(original_lines, chunk) {
         return Some((excerpt, RegionCloseness::Located));

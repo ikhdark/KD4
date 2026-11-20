@@ -496,6 +496,12 @@ impl ManagedRootProcess {
         self.job.require_descendant_containment()
     }
 
+    /// Bind the observation only after successful attachment of a suspended root.
+    #[cfg(windows)]
+    pub fn bind_contained_root(&self, root: &crate::process_observation::ObservedProcess) {
+        self.job.bind_contained_root(root);
+    }
+
     #[cfg(windows)]
     pub fn terminate(&self) -> io::Result<()> {
         self.job.terminate()

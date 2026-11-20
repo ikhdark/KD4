@@ -32,6 +32,7 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
       integerLexeme(context.source) !== null ? toBigInt(context.source) : item);
   const keys = Object.getOwnPropertyNames;
   const descriptor = Object.getOwnPropertyDescriptor;
+  const hasOwn = Object.hasOwn;
   const prototype = Object.getPrototypeOf;
   const objectPrototype = Object.prototype;
   const arrayPrototype = Array.prototype;
@@ -41,6 +42,15 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
   const sources = new WeakMap();
   const sourceOf = sources.get.bind(sources);
   const setSource = sources.set.bind(sources);
+  // This registration closure is installed only in the built-in command
+  // helper. Its two private convenience aliases are not wire evidence.
+  const commandEvidence = new WeakMap();
+  const commandEvidenceOf = commandEvidence.get.bind(commandEvidence);
+  const setCommandEvidence = commandEvidence.set.bind(commandEvidence);
+  const registerCommandEvidence = value => setCommandEvidence(value, {
+    output: descriptor(value, 'output').get,
+    exitCode: descriptor(value, 'exit_code').value,
+  });
   const sourceSnapshot = source => source.baseline?.original ??
     parseExact(source.baseline?.serialized ?? source.serialized);
   const lookup = projections.get.bind(projections);
@@ -145,11 +155,18 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
         if (array) result.length = descriptor(value, 'length').value;
         const names = isError ? [...new Set(['name', 'message', 'cause', 'evidence', 'results',
           ...keys(value).filter(key => key !== 'stack')])] : keys(value);
+        const command = commandEvidenceOf(value);
         for (const key of names) {
           if (array && key === 'length') continue;
           let field = descriptor(value, key);
           if (!field && isError && key === 'name') field = descriptor(proto, key);
           if (!field) continue;
+          // Do not invoke getters or omit caller edits to the built-in wrapper.
+          if (command && !field.enumerable && field.configurable &&
+              ((key === 'output' && hasOwn(field, 'get') &&
+                field.get === command.output && field.set === undefined) ||
+               (key === 'exit_code' && hasOwn(field, 'value') && !field.writable &&
+                field.value === command.exitCode))) continue;
           const content = 'value' in field ? clone(field.value, depth + 1) :
             unsupported('Canonical error evidence cannot contain accessors');
           Object.defineProperty(result, key, {value: content,
@@ -830,6 +847,7 @@ const PROJECTOR: &str = r#"((isProxy, boxedKind, projectTool) => {
       source: identity, selection: options, pointers}}));
   }
   return function project(value, original, projected, sourceFragments) {
+    if (arguments.length === 0) return registerCommandEvidence;
     if (arguments.length === 5 || arguments.length === 6) {
       const native = arguments[5];
       setSource(value, {serialized: original, tool: {namespace: projected, name: sourceFragments}, callId: native?.callId});

@@ -677,6 +677,17 @@ impl MessageProcessor {
                         serde_json::json!({"boundary":"decode_and_dispatch_not_handler_completion"}),
                     )
                 });
+                // Observed methods outside the allowlist are recorded as "other", which
+                // cannot name an API this server lacks. A method name is a protocol
+                // identifier, not user content; keep a plainly formed one for that case.
+                let unimplemented_method = observation.as_ref().and_then(|_| {
+                    let method = request.method.as_str();
+                    (method.len() <= 64
+                        && method.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'.' | b'-')
+                        }))
+                    .then(|| method.to_owned())
+                });
                 let codex_request = deserialize_client_request(request);
                 let result = match codex_request {
                     Ok(codex_request) => {
@@ -696,8 +707,13 @@ impl MessageProcessor {
                     Err(error) => Err(error),
                 };
                 if let Some(observation) = observation {
-                    observation.finish(if result.is_ok() { "dispatched_or_initialized" } else { "rejected" },
-                        serde_json::json!({"error_code":result.as_ref().err().map(|error| error.code)}));
+                    let error_code = result.as_ref().err().map(|error| error.code);
+                    let mut facts = serde_json::json!({"error_code":error_code});
+                    // -32601: the JSON-RPC method-not-found code.
+                    if error_code == Some(-32601) {
+                        facts["unimplemented_method"] = serde_json::json!(unimplemented_method);
+                    }
+                    observation.finish(if result.is_ok() { "dispatched_or_initialized" } else { "rejected" }, facts);
                 }
                 if let Err(error) = result {
                     self.outgoing.queue_error(request_id.clone(), error).await;

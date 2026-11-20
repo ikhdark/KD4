@@ -225,7 +225,21 @@ pub(super) async fn select_rollout_threads(
     params: &ListThreadsParams,
     cursor: Option<&BoundThreadListCursor>,
 ) -> ThreadStoreResult<SelectedRolloutThreads> {
-    match storage_path_for_request(params, cursor)? {
+    // Only an unbound default request can change path, so nothing else reads
+    // the certification row. An ascending listing starts at the oldest rows,
+    // where rows of removed rollouts concentrate and an index page can come
+    // back empty where the scan returns threads, so it keeps the scan.
+    let index_fresh = match state_db.as_deref() {
+        Some(state_db)
+            if cursor.is_none()
+                && params.storage_mode == ThreadListStorageMode::PreferStateDb
+                && params.sort_direction == SortDirection::Desc =>
+        {
+            thread_index_recently_certified(state_db).await
+        }
+        _ => false,
+    };
+    match storage_path_for_request(params, cursor, index_fresh)? {
         ThreadListStoragePath::StateDb => {
             // Serve the current catalog without waiting for backfill certification.
             // Desktop's sidebar and sub-agent listings use this path, and historical
@@ -349,9 +363,31 @@ pub(super) async fn list_rollout_threads_for_storage(
     })
 }
 
+/// Longest age of the last completed rollout reconciliation for which the index
+/// still stands in for a scan: three of its one-minute refresh intervals, so one
+/// bounded pass that had to resume does not send a listing back to the scan.
+const MAX_CERTIFIED_INDEX_AGE_SECONDS: i64 = 180;
+
+/// Whether the periodic rollout reconciliation certified the index against the
+/// rollout roots recently enough to serve a default listing from it. A withdrawn
+/// certification, an unreadable row, a completion older than the bound or a
+/// timestamp ahead of this clock all mean no.
+async fn thread_index_recently_certified(state_db: &codex_state::StateRuntime) -> bool {
+    let Ok(state) = state_db.get_backfill_state().await else {
+        return false;
+    };
+    state.coverage_certified()
+        && state.last_success_at.is_some_and(|certified_at| {
+            let age = chrono::Utc::now().signed_duration_since(certified_at);
+            age >= ChronoDuration::zero()
+                && age <= ChronoDuration::seconds(MAX_CERTIFIED_INDEX_AGE_SECONDS)
+        })
+}
+
 fn storage_path_for_request(
     params: &ListThreadsParams,
     cursor: Option<&BoundThreadListCursor>,
+    index_fresh: bool,
 ) -> ThreadStoreResult<ThreadListStoragePath> {
     if params.project_id.is_some() {
         if params.storage_mode == ThreadListStorageMode::ScanAndRepair {
@@ -402,6 +438,10 @@ fn storage_path_for_request(
         return Ok(ThreadListStoragePath::StateDb);
     }
     Ok(match params.storage_mode {
+        // The periodic reconciliation is the index's freshness contract: while
+        // its last completed pass is recent, the index is the catalog a scan
+        // would rebuild, without re-reading every rollout on the page.
+        ThreadListStorageMode::PreferStateDb if index_fresh => ThreadListStoragePath::StateDb,
         // A completed one-time backfill is not a current root-coverage proof:
         // another writer can publish or move a rollout without updating SQL.
         // Reuse canonical scan/repair until the index has a durable freshness

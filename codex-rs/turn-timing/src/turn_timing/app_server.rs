@@ -1,10 +1,24 @@
-//! Native accepted-tool lifecycle interchange. Events are recorded at their
-//! owners, not reconstructed/sorted from rounded terminal timing rows. This
-//! deliberately certifies no client delivery, OS execution or terminal emission.
+//! Native accepted-tool lifecycle and opt-in model-stream receive evidence.
+//! Neither captures frontend delivery, OS execution or RPC terminal emission.
 use super::*;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::num::NonZeroU64;
+use std::sync::OnceLock;
 
 const MAX_EVENTS: usize = 8192;
+const MAX_TEXT_EVENTS: usize = 512;
+const MAX_TEXT_BYTES_PER_BOUNDARY: usize = 4 * 1024 * 1024;
+const TEXT_CONSUMER: &str = "kd4-harness-model-stream";
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct TextDelivery {
+    active_streams: usize,
+    budget_exhausted: bool,
+    produced_bytes: usize,
+    received_bytes: usize,
+    events: Vec<Value>,
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct Capture {
@@ -18,6 +32,7 @@ pub(super) struct Capture {
     invalid: bool,
     started: bool,
     closed: Option<Value>,
+    text_delivery: TextDelivery,
 }
 
 impl Capture {
@@ -96,11 +111,60 @@ impl Capture {
         }
     }
 
+    fn text_chunk(
+        &mut self,
+        received_tag: Option<NonZeroU64>,
+        text: &str,
+        at_ns: u128,
+    ) -> Option<NonZeroU64> {
+        if self.closed.is_some() || self.text_delivery.budget_exhausted {
+            return None;
+        }
+        let bytes = if received_tag.is_some() {
+            &mut self.text_delivery.received_bytes
+        } else {
+            &mut self.text_delivery.produced_bytes
+        };
+        if self.text_delivery.events.len() >= MAX_TEXT_EVENTS
+            || bytes.saturating_add(text.len()) > MAX_TEXT_BYTES_PER_BOUNDARY
+            || self.sequence >= u64::MAX - 2
+        {
+            self.text_delivery.budget_exhausted = true;
+            return None;
+        }
+        *bytes += text.len();
+        self.sequence += 1;
+        let tag = received_tag.or_else(|| NonZeroU64::new(self.sequence))?;
+        let kind = if received_tag.is_some() {
+            "chunk_received"
+        } else {
+            "chunk_produced"
+        };
+        let mut event = json!({
+            "id": format!("{}:{}", self.capture_id, self.sequence),
+            "seq": self.sequence,
+            "at_ms": at_ns as f64 / 1e6,
+            "kind": kind,
+            "chunk_id": tag.to_string(),
+            "content_sha256": hex::encode(Sha256::digest(text.as_bytes())),
+            "content_bytes": text.len(),
+        });
+        if received_tag.is_some() {
+            event["consumer_id"] = json!(TEXT_CONSUMER);
+            event["boundary"] = json!("received");
+            event["client_paused"] = json!(false);
+            event["intentional_batch"] = json!(false);
+        }
+        self.text_delivery.events.push(event);
+        Some(tag)
+    }
+
     fn close(
         &mut self,
         at_ns: u128,
         thread: &str,
         turn: &str,
+        outcome: &str,
         accepted: usize,
         ungated: bool,
         inventory_complete: bool,
@@ -117,6 +181,16 @@ impl Capture {
         {
             return None;
         }
+        // Scope the extra facts to observed, drained streams. Do not infer
+        // loss from a cancelled reader, an open stream or a capture limit.
+        let export_text = self.text_delivery.active_streams == 0
+            && !self.text_delivery.budget_exhausted
+            && !self.text_delivery.events.is_empty()
+            && self.events.len() + self.text_delivery.events.len() + 2 <= MAX_EVENTS;
+        let terminal_seq = self.sequence + u64::from(export_text);
+        if export_text {
+            self.sequence = terminal_seq;
+        }
         self.event(at_ns, "turn_closed", None);
         let complete = inventory_complete
             && !self.invalid
@@ -132,7 +206,7 @@ impl Capture {
         if ungated {
             capabilities.push("AS-05");
         }
-        let packet = json!({"version":1, "thread_id":thread, "complete":complete,
+        let mut packet = json!({"version":1, "thread_id":thread, "complete":complete,
             "clock_id":self.clock, "sequence_domain":self.capture_id,
             "turn_inventory_complete":complete, "capabilities":capabilities, "events":events,
             "source":"kd4_native_accepted_tool_lifecycle",
@@ -144,15 +218,89 @@ impl Capture {
         if serde_json::to_vec(&packet).ok()?.len() > 2 * 1024 * 1024 {
             return None;
         }
+        if complete && export_text {
+            let mut candidate = packet.clone();
+            let mut events = events;
+            let mut delivery_events = std::mem::take(&mut self.text_delivery.events);
+            for event in &mut delivery_events {
+                event["turn_id"] = json!(turn);
+                if event["kind"] == "chunk_received" {
+                    event["received_thread"] = json!(thread);
+                }
+            }
+            events.extend(delivery_events);
+            events.push(json!({
+                "id": format!("{}:{}", self.capture_id, terminal_seq), "seq": terminal_seq,
+                "at_ms": at_ns as f64 / 1e6, "kind": "turn_terminal", "turn_id": turn,
+                "outcome": outcome,
+            }));
+            events.sort_unstable_by_key(|event| event["seq"].as_u64());
+            candidate["events"] = json!(events);
+            candidate["chunk_inventory_complete"] = json!(true);
+            candidate["chunk_delivery"] = json!("at_most_once");
+            candidate["delivery_contract"] = json!({
+                "version": 1, "consumer_id": TEXT_CONSUMER, "consumer_kind": "client",
+                "boundary": "received", "representation": "kd4-mapped-assistant-text-utf8-v1",
+                "ordered": true, "inventory_complete": true,
+            });
+            if serde_json::to_vec(&candidate).ok()?.len() <= 2 * 1024 * 1024 {
+                packet = candidate;
+            }
+        }
         self.closed = Some(packet.clone());
         Some(packet)
     }
 }
 
 impl TurnTimingState {
+    pub fn begin_text_delivery_stream(&self) -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        if !*ENABLED
+            .get_or_init(|| std::env::var_os("CODEX_KDR_TEXT_DELIVERY").is_some_and(|v| v == "1"))
+        {
+            return false;
+        }
+        let mut state = self.state();
+        let capture = &mut state.measurements.app_server;
+        if !capture.started || capture.closed.is_some() || capture.clock.is_none() {
+            return false;
+        }
+        capture.text_delivery.active_streams += 1;
+        true
+    }
+
+    pub fn record_text_produced(&self, text: &str) -> Option<NonZeroU64> {
+        let mut state = self.state();
+        let at_ns = self.clock.sample().time.monotonic_ns;
+        state.measurements.app_server.text_chunk(None, text, at_ns)
+    }
+
+    pub fn record_text_received(&self, tag: Option<NonZeroU64>, text: &str) {
+        let mut state = self.state();
+        let at_ns = self.clock.sample().time.monotonic_ns;
+        let capture = &mut state.measurements.app_server;
+        if tag.is_some() {
+            capture.text_chunk(tag, text, at_ns);
+        } else {
+            // Missing queue identity is not an attributable receipt.
+            capture.text_delivery.budget_exhausted = true;
+        }
+    }
+
+    pub fn finish_text_delivery_stream(&self) {
+        let mut state = self.state();
+        let active = &mut state.measurements.app_server.text_delivery.active_streams;
+        *active = active.saturating_sub(1);
+    }
+
     /// Close only the native accepted-tool observation window. This is NOT a
     /// server terminal-emission, cancel acknowledgment or client render receipt.
-    pub fn close_native_app_server_trace(&self, thread: &str, turn: &str) -> Option<Value> {
+    pub fn close_native_app_server_trace(
+        &self,
+        thread: &str,
+        turn: &str,
+        outcome: &str,
+    ) -> Option<Value> {
         let mut state = self.state();
         let at_ns = self.clock.sample().time.monotonic_ns;
         let accepted = state.tool_closure.entries.len();
@@ -185,6 +333,7 @@ impl TurnTimingState {
             at_ns,
             thread,
             turn,
+            outcome,
             accepted,
             ungated,
             inventory_complete,

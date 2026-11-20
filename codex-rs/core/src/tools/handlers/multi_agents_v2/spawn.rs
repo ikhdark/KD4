@@ -563,6 +563,9 @@ async fn handle_spawn_agent(
             instructions.push_str("\n\n");
         }
         instructions.push_str(TYPED_RECEIPT_LIFECYCLE);
+        if !typed_task.0.write_scope.is_empty() {
+            instructions.push_str(TYPED_WRITABLE_VALIDATION);
+        }
         if !typed_task.0.dependencies.is_empty() {
             instructions.push_str(TYPED_DEPENDENCY_RECEIPTS);
         }
@@ -1327,6 +1330,7 @@ async fn normalize_relevant_handles(
 
 const TYPED_RECEIPT_LIFECYCLE: &str = "This is an explicit typed assignment. Before acting on a follow-up, use get_agent_task with your own assignment_id to recover the current attempt and effective contract; the immutable bootstrap may describe an earlier attempt. Otherwise use get_agent_task only when contract details or captured validation call IDs are missing from the current context. Before your final response, call submit_agent_receipt with the actual outcome and available evidence; report missing validation honestly. A final response alone does not seal this typed assignment. Your read_scope names primary inputs and overlap identity, not a read restriction: read and search any other relevant, permitted file; write_scope and prohibited_changes limit changes.";
 const TYPED_DEPENDENCY_RECEIPTS: &str = "\n\nUse dependency_receipt_pins to fetch the admitted prerequisite receipts by assignment_id and attempt_id. If the pins are absent or you are resuming, use get_agent_task with your own assignment_id and read task.dependency_admissions; do not substitute a prerequisite's latest attempt. These pins are historical, not current authorization.";
+const TYPED_WRITABLE_VALIDATION: &str = "\n\nRun assigned, permitted builds, benchmarks and verification yourself under inherited validation and approval policy. Keep artifacts in assigned locations or approved isolated output lanes; opaque commands are not confined to write_scope. For report_only criteria, put the actual outcome, exact command, input identity and raw result or locator in criterion_results.evidence. Report failures and unperformed work honestly. Reports do not replace native source evidence or root acceptance.";
 
 fn typed_assignment_message(
     assignment: &Assignment,

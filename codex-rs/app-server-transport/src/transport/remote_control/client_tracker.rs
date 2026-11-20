@@ -28,6 +28,12 @@ use tracing::warn;
 const REMOTE_CONTROL_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 pub(crate) const REMOTE_CONTROL_IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 const REMOTE_CONTROL_TRANSPORT_EVENT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// Most unacknowledged data envelopes one stream may have in flight. With one,
+/// every message waited a relay round trip for the previous ACK and a busy
+/// session outran its phone. The window starts at one and widens by one per
+/// acknowledged envelope, so a stream that never acknowledges still holds a
+/// single shared replay slot.
+const REMOTE_CONTROL_STREAM_REPLAY_WINDOW: usize = 8;
 
 #[derive(Debug)]
 pub(crate) struct Stopped;
@@ -384,11 +390,20 @@ impl ClientTracker {
         mut status_rx: watch::Receiver<PongStatus>,
         disconnect_token: CancellationToken,
     ) -> (ClientId, StreamId, ConnectionId) {
-        // Preserve the one-envelope replay window per stream. A data envelope
+        // Preserve a bounded replay window per stream. A data envelope
         // waiting for global capacity must not prevent polling the status slot.
         let data = async {
             let stream_slot = Arc::new(tokio::sync::Semaphore::new(1));
-            while let Ok(permit) = Arc::clone(&stream_slot).acquire_owned().await {
+            let mut window = 1;
+            loop {
+                // While the stream lives only an ACK returns a permit, so having
+                // had to wait for one is the evidence that widens the window.
+                let awaited_ack = stream_slot.available_permits() == 0;
+                let Ok(permit) = Arc::clone(&stream_slot).acquire_owned().await else { break };
+                if awaited_ack && window < REMOTE_CONTROL_STREAM_REPLAY_WINDOW {
+                    stream_slot.add_permits(1);
+                    window += 1;
+                }
                 let Some(mut queued_message) = writer_rx.recv().await else { break };
                 let bytes = match queued_message.encoded_json.as_ref() {
                     Some(encoded) => encoded.streamed_len.unwrap_or(encoded.bytes.len()),

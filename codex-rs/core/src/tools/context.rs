@@ -141,7 +141,8 @@ impl ToolEffectRecovery {
 #[derive(Debug)]
 pub(crate) struct ToolDispatchState {
     state: AtomicU8,
-    handler_started: AtomicBool,
+    retains_nested_deadline_admission: AtomicBool,
+    started_attempt: OnceLock<crate::tools::operation_history::OperationAttempt>,
     settlement: OnceLock<ToolDispatchSettlement>,
 }
 
@@ -179,6 +180,9 @@ enum ToolDispatchPhase {
     AccountingUnconfirmed = 5,
 }
 
+// Keep handler entry and abort in the same compare-exchange domain.
+const HANDLER_STARTED: u8 = 1 << 7;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ToolDispatchAbort {
     BeforeAdmission,
@@ -190,7 +194,8 @@ impl ToolDispatchState {
     pub(crate) fn new() -> Self {
         Self {
             state: AtomicU8::new(ToolDispatchPhase::WaitingForAdmission as u8),
-            handler_started: AtomicBool::new(false),
+            retains_nested_deadline_admission: AtomicBool::new(false),
+            started_attempt: OnceLock::new(),
             settlement: OnceLock::new(),
         }
     }
@@ -237,26 +242,21 @@ impl ToolDispatchState {
     }
 
     pub(crate) fn try_complete(&self) -> bool {
-        self.state
-            .compare_exchange(
-                ToolDispatchPhase::Admitted as u8,
-                ToolDispatchPhase::Completed as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
+        self.try_finish(ToolDispatchPhase::Completed)
     }
 
     /// The handler settled, but required accounting did not confirm completion.
     /// This is terminal for cancellation without claiming ordinary completion.
     pub(crate) fn try_accounting_unconfirmed(&self) -> bool {
+        self.try_finish(ToolDispatchPhase::AccountingUnconfirmed)
+    }
+
+    fn try_finish(&self, phase: ToolDispatchPhase) -> bool {
         self.state
-            .compare_exchange(
-                ToolDispatchPhase::Admitted as u8,
-                ToolDispatchPhase::AccountingUnconfirmed as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current & !HANDLER_STARTED == ToolDispatchPhase::Admitted as u8)
+                    .then_some(phase as u8 | (current & HANDLER_STARTED))
+            })
             .is_ok()
     }
 
@@ -264,7 +264,7 @@ impl ToolDispatchState {
     pub(crate) fn try_abort(&self) -> ToolDispatchAbort {
         loop {
             let current = self.state.load(Ordering::Acquire);
-            let (next, outcome) = match current {
+            let (next, outcome) = match current & !HANDLER_STARTED {
                 value if value == ToolDispatchPhase::WaitingForAdmission as u8 => (
                     ToolDispatchPhase::AbortedBeforeAdmission,
                     ToolDispatchAbort::BeforeAdmission,
@@ -277,7 +277,12 @@ impl ToolDispatchState {
             };
             if self
                 .state
-                .compare_exchange(current, next as u8, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(
+                    current,
+                    next as u8 | (current & HANDLER_STARTED),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
                 .is_ok()
             {
                 return outcome;
@@ -285,47 +290,82 @@ impl ToolDispatchState {
         }
     }
 
-    pub(crate) fn mark_handler_started(&self) {
-        self.handler_started.store(true, Ordering::Release);
+    pub(crate) fn retain_nested_deadline_admission(&self) {
+        self.retains_nested_deadline_admission.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn try_start_handler(
+        &self,
+        attempt: &crate::tools::operation_history::OperationAttempt,
+    ) -> bool {
+        if self.retains_nested_deadline_admission.load(Ordering::Acquire) {
+            // An abort that wins before the phase transition must not use this
+            // prepared identity as evidence that the handler was entered.
+            let _ = self.started_attempt.set(attempt.clone());
+        }
+        self.state
+            .compare_exchange(
+                ToolDispatchPhase::Admitted as u8,
+                ToolDispatchPhase::Admitted as u8 | HANDLER_STARTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     pub(crate) fn handler_started(&self) -> bool {
-        self.handler_started.load(Ordering::Acquire)
+        self.state.load(Ordering::Acquire) & HANDLER_STARTED != 0
+    }
+
+    pub(crate) fn started_attempt(&self) -> Option<&crate::tools::operation_history::OperationAttempt> {
+        self.handler_started().then(|| self.started_attempt.get()).flatten()
+    }
+
+    /// A finite nested call with an owned exclusive admission lease needs exact
+    /// cancellation accounting even if a transport teardown lost its cause.
+    pub(crate) fn cancelled_nested_attempt(
+        &self,
+        cause: Option<CancellationCause>,
+    ) -> Option<&crate::tools::operation_history::OperationAttempt> {
+        if self.is_aborted()
+            && matches!(cause, Some(CancellationCause::NestedDeadline | CancellationCause::RuntimeShutdown))
+        {
+            self.started_attempt()
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn settled_history(&self, call_id: &str) -> Option<&JsonValue> {
+        self.settlement.get()?.operation_history(call_id)
     }
 
     /// Observe the cancellation owner, not elapsed time or a caller's intent.
-    /// The second phase read prevents handler entry racing a terminal outcome
-    /// from being reported as a still-running invocation.
     pub(crate) fn execution_observation(&self) -> JsonValue {
-        loop {
-            let phase = self.state.load(Ordering::Acquire);
-            let handler_started = self.handler_started();
-            if self.state.load(Ordering::Acquire) != phase {
-                continue;
-            }
-            let (state, terminal_outcome) = match phase {
-                value if value == ToolDispatchPhase::WaitingForAdmission as u8 => ("queued", None),
-                value if value == ToolDispatchPhase::Admitted as u8 =>
-                    (if handler_started { "running" } else { "admitted" }, None),
-                value if value == ToolDispatchPhase::Completed as u8 => ("terminal", Some("completed")),
-                value if value == ToolDispatchPhase::AccountingUnconfirmed as u8 =>
-                    ("terminal", Some("accounting_unconfirmed")),
-                value if value == ToolDispatchPhase::AbortedBeforeAdmission as u8 =>
-                    ("terminal", Some("aborted_before_admission")),
-                value if value == ToolDispatchPhase::AbortedAfterAdmission as u8 =>
-                    ("terminal", Some("aborted_after_admission")),
-                _ => ("unknown", None),
-            };
-            return serde_json::json!({
-                "state": state, "terminal_outcome": terminal_outcome,
-                "handler_started": handler_started,
-            });
-        }
+        let phase = self.state.load(Ordering::Acquire);
+        let handler_started = phase & HANDLER_STARTED != 0;
+        let (state, terminal_outcome) = match phase & !HANDLER_STARTED {
+            value if value == ToolDispatchPhase::WaitingForAdmission as u8 => ("queued", None),
+            value if value == ToolDispatchPhase::Admitted as u8 =>
+                (if handler_started { "running" } else { "admitted" }, None),
+            value if value == ToolDispatchPhase::Completed as u8 => ("terminal", Some("completed")),
+            value if value == ToolDispatchPhase::AccountingUnconfirmed as u8 =>
+                ("terminal", Some("accounting_unconfirmed")),
+            value if value == ToolDispatchPhase::AbortedBeforeAdmission as u8 =>
+                ("terminal", Some("aborted_before_admission")),
+            value if value == ToolDispatchPhase::AbortedAfterAdmission as u8 =>
+                ("terminal", Some("aborted_after_admission")),
+            _ => ("unknown", None),
+        };
+        serde_json::json!({
+            "state": state, "terminal_outcome": terminal_outcome,
+            "handler_started": handler_started,
+        })
     }
 
     pub(crate) fn is_terminal(&self) -> bool {
         matches!(
-            self.state.load(Ordering::Acquire),
+            self.state.load(Ordering::Acquire) & !HANDLER_STARTED,
             value if value == ToolDispatchPhase::Completed as u8
                 || value == ToolDispatchPhase::AccountingUnconfirmed as u8
                 || value == ToolDispatchPhase::AbortedBeforeAdmission as u8
@@ -335,7 +375,7 @@ impl ToolDispatchState {
 
     pub(crate) fn is_aborted(&self) -> bool {
         matches!(
-            self.state.load(Ordering::Acquire),
+            self.state.load(Ordering::Acquire) & !HANDLER_STARTED,
             value if value == ToolDispatchPhase::AbortedBeforeAdmission as u8
                 || value == ToolDispatchPhase::AbortedAfterAdmission as u8
         )
@@ -1734,6 +1774,16 @@ impl ToolOutput for ExecCommandToolOutput {
             serde_json::json!(!self.raw_output.is_empty() || self.process_exited);
         signal["empty_output"] = serde_json::json!(self.raw_output.is_empty());
         signal["command_evidence"] = serde_json::json!(true);
+        // Capture completeness is independent of the exit result and of
+        // display reduction. Missing or pending artifacts do not imply loss.
+        if self.process_exited && self.process_id.is_none()
+            && matches!(self.raw_output_artifact.as_ref(),
+                Some(RawOutputArtifact::Failed { .. } | RawOutputArtifact::Stored {
+                    finalized: true, truncated: true, ..
+                }))
+        {
+            signal["command_log_capture_incomplete"] = serde_json::json!(true);
+        }
         if let Some(artifact) = &self.raw_output_artifact
             && let (Some(id), _, _) = artifact.model_projection()
         {

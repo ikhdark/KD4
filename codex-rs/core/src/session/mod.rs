@@ -2960,16 +2960,19 @@ impl Session {
         // terminal append; never synthesize unsupported AS capabilities.
         if persist {
             let timing = match &mut msg {
-                EventMsg::TurnComplete(event) => event.timing.as_mut(),
-                EventMsg::TurnAborted(event) => event.timing.as_mut(),
+                EventMsg::TurnComplete(event) => event.timing.as_mut().map(|timing| {
+                    let outcome = if event.error.is_some() { "failed" } else { "completed" };
+                    (timing, outcome)
+                }),
+                EventMsg::TurnAborted(event) => event.timing.as_mut().map(|timing| (timing, "cancelled")),
                 _ => None,
             };
-            if let Some(timing) = timing {
+            if let Some((timing, outcome)) = timing {
                 let evidence = timing.measurement_evidence.get_or_insert_with(|| serde_json::json!({"schemaVersion":1}));
                 if evidence.is_object() {
                     evidence["causalIdentity"] = serde_json::json!({"session":self.thread_id.to_string(), "turn":turn_context.sub_id});
                     if let Some(trace) = turn_context.turn_timing_state.close_native_app_server_trace(
-                        &self.thread_id.to_string(), &turn_context.sub_id) {
+                        &self.thread_id.to_string(), &turn_context.sub_id, outcome) {
                         evidence["appServerTrace"] = trace;
                     }
                 }

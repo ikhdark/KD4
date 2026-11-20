@@ -245,6 +245,17 @@ impl PlanHandler {
                     "update_plan was cancelled before publication admission; no changes were made".into(),
                 )),
             };
+            // A queued plan call may have passed router admission before the
+            // same turn sealed its final receipt under this publication gate.
+            if turn
+                .extension_data
+                .get::<crate::agent::task_coordinator::AuthoredReceiptSealed>()
+                .is_some()
+            {
+                return Err(no_effects(
+                    "update_plan cannot publish after this turn sealed its receipt; no changes were made".into(),
+                ));
+            }
             // Anchor the first checklist to accepted input. Later status-only
             // updates still avoid history scans and keep that original anchor.
             let scope_guard = if (requested_args.plan.is_some()

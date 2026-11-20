@@ -10,6 +10,7 @@ use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_turn_timing::TurnTimingState;
 use futures::Stream;
 use serde_json::Value;
 use std::pin::Pin;
@@ -500,6 +501,7 @@ pub struct ResponseStream {
     /// Signals the mapper task that the consumer stopped polling before the
     /// provider stream reached its own terminal event.
     pub consumer_dropped: CancellationToken,
+    pub(crate) text_delivery: Option<Arc<TurnTimingState>>,
 }
 
 pub use codex_api::ResponseAttemptIdentity;
@@ -514,7 +516,28 @@ impl Stream for ResponseStream {
     type Item = Result<ResponseEvent>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.rx_event.poll_recv(cx)
+        if self.text_delivery.is_none() {
+            return self.rx_event.poll_recv(cx);
+        }
+        let event = match self.rx_event.poll_recv_charged(cx) {
+            Poll::Ready(Some(event)) => event,
+            Poll::Ready(None) => return Poll::Ready(None),
+            Poll::Pending => return Poll::Pending,
+        };
+        match event.event() {
+            Ok(ResponseEvent::OutputTextDelta(text)) if !text.is_empty() => {
+                if let Some(timing) = &self.text_delivery {
+                    timing.record_text_received(event.delivery_tag(), text);
+                }
+            }
+            Ok(ResponseEvent::Completed { .. }) => {
+                if let Some(timing) = self.text_delivery.take() {
+                    timing.finish_text_delivery_stream();
+                }
+            }
+            _ => {}
+        }
+        Poll::Ready(Some(event.into_event()))
     }
 }
 

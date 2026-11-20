@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::Weak;
 use std::time::Duration;
 use std::time::Instant;
@@ -43,6 +44,7 @@ use crate::tools::lifecycle::notify_tool_aborted;
 use crate::tools::registry::AnyToolResult;
 use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::registry::install_synthetic_terminal_projection;
+use crate::tools::registry::record_synthetic_terminal_attempt;
 use crate::tools::router::ToolCall;
 use crate::tools::router::ToolCallSource;
 use crate::tools::router::ToolRouter;
@@ -761,6 +763,9 @@ enum WorkspaceResourceGateGuard {
 }
 
 enum WorkspaceGateGuard {
+    NestedDeadline {
+        _guard: Arc<WorkspaceGateGuard>,
+    },
     ReadCohort {
         _guard: Arc<WorkspaceReadCohort>,
     },
@@ -784,6 +789,14 @@ enum WorkspaceGateGuard {
 }
 
 impl WorkspaceGateGuard {
+    fn is_globally_exclusive(&self) -> bool {
+        match self {
+            Self::HookExclusive { .. } | Self::Exclusive { .. } => true,
+            Self::Attributed { guard, .. } => guard.is_globally_exclusive(),
+            _ => false,
+        }
+    }
+
     fn attributed(self, holders: &WorkspaceGlobalHolders, shared: bool) -> Self {
         let Ok(holder) = WORKSPACE_GATE_CALL.try_with(|call| Arc::new(call.admitted(shared)))
         else {
@@ -2306,6 +2319,9 @@ impl ToolCallRuntime {
         let model_issued = matches!(&source, ToolCallSource::Direct);
         let abort_turn = Arc::clone(&turn);
         let dispatch_state = dispatch_state.unwrap_or_else(|| Arc::new(ToolDispatchState::new()));
+        let deadline_gate = source.nested_deadline().is_some()
+            .then(|| Arc::new(OnceLock::<Arc<WorkspaceGateGuard>>::new()));
+        let dispatch_deadline_gate = deadline_gate.clone();
         let admission_dispatch_state = Arc::clone(&dispatch_state);
         let router_dispatch_state = Arc::clone(&dispatch_state);
         let post_dispatch_state = Arc::clone(&dispatch_state);
@@ -2663,6 +2679,7 @@ impl ToolCallRuntime {
                                     model_projection: None,
                                     source_dependencies: None,
                                     code_mode_feedback: Vec::new(),
+                                    provider_read_offer_eligible: false,
                                 });
                             }
                         },
@@ -2682,6 +2699,17 @@ impl ToolCallRuntime {
                     // emits the single terminal lifecycle result.
                     drop(gate_guard);
                     return std::future::pending().await;
+                }
+                // Retain the existing exclusive lease through a nested
+                // deadline's journal write, even if cleanup releases the
+                // handler task first. Do not change shared/bypassed admission.
+                if let Some(slot) = dispatch_deadline_gate
+                    && gate_guard.as_ref().is_some_and(WorkspaceGateGuard::is_globally_exclusive)
+                {
+                    let guard = Arc::new(gate_guard.take().expect("exclusive gate missing"));
+                    let _ = slot.set(Arc::clone(&guard));
+                    gate_guard = Some(WorkspaceGateGuard::NestedDeadline { _guard: guard });
+                    admission_dispatch_state.retain_nested_deadline_admission();
                 }
                 // Gate admission is distinct from authorization and actual
                 // handler entry; keep each boundary independently observable.
@@ -2921,6 +2949,7 @@ impl ToolCallRuntime {
 
         let cancellation_owner = terminal_tasks.spawn(
             async move {
+                let mut deadline_gate = deadline_gate;
                 let result = async {
                 tokio::select! {
                 res = &mut dispatch_handle => Self::joined_tool_result(res, &dispatch_state).await,
@@ -2937,6 +2966,11 @@ impl ToolCallRuntime {
                         };
                         let interrupted =
                             is_ordinary_turn_interruption(abort_source.cancellation_cause());
+                        let journal_nested_cancellation = dispatch_state
+                            .cancelled_nested_attempt(abort_source.cancellation_cause()).is_some();
+                        if !journal_nested_cancellation {
+                            drop(deadline_gate.take());
+                        }
                         let mut cancellation_recovery: Option<serde_json::Value>;
                         let secs = started.elapsed().as_secs_f32();
                         abort_dispatch_span.record("aborted", true);
@@ -2968,11 +3002,15 @@ impl ToolCallRuntime {
                                 abort_invocation.clone(),
                                 Arc::clone(&cancellation_timing),
                             );
-                            if owns_unified_exec_processes || requires_commit_barrier || retains_cancelled_cell_output {
+                            if owns_unified_exec_processes || requires_commit_barrier
+                                || retains_cancelled_cell_output || journal_nested_cancellation
+                            {
                                 // A retained exec process is part of the turn's terminal
                                 // ownership barrier. Do not publish TurnAborted until the
                                 // originating handler and its process registry entry close.
                                 // State commits likewise publish their update before the response.
+                                // A cancelled nested call under exclusive admission
+                                // must account for that invocation before releasing it.
                                 cancellation_recovery = cleanup.await;
                             } else {
                                 // Other runtimes retain their owned dispatch future in a
@@ -3010,6 +3048,10 @@ impl ToolCallRuntime {
                                 recovery: Some(recovery),
                             });
                         }
+                        record_synthetic_terminal_attempt(
+                            &abort_invocation, &mut response, &dispatch_state,
+                        ).await;
+                        drop(deadline_gate.take());
                         scope_tool_dispatch_timing(
                             Arc::clone(&cancellation_timing),
                             install_synthetic_terminal_projection(
@@ -3037,7 +3079,7 @@ impl ToolCallRuntime {
                 }
                 }.await;
                 crate::tools::registry::record_tool_result_measurement(
-                    &measurement_turn.turn_timing_state,
+                    &measurement_turn,
                     measurement_timing.execution_id().0.as_str(),
                     &measurement_call_id,
                     &measurement_tool_name,
@@ -3397,6 +3439,7 @@ impl ToolCallRuntime {
             model_projection: None,
             source_dependencies: None,
             code_mode_feedback: Vec::new(),
+            provider_read_offer_eligible: false,
         }
     }
 

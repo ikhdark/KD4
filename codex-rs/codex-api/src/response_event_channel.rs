@@ -8,6 +8,7 @@ use crate::ApiError;
 use crate::ResponseEvent;
 use serde::Serialize;
 use std::io::Write;
+use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -26,6 +27,7 @@ pub const RESPONSE_EVENT_QUEUE_BYTES: usize = 32 * 1024 * 1024;
 struct QueuedEvent<E> {
     event: Result<ResponseEvent, E>,
     payload_bytes: usize,
+    delivery_tag: Option<NonZeroU64>,
     _bytes: OwnedSemaphorePermit,
     enqueued_at: Instant,
 }
@@ -34,12 +36,13 @@ struct QueuedEvent<E> {
 pub struct ChargedResponseEvent<E> {
     event: Result<ResponseEvent, E>,
     payload_bytes: usize,
+    delivery_tag: Option<NonZeroU64>,
 }
 
 impl<E> From<Result<ResponseEvent, E>> for ChargedResponseEvent<E> {
     fn from(event: Result<ResponseEvent, E>) -> Self {
         let payload_bytes = payload_bytes(&event);
-        Self { event, payload_bytes }
+        Self { event, payload_bytes, delivery_tag: None }
     }
 }
 
@@ -48,12 +51,22 @@ impl<E> ChargedResponseEvent<E> {
     pub fn payload_bytes(&self) -> usize { self.payload_bytes }
     pub fn into_event(self) -> Result<ResponseEvent, E> { self.event }
 
+    /// Per-channel diagnostic identity; not part of the payload or its charge.
+    pub fn set_delivery_tag(&mut self, tag: NonZeroU64) {
+        self.delivery_tag = Some(tag);
+    }
+
+    pub fn delivery_tag(&self) -> Option<NonZeroU64> {
+        self.delivery_tag
+    }
+
     /// Error conversion cannot change a successful payload. Errors carry no
     /// payload charge, so crossing an error-domain boundary needs no rescan.
     pub fn map_err<F>(self, transform: impl FnOnce(E) -> F) -> ChargedResponseEvent<F> {
         ChargedResponseEvent {
             event: self.event.map_err(transform),
             payload_bytes: self.payload_bytes,
+            delivery_tag: self.delivery_tag,
         }
     }
 
@@ -154,7 +167,7 @@ impl<E> ResponseEventSender<E> {
     }
 
     pub async fn send_charged(&self, charged: ChargedResponseEvent<E>) -> Result<(), ApiError> {
-        let ChargedResponseEvent { event, payload_bytes: size } = charged;
+        let ChargedResponseEvent { event, payload_bytes: size, delivery_tag } = charged;
         if size > self.limit {
             return Err(ApiError::invalid_response(format!(
                 "decoded response event exceeds the {}-byte payload limit",
@@ -178,6 +191,7 @@ impl<E> ResponseEventSender<E> {
         slot.send(QueuedEvent {
             event,
             payload_bytes: size,
+            delivery_tag,
             _bytes: permit,
             enqueued_at,
         });
@@ -205,6 +219,7 @@ impl<E> ResponseEventSender<E> {
         slot.send(QueuedEvent {
             event,
             payload_bytes: size,
+            delivery_tag: None,
             _bytes: permit,
             enqueued_at,
         });
@@ -239,7 +254,11 @@ impl<E> ResponseEventReceiver<E> {
             self.timing.terminal_received = true;
             self.finish_timing();
         }
-        ChargedResponseEvent { event: queued.event, payload_bytes: queued.payload_bytes }
+        ChargedResponseEvent {
+            event: queued.event,
+            payload_bytes: queued.payload_bytes,
+            delivery_tag: queued.delivery_tag,
+        }
     }
 
     fn finish_timing(&mut self) {

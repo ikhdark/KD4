@@ -41,6 +41,8 @@ const BACKFILL_RESUME_DELAY: Duration = Duration::from_secs(1);
 /// One pass, after which it hands the claim back and resumes from its checkpoint.
 const BACKFILL_PASS_BOUND: Duration = Duration::from_secs(20);
 const MAX_CONCURRENT_ROLLOUT_PATH_VALIDATIONS: usize = 8;
+/// Thread identities named in a page's stale-path record.
+const STALE_PATH_SAMPLE_IDS: usize = 3;
 const _: () = assert!(
     metadata::BACKFILL_LEASE_SECONDS as u64 > BACKFILL_PASS_BOUND.as_secs(),
     "a backfill lease must outlive the bound that limits each pass"
@@ -404,7 +406,7 @@ pub async fn list_threads_db(
             }
             let items = page.items;
             let mut valid_items = Vec::with_capacity(items.len());
-            let mut path_validations = futures::stream::iter(items)
+            let validated = futures::stream::iter(items)
                 .map(|item| async move {
                     let existing_path =
                         crate::compression::existing_rollout_path(item.rollout_path.as_path())
@@ -421,54 +423,87 @@ pub async fn list_threads_db(
                     };
                     (item, existing_path)
                 })
-                .buffered(MAX_CONCURRENT_ROLLOUT_PATH_VALIDATIONS);
-            while let Some((mut item, existing_path)) = path_validations.next().await {
+                .buffered(MAX_CONCURRENT_ROLLOUT_PATH_VALIDATIONS)
+                .collect::<Vec<_>>()
+                .await;
+            // One inventory of both rollout roots serves every stale row on this
+            // page. A filename walk per row cost two traversals of both roots for
+            // each of them, on every listing that reached such rows.
+            let stale_ids = validated
+                .iter()
+                .filter(|(_, existing_path)| existing_path.is_none())
+                .map(|(item, _)| item.id)
+                .collect::<Vec<_>>();
+            let mut relocations = if stale_ids.is_empty() {
+                None
+            } else {
+                Some(crate::list::ThreadRolloutInventory::scan(codex_home, &stale_ids).await)
+            };
+            let archived_root = codex_home.join(crate::ARCHIVED_SESSIONS_SUBDIR);
+            let mut dropped_stale_paths = 0usize;
+            let mut stale_sample = Vec::new();
+            for (mut item, existing_path) in validated {
                 if let Some(existing_path) = existing_path {
                     item.rollout_path = existing_path;
                     valid_items.push(item);
-                } else {
-                    // A rollout may have moved between active/archive directories
-                    // without the state row following it. Repair only a verified
-                    // file; absence is not permission to delete thread metadata.
-                    let id = item.id.to_string();
-                    let active =
-                        crate::list::find_thread_path_by_id_str(codex_home, &id, None).await;
-                    let relocated = match active {
-                        Ok(Some(path)) => Some((path, false)),
-                        Ok(None) => {
-                            crate::list::find_archived_thread_path_by_id_str(codex_home, &id, None)
-                                .await
-                                .ok()
-                                .flatten()
-                                .map(|path| (path, true))
-                        }
-                        Err(_) => None,
-                    };
-                    if let Some((path, is_archived)) = relocated
-                        && crate::list::read_session_meta_line(&path)
-                            .await
-                            .is_ok_and(|meta| meta.meta.id == item.id)
-                    {
-                        read_repair_rollout_path(
-                            Some(ctx),
-                            Some(item.id),
-                            Some(is_archived),
-                            &path,
-                        )
-                        .await;
-                        if is_archived == archived {
-                            item.rollout_path = path;
-                            valid_items.push(item);
-                        }
-                        continue;
-                    }
-                    warn!(
-                        "state db list_threads returned stale rollout path for thread {}: {}",
-                        item.id,
-                        item.rollout_path.display()
-                    );
-                    warn!("state db discrepancy during list_threads_db: stale_db_path_dropped");
+                    continue;
                 }
+                // A rollout may have moved between active/archive directories
+                // without the state row following it. Repair only a verified
+                // file; absence is not permission to delete thread metadata.
+                let located = match relocations.as_mut() {
+                    // An incomplete inventory establishes neither a location nor absence.
+                    Some(inventory) if inventory.is_complete() => {
+                        inventory.take_paths(item.id).await.unwrap_or_default()
+                    }
+                    _ => Vec::new(),
+                };
+                // The inventory returns header-verified copies in path order; an
+                // active copy still wins over an archived one.
+                let (archived_copies, active_copies): (Vec<_>, Vec<_>) = located
+                    .into_iter()
+                    .partition(|path| path.starts_with(&archived_root));
+                let candidate = active_copies
+                    .into_iter()
+                    .next()
+                    .map(|path| (path, false))
+                    .or_else(|| archived_copies.into_iter().next().map(|path| (path, true)));
+                let relocated = match candidate {
+                    Some((path, is_archived)) => {
+                        crate::compression::existing_rollout_path(path.as_path())
+                            .await
+                            .map(|path| (path, is_archived))
+                    }
+                    None => None,
+                };
+                if let Some((path, is_archived)) = relocated {
+                    codex_state::record_fallback(
+                        "find_thread_path",
+                        "db_unavailable",
+                        /*telemetry_override*/ None,
+                    );
+                    read_repair_rollout_path(Some(ctx), Some(item.id), Some(is_archived), &path)
+                        .await;
+                    if is_archived == archived {
+                        item.rollout_path = path;
+                        valid_items.push(item);
+                    }
+                    continue;
+                }
+                if dropped_stale_paths < STALE_PATH_SAMPLE_IDS {
+                    stale_sample.push(item.id.to_string());
+                }
+                dropped_stale_paths += 1;
+            }
+            if dropped_stale_paths > 0 {
+                // One record per page with a few identities. The log store keeps
+                // every level, so a line per row, at any level, let one listing
+                // over retained rows of removed rollouts displace everything else.
+                warn!(
+                    dropped_stale_paths,
+                    sample_thread_ids = %stale_sample.join(","),
+                    "state db discrepancy during list_threads_db: stale_db_path_dropped"
+                );
             }
             page.items = valid_items;
             Some(page)

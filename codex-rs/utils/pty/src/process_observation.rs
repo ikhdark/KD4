@@ -24,6 +24,12 @@ pub enum ProcessRole {
     AuxiliaryRoot,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DescendantCleanupObservation {
+    ContainedWindowsJobEmpty,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProcessStart {
     /// Local image observation; absent for remote/opaque or inaccessible roots.
@@ -40,6 +46,9 @@ pub struct ProcessStart {
     pub provenance: String,
     pub observed_at_unix_ms: u64,
     pub cleanup_observation: Option<String>,
+    /// Separate native containment evidence, not an inference from root exit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub descendant_cleanup_observation: Option<DescendantCleanupObservation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -178,6 +187,18 @@ impl ObservedProcess {
     }
     /// Separate evidence: dropping a handle is not proof of cleanup/reaping.
     pub fn cleanup_observed(&self, outcome: &'static str) {
+        self.update_start(|start| start.cleanup_observation = Some(outcome.into()));
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn contained_windows_job_emptied(&self) {
+        self.update_start(|start| {
+            start.descendant_cleanup_observation =
+                Some(DescendantCleanupObservation::ContainedWindowsJobEmpty);
+        });
+    }
+
+    fn update_start(&self, update: impl FnOnce(&mut ProcessStart)) {
         if let Some(recorder) = self.recorder.upgrade() {
             if let Ok(mut details) = recorder.details.try_lock() {
                 if let Some(start) = details
@@ -185,7 +206,7 @@ impl ObservedProcess {
                     .iter_mut()
                     .find(|start| start.instance_id == self.instance_id)
                 {
-                    start.cleanup_observation = Some(outcome.into());
+                    update(start);
                 }
             } else {
                 recorder.dropped.fetch_add(1, Ordering::Relaxed);
@@ -232,6 +253,7 @@ pub fn observe_process_start(
         backend_identity,
         observed_at_unix_ms: unix_ms(),
         cleanup_observation: None,
+        descendant_cleanup_observation: None,
     };
     // Keep birth/cleanup observation memory-only: logging or filesystem I/O at
     // this boundary must not delay containment, cleanup, or process delivery.

@@ -141,9 +141,8 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
         .ok_or_else(|| "failed to install dependency graph helper".to_string())?;
     // A separate private closure capability for owned mechanical helpers.
     set_global(scope, global, "__codex_helper_observation", observe_graph.into())?;
-    // Keep the registration capability and pagination factory private to the
-    // owned search implementation, rather than exposing either to cell code.
-    let helpers = format!("(registerSearchProjection => {{\n{}\n{}\n}})",
+    // Keep helper registration capabilities private to the owned closures.
+    let helpers = format!("((registerSearchProjection, registerCommandEvidence) => {{\n{}\n{}\n}})",
         include_str!("search_pagination.js"), include_str!("orchestration.js"));
     let orchestration = v8::String::new(scope, &helpers)
         .ok_or_else(|| "failed to allocate orchestration helpers".to_string())?;
@@ -155,7 +154,12 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     let register = helper_function(scope, "registerSearchProjection",
         super::output_projection::register_search_projection_callback)?;
     let receiver = v8::undefined(scope).into();
-    factory.call(scope, receiver, &[register.into()])
+    let projector = scope.get_slot::<RuntimeState>()
+        .map(|state| v8::Local::new(scope, &state.output_projector))
+        .ok_or_else(|| "output projector unavailable".to_string())?;
+    let register_command = projector.call(scope, receiver, &[])
+        .ok_or_else(|| "failed to initialize command evidence registration".to_string())?;
+    factory.call(scope, receiver, &[register.into(), register_command])
         .ok_or_else(|| "failed to initialize orchestration helpers".to_string())?;
     Ok(())
 }

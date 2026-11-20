@@ -141,6 +141,7 @@ use crate::tools::context::RequiredToolTerminal;
 use crate::tools::context::RequiredToolTerminalCause;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::parallel::ToolCallRuntime;
+use crate::tools::registry::ProviderReadOffer;
 use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::spec_plan::tool_suggest_enabled;
 use crate::turn_diff_tracker::TurnDiffTracker;
@@ -331,6 +332,11 @@ pub(crate) fn run_turn<'a>(
         if cancellation_token.is_cancelled() {
             return Err(CodexErr::TurnAborted);
         }
+        let provider_read_offers = turn_context.extension_data.get_or_init(ProviderReadOffers::default);
+        let _finish_read_measurements = FinishReadOfferMeasurements {
+            offers: Arc::clone(&provider_read_offers),
+            timing: Arc::clone(&turn_context.turn_timing_state),
+        };
         let agent_turn_preparation = sess
             .services
             .agent_control
@@ -1170,7 +1176,17 @@ pub(crate) fn run_turn<'a>(
                         )
                         .await;
                     }
-                    let token_limit_reached = token_status.token_limit_reached;
+                    // Canonical history includes settled native bytes, not necessarily
+                    // the next provider view. Let prepared-prompt admission own the
+                    // compaction decision for this continuation; it sees all siblings,
+                    // notices, and fallback representations before dispatch.
+                    let check_prepared_delivery = token_status.token_limit_reached
+                        && needs_follow_up
+                        && !has_pending_input
+                        && provider_read_offers.has_entries()
+                        && provider_read_offers.applies_to(sess.clone_history().await.raw_items());
+                    let token_limit_reached =
+                        token_status.token_limit_reached && !check_prepared_delivery;
 
                     trace!(
                         turn_id = %turn_context.sub_id,
@@ -1182,6 +1198,7 @@ pub(crate) fn run_turn<'a>(
                         full_context_window_limit = ?token_status.full_context_window_limit,
                         full_context_window_limit_reached = token_status.full_context_window_limit_reached,
                         token_limit_reached,
+                        check_prepared_delivery,
                         model_needs_follow_up,
                         has_pending_input,
                         needs_follow_up,
@@ -1839,14 +1856,15 @@ pub(crate) fn run_turn<'a>(
                         // Admission refused this projection before dispatch. Like a
                         // limit found after sampling, it is relieved for each crossing,
                         // first by exact retirement judged against that projection.
-                        Some(AdmissionRefusedProjection(projected_pressure))
-                            if unsampled_overflow_relief.is_none() =>
+                        Some(refusal)
+                            if !refusal.requires_compaction && unsampled_overflow_relief.is_none() =>
                         {
                             ConsumedOutputRetirement::Eligible {
-                                projected_pressure: Some(*projected_pressure),
+                                projected_pressure: Some(refusal.pressure),
                             }
                         }
-                        // Retirement did not make room for this prompt.
+                        // A recovery-only offer cannot relieve a terminal request.
+                        // Otherwise retirement already failed to make room.
                         Some(_) => ConsumedOutputRetirement::Unavailable,
                         // The provider rejected the prompt, so the local estimate
                         // already failed; only a real summary can be trusted here.
@@ -2595,7 +2613,7 @@ async fn run_completion_stop_hook<
         if tracker.lock().await.current_mutation_revision() != revision {
             // Arbitrary commands can leave descendants behind. An immediate
             // filesystem reread cannot certify their final effects are over.
-            assessment.verification_gaps.push("A Stop/SubagentStop command entered after validation. Its workspace effects and descendant lifetime are unbounded; earlier validation does not verify the final source. The hook was not replayed.".to_string());
+            assessment.verification_gaps.push("A Stop/SubagentStop hook may have changed workspace state. Its workspace effects and descendant lifetime are unbounded; any earlier validation does not verify the final source. The hook was not replayed.".to_string());
         }
         match result {
             Ok((observed, receipt)) => {
@@ -6148,13 +6166,330 @@ pub(crate) async fn prompt_token_estimates(
 /// never measured it. The projection uses local estimates: relief rewrites the
 /// observed prefix, after which admission has no calibration for the prompt.
 #[derive(Clone, Copy, Debug)]
-struct AdmissionRefusedProjection(ProjectedPromptPressure);
+struct AdmissionRefusedProjection {
+    pressure: ProjectedPromptPressure,
+    requires_compaction: bool,
+}
+
+const MAX_STAGED_READ_OFFERS: usize = 64;
+const MAX_PROMPT_OFFER_TRIALS: usize = 8;
+
+#[derive(Default)]
+pub(crate) struct ProviderReadOffers(Mutex<Vec<(Arc<ProviderReadOffer>, bool)>>);
+
+impl ProviderReadOffers {
+    pub(crate) fn stage(&self, offer: ProviderReadOffer) -> bool {
+        let mut entries = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if entries.len() >= MAX_STAGED_READ_OFFERS {
+            return false;
+        }
+        entries.push((Arc::new(offer), false));
+        true
+    }
+
+    fn has_entries(&self) -> bool {
+        !self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty()
+    }
+
+    fn applies_to(&self, canonical_history: &[ResponseItem]) -> bool {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|(entry, _)| {
+            unique_read_output(canonical_history, &entry.call_id)
+                .is_some_and(|(_, text)| text == entry.full)
+        })
+    }
+
+    fn snapshot(&self) -> Vec<(Arc<ProviderReadOffer>, bool)> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    /// Attribute inline bytes from the selected formatted logical request, not
+    /// from its canonical source or the physical WebSocket replay suffix.
+    /// An offer must not mark the original output consumed. A request-local
+    /// alias is lossless and preserves the canonical consumption contract.
+    fn observe_completion<'a>(
+        &self,
+        input: &'a [ResponseItem],
+        formatted_input: Option<&[ResponseItem]>,
+        timing: &TurnTimingState,
+    ) -> std::borrow::Cow<'a, [ResponseItem]> {
+        let mut entries = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut offered_indices = HashSet::new();
+        entries.retain_mut(|(entry, pinned)| {
+            let Some((index, text)) = unique_read_output(input, &entry.call_id) else {
+                return true;
+            };
+            if text == entry.offer {
+                offered_indices.insert(index);
+                if !*pinned {
+                    record_provider_read(timing, entry, Some(&[]), "provider_recovery_offer_no_inline_ranges");
+                    *pinned = true;
+                }
+                return true;
+            }
+            if text == entry.full {
+                // The first accepted offer has its own zero-inline receipt.
+                // Observing the canonical result later does not replace it.
+                if !*pinned {
+                    match formatted_input.and_then(|input| unique_read_output(input, &entry.call_id)) {
+                        Some((_, formatted)) if formatted == entry.full => record_provider_read(
+                            timing, entry, None, "exact_immutable_delivered_snapshot_ranges",
+                        ),
+                        Some((_, formatted)) => {
+                            let ranges = formatted_read_inline_ranges(&entry.full, formatted);
+                            record_provider_read(
+                                timing, entry, Some(&ranges), "selected_provider_read_literal_ranges",
+                            );
+                        }
+                        None => record_provider_read(
+                            timing, entry, Some(&[]), "selected_provider_read_representation_unavailable",
+                        ),
+                    }
+                }
+                return false;
+            }
+            true
+        });
+        if offered_indices.is_empty() {
+            std::borrow::Cow::Borrowed(input)
+        } else {
+            std::borrow::Cow::Owned(input.iter().enumerate()
+                .filter(|(index, _)| !offered_indices.contains(index))
+                .map(|(_, item)| item.clone())
+                .collect())
+        }
+    }
+}
+
+struct FinishReadOfferMeasurements {
+    offers: Arc<ProviderReadOffers>,
+    timing: Arc<TurnTimingState>,
+}
+
+impl Drop for FinishReadOfferMeasurements {
+    fn drop(&mut self) {
+        let mut entries = self.offers.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (entry, pinned) in entries.drain(..) {
+            if !pinned {
+                record_provider_read(&self.timing, &entry, Some(&[]), "no_completed_provider_delivery_observed");
+            }
+        }
+    }
+}
+
+fn record_provider_read(
+    timing: &TurnTimingState,
+    entry: &ProviderReadOffer,
+    inline_ranges: Option<&[(u64, u64)]>,
+    basis: &str,
+) {
+    let mut receipt = entry.receipt.clone();
+    if let Some(ranges) = inline_ranges {
+        receipt["ranges"] = serde_json::json!(ranges);
+        receipt["basis"] = serde_json::json!(basis);
+    }
+    timing.record_native_operation(
+        &entry.execution_id, &entry.call_id, "read", Some(receipt), entry.history.clone(),
+    );
+}
+
+/// Formatter sharing preserves row order. It either keeps the literal row
+/// text, replaces it with range-tagged parts (literal or alias), or emits a
+/// whole-result alias without rows. Count only verified literal bytes.
+fn formatted_read_inline_ranges(full: &str, formatted: &str) -> Vec<(u64, u64)> {
+    use serde_json::Value;
+
+    let (Ok(full), Ok(formatted)) = (
+        serde_json::from_str::<Value>(full),
+        serde_json::from_str::<Value>(formatted),
+    ) else {
+        return Vec::new();
+    };
+    let (Some(full), Some(formatted)) = (full["results"].as_array(), formatted["results"].as_array())
+    else {
+        return Vec::new();
+    };
+    if full.len() != formatted.len() {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    for (source, projected) in full.iter().zip(formatted) {
+        let (Some(source_start), Some(source_end), Some(source_text)) = (
+            source["canonical_range"]["start"].as_u64(),
+            source["canonical_range"]["end"].as_u64(),
+            source["text"].as_str(),
+        ) else {
+            continue;
+        };
+        if source_end.checked_sub(source_start) != Some(source_text.len() as u64)
+            || projected["canonical_range"] != source["canonical_range"]
+        {
+            continue;
+        }
+        let mut count_literal = |item: &Value| {
+            let (Some(start), Some(end), Some(text)) = (
+                item["canonical_range"]["start"].as_u64(),
+                item["canonical_range"]["end"].as_u64(),
+                item["text"].as_str(),
+            ) else {
+                return;
+            };
+            if source_start <= start && start < end && end <= source_end
+                && source_text.get((start - source_start) as usize..(end - source_start) as usize)
+                    == Some(text)
+            {
+                ranges.push((start, end));
+            }
+        };
+        if let Some(parts) = projected["included_content"].as_array() {
+            parts.iter().for_each(count_literal);
+        } else {
+            count_literal(projected);
+        }
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut() && start <= last.1 {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
+fn unique_read_output<'a>(input: &'a [ResponseItem], id: &str) -> Option<(usize, &'a str)> {
+    use codex_protocol::models::FunctionCallOutputBody;
+    let mut found = None;
+    for (index, item) in input.iter().enumerate() {
+        if let ResponseItem::FunctionCallOutput { call_id, output, .. } = item
+            && call_id == id
+        {
+            if found.is_some() {
+                return None;
+            }
+            let FunctionCallOutputBody::Text(text) = &output.body else {
+                return None;
+            };
+            found = Some((index, text.as_str()));
+        }
+    }
+    found
+}
+
+fn project_provider_read_offers(prompt: &Prompt, offers: &[&ProviderReadOffer]) -> Prompt {
+    use codex_protocol::models::FunctionCallOutputBody;
+    let inputs = [
+        &prompt.input, &prompt.stable_context_fallback_input,
+        &prompt.tool_history_fallback_input, &prompt.stable_context_tool_history_fallback_input,
+    ];
+    let mut projected: [Arc<[ResponseItem]>; 4] = inputs.map(Arc::clone);
+    for (i, input) in inputs.iter().enumerate() {
+        if let Some(j) = inputs[..i].iter().position(|prior| Arc::ptr_eq(prior, input)) {
+            projected[i] = Arc::clone(&projected[j]);
+            continue;
+        }
+        for entry in offers {
+            if let Some((index, text)) = unique_read_output(input, &entry.call_id)
+                && text == entry.full
+                && let ResponseItem::FunctionCallOutput { output, .. } =
+                    &mut Arc::make_mut(&mut projected[i])[index]
+            {
+                output.body = FunctionCallOutputBody::Text(entry.offer.clone());
+            }
+        }
+    }
+    let mut result = prompt.clone();
+    [
+        result.input, result.stable_context_fallback_input, result.tool_history_fallback_input,
+        result.stable_context_tool_history_fallback_input,
+    ] = projected;
+    result.digests.history = None;
+    result
+}
+
+async fn choose_provider_read_prompt(
+    sess: &Session,
+    turn: &TurnContext,
+    prompt: &Prompt,
+) -> (Option<Prompt>, Option<PreparedPromptAdmission>) {
+    // No recovery call can run under tool_choice=none, including for offers
+    // accepted on earlier requests. Re-admit the unprojected prompt instead.
+    if prompt.tool_calls_disabled {
+        return (None, None);
+    }
+    let Some(offers) = turn.extension_data.get::<ProviderReadOffers>() else {
+        return (None, None);
+    };
+    let offers = offers.snapshot();
+    let (mut selected, mut candidates) = (Vec::new(), Vec::new());
+    for (entry, pinned) in &offers {
+        if !unique_read_output(&prompt.input, &entry.call_id)
+            .is_some_and(|(_, text)| text == entry.full)
+        {
+            continue;
+        }
+        if *pinned {
+            selected.push(entry.as_ref());
+        } else {
+            candidates.push(entry.as_ref());
+        }
+    }
+    if selected.is_empty() && candidates.is_empty() {
+        return (None, None);
+    }
+    let baseline = (!selected.is_empty()).then(|| project_provider_read_offers(prompt, &selected));
+    if candidates.is_empty() {
+        return (baseline, None);
+    }
+    let baseline_admission = prepared_prompt_admission(sess, turn, baseline.as_ref().unwrap_or(prompt)).await;
+    if baseline_admission.fits {
+        return (baseline, Some(baseline_admission));
+    }
+    // Preserve as much inline coverage as possible without speculating about
+    // final token costs. Try the largest available savings first, then admit
+    // only an actually fitting prepared representation.
+    candidates.sort_by_key(|entry| std::cmp::Reverse(entry.full.len() - entry.offer.len()));
+    let eligible_count = candidates.len();
+    for (index, entry) in candidates.into_iter().take(MAX_PROMPT_OFFER_TRIALS).enumerate() {
+        selected.push(entry);
+        let trial = project_provider_read_offers(prompt, &selected);
+        let admission = prepared_prompt_admission(sess, turn, &trial).await;
+        if admission.fits {
+            return (Some(trial), Some(admission));
+        }
+        if index + 1 == eligible_count && tracing::enabled!(tracing::Level::TRACE) {
+            // This trial includes every verified offer. Fixed sibling results,
+            // failure details and notices remain part of the measured input.
+            let mandatory_effective_bytes = trial
+                .get_formatted_admission_inputs(turn.model_info.use_responses_lite)
+                .iter()
+                .filter_map(|input| serde_json::to_vec(input).ok())
+                .map(|bytes| bytes.len())
+                .max();
+            if let Some(mandatory_effective_bytes) = mandatory_effective_bytes {
+                trace!(
+                    reason = "mandatory_envelope_does_not_fit",
+                    mandatory_effective_bytes,
+                    mandatory_total_tokens = admission.calibrated.total_tokens,
+                    mandatory_scope_tokens = admission.calibrated.auto_compact_scope_tokens,
+                    eligible_count,
+                    "prepared provider read delivery cannot avoid context pressure"
+                );
+            }
+        }
+    }
+    // Do not send a degraded representation that cannot avoid pressure.
+    // The ordinary refusal/retirement/compaction path owns this case.
+    (baseline, Some(baseline_admission))
+}
 
 /// Admit immutable prepared inputs, including every eligible transport fallback.
 async fn admit_prepared_prompt(
     sess: &Session,
     turn: &TurnContext,
     prompt: &Prompt,
+    computed_admission: Option<PreparedPromptAdmission>,
 ) -> CodexResult<()> {
     let image_count = crate::image_preparation::image_input_count(&prompt.input);
     if image_count != 0 && !turn.model_info.input_modalities
@@ -6165,6 +6500,44 @@ async fn admit_prepared_prompt(
             turn.model_info.slug,
         )));
     }
+    let admission = match computed_admission {
+        Some(admission) => admission,
+        None => prepared_prompt_admission(sess, turn, prompt).await,
+    };
+    if !admission.fits {
+        // The turn relieves this projection instead of treating the refusal as
+        // a provider overflow.
+        let requires_compaction = prompt.tool_calls_disabled
+            && turn.extension_data.get::<ProviderReadOffers>().is_some_and(|offers| {
+                [
+                    &prompt.input,
+                    &prompt.stable_context_fallback_input,
+                    &prompt.tool_history_fallback_input,
+                    &prompt.stable_context_tool_history_fallback_input,
+                ]
+                .into_iter()
+                .any(|input| offers.applies_to(input))
+            });
+        turn.extension_data.insert(AdmissionRefusedProjection {
+            pressure: admission.local,
+            requires_compaction,
+        });
+        return Err(CodexErr::ContextWindowExceeded);
+    }
+    Ok(())
+}
+
+struct PreparedPromptAdmission {
+    fits: bool,
+    local: ProjectedPromptPressure,
+    calibrated: ProjectedPromptPressure,
+}
+
+async fn prepared_prompt_admission(
+    sess: &Session,
+    turn: &TurnContext,
+    prompt: &Prompt,
+) -> PreparedPromptAdmission {
     let PromptTokenEstimates {
         local_tokens,
         calibrated_tokens: total,
@@ -6196,19 +6569,12 @@ async fn admit_prepared_prompt(
     // the reserve against the immutable prepared prompt, never just the prior receipt.
     let soft_limit_waived = prompt.soft_limit_waiver
         && defer_compaction_for_final_answer(true, total.max(local_tokens), turn.model_context_window());
-    if status.full_context_window_limit_reached
-        || (status.token_limit_reached && !prompt.tool_calls_disabled && !soft_limit_waived)
-    {
-        // The turn relieves this projection instead of treating the refusal as
-        // a provider overflow.
-        turn.extension_data
-            .insert(AdmissionRefusedProjection(ProjectedPromptPressure {
-                total_tokens: local_tokens,
-                auto_compact_scope_tokens: local_scope,
-            }));
-        return Err(CodexErr::ContextWindowExceeded);
+    PreparedPromptAdmission {
+        fits: !(status.full_context_window_limit_reached
+            || (status.token_limit_reached && !prompt.tool_calls_disabled && !soft_limit_waived)),
+        local: ProjectedPromptPressure { total_tokens: local_tokens, auto_compact_scope_tokens: local_scope },
+        calibrated: ProjectedPromptPressure { total_tokens: total, auto_compact_scope_tokens: scope },
     }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6296,7 +6662,10 @@ fn try_run_sampling_request<'a>(
             }
             return Err(CodexErr::TurnAborted);
         }
-        admit_prepared_prompt(&sess, &turn_context, prompt).await?;
+        let (read_prompt, computed_admission) =
+            choose_provider_read_prompt(&sess, &turn_context, prompt).await;
+        let prompt = read_prompt.as_ref().unwrap_or(prompt);
+        admit_prepared_prompt(&sess, &turn_context, prompt, computed_admission).await?;
         let request_effort = sess.request_reasoning_effort(&turn_context).await;
         let service_tier = service_tier_for_sampling(&sess, &turn_context).await;
         feedback_tags!(
@@ -7050,9 +7419,17 @@ fn try_run_sampling_request<'a>(
                             .record_model_response_id(&identity.physical_attempt_id, &response_id);
                     }
                     if let Some(input) = client_session.effective_consumption_input() {
+                        let offers = turn_context.extension_data.get::<ProviderReadOffers>();
+                        let consumed = offers.as_ref().map_or(std::borrow::Cow::Borrowed(input), |offers| {
+                            offers.observe_completion(
+                                input,
+                                client_session.effective_input(),
+                                &turn_context.turn_timing_state,
+                            )
+                        });
                         sess.mark_tool_history_consumed(
                             &turn_context,
-                            input,
+                            &consumed,
                             generation_id.clone(),
                         )
                         .await;

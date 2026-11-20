@@ -338,6 +338,11 @@ fn routine_launch_receipt(receipt: &Value) -> Option<Value> {
     }
     let mut compact = Vec::with_capacity(roots.len());
     for root in roots {
+        if !root.get("descendant_cleanup_observation").is_none_or(Value::is_null) {
+            // Native job evidence is not routine launch metadata. Keep the
+            // full receipt with its root identity and independent reap result.
+            return None;
+        }
         let executable = root.get("resolved_executable")?.as_str()?;
         let environment = root.get("environment")?.as_object()?;
         if !root.pointer("/executable_identity/underlying_program")?.is_null()

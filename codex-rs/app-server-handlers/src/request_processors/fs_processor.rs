@@ -283,9 +283,27 @@ impl FsRequestProcessor {
                 "relative_or_other"
             }
         });
+        // A path this host will refuse cannot be recovered from its digest. Keep
+        // its layout only: every letter, digit and non-ASCII character becomes a
+        // class mark and the separators and punctuation stay, so the form a
+        // caller sent is visible without any name it contains.
+        let shape = path
+            .filter(|path| !std::path::Path::new(path).is_absolute())
+            .map(|path| {
+                path.chars()
+                    .take(512)
+                    .map(|character| match character {
+                        character if character.is_ascii_alphabetic() => 'a',
+                        character if character.is_ascii_digit() => '9',
+                        character if character.is_ascii() => character,
+                        _ => 'u',
+                    })
+                    .collect::<String>()
+            });
         serde_json::json!({"is_string":path.is_some(), "syntax":syntax,
             "bytes":path.map(str::len),
-            "sha256":path.map(|path| hex::encode(sha2::Sha256::digest(path.as_bytes())))})
+            "sha256":path.map(|path| hex::encode(sha2::Sha256::digest(path.as_bytes()))),
+            "refused_shape":shape})
     }
 
     pub(crate) async fn remove(

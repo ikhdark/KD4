@@ -6235,6 +6235,11 @@ where
         };
         guard.turn_timing.clone()
     });
+    let text_delivery = delivery_turn_timing
+        .as_ref()
+        .filter(|timing| timing.begin_text_delivery_stream())
+        .cloned();
+    let producer_text_delivery = text_delivery.clone();
 
     tokio::spawn(
         async move {
@@ -6316,6 +6321,13 @@ where
                     event = Err(ApiError::invalid_response(
                         "decoded response event exceeds the queue payload limit",
                     )).into();
+                }
+                if let Some(timing) = &producer_text_delivery
+                    && let Ok(ResponseEvent::OutputTextDelta(text)) = event.event()
+                    && !text.is_empty()
+                    && let Some(tag) = timing.record_text_produced(text)
+                {
+                    event.set_delivery_tag(tag);
                 }
                 if let Ok(response_event) = event.event()
                     && let Some(clock) = attempt_clock.as_ref()
@@ -6577,6 +6589,7 @@ where
             rx_event,
             attempt_identity,
             consumer_dropped: consumer_dropped_for_stream,
+            text_delivery,
         },
         rx_last_response,
     )
