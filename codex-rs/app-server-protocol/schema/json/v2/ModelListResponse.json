@@ -251,14 +251,14 @@
       ],
       "description": "Generic worker preferences, independent of the parent model/effort. Older servers omit this metadata; it is not the settings of every child."
     },
-    "subagentSettingsSupported": {
-      "default": false,
-      "description": "Whether thread/settings/update accepts and persists subagentSettings.",
-      "type": "boolean"
-    },
     "subagentServiceTierSupported": {
       "default": false,
       "description": "Whether subagentSettings.serviceTier is independently persisted and applied.",
+      "type": "boolean"
+    },
+    "subagentSettingsSupported": {
+      "default": false,
+      "description": "Whether thread/settings/update accepts and persists subagentSettings.",
       "type": "boolean"
     }
   },

@@ -203,12 +203,24 @@ def _validate_model_specific_options(
         )
 
 
-def _validate_generate_payload(payload: Dict[str, Any]) -> None:
-    model = str(payload.get("model", DEFAULT_MODEL))
+def _batch_integer(value: Any, field: str, job: int, low: int, high: int) -> int:
+    if isinstance(value, str) and value.strip().isascii() and value.strip().isdecimal():
+        try:
+            value = int(value)
+        except ValueError:
+            pass
+    if type(value) is not int or not low <= value <= high:
+        _die(f"Job {job}: {field} must be an integer between {low} and {high}.")
+    return value
+
+
+def _validate_generate_payload(payload: Dict[str, Any], job: int) -> None:
+    for field in ("model", "size", "quality", "background", "output_format", "moderation"):
+        if field in payload and not isinstance(payload[field], str):
+            _die(f"Job {job}: {field} must be a string.")
+    model = payload.get("model", DEFAULT_MODEL)
     _validate_model(model)
-    n = int(payload.get("n", 1))
-    if n < 1 or n > 10:
-        _die("n must be between 1 and 10")
+    payload["n"] = _batch_integer(payload.get("n", 1), "n", job, 1, 10)
     size = str(payload.get("size", DEFAULT_SIZE))
     quality = str(payload.get("quality", DEFAULT_QUALITY))
     background = payload.get("background")
@@ -217,8 +229,8 @@ def _validate_generate_payload(payload: Dict[str, Any]) -> None:
     _validate_background(background)
     _validate_model_specific_options(model=model, background=background)
     oc = payload.get("output_compression")
-    if oc is not None and not (0 <= int(oc) <= 100):
-        _die("output_compression must be between 0 and 100")
+    if oc is not None:
+        payload["output_compression"] = _batch_integer(oc, "output_compression", job, 0, 100)
 
 
 def _build_output_paths(
@@ -321,17 +333,36 @@ def _derive_downscale_path(path: Path, suffix: str) -> Path:
 
 
 def _check_output_paths(outputs: List[Path], args: argparse.Namespace) -> None:
-    """Reject known collisions before API work; keep write-time checks for races."""
-    if args.force:
-        return
+    """Reject duplicate targets and check for existing files before live calls."""
     candidates = list(outputs)
     if args.downscale_max_dim is not None:
         candidates.extend(
             _derive_downscale_path(path, args.downscale_suffix) for path in outputs
         )
+    seen = set()
     for path in candidates:
-        if path.exists():
+        identity = path.resolve()
+        if identity in seen:
+            _die(f"Output path is planned more than once: {path}")
+        seen.add(identity)
+        if not args.dry_run and not args.force and path.exists():
             _die(f"Output already exists: {path} (use --force to overwrite)")
+
+
+class _OutputAlreadyExists(FileExistsError):
+    pass
+
+
+def _write_image(path: Path, data: bytes, *, force: bool) -> None:
+    try:
+        with path.open("wb" if force else "xb") as output:
+            output.write(data)
+    except FileExistsError as error:
+        # A peer writer can win after preflight. Batch handling must be able
+        # to report that job failure without terminating every other job.
+        raise _OutputAlreadyExists(
+            f"Output already exists: {path} (use --force to overwrite)"
+        ) from error
 
 
 def _downscale_image_bytes(
@@ -389,25 +420,21 @@ def _decode_write_and_downscale(
         if idx >= len(outputs):
             break
         out_path = outputs[idx]
-        if out_path.exists() and not force:
-            _die(f"Output already exists: {out_path} (use --force to overwrite)")
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
         raw = base64.b64decode(image_b64)
-        out_path.write_bytes(raw)
+        _write_image(out_path, raw, force=force)
         print(f"Wrote {out_path}")
 
         if downscale_max_dim is None:
             continue
 
         derived = _derive_downscale_path(out_path, downscale_suffix)
-        if derived.exists() and not force:
-            _die(f"Output already exists: {derived} (use --force to overwrite)")
         derived.parent.mkdir(parents=True, exist_ok=True)
         resized = _downscale_image_bytes(
             raw, max_dim=downscale_max_dim, output_format=output_format
         )
-        derived.write_bytes(resized)
+        _write_image(derived, resized, force=force)
         print(f"Wrote {derived}")
 
 
@@ -452,8 +479,13 @@ def _normalize_job(job: Any, idx: int) -> Dict[str, Any]:
             _die(f"Empty prompt at job {idx}")
         return {"prompt": prompt}
     if isinstance(job, dict):
-        if "prompt" not in job or not str(job["prompt"]).strip():
-            _die(f"Missing prompt for job {idx}")
+        prompt = job.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            _die(f"Missing or invalid prompt for job {idx}")
+        if not isinstance(job.get("fields", {}), dict):
+            _die(f"Job {idx}: fields must be an object.")
+        if job.get("out") is not None and not isinstance(job["out"], str):
+            _die(f"Job {idx}: out must be a string.")
         return job
     _die(f"Invalid job at index {idx}: expected string or object.")
     return {}  # unreachable
@@ -636,57 +668,6 @@ async def _run_generate_batch(args: argparse.Namespace) -> int:
         "moderation": args.moderation,
     }
 
-    if args.dry_run:
-        for i, job in enumerate(jobs, start=1):
-            prompt = str(job["prompt"]).strip()
-            fields = _merge_non_null(base_fields, job.get("fields", {}))
-            # Allow flat job keys as well (use_case, scene, etc.)
-            fields = _merge_non_null(
-                fields, {k: job.get(k) for k in base_fields.keys()}
-            )
-            augmented = _augment_prompt_fields(args.augment, prompt, fields)
-
-            job_payload = dict(base_payload)
-            job_payload["prompt"] = augmented
-            job_payload = _merge_non_null(
-                job_payload, {k: job.get(k) for k in base_payload.keys()}
-            )
-            job_payload = {k: v for k, v in job_payload.items() if v is not None}
-
-            _validate_generate_payload(job_payload)
-            effective_output_format = _normalize_output_format(
-                job_payload.get("output_format")
-            )
-            _validate_transparency(
-                job_payload.get("background"), effective_output_format
-            )
-            job_payload["output_format"] = effective_output_format
-
-            n = int(job_payload.get("n", 1))
-            outputs = _job_output_paths(
-                out_dir=out_dir,
-                output_format=effective_output_format,
-                idx=i,
-                prompt=prompt,
-                n=n,
-                explicit_out=job.get("out"),
-            )
-            downscaled = None
-            if args.downscale_max_dim is not None:
-                downscaled = [
-                    str(_derive_downscale_path(p, args.downscale_suffix))
-                    for p in outputs
-                ]
-            _print_request(
-                {
-                    "endpoint": "/v1/images/generations",
-                    "job": i,
-                    "outputs": [str(p) for p in outputs],
-                    "outputs_downscaled": downscaled,
-                    **job_payload,
-                }
-            )
-        return 0
 
     # Check every job before starting any requests, including per-job overrides.
     prepared_jobs: List[Tuple[Dict[str, Any], List[Path], str]] = []
@@ -699,7 +680,7 @@ async def _run_generate_batch(args: argparse.Namespace) -> int:
         payload["prompt"] = _augment_prompt_fields(args.augment, prompt, fields)
         payload = _merge_non_null(payload, {k: job.get(k) for k in base_payload.keys()})
         payload = {k: v for k, v in payload.items() if v is not None}
-        _validate_generate_payload(payload)
+        _validate_generate_payload(payload, i)
         output_format = _normalize_output_format(payload.get("output_format"))
         _validate_transparency(payload.get("background"), output_format)
         payload["output_format"] = output_format
@@ -727,6 +708,20 @@ async def _run_generate_batch(args: argparse.Namespace) -> int:
             claimed_outputs[identity] = i
         prepared_jobs.append((payload, outputs, output_format))
 
+    if args.dry_run:
+        for i, (payload, outputs, _) in enumerate(prepared_jobs, start=1):
+            downscaled = None
+            if args.downscale_max_dim is not None:
+                downscaled = [str(_derive_downscale_path(path, args.downscale_suffix)) for path in outputs]
+            _print_request({
+                "endpoint": "/v1/images/generations",
+                "job": i,
+                "outputs": [str(path) for path in outputs],
+                "outputs_downscaled": downscaled,
+                **payload,
+            })
+        return 0
+
     client = _create_async_client()
     sem = asyncio.Semaphore(args.concurrency)
 
@@ -738,8 +733,10 @@ async def _run_generate_batch(args: argparse.Namespace) -> int:
         nonlocal any_failed
         job_label = f"[job {i}/{len(jobs)}]"
         payload, outputs, effective_output_format = prepared
-        try:
-            async with sem:
+        async with sem:
+            if args.fail_fast and any_failed:
+                return i, None
+            try:
                 print(f"{job_label} starting", file=sys.stderr)
                 started = time.time()
                 result = await _generate_one_with_retries(
@@ -750,22 +747,22 @@ async def _run_generate_batch(args: argparse.Namespace) -> int:
                 )
                 elapsed = time.time() - started
                 print(f"{job_label} completed in {elapsed:.1f}s", file=sys.stderr)
-            images = [item.b64_json for item in result.data]
-            _decode_write_and_downscale(
-                images,
-                outputs,
-                force=args.force,
-                downscale_max_dim=args.downscale_max_dim,
-                downscale_suffix=args.downscale_suffix,
-                output_format=effective_output_format,
-            )
-            return i, None
-        except Exception as exc:
-            any_failed = True
-            print(f"{job_label} failed: {exc}", file=sys.stderr)
-            if args.fail_fast:
-                raise
-            return i, str(exc)
+                images = [item.b64_json for item in result.data]
+                _decode_write_and_downscale(
+                    images,
+                    outputs,
+                    force=args.force,
+                    downscale_max_dim=args.downscale_max_dim,
+                    downscale_suffix=args.downscale_suffix,
+                    output_format=effective_output_format,
+                )
+                return i, None
+            except Exception as exc:
+                any_failed = True
+                print(f"{job_label} failed: {exc}", file=sys.stderr)
+                if args.fail_fast:
+                    raise
+                return i, str(exc)
 
     tasks = [
         asyncio.create_task(run_job(i, prepared))
@@ -810,6 +807,7 @@ def _generate(args: argparse.Namespace) -> None:
     _validate_transparency(args.background, output_format)
     payload["output_format"] = output_format
     output_paths = _build_output_paths(args.out, output_format, args.n, args.out_dir)
+    _check_output_paths(output_paths, args)
     downscaled = None
     if args.downscale_max_dim is not None:
         downscaled = [
@@ -827,7 +825,6 @@ def _generate(args: argparse.Namespace) -> None:
         )
         return
 
-    _check_output_paths(output_paths, args)
     print(
         "Calling Image API (generation). This can take up to a couple of minutes.",
         file=sys.stderr,
@@ -884,6 +881,7 @@ def _edit(args: argparse.Namespace) -> None:
     payload["output_format"] = output_format
     _validate_input_fidelity(args.input_fidelity)
     output_paths = _build_output_paths(args.out, output_format, args.n, args.out_dir)
+    _check_output_paths(output_paths, args)
     downscaled = None
     if args.downscale_max_dim is not None:
         downscaled = [
@@ -905,7 +903,6 @@ def _edit(args: argparse.Namespace) -> None:
         )
         return
 
-    _check_output_paths(output_paths, args)
     print(
         f"Calling Image API (edit) with {len(image_paths)} image(s).",
         file=sys.stderr,
@@ -1079,7 +1076,10 @@ def main() -> int:
     )
     _ensure_api_key(args.dry_run)
 
-    args.func(args)
+    try:
+        args.func(args)
+    except _OutputAlreadyExists as error:
+        _die(str(error))
     return 0
 
 

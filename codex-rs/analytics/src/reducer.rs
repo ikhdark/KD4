@@ -357,7 +357,8 @@ struct CompletedTurnState {
 
 #[derive(Default)]
 struct TurnState {
-    tool_count_baseline_seen: bool,
+    start_baseline_seen: bool,
+    steer_history_incomplete: bool,
     tool_counts_incomplete: bool,
     review_history_incomplete: bool,
     emitted: bool,
@@ -557,6 +558,7 @@ impl AnalyticsReducer {
         self.delivery_gap_active = true;
         for turn in self.turns.values_mut() {
             turn.tool_counts_incomplete = true;
+            turn.steer_history_incomplete = true;
             turn.review_history_incomplete = true;
         }
     }
@@ -583,6 +585,7 @@ impl AnalyticsReducer {
                 turn_id.to_string(),
                 TurnState {
                     tool_counts_incomplete: self.delivery_gap_active,
+                    steer_history_incomplete: self.delivery_gap_active,
                     review_history_incomplete: self.delivery_gap_active,
                     ..TurnState::default()
                 },
@@ -1500,7 +1503,7 @@ impl AnalyticsReducer {
                     return;
                 };
                 turn_state.thread_id = Some(notification.thread_id);
-                turn_state.tool_count_baseline_seen = true;
+                turn_state.start_baseline_seen = true;
                 turn_state.started_at = notification
                     .turn
                     .started_at
@@ -3027,7 +3030,7 @@ fn codex_turn_event_params(
     let token_usage = turn_state.token_usage.as_ref();
     let codex_error = turn_state.codex_error.as_ref();
     let tool_counts_complete =
-        turn_state.tool_count_baseline_seen && !turn_state.tool_counts_incomplete;
+        turn_state.start_baseline_seen && !turn_state.tool_counts_incomplete;
     let mut missing_facts = Vec::new();
     if config.is_none() {
         missing_facts.push("resolved_config");
@@ -3071,7 +3074,8 @@ fn codex_turn_event_params(
         turn_error: completed.turn_error.clone(),
         codex_error_kind: codex_error.map(|error| error.kind),
         codex_error_http_status_code: codex_error.and_then(|error| error.http_status_code),
-        steer_count: Some(turn_state.steer_count),
+        steer_count: (turn_state.start_baseline_seen && !turn_state.steer_history_incomplete)
+            .then_some(turn_state.steer_count),
         total_tool_call_count: tool_counts_complete.then_some(turn_state.tool_counts.total),
         shell_command_count: tool_counts_complete.then_some(turn_state.tool_counts.shell_command),
         file_change_count: tool_counts_complete.then_some(turn_state.tool_counts.file_change),

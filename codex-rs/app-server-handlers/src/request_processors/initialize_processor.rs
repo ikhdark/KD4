@@ -142,6 +142,11 @@ impl InitializeRequestProcessor {
             return Err(invalid_request("Already initialized"));
         }
 
+        // Negotiate only after the session commit and before its success response.
+        if capabilities.stdio_reattach {
+            connection_id.enable_stdio_reattach();
+        }
+
         if mutates_global_identity {
             // Only real client initialization may mutate process-global client metadata.
             let originator_overridden =

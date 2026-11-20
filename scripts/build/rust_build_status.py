@@ -19,6 +19,7 @@ import errno
 import hashlib
 import json
 import math
+import ntpath
 import os
 import platform
 from pathlib import Path
@@ -29,7 +30,9 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
+import tomllib
 import uuid
 from typing import Callable
 from typing import BinaryIO
@@ -45,6 +48,7 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.common.process_owner import run_owned, CleanupFailed  # noqa: E402
 from scripts.build.cargo_resources import BuildLease, _inherited_lease, run_build  # noqa: E402
 from scripts.common.atomic_json import write_json_atomic  # noqa: E402
+from scripts.common.generated_output_lock import repository_lock  # noqa: E402
 
 from scripts.common.tool_versions import cargo_lane_patterns  # noqa: E402
 from scripts.build.rust_tool_env import cargo_package_specs, local_rust_env  # noqa: E402
@@ -564,7 +568,7 @@ def _lane_name_from_command_line(command_line: str) -> str | None:
 def _process_path_key(path: str | Path) -> str:
     value = str(path)
     if PureWindowsPath(value).is_absolute():
-        return str(PureWindowsPath(value)).replace("\\", "/").rstrip("/").casefold()
+        return ntpath.normpath(value).replace("\\", "/").rstrip("/").casefold()
     return str(Path(value).resolve()).replace("\\", "/").rstrip("/")
 
 
@@ -1190,23 +1194,39 @@ def _auto_lane_base(command: Sequence[str]) -> str:
 def initialize_cargo_lanes_root(repo_root: Path, lane_root: Path) -> Path:
     lane_root = _checked_cargo_lanes_path(lane_root)
     default_root = default_cargo_lanes_root(repo_root)
-    if not lane_root.exists():
-        lane_root.mkdir(parents=True)
     marker = lane_root / CARGO_LANES_ROOT_MARKER
-    if marker.exists():
-        try:
-            valid_marker = (
-                not marker.is_symlink()
-                and stat.S_ISREG(marker.stat().st_mode)
-                and marker.read_text(encoding="utf-8").strip()
-                == CARGO_LANES_ROOT_MARKER_CONTENT
-            )
-        except (OSError, UnicodeError):
-            valid_marker = False
-        if not valid_marker:
-            raise CargoLanesRootValidationError(
-                f"invalid Cargo lanes root marker {marker}"
-            )
+    if os.path.lexists(marker):
+        # Reading an already-published immutable marker needs no sibling write.
+        _validate_lane_marker(marker)
+        return lane_root
+    # Keep the lock outside the directory whose ownership is in question.
+    lock_path = lane_root.with_name(f".{lane_root.name}.lane-init.lock")
+    with repository_lock(lock_path, "Cargo lane initialization", timeout=30):
+        lane_root = _checked_cargo_lanes_path(lane_root)
+        lane_root.mkdir(parents=True, exist_ok=True)
+        _write_or_validate_lane_marker(lane_root, default_root)
+    return lane_root
+
+
+def _validate_lane_marker(marker: Path) -> None:
+    try:
+        observation = marker.lstat()
+        valid_marker = (
+            not _observation_is_indirect(observation)
+            and stat.S_ISREG(observation.st_mode)
+            and marker.read_text(encoding="utf-8").strip()
+            == CARGO_LANES_ROOT_MARKER_CONTENT
+        )
+    except (OSError, UnicodeError):
+        valid_marker = False
+    if not valid_marker:
+        raise CargoLanesRootValidationError(f"invalid Cargo lanes root marker {marker}")
+
+
+def _write_or_validate_lane_marker(lane_root: Path, default_root: Path) -> None:
+    marker = lane_root / CARGO_LANES_ROOT_MARKER
+    if os.path.lexists(marker):
+        _validate_lane_marker(marker)
     else:
         entries = list(lane_root.iterdir())
         if lane_root != default_root and entries:
@@ -1214,8 +1234,10 @@ def initialize_cargo_lanes_root(repo_root: Path, lane_root: Path) -> Path:
                 f"custom Cargo lanes root must be empty or contain {CARGO_LANES_ROOT_MARKER}: "
                 f"{lane_root}"
             )
-        marker.write_text(f"{CARGO_LANES_ROOT_MARKER_CONTENT}\n", encoding="utf-8")
-    return lane_root
+        with tempfile.TemporaryDirectory(dir=lane_root.parent, prefix=f".{lane_root.name}.marker-") as stage:
+            candidate = Path(stage) / marker.name
+            candidate.write_text(f"{CARGO_LANES_ROOT_MARKER_CONTENT}\n", encoding="utf-8")
+            os.replace(candidate, marker)
 
 
 @dataclass(frozen=True)
@@ -2266,7 +2288,7 @@ def cargo_build_context(
             "CARGO_HOME",
             "RUSTUP_HOME",
         }
-        or key.startswith("CARGO_PROFILE_")
+        or key.startswith(("CARGO_PROFILE_", "CARGO_BUILD_RUST"))
         or (key.startswith("CARGO_TARGET_") and key.endswith(("_LINKER", "_RUSTFLAGS")))
     }
     tools = {}
@@ -2284,18 +2306,9 @@ def cargo_build_context(
             except OSError:
                 tools[name] = [str(resolved)]
     configs = {}
-    for name in (
-        "rust-toolchain",
-        "rust-toolchain.toml",
-        "codex-rs/rust-toolchain.toml",
-        ".cargo/config.toml",
-        "codex-rs/.cargo/config.toml",
-    ):
-        path = repo_root / name
-        if path.is_file():
-            configs[name] = hashlib.sha256(path.read_bytes()).hexdigest()
     options = []
     config_overrides = []
+    selected_manifest = None
     working_dir = Path.cwd()
     cargo_index = (
         _cargo_subcommand_index(command)
@@ -2312,6 +2325,10 @@ def cargo_build_context(
             working_dir /= next(tokens, "")
         elif token.startswith("-C"):
             working_dir /= token[2:]
+        elif token == "--manifest-path":
+            selected_manifest = next(tokens, "")
+        elif token.startswith("--manifest-path="):
+            selected_manifest = token.split("=", 1)[1]
         elif token == "--config":
             config_overrides.append(next(tokens, ""))
         elif token.startswith("--config="):
@@ -2333,6 +2350,36 @@ def cargo_build_context(
             "--no-default-features",
         ) or token.startswith("+"):
             options.append(token)
+    working_dir = working_dir.resolve()
+    root = repo_root.resolve()
+
+    def context_path(path: Path) -> str:
+        resolved = path.resolve()
+        return resolved.relative_to(root).as_posix() if resolved.is_relative_to(root) else str(resolved)
+
+    if selected_manifest is not None:
+        manifest = (working_dir / selected_manifest).resolve()
+    else:
+        manifest = next(
+            (directory / "Cargo.toml" for directory in (working_dir, *working_dir.parents)
+             if (directory / "Cargo.toml").is_file()),
+            None,
+        )
+    cargo_home = working_dir / Path(
+        env.get("CARGO_HOME") or (Path(env.get("HOME") or env.get("USERPROFILE") or Path.home()) / ".cargo")
+    )
+    discovered = _effective_cargo_configs(working_dir, cargo_home)
+    for start in {Path.cwd(), working_dir}:
+        discovered.extend(
+            directory / name for directory in (start, *start.parents)
+            for name in ("rust-toolchain", "rust-toolchain.toml")
+        )
+    for path in sorted(set(discovered)):
+        if path.is_file():
+            try:
+                configs[context_path(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                configs[context_path(path)] = None
     for value in config_overrides:
         options.extend(["--config", value])
         if "=" not in value:
@@ -2344,8 +2391,10 @@ def cargo_build_context(
             except OSError:
                 configs[str(path)] = None
     return {
-        "version": 2,
+        "version": 3,
         "sourceRoot": os.path.normcase(os.path.abspath(repo_root)),
+        "workingDirectory": context_path(working_dir),
+        "selectedManifest": context_path(manifest) if manifest is not None else None,
         "environment": settings,
         "tools": tools,
         "configs": configs,
@@ -2588,15 +2637,18 @@ def _source_mirror_ineligibility(command: Sequence[str], repo_root: Path) -> str
 
 
 def _is_warm_lane_dir(path: Path) -> bool:
-    # Profile names are configurable. Inspect only immediate, direct profile
-    # directories; their names alone do not prove reusable work.
-    return (
-        path.is_dir()
-        and not is_indirect_directory(path)
-        and any(
-            profile.is_dir() and not is_indirect_directory(profile) and is_cargo_artifact_dir(profile)
-            for profile in path.iterdir()
-        )
+    def direct_directories(directory: Path) -> Iterator[Path]:
+        if directory.is_dir() and not is_indirect_directory(directory):
+            for child in directory.iterdir():
+                if child.is_dir() and not is_indirect_directory(child):
+                    yield child
+
+    # Cargo places profiles directly in the lane for host builds and one
+    # level down for explicit target builds. Require artifact layout evidence.
+    return any(
+        is_cargo_artifact_dir(entry)
+        or any(is_cargo_artifact_dir(profile) for profile in direct_directories(entry))
+        for entry in direct_directories(path)
     )
 
 
@@ -2668,14 +2720,31 @@ def _mirror_slot_distance(mirrors_root: Path, wanted: Mapping[str, str]) -> Call
     return distance
 
 
+def _cargo_launch_offset(command: Sequence[str]) -> int | None:
+    if not command:
+        return None
+    offset = 0
+    if len(command) > 3 and Path(command[0]).stem.lower() == "rustup" and command[1] == "run":
+        offset = 4 if command[2] == "--install" else 3
+    return offset if offset < len(command) and Path(command[offset]).stem.lower() == "cargo" else None
+
+
+def _cargo_launch_subcommand(command: Sequence[str]) -> int | None:
+    offset = _cargo_launch_offset(command)
+    if offset is None:
+        return None
+    relative_index = _cargo_subcommand_index(command[offset:])
+    return None if relative_index is None else offset + relative_index
+
+
 def _cargo_command_with_message_format(command: Sequence[str]) -> list[str]:
     result = list(command)
     options = result[: result.index("--")] if "--" in result else result
     if any(token == "--message-format" or token.startswith("--message-format=") for token in options):
         raise ValueError("--freeze-bundle sets Cargo's --message-format; remove it from the command")
-    index = _cargo_subcommand_index(result) if result and Path(result[0]).stem.lower() == "cargo" else None
+    index = _cargo_launch_subcommand(result)
     if index is None:
-        raise ValueError("--freeze-bundle requires a direct Cargo build command")
+        raise ValueError("--freeze-bundle requires a Cargo command")
     return [*result[: index + 1], FREEZE_MESSAGE_FORMAT, *result[index + 1 :]]
 
 
@@ -2859,11 +2928,62 @@ def _physical_memory_gib() -> int | None:
         return None
 
 
-def _rustc_identity(env: Mapping[str, str], cwd: Path) -> str | None:
-    """`rustc -vV` as rustup resolves it from the build cwd (toolchain files)."""
+def _effective_cargo_configs(cwd: Path, cargo_home: Path) -> list[Path]:
+    config_dirs = (cargo_home, *(directory / ".cargo" for directory in (cwd, *cwd.parents)))
+    paths = []
+    for directory in config_dirs:
+        legacy = directory / "config"
+        paths.append(legacy if legacy.is_file() else directory / "config.toml")
+    return paths
+
+
+def _rustc_identity(env: Mapping[str, str], cwd: Path, command: Sequence[str] = ()) -> str | None:
+    """Query the compiler in the effective Cargo cwd and toolchain."""
+    wrapper_settings = {
+        name: env.get(name, env.get(f"CARGO_BUILD_{name}"))
+        for name in ("RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER")
+    }
+    if command and any(wrapper_settings.values()):
+        # -vV observes bare rustc, not the effective invocation or inputs of an
+        # arbitrary wrapper. Disable frozen reuse, not the normal Cargo build.
+        return None
+    probe_env = dict(env)
+    compiler = env.get("RUSTC") or env.get("CARGO_BUILD_RUSTC") or "rustc"
+    offset = _cargo_launch_offset(command)
+    if offset:
+        probe_env["RUSTUP_TOOLCHAIN"] = command[offset - 1]
+    if offset is not None and len(command) > offset + 1 and command[offset + 1].startswith("+"):
+        probe_env["RUSTUP_TOOLCHAIN"] = command[offset + 1][1:]
+    # Rustup selects Cargo before Cargo handles -C, and Cargo config may
+    # override the compiler. Do not attest to a different compiler in cases
+    # where this probe cannot bind the executed tool.
+    if Path.cwd().resolve() != cwd.resolve() or any(
+        arg == "--config" or arg.startswith("--config=") for arg in command
+    ):
+        return None
+    home = cwd / Path(env.get("CARGO_HOME") or (Path(env.get("HOME") or env.get("USERPROFILE") or Path.home()) / ".cargo"))
+    next_config = _effective_cargo_configs(cwd, home)
+    try:
+        for path in next_config:
+            if path.is_file():
+                document = tomllib.loads(path.read_text(encoding="utf-8"))
+                # Included files can change the effective compiler without
+                # changing this config. Leave that build to Cargo's own checks.
+                if "include" in document:
+                    return None
+                build = document.get("build", {})
+                if not isinstance(build, dict) or "rustc" in build:
+                    return None
+                if command and any(
+                    override is None and build.get(name.lower().replace("_", "-"))
+                    for name, override in wrapper_settings.items()
+                ):
+                    return None
+    except (OSError, UnicodeError, ValueError):
+        return None
     try:
         completed = subprocess.run(
-            [env.get("RUSTC", "rustc"), "-vV"], cwd=cwd, env=dict(env),
+            [compiler, "-vV"], cwd=cwd, env=probe_env,
             capture_output=True, text=True, timeout=60, check=False,
         )
     except (OSError, subprocess.SubprocessError):
@@ -3131,6 +3251,20 @@ def find_legacy_bundles(
     return [(bundle, path, caveat) for _, bundle, path, caveat in found]
 
 
+def _require_captured_manifest(
+    root: Path, context: Mapping[str, object], source: _SourceManifest,
+) -> None:
+    selected = context.get("selectedManifest")
+    manifest = (root / selected).resolve() if isinstance(selected, str) else None
+    root = root.resolve()
+    if (manifest is None or not manifest.is_relative_to(root)
+            or manifest.relative_to(root).as_posix() not in source.entries):
+        raise ValueError(
+            "cannot freeze or reuse: selected Cargo manifest is outside the captured "
+            "--repo-root inputs; select the actual source root"
+        )
+
+
 def find_reusable_bundle(
     *, repo_root: Path, command: Sequence[str], search_roots: Sequence[Path] = (),
     decisions: list[dict[str, object]] | None = None,
@@ -3141,13 +3275,24 @@ def find_reusable_bundle(
     rustc; every listed binary must still exist with its recorded SHA-256.
     Candidates come from the bundle index; search roots add unindexed receipts.
     """
+    index = _cargo_launch_subcommand(command)
+    if index is None or command[index] not in {"build", "b"}:
+        return None, 0
     env = os.environ.copy()
     env.update(local_rust_env(env, repo_root=repo_root, which=shutil.which))
+    env.setdefault("RUST_MIN_STACK", RUST_MIN_STACK_BYTES)
+    context = cargo_build_context(repo_root, command, env)
+    source = _source_manifest(repo_root)
+    _require_captured_manifest(repo_root, context, source)
+    rustc = _rustc_identity(env, repo_root / context["workingDirectory"], command)
+    if rustc is None:
+        _reuse_decision(decisions, "compiler_identity", "missing_evidence", candidate=repo_root)
+        return None, 0
     wanted = _reuse_key({
         "command": list(command),
-        "sourceManifest": source_tree_manifest(repo_root),
-        "buildContext": cargo_build_context(repo_root, command, env),
-        "rustc": _rustc_identity(env, Path.cwd()),
+        "sourceManifest": source.summary(),
+        "buildContext": context,
+        "rustc": rustc,
     })
     indexed: set[str] = set()
     try:
@@ -3279,8 +3424,13 @@ def run_in_cargo_lane(
             or (external and not (repo_root / ".git").exists())
         )
         source = _source_manifest(repo_root, materialize_internal_file_links=materialize_internal_file_links) if freeze else None
+        if source is not None:
+            _require_captured_manifest(repo_root, build_context, source)
         capture_started = time.perf_counter()
-        rustc = _rustc_identity(child_env, Path.cwd()) if freeze or timing_path is not None else None
+        rustc = (
+            _rustc_identity(child_env, repo_root / build_context["workingDirectory"], command)
+            if freeze or timing_path is not None else None
+        )
         if timing_path is not None:
             timing_evidence = {
                 "schemaVersion": 1,
@@ -3310,7 +3460,13 @@ def run_in_cargo_lane(
             record["timingEvidence"] = timing_evidence
         if source is not None and rebuild:
             cache_reuse["frozenBinary"].update(status="disabled", gate="explicit_rebuild")
-        if source is not None and not rebuild:
+        cargo_index = _cargo_launch_subcommand(command)
+        may_skip_execution = cargo_index is not None and command[cargo_index] in {"build", "b"}
+        if source is not None and not rebuild and not may_skip_execution:
+            cache_reuse["frozenBinary"].update(status="disabled", gate="execution_required")
+        if source is not None and not rebuild and may_skip_execution and rustc is None:
+            cache_reuse["frozenBinary"].update(status="disabled", gate="compiler_identity_unavailable")
+        if source is not None and not rebuild and may_skip_execution and rustc is not None:
             cache_reuse["frozenBinary"]["status"] = "miss"
             reuse = _newest_indexed_bundle(_reuse_key({
                 "command": list(command),
@@ -4212,6 +4368,9 @@ def prune_stale_lanes_report(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Inspect local Rust build health.")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    init_lanes_parser = subparsers.add_parser("initialize-lanes")
+    init_lanes_parser.add_argument("--repo-root", required=True, type=Path)
+    init_lanes_parser.add_argument("--lanes-root", required=True, type=Path)
     subparsers.add_parser(
         "lane-affinity", help="Compute Cargo lane affinity from a JSON argument array on stdin."
     )
@@ -4348,7 +4507,9 @@ def main(argv: list[str] | None = None) -> int:
         max_age_days = None
 
     try:
-        if args.command == "lane-affinity":
+        if args.command == "initialize-lanes":
+            initialize_cargo_lanes_root(args.repo_root, args.lanes_root)
+        elif args.command == "lane-affinity":
             command = json.load(sys.stdin)
             if not isinstance(command, list) or not all(isinstance(value, str) for value in command):
                 raise ValueError("lane-affinity requires a JSON array of strings")

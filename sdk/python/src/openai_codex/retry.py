@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import math
 import random
+import sys
 import threading
 import time
 from typing import Callable, TypeVar
@@ -40,17 +40,19 @@ def retry_on_overload(
         if (
             not isinstance(value, (int, float))
             or isinstance(value, bool)
-            or not math.isfinite(value)
+            or not -float("inf") < value < float("inf")
         ):
             raise ValueError(f"{name} must be finite")
     if initial_delay_s < 0:
         raise ValueError("initial_delay_s must be >= 0")
     if max_delay_s < 0:
         raise ValueError("max_delay_s must be >= 0")
-    if jitter_ratio < 0:
-        raise ValueError("jitter_ratio must be >= 0")
-    if timeout_s <= 0:
-        raise ValueError("timeout_s must be > 0")
+    if not 0 <= jitter_ratio <= sys.float_info.max:
+        raise ValueError("jitter_ratio must be nonnegative and representable as a float")
+    if timeout_s <= 0 or timeout_s > threading.TIMEOUT_MAX:
+        raise ValueError(f"timeout_s must be > 0 and at most {threading.TIMEOUT_MAX}")
+    if max_delay_s > threading.TIMEOUT_MAX:
+        raise ValueError(f"max_delay_s must be at most {threading.TIMEOUT_MAX}")
 
     deadline = time.monotonic() + timeout_s
 

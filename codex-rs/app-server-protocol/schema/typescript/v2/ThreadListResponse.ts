@@ -5,8 +5,8 @@ import type { Thread } from "./Thread";
 
 export type ThreadListResponse = { data: Array<Thread>,
 /**
- * Opaque cursor to pass to the next call to continue after the last item.
- * if None, there are no more items to return.
+ * Opaque cursor to continue the listing. Follow a non-null cursor even
+ * when a filtered page is short or empty; null means the listing is exhausted.
  */
 nextCursor: string | null,
 /**

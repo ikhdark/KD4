@@ -849,8 +849,10 @@ fn thread_increment_elicitation(url: &str, thread_id: String) -> Result<()> {
     let initialize = client.initialize()?;
     println!("< initialize response: {initialize:?}");
 
-    let response =
-        client.thread_increment_elicitation(ThreadIncrementElicitationParams { thread_id })?;
+    let response = client.thread_increment_elicitation(ThreadIncrementElicitationParams {
+        thread_id,
+        hold_dispatch: false,
+    })?;
     println!("< thread/incrementElicitation response: {response:?}");
 
     Ok(())
@@ -880,6 +882,7 @@ fn thread_hold_elicitation(url: &str, thread_id: String, hold_seconds: u64) -> R
     println!("< initialize response: {initialize:?}");
     let response = client.thread_increment_elicitation(ThreadIncrementElicitationParams {
         thread_id: thread_id.clone(),
+        hold_dispatch: false,
     })?;
     println!("< thread/incrementElicitation response: {response:?}");
     std::thread::sleep(Duration::from_secs(hold_seconds));
@@ -1578,22 +1581,25 @@ impl CodexClient {
                     if delta.thread_id != thread_id || delta.turn_id != turn_id {
                         continue;
                     }
-                    print!("{}", delta.delta);
-                    std::io::stdout().flush().ok();
+                    let mut stdout = std::io::stdout().lock();
+                    write!(stdout, "{}", delta.delta)?;
+                    stdout.flush()?;
                 }
                 ServerNotification::CommandExecutionOutputDelta(delta) => {
                     if delta.thread_id != thread_id || delta.turn_id != turn_id {
                         continue;
                     }
-                    print!("{}", delta.delta);
-                    std::io::stdout().flush().ok();
+                    let mut stdout = std::io::stdout().lock();
+                    write!(stdout, "{}", delta.delta)?;
+                    stdout.flush()?;
                 }
                 ServerNotification::TerminalInteraction(delta) => {
                     if delta.thread_id != thread_id || delta.turn_id != turn_id {
                         continue;
                     }
-                    println!("[stdin sent: {}]", delta.stdin);
-                    std::io::stdout().flush().ok();
+                    let mut stdout = std::io::stdout().lock();
+                    writeln!(stdout, "[stdin sent: {}]", delta.stdin)?;
+                    stdout.flush()?;
                 }
                 ServerNotification::ItemStarted(payload) => {
                     if payload.thread_id != thread_id || payload.turn_id != turn_id {

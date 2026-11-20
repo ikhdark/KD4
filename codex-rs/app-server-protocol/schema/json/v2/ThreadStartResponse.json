@@ -1699,6 +1699,29 @@
         }
       ]
     },
+    "SubagentModelSettings": {
+      "description": "Thread-local preferences for future generic workers, not per-spawn locks.",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "reasoningEffort": {
+          "$ref": "#/definitions/ReasoningEffort"
+        },
+        "serviceTier": {
+          "description": "Omit to follow the root's live tier; `default` pins Standard independently.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "model",
+        "reasoningEffort"
+      ],
+      "type": "object"
+    },
     "SurfacedToolResult": {
       "description": "Authoritative typed tool result surfaced as the terminal result of a turn. `canonical_message`, when present, is owner-authored and may be copied unchanged into legacy last-message consumers. `value` is never rendered into synthetic assistant prose by the host.",
       "properties": {
@@ -6905,6 +6928,7 @@
     "TurnValidationUncertainty": {
       "properties": {
         "captureIncomplete": {
+          "description": "True only for observed capture loss; false is not proof of full capture.",
           "type": "boolean"
         },
         "failedChecks": {
@@ -6914,6 +6938,7 @@
           "type": "array"
         },
         "pendingChecks": {
+          "description": "Checks with no terminal observation at settlement, not live operations.",
           "items": {
             "type": "string"
           },
@@ -7199,29 +7224,6 @@
           "type": "object"
         }
       ]
-    },
-    "SubagentModelSettings": {
-      "description": "Thread-local preferences for future generic workers, not per-spawn locks.",
-      "properties": {
-        "model": {
-          "type": "string"
-        },
-        "reasoningEffort": {
-          "$ref": "#/definitions/ReasoningEffort"
-        },
-        "serviceTier": {
-          "description": "Omit to follow the root's live tier; `default` pins Standard independently.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "model",
-        "reasoningEffort"
-      ],
-      "type": "object"
     }
   },
   "properties": {
@@ -7278,9 +7280,6 @@
         "null"
       ]
     },
-    "thread": {
-      "$ref": "#/definitions/Thread"
-    },
     "subagentSettings": {
       "anyOf": [
         {
@@ -7290,6 +7289,9 @@
           "type": "null"
         }
       ]
+    },
+    "thread": {
+      "$ref": "#/definitions/Thread"
     }
   },
   "required": [

@@ -672,12 +672,17 @@ pub fn classify_validation_invocations(
     combine_validation_classifications(invocations.iter().map(classify_validation))
 }
 
+fn literal_program_name(program: &str) -> Option<&str> {
+    let name = program.rsplit(['/', '\\']).next()?;
+    Some(name.strip_suffix(".exe").unwrap_or(name))
+}
+
 /// Literal launch lowering for named compiler operands. This is not a claim
 /// that arbitrary project or transitive compiler inputs have been discovered.
 fn literal_compilation_launch(command: &[String], depth: usize) -> Option<Vec<String>> {
         if depth > 8 { return None; }
         let (program, args) = command.split_first()?;
-        let binary = program.rsplit(['/', '\\']).next()?.trim_end_matches(".exe").to_ascii_lowercase();
+        let binary = literal_program_name(program)?.to_ascii_lowercase();
         let child = match binary.as_str() {
             "pwsh" | "powershell" => codex_shell_command::powershell::extract_powershell_command(command)
                 .and_then(|(_, script)| codex_shell_command::validation::standalone_powershell_argv(script))?,
@@ -697,10 +702,10 @@ pub fn explicit_compilation_inputs(selection: &str, launch_command: &[String]) -
     let commands = serde_json::from_str::<Vec<Vec<String>>>(selection).ok()?;
     let [command] = commands.as_slice() else { return None; };
     let (program, args) = command.split_first()?;
-    let binary = program.rsplit(['/', '\\']).next()?.trim_end_matches(".exe");
+    let binary = literal_program_name(program)?;
     let actual = literal_compilation_launch(launch_command, 0)?;
     let (actual_program, actual_args) = actual.split_first()?;
-    if !actual_program.rsplit(['/', '\\']).next()?.trim_end_matches(".exe").eq_ignore_ascii_case(binary)
+    if !literal_program_name(actual_program)?.eq_ignore_ascii_case(binary)
         || actual_args != args { return None; }
     let paths = if binary == "node" {
         match args {
@@ -743,7 +748,7 @@ pub fn explicit_compilation_inputs(selection: &str, launch_command: &[String]) -
 pub fn compilation_cargo_cwd(command: &[String], cwd: &std::path::Path) -> Option<std::path::PathBuf> {
     let command = literal_compilation_launch(command, 0)?;
     let (program, args) = command.split_first()?;
-    let binary = program.rsplit(['/', '\\']).next()?.trim_end_matches(".exe").to_ascii_lowercase();
+    let binary = literal_program_name(program)?.to_ascii_lowercase();
     if binary == "cargo" { return Some(cwd.to_path_buf()); }
     let runners = repository_runners(cwd);
     let owner = runners.iter().find(|runner| runner.admission_runner.as_deref() == Some("rust_build_status")

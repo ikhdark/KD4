@@ -219,7 +219,11 @@ fn append_convertible_hook_groups(
             let hooks = group.get("hooks").and_then(JsonValue::as_array).ok_or_else(|| invalid_data_error("hook group requires a hooks array"))?;
             for hook in hooks {
                 let hook = hook.as_object().ok_or_else(|| invalid_data_error("hook must be an object"))?;
-                if hook.get("type").and_then(JsonValue::as_str).unwrap_or("command") != "command" {
+                let handler_type = match hook.get("type") {
+                    None => "command",
+                    Some(value) => value.as_str().ok_or_else(|| invalid_data_error("hook type must be a string"))?,
+                };
+                if handler_type != "command" {
                     return Err(io::Error::new(io::ErrorKind::Unsupported, format!("hook event {event_name:?} uses a non-command handler")));
                 }
                 if let Some(key) = hook.keys().find(|key| !matches!(key.as_str(), "type" | "command" | "timeout" | "timeoutSec" | "statusMessage" | "async")) {
@@ -652,11 +656,18 @@ fn parse_frontmatter(
 
     let mut frontmatter = BTreeMap::new();
     for (key, value) in mapping {
-        let key = key.trim();
-        if key.is_empty() {
+        let Some(key) = key.as_str().map(str::trim).filter(|key| !key.is_empty()) else {
             continue;
+        };
+        if frontmatter
+            .insert(key.to_string(), frontmatter_value_from_yaml(value))
+            .is_some()
+        {
+            return (
+                BTreeMap::new(),
+                Some(format!("duplicate frontmatter key {key:?}")),
+            );
         }
-        frontmatter.insert(key.to_string(), frontmatter_value_from_yaml(value));
     }
 
     (frontmatter, None)

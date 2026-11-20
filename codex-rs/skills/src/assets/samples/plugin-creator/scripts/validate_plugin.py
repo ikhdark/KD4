@@ -18,7 +18,8 @@ SEMVER_RE = re.compile(
     r"(0|[1-9]\d*)"
     r"(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\."
     r"(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?"
-    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$",
+    re.ASCII,
 )
 HEX_COLOR_RE = re.compile(r"^#[0-9A-F]{6}$", re.IGNORECASE)
 
@@ -59,7 +60,7 @@ def load_json_object(path: Path, errors: list[str]) -> dict[str, Any] | None:
         return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         errors.append("unable to read `.codex-plugin/plugin.json`")
         return None
     except json.JSONDecodeError:
@@ -276,11 +277,21 @@ def validate_optional_https_url(
     value = payload.get(key)
     if value is None:
         return
-    parsed = urlparse(value) if isinstance(value, str) else None
-    if parsed is None or parsed.scheme != "https" or not parsed.netloc:
-        errors.append(
-            f"plugin.json field `{prefix}.{key}` must be an absolute `https://` URL"
+    try:
+        parsed = (
+            urlparse(value) if isinstance(value, str)
+            and not any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in value)
+            else None
         )
+        if parsed is not None and parsed.scheme == "https" and parsed.hostname and "\\" not in parsed.netloc:
+            # urllib defers port validation until it is accessed.
+            _ = parsed.port
+            return
+    except ValueError:
+        pass
+    errors.append(
+        f"plugin.json field `{prefix}.{key}` must be an absolute `https://` URL"
+    )
 
 
 def validate_optional_contract_path(
@@ -401,7 +412,7 @@ def load_companion_json_object(
         return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         errors.append(f"{label} must contain valid JSON")
         return None
     if not isinstance(payload, dict):
@@ -439,19 +450,19 @@ def validate_skill_manifest(skill_root: Path, errors: list[str]) -> None:
         errors.append(f"skill `{skill_root.name}` is missing `SKILL.md`")
         return
     try:
-        contents = skill_md_path.read_text(encoding="utf-8")
-    except OSError:
+        lines = skill_md_path.read_text(encoding="utf-8-sig").split("\n")
+    except (OSError, UnicodeDecodeError):
         errors.append(f"unable to read skill `{skill_root.name}`")
         return
-    if not contents.startswith("---\n"):
+    if lines[0].strip() != "---":
         errors.append(f"skill `{skill_root.name}` must start with YAML frontmatter")
         return
-    frontmatter_end = contents.find("\n---", 4)
-    if frontmatter_end == -1:
-        errors.append(f"skill `{skill_root.name}` frontmatter is not closed")
+    frontmatter_end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), 0)
+    if frontmatter_end < 2:
+        errors.append(f"skill `{skill_root.name}` frontmatter is empty or not closed")
         return
     try:
-        frontmatter = yaml.safe_load(contents[4:frontmatter_end])
+        frontmatter = yaml.safe_load("\n".join(lines[1:frontmatter_end]))
     except yaml.YAMLError:
         errors.append(f"skill `{skill_root.name}` frontmatter must be valid YAML")
         return
@@ -496,7 +507,7 @@ def validate_skill_agent_manifest(
 
     try:
         payload = yaml.safe_load(agent_yaml_path.read_text(encoding="utf-8"))
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         errors.append(f"unable to read skill `{skill_root.name}` agent YAML")
         return
     except yaml.YAMLError:
@@ -610,7 +621,7 @@ def reject_skill_agent_unknown_fields(
     *,
     prefix: str | None = None,
 ) -> None:
-    for key in sorted(set(payload) - allowed_keys):
+    for key in sorted(str(key) for key in set(payload) - allowed_keys):
         field = f"{prefix}.{key}" if prefix is not None else key
         errors.append(
             f"skill `{skill_root.name}` agent field `{field}` is not accepted by plugin validation"

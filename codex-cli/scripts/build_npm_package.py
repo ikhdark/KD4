@@ -447,9 +447,11 @@ def copy_native_binaries(
 
 def run_npm_pack(staging_dir: Path, output_path: Path) -> Path:
     output_path = output_path.resolve()
+    if output_path.exists() and not output_path.is_file():
+        raise RuntimeError(f"npm pack output must be a file: {output_path}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with tempfile.TemporaryDirectory(prefix="codex-npm-pack-") as pack_dir_str:
+    with tempfile.TemporaryDirectory(prefix="codex-npm-pack-", dir=output_path.parent) as pack_dir_str:
         pack_dir = Path(pack_dir_str)
         npm_cache_dir = pack_dir / "npm-cache"
         npm_logs_dir = pack_dir / "npm-logs"
@@ -486,9 +488,8 @@ def run_npm_pack(staging_dir: Path, output_path: Path) -> Path:
         if not tarball_path.exists():
             raise RuntimeError(f"Expected npm pack output not found: {tarball_path}")
 
-        shutil.move(str(tarball_path), output_path)
-
-    smoke_test_npm_tarball(output_path)
+        smoke_test_npm_tarball(tarball_path)
+        tarball_path.replace(output_path)
     return output_path
 
 

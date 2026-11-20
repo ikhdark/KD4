@@ -805,7 +805,10 @@ impl LocalAgentTaskStore {
                     return Err(error);
                 }
             };
-            std::fs::rename(&writing_path, &staging_path)?;
+            if let Err(error) = std::fs::rename(&writing_path, &staging_path) {
+                let _ = std::fs::remove_file(&writing_path);
+                return Err(error.into());
+            }
             std::fs::rename(&staging_path, &capsule_path)?;
             tokio::runtime::Handle::current().block_on(async move {
                 sqlx::query("UPDATE assignments SET body_json = json_set(body_json, '$.task_capsule', ?) WHERE assignment_id = ?")
@@ -2948,7 +2951,12 @@ LIMIT 1
                 // payload damage. Never erase it or certify that task as read.
                 // Database failures still invalidate the initialization.
                 if matches!(error, StoreError::Io(_)) && !invalid_payload {
-                    tracing::warn!(path = %path.display(), %error, "inaccessible task capsule retained; its assignment remains unavailable");
+                    if is_stage && published_path.is_none() {
+                        tracing::warn!(path = %path.display(), %error, "inaccessible staged task capsule retained; stage recovery is incomplete");
+                    } else {
+                        let retained = published_path.as_ref().unwrap_or(&path);
+                        tracing::warn!(path = %retained.display(), %error, "inaccessible task capsule retained; its assignment remains unavailable");
+                    }
                     continue;
                 }
                 if !invalid_payload {

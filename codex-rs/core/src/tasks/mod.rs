@@ -613,7 +613,6 @@ impl Session {
             Arc::clone(&turn_context.tool_call_acceptance),
         );
 
-        turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start.clone();
         let reservation_is_current = self
             .input_queue
             .transfer_pending_input_to_turn_state(&self.active_turn, &turn_state)

@@ -280,6 +280,12 @@ def _install_runtime_package(
     ]
     if install_target is not None:
         install_target.mkdir(parents=True, exist_ok=True)
+        package_dir = install_target / "codex_cli_bin"
+        distribution = PACKAGE_NAME.replace("-", "_")
+        if os.path.lexists(package_dir) or any(
+            install_target.glob(f"{distribution}-*.dist-info")
+        ):
+            raise RuntimeSetupError(f"{PACKAGE_NAME} already occupies {install_target}")
         args.extend(["--target", str(install_target)])
     args.append(str(staged_runtime_dir))
     try:

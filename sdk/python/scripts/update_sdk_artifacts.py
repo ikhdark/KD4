@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -21,6 +22,7 @@ from typing import Any, Sequence, get_args, get_origin
 SDK_DISTRIBUTION_NAME = "openai-codex"
 RUNTIME_DISTRIBUTION_NAME = "openai-codex-cli-bin"
 RUNTIME_PACKAGE_ROOT = Path("src") / "codex_cli_bin"
+STAGE_MARKER = ".codex-python-stage"
 CODEX_PACKAGE_METADATA = "codex-package.json"
 GENERATED_PACKAGE_INIT = '"""Auto-generated Python types derived from the app-server schemas."""\n'
 _generation_root: ContextVar[Path | None] = ContextVar("generation_root", default=None)
@@ -52,11 +54,22 @@ def _remove_owned_path(path: Path) -> None:
         path.unlink(missing_ok=True)
 
 
+def _report_rollback_error(error: BaseException, detail: str) -> None:
+    add_note = getattr(error, "add_note", None)
+    if add_note is not None:
+        add_note(detail)
+    else:
+        try:
+            print(detail, file=sys.stderr)
+        except (OSError, ValueError):
+            # Secondary reporting must not prevent the remaining restores.
+            pass
+
+
 def _publish_staged_paths(pairs: list[tuple[Path, Path]]) -> None:
     """Publish one owned set, restoring all prior paths on errors/cancellation."""
     backups: list[tuple[Path, Path, bool]] = []
     installed: list[Path] = []
-    committed = False
     try:
         for staged, destination in pairs:
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -70,20 +83,24 @@ def _publish_staged_paths(pairs: list[tuple[Path, Path]]) -> None:
                 os.replace(destination, backup / "old")
             installed.append(destination)
             os.replace(staged, destination)
-        committed = True
-    except BaseException:
-        committed = False
+    except BaseException as error:
         for destination, backup, existed in reversed(backups):
-            if destination in installed and (os.path.lexists(backup / "old") or not existed):
-                _remove_owned_path(destination)
-            if os.path.lexists(backup / "old"):
-                os.replace(backup / "old", destination)
+            try:
+                if destination in installed and (os.path.lexists(backup / "old") or not existed):
+                    _remove_owned_path(destination)
+                if os.path.lexists(backup / "old"):
+                    os.replace(backup / "old", destination)
+            except OSError as restore_error:
+                _report_rollback_error(error, f"Could not restore {destination}; backup directory {backup}: {restore_error}")
+            try:
+                if not os.path.lexists(backup / "old"):
+                    shutil.rmtree(backup)
+            except OSError as cleanup_error:
+                _report_rollback_error(error, f"Could not clean backup directory {backup}: {cleanup_error}")
         raise
-    finally:
+    else:
         for _, backup, _ in backups:
-            # Never erase the sole recoverable copy if restoration failed.
-            if committed or not os.path.lexists(backup / "old"):
-                shutil.rmtree(backup)
+            shutil.rmtree(backup)
 
 
 def app_server_schema_dir() -> Path:
@@ -133,6 +150,23 @@ def _validate_staging_destination(src: Path, dst: Path) -> None:
     destination = dst.resolve()
     if source == destination or source in destination.parents or destination in source.parents:
         raise ValueError(f"staging source and destination overlap: {src} -> {dst}")
+
+
+def _require_owned_stage(destination: Path, distribution: str) -> None:
+    if not os.path.lexists(destination):
+        return
+    info = destination.lstat()
+    indirect = stat.S_ISLNK(info.st_mode) or (
+        getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    )
+    if stat.S_ISDIR(info.st_mode) and not indirect:
+        if not any(destination.iterdir()):
+            return
+        marker = destination / STAGE_MARKER
+        if not marker.is_symlink() and marker.is_file():
+            if marker.read_text(encoding="utf-8").strip() == distribution:
+                return
+    raise ValueError(f"refusing to replace an unowned Python package stage: {destination}")
 
 
 def _copy_package_tree(src: Path, dst: Path) -> None:
@@ -229,19 +263,39 @@ def stage_python_sdk_package(
     staging_dir: Path,
     sdk_version: str,
     runtime_version: str,
+    *,
+    regenerate: bool = False,
 ) -> Path:
+    source = sdk_root()
+    _validate_staging_destination(source, staging_dir)
     package_version = normalize_codex_version(sdk_version)
-    _copy_package_tree(sdk_root(), staging_dir)
-    sdk_bin_dir = staging_dir / "src" / "openai_codex" / "bin"
-    if sdk_bin_dir.exists():
-        shutil.rmtree(sdk_bin_dir)
+    runtime_version = normalize_codex_version(runtime_version)
+    destination = staging_dir.absolute()
+    with (
+        _repository_lock(destination.with_name(f".{destination.name}.lock"), "Python SDK stage"),
+        tempfile.TemporaryDirectory(dir=destination.parent) as td,
+    ):
+        _require_owned_stage(destination, SDK_DISTRIBUTION_NAME)
+        private_stage = Path(td) / "sdk"
+        _copy_package_tree(source, private_stage)
+        sdk_bin_dir = private_stage / "src" / "openai_codex" / "bin"
+        if sdk_bin_dir.exists():
+            shutil.rmtree(sdk_bin_dir)
 
-    pyproject_path = staging_dir / "pyproject.toml"
-    pyproject_text = pyproject_path.read_text()
-    pyproject_text = _rewrite_project_name(pyproject_text, SDK_DISTRIBUTION_NAME)
-    pyproject_text = _rewrite_project_version(pyproject_text, package_version)
-    pyproject_text = _rewrite_runtime_dependency(pyproject_text, runtime_version)
-    pyproject_path.write_text(pyproject_text)
+        pyproject_path = private_stage / "pyproject.toml"
+        pyproject_text = pyproject_path.read_text()
+        pyproject_text = _rewrite_project_name(pyproject_text, SDK_DISTRIBUTION_NAME)
+        pyproject_text = _rewrite_project_version(pyproject_text, package_version)
+        pyproject_text = _rewrite_runtime_dependency(pyproject_text, runtime_version)
+        pyproject_path.write_text(pyproject_text)
+        if regenerate:
+            token = _generation_root.set(private_stage)
+            try:
+                generate_types()
+            finally:
+                _generation_root.reset(token)
+        (private_stage / STAGE_MARKER).write_text(f"{SDK_DISTRIBUTION_NAME}\n", encoding="utf-8")
+        _publish_staged_paths([(private_stage, destination)])
     return staging_dir
 
 
@@ -262,6 +316,7 @@ def stage_python_runtime_package(
         ),
         tempfile.TemporaryDirectory(dir=staging_dir.parent) as td,
     ):
+        _require_owned_stage(staging_dir, RUNTIME_DISTRIBUTION_NAME)
         private_stage = Path(td) / "runtime"
         _copy_package_tree(python_runtime_root(), private_stage)
         pyproject_path = private_stage / "pyproject.toml"
@@ -292,13 +347,14 @@ def stage_python_runtime_package(
         from scripts.codex_package.layout import validate_package_dir
         from scripts.codex_package.targets import PACKAGE_VARIANTS, TARGET_SPECS
 
-        validate_package_dir(native, PACKAGE_VARIANTS["codex"], TARGET_SPECS[targets[platform_tag]])
         _require_codex_package_version(native, package_archive, package_version)
+        validate_package_dir(native, PACKAGE_VARIANTS["codex"], TARGET_SPECS[targets[platform_tag]])
         runtime_package_root = staged_runtime_package_root(private_stage)
         for source in native.iterdir():
             if (runtime_package_root / source.name).exists():
                 raise RuntimeError(f"Native package collides with Python wrapper: {source.name}")
             os.replace(source, runtime_package_root / source.name)
+        (private_stage / STAGE_MARKER).write_text(f"{RUNTIME_DISTRIBUTION_NAME}\n", encoding="utf-8")
         _publish_staged_paths([(private_stage, staging_dir)])
     return requested_staging_dir
 
@@ -1496,8 +1552,8 @@ def _render_thread_block(
         *_approval_mode_model_arg_lines(),
         *_model_arg_lines(turn_fields),
         "        )",
-        "        turn = self._client.turn_start(self.id, wire_input, params=params)",
-        "        return TurnHandle(self._client, self.id, turn.turn.id)",
+        "        turn, origin = self._client._turn_start_owned(self.id, wire_input, params=params)",
+        "        return TurnHandle(self._client, self.id, turn.turn.id, _origin=origin)",
     ]
     return "\n".join(lines)
 
@@ -1523,12 +1579,12 @@ def _render_async_thread_block(
         *_approval_mode_model_arg_lines(),
         *_model_arg_lines(turn_fields),
         "        )",
-        "        turn = await self._codex._client.turn_start(",
+        "        turn, origin = await self._codex._client._turn_start_owned(",
         "            self.id,",
         "            wire_input,",
         "            params=params,",
         "        )",
-        "        return AsyncTurnHandle(self._codex, self.id, turn.turn.id)",
+        "        return AsyncTurnHandle(self._codex, self.id, turn.turn.id, _origin=origin)",
     ]
     return "\n".join(lines)
 
@@ -1790,12 +1846,8 @@ def run_command(args: argparse.Namespace) -> None:
     if args.command == "generate-types":
         generate_types()
     elif args.command == "stage-sdk":
-        _validate_staging_destination(sdk_root(), args.staging_dir)
-        generate_types()
         stage_python_sdk_package(
-            args.staging_dir,
-            normalize_codex_version(args.sdk_version),
-            normalize_codex_version(args.codex_version),
+            args.staging_dir, args.sdk_version, args.codex_version, regenerate=True,
         )
     elif args.command == "stage-runtime":
         _validate_staging_destination(python_runtime_root(), args.staging_dir)

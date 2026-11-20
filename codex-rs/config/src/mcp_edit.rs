@@ -332,6 +332,9 @@ pub fn serialize_mcp_server_for_edit(config: &McpServerConfig, existing: Option<
         if before.get(&key).map(ToString::to_string) == after.get(&key).map(ToString::to_string) {
             continue;
         }
+        if key == "startup_timeout_sec" {
+            table.remove("startup_timeout_ms");
+        }
         if let Some(replacement) = after.get(&key) {
             table.insert(&key, replacement.clone());
         } else {

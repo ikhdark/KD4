@@ -235,28 +235,12 @@ function Initialize-CargoLanesRoot {
         [string]$LanesRoot
     )
 
-    if (Test-CargoLanesRootReparsePoint -LanesRoot $LanesRoot) {
-        throw "Cargo lanes root must not be a reparse point or junction: $LanesRoot"
+    # Share root admission and its initialization lock with the Python owner.
+    $python = Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    & $python.Source -X utf8 -I -B (Join-Path $PSScriptRoot "rust_build_status.py") initialize-lanes --repo-root $RepoRoot --lanes-root $LanesRoot
+    if ($LASTEXITCODE -ne 0) {
+        throw "Cargo lanes root initialization failed: $LanesRoot"
     }
-
-    if (Test-CargoLanesRootMarker -LanesRoot $LanesRoot) {
-        return
-    }
-
-    $defaultLanesRoot = Join-Path $RepoRoot "codex-rs\target\lanes"
-    $isDefaultRoot = (Get-NormalizedCargoLanePath $LanesRoot) -ieq (Get-NormalizedCargoLanePath $defaultLanesRoot)
-    if (-not (Test-Path -LiteralPath $LanesRoot -PathType Container)) {
-        New-Item -ItemType Directory -Force -Path $LanesRoot | Out-Null
-    }
-    elseif (-not $isDefaultRoot) {
-        $existingEntries = @(Get-ChildItem -LiteralPath $LanesRoot -Force -ErrorAction Stop)
-        if ($existingEntries.Count -gt 0) {
-            return
-        }
-    }
-
-    $markerPath = Join-Path $LanesRoot $CargoLanesRootMarkerName
-    [IO.File]::WriteAllText($markerPath, "$CargoLanesRootMarkerContent`n")
 }
 
 function Test-SccacheWrapper {
@@ -692,8 +676,15 @@ function Get-CargoLaneLastUsed {
 function Test-CargoLaneWarm {
     param([string]$Target)
     if (-not (Test-Path -LiteralPath $Target -PathType Container)) { return $false }
-    foreach ($profile in @(Get-ChildItem -LiteralPath $Target -Directory -ErrorAction Stop)) {
-        if (($profile.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+    $direct = @(Get-ChildItem -LiteralPath $Target -Directory -ErrorAction Stop | Where-Object {
+        ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0
+    })
+    $nested = @(foreach ($entry in $direct) {
+        Get-ChildItem -LiteralPath $entry.FullName -Directory -ErrorAction SilentlyContinue | Where-Object {
+            ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0
+        }
+    })
+    foreach ($profile in ($direct + $nested)) {
         if ((Test-Path -LiteralPath (Join-Path $profile.FullName ".fingerprint") -PathType Container) -and
             (Test-Path -LiteralPath (Join-Path $profile.FullName "deps") -PathType Container) -and
             ((Test-Path -LiteralPath (Join-Path $profile.FullName "build") -PathType Container) -or

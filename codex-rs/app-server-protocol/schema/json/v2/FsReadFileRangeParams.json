@@ -1,0 +1,46 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AbsolutePathBuf": {
+      "description": "A path that is guaranteed to be absolute and normalized (though it is not guaranteed to be canonicalized or exist on the filesystem).\n\nIMPORTANT: When deserializing an `AbsolutePathBuf`, a base path must be set using [AbsolutePathBufGuard::new]. If no base path is set, the deserialization will fail unless the path being deserialized is already absolute.",
+      "type": "string"
+    }
+  },
+  "description": "Read a bounded byte range without transferring the rest of a file.",
+  "properties": {
+    "expectedRevision": {
+      "description": "Refuse a file revision different from a preceding range response.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "len": {
+      "description": "Maximum bytes to return; must not exceed 64 KiB.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "path": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        }
+      ],
+      "description": "Absolute path to read."
+    },
+    "start": {
+      "description": "Zero-based starting byte offset.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "len",
+    "path",
+    "start"
+  ],
+  "title": "FsReadFileRangeParams",
+  "type": "object"
+}

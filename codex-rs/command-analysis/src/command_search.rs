@@ -52,28 +52,30 @@ fn search_state_paths(
     targets: &[PathBuf],
     explicit_input_files: &[PathBuf],
     repository_root: &Path,
+    unresolved_inputs: &mut Vec<&'static str>,
 ) -> Vec<PathBuf> {
     let mut paths = targets.to_vec();
     paths.extend(explicit_input_files.iter().cloned());
     let git_entry = repository_root.join(".git");
-    // A linked worktree's .git file names its private metadata directory;
-    // info/exclude belongs to the shared directory named by commondir.
-    let git_dir = if git_entry.is_file() {
-        paths.push(git_entry.clone());
-        std::fs::read_to_string(&git_entry)
-            .ok()
-            .and_then(|text| text.trim().strip_prefix("gitdir: ").map(str::to_owned))
-            .map(|path| repository_root.join(path))
-            .unwrap_or_else(|| git_entry.clone())
-    } else {
-        git_entry
-    };
-    let common_dir_file = git_dir.join("commondir");
-    paths.push(common_dir_file.clone());
-    let common_dir = std::fs::read_to_string(common_dir_file)
-        .map(|path| git_dir.join(path.trim()))
-        .unwrap_or(git_dir);
-    paths.push(common_dir.join("info").join("exclude"));
+    // A linked worktree's info/exclude belongs to the shared Git directory.
+    // Unreadable repository metadata cannot certify a complete search scope.
+    match crate::git_dirs::git_directories_at(repository_root) {
+        Ok(Some((git_dir, common_dir))) => {
+            if git_dir != git_entry {
+                paths.push(git_entry);
+            }
+            paths.push(git_dir.join("commondir"));
+            paths.push(common_dir.join("info").join("exclude"));
+        }
+        Ok(None) => {
+            paths.push(git_entry.join("commondir"));
+            paths.push(git_entry.join("info").join("exclude"));
+        }
+        Err(_) => {
+            paths.push(git_entry);
+            unresolved_inputs.push("git_ignore_scope");
+        }
+    }
     for target in targets {
         let mut ancestor = if target.is_dir() {
             Some(target.as_path())
@@ -155,7 +157,7 @@ pub fn rg_search_dependency_paths(argv: &[String], cwd: &Path) -> Option<RgSearc
         });
     }
     let root = codex_git_utils::get_git_repo_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
-    let mut paths = search_state_paths(&directories, &inputs, &root);
+    let mut paths = search_state_paths(&directories, &inputs, &root, &mut unresolved_inputs);
     paths.extend(targets);
     paths.sort_unstable();
     paths.dedup();

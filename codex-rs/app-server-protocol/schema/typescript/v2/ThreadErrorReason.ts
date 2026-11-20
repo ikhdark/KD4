@@ -5,4 +5,4 @@
 /**
  * Stable classification for recoverable thread request failures.
  */
-export type ThreadErrorReason = "notFound" | "notLoaded" | "notMaterialized" | "ephemeralTurnsUnavailable";
+export type ThreadErrorReason = "notFound" | "notLoaded" | "notMaterialized" | "ephemeralTurnsUnavailable" | "parentNotLoaded";

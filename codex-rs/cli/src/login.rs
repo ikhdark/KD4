@@ -18,7 +18,7 @@ use codex_login::login_with_access_token;
 use codex_login::login_with_api_key;
 use codex_login::logout_with_revoke;
 use codex_login::run_device_code_login;
-use codex_login::run_login_server;
+use codex_login::run_login_server_async;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_utils_cli::CliConfigOverrides;
@@ -125,7 +125,7 @@ pub async fn login_with_chatgpt(
         auth_keyring_backend_kind,
         auth_route_config,
     );
-    let server = run_login_server(opts)?;
+    let server = run_login_server_async(opts).await?;
 
     print_login_server_start(server.actual_port, &server.auth_url);
 

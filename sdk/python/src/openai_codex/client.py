@@ -1,6 +1,5 @@
 import json
 import logging
-import math
 import os
 import queue
 import re
@@ -151,6 +150,15 @@ def _params_dict(
     raise TypeError(f"Expected generated params model or dict, got {type(params).__name__}")
 
 
+def _thread_identity_payload(
+    thread_id: str, params: V2ThreadResumeParams | V2ThreadForkParams | JsonObject | None
+) -> JsonObject:
+    payload = _params_dict(params)
+    if "threadId" in payload and payload["threadId"] != thread_id:
+        raise ValueError("params.threadId does not match thread_id")
+    return {**payload, "threadId": thread_id}
+
+
 def _installed_codex_path() -> Path:
     try:
         from codex_cli_bin import bundled_codex_path
@@ -264,10 +272,9 @@ class CodexConfig:
             if (
                 not isinstance(value, (int, float))
                 or isinstance(value, bool)
-                or not math.isfinite(value)
-                or value <= 0
+                or not 0 < value <= threading.TIMEOUT_MAX
             ):
-                raise ValueError(f"{name} must be finite and > 0")
+                raise ValueError(f"{name} must be finite and > 0, at most {threading.TIMEOUT_MAX}")
         for name in (
             "max_message_bytes",
             "max_buffered_notifications",
@@ -331,28 +338,37 @@ class CodexClient:
     @contextmanager
     def _operation(
         self, cancelled: threading.Event | None = None, *, control: bool = False,
-        rpc_control: bool = False,
+        rpc_control: bool = False, expected_epoch: int | None = None,
     ) -> Iterator[_Operation]:
         current = getattr(self._operation_local, "current", None)
         if current is not None:
+            if expected_epoch is not None and current.epoch != expected_epoch:
+                raise TransportClosedError("turn handle belongs to a closed Codex process")
             yield current
             return
         slots = self._control_slots if rpc_control else self._operation_slots
         if not control and not slots.acquire(blocking=False):
             raise CodexError("in-flight operation limit exceeded")
-        with self._lifecycle_lock:
-            operation = _Operation(
-                time.monotonic() + self.config.operation_timeout_s,
-                cancelled if cancelled is not None else threading.Event(),
-                self._proc,
-                self._router,
-                self._process_epoch,
-            )
-        self._operation_local.current = operation
         try:
-            yield operation
+            with self._lifecycle_lock:
+                if expected_epoch is not None and (
+                    self._proc is None or self._closing or self._process_epoch != expected_epoch
+                ):
+                    raise TransportClosedError("turn handle belongs to a closed Codex process")
+                operation = _Operation(
+                    time.monotonic() + self.config.operation_timeout_s,
+                    cancelled if cancelled is not None else threading.Event(),
+                    self._proc,
+                    self._router,
+                    self._process_epoch,
+                    generation_bound=expected_epoch is not None,
+                )
+            self._operation_local.current = operation
+            try:
+                yield operation
+            finally:
+                del self._operation_local.current
         finally:
-            del self._operation_local.current
             if not control:
                 slots.release()
 
@@ -698,12 +714,15 @@ class CodexClient:
         params: V2LoginAccountParams | JsonObject,
     ) -> LoginAccountResponse:
         with self._operation() as operation:
-            router = operation.router
+            router = self._bind_start_transport(operation)
+            payload = _params_dict(params)
+            reservation = (router.reserve_start("login")
+                           if payload.get("type") in ("chatgpt", "chatgptDeviceCode") else None)
             router.begin_login_start()
             try:
                 response = self.request(
                     "account/login/start",
-                    _params_dict(params),
+                    payload,
                     response_model=LoginAccountResponse,
                 )
                 response_root = response.root
@@ -711,9 +730,13 @@ class CodexClient:
                     response_root,
                     ChatgptLoginAccountResponse | ChatgptDeviceCodeLoginAccountResponse,
                 ):
-                    router.register_login(response_root.login_id, deadline=operation.deadline)
+                    router.register_login(
+                        response_root.login_id, deadline=operation.deadline, reservation=reservation,
+                    )
                 return response
             finally:
+                if reservation is not None:
+                    router.release_start(reservation)
                 router.end_login_start()
 
     def account_login_cancel(self, login_id: str) -> CancelLoginAccountResponse:
@@ -753,7 +776,7 @@ class CodexClient:
         thread_id: str,
         params: V2ThreadResumeParams | JsonObject | None = None,
     ) -> ThreadResumeResponse:
-        payload = {"threadId": thread_id, **_params_dict(params)}
+        payload = _thread_identity_payload(thread_id, params)
         return self.request("thread/resume", payload, response_model=ThreadResumeResponse)
 
     def thread_list(
@@ -773,7 +796,7 @@ class CodexClient:
         thread_id: str,
         params: V2ThreadForkParams | JsonObject | None = None,
     ) -> ThreadForkResponse:
-        payload = {"threadId": thread_id, **_params_dict(params)}
+        payload = _thread_identity_payload(thread_id, params)
         return self.request("thread/fork", payload, response_model=ThreadForkResponse)
 
     def thread_archive(self, thread_id: str) -> ThreadArchiveResponse:
@@ -925,8 +948,28 @@ class CodexClient:
         params: V2TurnStartParams | JsonObject | None = None,
     ) -> TurnStartResponse:
         """Start a turn and register its notification queue as early as possible."""
+        started, _ = self._turn_start_owned(thread_id, input_items, params)
+        return started
+
+    def _bind_start_transport(self, operation: _Operation) -> MessageRouter:
+        with self._lifecycle_lock:
+            if self._closing or self._proc is None:
+                raise TransportClosedError("Codex process is not running")
+            if operation.proc is not self._proc or operation.epoch != self._process_epoch:
+                raise TransportClosedError("operation belongs to a previous transport")
+            operation.generation_bound = True
+            return operation.router
+
+    def _turn_start_owned(
+        self,
+        thread_id: str,
+        input_items: list[JsonObject] | JsonObject | str,
+        params: V2TurnStartParams | JsonObject | None = None,
+    ) -> tuple[TurnStartResponse, _Operation]:
         with self._thread_start_lock(thread_id):
-            if self._operation_local.current.router.has_goal(thread_id):
+            operation = self._operation_local.current
+            router = self._bind_start_transport(operation)
+            if router.has_goal(thread_id):
                 raise InvalidRequestError(
                     -32600,
                     f"thread has an active goal operation: {thread_id}",
@@ -936,9 +979,13 @@ class CodexClient:
                 "threadId": thread_id,
                 "input": self._normalize_input_items(input_items),
             }
-            started = self.request("turn/start", payload, response_model=TurnStartResponse)
-            self.register_turn_notifications(started.turn.id)
-            return started
+            reservation = router.reserve_start("turn")
+            try:
+                started = self.request("turn/start", payload, response_model=TurnStartResponse)
+                router.register_turn(started.turn.id, reservation=reservation)
+                return started, operation
+            finally:
+                router.release_start(reservation)
 
     @contextmanager
     def _thread_start_lock(self, thread_id: str) -> Iterator[None]:
@@ -1024,10 +1071,12 @@ class CodexClient:
 
     def wait_for_turn_completed(self, turn_id: str) -> TurnCompletedNotification:
         """Block on the routed turn stream until the matching completion arrives."""
-        self.register_turn_notifications(turn_id)
+        operation = getattr(self._operation_local, "current", None)
+        router = operation.router if operation is not None else self._router
+        router.register_turn(turn_id)
         try:
             while True:
-                notification = self.next_turn_notification(turn_id)
+                notification = router.next_turn_notification(turn_id)
                 if (
                     notification.method == "turn/completed"
                     and isinstance(notification.payload, TurnCompletedNotification)
@@ -1035,7 +1084,7 @@ class CodexClient:
                 ):
                     return notification.payload
         finally:
-            self.unregister_turn_notifications(turn_id)
+            router.unregister_turn(turn_id)
 
     def wait_for_login_completed(
         self,
@@ -1065,13 +1114,12 @@ class CodexClient:
         cancel_on_close: bool = False,
     ) -> Iterator[AgentMessageDeltaNotification]:
         """Yield text deltas; failed turns raise, interrupted turns end normally."""
-        started = self.turn_start(thread_id, text, params=params)
+        started, origin = self._turn_start_owned(thread_id, text, params=params)
         turn_id = started.turn.id
-        self.register_turn_notifications(turn_id)
         completed = False
         try:
             while True:
-                notification = self.next_turn_notification(turn_id)
+                notification = origin.router.next_turn_notification(turn_id)
                 if (
                     notification.method == "item/agentMessage/delta"
                     and isinstance(notification.payload, AgentMessageDeltaNotification)
@@ -1090,9 +1138,10 @@ class CodexClient:
         finally:
             try:
                 if cancel_on_close and not completed:
-                    self.turn_interrupt(thread_id, turn_id)
+                    with self._operation(rpc_control=True, expected_epoch=origin.epoch):
+                        self.turn_interrupt(thread_id, turn_id)
             finally:
-                self.unregister_turn_notifications(turn_id)
+                origin.router.unregister_turn(turn_id)
 
     def _coerce_notification(self, method: str, params: object) -> Notification:
         params_dict = params if isinstance(params, dict) else {}

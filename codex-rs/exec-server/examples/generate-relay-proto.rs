@@ -45,7 +45,11 @@ fn normalize_newlines(text: &str) -> String {
 }
 
 fn sync_generated(path: &Path, generated: &[u8], check: bool) -> Result<()> {
-    let current = fs::read(path).ok();
+    let current = match fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).with_context(|| format!("read existing binding {}", path.display())),
+    };
     if current.as_deref() == Some(generated) {
         return Ok(());
     }

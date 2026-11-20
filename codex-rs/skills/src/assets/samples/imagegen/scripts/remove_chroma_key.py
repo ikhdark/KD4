@@ -57,17 +57,17 @@ def _parse_key_color(raw: str) -> Color:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
-    if args.tolerance < 0 or args.tolerance > 255:
+    if not 0 <= args.tolerance <= 255:
         _die("--tolerance must be between 0 and 255.")
-    if args.transparent_threshold < 0 or args.transparent_threshold > 255:
+    if not 0 <= args.transparent_threshold <= 255:
         _die("--transparent-threshold must be between 0 and 255.")
-    if args.opaque_threshold < 0 or args.opaque_threshold > 255:
+    if not 0 <= args.opaque_threshold <= 255:
         _die("--opaque-threshold must be between 0 and 255.")
     if args.soft_matte and args.transparent_threshold >= args.opaque_threshold:
         _die("--transparent-threshold must be lower than --opaque-threshold.")
-    if args.edge_feather < 0 or args.edge_feather > 64:
+    if not 0 <= args.edge_feather <= 64:
         _die("--edge-feather must be between 0 and 64.")
-    if args.edge_contract < 0 or args.edge_contract > 16:
+    if not 0 <= args.edge_contract <= 16:
         _die("--edge-contract must be between 0 and 16.")
 
     src = Path(args.input)
@@ -356,7 +356,12 @@ def _remove_chroma_key(args: argparse.Namespace) -> None:
 
     out.parent.mkdir(parents=True, exist_ok=True)
     output_format = "PNG" if out.suffix.lower() == ".png" else "WEBP"
-    out.write_bytes(_encode_image(rgba, output_format))
+    encoded = _encode_image(rgba, output_format)
+    try:
+        with out.open("wb" if args.force else "xb") as output:
+            output.write(encoded)
+    except FileExistsError:
+        _die(f"Output already exists: {out} (use --force to overwrite)")
 
     print(f"Wrote {out}")
     print(f"Key color: #{key[0]:02x}{key[1]:02x}{key[2]:02x}")

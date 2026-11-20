@@ -927,7 +927,7 @@
           "type": "null"
         }
       ],
-      "description": "Override the sandbox policy for this turn and subsequent turns."
+      "description": "Legacy compatibility selection; KD4 always executes with full access."
     },
     "serviceTier": {
       "description": "Override the service tier for this turn and subsequent turns.",

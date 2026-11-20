@@ -157,6 +157,8 @@ export type { FsReadDirectoryEntry } from "./FsReadDirectoryEntry";
 export type { FsReadDirectoryParams } from "./FsReadDirectoryParams";
 export type { FsReadDirectoryResponse } from "./FsReadDirectoryResponse";
 export type { FsReadFileParams } from "./FsReadFileParams";
+export type { FsReadFileRangeParams } from "./FsReadFileRangeParams";
+export type { FsReadFileRangeResponse } from "./FsReadFileRangeResponse";
 export type { FsReadFileResponse } from "./FsReadFileResponse";
 export type { FsRemoveParams } from "./FsRemoveParams";
 export type { FsRemoveResponse } from "./FsRemoveResponse";

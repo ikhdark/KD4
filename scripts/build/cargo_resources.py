@@ -12,6 +12,7 @@ from ctypes import wintypes as w
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import time
 import uuid
@@ -284,9 +285,10 @@ def budget_command(command, jobs, env):
         jobs = min(jobs, _jobs_value(env["CARGO_BUILD_JOBS"], logical))
     start = 0
     if result and Path(result[0]).stem.lower() == "rustup" and result[1:2] == ["run"]:
-        start = 3
+        start = 4 if result[2:3] == ["--install"] else 3
     if len(result) > start and Path(result[start]).stem.lower() == "cargo":
-        index = _cargo_subcommand_index(result, start_index=start + 1)
+        index = _cargo_subcommand_index(result[start:])
+        index = index + start if index is not None else None
         if index is not None and result[index] in {
             "build", "b", "check", "c", "rustc", "clippy", "doc", "d", "run", "r", "test", "t", "bench",
         }:
@@ -303,8 +305,19 @@ def budget_command(command, jobs, env):
                     jobs = min(jobs, _jobs_value(result[i + 1], logical))
                     i += 2
                     continue
-                if token.startswith("--jobs=") or (token.startswith("-j") and len(token) > 2):
-                    jobs = min(jobs, _jobs_value(token.split("=", 1)[1] if token.startswith("--") else token[2:], logical))
+                cluster = re.fullmatch(r"-([qvr]*)j(.*)", token)
+                if token.startswith("--jobs="):
+                    jobs = min(jobs, _jobs_value(token.split("=", 1)[1], logical))
+                elif cluster is not None:
+                    prefix, count = cluster.groups()
+                    if not count:
+                        i += 1
+                        if i == len(result):
+                            raise ValueError(f"{token} requires a Cargo job count")
+                        count = result[i]
+                    jobs = min(jobs, _jobs_value(count.removeprefix("="), logical))
+                    if prefix:
+                        rebuilt.append(f"-{prefix}")
                 else:
                     rebuilt.append(token)
                 i += 1
@@ -505,6 +518,8 @@ class BuildLease:
     def finish(self, quarantined=False):
         if self.finished:
             return
+        # Lease finalization is single-owner even if its receipt write fails.
+        self.finished = True
         try:
             self.release(quarantined=quarantined)
         finally:
@@ -521,7 +536,6 @@ class BuildLease:
                 record["sampledPeakSystemCommitBytes"] = max(row["system"]["commitBytes"] for row in self.rows)
                 record["sampledMinimumAvailablePhysicalBytes"] = min(row["system"]["availablePhysicalBytes"] for row in self.rows)
             write_json_atomic(self.receipt_path, record, exclusive=True)
-            self.finished = True
 
 
 def _inherited_lease(env):
@@ -556,7 +570,7 @@ def run_build(command, *, cold=True, resource_record=None, lane_wait_ms=0.0, lea
         record.update(status="inherited", jobs=jobs, parentJob=inherited["jobName"], executedCommand=adjusted)
         return run_owned(adjusted, env={**env, "CARGO_BUILD_JOBS": str(jobs)}, **kwargs)
     lease = lease if lease is not None else BuildLease(env, cold, record)
-    quarantine = False
+
     try:
         if lease.handle is None and not lease.acquire(wait=wait):
             raise BuildResourcesBusy("global Cargo resources are busy; command was not executed")
@@ -570,11 +584,22 @@ def run_build(command, *, cold=True, resource_record=None, lane_wait_ms=0.0, lea
         result = run_owned(lease.command, env=env, job_name=lease.job_name,
                            on_job_ready=lease.ready, on_job_stopped=lease.stopped, on_poll=lease.poll, **kwargs)
         record.update(status="complete" if result.returncode == 0 else "failed", exitCode=result.returncode)
-        return result
     except BaseException as error:
         quarantine = isinstance(error, CleanupFailed)
         record.update(status="busy" if isinstance(error, BuildResourcesBusy) else "failed",
                       error=f"{type(error).__name__}: {error}")
+        try:
+            lease.finish(quarantined=quarantine)
+        except OSError as receipt_error:
+            if not quarantine:
+                raise
+            detail = f"Cargo lease finalization failed: {receipt_error}"
+            add_note = getattr(error, "add_note", None)
+            if add_note is not None:
+                add_note(detail)
+            else:
+                print(detail, file=sys.stderr)
         raise
-    finally:
-        lease.finish(quarantined=quarantine)
+    else:
+        lease.finish(quarantined=False)
+        return result

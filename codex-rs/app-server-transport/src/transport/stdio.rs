@@ -3,17 +3,21 @@ use super::ConnectionOrigin;
 use super::TransportEvent;
 use super::enqueue_incoming_message_with_admission;
 use super::next_connection_id;
+use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingMessage;
 use crate::outgoing_message::QueuedOutgoingMessage;
 use codex_app_server_protocol_types::InitializeParams;
 use codex_app_server_protocol_types::JSONRPCMessage;
 use codex_app_server_protocol_types::JSONRPCRequest;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::io::BufRead;
 use std::io::ErrorKind;
 use std::io::Read;
 use std::io::Result as IoResult;
 use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -45,6 +49,25 @@ const STDIO_CONNECTION_RETIRED_METHOD: &str = "transport/stdioConnectionRetired"
 // pipes for a reattaching client, so the router names that connection here
 // before it cancels.
 static OUTPUT_RETIRED_CONNECTION: AtomicU64 = AtomicU64::new(u64::MAX);
+
+// Only live native stdio generations register here. The request handler knows
+// the connection ID, not the transport's reader/writer state.
+static STDIO_REATTACH: LazyLock<Mutex<HashMap<ConnectionId, bool>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+impl ConnectionId {
+    /// Record a successfully initialized native stdio client's reattach opt-in.
+    /// Other transports and already closed generations have no entry to update.
+    pub fn enable_stdio_reattach(self) {
+        if let Some(enabled) = STDIO_REATTACH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&self)
+        {
+            *enabled = true;
+        }
+    }
+}
 
 pub fn note_stdio_output_retirement(connection_id: crate::outgoing_message::ConnectionId) {
     OUTPUT_RETIRED_CONNECTION.store(connection_id.0, Ordering::Release);
@@ -307,12 +330,14 @@ struct OpenStdioConnection {
     cancellation: CancellationToken,
     writer_tx_for_reader: mpsc::Sender<QueuedOutgoingMessage>,
     writer_rx: mpsc::Receiver<QueuedOutgoingMessage>,
+    state: Arc<StdioConnectionState>,
 }
 
 async fn open_stdio_connection(
     transport_event_tx: &mpsc::Sender<TransportEvent>,
 ) -> IoResult<OpenStdioConnection> {
     let connection_id = next_connection_id();
+    let state = Arc::new(StdioConnectionState::register(connection_id));
     let cancellation = CancellationToken::new();
     let (writer_tx, writer_rx) = mpsc::channel::<QueuedOutgoingMessage>(CHANNEL_CAPACITY);
     let writer_tx_for_reader = writer_tx.clone();
@@ -330,24 +355,50 @@ async fn open_stdio_connection(
         cancellation,
         writer_tx_for_reader,
         writer_rx,
+        state,
     })
 }
 
 /// Close publication and reattachment state shared by the two halves of one
 /// stdio connection.
 struct StdioConnectionState {
+    connection_id: ConnectionId,
     closed: AtomicBool,
-    // From the admitted `initialize` request of this connection.
-    reattach_requested: AtomicBool,
     // The peer or the processor is gone, or a frame failed; the pipes are not reused.
     transport_ended: AtomicBool,
 }
 
 impl StdioConnectionState {
-    fn keeps_pipes(&self, connection_id: crate::outgoing_message::ConnectionId) -> bool {
-        self.reattach_requested.load(Ordering::Acquire)
-            && !self.transport_ended.load(Ordering::Acquire)
-            && OUTPUT_RETIRED_CONNECTION.load(Ordering::Acquire) == connection_id.0
+    fn register(connection_id: ConnectionId) -> Self {
+        STDIO_REATTACH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(connection_id, false);
+        Self {
+            connection_id,
+            closed: AtomicBool::new(false),
+            transport_ended: AtomicBool::new(false),
+        }
+    }
+
+    fn keeps_pipes(&self) -> bool {
+        !self.transport_ended.load(Ordering::Acquire)
+            && OUTPUT_RETIRED_CONNECTION.load(Ordering::Acquire) == self.connection_id.0
+            && STDIO_REATTACH
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&self.connection_id)
+                .copied()
+                .unwrap_or_default()
+    }
+}
+
+impl Drop for StdioConnectionState {
+    fn drop(&mut self) {
+        STDIO_REATTACH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.connection_id);
     }
 }
 
@@ -376,12 +427,8 @@ async fn serve_stdio_connections<W>(
             cancellation,
             writer_tx_for_reader,
             writer_rx,
+            state,
         } = connection;
-        let state = Arc::new(StdioConnectionState {
-            closed: AtomicBool::new(false),
-            reattach_requested: AtomicBool::new(false),
-            transport_ended: AtomicBool::new(false),
-        });
         // Aborting this owner must stop both halves, as when they were tracked directly.
         let reader = AbortOnDropHandle::new(spawn_stdio_reader(
             stdin_lines,
@@ -504,16 +551,11 @@ fn spawn_stdio_reader(
                             message,
                         ) => forwarded,
                     };
-                    if admitted && let Some(initialize) = initialize {
-                        state.reattach_requested.store(
-                            initialize
-                                .capabilities
-                                .is_some_and(|capabilities| capabilities.stdio_reattach),
-                            Ordering::Release,
-                        );
-                        if let Some(sender) = initialize_client_name_tx.take() {
-                            let _ = sender.send(initialize.client_info.name);
-                        }
+                    if admitted
+                        && let Some(initialize) = initialize
+                        && let Some(sender) = initialize_client_name_tx.take()
+                    {
+                        let _ = sender.send(initialize.client_info.name);
                     }
                     if !forwarded {
                         state.transport_ended.store(true, Ordering::Release);
@@ -534,7 +576,7 @@ fn spawn_stdio_reader(
             }
         }
 
-        if state.keeps_pipes(connection_id) {
+        if state.keeps_pipes() {
             // The owner publishes this close once the replacement is registered.
             cancellation_for_reader.cancel();
             return StdioReaderEnd {
@@ -711,7 +753,7 @@ where
         // Release blocked router sends before close publication waits on ingress.
         // The processor may itself be waiting for that router to consume output.
         drop(writer_rx);
-        if state.keeps_pipes(connection_id) {
+        if state.keeps_pipes() {
             // The owner publishes this close once the replacement is registered.
             cancellation_for_writer.cancel();
             return Some((stdout, frame_interrupted));

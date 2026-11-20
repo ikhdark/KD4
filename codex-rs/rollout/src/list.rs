@@ -1919,6 +1919,20 @@ pub struct ThreadRolloutInventory {
 
 impl ThreadRolloutInventory {
     pub async fn scan(home: &Path, thread_ids: &[ThreadId]) -> Self {
+        let mut visited = 0;
+        Self::scan_roots(
+            vec![home.join(SESSIONS_SUBDIR), home.join(ARCHIVED_SESSIONS_SUBDIR)],
+            thread_ids,
+            &mut visited,
+        )
+        .await
+    }
+
+    async fn scan_roots(
+        mut stack: Vec<PathBuf>,
+        thread_ids: &[ThreadId],
+        visited: &mut usize,
+    ) -> Self {
         let observed = tracing::enabled!(target: "codex_storage_runtime", tracing::Level::TRACE)
             .then(std::time::Instant::now);
         let requested: HashMap<_, _> = thread_ids.iter().copied()
@@ -1926,8 +1940,6 @@ impl ThreadRolloutInventory {
             .collect();
         let mut inventory = Self { paths: HashMap::new(), enumeration_error: None };
         if requested.is_empty() { return inventory; }
-        let mut stack = vec![home.join(SESSIONS_SUBDIR), home.join(ARCHIVED_SESSIONS_SUBDIR)];
-        let mut visited = 0usize;
         let result = async {
             while let Some(directory) = stack.pop() {
                 let mut entries = match tokio::fs::read_dir(directory).await {
@@ -1936,8 +1948,8 @@ impl ThreadRolloutInventory {
                     Err(error) => return Err(error),
                 };
                 while let Some(entry) = entries.next_entry().await? {
-                    visited += 1;
-                    if visited > 1_000_000 {
+                    *visited += 1;
+                    if *visited > 1_000_000 {
                         return Err(io::Error::other(
                             "rollout enumeration limit exceeded; no mutation performed",
                         ));
@@ -1964,7 +1976,7 @@ impl ThreadRolloutInventory {
         inventory.enumeration_error = result.err();
         if let Some(started) = observed {
             tracing::trace!(target: "codex_storage_runtime", stage = "rollout_inventory",
-                elapsed_us = started.elapsed().as_micros() as u64, visited_entries = visited,
+                elapsed_us = started.elapsed().as_micros() as u64, visited_entries = *visited,
                 requested_ids = requested.len(), matched_ids = inventory.paths.len(),
                 complete = inventory.enumeration_error.is_none());
         }
@@ -1989,6 +2001,69 @@ impl ThreadRolloutInventory {
         paths.dedup();
         Ok(paths)
     }
+}
+
+/// Listing is active-first and can skip individual invalid copies. Mutations
+/// continue to use the strict inventory and its original error ordering.
+pub(crate) async fn find_listed_rollout_relocations(
+    home: &Path,
+    thread_ids: &[ThreadId],
+) -> HashMap<ThreadId, (PathBuf, bool)> {
+    let mut visited = 0;
+    let mut active = ThreadRolloutInventory::scan_roots(
+        vec![home.join(SESSIONS_SUBDIR)],
+        thread_ids,
+        &mut visited,
+    )
+    .await;
+    if !active.is_complete() {
+        return HashMap::new();
+    }
+    let mut located = HashMap::new();
+    let mut remaining = Vec::new();
+    for &id in thread_ids {
+        if let Some(path) = take_listed_rollout_path(&mut active, id).await {
+            located.insert(id, (path, false));
+        } else {
+            remaining.push(id);
+        }
+    }
+    if !remaining.is_empty() {
+        let mut archived = ThreadRolloutInventory::scan_roots(
+            vec![home.join(ARCHIVED_SESSIONS_SUBDIR)],
+            &remaining,
+            &mut visited,
+        )
+        .await;
+        if archived.is_complete() {
+            for id in remaining {
+                if let Some(path) = take_listed_rollout_path(&mut archived, id).await {
+                    located.insert(id, (path, true));
+                }
+            }
+        }
+    }
+    located
+}
+
+async fn take_listed_rollout_path(
+    inventory: &mut ThreadRolloutInventory,
+    id: ThreadId,
+) -> Option<PathBuf> {
+    let mut best: Option<PathBuf> = None;
+    for candidate in inventory.paths.remove(&id).unwrap_or_default() {
+        let Some(path) = compression::existing_rollout_path(&candidate).await else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|current| path < *current)
+            && verified_rollout_thread_id(&path)
+                .await
+                .is_ok_and(|thread_id| thread_id == id)
+        {
+            best = Some(path);
+        }
+    }
+    best
 }
 
 /// Locate every physical rollout copy for one thread, retaining header checks.

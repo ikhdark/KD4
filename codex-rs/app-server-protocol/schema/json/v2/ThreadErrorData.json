@@ -7,7 +7,8 @@
         "notFound",
         "notLoaded",
         "notMaterialized",
-        "ephemeralTurnsUnavailable"
+        "ephemeralTurnsUnavailable",
+        "parentNotLoaded"
       ],
       "type": "string"
     }

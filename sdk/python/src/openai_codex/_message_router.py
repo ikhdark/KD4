@@ -51,11 +51,13 @@ class MessageRouter:
         self._control_waiters: set[str] = set()
         self._login_notifications: dict[str, _NotificationQueue] = {}
         self._pending_login_notifications: dict[str, deque[tuple[Notification, int]]] = {}
-        self._terminal_logins: set[str] = set()
+        self._terminal_logins: dict[str, float] = {}
         self._detached_logins: WeakValueDictionary[str, _NotificationQueue] = WeakValueDictionary()
         self._completed_detached_logins: WeakSet[_NotificationQueue] = WeakSet()
         self._recent_cancelled_logins: OrderedDict[str, _NotificationQueue] = OrderedDict()
         self._login_starts = 0
+        self._start_reservations: dict[object, str] = {}
+        self._speculative_starts: dict[str, dict[str, None]] = {"turn": {}, "login": {}}
         self._turn_notifications: dict[str, _NotificationQueue] = {}
         self._pending_turn_notifications: dict[str, deque[tuple[Notification, int]]] = {}
         self._abandoned_turns: set[str] = set()
@@ -82,7 +84,24 @@ class MessageRouter:
             self._notification_queues.add(notifications)
         return notifications
 
-    def _check_route_capacity(self, kind: str, key: str) -> None:
+    def _tracked_turn_ids(self) -> set[str]:
+        return (
+            self._turn_notifications.keys()
+            | self._pending_turn_notifications.keys()
+            | self._abandoned_turns
+            | self._terminal_turns
+        )
+
+    def _allocated_route_count(self) -> int:
+        logins = self._login_notifications.keys() | self._pending_login_notifications.keys()
+        return (
+            len(self._tracked_turn_ids() - self._speculative_starts["turn"].keys())
+            + len(logins - self._speculative_starts["login"].keys())
+            + len(self._goal_operations)
+            + len(self._start_reservations)
+        )
+
+    def _check_route_capacity(self, kind: str, key: str, *, early: bool = False) -> None:
         if kind == "turn" and (
             key in self._turn_notifications
             or key in self._pending_turn_notifications
@@ -94,15 +113,70 @@ class MessageRouter:
             key in self._login_notifications or key in self._pending_login_notifications
         ):
             return
-        turns = (
-            self._turn_notifications.keys()
-            | self._pending_turn_notifications.keys()
-            | self._abandoned_turns
-            | self._terminal_turns
-        )
-        logins = self._login_notifications.keys() | self._pending_login_notifications.keys()
-        if len(turns) + len(logins) + len(self._goal_operations) >= self._max_routes:
-            raise CodexError("notification route limit exceeded")
+        if self._allocated_route_count() < self._max_routes:
+            return
+        # Quarantine unacknowledged IDs without spending another start's slot.
+        # Their payloads still share the global notification and byte budgets.
+        if early and kind in self._start_reservations.values():
+            speculative = self._speculative_starts[kind]
+            if key in speculative or sum(map(len, self._speculative_starts.values())) < self._max_routes:
+                speculative[key] = None
+                return
+        raise CodexError("notification route limit exceeded")
+
+    def _consume_start(self, token: object | None, key: str | None) -> None:
+        kind = self._start_reservations.pop(token, None)
+        if kind is None:
+            return
+        speculative = self._speculative_starts[kind]
+        speculative.pop(key, None)
+        if kind in self._start_reservations.values():
+            # The remaining acknowledgements still have a chance to claim IDs.
+            return
+        if kind == "turn":
+            # Keep independent low-level turns when they fit after settlement.
+            # If the acknowledged turn has not emitted yet, save its slot.
+            available = self._max_routes - self._allocated_route_count()
+            if key is not None and key not in self._tracked_turn_ids():
+                available -= 1
+            for unclaimed in tuple(speculative)[:max(0, available)]:
+                speculative.pop(unclaimed)
+        for unclaimed in speculative:
+            if kind == "turn":
+                self._discard_pending(self._pending_turn_notifications.pop(unclaimed, deque()))
+                route = self._turn_notifications.pop(unclaimed, None)
+                self._terminal_turns.discard(unclaimed)
+                self._observed_terminal_turns.discard(unclaimed)
+            else:
+                self._discard_pending(self._pending_login_notifications.pop(unclaimed, deque()))
+                route = self._login_notifications.pop(unclaimed, None)
+                self._terminal_logins.pop(unclaimed, None)
+            if route is not None:
+                route.fail(CodexError("unacknowledged notification route was not claimed"))
+        speculative.clear()
+
+    def _promote_start(self, kind: str, key: str, token: object | None) -> None:
+        if token is not None:
+            if self._start_reservations.get(token) != kind:
+                raise CodexError("notification start reservation does not belong to this route")
+            self._consume_start(token, key)
+        elif key in self._speculative_starts[kind]:
+            # An independent waiter cannot spend a slot reserved by a start.
+            self._check_route_capacity("reservation", "")
+            self._speculative_starts[kind].pop(key)
+
+    def reserve_start(self, kind: str) -> object:
+        with self._lock:
+            if self._failure is not None:
+                raise self._failure
+            self._check_route_capacity("reservation", "")
+            token = object()
+            self._start_reservations[token] = kind
+            return token
+
+    def release_start(self, token: object) -> None:
+        with self._lock:
+            self._consume_start(token, None)
 
     def _discard_pending(self, pending: deque[tuple[Notification, int]]) -> None:
         for _, size in pending:
@@ -152,20 +226,27 @@ class MessageRouter:
             raise failure
         return self._global_notifications
 
-    def register_login(self, login_id: str, *, deadline: float | None = None) -> None:
+    def register_login(
+        self, login_id: str, *, deadline: float | None = None, reservation: object | None = None
+    ) -> None:
         """Register a queue for one interactive login attempt."""
 
         login_queue = self._notification_queue(deadline=deadline)
         with self._lock:
+            self._promote_start("login", login_id, reservation)
             detached = self._detached_logins.get(login_id)
             if detached is not None:
                 if self._failure is not None and detached not in self._completed_detached_logins:
                     raise self._failure
                 return
-            if self._failure is not None and login_id not in self._terminal_logins:
-                raise self._failure
             if login_id in self._login_notifications:
                 return
+            completed_at = self._terminal_logins.get(login_id)
+            if completed_at is not None and login_queue.deadline is not None and completed_at >= login_queue.deadline:
+                self._terminal_logins.pop(login_id)
+                self._discard_pending(self._pending_login_notifications.pop(login_id, deque()))
+            if self._failure is not None and login_id not in self._terminal_logins:
+                raise self._failure
             self._check_route_capacity("login", login_id)
             pending = self._pending_login_notifications.pop(login_id, deque())
             for notification, size in pending:
@@ -186,13 +267,14 @@ class MessageRouter:
                 self._login_notifications.get(login_id) or self._detached_logins.get(login_id)
             ):
                 return
+            self._speculative_starts["login"].pop(login_id, None)
             login_queue = self._login_notifications.pop(login_id, None)
             detached = self._detached_logins.pop(login_id, None)
             self._recent_cancelled_logins.pop(login_id, None)
             login_queue = login_queue if login_queue is not None else detached
             if login_queue is not None:
                 self._completed_detached_logins.discard(login_queue)
-            self._terminal_logins.discard(login_id)
+            self._terminal_logins.pop(login_id, None)
             self._discard_pending(self._pending_login_notifications.pop(login_id, deque()))
         if login_queue is not None:
             login_queue.fail(TransportClosedError("login notifications unregistered"))
@@ -213,9 +295,10 @@ class MessageRouter:
             notifications = self._login_notifications.pop(login_id, None)
             if notifications is None:
                 return
+            self._speculative_starts["login"].pop(login_id, None)
             if login_id in self._terminal_logins:
                 self._completed_detached_logins.add(notifications)
-            self._terminal_logins.discard(login_id)
+            self._terminal_logins.pop(login_id, None)
             self._detached_logins[login_id] = notifications
             self._recent_cancelled_logins[login_id] = notifications
             while len(self._recent_cancelled_logins) > self._max_routes:
@@ -230,8 +313,9 @@ class MessageRouter:
             self._login_starts -= 1
             if self._login_starts == 0:
                 for login_id, pending in self._pending_login_notifications.items():
+                    self._speculative_starts["login"].pop(login_id, None)
                     self._discard_pending(pending)
-                    self._terminal_logins.discard(login_id)
+                    self._terminal_logins.pop(login_id, None)
                 self._pending_login_notifications.clear()
 
     def next_login_notification(
@@ -255,13 +339,16 @@ class MessageRouter:
             raise RuntimeError(f"login {login_id!r} is not registered for waiting")
         return login_queue
 
-    def register_turn(self, turn_id: str, *, deadline: float | None = None) -> None:
+    def register_turn(
+        self, turn_id: str, *, deadline: float | None = None, reservation: object | None = None
+    ) -> None:
         """Register a queue for a turn stream and replay early events."""
 
         turn_queue = self._notification_queue(operation_deadline=False, deadline=deadline)
         if deadline is None and self._turn_timeout_s is not None:
             turn_queue.deadline = time.monotonic() + self._turn_timeout_s
         with self._lock:
+            self._promote_start("turn", turn_id, reservation)
             if self._failure is not None and turn_id not in self._terminal_turns:
                 raise self._failure
             if turn_id in self._turn_notifications:
@@ -282,6 +369,17 @@ class MessageRouter:
         """Stop retaining events for a turn that the caller will not consume."""
 
         with self._lock:
+            if turn_id in self._speculative_starts["turn"]:
+                # Retiring an unacknowledged route must not create a new
+                # tombstone that owns another operation's reserved slot.
+                self._speculative_starts["turn"].pop(turn_id)
+                turn_queue = self._turn_notifications.pop(turn_id, None)
+                self._discard_pending(self._pending_turn_notifications.pop(turn_id, deque()))
+                self._terminal_turns.discard(turn_id)
+                self._observed_terminal_turns.discard(turn_id)
+                if turn_queue is not None:
+                    turn_queue.fail(TransportClosedError("turn notifications unregistered"))
+                return
             turn_queue = self._turn_notifications.pop(turn_id, None)
             self._discard_pending(self._pending_turn_notifications.pop(turn_id, deque()))
             if turn_id in self._observed_terminal_turns or turn_id in self._terminal_turns:
@@ -354,26 +452,28 @@ class MessageRouter:
         with self._lock:
             if self._failure is not None:
                 return
-            waiter = self._response_waiters.pop(str(request_id), None)
-            self._control_waiters.discard(str(request_id))
-        if waiter is None:
-            return
+            key = str(request_id)
+            waiter = self._response_waiters.get(key)
+            if waiter is None:
+                return
 
-        if "error" in msg:
-            err = msg["error"]
-            if isinstance(err, dict):
-                waiter.put(
-                    map_jsonrpc_error(
+            if "error" in msg:
+                err = msg["error"]
+                if isinstance(err, dict):
+                    # Keep this waiter registered if decoding fails. The
+                    # reader's fail_all must wake it along with other requests.
+                    result = map_jsonrpc_error(
                         int(err.get("code", -32000)),
                         str(err.get("message", "unknown")),
                         err.get("data"),
                     )
-                )
+                else:
+                    result = CodexError("Malformed JSON-RPC error response")
             else:
-                waiter.put(CodexError("Malformed JSON-RPC error response"))
-            return
-
-        waiter.put(msg.get("result"))
+                result = msg.get("result")
+            self._response_waiters.pop(key)
+            self._control_waiters.discard(key)
+        waiter.put_nowait(result)
 
     def route_notification(self, notification: Notification) -> None:
         """Deliver a notification to a turn queue or the global queue."""
@@ -457,22 +557,22 @@ class MessageRouter:
         elif kind == "goal":
             self._goal_operations[key].fail(exc)
         elif kind == "turn":
-            self._discard_pending(self._pending_turn_notifications.pop(key, deque()))
             notifications = self._turn_notifications.get(key)
             if notifications is None:
-                self._check_route_capacity("turn", key)
+                self._check_route_capacity("turn", key, early=True)
                 notifications = self._notification_queue(operation_deadline=False)
                 self._turn_notifications[key] = notifications
+            self._discard_pending(self._pending_turn_notifications.pop(key, deque()))
             self._terminal_turns.discard(key)
             notifications.fail(exc)
         else:
-            self._discard_pending(self._pending_login_notifications.pop(key, deque()))
             notifications = self._login_notifications.get(key) or self._detached_logins.get(key)
             if notifications is None:
-                self._check_route_capacity("login", key)
+                self._check_route_capacity("login", key, early=True)
                 notifications = self._notification_queue(operation_deadline=False)
                 self._login_notifications[key] = notifications
-            self._terminal_logins.discard(key)
+            self._discard_pending(self._pending_login_notifications.pop(key, deque()))
+            self._terminal_logins.pop(key, None)
             self._completed_detached_logins.discard(notifications)
             notifications.fail(exc)
 
@@ -490,28 +590,27 @@ class MessageRouter:
                 detached = self._detached_logins.get(login_id)
                 if login_queue is None:
                     login_queue = detached
+                terminal = isinstance(notification.payload, AccountLoginCompletedNotification)
+                completed_at = time.monotonic() if terminal else None
                 if login_queue is None:
                     # Unknown IDs can be early only while login/start is in flight.
                     # A late completion for a discarded attempt must not recreate a route.
                     if self._login_starts == 0:
                         return
                     if login_id not in self._pending_login_notifications:
-                        self._check_route_capacity("login", login_id)
+                        self._check_route_capacity("login", login_id, early=True)
                     size = self._budget.reserve(notification)
                     self._pending_login_notifications.setdefault(login_id, deque()).append(
                         (notification, size)
                     )
-                else:
-                    if not login_queue.put(notification):
-                        return
-                # Only validated completions admitted to the byte budget are terminal.
-                if isinstance(notification.payload, AccountLoginCompletedNotification):
-                    if login_queue is not None:
-                        login_queue.deadline = None
+                elif not login_queue.put(notification, terminal=terminal):
+                    return
+                # Only timely, validated completions admitted to the budget are terminal.
+                if completed_at is not None:
                     if detached is not None:
                         self._completed_detached_logins.add(detached)
                     else:
-                        self._terminal_logins.add(login_id)
+                        self._terminal_logins.setdefault(login_id, completed_at)
             return
 
         turn_id = self._notification_turn_id(notification)
@@ -541,11 +640,11 @@ class MessageRouter:
                 return
             turn_queue = self._turn_notifications.get(turn_id)
             if notification.method == "turn/completed":
-                self._check_route_capacity("turn", turn_id)
+                self._check_route_capacity("turn", turn_id, early=True)
                 self._observed_terminal_turns.add(turn_id)
             if turn_queue is None:
                 if turn_id not in self._pending_turn_notifications:
-                    self._check_route_capacity("turn", turn_id)
+                    self._check_route_capacity("turn", turn_id, early=True)
                 size = self._budget.reserve(notification)
                 self._pending_turn_notifications.setdefault(turn_id, deque()).append(
                     (notification, size)

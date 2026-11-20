@@ -5943,6 +5943,7 @@
     "TurnValidationUncertainty": {
       "properties": {
         "captureIncomplete": {
+          "description": "True only for observed capture loss; false is not proof of full capture.",
           "type": "boolean"
         },
         "failedChecks": {
@@ -5952,6 +5953,7 @@
           "type": "array"
         },
         "pendingChecks": {
+          "description": "Checks with no terminal observation at settlement, not live operations.",
           "items": {
             "type": "string"
           },

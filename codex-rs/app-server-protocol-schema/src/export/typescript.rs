@@ -94,12 +94,9 @@ pub(super) fn filter_experimental_ts(out_dir: &Path) -> Result<()> {
 /// Removes union arms from a generated request type for methods marked experimental.
 fn filter_request_ts(out_dir: &Path, file_name: &str, experimental_methods: &[&str]) -> Result<()> {
     let path = out_dir.join(file_name);
-    if !path.exists() {
-        return Ok(());
-    }
-    let mut content =
+    let content =
         fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
-    content = filter_request_ts_contents(content, experimental_methods)?;
+    let content = filter_request_ts_contents(content, experimental_methods)?;
 
     fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())

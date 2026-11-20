@@ -69,6 +69,14 @@ pub fn create_update_plan_tool() -> ToolSpec {
         ("explanation".into(), JsonSchema::string(None)),
         ("expected_revision".into(), JsonSchema::string(Some(
             "Revision returned by the last update, required after the plan changed since this sampling step. Rejects stale updates without mutation.".into()))),
+        ("expected_step_revisions".into(), JsonSchema {
+            description: Some("With set and stable step IDs, map each updated step ID to its observed revision to reject stale changes without replacing the checklist.".into()),
+            ..JsonSchema::object(BTreeMap::new(), None, Some(JsonSchema {
+                minimum: Some(0.into()),
+                maximum: Some(u64::MAX.into()),
+                ..JsonSchema::integer(None)
+            }.into()))
+        }),
         ("superseded".into(), JsonSchema::array(JsonSchema::object(BTreeMap::from([
             ("step_id".into(), JsonSchema::string(None)),
             ("reason".into(), JsonSchema::string(None)),

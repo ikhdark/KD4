@@ -68,15 +68,19 @@ class _NotificationQueue:
         self.timeout_s = timeout_s
         self.deadline = time.monotonic() + timeout_s if operation_deadline else None
 
-    def put(self, item: Notification | BaseException) -> bool:
+    def put(self, item: Notification | BaseException, *, terminal: bool = False) -> bool:
         if isinstance(item, BaseException):
             self.fail(item)
             return False
         with self._condition:
             if self._failure is not None:
                 return False  # A route may be unregistered concurrently with delivery.
+            if terminal and self.deadline is not None and time.monotonic() >= self.deadline:
+                return False
             size = self._budget.reserve(item)
             self._items.append((item, size))
+            if terminal:
+                self.deadline = None
             self._condition.notify()
             self._notify_async_locked()
             return True
@@ -99,8 +103,8 @@ class _NotificationQueue:
             self._budget.release(size)
 
     def get(self, timeout: float | None = None) -> Notification:
-        if timeout is not None and timeout < 0:
-            raise ValueError("timeout must be nonnegative")
+        if timeout is not None and not 0 <= timeout <= threading.TIMEOUT_MAX:
+            raise ValueError(f"timeout must be finite and nonnegative, at most {threading.TIMEOUT_MAX}")
         now = time.monotonic()
         deadline = now + (self.timeout_s if timeout is None else timeout)
         with self._condition:

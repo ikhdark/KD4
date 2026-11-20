@@ -88,9 +88,11 @@ fn remove_marketplace_sync(
         )));
     }
 
-    if let Err(err) = ensure_no_other_layer_references(codex_home, &reload_layers()?, &marketplace_name) {
-        // A layer added during the base edit now owns this snapshot. The base
-        // removal succeeded, but dropping the stage must restore the in-use root.
+    if let Err(err) = reload_layers().and_then(|layers| {
+        ensure_no_other_layer_references(codex_home, &layers, &marketplace_name)
+    }) {
+        // A new layer may own the snapshot, or we may be unable to check.
+        // The base removal succeeded, but the staged root must be restored.
         if removed_config {
             return Ok(MarketplaceRemoveOutcome { marketplace_name, removed_installed_root: None });
         }

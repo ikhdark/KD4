@@ -20,15 +20,17 @@ def validate_skill(skill_path):
     if not skill_md.exists():
         return False, "SKILL.md not found"
 
-    content = skill_md.read_text(encoding="utf-8")
-    if not content.startswith("---"):
+    try:
+        lines = skill_md.read_text(encoding="utf-8-sig").split("\n")
+    except (OSError, UnicodeDecodeError) as e:
+        return False, f"Unable to read SKILL.md: {e}"
+    if lines[0].strip() != "---":
         return False, "No YAML frontmatter found"
 
-    match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
-    if not match:
+    end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), 0)
+    if end < 2:
         return False, "Invalid frontmatter format"
-
-    frontmatter_text = match.group(1)
+    frontmatter_text = "\n".join(lines[1:end])
 
     try:
         frontmatter = yaml.safe_load(frontmatter_text)
@@ -42,7 +44,7 @@ def validate_skill(skill_path):
     unexpected_keys = set(frontmatter.keys()) - allowed_properties
     if unexpected_keys:
         allowed = ", ".join(sorted(allowed_properties))
-        unexpected = ", ".join(sorted(unexpected_keys))
+        unexpected = ", ".join(sorted(str(key) for key in unexpected_keys))
         return (
             False,
             f"Unexpected key(s) in SKILL.md frontmatter: {unexpected}. Allowed properties are: {allowed}",

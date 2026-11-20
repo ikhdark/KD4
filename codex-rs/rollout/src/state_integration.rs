@@ -434,12 +434,8 @@ pub async fn list_threads_db(
                 .filter(|(_, existing_path)| existing_path.is_none())
                 .map(|(item, _)| item.id)
                 .collect::<Vec<_>>();
-            let mut relocations = if stale_ids.is_empty() {
-                None
-            } else {
-                Some(crate::list::ThreadRolloutInventory::scan(codex_home, &stale_ids).await)
-            };
-            let archived_root = codex_home.join(crate::ARCHIVED_SESSIONS_SUBDIR);
+            let relocations =
+                crate::list::find_listed_rollout_relocations(codex_home, &stale_ids).await;
             let mut dropped_stale_paths = 0usize;
             let mut stale_sample = Vec::new();
             for (mut item, existing_path) in validated {
@@ -451,31 +447,7 @@ pub async fn list_threads_db(
                 // A rollout may have moved between active/archive directories
                 // without the state row following it. Repair only a verified
                 // file; absence is not permission to delete thread metadata.
-                let located = match relocations.as_mut() {
-                    // An incomplete inventory establishes neither a location nor absence.
-                    Some(inventory) if inventory.is_complete() => {
-                        inventory.take_paths(item.id).await.unwrap_or_default()
-                    }
-                    _ => Vec::new(),
-                };
-                // The inventory returns header-verified copies in path order; an
-                // active copy still wins over an archived one.
-                let (archived_copies, active_copies): (Vec<_>, Vec<_>) = located
-                    .into_iter()
-                    .partition(|path| path.starts_with(&archived_root));
-                let candidate = active_copies
-                    .into_iter()
-                    .next()
-                    .map(|path| (path, false))
-                    .or_else(|| archived_copies.into_iter().next().map(|path| (path, true)));
-                let relocated = match candidate {
-                    Some((path, is_archived)) => {
-                        crate::compression::existing_rollout_path(path.as_path())
-                            .await
-                            .map(|path| (path, is_archived))
-                    }
-                    None => None,
-                };
+                let relocated = relocations.get(&item.id).cloned();
                 if let Some((path, is_archived)) = relocated {
                     codex_state::record_fallback(
                         "find_thread_path",

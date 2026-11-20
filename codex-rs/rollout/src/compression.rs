@@ -612,12 +612,12 @@ fn rollout_write_lock_path(path: &Path) -> PathBuf {
 
 pub(crate) fn materialize_rollout_for_append_locked(path: &Path) -> io::Result<PathBuf> {
     let plain_path = plain_rollout_path(path);
-    if plain_path.exists() {
+    if plain_path.try_exists()? {
         metrics::materialize("plain_exists");
         return Ok(plain_path);
     }
     let compressed_path = path::compressed_rollout_path(plain_path.as_path());
-    if !compressed_path.exists() {
+    if !compressed_path.try_exists()? {
         metrics::materialize("missing");
         return Ok(plain_path);
     }
@@ -1186,7 +1186,7 @@ mod worker {
         started_at: Instant,
         stats: &mut CompressionStats,
     ) -> io::Result<()> {
-        if !tokio::fs::try_exists(root).await.unwrap_or(false) {
+        if !tokio::fs::try_exists(root).await? {
             return Ok(());
         }
         let mut stack = vec![root.to_path_buf()];
@@ -1262,6 +1262,9 @@ mod worker {
                 metrics::file("scanned");
                 while jobs.len() >= MAX_CONCURRENT_COMPRESSION_JOBS {
                     collect_next_compression_job(&mut jobs, stats).await;
+                }
+                if started_at.elapsed() >= WORKER_MAX_RUNTIME {
+                    break;
                 }
                 jobs.spawn_blocking(move || {
                     let started_at = Instant::now();

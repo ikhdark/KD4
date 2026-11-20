@@ -1024,11 +1024,18 @@ impl SessionConfiguration {
             }
             next_configuration.workspace_roots = retargeted_workspace_roots;
         }
-        // Legacy permission selections remain accepted in settings updates,
-        // but cannot reinstate filesystem/network restrictions in KD4.
-        next_configuration.permission_profile_state.set_legacy_permission_profile(
-            PermissionProfile::Disabled,
-        )?;
+        // An explicit permission update still normalizes to full access.
+        // An unrelated settings update retains the already-normalized
+        // profile identity and workspace roots from the current session.
+        if updates.permission_profile.is_some()
+            || updates.sandbox_policy.is_some()
+            || updates.active_permission_profile.is_some()
+            || updates.profile_workspace_roots.is_some()
+        {
+            next_configuration
+                .permission_profile_state
+                .set_legacy_permission_profile(PermissionProfile::Disabled)?;
+        }
         if let Some(app_server_client_name) = updates.app_server_client_name.clone() {
             next_configuration.app_server_client_name = Some(app_server_client_name);
         }

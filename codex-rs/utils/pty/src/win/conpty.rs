@@ -19,6 +19,7 @@
 // SOFTWARE.
 
 use crate::win::psuedocon::PsuedoCon;
+use anyhow::Context;
 use anyhow::Error;
 use filedescriptor::FileDescriptor;
 use filedescriptor::Pipe;
@@ -36,20 +37,21 @@ use winapi::um::wincon::COORD;
 #[derive(Default)]
 pub struct ConPtySystem {}
 
+fn conpty_coord(cols: u16, rows: u16) -> anyhow::Result<COORD> {
+    Ok(COORD {
+        X: i16::try_from(cols).context("ConPTY column count exceeds 32767")?,
+        Y: i16::try_from(rows).context("ConPTY row count exceeds 32767")?,
+    })
+}
+
 fn create_conpty_handles(
     size: PtySize,
 ) -> anyhow::Result<(PsuedoCon, FileDescriptor, FileDescriptor)> {
+    let coord = conpty_coord(size.cols, size.rows)?;
     let stdin = Pipe::new()?;
     let stdout = Pipe::new()?;
 
-    let con = PsuedoCon::new(
-        COORD {
-            X: size.cols as i16,
-            Y: size.rows as i16,
-        },
-        stdin.read,
-        stdout.write,
-    )?;
+    let con = PsuedoCon::new(coord, stdin.read, stdout.write)?;
 
     Ok((con, stdin.write, stdout.read))
 }
@@ -126,10 +128,7 @@ impl Inner {
         pixel_width: u16,
         pixel_height: u16,
     ) -> Result<(), Error> {
-        self.con.resize(COORD {
-            X: num_cols as i16,
-            Y: num_rows as i16,
-        })?;
+        self.con.resize(conpty_coord(num_cols, num_rows)?)?;
         self.size = PtySize {
             rows: num_rows,
             cols: num_cols,

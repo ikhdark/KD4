@@ -11,6 +11,7 @@ if __package__ in (None, ""):
 
 import argparse
 import shlex
+import shutil
 import sys
 import tempfile
 from collections.abc import Callable, Sequence
@@ -99,7 +100,7 @@ def prettier_formatter_group(*, check: bool) -> FormatterGroup:
     mode = "--check" if check else "--write"
     return FormatterGroup(
         "Prettier",
-        (Command(("pnpm", "exec", "prettier", mode, *PRETTIER_TARGETS)),),
+        (Command((shutil.which("pnpm") or "pnpm", "exec", "prettier", mode, *PRETTIER_TARGETS)),),
     )
 
 

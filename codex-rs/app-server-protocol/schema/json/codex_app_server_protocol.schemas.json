@@ -1295,6 +1295,30 @@
             },
             "method": {
               "enum": [
+                "fs/readFileRange"
+              ],
+              "title": "Fs/readFileRangeRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/FsReadFileRangeParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Fs/readFileRangeRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
                 "fs/writeFile"
               ],
               "title": "Fs/writeFileRequestMethod",
@@ -11467,6 +11491,70 @@
         "title": "FsReadFileParams",
         "type": "object"
       },
+      "FsReadFileRangeParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Read a bounded byte range without transferring the rest of a file.",
+        "properties": {
+          "expectedRevision": {
+            "description": "Refuse a file revision different from a preceding range response.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "len": {
+            "description": "Maximum bytes to return; must not exceed 64 KiB.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "path": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/AbsolutePathBuf"
+              }
+            ],
+            "description": "Absolute path to read."
+          },
+          "start": {
+            "description": "Zero-based starting byte offset.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "len",
+          "path",
+          "start"
+        ],
+        "title": "FsReadFileRangeParams",
+        "type": "object"
+      },
+      "FsReadFileRangeResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Bounded contents and the opened file's size and revision.",
+        "properties": {
+          "dataBase64": {
+            "type": "string"
+          },
+          "fileBytes": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "revision": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "dataBase64",
+          "fileBytes",
+          "revision"
+        ],
+        "title": "FsReadFileRangeResponse",
+        "type": "object"
+      },
       "FsReadFileResponse": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Base64-encoded file contents returned by `fs/readFile`.",
@@ -13298,6 +13386,13 @@
               "null"
             ]
           },
+          "loginId": {
+            "description": "Matches the explicit login response; automatic plugin login has no request ID.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "name": {
             "type": "string"
           },
@@ -13305,13 +13400,6 @@
             "type": "boolean"
           },
           "threadId": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "loginId": {
-            "description": "Matches the explicit login response; automatic plugin login has no request ID.",
             "type": [
               "string",
               "null"
@@ -13983,14 +14071,14 @@
             ],
             "description": "Generic worker preferences, independent of the parent model/effort. Older servers omit this metadata; it is not the settings of every child."
           },
-          "subagentSettingsSupported": {
-            "default": false,
-            "description": "Whether thread/settings/update accepts and persists subagentSettings.",
-            "type": "boolean"
-          },
           "subagentServiceTierSupported": {
             "default": false,
             "description": "Whether subagentSettings.serviceTier is independently persisted and applied.",
+            "type": "boolean"
+          },
+          "subagentSettingsSupported": {
+            "default": false,
+            "description": "Whether thread/settings/update accepts and persists subagentSettings.",
             "type": "boolean"
           }
         },
@@ -18420,6 +18508,27 @@
           }
         ]
       },
+      "SubagentDefaults": {
+        "properties": {
+          "model": {
+            "description": "Preferred model before provider-catalog fallback or a per-spawn override.",
+            "type": "string"
+          },
+          "reasoningEffort": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/ReasoningEffort"
+              }
+            ],
+            "description": "Preferred effort before model-capability fallback or a per-spawn override."
+          }
+        },
+        "required": [
+          "model",
+          "reasoningEffort"
+        ],
+        "type": "object"
+      },
       "SubagentMigration": {
         "properties": {
           "name": {
@@ -18428,6 +18537,29 @@
         },
         "required": [
           "name"
+        ],
+        "type": "object"
+      },
+      "SubagentModelSettings": {
+        "description": "Thread-local preferences for future generic workers, not per-spawn locks.",
+        "properties": {
+          "model": {
+            "type": "string"
+          },
+          "reasoningEffort": {
+            "$ref": "#/definitions/v2/ReasoningEffort"
+          },
+          "serviceTier": {
+            "description": "Omit to follow the root's live tier; `default` pins Standard independently.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "model",
+          "reasoningEffort"
         ],
         "type": "object"
       },
@@ -18822,7 +18954,8 @@
           "notFound",
           "notLoaded",
           "notMaterialized",
-          "ephemeralTurnsUnavailable"
+          "ephemeralTurnsUnavailable",
+          "parentNotLoaded"
         ],
         "type": "string"
       },
@@ -20061,7 +20194,7 @@
             "type": "array"
           },
           "nextCursor": {
-            "description": "Opaque cursor to pass to the next call to continue after the last item. if None, there are no more items to return.",
+            "description": "Opaque cursor to continue the listing. Follow a non-null cursor even when a filtered page is short or empty; null means the listing is exhausted.",
             "type": [
               "string",
               "null"
@@ -20741,9 +20874,6 @@
               "null"
             ]
           },
-          "thread": {
-            "$ref": "#/definitions/v2/Thread"
-          },
           "subagentSettings": {
             "anyOf": [
               {
@@ -20753,6 +20883,9 @@
                 "type": "null"
               }
             ]
+          },
+          "thread": {
+            "$ref": "#/definitions/v2/Thread"
           }
         },
         "required": [
@@ -20933,16 +21066,6 @@
               "null"
             ]
           },
-          "summary": {
-            "anyOf": [
-              {
-                "$ref": "#/definitions/v2/ReasoningSummary"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
           "subagentSettings": {
             "anyOf": [
               {
@@ -20953,6 +21076,16 @@
               }
             ],
             "description": "Omitted on older servers; no selection means the SOL/high built-in default."
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ReasoningSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -20986,7 +21119,7 @@
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "command": {
-            "description": "Shell command string evaluated by the thread's configured shell. Unlike `command/exec`, this intentionally preserves shell syntax such as pipes, redirects, and quoting. This runs unsandboxed with full access rather than inheriting the thread sandbox policy.",
+            "description": "Shell command string evaluated by the thread's configured shell. Unlike `command/exec`, this intentionally preserves shell syntax such as pipes, redirects, and quoting. Like other KD4 execution, this runs unsandboxed with full access.",
             "type": "string"
           },
           "threadId": {
@@ -21200,9 +21333,6 @@
               "null"
             ]
           },
-          "thread": {
-            "$ref": "#/definitions/v2/Thread"
-          },
           "subagentSettings": {
             "anyOf": [
               {
@@ -21212,6 +21342,9 @@
                 "type": "null"
               }
             ]
+          },
+          "thread": {
+            "$ref": "#/definitions/v2/Thread"
           }
         },
         "required": [
@@ -22387,7 +22520,7 @@
                 "type": "null"
               }
             ],
-            "description": "Override the sandbox policy for this turn and subsequent turns."
+            "description": "Legacy compatibility selection; KD4 always executes with full access."
           },
           "serviceTier": {
             "description": "Override the service tier for this turn and subsequent turns.",
@@ -25900,6 +26033,7 @@
       "TurnValidationUncertainty": {
         "properties": {
           "captureIncomplete": {
+            "description": "True only for observed capture loss; false is not proof of full capture.",
             "type": "boolean"
           },
           "failedChecks": {
@@ -25909,6 +26043,7 @@
             "type": "array"
           },
           "pendingChecks": {
+            "description": "Checks with no terminal observation at settlement, not live operations.",
             "items": {
               "type": "string"
             },
@@ -26569,50 +26704,6 @@
           "okOverridden"
         ],
         "type": "string"
-      },
-      "SubagentDefaults": {
-        "properties": {
-          "model": {
-            "description": "Preferred model before provider-catalog fallback or a per-spawn override.",
-            "type": "string"
-          },
-          "reasoningEffort": {
-            "allOf": [
-              {
-                "$ref": "#/definitions/v2/ReasoningEffort"
-              }
-            ],
-            "description": "Preferred effort before model-capability fallback or a per-spawn override."
-          }
-        },
-        "required": [
-          "model",
-          "reasoningEffort"
-        ],
-        "type": "object"
-      },
-      "SubagentModelSettings": {
-        "description": "Thread-local preferences for future generic workers, not per-spawn locks.",
-        "properties": {
-          "model": {
-            "type": "string"
-          },
-          "reasoningEffort": {
-            "$ref": "#/definitions/v2/ReasoningEffort"
-          },
-          "serviceTier": {
-            "description": "Omit to follow the root's live tier; `default` pins Standard independently.",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "model",
-          "reasoningEffort"
-        ],
-        "type": "object"
       }
     }
   },

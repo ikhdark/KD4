@@ -102,8 +102,11 @@ def validate_archive_output(
         raise RuntimeError(
             f"Archive output must be outside the package directory: {archive_path}"
         )
-    if archive_path.exists() and not force:
-        raise RuntimeError(f"Archive output already exists: {archive_path}")
+    if archive_path.exists():
+        if not archive_path.is_file():
+            raise RuntimeError(f"Archive output must be a file: {archive_path}")
+        if not force:
+            raise RuntimeError(f"Archive output already exists: {archive_path}")
 
     archive_format = archive_format_for_path(archive_path)
     if compression not in {"default", "fast", "none"}:

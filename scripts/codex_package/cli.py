@@ -362,6 +362,8 @@ class Publication:
             raise RuntimeError(f"unexpected publication destination: {destination}")
         backup = None
         if destination.exists():
+            if not source.is_dir() and not destination.is_file():
+                raise RuntimeError(f"File output must be a file: {destination}")
             if not force and not (
                 destination.is_dir() and not any(destination.iterdir())
             ):
@@ -719,6 +721,8 @@ def write_archives_atomically(
             return
         for archive_path, staged_path, _ in staged:
             if archive_path.exists():
+                if not archive_path.is_file():
+                    raise RuntimeError(f"Archive output must be a file: {archive_path}")
                 if not force:
                     raise RuntimeError(f"Archive output already exists: {archive_path}")
                 backup_path = archive_path.with_name(

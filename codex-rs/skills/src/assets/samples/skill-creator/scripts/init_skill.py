@@ -18,7 +18,7 @@ import re
 import sys
 from pathlib import Path
 
-from generate_openai_yaml import write_openai_yaml
+from generate_openai_yaml import parse_interface_overrides, write_openai_yaml
 
 MAX_SKILL_NAME_LENGTH = 64
 ALLOWED_RESOURCES = {"scripts", "references", "assets"}
@@ -274,6 +274,14 @@ def init_skill(skill_name, path, resources, include_examples, interface_override
     Returns:
         Path to created skill directory, or None if error
     """
+    overrides, _ = parse_interface_overrides(interface_overrides)
+    if overrides is None:
+        return None
+    description = overrides.get("short_description")
+    if description and not 25 <= len(description) <= 64:
+        print(f"[ERROR] short_description must be 25-64 characters (got {len(description)}).")
+        return None
+
     # Determine skill directory path
     skill_dir = Path(path).resolve() / skill_name
 

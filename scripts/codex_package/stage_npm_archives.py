@@ -25,7 +25,7 @@ import stat
 import sys
 import tarfile
 import threading
-from typing import Sequence
+from typing import Mapping, Sequence
 import uuid
 
 from scripts.codex_package.layout import sha256_file as file_sha256
@@ -62,6 +62,7 @@ def install_codex_package_archives(
     extracted_cache_dir: Path | None = None,
     *,
     vendor_copy_mode: str = "auto",
+    selected_archives: Mapping[str, Path] | None = None,
 ) -> None:
     if not targets:
         return
@@ -80,6 +81,7 @@ def install_codex_package_archives(
                 target,
                 extracted_cache_dir,
                 vendor_copy_mode=vendor_copy_mode,
+                selected_archive=selected_archives[target] if selected_archives is not None else None,
             ): target
             for target in targets
         }
@@ -95,12 +97,18 @@ def install_single_codex_package_archive(
     extracted_cache_dir: Path | None = None,
     *,
     vendor_copy_mode: str = "auto",
+    selected_archive: Path | None = None,
 ) -> Path:
     archive_name = f"codex-package-{target}.tar.gz"
-    artifact_subdir = artifact_dir_for_target(
-        artifacts_dir, target, expected_names=(archive_name,)
-    )
-    archive_path = artifact_subdir / archive_name
+    if selected_archive is None:
+        artifact_subdir = artifact_dir_for_target(
+            artifacts_dir, target, expected_names=(archive_name,)
+        )
+        archive_path = artifact_subdir / archive_name
+    else:
+        archive_path = selected_archive
+        if not archive_path.is_file():
+            raise FileNotFoundError(f"Verified artifact did not contain {archive_path}")
 
     dest_dir = vendor_dir / target
     vendor_dir.mkdir(parents=True, exist_ok=True)

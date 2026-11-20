@@ -208,13 +208,12 @@ impl Session {
                 RegularTask::new(),
             )
             .await;
-        if start_result.is_err() {
-            return Err(TryStartTurnIfIdleError::new(
-                TryStartTurnIfIdleRejectionReason::Busy,
-                input,
-            ));
+        if start_result.is_ok() {
+            startup_guard.disarm();
         }
-        startup_guard.disarm();
+        // Admission transferred ownership to the session. Taskless startup
+        // recovery retains that input if installation failed; never hand a
+        // second, retryable copy back to the caller.
         Ok(())
     }
 

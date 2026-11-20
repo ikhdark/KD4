@@ -162,7 +162,7 @@ pub(crate) async fn reserve_policy(
             if let Ok(Some((named, current))) = tokio::task::spawn_blocking(move || {
                 let cwd = codex_command_analysis::validation::compilation_cargo_cwd(&command, &cwd)?;
                 let (manifests, roots) = codex_command_analysis::command_preflight::compilation_sources(&selection, &cwd)?;
-                Some(crate::git_workspace::compilation_rust_inputs(manifests, roots))
+                crate::git_workspace::compilation_rust_inputs(manifests, roots)
             }).await {
                 paths = named;
                 fingerprints = current;

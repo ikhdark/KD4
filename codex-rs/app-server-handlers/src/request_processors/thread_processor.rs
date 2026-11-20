@@ -5769,6 +5769,10 @@ pub(super) fn preview_from_rollout_items(items: &[RolloutItem]) -> String {
         .iter()
         .find_map(|item| match item {
             RolloutItem::EventMsg(EventMsg::UserMessage(user)) => Some(user.message.clone()),
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => match &event.item {
+                codex_protocol::items::TurnItem::UserMessage(user) => Some(user.message()),
+                _ => None,
+            },
             RolloutItem::ResponseItem(item) => match codex_core::parse_turn_item(item) {
                 Some(codex_protocol::items::TurnItem::UserMessage(user)) => Some(user.message()),
                 _ => None,

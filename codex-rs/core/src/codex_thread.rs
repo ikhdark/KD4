@@ -520,7 +520,7 @@ impl CodexThread {
     ///
     /// This is the required entry point for extensions that want to launch
     /// model-visible work from `ThreadLifecycleContributor::on_thread_idle`.
-    /// The call succeeds only if no user/client-triggered turn is queued, no
+    /// Admission requires that no user/client-triggered turn is queued, no
     /// task is currently active, and the thread is not in Plan mode. Active
     /// Review tasks are rejected by the active-task check because Review turns
     /// are not steerable.

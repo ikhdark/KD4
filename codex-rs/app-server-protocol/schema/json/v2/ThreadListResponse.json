@@ -6370,6 +6370,7 @@
     "TurnValidationUncertainty": {
       "properties": {
         "captureIncomplete": {
+          "description": "True only for observed capture loss; false is not proof of full capture.",
           "type": "boolean"
         },
         "failedChecks": {
@@ -6379,6 +6380,7 @@
           "type": "array"
         },
         "pendingChecks": {
+          "description": "Checks with no terminal observation at settlement, not live operations.",
           "items": {
             "type": "string"
           },
@@ -6681,7 +6683,7 @@
       "type": "array"
     },
     "nextCursor": {
-      "description": "Opaque cursor to pass to the next call to continue after the last item. if None, there are no more items to return.",
+      "description": "Opaque cursor to continue the listing. Follow a non-null cursor even when a filtered page is short or empty; null means the listing is exhausted.",
       "type": [
         "string",
         "null"

@@ -296,9 +296,11 @@ impl GitWorkspaceCache {
                 .environments
                 .iter()
                 .any(|environment| environment.remote);
-        let dependencies = cacheable
-            .then(|| root_dependencies(&key.environments))
-            .flatten();
+        let dependencies = if cacheable {
+            snapshot_root_dependencies(key.environments.clone()).await
+        } else {
+            None
+        };
 
         if let Some(dependencies) = dependencies.as_ref() {
             let state = self.state.lock().await;
@@ -344,9 +346,8 @@ impl GitWorkspaceCache {
         let entries = resolve_roots_in_order(root_resolutions).await;
 
         if let Some(before_dependencies) = dependencies {
-            let after_dependencies = root_dependencies(&key.environments);
-            if after_dependencies.as_ref() == Some(&before_dependencies)
-            {
+            let after_dependencies = snapshot_root_dependencies(key.environments.clone()).await;
+            if after_dependencies.as_ref() == Some(&before_dependencies) {
                 self.state.lock().await.root = Some(RootCacheEntry {
                     key: key.clone(),
                     dependencies: before_dependencies,
@@ -485,6 +486,15 @@ fn record_project_discovery_reuse(
     ) {
         warn!("project discovery reuse metric failed: {err}");
     }
+}
+
+async fn snapshot_root_dependencies(
+    environments: Vec<EnvironmentWorkspaceKey>,
+) -> Option<Vec<DependencyFingerprint>> {
+    tokio::task::spawn_blocking(move || root_dependencies(&environments))
+        .await
+        .ok()
+        .flatten()
 }
 
 fn root_dependencies(
@@ -632,9 +642,26 @@ pub(crate) fn compilation_input_fingerprints(paths: Vec<PathBuf>) -> BTreeMap<Pa
 /// repository-wide traversal. The existing source parser owns module syntax.
 pub(crate) fn compilation_rust_inputs(
     manifests: Vec<PathBuf>, roots: Vec<PathBuf>,
-) -> (Vec<PathBuf>, BTreeMap<PathBuf, String>) {
-    let mut pending = roots.into_iter().map(|path| (path, true)).collect::<std::collections::VecDeque<_>>();
-    pending.extend(manifests.into_iter().map(|path| (path, false)));
+) -> Option<(Vec<PathBuf>, BTreeMap<PathBuf, String>)> {
+    const MAX_INPUTS: usize = 16_384;
+    const MAX_PATH_BYTES: usize = 16 * 1024 * 1024;
+    const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+    let mut paths_left = MAX_INPUTS;
+    let mut path_bytes_left = MAX_PATH_BYTES;
+    let mut read_bytes_left = 128 * 1024 * 1024u64;
+    let mut enqueue = |pending: &mut std::collections::VecDeque<_>, path: PathBuf, crate_root| {
+        paths_left = paths_left.checked_sub(1)?;
+        path_bytes_left = path_bytes_left.checked_sub(path.as_os_str().len())?;
+        pending.push_back((path, crate_root));
+        Some(())
+    };
+    let mut pending = std::collections::VecDeque::new();
+    for path in roots {
+        enqueue(&mut pending, path, true)?;
+    }
+    for path in manifests {
+        enqueue(&mut pending, path, false)?;
+    }
     let mut named = BTreeSet::new();
     let mut expanded = BTreeSet::new();
     let mut fingerprints = BTreeMap::new();
@@ -646,8 +673,17 @@ pub(crate) fn compilation_rust_inputs(
             Ok(mut file) => {
                 let before = file.metadata().ok();
                 let mut bytes = Vec::new();
-                if (&mut file).take(8 * 1024 * 1024 + 1).read_to_end(&mut bytes).is_err()
-                    || bytes.len() > 8 * 1024 * 1024 { continue; }
+                let allowance = (MAX_FILE_BYTES + 1).min(read_bytes_left);
+                if allowance == 0 {
+                    return None;
+                }
+                let mut limited = (&mut file).take(allowance);
+                let read = limited.read_to_end(&mut bytes);
+                read_bytes_left -= allowance - limited.limit();
+                if read_bytes_left == 0 {
+                    return None;
+                }
+                if read.is_err() || bytes.len() as u64 > MAX_FILE_BYTES { continue; }
                 let after = file.metadata().ok();
                 if before.as_ref().map(|value| (value.len(), value.modified().ok()))
                     != after.as_ref().map(|value| (value.len(), value.modified().ok())) { continue; }
@@ -664,11 +700,14 @@ pub(crate) fn compilation_rust_inputs(
         if path.extension().is_some_and(|extension| extension == "rs")
             && expanded.insert(dunce::canonicalize(&path).unwrap_or_else(|_| path.clone()))
             && let Ok(source) = std::str::from_utf8(&bytes) {
-            pending.extend(cached_compilation_module_paths(&path, source, digest, crate_root)
-                .into_iter().map(|path| (path, false)));
+            for dependency in cached_compilation_module_paths(&path, source, digest, crate_root) {
+                enqueue(&mut pending, dependency, false)?;
+            }
         }
     }
-    (named.into_iter().collect(), fingerprints)
+    // An expired traversal cannot publish partial fingerprints as repair or
+    // reuse proof; only a returned observation reaches the validation owner.
+    Some((named.into_iter().collect(), fingerprints))
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]

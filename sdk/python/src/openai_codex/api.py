@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from typing import AsyncIterator, Iterator
 
 from ._approval_mode import (
@@ -41,7 +41,7 @@ from ._run import (
 )
 from ._sandbox import Sandbox as Sandbox, _sandbox_mode, _sandbox_policy
 from .async_client import AsyncCodexClient
-from .client import CodexClient, CodexConfig, _params_dict
+from .client import CodexClient, CodexConfig, _Operation, _params_dict
 from .errors import TransportClosedError
 from .generated.v2_all import (
     ApiKeyLoginAccountParams,
@@ -643,8 +643,8 @@ class Thread:
             **({"service_tier": service_tier} if service_tier is not UNSET else {}),
             summary=summary,
         )
-        turn = self._client.turn_start(self.id, wire_input, params=params)
-        return TurnHandle(self._client, self.id, turn.turn.id)
+        turn, origin = self._client._turn_start_owned(self.id, wire_input, params=params)
+        return TurnHandle(self._client, self.id, turn.turn.id, _origin=origin)
 
     # END GENERATED: Thread.flat_methods
 
@@ -737,12 +737,12 @@ class AsyncThread:
             **({"service_tier": service_tier} if service_tier is not UNSET else {}),
             summary=summary,
         )
-        turn = await self._codex._client.turn_start(
+        turn, origin = await self._codex._client._turn_start_owned(
             self.id,
             wire_input,
             params=params,
         )
-        return AsyncTurnHandle(self._codex, self.id, turn.turn.id)
+        return AsyncTurnHandle(self._codex, self.id, turn.turn.id, _origin=origin)
 
     # END GENERATED: AsyncThread.flat_methods
 
@@ -770,10 +770,16 @@ class TurnHandle:
     _closed: bool = field(default=False, init=False, repr=False)
     _epoch: int = field(init=False, repr=False)
     _router: MessageRouter = field(init=False, repr=False)
+    _origin: InitVar[_Operation | None] = field(default=None, kw_only=True)
 
-    def __post_init__(self) -> None:
-        self._epoch = self._client.process_epoch
-        self._router = self._client._router
+    def __post_init__(self, _origin: _Operation | None) -> None:
+        if _origin is None:
+            with self._client._lifecycle_lock:
+                self._epoch = self._client.process_epoch
+                self._router = self._client._router
+        else:
+            self._epoch = _origin.epoch
+            self._router = _origin.router
 
     def _ensure_current(self) -> None:
         if self._closed:
@@ -803,25 +809,24 @@ class TurnHandle:
     def steer(self, input: RunInput) -> TurnSteerResponse:
         """Send additional input to this active turn."""
         self._ensure_current()
-        return self._client.turn_steer(
-            self.thread_id,
-            self.id,
-            _to_wire_input(_normalize_run_input(input)),
-        )
+        items = _to_wire_input(_normalize_run_input(input))
+        with self._client._operation(rpc_control=True, expected_epoch=self._epoch):
+            return self._client.turn_steer(self.thread_id, self.id, items)
 
     def interrupt(self) -> TurnInterruptResponse:
         """Request interruption of this active turn."""
         self._ensure_current()
-        return self._client.turn_interrupt(self.thread_id, self.id)
+        with self._client._operation(rpc_control=True, expected_epoch=self._epoch):
+            return self._client.turn_interrupt(self.thread_id, self.id)
 
     def stream(self, *, cancel_on_close: bool = False) -> Iterator[Notification]:
         """Yield only notifications routed to this turn handle."""
         self._ensure_current()
-        self._client.register_turn_notifications(self.id)
+        self._router.register_turn(self.id)
         completed = False
         try:
             while True:
-                event = self._client.next_turn_notification(self.id)
+                event = self._router.next_turn_notification(self.id)
                 completed = (
                     event.method == "turn/completed"
                     and isinstance(event.payload, TurnCompletedNotification)
@@ -852,10 +857,16 @@ class AsyncTurnHandle:
     _closed: bool = field(default=False, init=False, repr=False)
     _epoch: int = field(init=False, repr=False)
     _router: MessageRouter = field(init=False, repr=False)
+    _origin: InitVar[_Operation | None] = field(default=None, kw_only=True)
 
-    def __post_init__(self) -> None:
-        self._epoch = self._codex._client.process_epoch
-        self._router = self._codex._client._sync._router
+    def __post_init__(self, _origin: _Operation | None) -> None:
+        if _origin is None:
+            with self._codex._client._sync._lifecycle_lock:
+                self._epoch = self._codex._client.process_epoch
+                self._router = self._codex._client._sync._router
+        else:
+            self._epoch = _origin.epoch
+            self._router = _origin.router
 
     def _ensure_current(self) -> None:
         if self._closed:
@@ -911,7 +922,7 @@ class AsyncTurnHandle:
         try:
             while True:
                 self._ensure_current()
-                event = await self._codex._client.next_turn_notification(self.id)
+                event = await self._router.turn_notification_queue(self.id).get_async()
                 self._ensure_current()
                 completed = (
                     event.method == "turn/completed"

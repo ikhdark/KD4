@@ -74,8 +74,8 @@ wording is untouched.
   Trace each criterion to the user's request (including corrections) or an
   applicable owner contract. Before handoff, check those sources against the
   plan so a missed item cannot silently disappear.
-- Working an existing audit case means resolving every open item in its
-  `current-findings.txt`, not the newest or easiest one.
+- Working an existing audit case means resolving every open finding in that
+  case, not the newest or easiest one.
 - For broad reviews, account for the complete requested inventory, including
   partial reads and every slice handed to a worker. Reconcile each worker's
   coverage, remaining scope and findings with that inventory; unassigned,
@@ -306,51 +306,38 @@ of downstream behavior. Preserve the live installation, credentials and active c
 The KDR audit and benchmark paths below apply to KD4 and KDR. KDA follows
 the same case lifecycle in its own [audit library](../KDA/audits/README.md)
 and retains run evidence in its [benchmark library](../KDA/benchmarks/README.md).
-All three use the shared KDR implementation library.
 
 - The audit case folder locates the work; KDR closure also requires the
   [authoritative receipt](../KDR/audits/README.md#managed-case-closure).
   Unfinished work lives in
   `KDR/audits/active-cases/<frontend|backend>/<task>/` (mixed UI/backend
-  acceptance uses `frontend`), one folder per task even for one report, with a
-  `current-findings.txt` that lists every requested item as open, verified,
-  no-defect, not-applicable, withdrawn or blocked, with its evidence or exact
-  blocker ([live findings file](../KDR/audits/README.md#live-findings-file)).
+  acceptance uses `frontend`), one folder per task even for one report. Track
+  each item's status with its evidence or exact blocker in the plan or existing
+  case record.
   Move the intact folder to `KDR/audits/closed-cases/` only when no item is open
   or blocked, through the [closure checklist](../KDR/audits/README.md#closure-checklist);
   an explicitly read-only review closes when the review is complete. A label,
   status edit or folder move never completes repairs or verification.
 - Automatically consolidate same-task follow-ups, corrections and small
-  adjustments into the existing audit case (when applicable) and implementation
-  record, including across sessions. A different date, title, wording or
-  implementation detail does not justify a new task folder. Create a separate
-  case or record only for a genuinely independent objective or explicit
-  user-requested separation.
+  adjustments into the existing task record, including across sessions. A
+  different date, title, wording or implementation detail does not justify a
+  new task folder. Create a separate case or record only for a genuinely
+  independent objective or explicit user-requested separation.
 - Benchmark runs are evidence without status: one `KDR/benchmarks/<task>/`
   folder per run or task, referenced from the audit case it serves. Do not
   create status indexes, parallel case roots, aliases, duplicate evidence
   stores, per-agent indexes or separate "later"/"follow-up" lists.
-- For every implementation task, including source, configuration, documentation
-  and file-organization changes, keep one
-  `KDR/implementation/<task>/implementation.txt`. Record the request, intention
-  and acceptance criteria before editing; update what actually changed, how and
-  why as work proceeds, then add final source identity, verification results,
-  evidence links and any gaps before handoff. Follow the
-  [implementation library](../KDR/implementation/README.md); link the record in
-  the handoff. It explains implementation, not audit status, and does not replace
-  behavioral proof or duplicate raw evidence. Record every distinct fix made
-  along the way, including secondary bugs and diagnostic, tooling or workflow
-  repairs. For each, state the issue, correction, verification result and evidence
-  link; distinguish verified fixes from implemented-but-unverified changes. Do not
-  leave these details only in chat or logs. When implementation relates to an
-  audit or benchmark, state that relationship and link the relevant case, finding
-  IDs and run evidence, as applicable, in the implementation record. Read-only
-  work needs no record.
-- When the inputs are ready, fold required implementation-note updates and
-  verified plan transitions into tool calls already needed for the task.
-  Sequence dependent actions and check their receipts: record intent before
-  edits and close steps only after verification. Keep unresolved work open;
-  do not delay ready work just to batch it.
+- Neither `current-findings.txt` nor `implementation.txt` is required by
+  default. Use these files when requested by the user or when a managed
+  workflow specifically requires them. For files that are kept, follow the
+  [findings format](../KDR/audits/README.md#live-findings-file) or
+  [implementation format](../KDR/implementation/README.md), as applicable.
+  Keep notes concise and link evidence rather than duplicating it. Notes do
+  not replace behavioral proof.
+- When the inputs are ready, fold verified plan transitions into tool calls
+  already needed for the task. Sequence dependent actions and check their
+  receipts. Close steps only after verification and keep unresolved work open.
+  Do not delay ready work just to batch it.
 - Keep library containers free of loose generated reports; preserve
   established tool-owned infrastructure. Frozen reports, receipts, source
   snapshots and evidence bytes stay unchanged; update live locators when moving
@@ -374,8 +361,8 @@ All three use the shared KDR implementation library.
   brief chat handoff with an absolute report link. User format restrictions
   take precedence.
 - Documentation-only and file-organization work needs no audit log, separate
-  report, relocation receipt or build. Keep its implementation record as above,
-  update existing guidance and affected links, verify placement, and summarize
+  report, relocation receipt or build. Update existing guidance and affected
+  links, verify placement, and summarize
   in chat unless a separate report is requested.
   Keep KD4's `codex-rs/protocol/src/prompts/base_instructions/default.md` concise
   and repository-neutral; it is reread live by the harness, while other KD4

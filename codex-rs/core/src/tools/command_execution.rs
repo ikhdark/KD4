@@ -339,7 +339,6 @@ struct CommandProcessState {
 struct CommandRepositoryState {
     epoch: u64,
     workspace_identity_observation_epoch: Option<u64>,
-    workspace_identity_observation_turn: Option<String>,
     observed_workspace_identity: Option<(u64, crate::git_workspace::WorkspaceEvidenceIdentity)>,
     observed_workspace_identity_hash: Option<(u64, String)>,
     observed_turn_mutation_revisions: HashMap<String, u64>,
@@ -430,7 +429,6 @@ impl CommandExecutionLedger {
         state.repository.observed_workspace_identity = None;
         state.repository.observed_workspace_identity_hash = None;
         state.repository.workspace_identity_observation_epoch = None;
-        state.repository.workspace_identity_observation_turn = None;
     }
 
     pub(crate) async fn observe_repository_revision(
@@ -516,7 +514,6 @@ impl CommandExecutionLedger {
         state.repository.observed_workspace_identity = Some((epoch, identity));
         state.repository.observed_workspace_identity_hash = Some((epoch, identity_hash));
         state.repository.workspace_identity_observation_epoch = Some(epoch);
-        state.repository.workspace_identity_observation_turn = turn.map(|(id, _)| id.to_string());
         epoch
     }
 

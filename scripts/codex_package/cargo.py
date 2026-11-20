@@ -1107,6 +1107,7 @@ def external_input_fingerprint(spec: TargetSpec, env: dict[str, str]) -> dict:
     """
     inputs: dict[str, object] = {}
     seen: set[Path] = set()
+    checkout_packages: set[Path] = set()
     root = CODEX_RS_ROOT.resolve()
 
     def digest_tree(path: Path) -> None:
@@ -1157,6 +1158,8 @@ def external_input_fingerprint(spec: TargetSpec, env: dict[str, str]) -> dict:
         if not manifest.is_file():
             raise ValueError(f"missing local dependency manifest: {manifest}")
         document = tomllib.loads(manifest.read_text(encoding="utf-8"))
+        if path.is_relative_to(root) and (path != root or "package" in document):
+            checkout_packages.add(path)
         local_edges(document, path)
         for pattern in document.get("workspace", {}).get("members", []):
             for member in sorted(path.glob(pattern)):
@@ -1230,8 +1233,36 @@ def external_input_fingerprint(spec: TargetSpec, env: dict[str, str]) -> dict:
                 for key in ("directory", "local-registry"):
                     if key in source:
                         digest_tree(base / source[key])
+        if checkout_packages:
+            # The ordinary checkout fingerprint omits ignored, untracked files.
+            # Bind those files under each selected package, not the whole workspace.
+            package_roots = [
+                path for path in sorted(checkout_packages)
+                if not any(parent in checkout_packages for parent in path.parents)
+            ]
+            git_env = source_git_environment()
+            batch: list[str] = []
+            for path in package_roots:
+                batch.append(path.relative_to(root).as_posix())
+                if sum(len(item) + 3 for item in batch) >= 8_000 or path == package_roots[-1]:
+                    ignored = run_owned(
+                        ["git", "--literal-pathspecs", "ls-files", "--others", "--ignored",
+                         "--exclude-standard", "-z", "--", *batch],
+                        cwd=root, env=git_env, capture_output=True, check=True,
+                        timeout=DISCOVERY_TIMEOUT_SECONDS,
+                    )
+                    for entry in ignored.stdout.split(b"\0"):
+                        if not entry:
+                            continue
+                        child = root / os.fsdecode(entry)
+                        if child.resolve(strict=True) != child or not child.is_file():
+                            raise ValueError(f"opaque ignored Cargo input: {child}")
+                        inputs[str(child)] = source_output_fingerprint(child)
+                        if inputs[str(child)] is None:
+                            raise ValueError(f"missing ignored Cargo input: {child}")
+                    batch.clear()
         return {"status": "ok", "inputs": inputs}
-    except (OSError, ValueError, TypeError, RecursionError) as error:
+    except (OSError, ValueError, TypeError, RecursionError, subprocess.SubprocessError) as error:
         return {"status": "unavailable", "inputs": inputs, "reason": str(error)}
 
 
@@ -1393,10 +1424,23 @@ def source_tree_fingerprint() -> dict[str, str]:
     }
 
 
+def source_git_environment() -> dict[str, str]:
+    """Use the selected package checkout for every source identity read."""
+    env = os.environ.copy()
+    for key in (
+        "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+        "GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS",
+        "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS",
+    ):
+        env.pop(key, None)
+    return env
+
+
 def run_git_bytes(git: str, *args: str) -> bytes:
     process = subprocess.Popen(
         [git, *args],
         cwd=CODEX_RS_ROOT,
+        env=source_git_environment(),
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
     )

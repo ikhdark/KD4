@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import os
+import stat
 import shutil
 import subprocess
 import sys
@@ -260,11 +261,44 @@ def _validate_skill(path: str) -> None:
         raise InstallError("SKILL.md not found in selected skill directory.")
 
 
+def _require_direct_checkout_tree(repo_root: str, relative: str) -> str:
+    root = os.path.realpath(repo_root)
+    if os.path.isabs(relative) or os.path.splitdrive(relative)[0]:
+        raise InstallError(f"Skill path must be repository-relative: {relative}")
+    if os.altsep:
+        relative = relative.replace(os.altsep, os.sep)
+    parts = [part for part in relative.split(os.sep) if part not in ("", os.curdir)]
+    if not parts or os.pardir in parts:
+        raise InstallError(f"Invalid skill checkout path: {relative}")
+
+    def reject_indirect(path: str) -> None:
+        state = os.lstat(path)
+        if stat.S_ISLNK(state.st_mode) or (
+            getattr(state, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        ):
+            raise InstallError(f"Skill checkout contains an indirect path: {path}")
+
+    def traversal_error(error: OSError) -> None:
+        raise InstallError(f"Unable to inspect skill checkout: {error}") from error
+
+    current = root
+    try:
+        for part in parts:
+            current = os.path.join(current, part)
+            reject_indirect(current)
+        for directory, dirs, files in os.walk(current, onerror=traversal_error):
+            for name in (*dirs, *files):
+                reject_indirect(os.path.join(directory, name))
+    except OSError as error:
+        traversal_error(error)
+    return current
+
+
 def _copy_skill(src: str, dest_dir: str) -> None:
     os.makedirs(os.path.dirname(dest_dir), exist_ok=True)
     if os.path.exists(dest_dir):
         raise InstallError(f"Destination already exists: {dest_dir}")
-    shutil.copytree(src, dest_dir)
+    shutil.copytree(src, dest_dir, symlinks=True)
 
 
 def _build_repo_url(owner: str, repo: str) -> str:
@@ -380,7 +414,7 @@ def main(argv: list[str]) -> int:
                 dest_dir = os.path.join(dest_root, skill_name)
                 if os.path.exists(dest_dir):
                     raise InstallError(f"Destination already exists: {dest_dir}")
-                skill_src = os.path.join(repo_root, path)
+                skill_src = _require_direct_checkout_tree(repo_root, path)
                 _validate_skill(skill_src)
                 _copy_skill(skill_src, dest_dir)
                 installed.append((skill_name, dest_dir))

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import sys
@@ -57,10 +58,23 @@ def _list_skills(repo: str, path: str, ref: str) -> list[str]:
                 f"Skills path not found: https://github.com/{repo}/tree/{ref}/{path}"
             ) from exc
         raise ListError(f"Failed to fetch skills: HTTP {exc.code}") from exc
-    data = json.loads(payload.decode("utf-8"))
+    except (http.client.HTTPException, OSError) as exc:
+        raise ListError(f"Failed to fetch skills: {exc}") from exc
+    try:
+        data = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ListError("Unexpected skills listing response.") from exc
     if not isinstance(data, list):
         raise ListError("Unexpected skills listing response.")
-    skills = [item["name"] for item in data if item.get("type") == "dir"]
+    skills: list[str] = []
+    for item in data:
+        if not isinstance(item, dict):
+            raise ListError("Unexpected skills listing entry.")
+        if item.get("type") == "dir":
+            name = item.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise ListError("Unexpected skill directory name.")
+            skills.append(name)
     return sorted(skills)
 
 

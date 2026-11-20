@@ -13,10 +13,12 @@ pub(crate) fn pull_events_from_value(value: &JsonValue) -> Vec<PullEvent> {
     }
     let total = value.get("total").and_then(JsonValue::as_u64);
     let completed = value.get("completed").and_then(JsonValue::as_u64);
-    if total.is_some() || completed.is_some() {
+    if (total.is_some() || completed.is_some())
+        && let Some(digest) = value.get("digest").and_then(JsonValue::as_str)
+        && !digest.trim().is_empty()
+    {
         events.push(PullEvent::ChunkProgress {
-            digest: value.get("digest").and_then(JsonValue::as_str)
-                .unwrap_or("").to_string(),
+            digest: digest.to_string(),
             total,
             completed,
         });

@@ -534,8 +534,14 @@ fn config_exists(path: &Path) -> Result<bool, String> {
 }
 
 fn read_toml(path: &Path, budget: &mut ConfigReadBudget) -> Result<toml::Value, String> {
-    const MAX_BYTES: usize = 1024 * 1024;
-    if budget.files >= 64 || budget.bytes >= MAX_BYTES {
+    read_toml_with_limits(path, budget, 64, 1024 * 1024)
+}
+
+fn read_toml_with_limits(
+    path: &Path, budget: &mut ConfigReadBudget, max_files: usize, max_bytes: usize,
+) -> Result<toml::Value, String> {
+    const MAX_FILE_BYTES: usize = 1024 * 1024;
+    if budget.files >= max_files || budget.bytes >= max_bytes {
         return Err(rejected(
             "Cargo configuration exceeds the bounded admission read.",
         ));
@@ -544,11 +550,12 @@ fn read_toml(path: &Path, budget: &mut ConfigReadBudget) -> Result<toml::Value, 
     let file =
         std::fs::File::open(path).map_err(|_| rejected("Cannot read Cargo configuration."))?;
     let mut text = String::new();
-    file.take((MAX_BYTES - budget.bytes + 1) as u64)
-        .read_to_string(&mut text)
-        .map_err(|_| rejected("Cannot read Cargo configuration."))?;
-    budget.bytes += text.len();
-    if budget.bytes > MAX_BYTES {
+    let allowance = (max_bytes - budget.bytes).min(MAX_FILE_BYTES) + 1;
+    let mut limited = file.take(allowance as u64);
+    let read = limited.read_to_string(&mut text);
+    budget.bytes += allowance - limited.limit() as usize;
+    read.map_err(|_| rejected("Cannot read Cargo configuration."))?;
+    if budget.bytes > max_bytes || text.len() > MAX_FILE_BYTES {
         return Err(rejected(
             "Cargo configuration exceeds the bounded admission read.",
         ));
@@ -763,27 +770,47 @@ pub fn compilation_sources(selection: &str, cwd: &Path) -> Option<(Vec<PathBuf>,
     }
     let workspace = workspace_root(&cwd, manifest.as_deref(), &mut ConfigReadBudget::default()).ok()?;
     let workspace_manifest = workspace.join("Cargo.toml");
-    let workspace_doc = read_toml(&workspace_manifest, &mut ConfigReadBudget::default()).ok()?;
+    let mut graph_reads = ConfigReadBudget::default();
+    let mut read_manifest = |path: &Path| {
+        read_toml_with_limits(path, &mut graph_reads, 1024, 16 * 1024 * 1024).ok()
+    };
+    let workspace_doc = read_manifest(&workspace_manifest)?;
     let workspace_dependencies = workspace_doc.get("workspace").and_then(|value| value.get("dependencies"));
     let mut pending = VecDeque::new();
     let direct_manifest = manifest.as_ref().map(|path| cwd.join(path)).unwrap_or_else(|| cwd.join("Cargo.toml"));
-    let direct = read_toml(&direct_manifest, &mut ConfigReadBudget::default()).ok();
+    let direct = read_manifest(&direct_manifest);
+    let mut entries_left = 16_384usize;
+    let mut path_bytes_left = 16 * 1024 * 1024usize;
+    let mut charge = |path: &Path| {
+        entries_left = entries_left.checked_sub(1)?;
+        path_bytes_left = path_bytes_left.checked_sub(path.as_os_str().len())?;
+        Some(())
+    };
     for package in &packages {
         let name = package.split('@').next()?;
         if direct.as_ref().and_then(|doc| doc.get("package")?.get("name")?.as_str()) == Some(name) {
+            charge(&direct_manifest)?;
             pending.push_back((direct_manifest.clone(), true));
         } else if let Some(path) = workspace_dependencies.and_then(|deps| deps.get(name))
             .and_then(|dependency| dependency.get("path")).and_then(toml::Value::as_str) {
-            pending.push_back((workspace.join(path).join("Cargo.toml"), true));
+            let path = workspace.join(path).join("Cargo.toml");
+            charge(&path)?;
+            pending.push_back((path, true));
         } else {
             let members = workspace_doc.get("workspace")?.get("members")?.as_array()?;
-            let found = members.iter().filter_map(toml::Value::as_str).find_map(|member| {
-                if member.contains(['*', '?', '[']) { return None; }
+            let mut found = None;
+            for member in members.iter().filter_map(toml::Value::as_str) {
+                if member.contains(['*', '?', '[']) { continue; }
                 let manifest = workspace.join(member).join("Cargo.toml");
-                let doc = read_toml(&manifest, &mut ConfigReadBudget::default()).ok()?;
-                (doc.get("package")?.get("name")?.as_str()? == name).then_some(manifest)
-            })?;
-            pending.push_back((found, true));
+                charge(&manifest)?;
+                if read_manifest(&manifest).and_then(|doc| {
+                    Some(doc.get("package")?.get("name")?.as_str()? == name)
+                }) == Some(true) {
+                    found = Some(manifest);
+                    break;
+                }
+            }
+            pending.push_back((found?, true));
         }
     }
     if packages.is_empty() { pending.push_back((direct_manifest, true)); }
@@ -793,33 +820,43 @@ pub fn compilation_sources(selection: &str, cwd: &Path) -> Option<(Vec<PathBuf>,
     while let Some((manifest, selected)) = pending.pop_front() {
         let manifest = resolved(&manifest).ok()?;
         if !seen.insert(manifest.clone()) { continue; }
-        let doc = read_toml(&manifest, &mut ConfigReadBudget::default()).ok()?;
+        let doc = read_manifest(&manifest)?;
         let directory = manifest.parent()?;
         manifests.insert(manifest.clone());
         let library = doc.get("lib").and_then(|value| value.get("path")).and_then(toml::Value::as_str)
             .map(|path| directory.join(path)).unwrap_or_else(|| directory.join("src/lib.rs"));
         if doc.get("lib").is_some() || doc.get("package").and_then(|value| value.get("autolib")).and_then(toml::Value::as_bool) != Some(false) {
+            charge(&library)?;
             roots.insert(library);
         }
         if doc.get("package").and_then(|value| value.get("build")).and_then(toml::Value::as_bool) != Some(false) {
             let build = doc.get("package").and_then(|value| value.get("build")).and_then(toml::Value::as_str)
                 .map(|path| directory.join(path)).unwrap_or_else(|| directory.join("build.rs"));
+            charge(&build)?;
             roots.insert(build);
         }
         if selected && !args.iter().any(|arg| arg == "--lib") {
             let main = directory.join("src/main.rs");
-            if main.is_file() || doc.get("package").and_then(|value| value.get("autobins")).and_then(toml::Value::as_bool) != Some(false) { roots.insert(main); }
+            if main.is_file() || doc.get("package").and_then(|value| value.get("autobins")).and_then(toml::Value::as_bool) != Some(false) {
+                charge(&main)?;
+                roots.insert(main);
+            }
             for kind in ["bin", "example", "test", "bench"] {
                 if kind != "bin" && !args.iter().any(|arg| arg == &format!("--{kind}") || arg == &format!("--{kind}s") || arg == "--all-targets") { continue; }
                 if let Some(targets) = doc.get(kind).and_then(toml::Value::as_array) {
                     for target in targets {
-                        if let Some(path) = target.get("path").and_then(toml::Value::as_str) { roots.insert(directory.join(path)); }
+                        if let Some(path) = target.get("path").and_then(toml::Value::as_str) {
+                            let path = directory.join(path);
+                            charge(&path)?;
+                            roots.insert(path);
+                        }
                     }
                 }
                 let folder = directory.join(if kind == "bin" { "src/bin" } else { match kind { "example" => "examples", "test" => "tests", _ => "benches" } });
                 if let Ok(entries) = std::fs::read_dir(folder) {
                     for entry in entries.flatten() {
                         let path = entry.path();
+                        charge(&path)?;
                         if path.extension().is_some_and(|extension| extension == "rs") { roots.insert(path); }
                         else if path.is_dir() && path.join("main.rs").is_file() { roots.insert(path.join("main.rs")); }
                     }
@@ -837,7 +874,9 @@ pub fn compilation_sources(selection: &str, cwd: &Path) -> Option<(Vec<PathBuf>,
                     let inherited = dependency.get("workspace").and_then(toml::Value::as_bool) == Some(true);
                     let value = if inherited { workspace_dependencies.and_then(|deps| deps.get(name))? } else { dependency };
                     if let Some(path) = value.get("path").and_then(toml::Value::as_str) {
-                        pending.push_back(((if inherited { &workspace } else { directory }).join(path).join("Cargo.toml"), false));
+                        let path = (if inherited { &workspace } else { directory }).join(path).join("Cargo.toml");
+                        charge(&path)?;
+                        pending.push_back((path, false));
                     }
                 }
             }
@@ -846,7 +885,10 @@ pub fn compilation_sources(selection: &str, cwd: &Path) -> Option<(Vec<PathBuf>,
     for directory in cwd.ancestors() {
         for name in ["config", "config.toml"] {
             let config = directory.join(".cargo").join(name);
-            if config.is_file() { manifests.insert(config); }
+            if config.is_file() {
+                charge(&config)?;
+                manifests.insert(config);
+            }
         }
     }
     Some((manifests.into_iter().collect(), roots.into_iter().collect()))

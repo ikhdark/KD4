@@ -563,6 +563,11 @@ def install_from_workflow_artifacts(
             targets,
             extracted_cache_dir,
             vendor_copy_mode=vendor_copy_mode,
+            selected_archives={
+                target: _workflow_artifact_dir(artifacts_dir, github_repo, artifact)
+                / f"codex-package-{target}.tar.gz"
+                for target, artifact in zip(targets, artifacts, strict=True)
+            },
         )
 
 
@@ -626,6 +631,17 @@ def download_artifacts(
             future.result()
 
 
+def _workflow_artifact_dir(
+    dest_dir: Path, github_repo: str, artifact: WorkflowArtifact
+) -> Path:
+    # Concurrent runs can select different generations with the same name.
+    # Only an identical, verified generation may be reused at this path.
+    identity = [github_repo, artifact.artifact_id, artifact.name,
+                artifact.size_in_bytes, artifact.archive_sha256]
+    key = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
+    return dest_dir / ".workflow-artifacts" / key
+
+
 def download_single_artifact(
     github_repo: str, dest_dir: Path, artifact: WorkflowArtifact
 ) -> None:
@@ -633,8 +649,10 @@ def download_single_artifact(
         raise RuntimeError(
             f"workflow artifact {artifact.name!r} has no authoritative sha256 digest"
         )
+    artifact_dir = _workflow_artifact_dir(dest_dir, github_repo, artifact)
+    dest_dir = artifact_dir.parent
     dest_dir.mkdir(parents=True, exist_ok=True)
-    artifact_dir = dest_dir / artifact.name
+    cache_key = artifact_dir.name
     if artifact_is_complete(artifact_dir, artifact):
         print(
             f"  using cached {artifact.name} ({format_bytes(artifact.size_in_bytes)})",
@@ -642,7 +660,7 @@ def download_single_artifact(
         )
         return
 
-    lock_path = dest_dir / f".{artifact.name}.lock"
+    lock_path = dest_dir / f".{cache_key}.lock"
     with exclusive_file_lock(lock_path):
         if artifact_is_complete(artifact_dir, artifact):
             print(
@@ -652,7 +670,7 @@ def download_single_artifact(
             return
 
         temp_dir = (
-            dest_dir / f".{artifact.name}.tmp-{os.getpid()}-{threading.get_ident()}"
+            dest_dir / f".{cache_key}.tmp-{os.getpid()}-{threading.get_ident()}"
         )
         shutil.rmtree(temp_dir, ignore_errors=True)
         temp_dir.mkdir(parents=True, exist_ok=True)
@@ -662,7 +680,7 @@ def download_single_artifact(
                 flush=True,
             )
             archive_path = dest_dir / (
-                f".{artifact.name}.{artifact.artifact_id}."
+                f".{cache_key}."
                 f"{os.getpid()}-{threading.get_ident()}.zip"
             )
             try:

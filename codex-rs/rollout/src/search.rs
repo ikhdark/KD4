@@ -240,7 +240,7 @@ async fn matching_payload_patterns(
     payload_root: &Path,
     json_search_term: &str,
 ) -> io::Result<Option<Vec<String>>> {
-    if !tokio::fs::try_exists(payload_root).await.unwrap_or(false) {
+    if !tokio::fs::try_exists(payload_root).await? {
         return Ok(Some(Vec::new()));
     }
     let mut command = Command::new(rg_command);
@@ -335,7 +335,7 @@ async fn ripgrep_rollout_paths(
     payload_patterns: &[String],
     search_term: &Regex,
 ) -> io::Result<Option<RolloutSearchMatches>> {
-    if !tokio::fs::try_exists(root).await.unwrap_or(false) {
+    if !tokio::fs::try_exists(root).await? {
         return Ok(Some(HashMap::new()));
     }
 

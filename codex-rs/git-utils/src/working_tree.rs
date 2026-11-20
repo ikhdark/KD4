@@ -323,7 +323,8 @@ fn watch_routes(root: &Path, control: &GitCommandControl) -> Result<Vec<PathBuf>
 }
 
 fn status_entry_identity(path: &Path, control: &GitCommandControl) -> Result<String, String> {
-    if !path.join(".git").exists() {
+    let marker = path.join(".git");
+    if !marker.try_exists().map_err(|error| format!("cannot observe {}: {error}", marker.display()))? {
         return Ok("uninitialized_gitlink".into());
     }
     read_git(path, &["rev-parse", "--verify", "HEAD"], 1024, control)

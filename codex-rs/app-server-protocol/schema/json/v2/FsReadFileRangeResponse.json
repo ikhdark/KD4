@@ -1,0 +1,24 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Bounded contents and the opened file's size and revision.",
+  "properties": {
+    "dataBase64": {
+      "type": "string"
+    },
+    "fileBytes": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "revision": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "dataBase64",
+    "fileBytes",
+    "revision"
+  ],
+  "title": "FsReadFileRangeResponse",
+  "type": "object"
+}

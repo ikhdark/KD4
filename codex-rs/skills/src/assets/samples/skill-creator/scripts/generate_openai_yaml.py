@@ -7,6 +7,7 @@ Usage:
 """
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -48,8 +49,10 @@ ALLOWED_INTERFACE_KEYS = {
 
 
 def yaml_quote(value):
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-    return f'"{escaped}"'
+    encoded = json.dumps(value, ensure_ascii=False)
+    # YAML also treats these Unicode characters as breaks or nonprintable.
+    return re.sub(r"[\x7f-\x9f\u2028\u2029\ud800-\udfff\ufffe\uffff]",
+                  lambda match: f"\\u{ord(match[0]):04x}", encoded)
 
 
 def format_display_name(skill_name):
@@ -106,12 +109,16 @@ def read_frontmatter_name(skill_dir):
     if not skill_md.exists():
         print(f"[ERROR] SKILL.md not found in {skill_dir}")
         return None
-    content = skill_md.read_text(encoding="utf-8")
-    match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
-    if not match:
+    try:
+        lines = skill_md.read_text(encoding="utf-8-sig").split("\n")
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"[ERROR] Cannot read SKILL.md: {exc}")
+        return None
+    end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), 0)
+    if lines[0].strip() != "---" or end < 2:
         print("[ERROR] Invalid SKILL.md frontmatter format.")
         return None
-    frontmatter_text = match.group(1)
+    frontmatter_text = "\n".join(lines[1:end])
 
     import yaml
 
@@ -169,7 +176,7 @@ def write_openai_yaml(skill_dir, skill_name, raw_overrides):
 
         try:
             payload = yaml.safe_load(output_path.read_text(encoding="utf-8"))
-        except (OSError, yaml.YAMLError) as exc:
+        except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
             print(f"[ERROR] Cannot read existing agents/openai.yaml: {exc}")
             return None
         if not isinstance(payload, dict) or not isinstance(
@@ -178,6 +185,13 @@ def write_openai_yaml(skill_dir, skill_name, raw_overrides):
             print("[ERROR] Existing agents/openai.yaml and interface must be mappings.")
             return None
         existing_interface = payload.get("interface", {})
+
+    for field in ("display_name", "short_description"):
+        if not overrides.get(field) and field in existing_interface and not isinstance(
+            existing_interface[field], str
+        ):
+            print(f"[ERROR] Existing interface.{field} must be a string.")
+            return None
 
     display_name = (
         overrides.get("display_name")

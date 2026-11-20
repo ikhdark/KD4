@@ -4965,7 +4965,7 @@ pub struct SessionMeta {
     pub cli_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_build: Option<SessionBuildInfo>,
-    #[serde(default)]
+    #[serde(default = "legacy_session_source")]
     pub source: SessionSource,
     /// Optional analytics source classification for this thread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5000,6 +5000,11 @@ pub struct SessionMeta {
     /// Initial context-window identity for consumers that tail rollout JSONL before compaction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<SessionContextWindow>,
+}
+
+// Older rollouts without provenance do not imply any particular client.
+fn legacy_session_source() -> SessionSource {
+    SessionSource::Unknown
 }
 
 impl Default for SessionMeta {

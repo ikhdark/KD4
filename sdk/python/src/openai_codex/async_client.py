@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 from ._goal import _GoalOperationState
 from ._run import _raise_for_failed_turn
-from .client import CodexClient, CodexConfig, _CONTROL_METHODS
+from .client import CodexClient, CodexConfig, _CONTROL_METHODS, _Operation
 from .errors import CodexError, InvalidRequestError, TransportClosedError
 from .generated.v2_all import (
     AccountLoginCompletedNotification,
@@ -119,10 +119,8 @@ class AsyncCodexClient:
             owner = None
             try:
                 with nullcontext() if shutdown else self._sync._operation(
-                    cancelled, rpc_control=control
+                    cancelled, rpc_control=control, expected_epoch=expected_epoch
                 ) as owner:
-                    if expected_epoch is not None and self.process_epoch != expected_epoch:
-                        raise TransportClosedError("turn handle belongs to a closed Codex process")
                     result = fn()
                 operation.set_result(result)
                 if on_cancel is not None:
@@ -378,8 +376,17 @@ class AsyncCodexClient:
         params: V2TurnStartParams | JsonObject | None = None,
     ) -> TurnStartResponse:
         """Start a turn using the wrapped sync client."""
+        started, _ = await self._turn_start_owned(thread_id, input_items, params)
+        return started
 
-        def cleanup(started: TurnStartResponse) -> None:
+    async def _turn_start_owned(
+        self,
+        thread_id: str,
+        input_items: list[JsonObject] | JsonObject | str,
+        params: V2TurnStartParams | JsonObject | None = None,
+    ) -> tuple[TurnStartResponse, _Operation]:
+        def cleanup(result: tuple[TurnStartResponse, _Operation]) -> None:
+            started, _ = result
             try:
                 self._sync.turn_interrupt(thread_id, started.turn.id)
             except (TransportClosedError, InvalidRequestError):
@@ -388,7 +395,7 @@ class AsyncCodexClient:
                 self._sync.unregister_turn_notifications(started.turn.id)
 
         return await self._run_sync(
-            lambda: self._sync.turn_start(thread_id, input_items, params),
+            lambda: self._sync._turn_start_owned(thread_id, input_items, params),
             cleanup,
         )
 
@@ -470,10 +477,11 @@ class AsyncCodexClient:
 
     async def wait_for_turn_completed(self, turn_id: str) -> TurnCompletedNotification:
         """Wait for the completion notification routed to one turn."""
-        self.register_turn_notifications(turn_id)
+        router = self._sync._router
+        router.register_turn(turn_id)
         try:
             while True:
-                notification = await self.next_turn_notification(turn_id)
+                notification = await router.turn_notification_queue(turn_id).get_async()
                 if (
                     notification.method == "turn/completed"
                     and isinstance(notification.payload, TurnCompletedNotification)
@@ -481,7 +489,7 @@ class AsyncCodexClient:
                 ):
                     return notification.payload
         finally:
-            self.unregister_turn_notifications(turn_id)
+            router.unregister_turn(turn_id)
 
     async def stream_text(
         self,
@@ -492,12 +500,12 @@ class AsyncCodexClient:
         cancel_on_close: bool = False,
     ) -> AsyncIterator[AgentMessageDeltaNotification]:
         """Yield text deltas; failed turns raise, interrupted turns end normally."""
-        started = await self.turn_start(thread_id, text, params)
+        started, origin = await self._turn_start_owned(thread_id, text, params)
         turn_id = started.turn.id
         completed = False
         try:
             while True:
-                notification = await self.next_turn_notification(turn_id)
+                notification = await origin.router.turn_notification_queue(turn_id).get_async()
                 if (
                     notification.method == "item/agentMessage/delta"
                     and isinstance(notification.payload, AgentMessageDeltaNotification)
@@ -516,6 +524,10 @@ class AsyncCodexClient:
         finally:
             try:
                 if cancel_on_close and not completed:
-                    await self.turn_interrupt(thread_id, turn_id)
+                    await self._run_sync(
+                        lambda: self._sync.turn_interrupt(thread_id, turn_id),
+                        expected_epoch=origin.epoch,
+                        control=True,
+                    )
             finally:
-                self.unregister_turn_notifications(turn_id)
+                origin.router.unregister_turn(turn_id)

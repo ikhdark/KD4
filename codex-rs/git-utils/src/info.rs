@@ -432,7 +432,7 @@ pub async fn recent_commits(cwd: &Path, limit: usize) -> Vec<CommitLogEntry> {
     let text = String::from_utf8_lossy(&log_out.stdout);
     let mut entries: Vec<CommitLogEntry> = Vec::new();
     for line in text.lines() {
-        let mut parts = line.split('\u{001f}');
+        let mut parts = line.splitn(3, '\u{001f}');
         let sha = parts.next().unwrap_or("").trim();
         let ts_s = parts.next().unwrap_or("").trim();
         let subject = parts.next().unwrap_or("").trim();

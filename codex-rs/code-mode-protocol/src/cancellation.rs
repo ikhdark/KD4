@@ -101,7 +101,9 @@ impl CancellationCauseCell {
 }
 
 impl PartialEq for CancellationCauseCell {
-    fn eq(&self, other: &Self) -> bool { self.get() == other.get() }
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other) || self.get() == other.get()
+    }
 }
 impl Eq for CancellationCauseCell {}
 

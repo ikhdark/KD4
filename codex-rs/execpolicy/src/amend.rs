@@ -181,7 +181,18 @@ fn append_locked_line(policy_path: &Path, line: &str) -> Result<(), AmendError> 
         return Ok(());
     }
 
-    if !contents.is_empty() && !contents.ends_with('\n') {
+    let needs_separator = !contents.is_empty() && !contents.ends_with('\n');
+    let extra = (line.len() as u64).saturating_add(1 + u64::from(needs_separator));
+    if extra > MAX_POLICY_FILE_BYTES - contents.len() as u64 {
+        return Err(AmendError::WritePolicyFile {
+            path: policy_path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "amendment would exceed the 64 MiB policy file limit",
+            ),
+        });
+    }
+    if needs_separator {
         contents.push('\n');
     }
     contents.push_str(line);

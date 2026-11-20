@@ -7,6 +7,13 @@
         "null"
       ]
     },
+    "loginId": {
+      "description": "Matches the explicit login response; automatic plugin login has no request ID.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "name": {
       "type": "string"
     },
@@ -14,13 +21,6 @@
       "type": "boolean"
     },
     "threadId": {
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "loginId": {
-      "description": "Matches the explicit login response; automatic plugin login has no request ID.",
       "type": [
         "string",
         "null"

@@ -4,6 +4,10 @@ type ObjectValue = Record<string, unknown>;
 const object = (value: unknown): value is ObjectValue =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 const text = (value: unknown): value is string => typeof value === "string";
+const oneOf = (value: unknown, options: readonly string[]) =>
+  text(value) && options.includes(value);
+const nullableNumber = (value: unknown) =>
+  value === null || (typeof value === "number" && Number.isFinite(value));
 const identity = (value: unknown) => text(value) && value.trim().length > 0;
 const count = (value: unknown) =>
   typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
@@ -58,16 +62,14 @@ function validItem(value: unknown): boolean {
         text(value.aggregated_output) &&
         (value.exit_code === null ||
           (typeof value.exit_code === "number" && Number.isSafeInteger(value.exit_code))) &&
-        ["in_progress", "completed", "failed", "declined"].includes(String(value.status))
+        oneOf(value.status, ["in_progress", "completed", "failed", "declined"])
       );
     case "code_mode_cell":
       return (
         identity(value.call_id) &&
         identity(value.cell_id) &&
         text(value.error) &&
-        ["in_progress", "yielded", "completed", "failed", "terminated"].includes(
-          String(value.status),
-        )
+        oneOf(value.status, ["in_progress", "yielded", "completed", "failed", "terminated"])
       );
     case "code_mode_tool_call":
       return (
@@ -76,7 +78,7 @@ function validItem(value: unknown): boolean {
         identity(value.parent_cell_id) &&
         identity(value.runtime_tool_call_id) &&
         identity(value.tool) &&
-        ["in_progress", "completed", "failed"].includes(String(value.status)) &&
+        oneOf(value.status, ["in_progress", "completed", "failed"]) &&
         (value.success === null || typeof value.success === "boolean") &&
         (value.error === null || text(value.error)) &&
         (value.duration_ms === null || count(value.duration_ms)) &&
@@ -91,7 +93,7 @@ function validItem(value: unknown): boolean {
       );
     case "file_change":
       return (
-        ["in_progress", "completed", "failed", "declined"].includes(String(value.status)) &&
+        oneOf(value.status, ["in_progress", "completed", "failed", "declined"]) &&
         (value.effects === undefined ||
           (object(value.effects) &&
             typeof value.effects.exact === "boolean" &&
@@ -106,16 +108,14 @@ function validItem(value: unknown): boolean {
         Array.isArray(value.changes) &&
         value.changes.every(
           (change) =>
-            object(change) &&
-            text(change.path) &&
-            ["add", "delete", "update"].includes(String(change.kind)),
+            object(change) && text(change.path) && oneOf(change.kind, ["add", "delete", "update"]),
         )
       );
     case "mcp_tool_call":
       return (
         text(value.server) &&
         text(value.tool) &&
-        ["in_progress", "completed", "failed"].includes(String(value.status)) &&
+        oneOf(value.status, ["in_progress", "completed", "failed"]) &&
         (value.error === null || error(value.error)) &&
         (value.result === null || (object(value.result) && Array.isArray(value.result.content)))
       );
@@ -129,7 +129,7 @@ function validItem(value: unknown): boolean {
         Object.values(value.agents_states).every(
           (state) =>
             object(state) &&
-            [
+            oneOf(state.status, [
               "pending_init",
               "running",
               "interrupted",
@@ -137,15 +137,13 @@ function validItem(value: unknown): boolean {
               "errored",
               "shutdown",
               "not_found",
-            ].includes(String(state.status)) &&
+            ]) &&
             (state.message === null || text(state.message)) &&
             surfaced(state.surfaced_result) &&
             optionalText(state.last_agent_message),
         ) &&
-        ["spawn_agent", "send_input", "resume_agent", "wait", "close_agent"].includes(
-          String(value.tool),
-        ) &&
-        ["in_progress", "completed", "failed"].includes(String(value.status))
+        oneOf(value.tool, ["spawn_agent", "send_input", "resume_agent", "wait", "close_agent"]) &&
+        oneOf(value.status, ["in_progress", "completed", "failed"])
       );
     case "web_search":
       return (
@@ -187,7 +185,7 @@ export function validateThreadEvent(value: unknown): ThreadEvent {
           error(value.error) &&
           (value.usage === undefined || usage(value.usage)) &&
           (value.disposition === undefined ||
-            ["failed", "interrupted", "transport_lost"].includes(String(value.disposition)));
+            oneOf(value.disposition, ["failed", "interrupted", "transport_lost"]));
         break;
       case "error":
         valid = error(value);
@@ -198,36 +196,44 @@ export function validateThreadEvent(value: unknown): ThreadEvent {
         valid = validItem(value.item);
         break;
       case "item.progress":
-        valid =
-          identity(value.item_id) &&
-          identity(value.call_id) &&
-          (value.kind === "command_output" || value.kind === "agent_message"
-            ? text(value.delta)
-            : value.kind === "mcp"
-              ? text(value.message)
-              : true);
-        if (value.kind === "agent_message") valid &&= typeof value.truncated === "boolean";
+        valid = identity(value.item_id) && identity(value.call_id) && identity(value.kind);
+        switch (value.kind) {
+          case "command_output":
+            valid &&=
+              text(value.delta) &&
+              (value.stream === null || oneOf(value.stream, ["stdout", "stderr"])) &&
+              (value.decoding_lossy === null || typeof value.decoding_lossy === "boolean") &&
+              typeof value.truncated === "boolean";
+            break;
+          case "agent_message":
+            valid &&= text(value.delta) && typeof value.truncated === "boolean";
+            break;
+          case "mcp":
+            valid &&=
+              text(value.message) &&
+              nullableNumber(value.progress) &&
+              nullableNumber(value.total) &&
+              typeof value.truncated === "boolean";
+            break;
+        }
         break;
     }
-    if (
-      (value.type === "turn.completed" || value.type === "turn.failed") &&
-      value.timing !== undefined &&
-      value.timing !== null &&
-      !object(value.timing)
-    )
-      valid = false;
-    if (object(value.timing) && value.timing.finalAnswer !== undefined) {
-      const answer = value.timing.finalAnswer;
-      valid &&=
-        object(answer) &&
-        (answer.message === null ||
-          (object(answer.message) &&
-            identity(answer.message.itemId) &&
-            text(answer.message.text) &&
-            identity(answer.message.completionAttemptId) &&
-            ["assistant_final", "legacy_unphased", "plan"].includes(
-              String(answer.message.origin),
-            )));
+    if (value.type === "turn.completed" || value.type === "turn.failed") {
+      const timing = value.timing;
+      if (timing !== undefined && timing !== null) {
+        valid &&= object(timing);
+        if (object(timing) && timing.finalAnswer !== undefined) {
+          const answer = timing.finalAnswer;
+          valid &&=
+            object(answer) &&
+            (answer.message === null ||
+              (object(answer.message) &&
+                identity(answer.message.itemId) &&
+                text(answer.message.text) &&
+                identity(answer.message.completionAttemptId) &&
+                oneOf(answer.message.origin, ["assistant_final", "legacy_unphased", "plan"])));
+        }
+      }
     }
   }
   if (!valid) throw new Error("Invalid turn stream: malformed known event envelope");
@@ -236,9 +242,17 @@ export function validateThreadEvent(value: unknown): ThreadEvent {
 
 /** Match the equivalent UUID spellings accepted by the CLI, or an opaque name. */
 export function canonicalThreadId(value: string): string | null {
-  const stripped = value
-    .replace(/^urn:uuid:/i, "")
-    .replace(/^\{(.*)\}$/, "$1")
-    .replace(/-/g, "");
-  return /^[0-9a-f]{32}$/i.test(stripped) ? stripped.toLowerCase() : null;
+  if (value.length === 32 && /^[0-9a-f]{32}$/i.test(value)) return value.toLowerCase();
+  let hyphenated = value;
+  if (value.length === 38 && value.startsWith("{") && value.endsWith("}")) {
+    hyphenated = value.slice(1, -1);
+  } else if (value.length === 45 && value.slice(0, 9).toLowerCase() === "urn:uuid:") {
+    hyphenated = value.slice(9);
+  }
+  if (
+    hyphenated.length !== 36 ||
+    !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(hyphenated)
+  )
+    return null;
+  return hyphenated.replaceAll("-", "").toLowerCase();
 }

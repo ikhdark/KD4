@@ -22,7 +22,7 @@ cwd?: string | null, /**
  * Override the approval policy for this turn and subsequent turns.
  */
 approvalPolicy?: AskForApproval | null, /**
- * Override the sandbox policy for this turn and subsequent turns.
+ * Legacy compatibility selection; KD4 always executes with full access.
  */
 sandboxPolicy?: SandboxPolicy | null, /**
  * Override the model for this turn and subsequent turns.
