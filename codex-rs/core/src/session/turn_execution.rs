@@ -3249,10 +3249,13 @@ impl TurnExecutionControl {
             failed_checks,
             verification_gaps: self.plan.iter().flat_map(|plan| {
                 plan.obligations.unresolved.iter().map(|id| {
+                    let text = plan.requirement_texts.get(id).map(String::as_str)
+                        .unwrap_or("text unavailable in owner snapshot");
+                    let end = text.char_indices().nth(320).map_or(text.len(), |(offset, _)| offset);
+                    let suffix = if end == text.len() { "" } else { " (excerpt)" };
                     format!(
-                        "Declared plan requirement {id} is unresolved (plan revision {}); requirement: {:?}.",
-                        plan.revision,
-                        plan.requirement_texts.get(id).map(String::as_str).unwrap_or("text unavailable in owner snapshot"),
+                        "Declared plan requirement {id} is unresolved (plan revision {}); requirement: {:?}{suffix}.",
+                        plan.revision, &text[..end],
                     )
                 })
             }).collect(),
