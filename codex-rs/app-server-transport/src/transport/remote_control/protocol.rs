@@ -118,13 +118,19 @@ pub(super) struct DeliveryObservation {
     stream_key: String,
     seq_id: u64,
     segment_id: Option<usize>,
+    message_observation_id: Option<uuid::Uuid>,
 }
 
 impl DeliveryObservation {
     pub(super) fn new(client: &ClientId, stream: &StreamId, seq_id: u64, segment_id: Option<usize>) -> Option<Self> {
         if !codex_protocol::timing::observations::enabled() { return None; }
         let bytes = serde_json::to_vec(&(client, stream)).ok()?;
-        Some(Self { stream_key: Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect(), seq_id, segment_id })
+        Some(Self { stream_key: Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect(), seq_id, segment_id, message_observation_id: None })
+    }
+
+    pub(super) fn with_message_id(mut self, id: Option<uuid::Uuid>) -> Self {
+        self.message_observation_id = id;
+        self
     }
 
     pub(super) fn record(&self, kind: &str, mut facts: serde_json::Value) {
@@ -132,6 +138,9 @@ impl DeliveryObservation {
         data.insert("stream_key_sha256".into(), self.stream_key.clone().into());
         data.insert("seq_id".into(), self.seq_id.into());
         data.insert("segment_id".into(), self.segment_id.into());
+        if let Some(id) = self.message_observation_id {
+            data.insert("message_observation_id".into(), serde_json::json!(id));
+        }
         let _ = codex_protocol::timing::observations::record(kind, "", "", "", facts);
     }
 }
@@ -146,7 +155,27 @@ pub(super) fn response_observation(message: &OutgoingMessage) -> serde_json::Val
     let (id, error_code) = match message {
         OutgoingMessage::Response(response) => (&response.id, None),
         OutgoingMessage::Error(error) => (&error.id, Some(error.error.code)),
-        _ => return serde_json::json!({"message_kind":"other"}),
+        OutgoingMessage::Request(request) => return serde_json::json!({
+            "message_kind":"server_request", "message_category":request.method(),
+        }),
+        OutgoingMessage::AppServerNotification(notification) => {
+            use codex_app_server_protocol_types::ServerNotification as N;
+            let (thread, turn): (Option<&str>, Option<&str>) = match notification {
+                N::ThreadNameUpdated(n) => (Some(&n.thread_id), None),
+                N::TurnStarted(n) => (Some(&n.thread_id), Some(&n.turn.id)),
+                N::TurnCompleted(n) => (Some(&n.thread_id), Some(&n.turn.id)),
+                N::ItemStarted(n) => (Some(&n.thread_id), Some(&n.turn_id)),
+                N::ItemCompleted(n) => (Some(&n.thread_id), Some(&n.turn_id)),
+                _ => (None, None),
+            };
+            let key = |id: &str| -> String {
+                Sha256::digest(id.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect()
+            };
+            return serde_json::json!({
+                "message_kind":"notification", "message_category":notification.to_string(),
+                "thread_key_sha256":thread.map(key), "turn_key_sha256":turn.map(key),
+            });
+        }
     };
     serde_json::json!({"message_kind":if error_code.is_some() { "error" } else { "response" },
         "request_key_sha256":rpc_request_key_v1(id), "request_key_version":1, "error_code":error_code})

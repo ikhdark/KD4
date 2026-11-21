@@ -106,8 +106,9 @@ struct BufferedServerEnvelope {
 impl BufferedServerEnvelope {
 
 
-    fn from_payload(encoded: EncodedServerPayload, completion: Option<WriteCompletion>, delivery_failure: Option<CancellationToken>, replay_credit: Arc<super::ReplayCredit>) -> Self {
-        let observation = super::protocol::DeliveryObservation::new(&encoded.client_id, &encoded.stream_id, encoded.seq_id, encoded.segment_id);
+    fn from_payload(encoded: EncodedServerPayload, completion: Option<WriteCompletion>, delivery_failure: Option<CancellationToken>, replay_credit: Arc<super::ReplayCredit>, message_id: Option<uuid::Uuid>) -> Self {
+        let observation = super::protocol::DeliveryObservation::new(&encoded.client_id, &encoded.stream_id, encoded.seq_id, encoded.segment_id)
+            .map(|observation| observation.with_message_id(message_id));
         Self {
             client_id: encoded.client_id,
             stream_id: encoded.stream_id,
@@ -160,6 +161,7 @@ impl ServerEventReceiver {
 }
 
 struct PendingServerEncoding {
+    message_observation_id: Option<uuid::Uuid>,
     key: (ClientId, StreamId),
     seq_id: u64,
     completion: Option<oneshot::Sender<std::time::Instant>>,
@@ -235,13 +237,16 @@ impl ServerWriterQueue {
                 event: queued.event, client_id: queued.client_id, stream_id: queued.stream_id, seq_id,
             };
             if let Some(observation) = super::protocol::DeliveryObservation::new(&envelope.client_id, &envelope.stream_id, seq_id, None) {
-                let facts = match &envelope.event {
+                let mut facts = match &envelope.event {
                     super::protocol::ServerEvent::ServerMessage { message } => super::protocol::response_observation(message),
-                    _ => serde_json::json!({"message_kind":"other"}),
+                    super::protocol::ServerEvent::Pong { .. } => serde_json::json!({"message_kind":"transport_control","message_category":"pong"}),
+                    _ => serde_json::json!({"message_kind":"transport_control"}),
                 };
+                facts["message_observation_id"] = serde_json::json!(queued.message_observation_id);
                 observation.record("mobile_transport_encoding", facts);
             }
             receiver.encoding = Some(PendingServerEncoding {
+                message_observation_id: queued.message_observation_id,
                 key, seq_id, completion: queued.write_complete_tx,
                 delivery_failure: queued.delivery_failure,
                 encoded: None,
@@ -295,7 +300,8 @@ impl ServerWriterQueue {
             let completion = if index + 1 == count {
                 encoding.completion.take().map(|sender| Arc::new(std::sync::Mutex::new(Some(sender))))
             } else { None };
-            let buffered = BufferedServerEnvelope::from_payload(encoded, completion, encoding.delivery_failure.clone(), Arc::clone(&encoding.replay_credit));
+            let buffered = BufferedServerEnvelope::from_payload(encoded, completion, encoding.delivery_failure.clone(),
+                Arc::clone(&encoding.replay_credit), encoding.message_observation_id);
             if let Some(observation) = &buffered.observation {
                 observation.record("mobile_transport_buffered", serde_json::json!({"frame_count":count}));
             }
@@ -392,6 +398,7 @@ impl BoundedOutboundBuffer {
         stream_id: &StreamId,
         acked_seq_id: u64,
         acked_segment_id: Option<usize>,
+        receive_boundary: Option<(uuid::Uuid, u128, u128)>,
     ) -> bool {
         let key = (client_id.clone(), stream_id.clone());
         let Some(buffer) = self.buffer_by_stream.get_mut(&key) else {
@@ -405,7 +412,14 @@ impl BoundedOutboundBuffer {
         }) {
             if let Some(envelope) = buffer.pop_front()
                 && let Some(observation) = envelope.observation {
-                observation.record("mobile_transport_acknowledged", serde_json::json!({"boundary":"relay_ack_not_phone_rendering"}));
+                let mut facts = serde_json::json!({"boundary":"relay_ack_not_phone_rendering"});
+                if let Some((generation, received_ns, accepted_ns)) = receive_boundary {
+                    facts["socket_generation"] = serde_json::json!(generation);
+                    facts["ack_reader_received_ns"] = serde_json::json!(u64::try_from(received_ns).ok());
+                    facts["ack_reader_to_buffer_ns"] =
+                        serde_json::json!(u64::try_from(accepted_ns.saturating_sub(received_ns)).ok());
+                }
+                observation.record("mobile_transport_acknowledged", facts);
             }
             removed += 1;
         }
@@ -589,12 +603,15 @@ impl WebsocketState {
             self.client_segment_reassembler.commit_completed(&client_id, &stream_id, seq_id);
         }
         if let Some((client_id, stream_id, seq_id, segment_id)) = delivery.ack {
-            self.record_ack(&client_id, &stream_id, seq_id, segment_id);
+            self.record_ack(&client_id, &stream_id, seq_id, segment_id, None);
         }
     }
 
-    fn record_ack(&mut self, client_id: &ClientId, stream_id: &StreamId, seq_id: u64, segment_id: Option<usize>) {
-        if self.outbound_buffer.ack(client_id, stream_id, seq_id, segment_id) {
+    fn record_ack(&mut self, client_id: &ClientId, stream_id: &StreamId, seq_id: u64, segment_id: Option<usize>,
+        received: Option<(uuid::Uuid, u128)>) {
+        let boundary = received.map(|(generation, received_ns)|
+            (generation, received_ns, codex_protocol::timing::process_monotonic_ns()));
+        if self.outbound_buffer.ack(client_id, stream_id, seq_id, segment_id, boundary) {
             // Confirmed consumption is activity; merely generating or buffering
             // output is not proof that this virtual subscriber is alive.
             self.last_ack_activity_by_stream.insert(
@@ -1637,7 +1654,8 @@ impl RemoteControlWebsocket {
                 writer_operation(&shutdown_token, websocket_writer.feed(tungstenite::Message::Text(frame.payload))).await?;
                 if shutdown_token.is_cancelled() { return Ok(()); }
                 if let Some(observation) = frame.observation {
-                    flushed_observations.push((observation, frame.buffered_at, feed_started.and_then(|at| u64::try_from(at.elapsed().as_nanos()).ok())));
+                    let feed_done = std::time::Instant::now();
+                    flushed_observations.push((observation, frame.buffered_at, feed_started, feed_done));
                 }
                 if let Some(completion) = frame.completion {
                     completions.push((completion, frame.delivery_failure));
@@ -1646,12 +1664,22 @@ impl RemoteControlWebsocket {
             let flush_started = (!flushed_observations.is_empty()).then(std::time::Instant::now);
             writer_operation(&shutdown_token, websocket_writer.flush()).await?;
             if shutdown_token.is_cancelled() { return Ok(()); }
-            let flush_wait_ns = flush_started.and_then(|at| u64::try_from(at.elapsed().as_nanos()).ok());
-            for (observation, buffered_at, feed_wait_ns) in flushed_observations {
+            // Use one timestamp for the entire batch, before recording any
+            // observations; journal I/O must not inflate the later frame ages.
+            let flush_done = flush_started.map(|_| std::time::Instant::now());
+            let nanos_between = |start: std::time::Instant, end: std::time::Instant| {
+                u64::try_from(end.checked_duration_since(start)?.as_nanos()).ok()
+            };
+            for (observation, buffered_at, feed_started, feed_done) in flushed_observations {
+                let (Some(feed_started), Some(flush_started), Some(flush_done)) =
+                    (feed_started, flush_started, flush_done) else { continue };
                 observation.record("mobile_transport_flushed", serde_json::json!({
                     "boundary":"relay_socket_flush_not_phone_receipt", "socket_generation":socket_generation,
-                    "feed_wait_ns":feed_wait_ns, "flush_wait_ns":flush_wait_ns,
-                    "buffer_age_ns":u64::try_from(buffered_at.elapsed().as_nanos()).ok(),
+                    "buffer_to_feed_ns":nanos_between(buffered_at, feed_started),
+                    "feed_wait_ns":nanos_between(feed_started, feed_done),
+                    "feed_to_flush_ns":nanos_between(feed_done, flush_started),
+                    "flush_wait_ns":nanos_between(flush_started, flush_done),
+                    "buffer_age_ns":nanos_between(buffered_at, flush_done),
                 }));
             }
             for (completion, failure) in completions {
@@ -1763,6 +1791,8 @@ impl RemoteControlWebsocket {
                     }
                 }
             };
+            let received = socket_generation.map(|generation|
+                (generation, codex_protocol::timing::process_monotonic_ns()));
             let (client_envelope, wire_size_bytes) = match incoming_message {
                 Ok(tungstenite::Message::Text(text)) => {
                     let wire_size_bytes = text.len();
@@ -1868,7 +1898,7 @@ impl RemoteControlWebsocket {
             let mut delivery = ClientDeliveryMetadata::from(&client_envelope);
             if let Some((client_id, stream_id, seq_id, segment_id)) = delivery.ack.take() {
                 let mut state = state.lock().await;
-                state.record_ack(&client_id, &stream_id, seq_id, segment_id);
+                state.record_ack(&client_id, &stream_id, seq_id, segment_id, received);
                 // Coalesce the cursor into the preceding frontier operation.
                 // ACK bookkeeping never consumes ordinary forwarding admission.
                 if let Some(previous) = pending.back_mut() {

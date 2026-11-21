@@ -39,6 +39,12 @@ and integrate through guarded delivery rather than editing the shared checkout.
 **Code preservation and change scope:** Treat existing code and behavior as intentional unless evidence indicates otherwise. Make the smallest changes necessary to accomplish the task. Do not remove, replace, or rewrite existing functionality merely because a new implementation overlaps with it or appears cleaner. Before replacing code, understand its responsibilities, dependencies, and existing guarantees. Replacement is justified when explicitly requested or supported by a concrete technical reason. Preserve unrelated behavior, contracts, error handling, and edge cases. Review the final diff for unintended removals, behavioral regressions, and unnecessary changes. Restore changes that cannot be justified by the task.
 Disabling a feature or making a valid path unreachable counts as modifying it
 even when the original code remains.
+Before modifying existing behavior or a shared contract, record the supported
+paths, affected callers and consumers, and relevant failure, compatibility and
+concurrency boundaries. For each material change, verify the intended outcome
+and representative previously valid paths against the final implementation
+using permitted checks. A successful new path does not prove older paths still
+work. Record which inventoried paths passed and which remain unverified.
 
 **Guidance preservation:** Treat existing instructions as requirements to preserve, not text to freely rewrite. When adding or updating guidance, make the smallest change necessary. Do not remove, replace, or weaken existing instructions merely because new guidance addresses a related subject. Replacement is justified only when explicitly requested, when existing guidance is demonstrably obsolete, or when a concrete incompatibility requires it. Before completing, inspect the diff and restore any unrelated or unjustified changes.
 A conflicting exception or a change in precedence, applicability or defaults
@@ -86,11 +92,16 @@ wording is untouched.
   Trace each criterion to the user's request (including corrections) or an
   applicable owner contract. Before handoff, check those sources against the
   plan so a missed item cannot silently disappear.
-- Existing requested obligations and every open finding in an audit case
-  remain required; do not reclassify them as incidental. Only the user may
-  narrow their request. An applicable owner contract may explicitly supersede
-  only requirements it governs, without overriding the user's request.
-  Record the authority for any such change and follow the case's closure rules.
+- A review or repair of an existing case as a whole covers every open finding.
+  An explicitly narrow read-only assignment, such as Git provenance, covers the
+  requested items and names exclusions and their reasons. Answer the assigned
+  question without reopening or resolving the original repair or behavioral
+  verification obligations or changing the case disposition. Existing
+  obligations remain active in their owning task or case; do not reclassify them
+  as incidental. Only the user may narrow their request. An applicable owner
+  contract may explicitly supersede only requirements it governs, without
+  overriding the user's request. Record the authority for any such change and
+  follow the case's closure rules.
 - For broad reviews, account for the complete requested inventory, including
   partial reads and every slice handed to a worker. Reconcile each worker's
   coverage, remaining scope and findings with that inventory; unassigned,
@@ -158,14 +169,19 @@ wording is untouched.
 
 **Benchmark reuse and preservation:** Before modifying or creating benchmark scripts, identify existing workloads that measure the requested behavior. Prefer reusing or parameterizing established benchmarks over changing their definitions. Extend coverage without removing existing scenarios. Changes to shared benchmark logic are permitted when correcting defects or improving measurement reliability, but must not silently invalidate historical comparisons. Preserve reproducibility and clearly distinguish new measurements from previously established baselines. Prefer stable benchmark infrastructure with reusable, named scenarios rather than accumulating a separate Python script for every measurement.
 
-- Before implementing a suggested new addition or feature, run a matched A/B
-  comparison of the current behavior (A) and proposed behavior (B) against explicit
-  improvement criteria using representative inputs and equivalent settings.
+- Before implementing a proposed feature or optimization, run a matched A/B
+  comparison of the current behavior (A) and proposed behavior (B) against
+  explicit improvement criteria with representative inputs and equivalent
+  settings.
   If measurement requires code, use a bounded isolated prototype first; proceed
   with full implementation only when the comparison demonstrates an improvement
   without regressions in required behavior. Consider correctness, performance,
   usability and maintenance cost as relevant; retain evidence and tradeoffs.
-  An inconclusive comparison is not evidence of improvement.
+  An inconclusive comparison is not evidence of improvement. If a valid
+  comparison cannot be obtained within applicable permissions and limits,
+  identify the blocker and leave the candidate unimplemented beyond a
+  permitted isolated prototype. Infeasibility does not waive the requirement;
+  continue independent work, including separable correctness repairs.
   Classify changes by effect: restoring established behavior is a repair;
   added behavior or optimization beyond that contract is a candidate change,
   even when bundled with a repair. Ordinary correctness repairs do not require
@@ -298,6 +314,17 @@ an evidence-backed rationale using existing patch assessment metadata when
 available, otherwise briefly before editing. Weigh correctness, retained benefits,
 complexity, maintenance and workflow impact; distinguish judgment from measurement.
 
+When a regression is confirmed, its repair also records the behavior that
+must keep working: add a `behavioral_constraints` entry to that repository's
+fix registry, following [evidence advisories](../KDR/docs/operations/EVIDENCE_ADVISORIES.md).
+When a change touches a recorded constraint or ledger condition, rerun its
+registered reproduction or workload with permitted checks before handoff. If
+that rerun fails or cannot be obtained, report a regression warning and do
+not report the new change as verified. Report every change to a registered
+reproduction, its inputs or its expected results. These warnings never
+refuse edits. When committing, give each verified fix its own commit that
+names its finding or fix ID and contains only that fix's files or hunks.
+
 Advisories are selective, non-blocking context, not approval gates or proof of
 full coverage. Distinguish delivered context, observed reads and reported
 consideration. Missing records remain unknown. Do not require proposal patches,
@@ -345,7 +372,8 @@ and retains run evidence in its [benchmark library](../KDA/benchmarks/README.md)
   case record.
   Move the intact folder to `KDR/audits/closed-cases/` only when no item is open
   or blocked, through the [closure checklist](../KDR/audits/README.md#closure-checklist);
-  an explicitly read-only review closes when the review is complete. A label,
+  a read-only review is complete when its assigned coverage is verified.
+  That does not close an existing case with open or blocked work. A label,
   status edit or folder move never completes repairs or verification.
 - Automatically consolidate same-task follow-ups, corrections and small
   adjustments into the existing task record, including across sessions. A

@@ -1669,7 +1669,9 @@ impl OutgoingMessageSender {
         commit: impl std::future::Future<Output = std::result::Result<Option<G>, JSONRPCErrorError>>,
     ) -> bool {
         let response = ClientResponsePayload::from(response);
+        let serialization_start = Self::resume_serialization_start(true);
         let serialized = response.into_jsonrpc_parts_and_payload(request_id.request_id.clone());
+        let serialization_timing = serialization_start.map(|start| (start, codex_protocol::timing::process_monotonic_ns(), serialized.is_ok()));
         let (id, result, analytics_response) = match serialized {
             Ok(parts) => parts,
             Err(error) => {
@@ -1694,6 +1696,8 @@ impl OutgoingMessageSender {
             return false;
         }
         let request_context = self.request_context(&request_id).await;
+        Self::record_resume_serialization(request_context.as_ref(), serialization_timing);
+        let response_observation = Self::observe_local_resume_response(request_context.as_ref());
         let reserve = async {
             tokio::select! {
                 biased;
@@ -1765,8 +1769,54 @@ impl OutgoingMessageSender {
             write_complete_tx: None,
         });
         drop(guard);
+        if let Some(observation) = response_observation {
+            observation.finish(
+                if committed { "enqueued" } else { "error_enqueued" },
+                serde_json::Value::Null,
+            );
+        }
         self.finish_request_context(request_context.as_ref()).await;
         committed
+    }
+
+    fn resume_serialization_start(resume_response: bool) -> Option<u128> {
+        (resume_response && codex_protocol::timing::observations::enabled())
+            .then(codex_protocol::timing::process_monotonic_ns)
+    }
+
+    fn record_resume_serialization(
+        context: Option<&RequestContext>,
+        timing: Option<(u128, u128, bool)>,
+    ) {
+        if let (Some(operation), Some((start_ns, end_ns, encoded))) = (
+            context.and_then(RequestContext::mobile_observation_id).filter(|id| id.starts_with("local:")),
+            timing,
+        ) {
+            let _ = codex_protocol::timing::observations::record(
+                "thread_resume_response_serialization", "", "", operation,
+                serde_json::json!({
+                    "start_ns": start_ns, "end_ns": end_ns, "encoded": encoded,
+                    "boundary": "response_projection_not_transport_frame"
+                }),
+            );
+        }
+    }
+
+    fn observe_local_resume_response(
+        context: Option<&RequestContext>,
+    ) -> Option<codex_protocol::timing::observations::Span> {
+        context
+            .and_then(RequestContext::mobile_observation_id)
+            .filter(|id| id.starts_with("local:"))
+            .map(|operation| {
+                codex_protocol::timing::observations::Span::start(
+                    "local_rpc_response",
+                    "",
+                    "",
+                    operation,
+                    serde_json::json!({"boundary": "resume_response_owner_not_peer_receipt"}),
+                )
+            })
     }
 
     async fn send_response_as_inner(
@@ -1778,9 +1828,11 @@ impl OutgoingMessageSender {
         let connection_id = request_id.connection_id;
         let request_id_for_analytics = request_id.request_id.clone();
         let retryable_history_page = matches!(&response, ClientResponsePayload::ThreadTurnsList(_));
-        let serialized_response = response
-            .into_jsonrpc_parts_and_payload(request_id.request_id.clone())
-            .map(|(id, result, response)| {
+        let resume_response = matches!(&response, ClientResponsePayload::ThreadResume(_));
+        let serialization_start = Self::resume_serialization_start(resume_response);
+        let serialized = response.into_jsonrpc_parts_and_payload(request_id.request_id.clone());
+        let serialization_timing = serialization_start.map(|start| (start, codex_protocol::timing::process_monotonic_ns(), serialized.is_ok()));
+        let serialized_response = serialized.map(|(id, result, response)| {
                 if let Some(response) = response {
                     match thread_originator {
                         Some(thread_originator) => {
@@ -1804,6 +1856,10 @@ impl OutgoingMessageSender {
                 (id, result)
             });
         let request_context = self.request_context(&request_id).await;
+        Self::record_resume_serialization(request_context.as_ref(), serialization_timing);
+        let response_observation = resume_response
+            .then(|| Self::observe_local_resume_response(request_context.as_ref()))
+            .flatten();
 
         match serialized_response {
             Ok((id, result)) => {
@@ -1828,6 +1884,9 @@ impl OutgoingMessageSender {
                 )
                 .await;
             }
+        }
+        if let Some(observation) = response_observation {
+            observation.finish("owner_returned_not_peer_receipt", serde_json::Value::Null);
         }
     }
 

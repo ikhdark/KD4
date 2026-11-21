@@ -8,6 +8,7 @@ fn main() {
     let small = std::env::args().any(|arg| arg == "--small-rows");
     let stress_mobile = std::env::args().any(|arg| arg == "--stress-mobile");
     let stress_lifecycle = std::env::args().any(|arg| arg == "--stress-lifecycle");
+    let late_rpc = std::env::args().any(|arg| arg == "--late-rpc");
     let block_secondary = std::env::args().any(|arg| arg == "--block-secondary");
     if block_secondary {
         let directory = std::path::PathBuf::from(std::env::var_os("CODEX_RUNTIME_OBSERVATIONS_DIR").expect("benchmark output directory"));
@@ -40,6 +41,15 @@ fn main() {
             }
             mobile_accepted += 1;
         }
+    }
+    if late_rpc {
+        let operation = "late-pressure-request";
+        let ingress = observations::record("mobile_rpc_received", "", "", operation,
+            json!({"schema_version":1,"connection_id":1,"method":"thread/resume"}));
+        observations::Span::start("mobile_rpc_response", "", "", operation, json!({}))
+            .finish("owner_returned_not_peer_receipt", json!({}));
+        println!("{}", json!({"workload":"late-rpc-after-detail-pressure",
+            "ingress_received":ingress.is_some()}));
     }
     let retirement_after_cap = observations::record("mobile_connection_retired", "", "", "connection-1",
         json!({"schema_version":1,"connection_id":1,"reason":"peer_closed"}));

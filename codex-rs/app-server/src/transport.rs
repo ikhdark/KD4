@@ -515,11 +515,11 @@ async fn send_message_to_connection(
         codex_app_server_transport::preview_remote_notification(&mut message);
     }
     let writer = connection_state.writer.clone();
-    let queued_message = QueuedOutgoingMessage {
-        message,
-        encoded_json: None,
-        write_complete_tx: write_complete_tx.map(|receipt| receipt.writer),
-    };
+    let mut queued_message = QueuedOutgoingMessage::new(message);
+    queued_message.write_complete_tx = write_complete_tx.map(|receipt| receipt.writer);
+    if connection_state.remote_preview {
+        queued_message.mark_remote_observation(connection_id.0);
+    }
     if connection_state.is_in_process {
         // This is a dedicated single-connection response owner. Waiting here
         // cannot stall the independent client/reply dispatcher or other clients.

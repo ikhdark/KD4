@@ -190,14 +190,16 @@ impl ConfigManager {
     where
         I: IntoIterator<Item = (String, bool)>,
     {
-        self.extend_runtime_feature_enablement_inner(None, enablement).map_err(|_| ())
+        self.extend_runtime_feature_enablement_inner(None, enablement)
+            .map(|_| ())
+            .map_err(|_| ())
     }
 
     pub fn extend_runtime_feature_enablement_for_generation<I>(
         &self,
         generation: u64,
         enablement: I,
-    ) -> std::io::Result<()>
+    ) -> std::io::Result<bool>
     where
         I: IntoIterator<Item = (String, bool)>,
     {
@@ -208,7 +210,7 @@ impl ConfigManager {
         &self,
         generation: Option<u64>,
         enablement: I,
-    ) -> std::io::Result<()>
+    ) -> std::io::Result<bool>
     where
         I: IntoIterator<Item = (String, bool)>,
     {
@@ -228,12 +230,12 @@ impl ConfigManager {
         let mut next = runtime_feature_enablement.clone();
         next.extend(enablement);
         if next == *runtime_feature_enablement {
-            return Ok(());
+            return Ok(false);
         }
         *runtime_feature_enablement = next;
         drop(runtime_feature_enablement);
-        self.invalidate_load_cache_locked();
-        Ok(())
+        self.invalidate_load_cache_locked("runtime_feature_enablement");
+        Ok(true)
     }
 
     pub fn replace_cloud_config_bundle_loader(
@@ -269,7 +271,7 @@ impl ConfigManager {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = std::mem::replace(&mut *guard, thread_config_loader);
-        self.invalidate_load_cache_locked();
+        self.invalidate_load_cache_locked("thread_config_loader");
         drop(guard);
         drop(policy);
         drop(previous);
@@ -434,7 +436,7 @@ impl ConfigManager {
                 supplied_at_startup: false,
             },
         );
-        self.invalidate_load_cache_locked();
+        self.invalidate_load_cache_locked("cloud_config_loader");
         previous
     }
 
@@ -905,10 +907,11 @@ impl ConfigManager {
         config.codex_self_exe = self.arg0_paths.codex_self_exe.clone();
     }
 
+    #[track_caller]
     pub fn invalidate_load_cache(&self) {
         let _policy = self.cloud_config_bundle.write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.invalidate_load_cache_locked();
+        self.invalidate_load_cache_locked("explicit_policy_invalidation");
     }
 
     /// Drops the coalesced config reads without advancing the policy generation.
@@ -930,12 +933,28 @@ impl ConfigManager {
 
     // Caller holds the policy publication write lock. Match the reader's
     // policy -> cache lock order, publishing the generation with its cleanup.
-    fn invalidate_load_cache_locked(&self) {
+    #[track_caller]
+    fn invalidate_load_cache_locked(&self, reason: &'static str) {
         let mut cache = self.load_cache.write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.load_generation.fetch_add(1, Ordering::AcqRel);
+        let previous = self.load_generation.fetch_add(1, Ordering::AcqRel);
         cache.ready.clear();
         cache.flights.clear();
+        drop(cache);
+        if codex_protocol::timing::observations::enabled() {
+            let location = std::panic::Location::caller();
+            let caller = location.file().rsplit(['/', '\\']).next().unwrap_or("unknown");
+            let _ = codex_protocol::timing::observations::record(
+                "app_server_config_generation_published", "", "", "",
+                serde_json::json!({
+                    "reason": reason,
+                    "previous_generation": previous,
+                    "generation": previous.wrapping_add(1),
+                    "source_file": caller,
+                    "source_line": location.line(),
+                }),
+            );
+        }
     }
 
 

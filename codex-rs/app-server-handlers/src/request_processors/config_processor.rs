@@ -177,6 +177,10 @@ impl ConfigRequestProcessor {
     pub(crate) fn handle_config_mutation(&self) {
         // Mutations may bypass ConfigManager writes; publish them to the next read.
         self.config_manager.invalidate_load_cache();
+        self.refresh_policy_consumers();
+    }
+
+    fn refresh_policy_consumers(&self) {
         self.config_manager.recheck_remote_policy_after_config_mutation();
         self.thread_manager.plugins_manager().clear_cache();
         self.thread_manager.skills_service().clear_cache();
@@ -267,7 +271,8 @@ impl ConfigRequestProcessor {
         // The owner rechecks this generation under its publication lock.
         let generation = self.config_manager.policy_generation();
         self.load_latest_config(/*fallback_cwd*/ None).await?;
-        self.config_manager
+        let changed = self
+            .config_manager
             .extend_runtime_feature_enablement_for_generation(
                 generation,
                 enablement
@@ -275,7 +280,13 @@ impl ConfigRequestProcessor {
                     .map(|(name, enabled)| (name.clone(), *enabled)),
             )
             .map_config_load_error()?;
-        self.handle_config_mutation();
+        // The publisher already advanced the generation for a change. An
+        // identical replay still refreshes loaded consumers (including retries
+        // after partial refresh), but is not a new policy publication.
+        if !changed {
+            self.config_manager.discard_cached_loads();
+        }
+        self.refresh_policy_consumers();
 
         self.reload_user_config(&refreshed_features).await?;
 

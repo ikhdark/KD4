@@ -368,6 +368,7 @@ impl ClientTracker {
                     event: ServerEvent::Pong {
                         status: PongStatus::Unknown,
                     },
+                    message_observation_id: None,
                     client_id,
                     stream_id,
                     write_complete_tx: None,
@@ -412,9 +413,12 @@ impl ClientTracker {
                         Err(_) => break,
                     },
                 };
+                let message_observation_id = queued_message.remote_observation_id;
                 if let Some(observation) = super::protocol::DeliveryObservation::new(&client_id, &stream_id, 0, None) {
                     let mut facts = super::protocol::response_observation(&queued_message.message);
                     facts["connection_id"] = connection_id.0.into();
+                    facts["message_observation_id"] = serde_json::json!(message_observation_id);
+                    facts["bytes"] = serde_json::json!(bytes);
                     observation.record("mobile_response_dequeued", facts);
                 }
                 let Some(cost) = super::replay_byte_cost(bytes, &client_id, &stream_id) else {
@@ -424,6 +428,7 @@ impl ClientTracker {
                 let Some(replay_credit) = data_lane.acquire_credit(permit, cost).await else { break };
                 if data_lane.sender.send(QueuedServerEnvelope {
                     event: ServerEvent::ServerMessage { message: Box::new(queued_message.message) },
+                    message_observation_id,
                     client_id: client_id.clone(),
                     stream_id: stream_id.clone(),
                     write_complete_tx: queued_message.write_complete_tx,
@@ -443,6 +448,7 @@ impl ClientTracker {
                 let Some(replay_credit) = status_lane.acquire_credit(permit, cost).await else { break };
                 if status_lane.sender.send(QueuedServerEnvelope {
                     event: ServerEvent::Pong { status },
+                    message_observation_id: None,
                     client_id: client_id.clone(),
                     stream_id: stream_id.clone(),
                     write_complete_tx: None,

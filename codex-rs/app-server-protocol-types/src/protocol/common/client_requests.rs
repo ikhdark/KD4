@@ -234,6 +234,14 @@ macro_rules! client_request_definitions {
         }
 
         impl ClientRequest {
+            /// Return the registered canonical category without reading parameters.
+            pub fn canonical_method_name(method: &str) -> Option<&'static str> {
+                match method {
+                    $($wire $( $(| $alias)* )? => Some($wire),)*
+                    _ => None,
+                }
+            }
+
             /// Keep method membership separate from parameter decoding without
             /// interpreting serde's diagnostic text. The legacy TryFrom API is unchanged.
             pub fn decode_jsonrpc(request: JSONRPCRequest) -> Result<Self, ClientRequestDecodeError> {

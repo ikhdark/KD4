@@ -105,6 +105,7 @@ fn app_server_request_span_template(
         otel.name = method,
         rpc.system = "jsonrpc",
         rpc.method = method,
+        rpc.method_category = ClientRequest::canonical_method_name(method).unwrap_or("other"),
         rpc.transport = transport,
         rpc.request_id = %request_id,
         rpc.request_key_sha256_v1 = %codex_app_server_transport::rpc_request_key_v1(request_id),

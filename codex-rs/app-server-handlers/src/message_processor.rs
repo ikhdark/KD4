@@ -578,19 +578,25 @@ impl MessageProcessor {
             && self.outgoing.connection_is_remote_control(connection_id).await;
         let local_observation = codex_protocol::timing::observations::enabled()
             && matches!(transport, AppServerTransport::Stdio)
-            && matches!(request_method, "thread/list" | "config/read" | "fs/getMetadata");
+            && matches!(
+                request_method,
+                "thread/list"
+                    | "thread/read"
+                    | "thread/resume"
+                    | "thread/turns/list"
+                    | "thread/queue/list"
+                    | "thread/metadata/update"
+                    | "turn/start"
+                    | "config/read"
+                    | "fs/getMetadata"
+            );
         let mobile_observation_id = if remote_observation || local_observation {
             let operation = if remote_observation {
                 uuid::Uuid::now_v7().to_string()
             } else {
                 format!("local:{}", uuid::Uuid::now_v7())
             };
-            let method = match request_method {
-                "initialize" | "config/read" | "fs/readFile" | "fs/readFileRange" | "fs/getMetadata"
-                | "fs/readDirectory" | "fs/writeFile" | "thread/list" | "thread/read" | "thread/resume"
-                | "thread/turns/list" | "turn/start" | "turn/interrupt" => request_method,
-                _ => "other",
-            };
+            let method = ClientRequest::canonical_method_name(request_method).unwrap_or("other");
             let _ = codex_protocol::timing::observations::record(
                 if remote_observation { "mobile_rpc_received" } else { "local_rpc_received" }, "", "", &operation,
                 serde_json::json!({"schema_version":1, "connection_id":connection_id.0,
@@ -624,6 +630,7 @@ impl MessageProcessor {
             rpc.request_key_sha256_v1 = %codex_app_server_transport::rpc_request_key_v1(&request.id),
             rpc.clock_id = codex_protocol::timing::process_clock_domain_id(),
             rpc.operation_id = mobile_observation_id.as_deref().unwrap_or_default(),
+            rpc.method_category = ClientRequest::canonical_method_name(request_method).unwrap_or("other"),
             "app-server request: {request_method}"
         );
         // Reject the complete wire envelope (including trace fields) before
@@ -1487,6 +1494,7 @@ impl MessageProcessor {
                             client_version.clone(),
                             /*supports_openai_form_elicitation*/
                             supports_openai_form_elicitation,
+                            mobile_observation_id.as_deref().filter(|id| id.starts_with("local:")),
                         ))
                         .await
                         .map(|()| None)

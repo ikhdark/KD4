@@ -2428,7 +2428,7 @@ impl ThreadRequestProcessor {
             );
             threads.push(thread);
         }
-        let status_observation = list_observation(diagnostic_operation, "thread_list_status_hydration");
+        let status_observation = request_phase_observation(diagnostic_operation, "thread_list_status_hydration");
         self.refresh_loaded_thread_statuses(&mut threads).await;
         if let Some(observation) = status_observation {
             observation.finish("completed", serde_json::Value::Null);
@@ -3467,6 +3467,7 @@ impl ThreadRequestProcessor {
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
         supports_openai_form_elicitation: bool,
+        diagnostic_operation: Option<&str>,
     ) -> Result<(), JSONRPCErrorError> {
         let mut config_attempt = 1;
         let mut retried_after_parent = false;
@@ -3478,6 +3479,7 @@ impl ThreadRequestProcessor {
                     app_server_client_name.clone(),
                     app_server_client_version.clone(),
                     supports_openai_form_elicitation,
+                    diagnostic_operation,
                 )
                 .await;
             match result {
@@ -3489,6 +3491,7 @@ impl ThreadRequestProcessor {
                     // Each attempt reloads history and config with the original
                     // overrides; never retry a policy denial or an accepted resume.
                     warn!(attempt = config_attempt, "configuration changed during thread/resume; retrying admission");
+                    record_resume_restart(diagnostic_operation, "configuration_generation_changed");
                     config_attempt += 1;
                 }
                 Err(error) if !retried_after_parent && params.history.is_none() => {
@@ -3506,6 +3509,7 @@ impl ThreadRequestProcessor {
                             return Err(error);
                         }
                     }
+                    record_resume_restart(diagnostic_operation, "parent_runtime_now_available");
                     retried_after_parent = true;
                 }
                 result => return result,
@@ -3520,6 +3524,7 @@ impl ThreadRequestProcessor {
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
         supports_openai_form_elicitation: bool,
+        diagnostic_operation: Option<&str>,
     ) -> Result<(), JSONRPCErrorError> {
         let mut revalidation_restarts = 0;
         'resume: loop {
@@ -3560,11 +3565,14 @@ impl ThreadRequestProcessor {
             parsed_thread_id.valid().map(|id| id.to_string())
                 .unwrap_or_else(|| params.thread_id.clone())
         };
+        let admission = request_phase_observation(diagnostic_operation, "thread_resume_state_admission");
         let mut _thread_list_state_permit = self
             .thread_list_state_permit
             .acquire_resume(resume_identity)
             .await;
-        match self
+        finish_resume_phase(admission, "acquired");
+        let live_probe = request_phase_observation(diagnostic_operation, "thread_resume_live_probe");
+        let live_result = self
             .resume_running_thread(
                 &request_id,
                 &params,
@@ -3572,8 +3580,9 @@ impl ThreadRequestProcessor {
                 app_server_client_name.clone(),
                 app_server_client_version.clone(),
             )
-            .await
-        {
+            .await;
+        finish_resume_phase(live_probe, if live_result.is_ok() { "returned" } else { "error" });
+        match live_result {
             Ok(RunningThreadResumeResult::Handled) => return Ok(()),
             Ok(RunningThreadResumeResult::NotRunning) => {}
             Err(error) => {
@@ -3610,6 +3619,7 @@ impl ThreadRequestProcessor {
         } = params;
         let include_turns = !exclude_turns;
 
+        let history_load = request_phase_observation(diagnostic_operation, "thread_resume_history_load");
         let resume_result = if let Some(history) = history {
             self.resume_thread_from_history(history)
                 .await
@@ -3619,6 +3629,7 @@ impl ThreadRequestProcessor {
                 .await
                 .map(|(thread_history, stored_thread)| (thread_history, Some(stored_thread)))
         };
+        finish_resume_phase(history_load, if resume_result.is_ok() { "loaded" } else { "error" });
         let (thread_history, mut resume_source_thread) = match resume_result {
             Ok(value) => value,
             Err(error) => {
@@ -3667,13 +3678,17 @@ impl ThreadRequestProcessor {
         );
 
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
+        let config_phase = request_phase_observation(diagnostic_operation, "thread_resume_config_resolution");
         let policy_generation = self.config_manager.policy_generation();
         let config = self
             .config_manager
             .load_for_cwd(request_overrides, typesafe_overrides, history_cwd)
             .await
-            .map_config_load_error()?;
+            .map_config_load_error();
+        finish_resume_phase(config_phase, if config.is_ok() { "loaded" } else { "error" });
+        let config = config?;
 
+        let response_history_build = request_phase_observation(diagnostic_operation, "thread_resume_history_projection");
         let resumed_thread_id = match &thread_history {
             InitialHistory::Resumed(resumed) => Some(resumed.conversation_id),
             _ => None,
@@ -3705,7 +3720,10 @@ impl ThreadRequestProcessor {
                 };
         }
 
+        finish_resume_phase(response_history_build, "prepared");
+        let advisory_fence = request_phase_observation(diagnostic_operation, "thread_resume_state_reacquire");
         _thread_list_state_permit.reacquire_state().await;
+        finish_resume_phase(advisory_fence, "acquired");
         if let Some(source) = resume_source_thread.as_ref() {
             let current = self
                 .read_stored_thread_for_resume(&parsed_thread_id, path.as_ref(), false)
@@ -3732,6 +3750,7 @@ impl ThreadRequestProcessor {
                     error.data = Some(serde_json::json!({"reason": "threadChanged"}));
                     return Err(error);
                 }
+                record_resume_restart(diagnostic_operation, "stored_thread_revalidation_changed");
                 continue 'resume;
             }
             resume_source_thread = Some(current);
@@ -3740,7 +3759,8 @@ impl ThreadRequestProcessor {
         self.config_manager
             .validate_policy_generation(policy_generation)
             .map_config_load_error()?;
-        match crate::bespoke_event_handling::with_startup_mcp_elicitation(
+        let activation_phase = request_phase_observation(diagnostic_operation, "thread_resume_runtime_activation");
+        let activation_result = crate::bespoke_event_handling::with_startup_mcp_elicitation(
             Arc::clone(&self.outgoing),
             request_id.connection_id,
             self.thread_manager.resume_thread_with_history_and_settings(
@@ -3756,8 +3776,9 @@ impl ThreadRequestProcessor {
                 },
             ),
         )
-        .await
-        {
+        .await;
+        finish_resume_phase(activation_phase, if activation_result.is_ok() { "returned" } else { "error" });
+        match activation_result {
             Ok(NewThread {
                 thread_id,
                 thread: codex_thread,
@@ -3804,6 +3825,7 @@ impl ThreadRequestProcessor {
                             // leaving this iteration releases its list-state permit.
                             tracing::debug!(target: "codex_app_server::desktop_benchmark",
                                 kdr_desktop_event = "resume_runtime_restart");
+                            record_resume_restart(diagnostic_operation, "borrowed_runtime_not_available");
                             params = live_params;
                             continue 'resume;
                         }
@@ -3852,7 +3874,8 @@ impl ThreadRequestProcessor {
                     }
                 }
 
-                let (mut thread, token_usage_snapshot) = match self
+                let response_projection = request_phase_observation(diagnostic_operation, "thread_resume_response_projection");
+                let response_thread = self
                     .load_thread_from_resume_source_or_send_internal(
                         thread_id,
                         codex_thread.as_ref(),
@@ -3861,8 +3884,9 @@ impl ThreadRequestProcessor {
                         resume_source_thread,
                         include_turns,
                     )
-                    .await
-                {
+                    .await;
+                finish_resume_phase(response_projection, if response_thread.is_ok() { "loaded" } else { "error" });
+                let (mut thread, token_usage_snapshot) = match response_thread {
                     Ok(thread) => thread,
                     Err(message) => {
                         self.rollback_failed_resumed_thread(
@@ -5037,7 +5061,7 @@ impl ThreadRequestProcessor {
             }
             None if relation_filter.is_some() => None,
             None => {
-                let observation = list_observation(diagnostic_operation, "thread_list_config_resolution");
+                let observation = request_phase_observation(diagnostic_operation, "thread_list_config_resolution");
                 let result = self.config_manager.load_latest_config(None).await.map_config_load_error();
                 if let Some(observation) = observation {
                     observation.finish(if result.is_ok() { "completed" } else { "error" }, serde_json::Value::Null);
@@ -5067,7 +5091,7 @@ impl ThreadRequestProcessor {
                         }}),
                 );
             }
-            let observation = list_observation(diagnostic_operation, "thread_list_store_page");
+            let observation = request_phase_observation(diagnostic_operation, "thread_list_store_page");
             let page = self
                 .thread_store
                 .list_threads(StoreListThreadsParams {
@@ -5143,9 +5167,23 @@ impl ThreadRequestProcessor {
     }
 }
 
-fn list_observation(operation: Option<&str>, phase: &str) -> Option<codex_protocol::timing::observations::Span> {
+fn request_phase_observation(operation: Option<&str>, phase: &str) -> Option<codex_protocol::timing::observations::Span> {
     operation.map(|operation| codex_protocol::timing::observations::Span::start(
         phase, "", "", operation, serde_json::Value::Null))
+}
+
+fn record_resume_restart(operation: Option<&str>, reason: &str) {
+    if let Some(operation) = operation {
+        let _ = codex_protocol::timing::observations::record(
+            "thread_resume_restart", "", "", operation, serde_json::json!({ "reason": reason }),
+        );
+    }
+}
+
+fn finish_resume_phase(phase: Option<codex_protocol::timing::observations::Span>, outcome: &str) {
+    if let Some(phase) = phase {
+        phase.finish(outcome, serde_json::Value::Null);
+    }
 }
 
 const MCP_ELICITATIONS_AUTO_DENY: bool = false;

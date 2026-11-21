@@ -129,6 +129,7 @@ pub fn take_remote_control_disabled_env() -> bool {
 
 pub(super) struct QueuedServerEnvelope {
     pub(super) event: ServerEvent,
+    pub(super) message_observation_id: Option<uuid::Uuid>,
     pub(super) client_id: ClientId,
     pub(super) stream_id: StreamId,
     pub(super) write_complete_tx: Option<oneshot::Sender<std::time::Instant>>,

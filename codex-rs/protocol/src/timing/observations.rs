@@ -11,9 +11,10 @@ use serde_json::{Value, json};
 const MAX_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ROW_BYTES: usize = 1024 * 1024;
 const MAX_SEGMENTS: u32 = 128;
+const LANES: [&str; 4] = ["runtime", "mobile", "lifecycle", "request"];
 
 struct Journal {
-    lanes: [Option<Lane>; 3],
+    lanes: [Option<Lane>; 4],
     sequence: u64,
     directory: PathBuf,
     rollover: bool,
@@ -57,7 +58,7 @@ fn journal() -> Option<&'static Mutex<Journal>> {
                 })
             };
             Some(Mutex::new(Journal {
-                lanes: [Some(open("")?), open("-mobile"), open("-lifecycle")],
+                lanes: [Some(open("")?), open("-mobile"), open("-lifecycle"), open("-request")],
                 sequence: 0,
                 directory,
                 rollover: std::env::var_os("CODEX_RUNTIME_OBSERVATIONS_ROLLOVER").is_some_and(|value| value == "1"),
@@ -89,22 +90,27 @@ pub fn record(
     let journal = journal()?;
     let mut journal = journal.lock().ok()?;
     let journal = &mut *journal;
-    // Ordinary tool traffic must not exhaust connection evidence. Keep the
-    // existing runtime cap and a separately bounded mobile lane, with a small
-    // retirement reserve even when response telemetry itself is saturated.
-    let (requested_lane, _, _) = if kind == "mobile_connection_retired" {
-        (2, "lifecycle", 64 * 1024)
+    // Frame detail must not exhaust the budget for request disposition or
+    // socket lifecycle. Keep the retirement reserve independent of both.
+    let requested_lane = if kind == "mobile_connection_retired" {
+        2
+    } else if kind.starts_with("mobile_rpc_") || kind.starts_with("mobile_socket_") {
+        3
     } else if kind.starts_with("mobile_") {
-        (1, "mobile", MAX_BYTES)
+        1
     } else {
-        (0, "runtime", MAX_BYTES)
+        0
     };
     // A secondary file failure must not disable ordinary observations. Fall
     // back to the original shared budget and explicitly report lost isolation.
     let lane_index = if journal.lanes[requested_lane].is_some() { requested_lane } else { 0 };
-    let lane_name = ["runtime", "mobile", "lifecycle"][lane_index];
-    let limit = if lane_index == 2 { 64 * 1024 } else { MAX_BYTES };
-    let unavailable_lanes: Vec<_> = ["runtime", "mobile", "lifecycle"].into_iter()
+    let lane_name = LANES[lane_index];
+    let limit = match lane_index {
+        2 => 64 * 1024,
+        3 => 4 * 1024 * 1024,
+        _ => MAX_BYTES,
+    };
+    let unavailable_lanes: Vec<_> = LANES.into_iter()
         .enumerate().filter_map(|(index, name)| journal.lanes[index].is_none().then_some(name)).collect();
     if journal.lanes[lane_index].as_ref()?.stopped {
         return None;
@@ -129,10 +135,11 @@ pub fn record(
         row["previous_segment_last_id"] = json!(lane.previous_segment_last_id);
     }
     let mut bytes = serde_json::to_vec(&row).ok()?;
+    let mut rollover_failed = false;
     if rollover && bytes.len() <= MAX_ROW_BYTES && lane.bytes + bytes.len() + 1024 > limit
         && lane.segment + 1 < MAX_SEGMENTS
     {
-        let suffix = ["", "-mobile", "-lifecycle"][lane_index];
+        let suffix = ["", "-mobile", "-lifecycle", "-request"][lane_index];
         let path = directory.join(format!(
             "runtime-{}-{}{suffix}-part{:06}.jsonl",
             std::process::id(), super::process_clock_domain_id(), lane.segment + 1
@@ -147,11 +154,18 @@ pub fn record(
             row["journal_segment"] = json!(lane.segment);
             row["previous_segment_last_id"] = json!(lane.previous_segment_last_id);
             bytes = serde_json::to_vec(&row).ok()?;
+        } else {
+            rollover_failed = true;
         }
     }
     if bytes.len() > MAX_ROW_BYTES || lane.bytes + bytes.len() + 1024 > limit {
+        let reason = if bytes.len() > MAX_ROW_BYTES { "row_too_large" }
+            else if rollover_failed { "rollover_create_failed" }
+            else if rollover { "segment_limit" }
+            else { "byte_limit" };
         row["kind"] = json!("capture_overflow");
-        row["data"] = json!({"row_bytes":bytes.len(), "retained_bytes":lane.bytes});
+        row["data"] = json!({"row_bytes":bytes.len(), "retained_bytes":lane.bytes,
+            "reason":reason, "first_dropped_at_ns":at_ns, "last_retained_event_id":lane.last_id});
         bytes = serde_json::to_vec(&row).ok()?;
         lane.stopped = true;
     }

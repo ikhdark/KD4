@@ -80,6 +80,8 @@ pub struct EncodedJson {
 #[derive(Debug)]
 pub struct QueuedOutgoingMessage {
     pub message: OutgoingMessage,
+    /// Private per-connection identity assigned before the remote writer queue.
+    pub remote_observation_id: Option<uuid::Uuid>,
     /// Buffered JSON or a validated streaming plan, without a trailing newline.
     /// The message must not be modified after this representation is prepared.
     pub encoded_json: Option<EncodedJson>,
@@ -93,8 +95,20 @@ impl QueuedOutgoingMessage {
     pub fn new(message: OutgoingMessage) -> Self {
         Self {
             message,
+            remote_observation_id: None,
             encoded_json: None,
             write_complete_tx: None,
+        }
+    }
+
+    /// Allocate only when private observations are enabled.
+    pub fn mark_remote_observation(&mut self, connection_id: u64) {
+        use codex_protocol::timing::observations;
+        if observations::enabled() {
+            let id = uuid::Uuid::now_v7();
+            self.remote_observation_id = Some(id);
+            let _ = observations::record("mobile_message_writer_queue_offered", "", "", "",
+                serde_json::json!({"connection_id":connection_id,"message_observation_id":id}));
         }
     }
 
