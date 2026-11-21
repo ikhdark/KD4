@@ -25,6 +25,7 @@ use codex_config::normalize_multi_agent_v2_feature_value;
 use codex_core::config::deserialize_config_toml_with_base;
 use codex_core::config::edit::ConfigEdit;
 use codex_core::config::edit::ConfigEditsBuilder;
+use codex_core::config::edit::validate_effective_model_provider;
 use codex_core::config::resolve_configured_features;
 use codex_core::config::validate_feature_requirements_for_config_toml;
 use codex_features::Features;
@@ -239,12 +240,12 @@ impl ConfigManager {
         }
 
         // Capture the exact on-disk representation before loading the migrated
-        // config layer. The client version fingerprints the migrated layer,
+        // config layer. The client version fingerprints the loader's projection,
         // while the atomic writer compares the raw TOML under its file lock.
         // Feature normalization preserves intent against the latest document.
         // Reject an intervening write rather than validate/report an older view.
         let writer_expected_version = Some(codex_config::version_for_toml(
-            &read_raw_user_config(&provided_path).await?,
+            &read_raw_user_config(&allowed_path).await?,
         ));
         let policy_generation = self.policy_generation();
         let layers = self
@@ -383,7 +384,7 @@ impl ConfigManager {
 
         // Plain decoding additionally rejects relative AbsolutePathBuf values;
         // retain that API validation rather than silently broaden accepted input.
-        validate_config(&user_config).map_err(|err| {
+        validate_config(user_config.clone()).map_err(|err| {
             ConfigManagerError::write(
                 ConfigWriteErrorCode::ConfigValidationError,
                 format!("Invalid configuration: {err}"),
@@ -408,16 +409,18 @@ impl ConfigManager {
                 format!("Invalid configuration: {err}"),
             )
         })?;
-        let updated_layers = layers.with_user_config(&provided_path, user_config.clone());
-        let effective = updated_layers.effective_config();
-        validate_config(&effective).map_err(|err| {
-            ConfigManagerError::write(
-                ConfigWriteErrorCode::ConfigValidationError,
-                format!("Invalid configuration: {err}"),
-            )
-        })?;
+        let updated_layers = layers.with_user_config(&allowed_path, user_config);
+        validate_config(updated_layers.effective_config())
+            .map_err(|err| err.to_string())
+            .and_then(validate_effective_model_provider)
+            .map_err(|err| {
+                ConfigManagerError::write(
+                    ConfigWriteErrorCode::ConfigValidationError,
+                    format!("Invalid configuration: {err}"),
+                )
+            })?;
 
-        let builder = ConfigEditsBuilder::for_config_path(provided_path.as_path())
+        let builder = ConfigEditsBuilder::for_config_path(allowed_path.as_path())
             .with_edits(config_edits)
             .with_expected_version(writer_expected_version);
         let manager = self.clone();
@@ -446,10 +449,10 @@ impl ConfigManager {
         self.invalidate_load_cache();
         codex_protocol::timing::client_probe::record(712, observation, 0, 0, 0, [0; 4]);
 
-        // The locked writer captured the exact serialized commit, including
-        // implicit empty-table removal. No unlocked or fallible reload follows.
+        // The locked writer projected the exact serialized commit as the loader
+        // sees it. No unlocked or fallible reload follows.
         let committed_version = codex_config::version_for_toml(&committed_config);
-        let updated_layers = layers.with_user_config(&provided_path, committed_config);
+        let updated_layers = layers.with_user_config(&allowed_path, committed_config);
         let effective = updated_layers.effective_config();
         let overridden = first_overridden_edit(&updated_layers, &effective, &parsed_segments);
         let status = overridden
@@ -762,10 +765,10 @@ fn toml_value_to_value(value: &TomlValue) -> anyhow::Result<toml_edit::Value> {
     }
 }
 
-fn validate_config(value: &TomlValue) -> Result<(), toml::de::Error> {
-    let config: ConfigToml = value.clone().try_into()?;
+fn validate_config(value: TomlValue) -> Result<ConfigToml, toml::de::Error> {
+    let config: ConfigToml = value.try_into()?;
     config.validate_context_limits().map_err(<toml::de::Error as serde::de::Error>::custom)?;
-    Ok(())
+    Ok(config)
 }
 
 fn value_at_path<'a>(root: &'a TomlValue, segments: &[String]) -> Option<&'a TomlValue> {

@@ -4,6 +4,8 @@ pub use crate::protocol::common::EXPERIMENTAL_CLIENT_METHODS;
 pub use crate::protocol::common::EXPERIMENTAL_SERVER_METHOD_PARAM_TYPES;
 pub use crate::protocol::common::EXPERIMENTAL_SERVER_METHOD_RESPONSE_TYPES;
 pub use crate::protocol::common::EXPERIMENTAL_SERVER_METHODS;
+pub use crate::protocol::common::EXPERIMENTAL_SERVER_NOTIFICATION_METHODS;
+pub use crate::protocol::common::EXPERIMENTAL_SERVER_NOTIFICATION_PAYLOAD_TYPES;
 pub use crate::protocol::common::SERVER_NOTIFICATION_METADATA;
 pub use crate::protocol::common::ServerNotificationMetadata;
 pub use crate::protocol::common::export_client_notification_schemas;

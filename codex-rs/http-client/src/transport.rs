@@ -1,6 +1,7 @@
 use crate::RetryAfter;
 use crate::client::HttpClient;
 use crate::client::RequestBuilder;
+use crate::error::ConnectionError;
 use crate::error::TransportError;
 use crate::request::Request;
 use crate::request::RequestBody;
@@ -379,14 +380,20 @@ impl ReqwestTransport {
                 }
                 // Includes route selection and redirect hops, but not body reads or auth.
                 let start = std::time::Instant::now();
-                let response = builder.send().await.map_err(|error| match error {
-                    crate::RouteAwareRequestError::Request(error) => Self::map_error(error),
-                    crate::RouteAwareRequestError::Timeout => TransportError::Timeout,
-                    error => TransportError::Build(format!(
-                        "HTTP routing failed: {}",
-                        error.safe_category()
-                    )),
-                })?;
+                let mut initial_request_not_sent = false;
+                let response = builder
+                    .send_tracking_initial_connect(&mut initial_request_not_sent)
+                    .await
+                    .map_err(|error| match error {
+                        crate::RouteAwareRequestError::Request(error) => {
+                            Self::map_error_with_initial_connect(error, initial_request_not_sent)
+                        }
+                        crate::RouteAwareRequestError::Timeout => TransportError::Timeout,
+                        error => TransportError::Build(format!(
+                            "HTTP routing failed: {}",
+                            error.safe_category()
+                        )),
+                    })?;
                 record_response_header_time(start.elapsed());
                 Ok(response)
             }
@@ -394,13 +401,25 @@ impl ReqwestTransport {
     }
 
     fn map_error(err: reqwest::Error) -> TransportError {
+        // Fixed clients may follow redirects internally, and body errors are
+        // after dispatch. Neither proves the original request was unsent.
+        Self::map_error_with_initial_connect(err, false)
+    }
+
+    fn map_error_with_initial_connect(
+        err: reqwest::Error,
+        initial_request_not_sent: bool,
+    ) -> TransportError {
         if err.is_builder() || is_permanent_connection_error(&err) {
             TransportError::Build(format!(
                 "permanent transport configuration failure: {:#}",
                 err.without_url()
             ))
         } else if err.is_connect() {
-            TransportError::Connection(err.without_url())
+            TransportError::Connection(ConnectionError::new(
+                err.without_url(),
+                initial_request_not_sent,
+            ))
         } else if err.is_timeout() {
             TransportError::Timeout
         } else {

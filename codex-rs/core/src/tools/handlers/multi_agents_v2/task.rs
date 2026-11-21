@@ -330,8 +330,10 @@ async fn handle_submit_agent_receipt(
                 )))?,
         })
     } else { None };
-    let receipt = store.submit_agent_receipt(binding.attempt_id, draft).await
-        .map_err(|error| task_store_error(SUBMIT_AGENT_RECEIPT_TOOL, error))?;
+    let receipt = store
+        .submit_agent_receipt(binding.attempt_id, draft)
+        .await
+        .map_err(receipt_store_error)?;
     turn.extension_data
         .insert(crate::agent::task_coordinator::AuthoredReceiptSealed);
     coordinator.mark_task_inactive(binding.assignment_id);
@@ -773,6 +775,41 @@ fn task_store_error(tool_name: &'static str, error: StoreError) -> FunctionCallE
     FunctionCallError::RespondToModel(format!("{tool_name}: {detail}"))
 }
 
+fn receipt_validation_refusal(
+    reason: &'static str,
+    message: String,
+    correction: &str,
+) -> FunctionCallError {
+    let mut failure = codex_protocol::tool_failure::ToolFailure::handler_refusal(
+        codex_protocol::tool_failure::ToolFailureCode::InvalidInput,
+        format!("{SUBMIT_AGENT_RECEIPT_TOOL}: {message}"),
+        reason,
+    );
+    failure.safe_next_actions = vec![correction.to_string()];
+    FunctionCallError::structured(failure)
+}
+
+fn receipt_store_error(error: StoreError) -> FunctionCallError {
+    // These contract rejections cannot reach the receipt transaction's COMMIT.
+    // A storage error, including from COMMIT itself, retains unknown effects.
+    let (reason, correction) = match &error {
+        StoreError::CriterionResultsInvalid(_) => (
+            "receipt_criteria",
+            "Reconcile the failed criterion with the current assignment. For a passed evidence-bound criterion, cite applicable owned evidence by its recorded call ID before resubmitting.",
+        ),
+        StoreError::InvalidAssignment(_) => (
+            "receipt_assignment",
+            "Reconcile the draft with the current assignment and its exact observed scoped delta. Correct the draft or report a real blocker before resubmitting.",
+        ),
+        StoreError::InvalidScope(_) => (
+            "receipt_scope",
+            "Inspect the reported scope or manifest limit. If the assigned scope cannot be sealed within that limit, report the blocker instead of retrying unchanged or omitting changes.",
+        ),
+        _ => return task_store_error(SUBMIT_AGENT_RECEIPT_TOOL, error),
+    };
+    receipt_validation_refusal(reason, error.to_string(), correction)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GetAgentTaskArgs {
@@ -923,15 +960,25 @@ impl ReceiptEvidenceRefArgs {
                         (Some(call), None) => format!(" Cite its recorded id `{}`.", call.call_id),
                         _ => " Cite evidence_ref.call_id exactly as returned in the call's criterion_evidence.".to_string(),
                     };
-                    return Err(FunctionCallError::RespondToModel(format!(
-                        "{SUBMIT_AGENT_RECEIPT_TOOL}: {} is not a recorded validation or source-inspection call of the bound attempt {attempt_id}.{hint}",
-                        self.call_id
-                    )));
+                    return Err(receipt_validation_refusal(
+                        "receipt_evidence_reference",
+                        format!(
+                            "{} is not a recorded validation or source-inspection call of the bound attempt {attempt_id}.{hint}",
+                            self.call_id,
+                        ),
+                        "Use the exact call ID returned in the successful owned call's criterion_evidence.",
+                    ));
                 };
-                call.evidence.end_epoch.ok_or_else(|| FunctionCallError::RespondToModel(format!(
-                    "{SUBMIT_AGENT_RECEIPT_TOOL}: validation call {} has no recorded end epoch in the bound attempt",
-                    self.call_id
-                )))?
+                call.evidence.end_epoch.ok_or_else(|| {
+                    receipt_validation_refusal(
+                        "receipt_evidence_reference",
+                        format!(
+                            "validation call {} has no recorded end epoch in the bound attempt",
+                            self.call_id,
+                        ),
+                        "Use evidence from a successful owned call with a recorded end epoch.",
+                    )
+                })?
             }
         };
         let kind = self

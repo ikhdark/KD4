@@ -311,14 +311,10 @@ impl RawOutputArtifactTask {
 
     /// Finalize on an existing blocking owner without nesting blocking jobs.
     pub fn finish_blocking(mut self) {
-        // Empty, complete producers need no durable recovery object. Leave the
-        // pending (or previous empty) state for consumers' inline fallback.
-        if self.handle.is_none() && self.failure.is_none() && !self.incomplete {
-            self.finished = true;
-            self.ready.cancel();
-            return;
-        }
-        let artifact = if let Some(mut writer) = self.writer.take() {
+        let artifact = if self.handle.is_none() && self.failure.is_none() && !self.capture_incomplete() {
+            // Publish known-empty capture without allocating a recovery log.
+            RawOutputArtifact::Empty
+        } else if let Some(mut writer) = self.writer.take() {
             let result = (|| {
                 writer.flush()?;
                 writer.get_ref().sync_all()?;

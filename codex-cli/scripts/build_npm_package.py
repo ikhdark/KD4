@@ -24,6 +24,7 @@ from scripts.codex_package.targets import TARGET_SPECS  # noqa: E402
 
 CODEX_SDK_ROOT = REPO_ROOT / "sdk" / "typescript"
 CODEX_NPM_NAME = "@openai/codex"
+CODEX_SDK_NPM_NAME = "@openai/codex-sdk"
 CODEX_PACKAGE_COMPONENT = "codex-package"
 
 # Derived adapter for the staging API. Canonical target metadata lives in
@@ -99,12 +100,26 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Path where the generated npm tarball should be written.",
     )
+    parser.add_argument("--cli-tarball", type=Path, help="Local launcher tarball for the SDK smoke install.")
+    parser.add_argument("--native-tarball", type=Path, help="Matching host native tarball for the SDK smoke install.")
     parser.add_argument(
         "--vendor-src",
         type=Path,
         help="Directory containing pre-installed native binaries to bundle (vendor root).",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.cli_tarball is not None or args.native_tarball is not None:
+        if (
+            args.package != "codex-sdk"
+            or args.pack_output is None
+            or args.cli_tarball is None
+            or args.native_tarball is None
+        ):
+            parser.error(
+                "--cli-tarball and --native-tarball must be used together with "
+                "--package codex-sdk and --pack-output"
+            )
+    return args
 
 
 def main() -> int:
@@ -175,7 +190,12 @@ def main() -> int:
         print(f"Staged package in {staging_dir}")
 
     if args.pack_output is not None:
-        output_path = run_npm_pack(staging_dir, args.pack_output)
+        output_path = run_npm_pack(
+            staging_dir,
+            args.pack_output,
+            cli_tarball=args.cli_tarball,
+            native_tarball=args.native_tarball,
+        )
         print(f"npm pack output written to {output_path}")
     return 0
 
@@ -406,11 +426,13 @@ def copy_native_binaries(
                 expected_version=expected_version,
             )
             for source in sorted(target_dir.rglob("*")):
-                if not source.is_file():
-                    continue
                 destination = dest_target_dir / source.relative_to(target_dir)
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, destination)
+                if source.is_dir():
+                    # The canonical layout includes codex-resources even when empty.
+                    destination.mkdir(parents=True, exist_ok=True)
+                elif source.is_file():
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, destination)
         else:
             dest_target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -445,7 +467,13 @@ def copy_native_binaries(
             )
 
 
-def run_npm_pack(staging_dir: Path, output_path: Path) -> Path:
+def run_npm_pack(
+    staging_dir: Path,
+    output_path: Path,
+    *,
+    cli_tarball: Path | None = None,
+    native_tarball: Path | None = None,
+) -> Path:
     output_path = output_path.resolve()
     if output_path.exists() and not output_path.is_file():
         raise RuntimeError(f"npm pack output must be a file: {output_path}")
@@ -488,44 +516,66 @@ def run_npm_pack(staging_dir: Path, output_path: Path) -> Path:
         if not tarball_path.exists():
             raise RuntimeError(f"Expected npm pack output not found: {tarball_path}")
 
-        smoke_test_npm_tarball(tarball_path)
+        smoke_test_npm_tarball(tarball_path, native_tarball, cli_tarball=cli_tarball)
         tarball_path.replace(output_path)
     return output_path
 
 
-def smoke_test_npm_tarball(
-    tarball_path: Path, native_tarball: Path | None = None
-) -> None:
+def npm_tarball_manifest(tarball_path: Path) -> dict:
     with tarfile.open(tarball_path, "r:gz") as tarball:
         manifest = tarball.extractfile("package/package.json")
         if manifest is None:
             raise RuntimeError(f"npm tarball has no package.json: {tarball_path}")
-        packed = json.load(manifest)
+        return json.load(manifest)
+
+
+def smoke_test_npm_tarball(
+    tarball_path: Path,
+    native_tarball: Path | None = None,
+    *,
+    cli_tarball: Path | None = None,
+) -> None:
+    packed = npm_tarball_manifest(tarball_path)
     package_name = packed["name"]
-    native_args = []
+    cli = packed
+    local_args = []
+    if cli_tarball is not None:
+        if package_name != CODEX_SDK_NPM_NAME or native_tarball is None:
+            raise RuntimeError("The local SDK smoke requires both launcher and host native tarballs")
+        cli = npm_tarball_manifest(cli_tarball)
+        if (
+            cli.get("name") != CODEX_NPM_NAME
+            or not cli.get("version")
+            or packed.get("dependencies", {}).get(CODEX_NPM_NAME) != cli["version"]
+        ):
+            raise RuntimeError("SDK/CLI tarball package or version mismatch")
+        local_args.append(str(cli_tarball.resolve()))
+
     if native_tarball is not None:
         platform_key = subprocess.check_output(
             [resolve_tool("node"), "-p", "process.platform + '-' + process.arch"],
             text=True,
+            timeout=30,
         ).strip()
-        if platform_key != "win32-x64":
-            raise RuntimeError("The paired native smoke requires Windows x64")
-        target = packed["codexNativeTargets"][platform_key]
-        with tarfile.open(native_tarball, "r:gz") as archive:
-            manifest = archive.extractfile("package/package.json")
-            if manifest is None:
-                raise RuntimeError("Native tarball has no package.json")
-            native = json.load(manifest)
+        target = cli.get("codexNativeTargets", {}).get(platform_key)
+        if target is None:
+            raise RuntimeError(f"The paired native smoke has no CLI target for {platform_key}")
+        native = npm_tarball_manifest(native_tarball)
         expected = f"npm:{native['name']}@{native['version']}"
-        if packed["optionalDependencies"].get(target["package"]) != expected:
+        if cli["optionalDependencies"].get(target["package"]) != expected:
             raise RuntimeError("Main/native tarball alias or version mismatch")
-        if native.get("os") != ["win32"] or native.get("cpu") != ["x64"]:
-            raise RuntimeError("Native tarball is not Windows x64")
-        native_args = [f"{target['package']}@{native_tarball.resolve().as_uri()}"]
+        platform, arch = platform_key.split("-", 1)
+        if native.get("os") != [platform] or native.get("cpu") != [arch]:
+            raise RuntimeError(f"Native tarball is not for {platform_key}")
+        local_args.append(f"{target['package']}@{native_tarball.resolve().as_uri()}")
     with tempfile.TemporaryDirectory(prefix="codex-npm-smoke-") as smoke_dir_str:
         smoke_dir = Path(smoke_dir_str)
         env = os.environ.copy()
-        env["NPM_CONFIG_CACHE"] = str(smoke_dir / "npm-cache")
+        if cli_tarball is None:
+            env["NPM_CONFIG_CACHE"] = str(smoke_dir / "npm-cache")
+        else:
+            # An explicitly prepared cache can supply the SDK's other deps offline.
+            env.setdefault("NPM_CONFIG_CACHE", str(smoke_dir / "npm-cache"))
         env["CODEX_HOME"] = str(smoke_dir / "codex-home")
         Path(env["CODEX_HOME"]).mkdir()
         subprocess.run(
@@ -539,12 +589,14 @@ def smoke_test_npm_tarball(
                 "--force",
                 "--ignore-scripts",
                 "--include=optional" if native_tarball is not None else "--omit=optional",
-                *(["--offline"] if native_tarball is not None else []),
+                # A paired CLI needs only local files. A paired SDK also has
+                # third-party dependencies and honors npm's offline setting.
+                *(["--offline"] if native_tarball is not None and cli_tarball is None else []),
                 "--no-audit",
                 "--no-fund",
                 "--no-package-lock",
                 str(tarball_path.resolve()),
-                *native_args,
+                *local_args,
             ],
             cwd=smoke_dir,
             check=True,
@@ -564,6 +616,15 @@ def smoke_test_npm_tarball(
             launchers = {package_name: launchers}
         for launcher in launchers.values():
             subprocess.run(["node", "--check", str(installed / launcher)], check=True)
+        if cli_tarball is not None:
+            # Constructing the published SDK follows its own CLI and native resolution.
+            subprocess.run(
+                [
+                    resolve_tool("node"), "--input-type=module", "-e",
+                    "import { Codex } from '@openai/codex-sdk'; new Codex();",
+                ],
+                cwd=smoke_dir, env=env, check=True, timeout=30,
+            )
         if native_tarball is not None:
             launcher = smoke_dir / "node_modules" / ".bin" / "codex.cmd"
             for argument in ("--version", "--help"):
@@ -571,7 +632,7 @@ def smoke_test_npm_tarball(
                     [str(launcher), argument], cwd=smoke_dir, env=env,
                     text=True, timeout=30,
                 )
-                if argument == "--version" and output.strip() != f"codex-cli {packed['version']}":
+                if argument == "--version" and output.strip() != f"codex-cli {cli['version']}":
                     raise RuntimeError(f"Unexpected installed CLI version: {output!r}")
                 if argument == "--help" and "Usage:" not in output:
                     raise RuntimeError(f"Installed CLI did not return help: {output!r}")

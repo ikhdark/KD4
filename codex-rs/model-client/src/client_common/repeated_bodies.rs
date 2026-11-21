@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ResponseItem;
@@ -21,7 +22,8 @@ struct IncludedBody {
 }
 
 #[derive(Default)]
-struct IncludedContent {
+struct IncludedContent<'a> {
+    user_inputs: HashMap<&'a str, Option<&'a [ContentItem]>>,
     exact: HashMap<[u8; 32], Vec<IncludedBody>>,
     requirements: HashMap<String, Vec<IncludedBody>>,
     sources: HashMap<String, Vec<(usize, IncludedBody)>>,
@@ -41,6 +43,14 @@ pub(super) fn deduplicate(source: &Arc<[ResponseItem]>) -> Arc<[ResponseItem]> {
     let mut result = Arc::clone(source);
     for (item_index, item) in source.iter().enumerate() {
         let (call_id, output) = match item {
+            ResponseItem::Message { id: Some(id), role, content, .. }
+                if role == "user" && id.starts_with("msg_user_") =>
+            {
+                included.user_inputs.entry(id.as_str())
+                    .and_modify(|owner| *owner = None)
+                    .or_insert(Some(content));
+                continue;
+            }
             ResponseItem::FunctionCallOutput {
                 call_id, output, ..
             }
@@ -90,7 +100,7 @@ pub(super) fn deduplicate(source: &Arc<[ResponseItem]>) -> Arc<[ResponseItem]> {
     result
 }
 
-impl IncludedContent {
+impl IncludedContent<'_> {
     /// Share a complete nonsource payload without hiding its surrounding
     /// status, timing, recovery or other changed result metadata.
     fn project_body(&mut self, text: &str, location: &Value) -> Option<Value> {
@@ -353,12 +363,12 @@ impl IncludedContent {
         else {
             return false;
         };
+        let mut changed = self.project_pinned_requirements(object);
         let Some(requirements) = object.get_mut("remaining_requirements")
             .and_then(Value::as_object_mut)
         else {
-            return false;
+            return changed;
         };
-        let mut changed = false;
         for (id, value) in requirements {
             let Some(text) = value.as_str().filter(|text| text.len() >= MIN_BODY_BYTES) else {
                 continue;
@@ -378,6 +388,50 @@ impl IncludedContent {
                 let mut owner = location.clone();
                 owner["requirement_id"] = Value::String(id.clone());
                 owners.push(IncludedBody { text: text.to_string(), location: owner });
+            }
+        }
+        changed
+    }
+
+    fn project_pinned_requirements(&self, object: &mut serde_json::Map<String, Value>) -> bool {
+        let Some(pins) = object.get_mut("pinned_requirements").and_then(Value::as_object_mut)
+        else {
+            return false;
+        };
+        let mut changed = false;
+        for pin in pins.values_mut() {
+            let Some(text) = pin["text"].as_str().filter(|text| text.len() >= MIN_BODY_BYTES)
+            else {
+                continue;
+            };
+            let (Some(id), Some(hash)) =
+                (pin["source"]["input_id"].as_str(), pin["source"]["sha256"].as_str())
+            else {
+                continue;
+            };
+            // Rebuild from this request only. A retired, mismatched or non-user
+            // owner cannot replace live scope text in the projected receipt.
+            let Some(Some(owner)) = self.user_inputs.get(id) else {
+                continue;
+            };
+            let Some(index) = owner.iter().position(|part| {
+                matches!(part, ContentItem::InputText { text: owned } if owned == text)
+            }) else {
+                continue;
+            };
+            if hex::encode(Sha256::digest(text.as_bytes())) != hash {
+                continue;
+            }
+            // IDs may be stripped by the transport. Include an exact, bounded
+            // beginning so the model can locate the earlier user text as well.
+            let preview_end = text.char_indices().nth(48).map_or(text.len(), |(offset, _)| offset);
+            let marker = json!({"already_in_context":{
+                "user_input_id":id,"content_index":index,"starts_with":&text[..preview_end],
+                "sha256":hash,"bytes":text.len()
+            }});
+            if marker.to_string().len() + 64 < text.len() {
+                pin["text"] = marker;
+                changed = true;
             }
         }
         changed

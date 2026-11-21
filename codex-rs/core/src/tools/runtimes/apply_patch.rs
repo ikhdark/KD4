@@ -532,6 +532,12 @@ pub(crate) fn patch_failure(error: &codex_apply_patch::ApplyPatchError) -> codex
     if let ApplyPatchError::ParseError(codex_apply_patch::ParseError::InvalidHunkError { line_number, .. }) = error {
         failure.details = Some(serde_json::json!({"line": line_number}));
     }
+    if let ApplyPatchError::ParseError(parse_error) = error {
+        // The typed parser error names the failed rule and line. Keep the stable
+        // message and `line` detail; add the owner's bounded text beside them.
+        failure.details.get_or_insert_with(|| serde_json::json!({}))["owner_diagnostic"] =
+            serde_json::Value::String(codex_utils_string::truncate_middle_chars(&parse_error.to_string(), 1_024));
+    }
     if let ApplyPatchError::RevisionGuardMismatch(diagnostic) = error {
         // The owner already bounds each available source excerpt; preserve its
         // expected/current identities on shell interception as well as direct calls.

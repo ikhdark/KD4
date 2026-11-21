@@ -5,8 +5,10 @@ mod comment_parser;
 extern crate rustc_ast;
 extern crate rustc_errors;
 extern crate rustc_hir;
+extern crate rustc_lexer;
 extern crate rustc_lint;
 extern crate rustc_middle;
+extern crate rustc_parse;
 extern crate rustc_session;
 extern crate rustc_span;
 
@@ -25,6 +27,7 @@ use rustc_hir::UnOp;
 use rustc_hir::def::DefKind;
 use rustc_lint::LateContext;
 use rustc_lint::LateLintPass;
+use rustc_parse::lexer::nfc_normalize;
 use rustc_span::BytePos;
 use rustc_span::Span;
 
@@ -226,7 +229,11 @@ impl ArgumentCommentLint {
                 });
 
             if let Some(actual_name) = argument_comment {
-                if actual_name != expected_name {
+                // Rust normalizes identifiers to NFC; comment snippets retain their spelling.
+                if actual_name != expected_name
+                    && (actual_name.is_ascii()
+                        || nfc_normalize(actual_name).as_str() != expected_name)
+                {
                     span_lint_and_help(
                         cx,
                         ARGUMENT_COMMENT_MISMATCH,

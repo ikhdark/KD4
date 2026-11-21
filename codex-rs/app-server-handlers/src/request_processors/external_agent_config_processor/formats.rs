@@ -656,9 +656,10 @@ fn parse_frontmatter(
 
     let mut frontmatter = BTreeMap::new();
     for (key, value) in mapping {
-        let Some(key) = key.as_str().map(str::trim).filter(|key| !key.is_empty()) else {
+        let key = key.trim();
+        if key.is_empty() {
             continue;
-        };
+        }
         if frontmatter
             .insert(key.to_string(), frontmatter_value_from_yaml(value))
             .is_some()

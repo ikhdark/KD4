@@ -3641,6 +3641,11 @@ def run_in_cargo_lane(
                         _prune_bundle_store(store, max_age_days=max(1.0, max_age))
                         bundle_dir = store / f"{manifest['sha256'][:16]}-{uuid.uuid4().hex[:8]}"
                     if bundle_dir is not None:
+                        if not executables and not link_artifacts:
+                            raise ValueError(
+                                "--freeze-bundle requires a Cargo executable or a captured link artifact; "
+                                "build a binary or use --record-link-crate to capture a library"
+                            )
                         capture_started = time.perf_counter()
                         frozen = freeze_bundle(bundle_dir, [*executables,
                             *(Path(row["cargoPath"]) for row in link_artifacts)])
@@ -4454,9 +4459,9 @@ def main(argv: list[str] | None = None) -> int:
     run_lane_parser.add_argument(
         "--freeze-bundle",
         type=Path,
-        help="New directory: copy the built (or reused) executables there "
-        f"(read-only) with {BUNDLE_RECEIPT_NAME} before the lane is released. "
-        "Sealed snapshots without it freeze into the local bundle store.",
+        help="New directory: copy built (or reused) executables and requested link artifacts "
+        f"there (read-only) with {BUNDLE_RECEIPT_NAME} before the lane is released. "
+        "At least one artifact is required. Sealed snapshots without it freeze executables into the local bundle store.",
     )
     run_lane_parser.add_argument(
         "--record-link-crate", action="append", default=[],

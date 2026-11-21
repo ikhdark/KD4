@@ -913,7 +913,7 @@ async fn cli_main(
             }
         }
         Some(Subcommand::AppServer(app_server_cli)) => {
-            reject_runtime_options_for_app_server_subcommand(&app_server_cli)?;
+            validate_app_server_options(&root, &app_server_cli)?;
             let AppServerCommand {
                 subcommand,
                 strict_config: app_server_strict_config,
@@ -1657,9 +1657,25 @@ fn reject_strict_config_for_app_server_subcommand(
     )
 }
 
-fn reject_runtime_options_for_app_server_subcommand(
-    command: &AppServerCommand,
-) -> anyhow::Result<()> {
+fn validate_app_server_options(root: &RootOptions, command: &AppServerCommand) -> anyhow::Result<()> {
+    let unsupported_root_option = if root.model.is_some() {
+        Some(("--model", "use `-c model=...` to set the server-wide default"))
+    } else if root.cwd.is_some() {
+        Some((
+            "--cd",
+            "launch from the intended directory or specify `cwd` in the client request",
+        ))
+    } else {
+        None
+    };
+    if let Some((flag, hint)) = unsupported_root_option {
+        let name = app_server_subcommand_name(command.subcommand.as_ref());
+        if command.subcommand.is_none() {
+            anyhow::bail!("`{flag}` is not supported for `codex {name}`; {hint}");
+        }
+        anyhow::bail!("`{flag}` is not supported for `codex {name}`");
+    }
+
     let Some(subcommand) = command.subcommand.as_ref() else {
         return Ok(());
     };

@@ -1,7 +1,6 @@
-//! Helpers for truncating rollouts based on "user turn" boundaries.
-//!
-//! In core, "user turns" are detected by scanning `ResponseItem::Message` items and
-//! interpreting them via `event_mapping::parse_turn_item(...)`.
+//! Helpers for truncating rollouts by persisted turns or user-message boundaries.
+//! Modern turns own all their inputs, including steering. Legacy rollouts without
+//! an explicit start still use instruction records as boundaries.
 
 use crate::context_manager::is_user_turn_boundary;
 use crate::event_mapping;
@@ -18,6 +17,7 @@ use codex_protocol::protocol::RolloutItem;
 #[derive(Default)]
 pub(crate) struct PriorUserTurnTracker {
     legacy_inter_agent_mail: LegacyInterAgentMailReader,
+    explicit_turn: ExplicitTurn,
     rollback_turn_positions: Vec<usize>,
     user_turn_positions: Vec<usize>,
 }
@@ -25,8 +25,9 @@ pub(crate) struct PriorUserTurnTracker {
 impl PriorUserTurnTracker {
     pub(crate) fn observe(&mut self, items: &[RolloutItem], idx: usize, item: &RolloutItem) {
         let legacy_mail = self.legacy_inter_agent_mail.observe(item).is_some();
-        if is_rollback_instruction_turn_boundary(items, idx, item, legacy_mail) {
-            self.rollback_turn_positions.push(idx);
+        self.explicit_turn.observe(items, idx, item);
+        if let Some(start) = self.explicit_turn.instruction_start(items, idx, item, legacy_mail) {
+            push_instruction_start(&mut self.rollback_turn_positions, start);
         }
         if rollout_item_is_user_turn_boundary(item) || legacy_mail {
             self.user_turn_positions.push(idx);
@@ -66,12 +67,14 @@ fn rollout_item_is_user_turn_boundary(item: &RolloutItem) -> bool {
 /// user-message positions returned by this function.
 pub(crate) fn user_message_positions_in_rollout(items: &[RolloutItem]) -> Vec<usize> {
     let mut legacy_inter_agent_mail = LegacyInterAgentMailReader::default();
+    let mut explicit_turn = ExplicitTurn::default();
     let mut rollback_turn_positions = Vec::new();
     let mut user_positions = Vec::new();
     for (idx, item) in items.iter().enumerate() {
         let legacy_mail = legacy_inter_agent_mail.observe(item).is_some();
-        if is_rollback_instruction_turn_boundary(items, idx, item, legacy_mail) {
-            rollback_turn_positions.push(idx);
+        explicit_turn.observe(items, idx, item);
+        if let Some(start) = explicit_turn.instruction_start(items, idx, item, legacy_mail) {
+            push_instruction_start(&mut rollback_turn_positions, start);
         }
         match item {
             RolloutItem::ResponseItem(item @ ResponseItem::Message { .. })
@@ -97,57 +100,69 @@ pub(crate) fn user_message_positions_in_rollout(items: &[RolloutItem]) -> Vec<us
     user_positions
 }
 
-/// Return the indices of fork-turn boundaries in a rollout.
-///
-/// A fork-turn boundary is either:
-/// - a real user message boundary, or
-/// - an inter-agent communication whose `trigger_turn` is `true`, or
-/// - legacy assistant-encoded mail with the same flag (see `LegacyInterAgentMailReader`).
-///
-/// Trigger provenance comes from the typed communication or delivery metadata,
-/// never an assistant's JSON example. Only records written before typed delivery
-/// existed carry mail as assistant JSON; they keep the boundaries their own
-/// rollback markers counted.
-///
-/// Like `user_message_positions_in_rollout`, this applies `ThreadRolledBack` markers so indexing
-/// reflects the effective post-rollback history. Rollback counts instruction turns, so a rollback
-/// removes the stale suffix starting at the earliest rolled-back instruction-turn boundary instead
-/// of simply truncating the mixed fork-boundary list.
-pub(crate) fn fork_turn_positions_in_rollout(items: &[RolloutItem]) -> Vec<usize> {
+#[derive(Clone, Copy)]
+struct ForkTurnBoundary {
+    start: usize,
+    // Compaction replacement histories store model items, not TurnStarted.
+    anchor: usize,
+}
+
+#[derive(Default)]
+struct ForkBoundaries {
+    turns: Vec<ForkTurnBoundary>,
+    checkpoints: Vec<usize>,
+}
+
+/// Find effective fork turns. Only real user inputs and trusted triggering mail
+/// count toward Last-N. Explicit turns contribute at most one boundary, while
+/// older records without a start retain their per-instruction boundaries.
+fn fork_boundaries(items: &[RolloutItem]) -> ForkBoundaries {
     let mut legacy_inter_agent_mail = LegacyInterAgentMailReader::default();
+    let mut explicit_turn = ExplicitTurn::default();
     let mut rollback_turn_positions = Vec::new();
-    let mut fork_turn_positions = Vec::new();
+    let mut boundaries = ForkBoundaries::default();
     for (idx, item) in items.iter().enumerate() {
         let legacy_mail = legacy_inter_agent_mail.observe(item);
-        if is_rollback_instruction_turn_boundary(items, idx, item, legacy_mail.is_some()) {
-            rollback_turn_positions.push(idx);
+        explicit_turn.observe(items, idx, item);
+        if let Some(start) = explicit_turn.instruction_start(items, idx, item, legacy_mail.is_some())
+        {
+            push_instruction_start(&mut rollback_turn_positions, start);
         }
-        let legacy_trigger = legacy_mail.is_some_and(|mail| mail.trigger_turn);
+        let forkable = match item {
+            RolloutItem::ResponseItem(item) => {
+                is_real_user_message_boundary(item)
+                    || legacy_mail.is_some_and(|mail| mail.trigger_turn)
+            }
+            RolloutItem::InterAgentCommunication(communication) => communication.trigger_turn,
+            RolloutItem::InterAgentCommunicationMetadata { trigger_turn, .. } => *trigger_turn,
+            _ => false,
+        };
+        if forkable {
+            let start = explicit_turn.start.unwrap_or(idx);
+            if boundaries.turns.last().is_none_or(|turn| turn.start != start) {
+                boundaries.turns.push(ForkTurnBoundary { start, anchor: idx });
+            }
+        }
         match item {
-            RolloutItem::ResponseItem(item)
-                if is_real_user_message_boundary(item) || legacy_trigger =>
-            {
-                fork_turn_positions.push(idx);
-            }
-            RolloutItem::InterAgentCommunication(communication) if communication.trigger_turn => {
-                fork_turn_positions.push(idx);
-            }
-            RolloutItem::InterAgentCommunicationMetadata { trigger_turn, .. } if *trigger_turn => {
-                fork_turn_positions.push(idx);
-            }
+            RolloutItem::Compacted(_) => boundaries.checkpoints.push(idx),
             RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
                 let num_turns = usize::try_from(rollback.num_turns).unwrap_or(usize::MAX);
-                if let Some(rollback_start_idx) = apply_rollback_to_instruction_turn_positions(
+                if let Some(start) = apply_rollback_to_instruction_turn_positions(
                     &mut rollback_turn_positions,
                     num_turns,
                 ) {
-                    fork_turn_positions.retain(|position| *position < rollback_start_idx);
+                    boundaries
+                        .turns
+                        .truncate(boundaries.turns.partition_point(|turn| turn.start < start));
+                    boundaries.checkpoints.truncate(
+                        boundaries.checkpoints.partition_point(|index| *index < start),
+                    );
                 }
             }
             _ => {}
         }
     }
-    fork_turn_positions
+    boundaries
 }
 
 /// Filter owned history while repairing rollback counts for removed instructions.
@@ -193,44 +208,33 @@ fn rollout_filter_decisions(
     mut keep: impl FnMut(&RolloutItem) -> bool,
 ) -> Vec<(bool, Option<u32>)> {
     let mut legacy_mail = LegacyInterAgentMailReader::default();
-    let mut instruction_turns = Vec::new();
-    let mut active_turn: Option<(&str, usize)> = None;
+    let mut instruction_turns: Vec<(bool, usize)> = Vec::new();
+    let mut explicit_turn = ExplicitTurn::default();
     let mut replay_effects: Vec<usize> = Vec::new();
     let mut decisions: Vec<(bool, Option<u32>)> = Vec::with_capacity(items.len());
     for (index, item) in items.iter().enumerate() {
         let legacy = legacy_mail.observe(item).is_some();
         let retained = keep(item);
-        let instruction_boundary =
-            is_rollback_instruction_turn_boundary(items, index, item, legacy);
+        explicit_turn.observe(items, index, item);
+        let instruction_start = explicit_turn.instruction_start(items, index, item, legacy);
         match item {
-            RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => {
-                active_turn = Some((event.turn_id.as_str(), index));
-            }
-            RolloutItem::EventMsg(
-                EventMsg::TurnComplete(event) | EventMsg::ImportedTurnClosed(event),
-            ) if active_turn.is_some_and(|(id, _)| id == event.turn_id.as_str()) => {
-                active_turn = None;
-            }
-            RolloutItem::EventMsg(EventMsg::TurnAborted(event))
-                if event.turn_id.as_deref().is_none_or(|id| {
-                    active_turn.is_some_and(|(active_id, _)| active_id == id)
-                }) =>
-            {
-                active_turn = None;
-            }
             RolloutItem::TurnContext(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::Compacted(_)
             | RolloutItem::ContextReplay { .. }
             | RolloutItem::SamplingBoundary(_)
             | RolloutItem::AdditionalContextState { .. }
-            | RolloutItem::ResponseItem(_) if retained && !instruction_boundary => {
+            | RolloutItem::ResponseItem(_) if retained && instruction_start.is_none() => {
                 replay_effects.push(index);
             }
             _ => {}
         }
-        if instruction_boundary {
-            instruction_turns.push((retained, active_turn.map_or(index, |(_, start)| start)));
+        if let Some(start) = instruction_start {
+            // If any instruction survives filtering, replay still counts the turn.
+            match instruction_turns.last_mut() {
+                Some((keep, previous)) if *previous == start => *keep |= retained,
+                _ => instruction_turns.push((retained, start)),
+            }
         }
         let rollback = if let RolloutItem::EventMsg(EventMsg::ThreadRolledBack(event)) = item {
             let count = usize::try_from(event.num_turns).unwrap_or(usize::MAX);
@@ -276,6 +280,60 @@ fn apply_rollout_filter_decision(
         event.num_turns = count;
     }
     Some(item)
+}
+
+#[derive(Default)]
+struct ExplicitTurn {
+    start: Option<usize>,
+}
+
+impl ExplicitTurn {
+    fn observe(&mut self, items: &[RolloutItem], idx: usize, item: &RolloutItem) {
+        let active_id = self.start.and_then(|start| match &items[start] {
+            RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => Some(event.turn_id.as_str()),
+            _ => None,
+        });
+        match item {
+            RolloutItem::EventMsg(EventMsg::TurnStarted(_)) => self.start = Some(idx),
+            RolloutItem::EventMsg(
+                EventMsg::TurnComplete(event) | EventMsg::ImportedTurnClosed(event),
+            ) if active_id == Some(event.turn_id.as_str()) => self.start = None,
+            RolloutItem::EventMsg(EventMsg::TurnAborted(event))
+                if event.turn_id.as_deref().is_none_or(|id| active_id == Some(id)) =>
+            {
+                self.start = None;
+            }
+            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(event)) if event.num_turns > 0 => {
+                self.start = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn instruction_start(
+        &self,
+        items: &[RolloutItem],
+        idx: usize,
+        item: &RolloutItem,
+        legacy_mail: bool,
+    ) -> Option<usize> {
+        let explicit_input = self.start.is_some() && match item {
+            RolloutItem::EventMsg(EventMsg::UserMessage(_)) => true,
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => matches!(
+                &event.item,
+                TurnItem::UserMessage(message) if crate::event_mapping::is_user_input_item_id(&message.id)
+            ),
+            _ => false,
+        };
+        (explicit_input || is_rollback_instruction_turn_boundary(items, idx, item, legacy_mail))
+            .then_some(self.start.unwrap_or(idx))
+    }
+}
+
+fn push_instruction_start(positions: &mut Vec<usize>, start: usize) {
+    if positions.last().copied() != Some(start) {
+        positions.push(start);
+    }
 }
 
 /// `legacy_inter_agent_mail` is the `LegacyInterAgentMailReader` verdict for `item`.
@@ -456,20 +514,26 @@ pub(crate) fn truncate_rollout_to_last_n_fork_turns(
         return Ok(Vec::new());
     }
 
-    let fork_turn_positions = fork_turn_positions_in_rollout(items);
-    let Some(keep_idx) = fork_turn_positions
-        .len()
-        .checked_sub(n_from_end)
-        .map(|position| fork_turn_positions[position])
-        .or_else(|| fork_turn_positions.first().copied())
+    let boundaries = fork_boundaries(items);
+    let Some(ForkTurnBoundary { start: keep_idx, anchor }) = boundaries
+        .turns
+        .get(boundaries.turns.len().saturating_sub(n_from_end))
+        .copied()
     else {
         return Ok(Vec::new());
     };
-    let mut retained = items[keep_idx..].to_vec();
-    if !retained
-        .iter()
-        .any(|item| matches!(item, RolloutItem::Compacted(_)))
-    {
+    let mut retained = Vec::with_capacity(items.len() - keep_idx);
+    // A pre-input compaction belongs to the excluded history, even if planning
+    // wrote it after TurnStarted. Keep the opening event, not that checkpoint.
+    retained.extend(
+        items[keep_idx..anchor]
+            .iter()
+            .filter(|item| !matches!(item, RolloutItem::Compacted(_)))
+            .cloned(),
+    );
+    let anchor_offset = retained.len();
+    retained.extend_from_slice(&items[anchor..]);
+    if boundaries.checkpoints.last().is_none_or(|index| *index < anchor) {
         return Ok(carry_source_integrity_notice(items, retained));
     }
     let cannot_bound_checkpoint = || {
@@ -477,13 +541,13 @@ pub(crate) fn truncate_rollout_to_last_n_fork_turns(
         "Cannot fork last-N turns: a compaction checkpoint does not uniquely identify the retained turn boundary. Use full-history or task-capsule mode instead.".into(),
     )
     };
-    let boundary = match &items[keep_idx] {
+    let boundary = match &items[anchor] {
         RolloutItem::ResponseItem(item) => std::borrow::Cow::Borrowed(item),
         RolloutItem::InterAgentCommunication(communication) => {
             std::borrow::Cow::Owned(communication.to_model_input_item())
         }
         RolloutItem::InterAgentCommunicationMetadata { .. } => {
-            let Some(RolloutItem::ResponseItem(item)) = items.get(keep_idx + 1) else {
+            let Some(RolloutItem::ResponseItem(item)) = items.get(anchor + 1) else {
                 return Err(cannot_bound_checkpoint());
             };
             std::borrow::Cow::Borrowed(item)
@@ -511,9 +575,14 @@ pub(crate) fn truncate_rollout_to_last_n_fork_turns(
             matched.then_some(index)
         })
         .collect::<Vec<_>>();
-    for (offset, item) in retained.iter_mut().enumerate() {
-        if let RolloutItem::Compacted(compacted) = item {
-            if matching_positions.partition_point(|index| *index < keep_idx + offset) != 1 {
+    for (offset, item) in retained[anchor_offset..].iter_mut().enumerate() {
+        let checkpoint_index = anchor + offset;
+        // A rolled-back checkpoint is retired by the fork filter; it must
+        // neither determine what is inherited nor veto a valid cut.
+        if let RolloutItem::Compacted(compacted) = item
+            && boundaries.checkpoints.binary_search(&checkpoint_index).is_ok()
+        {
+            if matching_positions.partition_point(|index| *index < checkpoint_index) != 1 {
                 return Err(cannot_bound_checkpoint());
             }
             let history = compacted

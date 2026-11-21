@@ -33,6 +33,7 @@ pub use crate::dispatch::admit_dispatch;
 pub use crate::dispatch::bind_dispatch_guard;
 pub use crate::dispatch::with_dispatch_guard;
 pub use crate::dispatch::with_request_dispatch_scope;
+pub use crate::error::ConnectionError;
 pub use crate::error::StreamError;
 pub use crate::error::TransportError;
 pub use crate::outbound_proxy::BuildRouteAwareHttpClientError;

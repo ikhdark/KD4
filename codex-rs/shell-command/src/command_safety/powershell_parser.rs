@@ -298,9 +298,104 @@ pub fn powershell_command_syntax_error(command: &[String]) -> Option<String> {
         return None;
     };
     match parse_with_powershell_ast(executable, script) {
-        PowershellParseOutcome::SyntaxError(diagnostic) => Some(diagnostic),
+        PowershellParseOutcome::SyntaxError(diagnostic) => {
+            Some(with_brace_expansion_hint(script, diagnostic))
+        }
         _ => None,
     }
+}
+
+/// PowerShell has no brace expansion: an unquoted `a/{b,c}` word is not a path
+/// list. When the first parser error falls inside such a word, name that cause;
+/// every other diagnostic is returned unchanged.
+fn with_brace_expansion_hint(script: &str, diagnostic: String) -> String {
+    let chars = script.chars().collect::<Vec<_>>();
+    let in_brace_list = first_error_offset(script, &diagnostic)
+        .and_then(|offset| word_bounds_at(&chars, offset))
+        .is_some_and(|(start, end)| {
+            !matches!(chars[start], '\'' | '"') && contains_brace_list(&chars[start..end])
+        });
+    if in_brace_list {
+        format!(
+            "{diagnostic}\nHint: PowerShell does not expand Bash-style braces such as `a/{{b,c}}`; pass each path separately, for example `a/b a/c`."
+        )
+    } else {
+        diagnostic
+    }
+}
+
+/// Character offset of the first `line L, column C (...)` diagnostic.
+fn first_error_offset(script: &str, diagnostic: &str) -> Option<usize> {
+    let position = diagnostic.lines().next()?.strip_prefix("line ")?;
+    let (line, rest) = position.split_once(", column ")?;
+    let (column, _) = rest.split_once(' ')?;
+    let line = line.parse::<usize>().ok()?;
+    let column = column.parse::<usize>().ok()?;
+    let mut offset = 0;
+    let mut lines = script.split('\n');
+    for _ in 1..line {
+        offset += lines.next()?.chars().count() + 1;
+    }
+    lines.next()?;
+    Some(offset + column.checked_sub(1)?)
+}
+
+/// Bounds of the whitespace-delimited word containing `offset`, treating quoted
+/// spans and backtick escapes as part of a word.
+fn word_bounds_at(chars: &[char], offset: usize) -> Option<(usize, usize)> {
+    let mut index = 0;
+    let mut start: Option<usize> = None;
+    let mut quote: Option<char> = None;
+    while index < chars.len() {
+        let c = chars[index];
+        if c == '`' && quote != Some('\'') {
+            start.get_or_insert(index);
+            index += 2;
+            continue;
+        }
+        if let Some(open) = quote {
+            if c == open {
+                if open == '\'' && chars.get(index + 1) == Some(&'\'') {
+                    index += 2;
+                    continue;
+                }
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if c == '\'' || c == '"' {
+            quote = Some(c);
+            start.get_or_insert(index);
+        } else if c.is_whitespace() {
+            if let Some(word_start) = start.take()
+                && word_start <= offset
+                && offset <= index
+            {
+                return Some((word_start, index));
+            }
+        } else {
+            start.get_or_insert(index);
+        }
+        index += 1;
+    }
+    start
+        .filter(|word_start| *word_start <= offset)
+        .map(|word_start| (word_start, chars.len()))
+}
+
+/// A `{a,b}` list: braces around a comma, with no whitespace, nested brace,
+/// quote, variable, subexpression, index, separator or pipe inside.
+fn contains_brace_list(word: &[char]) -> bool {
+    let forbidden = |c: char| c.is_whitespace() || "{}$()[]'\"`;|".contains(c);
+    word.iter().enumerate().any(|(index, c)| {
+        if *c != '{' {
+            return false;
+        }
+        let body = &word[index + 1..];
+        let length = body.iter().take_while(|c| !forbidden(**c)).count();
+        body[..length].contains(&',') && body.get(length) == Some(&'}')
+    })
 }
 
 fn parse_with_powershell_ast_request(

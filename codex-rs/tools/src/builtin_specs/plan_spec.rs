@@ -66,6 +66,15 @@ pub fn create_update_plan_tool() -> ToolSpec {
             Some("Replace the checklist. Rows may be renamed or removed, but unfinished requirements must be retained via continues or retired with accepted user authorization.".into()))),
         ("set".into(), updates),
         ("pin".into(), pins),
+        ("report_blocked".into(), JsonSchema::object(BTreeMap::from([
+            ("obligation_ids".into(), JsonSchema::array(JsonSchema::string(None), Some(
+                "Exact still-unresolved requirement IDs. Complete independently ready work first; the report never resolves these IDs.".into()))),
+            ("receipt_call_id".into(), JsonSchema::string(Some(
+                "The receipt_call_id from a current native read_file NotFound in the primary environment.".into()))),
+            ("path".into(), JsonSchema::string(Some(
+                "Exact path supplied to that read and reserved to the user in the cited input: `Only the user can provide PATH; do not create or substitute it.`".into()))),
+            ("source".into(), reference.clone()),
+        ]), Some(vec!["obligation_ids".into(), "receipt_call_id".into(), "path".into(), "source".into()]), Some(false.into()))),
         ("explanation".into(), JsonSchema::string(None)),
         ("expected_revision".into(), JsonSchema::string(Some(
             "Revision returned by the last update, required after the plan changed since this sampling step. Rejects stale updates without mutation.".into()))),
@@ -97,17 +106,17 @@ pub fn create_update_plan_tool() -> ToolSpec {
     ]);
     ToolSpec::Function(ResponsesApiTool {
         name: "update_plan".into(),
-        description: format!("{}\n\n{}", "Update a progress checklist or pin task requirements through its existing owner. Unavailable in Plan mode. Use exactly one of plan, set or pin; at most one checklist step may be in_progress. Pins survive compaction with stable IDs, authentic input provenance and explicit states; they do not discard other requirements. Checklist statuses are model reports, not proof of task correctness.", include_str!("plan_progress.md").trim()),
+        description: format!("{}\n\n{}", "Update a progress checklist or pin task requirements through its existing owner. Unavailable in Plan mode. Use exactly one of plan, set, pin or report_blocked; at most one checklist step may be in_progress. Pins survive compaction with stable IDs, authentic input provenance and explicit states; they do not discard other requirements. Checklist statuses are model reports, not proof of task correctness. report_blocked requires expected_revision and exact native evidence; it leaves debt unresolved.", include_str!("plan_progress.md").trim()),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema {
-            one_of: Some(["plan", "set", "pin"].into_iter().map(|key| JsonSchema {
+            one_of: Some(["plan", "set", "pin", "report_blocked"].into_iter().map(|key| JsonSchema {
                 required: Some(vec![key.into()]),
                 ..JsonSchema::object(BTreeMap::new(), None, None)
             }).collect()),
             ..JsonSchema::object(properties, None, Some(false.into()))
         },
-        output_schema: Some(json!({
+        output_schema: Some(json!({"oneOf":[{
             "type":"object",
             "properties":{
                 "current_plan":{"type":"object","properties":{
@@ -143,6 +152,26 @@ pub fn create_update_plan_tool() -> ToolSpec {
             },
             "required":["current_plan","revision","step_ids","message","effect","no_progress","completion_authority","lineage_complete","obligations"],
             "additionalProperties":false
-        }).into()),
+        },{
+            "type":"object",
+            "properties":{
+                "request_state":{"const":"incomplete"},
+                "blocked_prerequisite":{
+                    "type":"object",
+                    "properties":{
+                        "receipt_call_id":{"type":"string"},
+                        "path":{"type":"string"},
+                        "canonical_uri":{"type":"string"},
+                        "environment_id":{"type":"string"},
+                        "obligation_ids":{"type":"array","items":{"type":"string"}},
+                        "plan_revision":{"type":"string"}
+                    },
+                    "required":["receipt_call_id","path","canonical_uri","environment_id","obligation_ids","plan_revision"],
+                    "additionalProperties":false
+                }
+            },
+            "required":["request_state","blocked_prerequisite"],
+            "additionalProperties":false
+        }]}).into()),
     })
 }

@@ -870,6 +870,7 @@
       const occurrences = new Map();
       const hydrationHits = new Map();
       const normalizePath = (file) => file.replace(/^(\.\/)+/, "");
+      const keyFor = __codex_search_path_key(scope);
       let unparsed = false;
       let binary = false;
       let summarySeen = false;
@@ -894,10 +895,11 @@
             unparsed = true;
             break;
           }
-          const previous = files.get(file);
+          const key = keyFor(file);
+          const previous = files.get(key);
           if (previous && previous.count !== observed) unparsed = true;
-          files.set(file, {
-            path: file,
+          files.set(key, {
+            path: previous && previous.path < file ? previous.path : file,
             count: Math.max(previous?.count ?? 0, observed),
           });
           offset = end + 1;
@@ -942,7 +944,7 @@
             continue;
           }
           const key =
-            file === null ? `bytes:${data.path.bytes}` : `text:${file}`;
+            file === null ? `bytes:${data.path.bytes}` : `text:${keyFor(file)}`;
           const entry = files.get(key) ?? {
             ...(file === null
               ? { path_bytes: data.path.bytes }
@@ -952,6 +954,7 @@
             pattern_counts: patterns.map(item => ({ ...item, occurrences: 0, matching_lines: 0 })),
           };
           if (file === null) unparsed = true;
+          else if (file < entry.path) entry.path = file;
           if (event.type === "end") {
             binary = entry.binary = true;
           } else if (
@@ -1077,11 +1080,12 @@
         // Serial reads add no detached tasks or new scheduler/lock lifetime.
         // A failed file never discards successful search/read siblings.
         const rank = new Map();
+        const priorityKey = path => keyFor(path).replaceAll("\\", "/");
         for (const path of preferred_paths) {
-          const key = normalizePath(path.replaceAll("\\", "/"));
+          const key = priorityKey(path);
           if (!rank.has(key)) rank.set(key, rank.size);
         }
-        const priority = entry => rank.get(entry.path?.replaceAll("\\", "/")) ?? rank.size;
+        const priority = entry => entry.path === undefined ? rank.size : rank.get(priorityKey(entry.path)) ?? rank.size;
         const order = rank.size ? [...sorted].sort((left, right) =>
           priority(left) - priority(right)) : sorted;
         for (const entry of order) {
@@ -1397,23 +1401,23 @@
           if (on_progress && (await on_progress(current)) !== true)
             reject("command progress needs review", evidence);
           const remaining = Math.floor(deadline - now());
-          // Empty native polls have a five-second floor. Do not launch a
-          // fresh observation that cannot fit in the remaining wait budget.
-          if (remaining < 5_000)
+          if (remaining <= 0)
             reject(
               silent
                 ? "command wait budget reached with no output observed; inspect and resume the retained handle"
                 : "command wait budget reached; inspect and resume the retained handle",
               evidence, "timed_out",
             );
-          // A passive output wait can remain pending forever. Bound the existing
-          // poll instead; never race/detach a tool, kill the process, or restart it.
+          // The nested deadline caps observation even when native write_stdin
+          // floors the requested yield at five seconds. Its NESTED_POLL_MARGIN
+          // (2 seconds) is reserved for returning the receipt, not polling.
+          // Keep the owner attached; a passive wait or a race could lose it.
           current = await capability("write_stdin")({
             session_id: session,
             incarnation,
             wait_for_output: false,
             yield_time_ms: remaining,
-          });
+          }, { timeout_ms: remaining + 2_000 });
         } catch (cause) {
           if (cause?.evidence === evidence) throw cause;
           evidence.cause = cause;

@@ -30,6 +30,10 @@ KD4 owns the backend. The editable Desktop frontend is in sibling
 `Codex-Fork`; follow [its instructions](../Codex-Fork/AGENTS.md) for frontend
 work. Leave the Windows Store installation untouched.
 
+For concurrent KDA Rust work, edit and compile in separate
+[KDR session workspaces](../KDR/scripts/build/README.md#session-workspaces)
+and integrate through guarded delivery rather than editing the shared checkout.
+
 ## Work through the complete request
 
 **Code preservation and change scope:** Treat existing code and behavior as intentional unless evidence indicates otherwise. Make the smallest changes necessary to accomplish the task. Do not remove, replace, or rewrite existing functionality merely because a new implementation overlaps with it or appears cleaner. Before replacing code, understand its responsibilities, dependencies, and existing guarantees. Replacement is justified when explicitly requested or supported by a concrete technical reason. Preserve unrelated behavior, contracts, error handling, and edge cases. Review the final diff for unintended removals, behavioral regressions, and unnecessary changes. Restore changes that cannot be justified by the task.
@@ -45,37 +49,48 @@ wording is untouched.
   benefit, fix the owning component, then verify the requested outcome and
   affected valid behavior. Trace callers and consumers; fix implementation bugs
   in code, not prompt workarounds.
-- Reviews and audits include fixing verified in-scope issues unless the user
-  explicitly requests read-only work. Recommendations, classification and worker
-  handoffs do not discharge authorized repairs. Nothing is postponed: finish
-  reviewed or audited work in the same task; the only stop is a genuine blocker
-  that needs user input or authority.
-- Report evidence-backed findings and fix every verified in-scope defect they
-  reveal, rather than stopping at an explanation or report. Reconcile evidence
-  with current source, verify repairs and preserved valid behavior, and
-  distinguish verified fixes from unresolved findings; respect explicit
-  read-only limits.
-- Scope is the request plus everything it names or asks you to review. Every
-  defect you verify inside that scope is in scope, including older or secondary
-  occurrences and every site sharing its root cause; labels such as unrelated,
-  historical, follow-up, optional or separately owned do not remove it. Exclude
-  only work outside the request, and name each exclusion with its reason. Do not
-  start unrequested historical campaigns or turn unverified speculation into
+- Cover the full requested scope of reviews and audits and fix every verified
+  defect in it unless the user explicitly requests read-only work.
+  Prioritize repairs for defects that block the requested outcome, break valid
+  behavior or undermine required verification. Lower priority changes the order,
+  not the obligation. When useful, recommend a narrower audit or explicitly
+  read-only coverage for lower-priority areas; do not assume either.
+  Recommendations, classification and worker handoffs do not discharge required
+  repairs. Reconcile findings with current source, verify repairs and preserved
+  valid behavior, and distinguish verified fixes from unresolved findings.
+- Required work includes the user's requested outcomes and constraints,
+  applicable owner contracts, and fixes needed to meet them, preserve affected
+  valid behavior or verify the result reliably. Older or secondary occurrences
+  and sites sharing a root cause remain required where they affect that scope;
+  labels such as historical, follow-up, optional or separately owned do not
+  remove them.
+- Beyond required coverage, investigate an additional failure path only while
+  there is a concrete reason it could materially affect the requested outcome,
+  affected valid behavior or the reliability of required verification.
+  Discovery alone does not expand scope. Briefly report relevant incidental
+  discoveries as non-blocking observations and recommend priorities when useful.
+  If recording them in an audit case, use its case notes, not open finding rows
+  or closure obligations. For reviews, name exclusions with their reasons.
+  Do not start unrequested historical campaigns or turn speculation into
   acceptance criteria.
 - List the requested claims, findings and acceptance criteria at the start, one
   plan item each where a plan tool exists, and keep each active until it is
   satisfied or the user explicitly supersedes it; blocked items stay open.
-  Status questions and compaction do not cancel unfinished work. Diagnose, fix
-  and verify each distinct in-scope failure mode, or close it with an
-  evidence-backed no-defect/not-applicable finding. Do not narrow an
-  investigation-and-fix task to classification, documentation, the latest
-  failure or its easiest successful path; disclosing a narrowing does not make
-  it acceptable.
+  You may recommend priorities, but do not narrow or downgrade an explicit
+  requirement without the user's authorization. Status questions and compaction
+  do not cancel unfinished work. Diagnose, fix and verify each required failure
+  mode, or close it with an evidence-backed no-defect/not-applicable finding.
+  Do not narrow an investigation-and-fix task to classification, documentation,
+  the latest failure or its easiest successful path; disclosing a narrowing
+  does not make it acceptable.
   Trace each criterion to the user's request (including corrections) or an
   applicable owner contract. Before handoff, check those sources against the
   plan so a missed item cannot silently disappear.
-- Working an existing audit case means resolving every open finding in that
-  case, not the newest or easiest one.
+- Existing requested obligations and every open finding in an audit case
+  remain required; do not reclassify them as incidental. Only the user may
+  narrow their request. An applicable owner contract may explicitly supersede
+  only requirements it governs, without overriding the user's request.
+  Record the authority for any such change and follow the case's closure rules.
 - For broad reviews, account for the complete requested inventory, including
   partial reads and every slice handed to a worker. Reconcile each worker's
   coverage, remaining scope and findings with that inventory; unassigned,
@@ -91,12 +106,12 @@ wording is untouched.
   editing. Age, labels and missing evidence prove neither a defect nor its
   absence.
 - Make the smallest justified owning change and necessary integration edits;
-  smallest limits blast radius, not the number of defects, so fix every site
-  sharing the root cause. Preserve user and concurrent-agent work, unrelated
-  behavior, interfaces, defaults, dependencies and formatting; re-read before
-  editing and merge rather than replay an older copy. Prefer extending a working
-  fix; replace it only when incremental correction is insufficient, explaining
-  the lost and retained benefits.
+  smallest limits blast radius, not required repairs. Fix every site within the
+  required scope that shares the root cause. Preserve user and concurrent-agent
+  work, unrelated behavior, interfaces, defaults, dependencies and formatting;
+  re-read before editing and merge rather than replay an older copy. Prefer
+  extending a working fix; replace it only when incremental correction is
+  insufficient, explaining the lost and retained benefits.
   Use the read source hash or revision as a write precondition where supported;
   on mismatch, re-read, merge and retry against the new identity. Without a
   conditional write, re-read just before a minimal context-checked edit and
@@ -123,10 +138,10 @@ wording is untouched.
   retain a material regression only with explicit user acceptance. Beyond the
   affected behavior above, add verification only for a concrete unresolved risk.
   Stopping one fix does not end the remaining requested work.
-- Before handoff reconcile every requested item against evidence. Hand off only
-  when each item is verified, closed as no-defect/not-applicable with evidence,
-  withdrawn by the user, or genuinely blocked. Candidates, coverage gaps,
-  unknown outcomes, missing coverage and incomplete recovery are unfinished work,
+- Before handoff reconcile every required item against evidence. Hand off only
+  when each is verified, closed as no-defect/not-applicable with evidence,
+  withdrawn by the user, or genuinely blocked. Within required scope, candidates,
+  coverage gaps, unknown outcomes and incomplete recovery are unfinished work,
   not report categories or passes: identify the missing observation and next
   permitted action, then perform it. A caveat, needs-review label, report or
   promise to continue is not a substitute for obtainable work, and asking
@@ -228,8 +243,22 @@ wording is untouched.
   identity, not log proximity. Separate observations, inference, hypothetical
   savings and verified improvement; fewer tokens, a faster run or a passing
   benchmark is not an improvement unless correctness, recovery and coverage hold.
-  Challenge important findings with counterexamples and correct unsupported
-  conclusions explicitly.
+- Start diagnosis with the perspective best supported by the observed symptoms,
+  the owning execution path and a plausible failure mechanism. Before accepting
+  a material diagnosis, implementation decision or verification claim, identify
+  the strongest plausible counterexample or alternative explanation and attempt
+  a bounded, permitted check that could distinguish it from the leading
+  conclusion. If the evidence cannot distinguish them, preserve uncertainty
+  rather than accepting the conclusion. Correct unsupported conclusions
+  explicitly.
+- Expand diagnosis when unexplained observations, contradictions, evidence of a
+  shared root cause, or meaningful regression or verification risks could change
+  the diagnosis, repair or proof. Do not repeat a challenge without new evidence
+  or an unresolved material risk. Once the defect is explained, corrected and
+  verified against the required behavior, stop exploring hypothetical alternatives
+  unless concrete evidence or an unresolved material risk warrants it.
+  Selectivity limits investigation, not required audit coverage, repairs or
+  verification; continue the remaining required work.
 - Use independent review for high-consequence changes or evidence that cannot
   adequately challenge the author's assumptions, subject to delegation
   authorization. Strong matched evidence may suffice for lower-consequence fixes.
@@ -349,9 +378,9 @@ and retains run evidence in its [benchmark library](../KDA/benchmarks/README.md)
   fix that matched measurement showed was not an improvement; record it with
   that evidence in the case's [defers](../KDR/audits/README.md#defers) so it is
   not re-proposed without new evidence. A defer never resolves its finding.
-  Nothing else is deferred or postponed: difficult or unverified work is
-  finished in the task, and only a genuine blocker stays open in its active
-  case with the exact input or authority it needs.
+  Required case work is not deferred or postponed: finish it in the task.
+  Only a genuine blocker stays open in its active case with the exact input
+  or authority it needs.
 - Keep requested investigation/audit/benchmark reports short and `.txt`: scope
   and coverage, status/counts, findings with ID/severity/path/trigger/evidence/
   disposition, measurements, and any genuine blocker with the exact input or

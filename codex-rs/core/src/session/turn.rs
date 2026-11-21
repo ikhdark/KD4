@@ -113,6 +113,7 @@ use crate::session::turn_execution::AuthoritativeWaitResolution;
 use crate::session::turn_execution::ContinuationDisposition;
 use crate::session::turn_execution::ConvergenceGuardKind;
 use crate::session::turn_execution::GenerationRequestDisposition;
+use crate::session::turn_execution::ObligationStoppingDecision;
 use crate::session::turn_execution::SamplingConvergenceDecision;
 use crate::session::turn_execution::SamplingRequestSettledState;
 use crate::session::turn_execution::SamplingRequestSignalCollector;
@@ -570,6 +571,12 @@ pub(crate) fn run_turn<'a>(
             .await
             .set_environment_display_roots(display_roots);
         let kd4_runtime = turn_context.config.features.enabled(Feature::Kd4Runtime);
+        let authored_receipt_sealed = || {
+            turn_context
+                .extension_data
+                .get::<crate::agent::task_coordinator::AuthoredReceiptSealed>()
+                .is_some()
+        };
 
         let mut turn_execution =
             TurnExecutionControl::new_with_timing(Arc::clone(&turn_context.turn_timing_state))
@@ -745,6 +752,11 @@ pub(crate) fn run_turn<'a>(
                     request_baselines.relevant_state_fingerprint(),
                 );
             }
+            // Sealing a typed receipt revokes tool authority. Use the remaining
+            // generation to hand off the result, not to advertise another tool call.
+            if authored_receipt_sealed() && !generation_request.terminal_completion_only {
+                generation_request = generation_request.require_terminal_completion();
+            }
             let previous_rates = sess.state.lock().await.token_info_and_rate_limits().1;
             turn_context.turn_timing_state.observe_credits(
                 previous_rates
@@ -790,6 +802,29 @@ pub(crate) fn run_turn<'a>(
                     reason,
                 )
                 .await;
+            }
+
+            let allows_ordinary_final_reconciliation = || {
+                kd4_runtime
+                    && !generation_request.terminal_completion_only
+                    && !stop_hook_active
+                    && finalized_mutation_revision.is_none()
+                    && !authored_receipt_sealed()
+            };
+            // A forced terminal generation still cannot publish a success
+            // candidate while ordinary gated work has unresolved owner debt.
+            // Sealed workers and an active completion hook retain authority.
+            let gate_budget_final = kd4_runtime
+                && budget_forced_terminal == Some(ForcedTerminalReason::GenerationBudget)
+                && !stop_hook_active
+                && finalized_mutation_revision.is_none()
+                && !authored_receipt_sealed();
+            if (allows_ordinary_final_reconciliation() || gate_budget_final)
+                && turn_execution.unresolved_plan().is_some()
+            {
+                let _ = turn_context.extension_data.get_or_init(
+                    crate::stream_events_utils::DeferredFinalOutput::default,
+                );
             }
 
             has_started_generation = true;
@@ -968,7 +1003,13 @@ pub(crate) fn run_turn<'a>(
                     // required sibling stops this generation; Drop can retain
                     // only settled failures and live validation questions.
                     if let Some(required_tool_terminal) = required_tool_terminal {
-                        if required_tool_terminal.cause != RequiredToolTerminalCause::Blocked {
+                        let blocked = required_tool_terminal.cause == RequiredToolTerminalCause::Blocked;
+                        let obligation_assessment = (kd4_runtime && blocked
+                            && turn_execution.unresolved_plan().is_some())
+                            .then(|| turn_execution.obligation_stop_assessment(
+                                settled_state.mutation_revision, Some(&required_tool_terminal),
+                            ));
+                        if !blocked {
                             let error = CodexErrorInfo::Other;
                             sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone()).await;
                             sess.send_event(&turn_context, EventMsg::Error(ErrorEvent {
@@ -978,10 +1019,10 @@ pub(crate) fn run_turn<'a>(
                         }
                         return Ok(TurnTaskResult {
                             stop_cause: None,
-                            last_agent_message,
+                            last_agent_message: if obligation_assessment.is_some() { None } else { last_agent_message },
                             accepted_final_message: None,
                             surfaced_result,
-                            completion_assessment: None,
+                            completion_assessment: obligation_assessment,
                             required_tool_terminal: Some(required_tool_terminal),
                             defer_pending_input: false,
                         });
@@ -1045,6 +1086,42 @@ pub(crate) fn run_turn<'a>(
                     )
                     .instrument(trace_span!("run_turn.collect_post_sampling_state"))
                     .await;
+                    // Consume a report at its own settlement, not after a later
+                    // generation or newly admitted input changes the turn.
+                    let blocked = turn_execution.take_blocked_prerequisite(
+                        turn_context.as_ref(),
+                        settled_state.mutation_revision,
+                        sess.input_queue.incorporated_user_intent_epoch(),
+                    );
+                    if !has_pending_input
+                        && allows_ordinary_final_reconciliation()
+                        && let Some(blocked) = blocked
+                    {
+                        if cancellation_token.is_cancelled() {
+                            return Err(CodexErr::TurnAborted);
+                        }
+                        let terminal = blocked.terminal();
+                        sess.send_event(&turn_context, EventMsg::Warning(WarningEvent {
+                            message: terminal.message.clone(),
+                        })).await;
+                        let mut assessment = turn_execution.obligation_stop_assessment(
+                            settled_state.mutation_revision,
+                            Some(&terminal),
+                        );
+                        if let Some(disposition) = assessment.task_disposition.as_mut() {
+                            disposition.terminal_action = "blocked_missing_prerequisite".into();
+                            disposition.evidence_refs.push(blocked.read_evidence_ref());
+                        }
+                        return Ok(TurnTaskResult {
+                            stop_cause: None,
+                            last_agent_message: None,
+                            accepted_final_message: None,
+                            surfaced_result: None,
+                            completion_assessment: Some(assessment),
+                            required_tool_terminal: Some(terminal),
+                            defer_pending_input: false,
+                        });
+                    }
                     // Explicit owner completion and the emergency generation budget
                     // may request one final tool-free response. Repeated actions and
                     // passing validation do not establish completion of the task.
@@ -1068,6 +1145,13 @@ pub(crate) fn run_turn<'a>(
                                 &mut generation_budget_error_reported,
                             )
                             .await;
+                            if gate_budget_final && turn_execution.unresolved_plan().is_some() {
+                                completion_assessment = Some(turn_execution.obligation_stop_assessment(
+                                    settled_state.mutation_revision, None,
+                                ));
+                                last_agent_message = None;
+                                break 'sampling_loop;
+                            }
                         }
                     }
                     let request_analysis = request_signals.analyze_settled_request();
@@ -1328,6 +1412,76 @@ pub(crate) fn run_turn<'a>(
                     }
 
                     if !needs_follow_up {
+                        // Gate ordinary completion before answer-only repair or effectful hooks.
+                        // Terminal budgets, user Stop, and sealed receipts keep their authority.
+                        if allows_ordinary_final_reconciliation() {
+                            let retry = match turn_execution.decide_obligation_stop() {
+                                ObligationStoppingDecision::Allow => None,
+                                ObligationStoppingDecision::Continue(text) => {
+                                    if let Some(plan) = turn_execution.unresolved_plan() {
+                                        super::turn_execution::hold_exact_read_for_obligation(
+                                            sess.as_ref(),
+                                            turn_context.as_ref(),
+                                            plan,
+                                            sess.input_queue.incorporated_user_intent_epoch(),
+                                        ).await;
+                                    }
+                                    Some(text)
+                                }
+                                ObligationStoppingDecision::Suspend => {
+                                    completion_assessment = Some(turn_execution.obligation_stop_assessment(
+                                        settled_state.mutation_revision, None,
+                                    ));
+                                    defer_pending_input |= has_pending_input;
+                                    let message = "Work stopped incomplete: the plan still contains unresolved obligations after the bounded continuation opportunities.";
+                                    last_agent_message = None;
+                                    emit_status_affecting_turn_error(
+                                        sess.as_ref(),
+                                        turn_context.as_ref(),
+                                        message,
+                                    ).await;
+                                    break 'sampling_loop;
+                                }
+                            };
+                            if let Some(text) = retry {
+                                if !admit_regular_follow_up(
+                                    sess.as_ref(),
+                                    turn_context.as_ref(),
+                                    logical_generation_budget,
+                                    &mut generation_budget_error_reported,
+                                ).await {
+                                    completion_assessment = Some(turn_execution.obligation_stop_assessment(
+                                        settled_state.mutation_revision, None,
+                                    ));
+                                    defer_pending_input |= has_pending_input;
+                                    last_agent_message = None;
+                                    break 'sampling_loop;
+                                }
+                                sess.record_conversation_items(&turn_context, &[ResponseItem::Message {
+                                    id: None,
+                                    role: "developer".to_string(),
+                                    content: vec![ContentItem::InputText { text }],
+                                    phase: None,
+                                    internal_chat_message_metadata_passthrough: None,
+                                }]).await?;
+                                output_state.invalidate_for_repair();
+                                let _ = turn_context.extension_data
+                                    .remove::<crate::stream_events_utils::DeferredFinalOutput>();
+                                last_agent_message = None;
+                                pending_generation_request = Some(GenerationRequestDisposition {
+                                    purpose: Some(TurnTimingGenerationPurpose::Repair),
+                                    relevant_state_fingerprint: turn_execution
+                                        .baselines_with_tool_exposure_revision(
+                                            settled_state.mutation_revision,
+                                            settled_state.tool_exposure_revision,
+                                        ).relevant_state_fingerprint(),
+                                    failure_fingerprint: None,
+                                    terminal_completion_only: false,
+                                });
+                                pending_continuation_cause = Some(ContinuationCause::StopHook);
+                                continue 'sampling_loop;
+                            }
+                        }
                         // A delivery candidate has no publication authority until this
                         // completion attempt survives hooks and pending-input admission.
                         let candidate = authoritative_wait_terminal_surface;
@@ -1434,56 +1588,7 @@ pub(crate) fn run_turn<'a>(
                         } else {
                             last_agent_message = output_state.answer_text();
                         }
-                        // Reconcile owner-derived task debt before any effectful hook.
-                        // Terminal-only repairs and explicit stops cannot reopen work.
-                        // Sealing an authored worker receipt also ends this turn's
-                        // tool authority. Report remaining debt without asking for
-                        // a plan tool call that the router will reject.
-                        if kd4_runtime
-                            && !generation_request.terminal_completion_only
-                            && !stop_hook_active
-                            && finalized_mutation_revision.is_none()
-                            && turn_context.extension_data
-                                .get::<crate::agent::task_coordinator::AuthoredReceiptSealed>()
-                                .is_none()
-                            && let Some(text) = turn_execution.take_completion_reconciliation()
-                            && admit_regular_follow_up(
-                                sess.as_ref(),
-                                turn_context.as_ref(),
-                                logical_generation_budget,
-                                &mut generation_budget_error_reported,
-                            ).await
-                        {
-                            sess.record_conversation_items(&turn_context, &[ResponseItem::Message {
-                                id: None,
-                                role: "developer".to_string(),
-                                content: vec![ContentItem::InputText { text }],
-                                phase: None,
-                                internal_chat_message_metadata_passthrough: None,
-                            }]).await?;
-                            output_state.invalidate_for_repair();
-                            let _ = turn_context.extension_data
-                                .remove::<crate::stream_events_utils::DeferredFinalOutput>();
-                            last_agent_message = None;
-                            pending_generation_request = Some(GenerationRequestDisposition {
-                                purpose: Some(TurnTimingGenerationPurpose::Repair),
-                                relevant_state_fingerprint: turn_execution
-                                    .baselines_with_tool_exposure_revision(
-                                        settled_state.mutation_revision,
-                                        settled_state.tool_exposure_revision,
-                                    ).relevant_state_fingerprint(),
-                                failure_fingerprint: None,
-                                terminal_completion_only: false,
-                            });
-                            pending_continuation_cause = Some(ContinuationCause::StopHook);
-                            continue 'sampling_loop;
-                        }
-                        // C1: the direct runtime shares this completion path. It must not skip
-                        // the after-agent and completion-stop hooks, because those are the
-                        // authoritative, user-configured control over whether a turn may finish.
-                        // A final answer alone is not task-acceptance proof. Known
-                        // debt gets the bounded reconciliation above, then remains
-                        // reportable without auto-looping on a genuine blocker.
+                        // Completion hooks retain their authority after the gate.
                         // Explicit goal intents retain their separate acceptance owner.
                         let mut finalizer_ran = false;
                         let mutating_finalizer_aborted = if matches!(

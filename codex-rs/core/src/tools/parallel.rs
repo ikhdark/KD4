@@ -2287,6 +2287,12 @@ impl ToolCallRuntime {
         let cleanup_deadline = router.tool_cancellation_cleanup_deadline(&call);
         let owns_unified_exec_processes = router.tool_owns_unified_exec_processes(&call);
         let requires_commit_barrier = router.tool_cancellation_requires_commit_barrier(&call);
+        // A runtime that guarantees this payload observational leaves nothing to
+        // roll back when cancelled. Process owners and state commits keep their
+        // own recovery facts.
+        let observational_call = router.permits_shared_workspace_observation(&call)
+            && !owns_unified_exec_processes
+            && !requires_commit_barrier;
         // Native command sinks must finalize before publishing cancellation,
         // just like resumable exec and cells. Reuse the registered identity and
         // existing bounded cleanup owner; do not start another waiter/process.
@@ -2321,6 +2327,11 @@ impl ToolCallRuntime {
         let dispatch_state = dispatch_state.unwrap_or_else(|| Arc::new(ToolDispatchState::new()));
         let deadline_gate = source.nested_deadline().is_some()
             .then(|| Arc::new(OnceLock::<Arc<WorkspaceGateGuard>>::new()));
+        // Shared calls also need exact effective-input identity for timeout recovery.
+        // A guaranteed observational read has separate evidence of retry safety.
+        if deadline_gate.is_some() && !observational_call {
+            dispatch_state.retain_nested_deadline_attempt();
+        }
         let dispatch_deadline_gate = deadline_gate.clone();
         let admission_dispatch_state = Arc::clone(&dispatch_state);
         let router_dispatch_state = Arc::clone(&dispatch_state);
@@ -2709,7 +2720,6 @@ impl ToolCallRuntime {
                     let guard = Arc::new(gate_guard.take().expect("exclusive gate missing"));
                     let _ = slot.set(Arc::clone(&guard));
                     gate_guard = Some(WorkspaceGateGuard::NestedDeadline { _guard: guard });
-                    admission_dispatch_state.retain_nested_deadline_admission();
                 }
                 // Gate admission is distinct from authorization and actual
                 // handler entry; keep each boundary independently observable.
@@ -3009,7 +3019,7 @@ impl ToolCallRuntime {
                                 // ownership barrier. Do not publish TurnAborted until the
                                 // originating handler and its process registry entry close.
                                 // State commits likewise publish their update before the response.
-                                // A cancelled nested call under exclusive admission
+                                // A cancelled finite nested call
                                 // must account for that invocation before releasing it.
                                 cancellation_recovery = cleanup.await;
                             } else {
@@ -3026,6 +3036,22 @@ impl ToolCallRuntime {
                                 }));
                                 abort_session.terminal_tasks.spawn(cleanup);
                             }
+                        }
+                        // An admitted observational call (a native read) reports the
+                        // generic unknown-effects recovery above only because its
+                        // handler was dropped mid-read. State what its runtime
+                        // guarantees instead, so a cancelled read is not presented as
+                        // an effect to inspect.
+                        if !cancelled_before_admission
+                            && observational_call
+                            && let Some(recovery) = cancellation_recovery.as_mut()
+                            && recovery["live_operations"].as_array().is_none_or(|live| live.is_empty())
+                        {
+                            recovery["effects_state"] = "none".into();
+                            recovery["retry_safe"] = true.into();
+                            recovery["effects"] = serde_json::json!({"safe_next_actions": [
+                                "Reissue this read if its result is still needed."]});
+                            recovery["required_action"] = "This read-only call was cancelled before it returned and changed nothing. Reissue it if its result is still needed.".into();
                         }
                         // Required state/process cleanup has joined. Lifecycle observers
                         // do not extend the turn's durable-commit barrier.

@@ -229,6 +229,20 @@ impl LocalThreadStore {
         live_writer::rollout_path(self, thread_id).await
     }
 
+    /// Check index-backed visibility against the committed rollout location.
+    /// A filesystem fallback can also repair the stale SQLite archive state.
+    pub async fn indexed_thread_is_archived(
+        &self,
+        metadata: &mut codex_state::ThreadMetadata,
+    ) -> ThreadStoreResult<bool> {
+        read_thread::resolve_sqlite_rollout_location(self, metadata).await?;
+        Ok(metadata.archived_at.is_some()
+            || helpers::rollout_path_is_archived(
+                self.config.codex_home.as_path(),
+                metadata.rollout_path.as_path(),
+            ))
+    }
+
     /// Resolve an existing rollout using the same live/active/archive policy as reads.
     pub async fn resolve_existing_rollout_path(
         &self,

@@ -658,6 +658,19 @@ impl CodexThread {
             .await
     }
 
+    /// Stops agents that a turn which ended on an error left running. With a
+    /// turn id it applies only to that turn. Returns whether such a turn was
+    /// remembered for this thread.
+    pub async fn interrupt_agents_left_running_by_failed_turn(
+        &self,
+        turn_id: Option<&str>,
+    ) -> bool {
+        self.codex
+            .session
+            .interrupt_agents_left_running_by_failed_turn(turn_id)
+            .await
+    }
+
     pub(crate) async fn submit_with_preacquired_execution_guard(
         &self,
         op: Op,
@@ -1052,20 +1065,33 @@ impl CodexThread {
             .await;
     }
 
-    /// Batch refresh after the caller invalidated the shared discovery managers
-    /// once. Per-thread config layers and refresh serialization are unchanged.
+    /// Best-effort runtime refresh after the caller invalidated discovery.
     pub async fn refresh_runtime_config_features_after_discovery_invalidation(
         &self,
         next_config: crate::config::Config,
         refreshed_features: &[Feature],
     ) {
+        let _ = self
+            .try_refresh_runtime_config_features_after_discovery_invalidation(
+                next_config,
+                refreshed_features,
+            )
+            .await;
+    }
+
+    /// Refresh after shared discovery invalidation, reporting a rejected publication.
+    pub async fn try_refresh_runtime_config_features_after_discovery_invalidation(
+        &self,
+        next_config: crate::config::Config,
+        refreshed_features: &[Feature],
+    ) -> std::io::Result<()> {
         self.codex
             .session
             .refresh_runtime_config_features_after_discovery_invalidation(
                 next_config,
                 refreshed_features,
             )
-            .await;
+            .await
     }
 
     pub async fn environment_selections(&self) -> Vec<TurnEnvironmentSelection> {

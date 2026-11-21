@@ -43,7 +43,7 @@ def resource_root(env):
 
 
 def policy(env):
-    max_active = _integer(env, "MAX_ACTIVE", 3)
+    max_active = _integer(env, "MAX_ACTIVE", 4)
     return {
         "maxActive": max_active,
         "maxCold": _integer(env, "MAX_COLD", max_active),
@@ -331,6 +331,8 @@ class BuildResourcesBusy(RuntimeError):
 
 
 class BuildLease:
+    PROGRESS_SECONDS = 60.0
+
     def __init__(self, env, cold, record):
         self.api = WindowsResources()
         self.env, self.cold, self.record = env, cold, record
@@ -348,6 +350,7 @@ class BuildLease:
         self.rows = []
         self.wait_started = None
         self.wait_reasons = set()
+        self.progress_reported_at = None
         self.coordination_reported_at = float("-inf")
         self.finished = False
         self.receipt_path = self.root / "receipts" / (self.token + ".json")
@@ -413,9 +416,20 @@ class BuildLease:
                         resourceWaitMs=(time.perf_counter() - started) * 1000,
                         waitReasons=sorted(reasons), activeAtAdmission=len(rows) + 1)
                     return True
+                now = time.perf_counter()
                 if reason not in reasons:
                     print(f"waiting for global Cargo resources: {reason}", file=sys.stderr)
                     reasons.add(reason)
+                    self.progress_reported_at = now
+                elif wait and now - (self.progress_reported_at or started) >= self.PROGRESS_SECONDS:
+                    # A wait=False caller (the lane reservation) reports its own cadence.
+                    self.progress_reported_at = now
+                    holders = ", ".join(
+                        f"pid {row.get('pid', '?')} ({'cold' if row['cold'] else 'warm'}, {row['jobs']} jobs, "
+                        f"{row['reservedBytes'] / GIB:.1f} GiB reserved)" for row in rows) or "none"
+                    print(f"still waiting for global Cargo resources: {reason} after {now - started:.0f}s; "
+                          f"{len(rows)} active build(s): {holders}; admission headroom {available / GIB:.1f} GiB, "
+                          f"one job needs {(base + self.policy['memoryPerJobBytes']) / GIB:.1f} GiB", file=sys.stderr)
                 self.record.update(status="waiting", waitReasons=sorted(reasons),
                                    resourceWaitMs=(time.perf_counter() - started) * 1000)
             if not wait:

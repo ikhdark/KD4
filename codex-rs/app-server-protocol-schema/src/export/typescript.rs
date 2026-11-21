@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use types::experimental_fields;
 use types::schema_support::EXPERIMENTAL_CLIENT_METHODS;
 use types::schema_support::EXPERIMENTAL_SERVER_METHODS;
+use types::schema_support::EXPERIMENTAL_SERVER_NOTIFICATION_METHODS;
 
 // Header processing also visits existing user files in the output directory.
 // Support up to 64 MiB per TypeScript file without an unbounded allocation.
@@ -80,34 +81,41 @@ pub(super) fn prettier_file_batches<'a>(prettier: &Path, files: &'a [PathBuf]) -
 pub(super) fn filter_experimental_ts(out_dir: &Path) -> Result<()> {
     let registered_fields = experimental_fields();
     let experimental_method_types = experimental_method_types();
-    // Most generated TS files are filtered by schema processing, but
-    // Request unions and types with `#[experimental(...)]` fields need direct
-    // post-processing because they encode method/field information locally.
-    filter_request_ts(out_dir, "ClientRequest.ts", EXPERIMENTAL_CLIENT_METHODS)?;
-    filter_request_ts(out_dir, "ServerRequest.ts", EXPERIMENTAL_SERVER_METHODS)?;
+    // Filter the generated method unions and types with `#[experimental(...)]` fields.
+    filter_method_union_ts(out_dir, "ClientRequest.ts", EXPERIMENTAL_CLIENT_METHODS)?;
+    filter_method_union_ts(out_dir, "ServerRequest.ts", EXPERIMENTAL_SERVER_METHODS)?;
+    filter_method_union_ts(
+        out_dir,
+        "ServerNotification.ts",
+        EXPERIMENTAL_SERVER_NOTIFICATION_METHODS,
+    )?;
     filter_experimental_type_fields_ts(out_dir, &registered_fields)?;
     remove_generated_type_files(out_dir, &experimental_method_types, "ts")?;
     Ok(())
 }
 
 
-/// Removes union arms from a generated request type for methods marked experimental.
-fn filter_request_ts(out_dir: &Path, file_name: &str, experimental_methods: &[&str]) -> Result<()> {
+/// Removes union arms for methods marked experimental.
+fn filter_method_union_ts(
+    out_dir: &Path,
+    file_name: &str,
+    experimental_methods: &[&str],
+) -> Result<()> {
     let path = out_dir.join(file_name);
     let content =
         fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
-    let content = filter_request_ts_contents(content, experimental_methods)?;
+    let content = filter_method_union_ts_contents(content, experimental_methods)?;
 
     fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
 }
 
-fn filter_request_ts_contents(
+fn filter_method_union_ts_contents(
     mut content: String,
     experimental_methods: &[&str],
 ) -> Result<String> {
     let (prefix, body, suffix) =
-        split_type_alias(&content).context("cannot parse generated request type alias")?;
+        split_type_alias(&content).context("cannot parse generated method union type alias")?;
     let experimental_methods: HashSet<&str> = experimental_methods
         .iter()
         .copied()

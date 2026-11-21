@@ -17,6 +17,11 @@ python .\scripts\codex_package\stage_npm_packages.py `
 
 `--package codex` expands to the launcher plus Windows x64 and ARM64 native
 packages. `codex-sdk` stages the TypeScript SDK with a matching CLI dependency.
+When staged together, the SDK smoke install uses this run's launcher and
+host-native tarballs, without resolving the CLI from a registry. The SDK's
+other dependencies still use normal npm resolution; for an offline smoke
+install, set `NPM_CONFIG_OFFLINE=true` and point `NPM_CONFIG_CACHE` at a prepared
+cache containing those dependencies.
 Staging `codex-sdk` also runs `pnpm install --frozen-lockfile` (including dependency
 lifecycle scripts) and builds the SDK, even with local `--vendor-src`. It may
 download dependencies; local staging is not an offline/no-install check. Inspect
@@ -36,5 +41,8 @@ That route downloads artifacts and requires the configured GitHub tooling/access
 It accepts `--package`, `--version` (or `--release-version`), `--staging-dir`, and
 `--pack-output`; native packages additionally require `--vendor-src` pointing at
 a prehydrated canonical vendor tree. Use the root staging helper for a matching
-set of CLI, native, and SDK tarballs, then follow the
+set of CLI, native, and SDK tarballs, or pass both `--cli-tarball` and
+`--native-tarball` when packing an SDK against an already staged local set.
+An SDK pack with no local pair still resolves its dependencies normally.
+For CLI installation, follow the
 [local install instructions](../README.npm.md).

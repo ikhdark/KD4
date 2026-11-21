@@ -103,6 +103,23 @@ async fn collect_failed_turn_interrupts<F: Future<Output = &'static str>>(
     outcomes
 }
 
+/// Failures after which a turn's agents are still interrupted: the turn
+/// worker itself broke, the sandbox failed, or the provider refused the
+/// request. A refused request also carries policy refusals (`invalid_prompt`,
+/// `bio_policy`, `content_policy_violation`) that this client cannot tell
+/// apart from other rejected requests. Every other failure leaves them running.
+fn failed_turn_stops_agents(error: &ErrorEvent, outcome: &TurnTerminalOutcome) -> bool {
+    matches!(outcome, TurnTerminalOutcome::WorkerJoinFailed(_))
+        || matches!(
+            error.codex_error_info,
+            Some(
+                CodexErrorInfo::CyberPolicy
+                    | CodexErrorInfo::SandboxError
+                    | CodexErrorInfo::BadRequest
+            )
+        )
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TurnTaskResult {
     pub(crate) stop_cause: Option<codex_protocol::protocol::TurnExecutionStopCause>,
@@ -1561,15 +1578,20 @@ impl Session {
                     codex_error_info: Some(CodexErrorInfo::Other),
                 })
         });
-        if error.is_some()
+        if let Some(error) = error.as_ref()
             && (abort_reason.is_none()
                 || matches!(
                     finalization.outcome,
                     TurnTerminalOutcome::WorkerJoinFailed(_)
                 ))
         {
-            self.interrupt_spawned_agents_after_failed_turn(&turn_context)
-                .await;
+            if failed_turn_stops_agents(error, &finalization.outcome) {
+                self.interrupt_spawned_agents_after_failed_turn(&turn_context)
+                    .await;
+            } else {
+                self.leave_spawned_agents_running_after_failed_turn(&turn_context)
+                    .await;
+            }
         }
         let last_agent_message = if last_agent_message.is_none()
             && surfaced_result.is_none()
@@ -1589,6 +1611,12 @@ impl Session {
                 if last_agent_message.is_none()
                     && surfaced_result.is_none()
                     && abort_reason.is_none()
+                    // A stopping-gate failure deliberately withheld the draft. Do not
+                    // reconstruct it as a previously displayed assistant message.
+                    && !matches!(&finalization.outcome, TurnTerminalOutcome::Completed { result }
+                        if result.completion_assessment.as_ref()
+                            .and_then(|assessment| assessment.task_disposition.as_ref())
+                            .is_some_and(|disposition| disposition.terminal_action == "stopped_with_unresolved_obligations"))
                     && turn_context.final_output_json_schema.is_none() =>
             {
                 let history = self.clone_history().await;
@@ -1751,6 +1779,7 @@ impl Session {
     /// started do not wake it, so agents still running would spend tokens on
     /// results no turn reads. Interrupt them (they keep their work and can be
     /// resumed) and tell the user which results wait for the next message.
+    /// Only the failures named by `failed_turn_stops_agents` take this path.
     pub(crate) async fn interrupt_spawned_agents_after_failed_turn(
         &self,
         turn_context: &TurnContext,
@@ -1758,11 +1787,162 @@ impl Session {
         self.interrupt_turn_owned_agents(turn_context, true).await
     }
 
+    /// An ordinary failure of this turn says nothing about the agents it
+    /// started, so they finish the work they already have. The failed turn is
+    /// not restarted, their completions do not wake it and they cannot
+    /// delegate, so no new agent work or inference starts here. Each result is
+    /// sealed under its task assignment and queued for this thread's next
+    /// message; the queue is in memory, so after a restart the sealed receipt
+    /// is the copy a turn reads. The turn is remembered so a stop request can
+    /// still reach them.
+    async fn leave_spawned_agents_running_after_failed_turn(&self, turn_context: &TurnContext) {
+        let control = &self.services.agent_control;
+        let label = |thread_id: codex_protocol::ThreadId| {
+            control
+                .get_agent_metadata(thread_id)
+                .and_then(|metadata| metadata.agent_path)
+                .map_or_else(|| thread_id.to_string(), |path| path.as_str().to_string())
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let mut running = Vec::new();
+        let mut unlisted = false;
+        match tokio::time::timeout_at(
+            deadline,
+            control.list_turn_owned_agent_subtree(self.thread_id, &turn_context.sub_id),
+        )
+        .await
+        {
+            Ok(Ok(subtree)) => {
+                let children = subtree
+                    .into_iter()
+                    .filter(|id| *id != self.thread_id)
+                    .collect();
+                for (thread_id, outcome) in
+                    collect_failed_turn_interrupts(children, deadline, |id| async move {
+                        if matches!(
+                            control.get_status(id).await,
+                            crate::agent::AgentStatus::PendingInit
+                                | crate::agent::AgentStatus::Running
+                        ) {
+                            "running"
+                        } else {
+                            "not_running"
+                        }
+                    })
+                    .await
+                {
+                    match outcome {
+                        "running" => running.push(label(thread_id)),
+                        "not_running" => {}
+                        _ => unlisted = true,
+                    }
+                }
+            }
+            _ => unlisted = true,
+        }
+        let mut queued = Vec::new();
+        for author in self.input_queue.pending_mailbox_authors().await {
+            let author = author.as_str().to_string();
+            if !queued.contains(&author) {
+                queued.push(author);
+            }
+        }
+        if !running.is_empty() || unlisted {
+            *self
+                .agents_left_running_by_failed_turn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(turn_context.sub_id.clone());
+        }
+        if running.is_empty() && queued.is_empty() && !unlisted {
+            return;
+        }
+        let mut message =
+            "This turn ended on an error, so it will not read results from agents.".to_string();
+        if !running.is_empty() {
+            message.push_str(&format!(
+                " Agents it started or reused keep running until their current work is done: {}. No new agent work is started. Each result is stored with its task assignment and delivered with your next message; after a restart it is not delivered again, so read it with get_agent_task or list_agents. A stop request for this thread stops them.",
+                crate::session::turn_execution::bounded_path_list(&running)
+            ));
+        }
+        if unlisted {
+            message.push_str(
+                " Not every agent could be listed in time; any still running were left running, and a stop request for this thread stops them.",
+            );
+        }
+        if !queued.is_empty() {
+            message.push_str(&format!(
+                " Results queued from {} will be delivered with your next message.",
+                crate::session::turn_execution::bounded_path_list(&queued)
+            ));
+        }
+        self.send_event(turn_context, EventMsg::Warning(WarningEvent { message }))
+            .await;
+    }
+
+    /// Stop request for agents that a failed turn left running. With a turn
+    /// id it applies only to that turn. Returns whether such a turn was
+    /// remembered; the agents may already have finished.
+    pub(crate) async fn interrupt_agents_left_running_by_failed_turn(
+        &self,
+        expected_turn_id: Option<&str>,
+    ) -> bool {
+        let turn_id = {
+            let mut remembered = self
+                .agents_left_running_by_failed_turn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if expected_turn_id.is_some_and(|expected| remembered.as_deref() != Some(expected)) {
+                return false;
+            }
+            remembered.take()
+        };
+        let Some(turn_id) = turn_id else {
+            return false;
+        };
+        let (_, message) = self
+            .interrupt_agents_owned_by_turn(
+                &turn_id,
+                "A stop was requested after this thread's turn ended on an error.",
+            )
+            .await;
+        if let Some(message) = message {
+            self.send_event_raw(codex_protocol::protocol::Event {
+                id: turn_id,
+                msg: EventMsg::Warning(WarningEvent { message }),
+            })
+            .await;
+        }
+        true
+    }
+
     async fn interrupt_turn_owned_agents(
         &self,
         turn_context: &TurnContext,
         failed: bool,
     ) -> Vec<String> {
+        let (interrupted, message) = self
+            .interrupt_agents_owned_by_turn(
+                &turn_context.sub_id,
+                if failed {
+                    "This turn ended on an error, so it will not read results from agents."
+                } else {
+                    "Cancellation was requested for this turn and its owned agents."
+                },
+            )
+            .await;
+        if let Some(message) = message {
+            self.send_event(turn_context, EventMsg::Warning(WarningEvent { message }))
+                .await;
+        }
+        interrupted
+    }
+
+    async fn interrupt_agents_owned_by_turn(
+        &self,
+        turn_id: &str,
+        lead: &str,
+    ) -> (Vec<String>, Option<String>) {
         let control = &self.services.agent_control;
         let label = |thread_id: codex_protocol::ThreadId| {
             control
@@ -1778,7 +1958,7 @@ impl Session {
         let mut unconfirmed = Vec::new();
         match tokio::time::timeout_at(
             deadline,
-            control.list_turn_owned_agent_subtree(self.thread_id, &turn_context.sub_id),
+            control.list_turn_owned_agent_subtree(self.thread_id, turn_id),
         )
         .await
         {
@@ -1823,13 +2003,9 @@ impl Session {
             }
         }
         if interrupted.is_empty() && queued.is_empty() && unconfirmed.is_empty() {
-            return interrupted;
+            return (interrupted, None);
         }
-        let mut message = if failed {
-            "This turn ended on an error, so it will not read results from agents."
-        } else {
-            "Cancellation was requested for this turn and its owned agents."
-        }.to_string();
+        let mut message = lead.to_string();
         if !interrupted.is_empty() {
             message.push_str(&format!(
                 " Enqueued interrupt requests for agents it started or reused: {}. This does not confirm they have stopped. They keep their work and can be resumed.",
@@ -1848,9 +2024,7 @@ impl Session {
                 crate::session::turn_execution::bounded_path_list(&queued)
             ));
         }
-        self.send_event(turn_context, EventMsg::Warning(WarningEvent { message }))
-            .await;
-        interrupted
+        (interrupted, Some(message))
     }
 
     async fn finalize_turn_terminal_fail_safe(

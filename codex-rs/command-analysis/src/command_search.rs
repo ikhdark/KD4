@@ -288,6 +288,14 @@ fn missing_rg_path_advisory_with_budget(
         regex_lite::Regex::new(r"(?m)^rg: (.+?): [^\r\n]*\(os error [23]\)\r?$")
             .expect("valid rg missing-path regex")
     });
+    #[expect(
+        clippy::expect_used,
+        reason = "the fixed wildcard-path regex is valid and mirrors the missing-path regex"
+    )]
+    static WILDCARD_PATH: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
+        regex_lite::Regex::new(r"(?m)^rg: (.+?): [^\r\n]*\(os error 123\)\r?$")
+            .expect("valid rg wildcard-path regex")
+    });
     let mut reported = Vec::<&str>::new();
     for capture in MISSING_PATH.captures_iter(output) {
         if budget.check().is_err() {
@@ -318,12 +326,32 @@ fn missing_rg_path_advisory_with_budget(
         })
         .take(MAX_MISSING_PATH_NOTES)
         .collect::<Vec<_>>();
-    (!notes.is_empty()).then(|| {
+    let missing_hint = (!notes.is_empty()).then(|| {
         format!(
             "Hint: `rg` could not open these search paths; possible existing paths (not verified replacements) are {}. The other paths still ran, and a path error is not evidence of no matches.",
             notes.join("; ")
         )
-    })
+    });
+    // Windows reports a literal wildcard path operand as an invalid name
+    // (os error 123) rather than a missing path, so it needs its own hint.
+    let mut wildcards = Vec::<&str>::new();
+    for capture in WILDCARD_PATH.captures_iter(output) {
+        let path = capture.get(1).map_or("", |path| path.as_str()).trim();
+        if path.contains(['*', '?']) && !wildcards.contains(&path) {
+            wildcards.push(path);
+        }
+    }
+    wildcards.truncate(MAX_MISSING_PATH_NOTES);
+    let wildcard_hint = (!wildcards.is_empty()).then(|| {
+        format!(
+            "Hint: `rg` does not expand wildcard path operands, and PowerShell or cmd leave them literal for a native command, so {} reached it as a literal path (os error 123). Search the parent directory and pass the wildcard through `--glob`, for example `rg PATTERN src --glob \"gate*\"`. The other paths still ran, and a path error is not evidence of no matches.",
+            wildcards.iter().map(|path| format!("`{path}`")).collect::<Vec<_>>().join(", ")
+        )
+    });
+    match (missing_hint, wildcard_hint) {
+        (Some(missing), Some(wildcard)) => Some(format!("{missing}\n{wildcard}")),
+        (missing, wildcard) => missing.or(wildcard),
+    }
 }
 
 /// Search below the deepest existing ancestor, climbing at most two levels and

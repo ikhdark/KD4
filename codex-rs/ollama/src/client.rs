@@ -21,7 +21,7 @@ const OLLAMA_CONNECTION_ERROR: &str = "No running Ollama server detected. Start 
 /// Bounds each metadata request made during setup, so a server that accepts the connection but
 /// never answers cannot hang startup. Model pulls stream for as long as the download takes.
 const SETUP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// Pull progress lines are a few hundred bytes; a longer unterminated line is not Ollama output.
+/// Maximum bytes in a pull progress line, excluding its newline delimiter.
 const MAX_PULL_LINE_BYTES: usize = 1024 * 1024;
 
 /// Client for interacting with a local Ollama instance.
@@ -243,7 +243,20 @@ impl OllamaClient {
                         finished = true;
                     }
                 }
-                while let Some(line) = buf.take_line() {
+                loop {
+                    let line = buf.take_line();
+                    let line_len = match &line {
+                        // Complete lines include the delimiter, even when synthesized at EOF.
+                        Some(line) => line.len() - 1,
+                        None => buf.pending_len(),
+                    };
+                    if line_len > MAX_PULL_LINE_BYTES {
+                        yield PullEvent::Error(format!(
+                            "pull response line exceeded {MAX_PULL_LINE_BYTES} bytes"
+                        ));
+                        return;
+                    }
+                    let Some(line) = line else { break; };
                     if let Ok(text) = std::str::from_utf8(&line) {
                         let text = text.trim();
                         if text.is_empty() { continue; }
@@ -258,12 +271,6 @@ impl OllamaClient {
                                 && status == "success" { return; }
                         }
                     }
-                }
-                if buf.pending_len() > MAX_PULL_LINE_BYTES {
-                    yield PullEvent::Error(format!(
-                        "pull response line exceeded {MAX_PULL_LINE_BYTES} bytes"
-                    ));
-                    return;
                 }
             }
         };

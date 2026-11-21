@@ -247,6 +247,8 @@ struct CodeModePacketReceipt {
     nested_call_transitions: Vec<JsonValue>,
     unobserved_settlements: Vec<FunctionCallOutputContentItem>,
     omitted_unobserved_settlement_count: usize,
+    /// Nested calls this cell has admitted so far; zero proves none ever started.
+    nested_calls_admitted: usize,
 }
 
 struct BoundedJsonWriter {
@@ -1568,6 +1570,7 @@ impl CodeModeService {
             nested_call_transitions,
             unobserved_settlements: metrics.unobserved_settlements,
             omitted_unobserved_settlement_count: metrics.omitted_unobserved_settlement_count,
+            nested_calls_admitted: metrics.next_nested_ordinal,
         }
     }
 
@@ -1948,6 +1951,7 @@ pub(super) fn handle_runtime_response(
         packet.first_required_terminal,
         (packet.tool_output_recovery_count > 0 && !packet.output_budget_explicit)
             .then_some(hard_limit.saturating_sub(control_tokens)),
+        packet.nested_calls_admitted == 0,
     );
     // The cell budget is the only projection in-cell recovery crosses after
     // its own bounded read, so a truncated delivery reduced that evidence again.
@@ -2523,6 +2527,7 @@ fn format_runtime_response(
     nested_presentations: std::collections::BTreeMap<usize, (String, bool)>,
     required_terminal: Option<CodeModeNestedTerminal>,
     recovery_whole_limit: Option<usize>,
+    no_nested_calls: bool,
 ) -> FunctionToolOutput {
     let continuation_owner_key = match &response {
         RuntimeResponse::Yielded { cell_id, .. }
@@ -2670,6 +2675,9 @@ fn format_runtime_response(
         };
         format!("Required nested tool outcome: {}", terminal.message)
     });
+    // A script error before the first nested call leaves no call effects to
+    // inspect or preserve, so the generic recovery checkpoint would misdescribe it.
+    let failed_before_any_call = no_nested_calls && script_error.is_some();
     if let Some(error_text) = script_error {
         let script_error = format!("Script error:\n{error_text}");
         match &mut diagnostic {
@@ -2681,7 +2689,12 @@ fn format_runtime_response(
         }
     }
     if !success {
-        let guidance = include_str!("../../../templates/failed_cell_recovery.md").trim();
+        let guidance = if failed_before_any_call {
+            include_str!("../../../templates/failed_cell_no_calls_recovery.md")
+        } else {
+            include_str!("../../../templates/failed_cell_recovery.md")
+        }
+        .trim();
         match &mut diagnostic {
             Some(diagnostic) => {
                 diagnostic.push_str("\n\n");

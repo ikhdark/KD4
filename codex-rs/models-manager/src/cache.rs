@@ -18,6 +18,7 @@ use tracing::error;
 use tracing::info;
 
 use crate::manager::ModelsCacheIdentity;
+use crate::manager::validate_catalog_capabilities;
 
 const MAX_CACHED_IDENTITIES: usize = 8;
 
@@ -587,10 +588,9 @@ fn write_basis_from_snapshot(
 fn decode_cache(contents: &[u8]) -> io::Result<ModelsCache> {
     let mut cache: ModelsCache = serde_json::from_slice(contents)
         .map_err(|err| io::Error::new(ErrorKind::InvalidData, err.to_string()))?;
+    validate_catalog_capabilities(&cache.models)
+        .map_err(|err| io::Error::new(ErrorKind::InvalidData, err))?;
     for model in &mut cache.models {
-        model
-            .validate_capabilities()
-            .map_err(|err| io::Error::new(ErrorKind::InvalidData, err))?;
         model.uses_default_base_instructions = cache.default_instruction_slugs.contains(&model.slug);
         model.used_fallback_model_metadata = cache.fallback_metadata_slugs.contains(&model.slug);
     }

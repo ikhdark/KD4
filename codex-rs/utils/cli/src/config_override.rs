@@ -89,10 +89,7 @@ impl CliConfigOverrides {
         self.raw_overrides
             .iter()
             .map(|s| {
-                // Only split on the *first* '=' so values are free to contain
-                // the character.
-                let (key, value_str) = s
-                    .split_once('=')
+                let (key, value_str) = split_override(s)
                     .ok_or_else(|| format!("Invalid override (missing '='): {s}"))?;
                 let key = key.trim();
                 let value_str = value_str.trim();
@@ -113,6 +110,26 @@ impl CliConfigOverrides {
             })
             .collect()
     }
+}
+
+// Leave key validation to the config loader; only find the assignment
+// delimiter without splitting a quoted TOML key or scanning the value.
+fn split_override(raw: &str) -> Option<(&str, &str)> {
+    let mut quote = None;
+    let mut bytes = raw.bytes().enumerate();
+    while let Some((index, byte)) = bytes.next() {
+        match (quote, byte) {
+            (None, b'=') => return Some((&raw[..index], &raw[index + 1..])),
+            (None, b'"' | b'\'') => quote = Some(byte),
+            (Some(b'"'), b'\\') => {
+                // Basic keys allow escapes; literal keys do not.
+                let _ = bytes.next();
+            }
+            (Some(delimiter), _) if delimiter == byte => quote = None,
+            _ => {}
+        }
+    }
+    None
 }
 
 fn parse_toml_value(raw: &str) -> Result<Value, toml::de::Error> {

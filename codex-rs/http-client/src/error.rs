@@ -6,6 +6,37 @@ use http::HeaderMap;
 use http::StatusCode;
 use thiserror::Error;
 
+/// A connector error together with its scope in the original request.
+#[derive(Debug, Error)]
+#[error("{source}")]
+pub struct ConnectionError {
+    #[source]
+    source: HttpError,
+    initial_request_not_sent: bool,
+}
+
+impl ConnectionError {
+    pub(crate) fn new(source: HttpError, initial_request_not_sent: bool) -> Self {
+        Self {
+            source,
+            initial_request_not_sent,
+        }
+    }
+
+    /// True only if the transport can prove that the original request was not sent.
+    pub fn initial_request_not_sent(&self) -> bool {
+        self.initial_request_not_sent
+    }
+}
+
+impl std::ops::Deref for ConnectionError {
+    type Target = HttpError;
+
+    fn deref(&self) -> &Self::Target {
+        &self.source
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum TransportError {
     #[error("http {status}: {body:?}")]
@@ -24,7 +55,7 @@ pub enum TransportError {
     #[error("connection establishment timed out")]
     ConnectionTimeout,
     #[error("connection failed: {0}")]
-    Connection(#[source] HttpError),
+    Connection(#[source] ConnectionError),
     #[error("network error: {0}")]
     Network(String),
     /// A transient failure proven to have happened before the request was

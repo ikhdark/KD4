@@ -71,10 +71,9 @@ impl RetryOn {
                 err,
                 TransportError::PreDispatch(_) | TransportError::ConnectionTimeout
             )
-                // reqwest's is_connect is the transport owner's proof that
-                // this hop failed before HTTP dispatch. Keep HTTP responses
-                // and ambiguous post-dispatch network failures non-replayable.
-                || matches!(err, TransportError::Connection(error) if error.is_connect()))
+                // A failed connection proves only that its own hop was unsent.
+                // Replaying the operation also requires proof about the first hop.
+                || matches!(err, TransportError::Connection(error) if error.initial_request_not_sent()))
     }
 }
 

@@ -1429,6 +1429,8 @@ impl CommandLogCeilingGap {
 
 #[derive(Debug, Clone)]
 pub enum RawOutputArtifact {
+    /// EOF was observed without loss and there are no bytes to retain.
+    Empty,
     Pending {
         codex_home: PathBuf,
         thread_id: String,
@@ -1454,6 +1456,7 @@ pub enum RawOutputArtifact {
 impl PartialEq for RawOutputArtifact {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
+            (Self::Empty, Self::Empty) => true,
             (
                 Self::Pending {
                     codex_home: left_home,
@@ -1747,6 +1750,7 @@ impl RawOutputArtifact {
             _ => None,
         };
         let (owner, id, bytes, complete, availability) = match artifact {
+            Some(Self::Empty) => (None, None, Some(0), true, "unavailable"),
             Some(Self::Pending { thread_id, .. }) =>
                 (Some(thread_id.as_str()), None, None, false, "pending"),
             Some(Self::Stored { id, path, bytes, finalized, truncated, .. }) => (
@@ -1836,7 +1840,7 @@ impl RawOutputArtifact {
 
     pub fn render_for_model(&self) -> String {
         match self {
-            Self::Pending { .. } => String::new(),
+            Self::Empty | Self::Pending { .. } => String::new(),
             Self::Stored {
                 id,
                 bytes,
@@ -1863,6 +1867,7 @@ impl RawOutputArtifact {
         &self,
     ) -> (Option<ToolOutputArtifactId>, Option<u64>, Option<String>) {
         match self {
+            Self::Empty => (None, Some(0), None),
             Self::Pending { .. } => (None, None, None),
             Self::Stored { id, bytes, .. } => (Some(*id), Some(*bytes), None),
             Self::Failed { id, bytes, .. } if self.is_plain_command_log() => (
@@ -1892,6 +1897,7 @@ impl RawOutputArtifact {
 
     pub fn retained_bytes(&self) -> Option<u64> {
         match self {
+            Self::Empty => Some(0),
             Self::Pending { .. } => None,
             Self::Stored { bytes, .. } => Some(*bytes),
             Self::Failed { .. } => None,
@@ -1910,7 +1916,7 @@ impl RawOutputArtifact {
                 ..
             } => Some(*bytes),
             Self::Stored { bytes, .. } => Some((*bytes).max(MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64)),
-            Self::Pending { .. } | Self::Failed { .. } => None,
+            Self::Empty | Self::Pending { .. } | Self::Failed { .. } => None,
         }
     }
 

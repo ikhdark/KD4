@@ -1,5 +1,6 @@
 use anyhow::Context;
 use codex_config::CONFIG_TOML_FILE;
+use codex_config::config_toml::ConfigToml;
 use codex_config::is_multi_agent_v2_feature_path;
 use codex_config::serialize_mcp_server;
 use codex_config::serialize_mcp_server_for_edit;
@@ -9,6 +10,10 @@ use codex_config::types::ToolSuggestDisabledTool;
 use codex_config::version_for_toml;
 use codex_file_system::acquire_resolved_atomic_write_lock;
 use codex_file_system::write_atomically;
+use codex_model_provider_info::LEGACY_OLLAMA_CHAT_PROVIDER_ID;
+use codex_model_provider_info::OLLAMA_CHAT_PROVIDER_REMOVED_ERROR;
+use codex_model_provider_info::built_in_model_providers;
+use codex_model_provider_info::merge_configured_model_providers;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::TrustLevel;
@@ -28,6 +33,25 @@ use toml_edit::value;
 const NOTICE_TABLE_KEY: &str = "notice";
 
 mod document_helpers;
+
+/// Provider selections in persisted edits must resolve against the same catalog
+/// as runtime startup, after merging the active layers and the whole edit batch.
+pub fn validate_effective_model_provider(config: ConfigToml) -> Result<(), String> {
+    let providers = merge_configured_model_providers(
+        built_in_model_providers(config.openai_base_url.filter(|url| !url.is_empty())),
+        config.model_providers,
+    )?;
+    if let Some(id) = config.model_provider
+        && !providers.contains_key(&id)
+    {
+        return Err(if id == LEGACY_OLLAMA_CHAT_PROVIDER_ID {
+            OLLAMA_CHAT_PROVIDER_REMOVED_ERROR.to_string()
+        } else {
+            format!("Model provider `{id}` not found")
+        });
+    }
+    Ok(())
+}
 
 /// Discrete config mutations supported by the persistence engine.
 #[derive(Clone, Debug)]
@@ -986,7 +1010,11 @@ impl ConfigEditsBuilder {
             |serialized| {
                 let mut doc = serialized.parse::<DocumentMut>()?;
                 codex_config::loader::migrate_config_document(&mut doc, &self.config_path)?;
-                Ok(toml::from_str(&doc.to_string())?)
+                let config = toml::from_str(&doc.to_string())?;
+                let base_dir = self.config_path.parent().context("config path has no parent")?;
+                Ok(codex_config::loader::resolve_relative_paths_in_config_toml(
+                    config, base_dir,
+                )?)
             },
         )
     }

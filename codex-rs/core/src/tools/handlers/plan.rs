@@ -14,6 +14,7 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::EventMsg;
+use codex_tools::JsonToolOutput;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use serde_json::Value as JsonValue;
@@ -152,17 +153,6 @@ impl PlanHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
-        let ToolInvocation {
-            session,
-            step_context,
-            cancellation_token,
-            tracker: _,
-            call_id: _call_id,
-            source: _,
-            payload,
-            ..
-        } = invocation;
-        let turn = Arc::clone(&step_context.turn);
         // These refusals settle before durable publication; no plan mutation
         // can escape them. Preserve uncertainty for persistence/task failures.
         let no_effects = |message: String| FunctionCallError::structured(
@@ -171,7 +161,7 @@ impl PlanHandler {
             ).with_completed_execution(),
         );
 
-        let arguments = match payload {
+        let arguments = match &invocation.payload {
             ToolPayload::Function { arguments } => arguments,
             _ => {
                 return Err(no_effects(
@@ -180,15 +170,35 @@ impl PlanHandler {
             }
         };
 
-        if turn.collaboration_mode.mode == ModeKind::Plan {
+        if invocation.step_context.turn.collaboration_mode.mode == ModeKind::Plan {
             return Err(no_effects(
                 "update_plan is a TODO/checklist tool and is not allowed in Plan mode".to_string(),
             ));
         }
 
-        let mut arguments: JsonValue = serde_json::from_str(&arguments).map_err(|error| {
+        let mut arguments: JsonValue = serde_json::from_str(arguments).map_err(|error| {
             no_effects(format!("failed to parse function arguments: {error}"))
         })?;
+        if let Some(args) = arguments.as_object_mut().and_then(|args| args.remove("report_blocked")) {
+            let expected_revision = arguments.as_object().filter(|args| args.len() == 1)
+                .and_then(|args| args.get("expected_revision"))
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| no_effects("provide report_blocked and expected_revision without checklist edits or measurements".into()))?;
+            let args = serde_json::from_value(args)
+                .map_err(|error| no_effects(format!("invalid report_blocked: {error}")))?;
+            let result = crate::session::turn_execution::report_blocked_prerequisite(
+                &invocation, expected_revision, args,
+            ).await.map_err(no_effects)?;
+            return Ok(boxed_tool_output(JsonToolOutput::new(result)));
+        }
+        let ToolInvocation {
+            session,
+            step_context,
+            cancellation_token,
+            tracker,
+            ..
+        } = invocation;
+        let turn = Arc::clone(&step_context.turn);
         let measurements = arguments.as_object_mut().and_then(|arguments| arguments.remove("measurements"))
             .map(|packet| turn.turn_timing_state.validate_measurement_annotations(&packet))
             .transpose().map_err(no_effects)?;
@@ -276,6 +286,7 @@ impl PlanHandler {
             } else {
                 None
             };
+            let mutation_revision = tracker.lock().await.current_mutation_revision();
             let staged = session
                 .services
                 .plan_store
@@ -287,6 +298,12 @@ impl PlanHandler {
                     "update_plan was cancelled before durable publication; no changes were made".into(),
                 ));
             }
+            crate::session::turn_execution::check_held_exact_read_plan_closure(
+                turn.as_ref(),
+                &staged.update,
+                step_context.user_intent_epoch,
+                mutation_revision,
+            ).map_err(no_effects)?;
             let output = PlanToolOutput {
                 current_plan: staged.update.current.clone(),
                 effect: staged.update.effect,

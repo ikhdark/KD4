@@ -94,6 +94,7 @@ impl PartialResultDraft {
 impl LocalAgentTaskStore {
     /// Compare-and-append under the existing writer lock. An identical replay
     /// of the immediately committed version is idempotent, including lost replies.
+    /// `InvalidAssignment` is a draft or version refusal before any write.
     pub async fn publish_agent_partial_result(
         &self,
         root_session_id: String,

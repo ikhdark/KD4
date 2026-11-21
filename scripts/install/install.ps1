@@ -1306,10 +1306,19 @@ try {
             Restore-JunctionSnapshot -Path $currentDir -Snapshot $currentSnapshot
             throw $activationError
         }
+        # Activation is verified; cleanup failures must not prevent PATH setup.
         if ($null -ne $oldStandaloneBackup) {
-            Remove-Item -LiteralPath $oldStandaloneBackup -Recurse -Force
+            try {
+                Remove-Item -LiteralPath $oldStandaloneBackup -Recurse -Force
+            } catch {
+                Write-Warning "Could not remove the old standalone backup at ${oldStandaloneBackup}: $_" -WarningAction Continue
+            }
         }
-        Remove-OldCompletedReleases -ReleasesDir $releasesDir -ActiveReleaseDir $releaseDir
+        try {
+            Remove-OldCompletedReleases -ReleasesDir $releasesDir -ActiveReleaseDir $releaseDir
+        } catch {
+            Write-Warning "Could not prune old completed Codex releases: $_" -WarningAction Continue
+        }
 } finally {
     Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue
 }

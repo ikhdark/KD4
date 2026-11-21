@@ -141,7 +141,7 @@ impl ToolEffectRecovery {
 #[derive(Debug)]
 pub(crate) struct ToolDispatchState {
     state: AtomicU8,
-    retains_nested_deadline_admission: AtomicBool,
+    retains_nested_deadline_attempt: AtomicBool,
     started_attempt: OnceLock<crate::tools::operation_history::OperationAttempt>,
     settlement: OnceLock<ToolDispatchSettlement>,
 }
@@ -194,7 +194,7 @@ impl ToolDispatchState {
     pub(crate) fn new() -> Self {
         Self {
             state: AtomicU8::new(ToolDispatchPhase::WaitingForAdmission as u8),
-            retains_nested_deadline_admission: AtomicBool::new(false),
+            retains_nested_deadline_attempt: AtomicBool::new(false),
             started_attempt: OnceLock::new(),
             settlement: OnceLock::new(),
         }
@@ -290,15 +290,15 @@ impl ToolDispatchState {
         }
     }
 
-    pub(crate) fn retain_nested_deadline_admission(&self) {
-        self.retains_nested_deadline_admission.store(true, Ordering::Release);
+    pub(crate) fn retain_nested_deadline_attempt(&self) {
+        self.retains_nested_deadline_attempt.store(true, Ordering::Release);
     }
 
     pub(crate) fn try_start_handler(
         &self,
         attempt: &crate::tools::operation_history::OperationAttempt,
     ) -> bool {
-        if self.retains_nested_deadline_admission.load(Ordering::Acquire) {
+        if self.retains_nested_deadline_attempt.load(Ordering::Acquire) {
             // An abort that wins before the phase transition must not use this
             // prepared identity as evidence that the handler was entered.
             let _ = self.started_attempt.set(attempt.clone());
@@ -321,7 +321,7 @@ impl ToolDispatchState {
         self.handler_started().then(|| self.started_attempt.get()).flatten()
     }
 
-    /// A finite nested call with an owned exclusive admission lease needs exact
+    /// A finite nested call whose handler started needs exact
     /// cancellation accounting even if a transport teardown lost its cause.
     pub(crate) fn cancelled_nested_attempt(
         &self,
@@ -1536,6 +1536,14 @@ impl AbortedToolOutput {
                 Some("reported") => ToolEffectsState::Reported,
                 _ => ToolEffectsState::Unknown,
             };
+            // Only the cancellation owner certifies a no-effect call safe to
+            // reissue; a call refused before admission keeps its explicit false.
+            if failure.effects == ToolEffectsState::None && recovery["retry_safe"] == true {
+                failure.retry_safe = true;
+                failure.safe_next_actions = vec![
+                    "This read-only call changed nothing; reissue it if its result is still needed.".into(),
+                ];
+            }
             // Live operations belong to the typed field that callers inspect;
             // keep the remaining recovery in its original key order.
             let mut details = recovery.clone();
@@ -1941,6 +1949,8 @@ impl ToolOutput for ExecCommandToolOutput {
             session_capabilities: Option<ExecSessionCapabilities>,
             process_exited: bool,
             #[serde(skip_serializing_if = "Option::is_none")]
+            output_drained: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             search_no_match: Option<bool>,
             output_complete: bool,
             output_reduced: bool,
@@ -2089,6 +2099,7 @@ impl ToolOutput for ExecCommandToolOutput {
             session_id: self.process_id,
             session_capabilities: self.session_capabilities,
             process_exited: self.process_exited,
+            output_drained: self.process_output.as_ref().map(|snapshot| snapshot.output_closed),
             search_no_match: self.search_no_match_is_success().then_some(true),
             output_complete: self.process_exited
                 && self.process_id.is_none()
@@ -2779,7 +2790,9 @@ impl ExecCommandToolOutput {
             && self
                 .raw_output_artifact
                 .as_ref()
-                .is_none_or(RawOutputArtifact::is_pending)
+                .is_none_or(|artifact| {
+                    artifact.is_pending() || matches!(artifact, RawOutputArtifact::Empty)
+                })
         {
             // A terminal poll may have no new bytes. Retain the complete owning
             // snapshot, not just that poll's suffix, before hiding any output.

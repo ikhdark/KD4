@@ -219,7 +219,16 @@ impl ToolExecutor<ToolInvocation> for FileSearchHandler {
             )
             .await
             .map_err(|e| {
-                FunctionCallError::RespondToModel(format!("file search launch failed: {e}"))
+                let message = format!("file search launch failed: {e}");
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(codex_utils_pty::ManagedRootProcess::is_capacity_refusal)
+                {
+                    FunctionCallError::structured(ToolFailure::no_effects(
+                        ToolFailureCode::RetryableFailure, message,
+                    ))
+                } else {
+                    FunctionCallError::RespondToModel(message)
+                }
             })?;
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();

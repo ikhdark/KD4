@@ -767,19 +767,67 @@ def _merge_legacy_goal_definitions(schema: dict[str, Any]) -> None:
     definitions.update(legacy)
 
 
+def _notification_method(variant: dict[str, Any]) -> str | None:
+    return _string_literal(variant.get("properties", {}).get("method"))
+
+
+def _retain_experimental_notifications(
+    notifications: dict[str, Any], definitions: dict[str, Any]
+) -> set[str]:
+    """Keep SDK-supported negotiated notifications out of the stable Rust export."""
+    path = Path(__file__).with_name("compatibility") / "experimental_notifications.json"
+    contract = json.loads(path.read_text(encoding="utf-8"))
+    variants = notifications["oneOf"]
+    by_method = {_notification_method(variant): variant for variant in variants}
+    retained_methods: set[str] = set()
+    insert_before: dict[str, list[dict[str, Any]]] = {}
+    for anchor, additions in contract["insert_before"].items():
+        for variant in additions:
+            method = _notification_method(variant)
+            ref = variant["properties"]["params"]["$ref"]
+            name = ref.removeprefix("#/definitions/")
+            if method is None or method in retained_methods:
+                raise RuntimeError(
+                    f"Invalid retained experimental notification in {path}: {method}"
+                )
+            retained_methods.add(method)
+            if method in by_method:
+                # Keep current shapes from explicit experimental input or graduated methods.
+                current_ref = by_method[method]["properties"]["params"].get("$ref")
+                if current_ref != ref or name not in definitions:
+                    raise RuntimeError(f"Changed payload for retained notification: {method}")
+                continue
+            if name in definitions:
+                raise RuntimeError(f"Retained experimental notification payload collides: {name}")
+            definitions[name] = contract["definitions"][name]
+            insert_before.setdefault(anchor, []).append(variant)
+
+    if missing_anchors := insert_before.keys() - by_method.keys():
+        raise RuntimeError(
+            "Missing insertion anchors for retained experimental notifications: "
+            + ", ".join(sorted(missing_anchors))
+        )
+    notifications["oneOf"] = [
+        entry
+        for variant in variants
+        for entry in (*insert_before.get(_notification_method(variant), ()), variant)
+    ]
+    return retained_methods
+
+
 def _normalized_schema_bundle_text(schema_dir: Path) -> str:
     """Normalize the schema bundle before feeding it to the Python type generator."""
     schema = json.loads(schema_bundle_path(schema_dir).read_text())
     _merge_legacy_goal_definitions(schema)
+    definitions = schema["definitions"]
+    _retain_experimental_notifications(definitions["ServerNotification"], definitions)
     _make_chatgpt_account_email_nullable(schema)
     _normalize_nullable_typed_maps(schema)
-    definitions = schema.get("definitions", {})
-    if isinstance(definitions, dict):
-        for name, definition in definitions.items():
-            if isinstance(definition, dict):
-                if name == "CodexErrorInfo":
-                    _normalize_open_ended_error_enum(definition)
-                _flatten_string_enum_one_of(definition)
+    for name, definition in definitions.items():
+        if isinstance(definition, dict):
+            if name == "CodexErrorInfo":
+                _normalize_open_ended_error_enum(definition)
+            _flatten_string_enum_one_of(definition)
     # Normalize the schema into something datamodel-code-generator can map to
     # stable class names instead of anonymous numbered helpers.
     _annotate_schema(schema)
@@ -1019,9 +1067,10 @@ def _require_nullable_chatgpt_account_email(out_path: Path) -> None:
     out_path.write_text(source[:class_start] + class_source + source[class_end:])
 
 
-def _notification_specs(schema_dir: Path) -> list[tuple[str, str]]:
+def _notification_specs(
+    server_notifications: dict[str, Any], retained_methods: set[str]
+) -> list[tuple[str, str]]:
     """Map each server notification method to its generated payload model class."""
-    server_notifications = json.loads((schema_dir / "ServerNotification.json").read_text())
     one_of = server_notifications.get("oneOf", [])
     generated_source = (sdk_root() / "src" / "openai_codex" / "generated" / "v2_all.py").read_text()
 
@@ -1051,6 +1100,11 @@ def _notification_specs(schema_dir: Path) -> list[tuple[str, str]]:
             continue
         specs.append((method, class_name))
 
+    if missing := retained_methods - {method for method, _ in specs}:
+        raise RuntimeError(
+            "Missing generated experimental notification payloads: " + ", ".join(sorted(missing))
+        )
+
     _, legacy_notifications = _legacy_goal_contract()
     current_methods = {
         method
@@ -1072,11 +1126,10 @@ def _notification_specs(schema_dir: Path) -> list[tuple[str, str]]:
 
 
 def _notification_turn_id_specs(
-    schema_dir: Path,
+    server_notifications: dict[str, Any],
     specs: list[tuple[str, str]],
 ) -> tuple[list[str], list[str]]:
     """Classify notification payloads by where their turn id is carried."""
-    server_notifications = json.loads((schema_dir / "ServerNotification.json").read_text())
     _merge_legacy_goal_definitions(server_notifications)
     definitions = server_notifications.get("definitions", {})
     if not isinstance(definitions, dict):
@@ -1113,12 +1166,13 @@ def _type_tuple_source(class_names: list[str]) -> str:
 def generate_notification_registry(schema_dir: Path) -> None:
     """Regenerate notification dispatch metadata from the runtime notification schema."""
     out = sdk_root() / "src" / "openai_codex" / "generated" / "notification_registry.py"
-    specs = _notification_specs(schema_dir)
-    class_names = sorted({class_name for _, class_name in specs})
-    direct_turn_id_types, nested_turn_types = _notification_turn_id_specs(
-        schema_dir,
-        specs,
+    server_notifications = json.loads((schema_dir / "ServerNotification.json").read_text())
+    retained_methods = _retain_experimental_notifications(
+        server_notifications, server_notifications["definitions"]
     )
+    specs = _notification_specs(server_notifications, retained_methods)
+    class_names = sorted({class_name for _, class_name in specs})
+    direct_turn_id_types, nested_turn_types = _notification_turn_id_specs(server_notifications, specs)
 
     lines = [
         "# Auto-generated by scripts/update_sdk_artifacts.py",

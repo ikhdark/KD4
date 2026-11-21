@@ -70,8 +70,22 @@ function Assert-LastExitCode([string] $Description) {
   }
 }
 
+function Install-WingetPackage([string] $Id, [string[]] $PackageArgs = @()) {
+  # PowerShell 7 may otherwise throw before we can handle winget's no-op results.
+  $PSNativeCommandUseErrorActionPreference = $false
+  winget install @WingetArgs --id $Id @PackageArgs | Out-Host
+  # UPDATE_NOT_APPLICABLE (installed package), PACKAGE_ALREADY_INSTALLED,
+  # and INSTALL_ALREADY_INSTALLED are expected on reruns.
+  if ($LASTEXITCODE -in 0x8A15002B, 0x8A150061, 0x8A15010D) { return }
+  if ($LASTEXITCODE -in 0x8A150109, 0x8A15010A, 0x8A15010B) {
+    throw "winget install $Id requires a restart (exit code $LASTEXITCODE). Restart Windows and rerun setup."
+  }
+  Assert-LastExitCode "winget install $Id"
+}
+
 function Ensure-VSComponents([string[]]$Components) {
-  $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+  # Use the documented automation entry point rather than the UI launcher.
+  $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
   $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
   if (-not (Test-Path $vsInstaller) -or -not (Test-Path $vswhere)) { return }
 
@@ -95,7 +109,12 @@ function Ensure-VSComponents([string[]]$Components) {
   if ($verb -eq 'install') { $args += @('--productId', 'Microsoft.VisualStudio.Product.BuildTools') }
   foreach ($c in $Components) { $args += @('--add', $c) }
   Write-Host "-- Ensuring VS components installed: $($Components -join ', ')" -ForegroundColor DarkCyan
+  $PSNativeCommandUseErrorActionPreference = $false
   & $vsInstaller @args | Out-Host
+  if ($LASTEXITCODE -in 1641, 3010) {
+    throw "Visual Studio $verb requires a restart (exit code $LASTEXITCODE). Restart Windows and rerun setup."
+  }
+  Assert-LastExitCode "Visual Studio $verb"
 }
 
 function Enter-VsDevShell() {
@@ -144,7 +163,7 @@ $vsOverride = @(
   '--add', 'Microsoft.VisualStudio.Component.VC.Tools.ARM64EC',
   '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.22000'
 ) -join ' '
-winget install @WingetArgs --id Microsoft.VisualStudio.2022.BuildTools --override $vsOverride | Out-Host
+Install-WingetPackage 'Microsoft.VisualStudio.2022.BuildTools' -PackageArgs @('--override', $vsOverride)
 
 # Ensure required VC components even if winget doesn't modify the instance
 $components = @(
@@ -157,26 +176,26 @@ Ensure-VSComponents -Components $components
 
 # 2) Rustup
 Write-Host "-- Installing rustup" -ForegroundColor DarkCyan
-winget install @WingetArgs --id Rustlang.Rustup | Out-Host
+Install-WingetPackage 'Rustlang.Rustup'
 
 # Make cargo available in this session
 Add-CargoBinToPath
 
 # 3) Git (often present, but ensure installed)
 Write-Host "-- Installing Git" -ForegroundColor DarkCyan
-winget install @WingetArgs --id Git.Git | Out-Host
+Install-WingetPackage 'Git.Git'
 
 # 4) ripgrep (rg)
 Write-Host "-- Installing ripgrep (rg)" -ForegroundColor DarkCyan
-winget install @WingetArgs --id BurntSushi.ripgrep.MSVC | Out-Host
+Install-WingetPackage 'BurntSushi.ripgrep.MSVC'
 
 # 5) just
 Write-Host "-- Installing just" -ForegroundColor DarkCyan
-winget install @WingetArgs --id Casey.Just | Out-Host
+Install-WingetPackage 'Casey.Just'
 
 # 6) cmake (commonly needed by native crates)
 Write-Host "-- Installing CMake" -ForegroundColor DarkCyan
-winget install @WingetArgs --id Kitware.CMake | Out-Host
+Install-WingetPackage 'Kitware.CMake'
 
 # Ensure cargo is available after rustup install
 Add-CargoBinToPath
@@ -257,7 +276,7 @@ function Add-LLVMToPath() {
 }
 
 Write-Host "-- Installing LLVM/Clang" -ForegroundColor DarkCyan
-winget install @WingetArgs --id LLVM.LLVM | Out-Host
+Install-WingetPackage 'LLVM.LLVM'
 Add-LLVMToPath
 
 # Ensure the MSVC environment is available for the workspace build.

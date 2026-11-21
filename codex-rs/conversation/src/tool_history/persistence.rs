@@ -80,6 +80,17 @@ impl ToolHistoryVersion for ToolHistoryJournalRecord {
 }
 
 #[derive(Deserialize)]
+struct CheckpointSequences {
+    version: u64,
+    #[serde(default)]
+    journal_sequences: BTreeMap<String, u64>,
+}
+
+impl ToolHistoryVersion for CheckpointSequences {
+    fn history_version(&self) -> u64 { self.version }
+}
+
+#[derive(Deserialize)]
 struct ToolHistoryVersionHeader {
     version: u64,
 }
@@ -575,15 +586,6 @@ async fn persist_tool_history_checkpoint(
     }
     // Production callers hold the per-thread I/O permit: this snapshot
     // supersedes every record currently in the journal, including old writers.
-    #[derive(Default, Deserialize)]
-    struct CheckpointSequences {
-        version: u64,
-        #[serde(default)]
-        journal_sequences: BTreeMap<String, u64>,
-    }
-    impl ToolHistoryVersion for CheckpointSequences {
-        fn history_version(&self) -> u64 { self.version }
-    }
     let cached_boundary = {
         let writer = Arc::clone(&writer);
         let path = path.clone();
@@ -752,20 +754,22 @@ pub async fn persist_tool_history_mutations_with_writer(
         if writer.file.is_none() {
             // Validate an unknown or externally changed source before opening
             // an append handle (including before repairing an incomplete tail).
-            match std::fs::read(&ledger) {
+            // A journal may begin after records already compacted into the ledger.
+            let mut checkpoint_sequences = match std::fs::read(&ledger) {
                 Ok(bytes) => {
-                    decode_tool_history_version::<ToolHistoryVersionHeader>(&bytes, LEDGER_VERSION)
-                        .map_err(|error| format!("tool-history writes disabled: {error:?}"))?;
+                    decode_tool_history_version::<CheckpointSequences>(&bytes, LEDGER_VERSION)
+                        .map_err(|error| format!("tool-history writes disabled: {error:?}"))?
+                        .journal_sequences
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
                 Err(error) => return Err(format!("failed to read tool-history ledger: {error}")),
-            }
+            };
             match std::fs::read(&path) {
                 Ok(bytes) => replay_tool_history_journal_bytes(
                     &path,
                     &bytes,
                     &mut ToolHistoryState::default(),
-                    &mut BTreeMap::new(),
+                    &mut checkpoint_sequences,
                     false,
                 )
                 .map_err(|error| format!("tool-history writes disabled: {error:?}"))?,

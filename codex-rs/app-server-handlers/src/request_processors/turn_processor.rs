@@ -1771,9 +1771,23 @@ impl TurnRequestProcessor {
                 thread.interrupt_turn_if_active(&target).await.map_err(|error| {
                     internal_error(format!("failed to interrupt startup turn: {error}"))
                 })?;
+            } else {
+                // No turn to stop: Stop still reaches agents that a turn which
+                // ended on an error left running.
+                thread.interrupt_agents_left_running_by_failed_turn(None).await;
             }
             queue.pause_with_result(thread_uuid).await?;
             observation.finish("fenced_and_queue_paused", serde_json::Value::Null);
+            return Ok(Some(TurnInterruptResponse {}));
+        }
+
+        // A turn that ended on an error may have left its agents running. Naming
+        // that turn stops them; any other idle target is still rejected below.
+        if thread.active_turn_id().await.is_none()
+            && thread
+                .interrupt_agents_left_running_by_failed_turn(Some(&turn_id))
+                .await
+        {
             return Ok(Some(TurnInterruptResponse {}));
         }
 

@@ -262,6 +262,9 @@ try {
     Assert-PgoTrainingBundle $state
     Assert-PgoTrainingStopped $state
     if ($Stage -eq "Train") {
+        $trainingSqliteHome = Invoke-PgoOwner -Options @{ LocalCodexHome = $LocalCodexHome } -Action {
+            Get-DefaultLocalCodexSqliteHome -LocalCodexHome $LocalCodexHome
+        }
         $state.trained = $false
         $state.profileData = $null
         $state.profileDataSha256 = $null
@@ -275,7 +278,7 @@ try {
             CODEX_CLI_PATH = Join-Path $state.bundleDirectory "codex.exe"
             CODEX_CODE_MODE_HOST_PATH = Join-Path $state.bundleDirectory "codex-code-mode-host.exe"
             CODEX_HOME = $LocalCodexHome
-            CODEX_SQLITE_HOME = Join-Path $LocalCodexHome "sqlite"
+            CODEX_SQLITE_HOME = $trainingSqliteHome
         }
         $previous = @{}
         try {

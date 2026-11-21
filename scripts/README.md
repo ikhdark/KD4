@@ -60,14 +60,15 @@ bundle hits need no resource lease. Direct unmanaged Cargo commands do not join
 this pool; their memory use still reduces the observed admission headroom.
 
 Cargo jobs are chosen at launch: at 32 logical processors, an otherwise idle pool
-starts with 32, then 16, then 10 jobs as builds join. Explicit smaller job counts
-remain smaller. Running Cargo job counts cannot be changed safely; Windows owning
-jobs instead rebalance **whole-process-tree hard CPU caps** as builds join/finish.
-Three builds have at most one third of the configured CPU ceiling each. Opaque
-wrappers receive `CARGO_BUILD_JOBS`; wrapper-supplied `-j` may override it, but not
-the owning tree's CPU cap. Nested managed wrappers reuse a verified parent lease.
+starts with 32, then 16, then 10, then 8 jobs as builds join. Explicit smaller
+job counts remain smaller. Running Cargo job counts cannot be changed safely;
+Windows owning jobs instead rebalance **whole-process-tree hard CPU caps** as
+builds join/finish. Four builds have at most one quarter of the configured CPU
+ceiling each. Opaque wrappers receive `CARGO_BUILD_JOBS`; wrapper-supplied `-j`
+may override it, but not the owning tree's CPU cap. Nested managed wrappers reuse
+a verified parent lease.
 
-Defaults are experimental: at most three managed builds (including cold builds),
+Defaults are experimental: at most four managed builds (including cold builds),
 100% aggregate host CPU, 512 MiB projected commit per Cargo job, plus 4 GiB for
 a cold build or 2 GiB for a warm build. Admission leaves at least 2 GiB each of
 available physical memory and commit headroom, subtracting other admitted builds'
@@ -82,7 +83,7 @@ Use process-scoped environment overrides, not machine-wide settings:
 
 ```powershell
 $env:CODEX_CARGO_LANE_MAX_ACTIVE_PER_BASE = "3" # mirror overflow / warm retention only
-$env:CODEX_CARGO_BUILD_MAX_ACTIVE = "3"       # shared admission ceiling
+$env:CODEX_CARGO_BUILD_MAX_ACTIVE = "4"       # shared admission ceiling
 $env:CODEX_CARGO_BUILD_CPU_PERCENT = "100"    # aggregate CPU cap, 1..100
 ```
 

@@ -916,6 +916,8 @@ def build_stage_command(
     output_dir: Path,
     staging_dir: Path,
     vendor_src_by_native_key: dict[tuple[tuple[str, ...], tuple[str, ...]], Path],
+    *,
+    sdk_smoke_tarballs: tuple[Path, Path] | None = None,
 ) -> tuple[Path, list[str]]:
     pack_output = output_dir / tarball_name_for_package(package, release_version)
     # Launch via the running interpreter: CreateProcess cannot exec a .py file
@@ -937,6 +939,10 @@ def build_stage_command(
     if vendor_src is not None:
         cmd.extend(["--vendor-src", str(vendor_src)])
 
+    if sdk_smoke_tarballs is not None:
+        cli_tarball, native_tarball = sdk_smoke_tarballs
+        cmd.extend(["--cli-tarball", str(cli_tarball), "--native-tarball", str(native_tarball)])
+
     return pack_output, cmd
 
 
@@ -949,6 +955,7 @@ def stage_package(
     keep_staging_dirs: bool,
     *,
     capture_output: bool,
+    sdk_smoke_tarballs: tuple[Path, Path] | None = None,
 ) -> StagePackageResult:
     staging_dir = Path(
         tempfile.mkdtemp(prefix=f"npm-stage-{package}-", dir=runner_temp)
@@ -959,6 +966,7 @@ def stage_package(
         output_dir,
         staging_dir,
         vendor_src_by_native_key,
+        sdk_smoke_tarballs=sdk_smoke_tarballs,
     )
     log = f"Staging {package} in {staging_dir}\n"
 
@@ -985,10 +993,27 @@ def stage_packages(
     keep_staging_dirs: bool,
     max_stage_workers: int | None,
 ) -> list[StagePackageResult]:
-    worker_count = worker_count_for(len(packages), max_stage_workers)
+    native_package = None
+    if "codex-sdk" in packages and "codex" in packages:
+        platform_key = check_output_owned(
+            ["node", "-p", "process.platform + '-' + process.arch"],
+            cwd=REPO_ROOT, text=True, timeout=30,
+        ).strip()
+        native_package = next(
+            (
+                name
+                for name, config in codex_platform_packages().items()
+                if config["platform_key"] == platform_key and name in packages
+            ),
+            None,
+        )
+        if native_package is None:
+            raise RuntimeError(f"No staged native package for SDK smoke host {platform_key}")
+    ready = [package for package in packages if not native_package or package != "codex-sdk"]
+    worker_count = worker_count_for(len(ready), max_stage_workers)
     if worker_count == 1:
-        return [
-            stage_package(
+        results_by_package = {
+            package: stage_package(
                 package,
                 release_version,
                 output_dir,
@@ -997,37 +1022,49 @@ def stage_packages(
                 keep_staging_dirs,
                 capture_output=False,
             )
-            for package in packages
-        ]
-
-    print(
-        f"Staging {len(packages)} packages with {worker_count} workers",
-        flush=True,
-    )
-    results_by_package: dict[str, StagePackageResult] = {}
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = {
-            executor.submit(
-                stage_package,
-                package,
-                release_version,
-                output_dir,
-                runner_temp,
-                vendor_src_by_native_key,
-                keep_staging_dirs,
-                capture_output=True,
-            ): package
-            for package in packages
+            for package in ready
         }
-        for future in as_completed(futures):
-            result = future.result()
-            if result.log:
-                print(
-                    result.log,
-                    end="" if result.log.endswith("\n") else "\n",
-                    flush=True,
-                )
-            results_by_package[result.package] = result
+    else:
+        print(
+            f"Staging {len(ready)} packages with {worker_count} workers",
+            flush=True,
+        )
+        results_by_package = {}
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(
+                    stage_package,
+                    package,
+                    release_version,
+                    output_dir,
+                    runner_temp,
+                    vendor_src_by_native_key,
+                    keep_staging_dirs,
+                    capture_output=True,
+                ): package
+                for package in ready
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                if result.log:
+                    print(result.log, end="" if result.log.endswith("\n") else "\n", flush=True)
+                results_by_package[result.package] = result
+
+    if native_package is not None:
+        # Consume only this run's validated tarballs, before activating any output.
+        results_by_package["codex-sdk"] = stage_package(
+            "codex-sdk",
+            release_version,
+            output_dir,
+            runner_temp,
+            vendor_src_by_native_key,
+            keep_staging_dirs,
+            capture_output=False,
+            sdk_smoke_tarballs=(
+                results_by_package["codex"].pack_output,
+                results_by_package[native_package].pack_output,
+            ),
+        )
 
     return [results_by_package[package] for package in packages]
 

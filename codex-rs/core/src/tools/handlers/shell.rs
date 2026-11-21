@@ -19,6 +19,7 @@ use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
 use crate::tools::command_execution::CommandAttemptKey;
+use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolOutput;
@@ -968,7 +969,12 @@ async fn run_exec_like_with_exit_code_inner(
     let quiet_success_candidate = quiet_on_success && canonical_complete
         && out.as_ref().is_ok_and(|output| output.exit_code == 0 && !output.timed_out);
     let raw_output_artifact = match raw_capture.map(|capture| capture.artifact) {
-        Some(artifact) if !artifact.is_pending() => Some(artifact),
+        Some(artifact)
+            if !artifact.is_pending()
+                && !(quiet_success_candidate && matches!(artifact, RawOutputArtifact::Empty)) =>
+        {
+            Some(artifact)
+        }
         // Small complete captures stay inline. A reduced display still needs a
         // recovery handle, so retain the exact original bytes on demand.
         _ if canonical_complete

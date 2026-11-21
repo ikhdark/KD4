@@ -733,7 +733,11 @@ impl RolloutRecorder {
                 {
                     warn!(%error, "failed to reconstruct persisted tool manifest");
                 }
-                items.push(item);
+                // Append preflight still verifies and enrolls every payload, but
+                // diagnostic snapshots are not part of the resumed history.
+                if !matches!(item, RolloutItem::ContextReplay { .. }) {
+                    items.push(item);
+                }
             })
             .await?;
         let (thread_id, errors, partial_tail, unresolved_payloads) = integrity
@@ -931,7 +935,7 @@ impl RolloutRecorder {
                 .iter()
                 .map(|item| match rollout_admission_bytes(std::slice::from_ref(item)) {
                     Ok(charge) => Ok(charge),
-                    Err(_) if matches!(item, RolloutItem::ContextReplay { .. }) => {
+                    Err(_) if crate::payload_artifact::is_spooled_before_admission(item) => {
                         crate::payload_artifact::validate_replay_size(item)?;
                         Ok(0) // Spool this record instead of cloning its body into the queue.
                     }
@@ -1590,7 +1594,11 @@ impl RolloutRecordDecoder {
         let v: Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(e) => {
-                warn!("failed to parse line as JSON: {line:?}, error: {e}");
+                warn!(
+                    record = self.record_number,
+                    bytes = line.len(),
+                    "failed to parse rollout record as JSON: {e}"
+                );
                 self.parse_errors = self.parse_errors.saturating_add(1);
                 self.last_record_partial = !terminated && e.is_eof();
                 return Ok(None);

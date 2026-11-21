@@ -28,6 +28,7 @@ use sha2::Digest;
 use sha2::Sha256;
 
 use crate::tool_history::SourceDependencyV1;
+use crate::tools::context::RequiredToolTerminal;
 use crate::tools::context::ToolDispatchSettlement;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::turn_timing::TurnTimingState;
@@ -2704,6 +2705,378 @@ impl DeliveredSourceCoverage {
 
 
 
+#[derive(Clone)]
+struct MissingPrerequisiteRead {
+    receipt_call_id: String,
+    requested_path: String,
+    canonical_uri: String,
+    native_path: String,
+    environment_id: String,
+    mutation_revision: u64,
+    user_intent_epoch: u64,
+}
+
+#[derive(Default)]
+struct ObligationPrerequisiteState {
+    reads: VecDeque<MissingPrerequisiteRead>,
+    report: Option<BlockedPrerequisite>,
+    complete_reads: VecDeque<(String, u64, u64)>,
+    held_exact_read: Option<HeldExactRead>,
+}
+
+struct HeldExactRead {
+    user_intent_epoch: u64,
+    path: String,
+    requirements: BTreeMap<String, String>,
+}
+
+#[derive(Default)]
+struct ObligationPrerequisites(Mutex<ObligationPrerequisiteState>);
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BlockedPrerequisiteArgs {
+    obligation_ids: Vec<String>,
+    receipt_call_id: String,
+    path: String,
+    source: BlockedPrerequisiteSource,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BlockedPrerequisiteSource {
+    input_id: String,
+    sha256: String,
+}
+
+pub(crate) struct BlockedPrerequisite {
+    missing: MissingPrerequisiteRead,
+    plan_call_id: String,
+    plan_revision: String,
+    obligation_ids: Vec<String>,
+}
+
+impl BlockedPrerequisite {
+    pub(crate) fn terminal(&self) -> RequiredToolTerminal {
+        RequiredToolTerminal {
+            call_id: self.plan_call_id.clone(),
+            cause: crate::tools::context::RequiredToolTerminalCause::Blocked,
+            message: format!(
+                "Work remains incomplete: a native read could not find the user-named prerequisite {:?} in environment {:?}. Provide it or send new instructions to resume.",
+                self.missing.native_path, self.missing.environment_id,
+            ),
+        }
+    }
+
+    pub(crate) fn read_evidence_ref(&self) -> String {
+        format!("native:read_file:{}", self.missing.receipt_call_id)
+    }
+}
+
+/// Called only by the native filesystem owner after its primary read returns
+/// NotFound. Neither command output nor model-authored JSON can mint this record.
+pub(crate) async fn record_missing_prerequisite_read(
+    invocation: &crate::tools::context::ToolInvocation,
+    requested_path: &str,
+    canonical_uri: String,
+    native_path: String,
+    environment_id: &str,
+) {
+    let turn = &invocation.step_context.turn;
+    if !turn.config.features.enabled(codex_features::Feature::Kd4Runtime)
+        || invocation.cancellation_token.is_cancelled()
+    {
+        return;
+    }
+    let mutation_revision = invocation.tracker.lock().await.current_mutation_revision();
+    let user_intent_epoch = invocation.step_context.user_intent_epoch;
+    if user_intent_epoch != invocation.session.input_queue.incorporated_user_intent_epoch() {
+        return;
+    }
+    let entry = MissingPrerequisiteRead {
+        receipt_call_id: invocation.call_id.clone(),
+        requested_path: requested_path.to_string(),
+        canonical_uri,
+        native_path,
+        environment_id: environment_id.to_string(),
+        mutation_revision,
+        user_intent_epoch,
+    };
+    let state = turn.extension_data.get_or_init(ObligationPrerequisites::default);
+    let mut state = state.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Retain bounded turn-local observations, not a cross-turn permission cache.
+    state.reads.retain(|previous| previous.receipt_call_id != entry.receipt_call_id);
+    state.reads.push_back(entry);
+    if state.reads.len() > 32 {
+        state.reads.pop_front();
+    }
+}
+
+/// Called by the native read owner only after complete source bytes are
+/// available in the delivered projection. Other tool results are not proof.
+pub(crate) async fn record_complete_obligation_read(
+    invocation: &crate::tools::context::ToolInvocation,
+    requested_path: &str,
+) {
+    let turn = &invocation.step_context.turn;
+    if !turn.config.features.enabled(codex_features::Feature::Kd4Runtime)
+        || invocation.cancellation_token.is_cancelled()
+    {
+        return;
+    }
+    let epoch = invocation.step_context.user_intent_epoch;
+    let mutation = invocation.tracker.lock().await.current_mutation_revision();
+    let owner = turn.extension_data.get_or_init(ObligationPrerequisites::default);
+    let mut state = owner.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let observation = (requested_path.to_string(), epoch, mutation);
+    state.complete_reads.retain(|previous| previous != &observation);
+    state.complete_reads.push_back(observation);
+    if state.complete_reads.len() > 32 {
+        state.complete_reads.pop_front();
+    }
+}
+
+/// A deliberately narrow operative form, not a language-based work planner.
+/// Whole-file native acquisition is opt-in, not inferred from plain "Read"
+/// instructions. Other methods and differently scoped reads keep their
+/// existing plan owner's semantics.
+fn exact_user_read_path(text: &str) -> Option<&str> {
+    let rest = text.trim_start().strip_prefix("Use read_file to read ")?;
+    let (path, tail) = if let Some(delimiter @ ('`' | '"' | '\'')) = rest.chars().next() {
+        rest[1..].split_once(delimiter)?
+    } else {
+        rest.split_once(char::is_whitespace)?
+    };
+    let tail = tail.trim_start().strip_prefix("in one complete read")?;
+    (!path.is_empty()
+        && !path.contains(['*', '?', '<', '>', '|', '\r', '\n'])
+        && tail.chars().next().is_none_or(|c| c.is_whitespace() || matches!(c, '.' | ',' | ';')))
+        .then_some(path)
+}
+
+/// Preserve the explicit exact-read requirement when rejecting an ordinary
+/// final. Other requirement types keep their existing plan owner's semantics.
+pub(crate) async fn hold_exact_read_for_obligation(
+    session: &crate::session::Session,
+    turn: &crate::session::turn_context::TurnContext,
+    plan: &crate::plan_store::PlanExecutionSnapshot,
+    epoch: u64,
+) {
+    let owner = turn.extension_data.get_or_init(ObligationPrerequisites::default);
+    if owner.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .held_exact_read.as_ref().is_some_and(|held| held.user_intent_epoch == epoch)
+    {
+        return;
+    }
+    let history = session.clone_history().await;
+    let Some(content) = history.raw_items().iter().rev().find_map(|item| match item {
+        codex_protocol::models::ResponseItem::Message { id: Some(id), role, content, .. }
+            if role == "user" && codex_conversation::event_mapping::is_user_input_item_id(id) =>
+        {
+            Some(content)
+        }
+        _ => None,
+    }) else {
+        return;
+    };
+    let Some((text, path)) = content.iter().find_map(|part| match part {
+        codex_protocol::models::ContentItem::InputText { text } => {
+            exact_user_read_path(text).map(|path| (text, path))
+        }
+        _ => None,
+    }) else {
+        return;
+    };
+    // Reuse only the accepted, still-unresolved request pin. A model-authored
+    // row cannot fabricate a new source-bound acceptance gate.
+    let requirements = plan.requirement_texts.iter()
+        .filter(|(_, requirement)| *requirement == text)
+        .map(|(id, requirement)| (id.clone(), requirement.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if !requirements.is_empty() {
+        owner.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).held_exact_read =
+            Some(HeldExactRead { user_intent_epoch: epoch, path: path.to_string(), requirements });
+    }
+}
+
+pub(crate) fn check_held_exact_read_plan_closure(
+    turn: &crate::session::turn_context::TurnContext,
+    staged: &codex_conversation::plan_store::PlanStoreUpdate,
+    epoch: u64,
+    mutation_revision: u64,
+) -> Result<(), String> {
+    let Some(owner) = turn.extension_data.get::<ObligationPrerequisites>() else {
+        return Ok(());
+    };
+    let state = owner.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(held) = state.held_exact_read.as_ref().filter(|held| held.user_intent_epoch == epoch)
+    else {
+        return Ok(());
+    };
+    let unresolved = staged.lineage.obligation_summary(&staged.current).unresolved;
+    if held.requirements.iter().any(|(id, text)| {
+        !unresolved.contains(id)
+            && !staged.lineage.compaction_anchor_closed(&format!("[{id}] {text}"), true)
+    }) && !state.complete_reads.iter().any(|(path, observed_epoch, revision)| {
+        path == &held.path && *observed_epoch == epoch && *revision == mutation_revision
+    }) {
+        return Err(format!(
+            "The held exact-read obligation cannot be completed by a checklist edit alone. Read {:?} through its native owner; no plan changes were made.",
+            held.path
+        ));
+    }
+    Ok(())
+}
+
+fn names_exact_prerequisite(text: &str, path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let delimiter = |c: char| c.is_whitespace() || matches!(c, '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '<' | '>' | ',' | ';');
+    text.match_indices(path).any(|(start, _)| {
+        let before = text[..start].chars().next_back();
+        let mut after = text[start + path.len()..].chars();
+        let end = after.next();
+        before.is_none_or(delimiter)
+            && (end.is_none_or(delimiter)
+                || end == Some('.') && after.next().is_none_or(delimiter))
+    })
+}
+
+/// User-only input is an explicit accepted-source contract. A failed read
+/// proves absence, never that the agent is forbidden from supplying a remedy.
+fn declares_user_only_prerequisite(text: &str, path: &str) -> bool {
+    if path.is_empty() || path.contains(['\r', '\n']) {
+        return false;
+    }
+    let plain = format!("Only the user can provide {path}; do not create or substitute it.");
+    let quoted = format!("Only the user can provide `{path}`; do not create or substitute it.");
+    [plain, quoted].iter().any(|declaration| {
+        text.match_indices(declaration.as_str()).any(|(start, _)| {
+            let before = text[..start].rsplit('\n').next().unwrap_or_default().trim_end();
+            before.is_empty() || before.ends_with(['.', '!', '?'])
+        })
+    })
+}
+
+/// Validate a model-issued report against the current plan owner, exact native
+/// read, and authentic user input. This reports an observed missing prerequisite
+/// only: it neither resolves plan IDs nor grants work or certifies other options.
+pub(crate) async fn report_blocked_prerequisite(
+    invocation: &crate::tools::context::ToolInvocation,
+    expected_revision: &str,
+    mut args: BlockedPrerequisiteArgs,
+) -> Result<Value, String> {
+    let turn = &invocation.step_context.turn;
+    let session = &invocation.session;
+    let user_intent_epoch = invocation.step_context.user_intent_epoch;
+    if !turn.config.features.enabled(codex_features::Feature::Kd4Runtime) {
+        return Err("report_blocked requires KD4 runtime".into());
+    }
+    let _publication = tokio::select! {
+        guard = session.services.plan_store.publication_guard() => guard,
+        _ = invocation.cancellation_token.cancelled() => return Err("report_blocked cancelled".into()),
+    };
+    let plan = session.services.plan_store.execution_snapshot().await
+        .ok_or("report_blocked requires an active unresolved plan")?;
+    args.obligation_ids.sort_unstable();
+    let mut current_ids = plan.obligations.unresolved.clone();
+    current_ids.sort_unstable();
+    if current_ids.is_empty() || args.obligation_ids != current_ids || plan.revision != expected_revision {
+        return Err("report_blocked requires the current plan revision and every still-unresolved ID; finish independent work first".into());
+    }
+    if current_ids.iter().any(|id| {
+        plan.requirement_texts
+            .get(id)
+            .is_none_or(|text| !names_exact_prerequisite(text, &args.path))
+    }) {
+        return Err("report_blocked cannot stop work while unresolved obligations do not name this prerequisite".into());
+    }
+    let (_scope_guard, scope) = tokio::select! {
+        result = session.plan_scope_inputs() => result
+            .map_err(|error| format!("report_blocked could not read accepted input provenance: {error}"))?,
+        _ = invocation.cancellation_token.cancelled() => return Err("report_blocked cancelled".into()),
+    };
+    let source_is_authentic = scope.reconciliation_value()["scope_change_refs"]
+        .as_array().is_some_and(|refs| refs.iter().any(|reference| {
+            reference["input_id"].as_str() == Some(args.source.input_id.as_str())
+                && reference["sha256"].as_str() == Some(args.source.sha256.as_str())
+        }));
+    if !source_is_authentic {
+        return Err("report_blocked source must identify an authentic accepted user input".into());
+    }
+    let history = session.clone_history().await;
+    let source_names_prerequisite = history.raw_items().iter().any(|item| {
+        let codex_protocol::models::ResponseItem::Message {
+            id: Some(id), role, content, ..
+        } = item else {
+            return false;
+        };
+        if id.as_str() != args.source.input_id.as_str() || role != "user" {
+            return false;
+        }
+        content.iter().any(|part| {
+            let codex_protocol::models::ContentItem::InputText { text } = part else {
+                return false;
+            };
+            hex::encode(Sha256::digest(text.as_bytes())) == args.source.sha256
+                && declares_user_only_prerequisite(text, &args.path)
+                && current_ids.iter().any(|id| plan.requirement_texts.get(id) == Some(text))
+        })
+    });
+    if !source_names_prerequisite {
+        return Err("report_blocked requires an unresolved accepted user request explicitly declaring that only the user can provide this exact prerequisite and it must not be created or substituted".into());
+    }
+    let mutation_revision = invocation.tracker.lock().await.current_mutation_revision();
+    if invocation.cancellation_token.is_cancelled()
+        || user_intent_epoch != session.input_queue.incorporated_user_intent_epoch()
+        || turn.extension_data.get::<crate::agent::task_coordinator::AuthoredReceiptSealed>().is_some()
+    {
+        return Err("report_blocked no longer has this turn's tool authority".into());
+    }
+    let primary = invocation.step_context.environments.primary()
+        .ok_or("report_blocked requires a ready primary environment for the user-named path")?;
+    let receipts = turn.extension_data.get::<ObligationPrerequisites>()
+        .ok_or("report_blocked requires a settled native NotFound receipt from this turn")?;
+    let mut receipts = receipts.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let missing = receipts.reads.iter().find(|observed| {
+        observed.receipt_call_id == args.receipt_call_id
+            && observed.requested_path == args.path
+            && observed.environment_id == primary.environment_id
+            && observed.user_intent_epoch == user_intent_epoch
+            && observed.mutation_revision == mutation_revision
+    }).cloned().ok_or("report_blocked receipt does not match the prerequisite or is stale; explicitly re-observe it if necessary")?;
+    let output = serde_json::json!({
+        "blocked_prerequisite": {
+            "receipt_call_id": missing.receipt_call_id,
+            "path": missing.native_path,
+            "canonical_uri": missing.canonical_uri,
+            "environment_id": missing.environment_id,
+            "obligation_ids": current_ids,
+            "plan_revision": plan.revision,
+        },
+        "request_state": "incomplete",
+    });
+    receipts.report = Some(BlockedPrerequisite {
+        missing,
+        plan_call_id: invocation.call_id.clone(),
+        plan_revision: plan.revision,
+        obligation_ids: current_ids,
+    });
+    Ok(output)
+}
+
+/// The gate can ask for another ordinary model decision; it cannot dispatch tools.
+pub(crate) enum ObligationStoppingDecision {
+    Allow,
+    Continue(String),
+    Suspend,
+}
+
+// This is an instruction-epoch bound. Tool calls, plan revisions and report
+// messages cannot replenish it.
+const MAX_OBLIGATION_FINAL_DEFERRALS: u8 = 2;
+
 pub(crate) struct TurnExecutionControl {
     issued_directives: BTreeSet<String>,
 
@@ -2715,7 +3088,7 @@ pub(crate) struct TurnExecutionControl {
     plan: Option<crate::plan_store::PlanExecutionSnapshot>,
     /// An inherited completed checklist is not a final-answer hint for new input.
     plan_updated_since_input: bool,
-    completion_reconciliation_issued: bool,
+    obligation_final_deferrals: u8,
     plan_revision: u64,
     input_revision: u64,
     /// Passive cycle identity excludes reports, unlike completion/dispatch authority.
@@ -2779,7 +3152,7 @@ impl TurnExecutionControl {
             delivered_agent_events: BTreeSet::new(),
             plan: None,
             plan_updated_since_input: false,
-            completion_reconciliation_issued: false,
+            obligation_final_deferrals: 0,
             plan_revision: 0,
             input_revision: 0,
             instruction_revision: 0,
@@ -2897,25 +3270,66 @@ impl TurnExecutionControl {
                 .is_some_and(|plan| plan.has_steps && plan.obligations.unresolved.is_empty())
     }
 
-    fn unresolved_current_plan(&self) -> Option<&crate::plan_store::PlanExecutionSnapshot> {
-        // Task debt survives resume and user steering even without a plan edit.
-        // Only completed-plan answer hints depend on work since the latest input.
-        self.plan.as_ref().filter(|plan| !plan.obligations.unresolved.is_empty())
+    pub(crate) fn unresolved_plan(&self) -> Option<&crate::plan_store::PlanExecutionSnapshot> {
+        // Task debt survives resume and steering even without a plan edit.
+        self.plan
+            .as_ref()
+            .filter(|plan| !plan.obligations.unresolved.is_empty())
     }
 
-    /// One decision opportunity before hooks, not a loop until the model closes
-    /// a checklist. Genuine blockers may hand back with the debt still reported.
-    pub(crate) fn take_completion_reconciliation(&mut self) -> Option<String> {
-        if self.completion_reconciliation_issued {
-            return None;
+    pub(crate) fn take_blocked_prerequisite(
+        &self,
+        turn: &crate::session::turn_context::TurnContext,
+        mutation_revision: u64,
+        user_intent_epoch: u64,
+    ) -> Option<BlockedPrerequisite> {
+        let owner = turn.extension_data.get::<ObligationPrerequisites>()?;
+        let report = owner.0.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .report.take()?;
+        let plan = self.unresolved_plan()?;
+        let mut unresolved = plan.obligations.unresolved.clone();
+        unresolved.sort_unstable();
+        (report.plan_revision == plan.revision
+            && report.obligation_ids == unresolved
+            && report.missing.mutation_revision == mutation_revision
+            && report.missing.user_intent_epoch == user_intent_epoch)
+            .then_some(report)
+    }
+
+    pub(crate) fn decide_obligation_stop(&mut self) -> ObligationStoppingDecision {
+        let Some(plan) = self.unresolved_plan() else {
+            return ObligationStoppingDecision::Allow;
+        };
+        if self.obligation_final_deferrals >= MAX_OBLIGATION_FINAL_DEFERRALS {
+            return ObligationStoppingDecision::Suspend;
         }
-        let plan = self.unresolved_current_plan()?;
         let directive = format!(
-            "Final answer deferred: the current plan still has unresolved requirement IDs {} (revision {}). Continue the requested work or explicitly resolve genuinely finished requirements through update_plan. If a real permission, user-decision or external blocker prevents progress, leave the affected requirements unresolved and report that blocker. This is one reconciliation opportunity, not permission to retry unchanged failures, invent evidence or alter scope.",
+            "Final answer deferred: unresolved requirement IDs {} (revision {}). Use the normal tools to advance the outstanding work, or recover an existing operation through its owner. Keep obligations not established as finished unresolved. For a prerequisite explicitly reserved to the user, use update_plan.report_blocked with fresh native NotFound evidence and the authentic source. An unchanged failed attempt or generic blocker claim does not resolve this debt.",
             plan.obligations.unresolved.join(", "), plan.revision,
         );
-        self.completion_reconciliation_issued = true;
-        Some(directive)
+        self.obligation_final_deferrals += 1;
+        ObligationStoppingDecision::Continue(directive)
+    }
+
+    pub(crate) fn obligation_stop_assessment(
+        &self,
+        mutation_revision: u64,
+        blocked: Option<&RequiredToolTerminal>,
+    ) -> codex_protocol::protocol::TurnCompletionAssessment {
+        let mut assessment = self.completion_assessment(mutation_revision);
+        if let Some(disposition) = assessment.task_disposition.as_mut() {
+            // Keep all unresolved IDs, including siblings of a blocked operation.
+            // This receipt never claims every obligation was attempted or blocked.
+            disposition.terminal_action = if let Some(blocked) = blocked {
+                disposition.evidence_refs.push(format!("native:required_tool:{}", blocked.call_id));
+                assessment.verification_gaps.push(blocked.message.clone());
+                "blocked_required_operation"
+            } else {
+                "stopped_with_unresolved_obligations"
+            }.into();
+        }
+        assessment
     }
 
 
@@ -3413,12 +3827,10 @@ impl TurnExecutionControl {
             self.batching_advice_issued = false;
             self.wait_advice_issued = false;
         }
-        // Without new instructions, accepted input is a child's or peer's
-        // delivered report or final answer: new information. Only new
-        // instructions re-arm the one-shot
-        // intervention or reset passive cycle identity.
+        // A report from a child or peer is new information, not a new instruction.
+        // Only new instructions re-arm the gate or reset passive cycle identity.
         if instructions_changed {
-            self.completion_reconciliation_issued = false;
+            self.obligation_final_deferrals = 0;
             self.instruction_revision = self.instruction_revision.saturating_add(1);
 
             self.reset_convergence();
@@ -3633,10 +4045,11 @@ impl TurnExecutionControl {
             // A child assignment or code-mode cell becoming terminal proves
             // that wait is done, not that the consuming turn has no work left.
             if observation.disposition == AuthoritativeWaitDisposition::Terminal
-                && matches!(
-                    observation.result.adapter.as_str(),
-                    "multi_agent_v2" | "code_mode_cell"
-                )
+                && (unresolved_requirements
+                    || matches!(
+                        observation.result.adapter.as_str(),
+                        "multi_agent_v2" | "code_mode_cell"
+                    ))
             {
                 return SamplingConvergenceDecision::default();
             }
@@ -3644,9 +4057,6 @@ impl TurnExecutionControl {
             if observation.disposition == AuthoritativeWaitDisposition::Terminal
                 && observation.result.surfaceable_message.is_some()
             {
-                if unresolved_requirements {
-                    return SamplingConvergenceDecision::default();
-                }
                 // The owner has already supplied the exact assistant text for
                 // this terminal state. Surface it directly instead of making
                 // the model restate an authoritative completion.

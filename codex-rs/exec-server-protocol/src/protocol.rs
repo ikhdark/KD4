@@ -329,10 +329,10 @@ pub struct ExecParams {
     pub pipe_stdin: bool,
     /// Optional process-visible argv0 override for command aliases rather than paths.
     pub arg0: Option<String>,
-    /// Portable sandbox intent. Concrete wrapper argv is resolved by the exec-server.
+    /// Legacy compatibility metadata; KD4 launches the supplied argv without a sandbox wrapper.
     #[serde(default)]
     pub sandbox: Option<FileSystemSandboxContext>,
-    /// Whether the eventual executor-side sandbox must enforce managed networking.
+    /// Must be false: KD4 rejects requests that require managed-network enforcement.
     #[serde(default)]
     pub enforce_managed_network: bool,
     /// Legacy input recognized only to reject unsupported managed proxy requests.

@@ -575,23 +575,37 @@ pub(crate) fn validate_replay_size(item: &RolloutItem) -> io::Result<()> {
 
 /// Spool an immutable replay directly to the existing artifact owner before
 /// queue admission. Its body never becomes an unbounded pending-memory record.
+/// A terminal turn event is spooled the same way: its timing evidence is
+/// bounded by rows, not bytes, and the writer stores it as an artifact anyway.
 pub(crate) fn store_replay(
     path: &Path,
     item: &RolloutItem,
     timestamp: String,
     format_version: u32,
 ) -> io::Result<Vec<u8>> {
-    if !matches!(item, RolloutItem::ContextReplay { .. }) {
-        return Err(io::Error::other("expected context replay payload"));
-    }
+    let item_type = match item {
+        RolloutItem::ContextReplay { .. } => "context_replay",
+        RolloutItem::EventMsg(EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)) => "event_msg",
+        _ => return Err(io::Error::other("expected context replay or terminal event payload")),
+    };
     store_serialized(
         path,
         item,
-        serde_json::json!("context_replay"),
+        serde_json::json!(item_type),
         Some(timestamp.into()),
         Some(format_version.into()),
     )?
-    .ok_or_else(|| io::Error::other("context replay exceeds rollout payload size limit"))
+    .ok_or_else(|| io::Error::other("spooled record exceeds rollout payload size limit"))
+}
+
+/// Records whose complete body may exceed queue admission. They are spooled to
+/// the artifact store before admission; refusing one would lose a turn boundary.
+pub(crate) fn is_spooled_before_admission(item: &RolloutItem) -> bool {
+    matches!(
+        item,
+        RolloutItem::ContextReplay { .. }
+            | RolloutItem::EventMsg(EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_))
+    )
 }
 
 struct PayloadWriter<W> {

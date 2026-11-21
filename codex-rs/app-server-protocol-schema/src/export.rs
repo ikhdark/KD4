@@ -39,6 +39,8 @@ use types::schema_support::EXPERIMENTAL_CLIENT_METHODS;
 use types::schema_support::EXPERIMENTAL_SERVER_METHOD_PARAM_TYPES;
 use types::schema_support::EXPERIMENTAL_SERVER_METHOD_RESPONSE_TYPES;
 use types::schema_support::EXPERIMENTAL_SERVER_METHODS;
+use types::schema_support::EXPERIMENTAL_SERVER_NOTIFICATION_METHODS;
+use types::schema_support::EXPERIMENTAL_SERVER_NOTIFICATION_PAYLOAD_TYPES;
 use types::schema_support::RawSchemaEntry;
 use types::schema_support::generate_raw_json_schema;
 use anyhow::Context;
@@ -355,6 +357,7 @@ fn experimental_methods() -> HashSet<&'static str> {
     EXPERIMENTAL_CLIENT_METHODS
         .iter()
         .chain(EXPERIMENTAL_SERVER_METHODS)
+        .chain(EXPERIMENTAL_SERVER_NOTIFICATION_METHODS)
         .copied()
         .filter(|method| !method.is_empty())
         .collect()
@@ -367,6 +370,10 @@ fn experimental_method_types() -> HashSet<String> {
     collect_experimental_type_names(EXPERIMENTAL_CLIENT_METHOD_DEPENDENCY_TYPES, &mut type_names);
     collect_experimental_type_names(EXPERIMENTAL_SERVER_METHOD_PARAM_TYPES, &mut type_names);
     collect_experimental_type_names(EXPERIMENTAL_SERVER_METHOD_RESPONSE_TYPES, &mut type_names);
+    collect_experimental_type_names(
+        EXPERIMENTAL_SERVER_NOTIFICATION_PAYLOAD_TYPES,
+        &mut type_names,
+    );
     type_names
 }
 

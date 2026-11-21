@@ -29,6 +29,32 @@ const __codex_search_scope = (options, result) => {
         ? "bounded_by_native_file_search" : "bounded_by_exec_command_and_await_command" } };
 };
 
+// Key rg records by the launch owner's lexical roots, without changing rg argv,
+// proving physical file identity, or folding case on case-sensitive directories.
+const __codex_search_path_key = scope => {
+  const windows = scope.resolved_roots.some(({ resolved }) =>
+    /^(?:[a-z]:[\\/]|\\\\)/i.test(resolved ?? ""));
+  const spelling = path => (windows ? path.replaceAll("\\", "/") : path).replace(/^(\.\/)+/, "");
+  const relative = path => !path.startsWith("/") && !(windows && /^[a-z]:/i.test(path));
+  const roots = scope.resolved_roots.flatMap(({ requested, resolved }) => {
+    if (typeof resolved !== "string" || typeof requested !== "string") return [];
+    const path = spelling(requested);
+    // On POSIX, a symlink followed by ".." is not a lexical parent.
+    if (!relative(path) || (!windows && path.split("/").includes(".."))) return [];
+    const from = path.replace(/\/+$/, "") || ".";
+    return [{ from, to: spelling(resolved), prefix: from + "/" }];
+  }).sort((a, b) => (b.from === "." ? 0 : b.from.length) - (a.from === "." ? 0 : a.from.length));
+  return file => {
+    const path = spelling(file);
+    if (!relative(path)) return path;
+    const root = roots.find(({ from, prefix }) =>
+      from === "." || path === from || path.startsWith(prefix));
+    if (!root) return path;
+    const tail = root.from === "." ? path : path.slice(root.prefix.length).replace(/^\/+/, "");
+    return tail ? root.to.replace(/\/+$/, "") + "/" + tail : root.to;
+  };
+};
+
 // Extend the existing rg helper, session store and guarded checksum owners.
 // State is immutable after admission: concurrent/repeated cursors select the
 // same page, without a shared advancing offset, detached tasks or new locks.
@@ -85,8 +111,14 @@ const __codex_paginate_search = (search) => {
       error.evidence = { result, scope: __codex_search_scope(options, result) };
       throw error;
     }
-    const paths = [...new Set(result.stdout.split("\0").filter(Boolean))].sort();
     const receipt = __codex_search_scope(options, result);
+    const keyFor = __codex_search_path_key(receipt);
+    const files = new Map();
+    for (const path of result.stdout.split("\0").filter(Boolean)) {
+      const key = keyFor(path), previous = files.get(key);
+      if (previous === undefined || path < previous) files.set(key, path);
+    }
+    const paths = [...files.values()].sort();
     if (paths.length > 128) {
       const error = new Error("paged search scope exceeds 128 files; narrow path or glob");
       error.evidence = { scope: receipt, inventory_files: paths.length, inventory_limit: 128 };

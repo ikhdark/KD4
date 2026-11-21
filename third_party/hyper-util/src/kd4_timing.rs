@@ -115,6 +115,8 @@ impl Context {
     }
 }
 
+const SOCKET_EVENT_LIMIT: u16 = 64;
+
 /// This adapter is installed only directly around the raw TCP socket.
 #[derive(Debug)]
 pub struct Wire {
@@ -133,7 +135,7 @@ impl Wire {
         })
     }
     pub fn begin(&mut self, read: bool) {
-        if self.emitted > 64 || self.context.observer.strong_count() == 0 {
+        if self.emitted > SOCKET_EVENT_LIMIT || self.context.observer.strong_count() == 0 {
             return;
         }
         let slot = if read {
@@ -153,24 +155,39 @@ impl Wire {
             self.write_started.take()
         };
         if let Some(start) = start {
-            if self.emitted == 64 {
-                self.context.emit(
-                    "socket_capture_overflow",
-                    start,
-                    None,
-                    true,
-                    "retention_limit",
-                );
-            } else {
-                self.context.emit(
-                    if read { "socket_read" } else { "socket_write" },
-                    start,
-                    result.as_ref().ok().map(|count| *count as u64),
-                    true,
-                    if result.is_ok() { "success" } else { "failed" },
-                );
-            }
-            self.emitted += 1;
+            self.record(
+                if read { "socket_read" } else { "socket_write" },
+                start,
+                result.as_ref().ok().map(|count| *count as u64),
+                if result.is_ok() { "success" } else { "failed" },
+            );
+        }
+    }
+
+    fn record(
+        &mut self,
+        phase: &'static str,
+        start: Instant,
+        bytes: Option<u64>,
+        outcome: &'static str,
+    ) {
+        // Read and write may both be pending when the last row is consumed.
+        // Completions and abandonments share one cap and one overflow marker.
+        if self.emitted > SOCKET_EVENT_LIMIT {
+            return;
+        }
+        let overflow = self.emitted == SOCKET_EVENT_LIMIT;
+        self.emitted += 1;
+        if overflow {
+            self.context.emit(
+                "socket_capture_overflow",
+                start,
+                None,
+                true,
+                "retention_limit",
+            );
+        } else {
+            self.context.emit(phase, start, bytes, true, outcome);
         }
     }
 }
@@ -182,7 +199,7 @@ impl Drop for Wire {
             ("socket_write", self.write_started.take()),
         ] {
             if let Some(start) = start {
-                self.context.emit(phase, start, None, true, "abandoned");
+                self.record(phase, start, None, "abandoned");
             }
         }
     }

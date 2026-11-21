@@ -121,6 +121,16 @@ fn completed_process_output(
 }
 
 
+/// An argument combination refused before any process is polled, written or
+/// signalled: nothing ran, so the failure says so instead of unknown effects.
+fn argument_refusal(message: &str) -> FunctionCallError {
+    FunctionCallError::structured(ToolFailure::handler_refusal(
+        ToolFailureCode::InvalidInput,
+        message,
+        "write_stdin_arguments",
+    ))
+}
+
 impl WriteStdinHandler {
     async fn handle_call(
         &self,
@@ -147,8 +157,8 @@ impl WriteStdinHandler {
 
         let args: WriteStdinArgs = parse_arguments(&arguments)?;
         if args.close_stdin && (!args.chars.is_empty() || args.terminate || args.wait_for_output == Some(true)) {
-            return Err(FunctionCallError::RespondToModel(
-                "close_stdin requires empty chars and cannot be combined with terminate or wait_for_output=true; send input separately".into(),
+            return Err(argument_refusal(
+                "close_stdin requires empty chars and cannot be combined with terminate or wait_for_output=true; send input separately",
             ));
         }
         if args.status_only {
@@ -160,8 +170,8 @@ impl WriteStdinHandler {
                 || args.max_output_tokens.is_some()
                 || args.event_filter.is_some()
             {
-                return Err(FunctionCallError::RespondToModel(
-                    "status_only is observation-only; omit chars, terminate, close_stdin, wait_for_output, yield_time_ms, max_output_tokens and event_filter".into(),
+                return Err(argument_refusal(
+                    "status_only is observation-only; omit chars, terminate, close_stdin, wait_for_output, yield_time_ms, max_output_tokens and event_filter",
                 ));
             }
             let incarnation = args.incarnation.ok_or_else(|| {
@@ -196,14 +206,15 @@ impl WriteStdinHandler {
             if !args.chars.is_empty() || args.terminate || args.close_stdin || args.wait_for_output.is_some()
                 || args.yield_time_ms.is_some() || args.max_output_tokens.is_some()
             {
-                return Err(FunctionCallError::RespondToModel(
-                    "event_filter is observation-only; omit chars, terminate, close_stdin, wait_for_output, yield_time_ms and max_output_tokens".into(),
+                return Err(argument_refusal(
+                    "event_filter is observation-only; omit chars, terminate, close_stdin, wait_for_output, yield_time_ms and max_output_tokens",
                 ));
             }
-            filter.validate(self.max_timeout_ms).map_err(FunctionCallError::RespondToModel)?;
-            let incarnation = args.incarnation.ok_or_else(|| FunctionCallError::RespondToModel(
-                "event_filter requires the originating process incarnation".into(),
-            ))?;
+            filter.validate(self.max_timeout_ms).map_err(|message| argument_refusal(&message))?;
+            let incarnation = args.incarnation.ok_or_else(|| FunctionCallError::structured(ToolFailure::no_effects(
+                ToolFailureCode::StaleInput,
+                "event_filter requires the originating process incarnation",
+            )))?;
             if session.services.unified_exec_manager.process_incarnation(args.session_id).await.is_none()
                 && let Some(receipt) = session.retained_process_result(args.session_id, incarnation).await
             {
@@ -259,13 +270,13 @@ impl WriteStdinHandler {
         };
         let wait_for_output = args.waits_for_output();
         if args.terminate && !args.chars.is_empty() {
-            return Err(FunctionCallError::RespondToModel(
-                "terminate requires empty chars; send input separately".to_string(),
+            return Err(argument_refusal(
+                "terminate requires empty chars; send input separately",
             ));
         }
         if wait_for_output && !args.chars.is_empty() {
-            return Err(FunctionCallError::RespondToModel(
-                "wait_for_output requires empty chars; send input separately".to_string(),
+            return Err(argument_refusal(
+                "wait_for_output requires empty chars; send input separately",
             ));
         }
         if args.terminate

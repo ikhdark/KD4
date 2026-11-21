@@ -114,6 +114,7 @@ class AsyncCodexClient:
         exited: Future[None] = Future()
         cancelled = threading.Event()
         delivered = threading.Event()
+        delivery_lock = threading.Lock()
 
         def run_operation() -> None:
             owner = None
@@ -127,7 +128,9 @@ class AsyncCodexClient:
                     # The same admitted worker owns late-result cleanup. No
                     # unbounded cleanup threads, even if cancellation races delivery.
                     if not delivered.wait(self._sync.config.operation_timeout_s):
-                        cancelled.set()
+                        with delivery_lock:
+                            if not delivered.is_set():
+                                cancelled.set()
                     if cancelled.is_set():
                         assert owner is not None
                         with self._sync._cleanup_operation(owner):
@@ -171,7 +174,6 @@ class AsyncCodexClient:
                 if shutdown
                 else self._sync.config.operation_timeout_s
             )
-            deadline = asyncio.get_running_loop().time() + timeout
             result = await asyncio.wait_for(asyncio.shield(wrapped), timeout=timeout)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             cancelled.set()
@@ -182,16 +184,16 @@ class AsyncCodexClient:
             wrapped.add_done_callback(lambda done: None if done.cancelled() else done.exception())
             raise
         else:
-            # Delivery has committed: return the successful handle rather than
-            # losing it to cancellation during the worker's admission handoff.
-            delivered.set()
-            while True:
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0 or cancelled.is_set():
-                    cancelled.set()
+            # Commit delivery only if the worker has not claimed cleanup.
+            with delivery_lock:
+                if cancelled.is_set():
                     raise TimeoutError("operation delivery deadline exceeded")
+                delivered.set()
+            # After commit the worker only has to release admission. Neither
+            # the RPC deadline nor task cancellation can revoke this result.
+            while True:
                 try:
-                    await asyncio.wait_for(asyncio.shield(worker_exited), remaining)
+                    await asyncio.shield(worker_exited)
                     break
                 except asyncio.CancelledError:
                     continue

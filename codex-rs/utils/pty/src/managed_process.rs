@@ -309,6 +309,13 @@ fn reclaimable_reservation(
 
 
 impl ManagedRootProcess {
+    /// True only for the admission cap refusal before a new root is spawned.
+    pub fn is_capacity_refusal(error: &io::Error) -> bool {
+        error.get_ref().is_some_and(
+            <dyn std::error::Error + Send + Sync>::is::<AdmissionCapacityExhausted>,
+        )
+    }
+
     /// Reserve one of the process-wide managed-root slots before spawning.
     pub fn reserve() -> io::Result<Self> {
         Self::reserve_inner(None)

@@ -40,6 +40,25 @@ pub async fn check_managed_cargo_lane(
     env: &HashMap<String, String>,
     allow_native_filesystem_reads: bool,
 ) -> Result<(), String> {
+    check_managed_cargo_admission(command, cwd, env, allow_native_filesystem_reads)
+        .await
+        .map_err(|error| match error {
+            CargoAdmissionError::Refused(message) | CargoAdmissionError::Worker(message) => message,
+        })
+}
+
+#[derive(Debug)]
+pub enum CargoAdmissionError {
+    Refused(String),
+    Worker(String),
+}
+
+pub async fn check_managed_cargo_admission(
+    command: &[String],
+    cwd: &Path,
+    env: &HashMap<String, String>,
+    allow_native_filesystem_reads: bool,
+) -> Result<(), CargoAdmissionError> {
     // Decode identity before taking the non-Cargo path: shell quoting and
     // EncodedCommand can hide even a literal Cargo program from a raw scan.
     if infer_direct_shell_type(command).is_none()
@@ -56,7 +75,8 @@ pub async fn check_managed_cargo_lane(
     let (command, cwd, env) = (command.to_vec(), cwd.to_path_buf(), env.clone());
     crate::run_blocking_command_analysis(move || check(&command, &cwd, &env, 0, allow_native_filesystem_reads))
         .await
-        .map_err(|error| rejected(&format!("Target admission worker failed: {error}")))?
+        .map_err(|error| CargoAdmissionError::Worker(rejected(&format!("Target admission worker failed: {error}"))))?
+        .map_err(CargoAdmissionError::Refused)
 }
 
 fn check(

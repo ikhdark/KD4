@@ -2621,7 +2621,8 @@ impl Session {
         next_config: Config,
         refreshed_features: &[Feature],
     ) {
-        self.refresh_runtime_config_features_inner(next_config, refreshed_features, true)
+        let _ = self
+            .refresh_runtime_config_features_inner(next_config, refreshed_features, true)
             .await;
     }
 
@@ -2629,9 +2630,9 @@ impl Session {
         &self,
         next_config: Config,
         refreshed_features: &[Feature],
-    ) {
+    ) -> std::io::Result<()> {
         self.refresh_runtime_config_features_inner(next_config, refreshed_features, false)
-            .await;
+            .await
     }
 
     async fn refresh_runtime_config_features_inner(
@@ -2639,7 +2640,7 @@ impl Session {
         next_config: Config,
         refreshed_features: &[Feature],
         invalidate_discovery: bool,
-    ) {
+    ) -> std::io::Result<()> {
         let refresh_started = std::time::Instant::now();
         // Serialize refreshes with environment/profile updates while preparing
         // the hooks that will be published with this configuration.
@@ -2669,6 +2670,21 @@ impl Session {
             }
             config.tool_suggest =
                 resolve_tool_suggest_config_from_layer_stack(&config.config_layer_stack);
+            // Resolve from the retained thread layers, not the host snapshot's
+            // derived fields. The legacy file reload also uses this path.
+            config.include_skill_instructions = match config
+                .config_layer_stack
+                .effective_config()
+                .get("skills")
+                .and_then(|skills| skills.get("include_instructions"))
+            {
+                Some(value) => value.as_bool().ok_or_else(|| {
+                    let message = "skills.include_instructions must be a boolean";
+                    tracing::warn!("{message}");
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+                })?,
+                None => true,
+            };
             Arc::new(config)
         };
         if invalidate_discovery {
@@ -2694,11 +2710,13 @@ impl Session {
                 } else {
                     tracing::error!("hook discovery failed; retaining current runtime config: {err}");
                 }
-                return;
+                return Err(std::io::Error::other(format!(
+                    "hook discovery worker failed: {err}"
+                )));
             }
         };
 
-        let (previous_config, new_config) = {
+        let (previous_config, new_config, hook_warnings) = {
             let mut state = self.state.lock().await;
             let previous_config = notify_config_contributors
                 .then(|| Self::build_effective_session_config(&state.session_configuration));
@@ -2711,7 +2729,14 @@ impl Session {
             } else {
                 runtime.manager().invalidate_resource_caches();
             }
-            let hooks = hooks.with_run_history_from(&self.services.hooks.load());
+            let previous_hooks = self.services.hooks.load();
+            let hook_warnings = hooks
+                .startup_warnings()
+                .iter()
+                .filter(|warning| !previous_hooks.startup_warnings().contains(warning))
+                .cloned()
+                .collect::<Vec<_>>();
+            let hooks = hooks.with_run_history_from(&previous_hooks);
             let hooks = hooks.with_mcp_executor(Arc::new(
                 crate::hook_mcp_executor::CoreHookMcpExecutor {
                     runtime: Arc::clone(&self.services.mcp_runtime),
@@ -2721,12 +2746,22 @@ impl Session {
             self.services.hooks.store(Arc::new(hooks));
             let new_config = notify_config_contributors
                 .then(|| Self::build_effective_session_config(&state.session_configuration));
-            (previous_config, new_config)
+            (previous_config, new_config, hook_warnings)
         };
         self.emit_config_changed_contributors(previous_config.as_ref(), new_config.as_ref());
+        // Recoverable discovery warnings do not reject a usable registry, but
+        // newly rejected hook entries must be visible on the live thread.
+        for message in hook_warnings {
+            self.deliver_event_raw(Event {
+                id: INITIAL_SUBMIT_ID.to_owned(),
+                msg: EventMsg::Warning(WarningEvent { message }),
+            })
+            .await;
+        }
         if plugin_refresh_trace_enabled() {
             tracing::info!(target: "codex_plugin_refresh", phase = "user_layer_published", thread_id = %self.thread_id, elapsed_us = refresh_started.elapsed().as_micros() as u64);
         }
+        Ok(())
     }
 
     fn emit_config_changed_contributors(

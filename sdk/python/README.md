@@ -135,10 +135,15 @@ events still fail closed on validation errors.
 Cancelled or timed-out RPC response waits detach without stopping unrelated turns;
 late responses are ignored. Queued, unwritten frames are skipped. An ambiguous
 in-progress pipe write or broken I/O still aborts the transport generation: close
-it before restarting. Cancellation of a notification-only wait leaves its events
-available. A cancelled async turn start retains its bounded worker until a response
-or the original RPC deadline, then interrupts a received late start result. A start
-with no acknowledged result has unknown server-side outcome; do not blindly retry.
+it before restarting. Cancelling a low-level `next_*_notification()` read does not
+consume queued events or close its route. By contrast, cancelling an active turn
+stream or run or an async login handle's `wait()` closes its notification route
+and discards unread events. Closing a login handle does not cancel the server-side
+login attempt; use `cancel()` to request that separately.
+
+A cancelled async turn start retains its bounded worker until a response or the
+original RPC deadline, then interrupts a received late start result. A start with
+no acknowledged result has unknown server-side outcome; do not blindly retry.
 Arbitrary user callbacks cannot be forcibly stopped by Python; blocked callbacks
 keep their admission slot rather than spawning unlimited work.
 

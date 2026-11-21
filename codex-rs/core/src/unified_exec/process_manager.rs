@@ -2491,8 +2491,25 @@ impl UnifiedExecProcessManager {
             )
             .await
         };
-        let spawned =
-            spawn_result.map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
+        let spawned = spawn_result.map_err(|error| {
+            #[cfg(windows)]
+            if let Some(cause) = error
+                .chain()
+                .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+                .find(|io| {
+                    io.raw_os_error()
+                        == Some(windows_sys::Win32::Foundation::ERROR_FILENAME_EXCED_RANGE as i32)
+                })
+            {
+                return UnifiedExecError::LaunchInputRefused {
+                    message: format!(
+                        "Windows could not launch the process: {cause}. Shorten the command line or paths before trying again."
+                    ),
+                    kind: "windows_launch_length",
+                };
+            }
+            UnifiedExecError::create_process(error.to_string())
+        })?;
         spawn_lifecycle.after_spawn();
         mark_exec_process_spawned();
         drop(spawn_timing);

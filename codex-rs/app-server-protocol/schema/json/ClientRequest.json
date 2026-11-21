@@ -1296,9 +1296,10 @@
           ]
         },
         "len": {
-          "description": "Maximum bytes to return; must not exceed 64 KiB.",
+          "description": "Maximum bytes to return, from 1 through 65,536 inclusive.",
           "format": "uint",
-          "minimum": 0.0,
+          "maximum": 65536.0,
+          "minimum": 1.0,
           "type": "integer"
         },
         "path": {

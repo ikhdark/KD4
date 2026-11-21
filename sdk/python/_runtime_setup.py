@@ -3,11 +3,11 @@ import importlib.metadata
 import importlib.util
 import json
 import os
-import platform
 import re
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import urllib.error
 import urllib.request
@@ -16,6 +16,10 @@ from pathlib import Path
 PACKAGE_NAME = "openai-codex-cli-bin"
 SDK_PACKAGE_NAME = "openai-codex"
 REPO_SLUG = "ikhdark/KD4"
+_RUNTIME_ASSETS = {
+    "win_amd64": "codex-package-x86_64-pc-windows-msvc.tar.gz",
+    "win_arm64": "codex-package-aarch64-pc-windows-msvc.tar.gz",
+}
 
 
 class RuntimeSetupError(RuntimeError):
@@ -58,14 +62,18 @@ def ensure_runtime_package_installed(
     ):
         return requested_version
 
+    platform_tag = platform_wheel_tag(python_executable)
     with tempfile.TemporaryDirectory(prefix="codex-python-runtime-") as temp_root_str:
         temp_root = Path(temp_root_str)
-        archive_path = _download_release_archive(requested_version, temp_root)
+        archive_path = _download_release_archive(
+            requested_version, temp_root, _RUNTIME_ASSETS[platform_tag]
+        )
         staged_runtime_dir = _stage_runtime_package(
             sdk_python_dir,
             requested_version,
             archive_path,
             temp_root / "runtime-stage",
+            platform_tag=platform_tag,
         )
         _install_runtime_package(python_executable, staged_runtime_dir, install_target)
 
@@ -88,28 +96,43 @@ def ensure_runtime_package_installed(
 
 
 def platform_asset_name() -> str:
-    if platform.system() != "Windows":
+    return _RUNTIME_ASSETS[platform_wheel_tag()]
+
+
+def platform_wheel_tag(python_executable: str | Path | None = None) -> str:
+    """Return the Windows wheel platform for the selected Python interpreter."""
+    if python_executable is None:
+        python_executable = sys.executable
+        wheel_platform = sysconfig.get_platform()
+    else:
+        # Windows wheel tags use the interpreter build platform, not the host CPU.
+        try:
+            result = subprocess.run(
+                [
+                    str(python_executable),
+                    "-I",
+                    "-S",
+                    "-B",
+                    "-c",
+                    "import sysconfig; print(sysconfig.get_platform())",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise RuntimeSetupError(
+                f"Unable to determine the wheel platform for {python_executable}."
+            ) from exc
+        wheel_platform = result.stdout.strip()
+
+    platform_tag = wheel_platform.replace("-", "_")
+    if platform_tag not in _RUNTIME_ASSETS:
         raise RuntimeSetupError(
-            f"Unsupported runtime platform: system={platform.system()!r}; Windows is required."
+            f"Unsupported runtime wheel platform {wheel_platform!r} for {python_executable}; "
+            "Windows x64 or ARM64 is required."
         )
-
-    machine = platform.machine().lower()
-
-    if machine in {"aarch64", "arm64"}:
-        return "codex-package-aarch64-pc-windows-msvc.tar.gz"
-    if machine in {"x86_64", "amd64"}:
-        return "codex-package-x86_64-pc-windows-msvc.tar.gz"
-
-    raise RuntimeSetupError(
-        f"Unsupported Windows runtime architecture: machine={platform.machine()!r}"
-    )
-
-
-def platform_wheel_tag() -> str:
-    asset_name = platform_asset_name()
-    if "aarch64" in asset_name:
-        return "win_arm64"
-    return "win_amd64"
+    return platform_tag
 
 
 def _installed_runtime_version(python_executable: str | Path) -> str | None:
@@ -165,8 +188,7 @@ def _release_metadata(version: str) -> dict[str, object]:
     ) from last_error
 
 
-def _download_release_archive(version: str, temp_root: Path) -> Path:
-    asset_name = platform_asset_name()
+def _download_release_archive(version: str, temp_root: Path, asset_name: str) -> Path:
     archive_path = temp_root / asset_name
     release_tag = _release_tag(version)
 
@@ -255,13 +277,15 @@ def _stage_runtime_package(
     runtime_version: str,
     runtime_package_archive: Path,
     staging_dir: Path,
+    *,
+    platform_tag: str,
 ) -> Path:
     script_module = _load_update_script_module(sdk_python_dir)
     return script_module.stage_python_runtime_package(  # type: ignore[no-any-return]
         staging_dir,
         runtime_version,
         runtime_package_archive.resolve(),
-        platform_tag=platform_wheel_tag(),
+        platform_tag=platform_tag,
     )
 
 

@@ -227,7 +227,17 @@ async fn publish(invocation: ToolInvocation) -> Result<Box<dyn ToolOutput>, Func
             args.result,
         )
         .await
-        .map_err(|error| task_store_error(PUBLISH_TOOL, error))?;
+        .map_err(|error| match error {
+            // Draft validation and version refusals occur before any write.
+            StoreError::InvalidAssignment(_) => FunctionCallError::structured(
+                codex_protocol::tool_failure::ToolFailure::handler_refusal(
+                    codex_protocol::tool_failure::ToolFailureCode::InvalidInput,
+                    format!("{PUBLISH_TOOL}: {error}"),
+                    "partial_result_validation",
+                ),
+            ),
+            _ => task_store_error(PUBLISH_TOOL, error),
+        })?;
     Ok(boxed_tool_output(output(
         binding.assignment_id,
         Some(result),

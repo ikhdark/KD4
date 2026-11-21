@@ -222,7 +222,9 @@ pub(super) async fn attach_missing_rg_path_advisory(
         || response
             .repair_notice
             .as_deref()
-            .is_some_and(|notice| notice.contains("rg_missing_path"))
+            .is_some_and(|notice| {
+                notice.contains("rg_missing_path") || notice.contains("rg_literal_glob_path")
+            })
         || !response
             .raw_output
             .windows(RG_ERROR.len())
@@ -1354,6 +1356,9 @@ fn exec_command_error_output(
     use codex_protocol::tool_failure::ToolFailure;
     use codex_protocol::tool_failure::ToolFailureCode;
     let failure = match error {
+        UnifiedExecError::LaunchInputRefused { kind, .. } if no_process_registered => {
+            ToolFailure::handler_refusal(ToolFailureCode::InvalidInput, message, kind)
+        }
         UnifiedExecError::CreateProcess { .. } if no_process_registered => {
             ToolFailure::no_effects(ToolFailureCode::RetryableFailure, message)
         }

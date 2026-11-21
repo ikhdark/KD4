@@ -230,7 +230,7 @@ impl PsuedoCon {
                 err
             );
             log::error!("{msg}");
-            bail!("{msg}");
+            return Err(Error::new(err).context(msg));
         }
 
         let observation = crate::process_observation::observe_process_start(

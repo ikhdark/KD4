@@ -32,7 +32,9 @@ pub struct FsReadFileRangeParams {
     /// Zero-based starting byte offset.
     #[ts(type = "number")]
     pub start: u64,
-    /// Maximum bytes to return; must not exceed 64 KiB.
+    /// Maximum bytes to return, from 1 through 65,536 inclusive.
+    // Matches the limits enforced by the filesystem and request handler.
+    #[schemars(range(min = 1, max = 65536))]
     pub len: usize,
     /// Refuse a file revision different from a preceding range response.
     #[serde(default, skip_serializing_if = "Option::is_none")]

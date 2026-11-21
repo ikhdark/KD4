@@ -1,0 +1,1 @@
+Failure-recovery checkpoint: This cell failed before it started any nested tool call, so it produced no nested tool effects to inspect or preserve. Correct the script error and resubmit only the intended work. A failed cell is not permission to rerun benchmarks or start another investigation. Respect the latest user pause or stop instruction.

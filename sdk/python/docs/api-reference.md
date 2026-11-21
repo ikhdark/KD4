@@ -180,7 +180,10 @@ Async handle methods return awaitables.
 Async handle methods return awaitables.
 
 `wait()` consumes only the completion notification for its matching login
-attempt. API-key login completes synchronously and does not return a handle.
+attempt. The async `wait()` closes the notification route when it exits,
+including on cancellation, and discards unread events. This does not cancel
+the server-side login attempt; use `cancel()` to request that separately.
+API-key login completes synchronously and does not return a handle.
 
 ## Thread / AsyncThread
 
@@ -291,9 +294,11 @@ Behavior notes:
 - `stream()` and `run()` consume only notifications for their own turn ID
 - one `AsyncCodex` instance can stream multiple active turns concurrently
 
-Handle close/abandon and early stream exit detach by default. Opt into cancellation
-with `close(cancel=True)` or `stream(cancel_on_close=True)`; explicitly close/aclose
-the iterator on early exit. Interruption failures propagate after route cleanup.
+Handle close/abandon and early stream exit detach by default. Cancelling an active
+async `stream()` or `run()` discards unread events when the route closes. Opt into
+interruption with `close(cancel=True)` or `stream(cancel_on_close=True)`;
+explicitly close/aclose the iterator on early exit. Interruption failures
+propagate after route cleanup.
 Closing a generator before its first iteration does not run its cleanup; close the
 handle directly in that case. `CodexConfig.turn_timeout_s` optionally sets a hard
 whole-turn cap; `notification_timeout_s` bounds each wait independently of the RPC

@@ -259,6 +259,8 @@ struct ProviderTierObservation {
 struct ModelAttemptOffsets {
     provider_observations: Option<ProviderObservations>,
     prompt_cache_comparison_response_id: Option<String>,
+    request_model: Option<String>,
+    request_dialect: Option<&'static str>,
     /// Routing hint the carrying transport sent: the HTTP request's own header, or the
     /// handshake header of the WebSocket connection that carried this attempt.
     routing_hint_carrier: Option<&'static str>,
@@ -299,11 +301,12 @@ struct ModelAttemptClock {
 }
 
 impl ModelAttemptClock {
-    fn record_prompt_cache_comparison(&self, options: Option<&codex_api::PromptCacheOptions>) {
-        if let Some(options) = options {
-            self.offsets.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-                .prompt_cache_comparison_response_id = Some(options.comparison_response_id.clone());
-        }
+    fn record_request_projection(&self, request: &ResponsesApiRequest, use_responses_lite: bool) {
+        let mut offsets = self.offsets.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        offsets.request_model = Some(request.model.clone());
+        offsets.request_dialect = Some(if use_responses_lite { "responses_lite" } else { "responses" });
+        offsets.prompt_cache_comparison_response_id = request.prompt_cache_options.as_ref()
+            .map(|options| options.comparison_response_id.clone());
     }
 
     /// `carrier` names who sent the hint; `None` means that carrier sent no hint.
@@ -748,6 +751,10 @@ impl ModelTokenReceipts {
 struct ModelStreamDelivery {
     version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
+    request_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_dialect: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     requested_service_tier: Option<String>,
     /// `http_request` or `websocket_handshake`; with no `routing_hint`, that carrier sent none.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -893,6 +900,8 @@ impl ModelStreamDeliveryObserver {
         self.summary.first_response_body_byte_ns = offsets.first_response_body_byte_ns;
         self.summary.provider_processing_us = offsets.provider_processing_us;
         self.summary.provider_observations = offsets.provider_observations.clone();
+        self.summary.request_model = offsets.request_model.clone();
+        self.summary.request_dialect = offsets.request_dialect;
         self.summary.prompt_cache_comparison_response_id = offsets.prompt_cache_comparison_response_id.clone();
         self.summary.routing_hint_carrier = offsets.routing_hint_carrier;
         self.summary.routing_hint = offsets.routing_hint.clone();
@@ -4694,7 +4703,7 @@ impl ModelClientSession {
                             .extra_headers
                             .insert(X_CODEX_ROUTING_HINT_HEADER, routing_hint);
                     }
-                    attempt_clock.record_prompt_cache_comparison(request.prompt_cache_options.as_ref());
+                    attempt_clock.record_request_projection(&request, model_info.use_responses_lite);
                     drop(request_transformation_guard);
                     let request_session_telemetry = session_telemetry_for_request(session_telemetry, &request, self.turn_timing.as_ref());
                     let attempt_identity = new_attempt_identity(sampling_request_id);
@@ -5084,7 +5093,7 @@ impl ModelClientSession {
                 self.client.attach_cache_comparison(&client_setup, model_info, &mut request)
             };
             if let Some(clock) = attempt_clock.as_ref() {
-                clock.record_prompt_cache_comparison(request.prompt_cache_options.as_ref());
+                clock.record_request_projection(&request, model_info.use_responses_lite);
             }
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),

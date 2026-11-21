@@ -920,16 +920,16 @@ impl CatalogRequestProcessor {
             name,
             enabled,
         } = params;
-        let selected_path = path.clone();
-        let selected_name = name.clone();
-        let edit = match (path, name) {
+        let selected_name = name.as_deref().map(str::trim);
+        let edit = match (path.as_ref(), selected_name) {
             (Some(path), None) => ConfigEdit::SetSkillConfig {
-                path: path.into_path_buf(),
+                path: path.to_path_buf(),
                 enabled,
             },
-            (None, Some(name)) if !name.trim().is_empty() => {
-                ConfigEdit::SetSkillConfigByName { name, enabled }
-            }
+            (None, Some(name)) if !name.is_empty() => ConfigEdit::SetSkillConfigByName {
+                name: name.to_owned(),
+                enabled,
+            },
             _ => {
                 return Err(invalid_params(
                     "skills/config/write requires exactly one of path or name",
@@ -946,8 +946,20 @@ impl CatalogRequestProcessor {
         self.config_manager.invalidate_load_cache();
         self.thread_manager.plugins_manager().clear_cache();
         self.thread_manager.skills_service().clear_cache();
+        let canonical_path = path.as_ref().and_then(|path| path.canonicalize().ok());
+        // A path can identify a project outside the server cwd; a name alone cannot.
+        let cwd = path
+            .as_ref()
+            .and_then(skill_project_cwd)
+            .or_else(|| canonical_path.as_ref().and_then(skill_project_cwd));
+        let cwds = match cwd {
+            Some(cwd) if cwd != self.config.cwd => {
+                vec![self.config.cwd.to_path_buf(), cwd.into_path_buf()]
+            }
+            _ => Vec::new(),
+        };
         let reloaded = self.skills_list_response(SkillsListParams {
-            cwds: Vec::new(),
+            cwds,
             force_reload: false,
         }).await.map_err(|mut error| {
             let data = error.data.get_or_insert_with(|| serde_json::json!({}));
@@ -957,8 +969,9 @@ impl CatalogRequestProcessor {
             error
         })?;
         let mut matching = reloaded.data.iter().flat_map(|entry| &entry.skills).filter(|skill| {
-            selected_path.as_ref().is_some_and(|path| &skill.path == path)
-                || selected_name.as_ref().is_some_and(|name| &skill.name == name)
+            path.as_ref() == Some(&skill.path)
+                || canonical_path.as_ref() == Some(&skill.path)
+                || selected_name.is_some_and(|name| skill.name == name)
         });
         let partial_error = || {
             let mut error = internal_error("skill setting saved, but its effective state is unavailable or differs across sources");
@@ -971,6 +984,29 @@ impl CatalogRequestProcessor {
         }
         Ok(SkillsConfigWriteResponse { effective_enabled })
     }
+}
+
+// Use the directory that owns the skill root, not the skill's own directory.
+fn skill_project_cwd(path: &AbsolutePathBuf) -> Option<AbsolutePathBuf> {
+    let matches = |name: &std::ffi::OsStr, expected: &str| {
+        if cfg!(windows) {
+            name.eq_ignore_ascii_case(expected)
+        } else {
+            name == expected
+        }
+    };
+    path.ancestors().skip(1).find_map(|ancestor| {
+        if !matches(ancestor.file_name()?, "skills") {
+            return None;
+        }
+        let root_owner = ancestor.parent()?;
+        let name = root_owner.file_name()?;
+        if matches(name, ".agents") || matches(name, ".codex") {
+            root_owner.parent()
+        } else {
+            None
+        }
+    })
 }
 
 // Free completed slots immediately; response ordering is restored only after

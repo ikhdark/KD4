@@ -311,12 +311,13 @@ impl ConfigRequestProcessor {
                     }
                 };
                 thread
-                    .refresh_runtime_config_features_after_discovery_invalidation(
+                    .try_refresh_runtime_config_features_after_discovery_invalidation(
                         next_config,
                         refreshed_features,
                     )
-                    .await;
-                None
+                    .await
+                    .err()
+                    .map(|err| (thread_id.to_string(), err.to_string()))
             })
             .buffer_unordered(5)
             .filter_map(|failure| async move { failure })

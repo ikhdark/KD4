@@ -906,16 +906,6 @@ impl OpenAiModelsManager {
                     .await
                 {
                     Ok(ModelsFetchResult::Modified { models, etag }) => {
-                        if !models.is_empty()
-                            && models
-                                .iter()
-                                .all(|model| model.validate_capabilities().is_err())
-                        {
-                            error!(
-                                "rejecting entirely invalid ETag catalog; retaining last good snapshot"
-                            );
-                            continue;
-                        }
                         if !self.cache_manager.identity_is_current(&refresh_identity) {
                             self.ensure_current_cache_identity().await;
                             continue;
@@ -1275,11 +1265,7 @@ impl OpenAiModelsManager {
             )
             .await?;
         if let ModelsFetchResult::Modified { models, .. } = &result {
-            for model in models {
-                model
-                    .validate_capabilities()
-                    .map_err(CodexErr::InvalidRequest)?;
-            }
+            validate_catalog_capabilities(models).map_err(CodexErr::InvalidRequest)?;
         }
         Ok(result)
     }
@@ -1340,23 +1326,13 @@ impl OpenAiModelsManager {
         Ok(())
     }
 
-    /// Replace the identity-scoped catalog and validator as one logical snapshot.
+    /// Replace the identity-scoped catalog and validator from an accepted fetch or cache entry.
     async fn apply_remote_models_and_etag_for_identity(
         &self,
         models: Vec<ModelInfo>,
         etag: Option<String>,
         expected_identity: &str,
     ) -> bool {
-        if !models.is_empty()
-            && models
-                .iter()
-                .all(|model| model.validate_capabilities().is_err())
-        {
-            tracing::warn!(
-                "rejecting an entirely invalid model catalog; retaining last good snapshot"
-            );
-            return false;
-        }
         let merged_models = self.merged_remote_models(models);
         let mut state = self.state.write().await;
         if state.active_cache_identity != expected_identity
@@ -1639,6 +1615,19 @@ fn normalize_model_catalog(models: Vec<ModelInfo>) -> Vec<ModelInfo> {
     normalize_model_catalog_with_rejections(models).models
 }
 
+/// A genuinely empty catalog is meaningful, but a nonempty catalog whose rows
+/// all fail capability validation must not replace the last good snapshot.
+/// Raw rows are retained on disk so quarantine can be rebuilt on cache load.
+pub(crate) fn validate_catalog_capabilities(models: &[ModelInfo]) -> Result<(), String> {
+    let Some((first, rest)) = models.split_first() else {
+        return Ok(());
+    };
+    match first.validate_capabilities() {
+        Err(error) if !rest.iter().any(|model| model.validate_capabilities().is_ok()) => Err(error),
+        _ => Ok(()),
+    }
+}
+
 struct NormalizedModelCatalog {
     models: Vec<ModelInfo>,
     rejected_slugs: std::collections::BTreeSet<String>,
@@ -1688,15 +1677,31 @@ fn construct_model_info_with_rejections(
     rejected_slugs: &std::collections::BTreeSet<String>,
     config: &ModelsManagerConfig,
 ) -> ModelInfo {
-    let suffix = model_info::namespaced_model_suffix(model);
-    if rejected_slugs.iter().any(|slug| {
-        model_info::matches_model_slug(model, slug)
-            || suffix.is_some_and(|suffix| model_info::matches_model_slug(suffix, slug))
-    }) {
-        tracing::warn!(%model, "using explicit fallback for quarantined model metadata");
-        return construct_model_info_from_normalized(model, &[], config);
-    }
-    construct_model_info_from_normalized(model, candidates, config)
+    // Resolve in normal lookup order. A rejected slug blocks a less
+    // specific match, not an exact or longer surviving model slug.
+    let lookup = |slug| {
+        let candidate = find_normalized_model_by_longest_prefix(slug, candidates);
+        if rejected_slugs.iter().any(|rejected| {
+            candidate.is_none_or(|candidate| rejected.len() >= candidate.slug.len())
+                && model_info::matches_model_slug(slug, rejected)
+        }) {
+            Err(())
+        } else {
+            Ok(candidate)
+        }
+    };
+    let remote = lookup(model)
+        .and_then(|remote| {
+            if remote.is_some() {
+                return Ok(remote);
+            }
+            model_info::namespaced_model_suffix(model).map_or(Ok(None), lookup)
+        })
+        .unwrap_or_else(|()| {
+            tracing::warn!(%model, "using explicit fallback for quarantined model metadata");
+            None
+        });
+    construct_model_info_from_selected(model, remote, config)
 }
 
 fn load_bundled_models() -> Result<Vec<ModelInfo>, std::io::Error> {
@@ -1748,24 +1753,21 @@ pub(crate) fn construct_model_info_from_candidates(
     candidates: &[ModelInfo],
     config: &ModelsManagerConfig,
 ) -> ModelInfo {
-    let normalized = normalize_model_catalog(candidates.to_vec());
-    construct_model_info_from_normalized(model, &normalized, config)
+    let normalized = normalize_model_catalog_with_rejections(candidates.to_vec());
+    construct_model_info_with_rejections(
+        model,
+        &normalized.models,
+        &normalized.rejected_slugs,
+        config,
+    )
 }
 
-/// Borrow an already validated manager snapshot and copy only the selected record.
-fn construct_model_info_from_normalized(
+/// Copy only the descriptor selected from the validated snapshot.
+fn construct_model_info_from_selected(
     model: &str,
-    candidates: &[ModelInfo],
+    remote: Option<&ModelInfo>,
     config: &ModelsManagerConfig,
 ) -> ModelInfo {
-    // First use the normal longest-prefix match. If that misses, allow a narrowly scoped
-    // retry for namespaced slugs like `custom/gpt-5.3-codex`.
-    let remote = find_normalized_model_by_longest_prefix(model, candidates).or_else(|| {
-        find_normalized_model_by_longest_prefix(
-            model_info::namespaced_model_suffix(model)?,
-            candidates,
-        )
-    });
     let mut model_info = if let Some(remote) = remote {
         ModelInfo {
             slug: model.to_string(),

@@ -300,13 +300,9 @@ async fn spawn_process_portable(
     let (slave, mut child, admission) = tokio::task::spawn_blocking(move || {
         let child = crate::process_observation::ProcessObservationContext::scope_sync(
             observation_context,
-            || {
-                slave
-                    .spawn_command(command_builder)
-                    .map_err(std::io::Error::other)
-            },
+            || slave.spawn_command(command_builder),
         )?;
-        Ok::<_, std::io::Error>((slave, child, admission))
+        Ok::<_, anyhow::Error>((slave, child, admission))
     })
     .await??;
     #[cfg(not(windows))]

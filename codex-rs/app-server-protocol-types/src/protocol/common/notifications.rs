@@ -83,6 +83,16 @@ macro_rules! server_notification_definitions {
             )*
         ];
 
+        #[doc(hidden)]
+        pub const EXPERIMENTAL_SERVER_NOTIFICATION_METHODS: &[&str] = &[
+            $(experimental_method_entry!($(#[experimental($experimental_reason)])? => $wire),)*
+        ];
+
+        #[doc(hidden)]
+        pub const EXPERIMENTAL_SERVER_NOTIFICATION_PAYLOAD_TYPES: &[&str] = &[
+            $(experimental_type_entry!($(#[experimental($experimental_reason)])? $payload),)*
+        ];
+
         /// Returns `true` for notifications that must survive transport backpressure.
         ///
         /// These notifications either carry the authoritative assistant transcript or

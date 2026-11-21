@@ -268,7 +268,7 @@ where
 /// CLI.
 /// Note: In debug builds the temp-dir guard is disabled to ease local testing.
 ///
-/// IMPORTANT: Callers must update PATH before multiple threads are spawned.
+/// IMPORTANT: Callers must update the environment before multiple threads are spawned.
 fn prepare_path_entry_for_codex_aliases(
     existing_path: Option<OsString>,
 ) -> std::io::Result<(Arg0PathEntryGuard, OsString)> {
@@ -310,13 +310,37 @@ fn prepare_path_entry_for_codex_aliases(
     let lock_file = lock_session_dir(path)?;
 
     let exe = std::env::current_exe()?;
-    let batch_contents = patch_alias_batch_script(&exe);
+    // cmd decodes batch source using its active code page, but expands
+    // environment variables as Unicode. Bind the variable to this alias
+    // directory so a nested Codex invocation cannot redirect these aliases.
+    let exe_env = path
+        .file_name()
+        .filter(|_| cfg!(windows) && !exe.as_os_str().as_encoded_bytes().is_ascii())
+        .map(|name| format!("CODEX_ARG0_EXE_{}", name.to_string_lossy()));
+    let literal_exe = exe.display().to_string().replace('%', "%%");
+    let batch_contents = if let Some(exe_env) = exe_env.as_deref() {
+        // Even an unread non-ASCII line can disrupt cmd's UTF-8 batch reader.
+        // Keep the active aliases ASCII and the old literal fallback separate.
+        let fallback = path.join("literal");
+        std::fs::create_dir(&fallback)?;
+        std::fs::write(
+            fallback.join("apply_patch.bat"),
+            patch_alias_batch_script(&literal_exe, None),
+        )?;
+        patch_alias_batch_script(&format!("%{exe_env}%"), Some(exe_env))
+    } else {
+        patch_alias_batch_script(&literal_exe, None)
+    };
     for filename in &[APPLY_PATCH_ARG0, MISSPELLED_APPLY_PATCH_ARG0] {
         let batch_script = path.join(format!("{filename}.bat"));
         std::fs::write(&batch_script, &batch_contents)?;
     }
 
     let updated_path_env_var = path_env_with_entry(path, existing_path)?;
+    if let Some(exe_env) = exe_env {
+        // SAFETY: Alias preparation runs during single-threaded startup.
+        unsafe { std::env::set_var(exe_env, &exe) };
+    }
 
     Ok((
         Arg0PathEntryGuard {
@@ -327,14 +351,18 @@ fn prepare_path_entry_for_codex_aliases(
     ))
 }
 
-fn patch_alias_batch_script(exe: &Path) -> String {
+fn patch_alias_batch_script(exe: &str, exe_env: Option<&str>) -> String {
     // Quotes do not suppress percent expansion in batch source. Delayed
     // expansion must also be disabled before cmd reads the executable line.
     // An inherited ERRORLEVEL environment variable masks cmd's status pseudo-
     // variable. Clear that alias locally before capturing the helper's exit.
-    let exe = exe.display().to_string().replace('%', "%%");
+    let fallback = exe_env.map_or_else(String::new, |name| {
+        // Do not use CALL: the fallback takes over this batch and returns its
+        // status, without CALL's additional expansion of the forwarded args.
+        format!("if not defined {name} \"%~dp0literal\\apply_patch.bat\" %*\n")
+    });
     format!(
-        "@echo off\nsetlocal DisableDelayedExpansion\nset \"ERRORLEVEL=\"\n\"{exe}\" {CODEX_CORE_APPLY_PATCH_ARG1} %*\nexit /b %ERRORLEVEL%\n"
+        "@echo off\nsetlocal DisableDelayedExpansion\nset \"ERRORLEVEL=\"\n{fallback}\"{exe}\" {CODEX_CORE_APPLY_PATCH_ARG1} %*\nexit /b %ERRORLEVEL%\n"
     )
 }
 

@@ -5,7 +5,7 @@ Traditionally, there are two transport mechanisms for an MCP server: stdio and H
 This crate helps enable a third, which is UNIX domain socket, because it has the advantages that:
 
 - The UDS can be attached to long-running process, like an HTTP server.
-- The UDS can leverage UNIX file permissions to restrict access.
+- On Windows, the server can place its socket in a directory with restricted access.
 
 To that end, this crate provides an adapter between a UDS and stdio. Start an MCP
 server that listens on a socket, then configure Codex to launch the adapter with
@@ -19,14 +19,13 @@ args = ['C:\path\to\mcp.sock']
 ```
 
 The adapter executable must already be built and available on `PATH`, or `command`
-must be its absolute path. The reusable crate also supports Unix socket paths
-such as `/tmp/mcp.sock`; that does not make this KD4 checkout a Unix distribution.
+must be its absolute path. Both the adapter and its socket backend in this checkout are Windows-only.
 
 Unfortunately, the Rust standard library does not provide support for UNIX domain sockets on Windows today even though support was added in October 2018 in Windows 10:
 
 https://github.com/rust-lang/rust/issues/56533
 
-As a workaround, this crate uses `codex-uds`, which provides a cross-platform async UDS API backed by https://crates.io/crates/uds_windows on Windows.
+As a workaround, this crate uses `codex-uds`, which provides a Windows async UDS API backed by https://crates.io/crates/uds_windows on Windows.
 
 ## Completion policy
 

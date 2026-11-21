@@ -16,7 +16,7 @@ path: AbsolutePathBuf,
  */
 start: number,
 /**
- * Maximum bytes to return; must not exceed 64 KiB.
+ * Maximum bytes to return, from 1 through 65,536 inclusive.
  */
 len: number,
 /**

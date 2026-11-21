@@ -354,7 +354,20 @@ impl RouteAwareRequestBuilder {
     }
 
     pub async fn send(self) -> Result<reqwest::Response, RouteAwareRequestError> {
-        self.pool.send(self.request?, self.redirect_filter).await
+        self.send_tracking_initial_connect(&mut false).await
+    }
+
+    pub(crate) async fn send_tracking_initial_connect(
+        self,
+        initial_request_not_sent: &mut bool,
+    ) -> Result<reqwest::Response, RouteAwareRequestError> {
+        self.pool
+            .send(
+                self.request?,
+                self.redirect_filter,
+                initial_request_not_sent,
+            )
+            .await
     }
 }
 
@@ -563,6 +576,7 @@ impl RouteAwareClientPool {
         &self,
         mut request: reqwest::Request,
         redirect_filter: Option<RedirectFilter>,
+        initial_request_not_sent: &mut bool,
     ) -> Result<reqwest::Response, RouteAwareRequestError> {
         let request_method = request.method().clone();
         self.client_builder
@@ -659,6 +673,7 @@ impl RouteAwareClientPool {
                         client.log_error(&request_method, &request_url, &error);
                     }
                     if redirects == 0 && error.is_connect() {
+                        *initial_request_not_sent = true;
                         crate::transport::record_timing(|timing| {
                             timing.initial_request_not_sent = true;
                         });

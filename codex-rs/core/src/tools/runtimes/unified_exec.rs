@@ -312,14 +312,26 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
             && !req.turn_environment.environment.is_remote()
             && let Some(cwd) = native_cwd.as_ref()
         {
-            crate::tools::handlers::command_preflight::check_managed_cargo_lane(
+            crate::tools::handlers::command_preflight::check_managed_cargo_admission(
                 &req.command_for_approval,
                 cwd.as_path(),
                 &env,
                 ctx.turn.file_system_sandbox_policy().has_full_disk_read_access(),
             )
             .await
-            .map_err(ToolError::Rejected)?;
+            .map_err(|error| match error {
+                codex_command_analysis::command_preflight::CargoAdmissionError::Refused(message) => {
+                    ToolError::Codex(codex_protocol::error::CodexErr::Io(std::io::Error::other(
+                        crate::unified_exec::UnifiedExecError::LaunchInputRefused {
+                            message,
+                            kind: "managed_cargo_lane",
+                        },
+                    )))
+                }
+                codex_command_analysis::command_preflight::CargoAdmissionError::Worker(message) => {
+                    ToolError::Rejected(message)
+                }
+            })?;
         }
 
         let shell_startup_command = command.clone();

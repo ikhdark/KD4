@@ -453,11 +453,8 @@ impl ThreadQueueRequestProcessor {
                 }
             }
         }
-        if metadata
-            .as_ref()
-            .is_some_and(|metadata| metadata.archived_at.is_some())
-        {
-            return Err(invalid_params("thread is archived"));
+        if let Some(metadata) = metadata.as_mut() {
+            self.ensure_indexed_thread_active(metadata).await?;
         }
         if metadata.is_none() {
             let thread = loaded.ok_or_else(|| invalid_params("thread not found"))?;
@@ -473,6 +470,28 @@ impl ThreadQueueRequestProcessor {
             return Err(internal_error("unsupported persisted thread queue version"));
         }
         Ok(queue)
+    }
+
+    async fn ensure_indexed_thread_active(
+        &self,
+        metadata: &mut codex_state::ThreadMetadata,
+    ) -> Result<(), JSONRPCErrorError> {
+        let archived = if let Some(local_store) = self
+            .thread_store
+            .as_any()
+            .downcast_ref::<codex_thread_store::LocalThreadStore>()
+        {
+            local_store
+                .indexed_thread_is_archived(metadata)
+                .await
+                .map_err(queue_error)?
+        } else {
+            metadata.archived_at.is_some()
+        };
+        if archived {
+            return Err(invalid_params("thread is archived"));
+        }
+        Ok(())
     }
 
     async fn save(&self, id: ThreadId, queue: &mut Queue) -> Result<(), JSONRPCErrorError> {
@@ -494,7 +513,10 @@ impl ThreadQueueRequestProcessor {
             .ok_or_else(|| internal_error("queue revision overflow"))?;
         let payload = queue.encode_with_budget(MAX_QUEUE_BYTES)?;
         let db = self.db()?;
-        if db.get_thread(id).await.map_err(queue_error)?.is_none() {
+        if let Some(mut metadata) = db.get_thread(id).await.map_err(queue_error)? {
+            // Archive visibility may have changed since the queue was loaded.
+            self.ensure_indexed_thread_active(&mut metadata).await?;
+        } else {
             let thread = self
                 .thread_manager
                 .get_thread(id)

@@ -1254,6 +1254,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             let advisory = super::evidence_memory::source_read(
                 &invocation, if script_consumer { output.value() } else { &projected },
             ).await;
+            let mut complete_obligation_read = false;
             if let Some(evidence) = evidence {
                 let mut signal = crate::tools::context::semantic_evidence_sampling_signal(evidence);
                 if let Some(advisory) = advisory { signal["evidence_advisory"] = advisory; }
@@ -1268,6 +1269,10 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     "path":delivered["path"], "environment":delivered["environment_id"],
                     "canonical_uri":delivered["canonical_uri"],
                 })) {
+                    complete_obligation_read = ordinary_snapshot && successful
+                        && invocation.step_context.environments.primary().is_some_and(|primary| primary.environment_id == environment_id)
+                        && delivered["file_complete"] == true
+                        && receipt["ranges"] == json!([[0, receipt["contentBytes"]]]);
                     signal["native_read"] = receipt;
                 }
                 // Recovery handles bind coverage but are not semantic evidence:
@@ -1282,6 +1287,9 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             // this undelivered packet; keep that failure's effects unknown.
             crate::tools::context::ensure_exact_model_delivery(&output, &invocation)
                 .map_err(|error| FunctionCallError::structured(error.failure()))?;
+            if complete_obligation_read {
+                crate::session::turn_execution::record_complete_obligation_read(&invocation, &args.path).await;
+            }
             Ok(boxed_tool_output(output))
         };
         // Earlier failures precede any receipt or history mutation; this owner
@@ -1712,13 +1720,22 @@ async fn read_environment_file(
                 && err.kind() == std::io::ErrorKind::NotFound
             {
                 let note = suggestion_note(err.kind()).await.unwrap_or_default();
-                return Err(read_error(format!(
-                    "{}{note}",
-                    primary_error.clone().unwrap_or_else(|| format!(
-                        "unable to read {}",
-                        path.inferred_native_path_string()
-                    ))
-                )));
+                let native_path = path.inferred_native_path_string();
+                crate::session::turn_execution::record_missing_prerequisite_read(
+                    invocation, &args.path, path.to_string(), native_path.clone(),
+                    &environment.environment_id,
+                ).await;
+                let mut error = codex_protocol::tool_failure::ToolFailure::no_effects(
+                    codex_protocol::tool_failure::ToolFailureCode::Failed,
+                    format!("{}{note}", primary_error.unwrap_or_else(|| format!("unable to read {native_path}"))),
+                ).with_completed_execution();
+                error.details = Some(json!({
+                    "kind": "native_read_not_found",
+                    "receipt_call_id": invocation.call_id,
+                    "path": args.path,
+                    "environment_id": environment.environment_id,
+                }));
+                return Err(FunctionCallError::structured(error));
             }
             let metadata = match fs.get_metadata(&path, Some(&sandbox)).await {
                 Ok(metadata) => metadata,

@@ -515,39 +515,47 @@ async fn handle_spawn_agent(
             armed: true,
         };
         let canonical_capsule = match construct_and_attach_task_capsule(
-                store.as_ref(),
-                &repo_root,
-                &assignment,
-                &attempt,
-                relevant_handles,
-            )
-            .await
-            {
-                Ok(payload) => payload,
-                Err(error) => {
-                    if let Err(rollback_error) = store
-                        .abandon_agent_task(
-                            TaskActor::RootSession(assignment.root_session_id.clone()),
-                            assignment.assignment_id,
-                            format!("TaskCapsule construction failed before launch: {error}"),
-                        )
-                        .await
-                    {
+            store.as_ref(),
+            &repo_root,
+            &assignment,
+            &attempt,
+            relevant_handles,
+        )
+        .await
+        {
+            Ok(payload) => payload,
+            Err(error) => {
+                let assignment_abandoned = match store
+                    .abandon_agent_task(
+                        TaskActor::RootSession(assignment.root_session_id.clone()),
+                        assignment.assignment_id,
+                        format!("TaskCapsule construction failed before launch: {error}"),
+                    )
+                    .await
+                {
+                    Ok(_) => true,
+                    Err(rollback_error) => {
                         tracing::warn!(
                             assignment_id = %assignment.assignment_id,
                             %rollback_error,
                             "failed to abandon typed assignment after TaskCapsule failure"
                         );
+                        false
                     }
-                    coordinator
-                        .maybe_emit_terminal_metrics(
-                            assignment.assignment_id,
-                            &turn.session_telemetry,
-                        )
-                        .await;
-                    return Err(typed_task_store_error(error));
-                }
-            };
+                };
+                coordinator
+                    .maybe_emit_terminal_metrics(assignment.assignment_id, &turn.session_telemetry)
+                    .await;
+                // Returning drops the logical reservation. The launch guard still
+                // owns deferred binding cleanup and retries abandonment if needed.
+                return Err(prelaunch_capsule_failure(
+                    error,
+                    assignment.assignment_id,
+                    attempt.attempt_id,
+                    assignment_abandoned,
+                ));
+            }
+        };
         let task_capsule = matches!(fork_mode, SpawnAgentForkMode::TaskCapsule).then(|| {
             capsule_with_launch_pins(&canonical_capsule, &admitted.dependency_admissions)
                 .unwrap_or_else(|| canonical_capsule.clone())
@@ -1388,7 +1396,7 @@ fn typed_assignment_message(
 
 /// A correctable argument refusal raised before the first spawn effect
 /// (capacity reservation, task-store work, capsule capture or thread launch).
-/// Refusals at or after that boundary keep the generic unknown-effects mapping.
+/// Refusals after this boundary must account for prior effects.
 /// `kind` names the refusing check; the handler-refusal marker keeps a direct
 /// call's own reason instead of a schema re-explanation (registry.rs).
 fn pre_effect_refusal(kind: &str, message: impl Into<String>) -> FunctionCallError {
@@ -1443,10 +1451,49 @@ fn pre_effect_settings_refusal(error: FunctionCallError, args: &SpawnAgentArgs) 
     ))
 }
 
+fn prelaunch_capsule_failure(
+    error: StoreError,
+    assignment_id: AssignmentId,
+    attempt_id: codex_agent_task_store::AttemptId,
+    assignment_abandoned: bool,
+) -> FunctionCallError {
+    use codex_protocol::tool_failure::{ToolFailure, ToolFailureCode};
+
+    let (assignment_cleanup, cleanup_message) = if assignment_abandoned {
+        ("abandoned", "Assignment abandonment committed.")
+    } else {
+        ("unconfirmed", "Assignment abandonment could not be confirmed.")
+    };
+    let detail = typed_task_store_error_message(error);
+    let mut failure = ToolFailure::new(
+        ToolFailureCode::Failed,
+        format!(
+            "{detail}\nNo worker launched. The spawn reservation was released. {cleanup_message} Binding cleanup is not confirmed."
+        ),
+    )
+    .with_completed_execution();
+    // Admission and residency housekeeping have already run. Do not claim
+    // no effects or mark the durable assignment as not admitted.
+    failure.details = Some(serde_json::json!({
+        "stage": "task_capsule",
+        "worker_launched": false,
+        "reservation_cleanup": "released",
+        "assignment_id": assignment_id,
+        "attempt_id": attempt_id,
+        "assignment_cleanup": assignment_cleanup,
+        "binding_cleanup": "unconfirmed",
+    }));
+    FunctionCallError::structured(failure)
+}
+
 fn typed_task_store_error(error: StoreError) -> FunctionCallError {
+    FunctionCallError::RespondToModel(typed_task_store_error_message(error))
+}
+
+fn typed_task_store_error_message(error: StoreError) -> String {
     let storage_failure = task_store_failure_kind(&error).is_some();
     let detail = task_store_error_detail("spawn_agent", error);
-    FunctionCallError::RespondToModel(if storage_failure {
+    if storage_failure {
         // Name the next action once: a vague failure cost a generation per
         // retry and per re-planned batch of spawns in the audited sessions.
         format!(
@@ -1454,7 +1501,7 @@ fn typed_task_store_error(error: StoreError) -> FunctionCallError {
         )
     } else {
         format!("spawn_agent: {detail}")
-    })
+    }
 }
 
 #[derive(Debug, Serialize)]

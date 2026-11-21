@@ -1480,6 +1480,36 @@ class FsReadFileParams(BaseModel):
     path: Annotated[AbsolutePathBuf, Field(description="Absolute path to read.")]
 
 
+class FsReadFileRangeParams(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    expected_revision: Annotated[
+        str | None,
+        Field(
+            alias="expectedRevision",
+            description="Refuse a file revision different from a preceding range response.",
+        ),
+    ] = None
+    len: Annotated[
+        int,
+        Field(
+            description="Maximum bytes to return, from 1 through 65,536 inclusive.", ge=1, le=65536
+        ),
+    ]
+    path: Annotated[AbsolutePathBuf, Field(description="Absolute path to read.")]
+    start: Annotated[int, Field(description="Zero-based starting byte offset.", ge=0)]
+
+
+class FsReadFileRangeResponse(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    data_base64: Annotated[str, Field(alias="dataBase64")]
+    file_bytes: Annotated[int, Field(alias="fileBytes", ge=0)]
+    revision: str
+
+
 class FsReadFileResponse(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -2223,6 +2253,13 @@ class McpServerOauthLoginCompletedNotification(BaseModel):
         populate_by_name=True,
     )
     error: str | None = None
+    login_id: Annotated[
+        str | None,
+        Field(
+            alias="loginId",
+            description="Matches the explicit login response; automatic plugin login has no request ID.",
+        ),
+    ] = None
     name: str
     success: bool
     thread_id: Annotated[str | None, Field(alias="threadId")] = None
@@ -2243,6 +2280,13 @@ class McpServerOauthLoginResponse(BaseModel):
         populate_by_name=True,
     )
     authorization_url: Annotated[str, Field(alias="authorizationUrl")]
+    login_id: Annotated[
+        str | None,
+        Field(
+            alias="loginId",
+            description="Correlates this request with its asynchronous completion; absent on older peers.",
+        ),
+    ] = None
 
 
 class McpServerRefreshResponse(BaseModel):
@@ -6354,6 +6398,15 @@ class FsReadFileRequest(BaseModel):
     id: RequestId
     method: Annotated[Literal["fs/readFile"], Field(title="Fs/readFileRequestMethod")]
     params: FsReadFileParams
+
+
+class FsReadFileRangeRequest(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: RequestId
+    method: Annotated[Literal["fs/readFileRange"], Field(title="Fs/readFileRangeRequestMethod")]
+    params: FsReadFileRangeParams
 
 
 class FsWriteFileRequest(BaseModel):
@@ -11309,6 +11362,7 @@ class ClientRequest(
         | AppReadRequest
         | AppInstalledRequest
         | FsReadFileRequest
+        | FsReadFileRangeRequest
         | FsWriteFileRequest
         | FsCreateDirectoryRequest
         | FsGetMetadataRequest
@@ -11408,6 +11462,7 @@ class ClientRequest(
         | AppReadRequest
         | AppInstalledRequest
         | FsReadFileRequest
+        | FsReadFileRangeRequest
         | FsWriteFileRequest
         | FsCreateDirectoryRequest
         | FsGetMetadataRequest

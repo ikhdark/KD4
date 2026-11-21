@@ -101,7 +101,6 @@ struct RunningProcess {
     output_notify: Arc<Notify>,
     open_streams: usize,
     closed: bool,
-    finalizing: bool,
     termination_requested: Arc<std::sync::atomic::AtomicBool>,
     failure: Option<String>,
     sandbox: SandboxType,
@@ -543,7 +542,6 @@ impl LocalProcess {
                     output_notify: Arc::clone(&output_notify),
                     open_streams: 2,
                     closed: false,
-                    finalizing: false,
                     termination_requested: Arc::clone(&termination_requested),
                     failure: None,
                     sandbox,
@@ -906,25 +904,30 @@ impl LocalProcess {
                 None => return Ok(TerminateResponse { running: false }),
             }
         };
-        // Native tree confirmation can wait. Do not hold the process map or an
-        // async worker while it runs; the worker retains this exact incarnation
-        // if its RPC future is cancelled. Errors leave the record retryable.
-        let worker_session = Arc::clone(&session);
-        tokio::task::spawn_blocking(move || worker_session.request_terminate())
-            .await
-            .map_err(|error| internal_error(format!("shutdown uncertain: termination worker failed: {error}")))?
-            .map_err(|error| internal_error(format!("shutdown uncertain: failed to confirm process tree cleanup: {error}")))?;
-        let running = !session.has_exited();
-        maybe_emit_closed(params.process_id.clone(), Arc::clone(&self.inner)).await;
-        let closed = {
-            let processes = self.inner.processes.lock().await;
-            matches!(processes.get(&params.process_id), Some(ProcessEntry::Running(process))
-                if process.closed && Arc::ptr_eq(&process.session, &session))
-        };
-        if closed {
-            session.finish();
-        }
-        Ok(TerminateResponse { running })
+        // Once native termination starts, the process owner must also recheck
+        // closure after confirmation, even if the RPC or local caller goes away.
+        let inner = Arc::clone(&self.inner);
+        let process_id = params.process_id;
+        tokio::spawn(async move {
+            let worker_session = Arc::clone(&session);
+            tokio::task::spawn_blocking(move || worker_session.request_terminate())
+                .await
+                .map_err(|error| internal_error(format!("shutdown uncertain: termination worker failed: {error}")))?
+                .map_err(|error| internal_error(format!("shutdown uncertain: failed to confirm process tree cleanup: {error}")))?;
+            let running = !session.has_exited();
+            maybe_emit_closed(process_id.clone(), Arc::clone(&inner)).await;
+            let closed = {
+                let processes = inner.processes.lock().await;
+                matches!(processes.get(&process_id), Some(ProcessEntry::Running(process))
+                    if process.closed && Arc::ptr_eq(&process.session, &session))
+            };
+            if closed {
+                session.finish();
+            }
+            Ok(TerminateResponse { running })
+        })
+        .await
+        .map_err(|error| internal_error(format!("shutdown uncertain: termination task failed: {error}")))?
     }
 }
 
@@ -1306,12 +1309,12 @@ async fn finish_output_stream(process_id: ProcessId, stream: ExecOutputStream, i
 }
 
 async fn maybe_emit_closed(process_id: ProcessId, inner: Arc<Inner>) {
-    let identity = {
+    let output_notify = {
         let mut processes = inner.processes.lock().await;
         let Some(ProcessEntry::Running(process)) = processes.get_mut(&process_id) else {
             return;
         };
-        if process.closed || process.finalizing || process.open_streams != 0 {
+        if process.closed || process.open_streams != 0 {
             return;
         }
         if process.termination_requested.load(Ordering::Acquire)
@@ -1322,21 +1325,10 @@ async fn maybe_emit_closed(process_id: ProcessId, inner: Arc<Inner>) {
         if process.exit_code.is_none() {
             return;
         }
-        process.finalizing = true;
-        Arc::clone(&process.output_notify)
-    };
-    // KD4 launches local processes without a sandbox, so a close never reports
-    // a sandbox denial. The wire field stays for protocol compatibility.
-    let assessment = Some(false);
-    let output_notify = {
-        let mut processes = inner.processes.lock().await;
-        let Some(ProcessEntry::Running(process)) = processes.get_mut(&process_id) else {
-            return;
-        };
-
-        if process.closed || !Arc::ptr_eq(&process.output_notify, &identity) {
-            return;
-        }
+        // There is no longer an out-of-lock sandbox assessment. Commit the
+        // close under the same lock that checked termination and stream state.
+        // KD4 launches local processes without a sandbox; keep the wire field.
+        let assessment = Some(false);
         process.sandbox_denied = assessment.unwrap_or(false);
         // Release empty jobs promptly; retained records must still be able to
         // cancel descendants after a natural root exit, without cancelling them
